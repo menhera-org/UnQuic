@@ -2,16 +2,20 @@
 use crate::pack::flow_hash;
 use std::{io, os::fd::RawFd};
 
-fn sum(bytes: &[u8]) -> u32 {
+pub(super) fn sum(bytes: &[u8]) -> u32 {
     let (pairs, tail) = bytes.as_chunks::<2>();
-    pairs
+    let native = pairs
         .iter()
-        .map(|&p| u32::from(u16::from_be_bytes(p)))
+        .map(|&p| u32::from(u16::from_ne_bytes(p)))
         .sum::<u32>()
-        + tail.first().map_or(0, |&b| u32::from(b) << 8)
+        + tail
+            .first()
+            .map_or(0, |&b| u32::from(u16::from_ne_bytes([b, 0])));
+    // Fold carries before the byte swap; this avoids swapping every input word.
+    u32::from(fold(native).to_be())
 }
 
-fn fold(mut sum: u32) -> u16 {
+pub(super) fn fold(mut sum: u32) -> u16 {
     while sum > 65535 {
         sum = (sum & 65535) + (sum >> 16);
     }
@@ -182,7 +186,7 @@ fn checksum_matches_reference_for_odd_even_and_unaligned_inputs() {
                 .chunks(2)
                 .map(|p| u16::from_be_bytes([p[0], *p.get(1).unwrap_or(&0)]) as u32)
                 .sum();
-            assert_eq!(sum(input), expected);
+            assert_eq!(fold(sum(input)), fold(expected));
         }
     }
 }

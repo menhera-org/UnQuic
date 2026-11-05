@@ -342,7 +342,8 @@ now run against the real implementation in tests/reassembly.rs.
   acceptance; under pressure, validated tails may complete existing frames,
   but no packet is ACK-eligible until all its nonterminal DATA is retained.
 - TAP reads retain the 64-frame budget and strip internal `IFF_VNET_HDR`
-  metadata; checksum/GSO read offloads remain disabled. Compatible complete
+  metadata. The runtime enables checksum offload and completes partial checksums
+  in place; GSO read offloads remain disabled. Compatible complete
   UDP frames can share a lossless USO TAP write, preserving per-flow order,
   backpressure and the existing receive deadline. Other frames use single writes.
   Workers use bounded nonblocking io_uring read batches when available,
@@ -361,8 +362,9 @@ now run against the real implementation in tests/reassembly.rs.
 - The Rust UDP_SEGMENT/GRO load tool uses concurrent sockets, per-flow pacing,
   byte validation and duplicate tracking; it reports generator CPU separately.
   Direct veth probes exceed 20 Gbit/s each way. Four-/eight-worker harness
-  smoke tests pass with plain UDP. Segmented TAP-to-TAP tests require B3
-  checksum/super-frame input support; these probes do not pass the tunnel gate.
+  smoke tests pass with plain UDP. Segmented senders now work through the runtime's checksum completion path;
+  the kernel still segments before TAP reads. B3 super-frame input remains
+  unfinished, and the direct probes do not pass the tunnel gate.
 - Measure: record frames per second and CPU per core on the container
   loopback in a `BENCH.md` table with kernel version and CPU model. These
   numbers are a baseline until a complete-transport run demonstrates at least

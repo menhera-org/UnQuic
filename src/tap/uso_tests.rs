@@ -89,6 +89,7 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
         frame_limit: crate::MAX_FRAME_LEN,
         vnet: true,
         uso: true,
+        completed_checksums: 0,
     };
     let capture = raw_socket(c"uq-v1", libc::ETH_P_ALL as u16);
     for v6 in [false, true] {
@@ -296,6 +297,7 @@ fn batching_preserves_backpressure_and_disables_rejected_offloads() {
         frame_limit: crate::MAX_FRAME_LEN,
         vnet: true,
         uso: true,
+        completed_checksums: 0,
     };
     let a = frame(false, 1, &[1; 120]);
     let b = frame(false, 2, &[2; 120]);
@@ -321,6 +323,7 @@ fn batching_preserves_backpressure_and_disables_rejected_offloads() {
         frame_limit: crate::MAX_FRAME_LEN,
         vnet: true,
         uso: true,
+        completed_checksums: 0,
     };
     let (mask, result) = short.write_batch([a.as_slice(), b.as_slice()].into_iter());
     assert_eq!(mask, 3);
@@ -334,6 +337,7 @@ fn batching_preserves_backpressure_and_disables_rejected_offloads() {
         frame_limit: crate::MAX_FRAME_LEN,
         vnet: true,
         uso: true,
+        completed_checksums: 0,
     };
     let (mask, result) = rejected.write_batch([a.as_slice(), b.as_slice()].into_iter());
     assert_eq!(mask, 1);
@@ -354,6 +358,7 @@ fn tap_metadata_is_removed_and_unsupported_partial_frames_are_rejected() {
         frame_limit: crate::MAX_FRAME_LEN,
         vnet: true,
         uso: true,
+        completed_checksums: 0,
     };
     let mut bytes = [0u8; crate::MAX_FRAME_LEN + 1];
     for flags in [0, 2, 1, 4, 128] {

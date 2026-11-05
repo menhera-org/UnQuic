@@ -1,10 +1,15 @@
 # Release transport overload investigation
 
 The original receive-admission collapse and a later TAP readiness busy loop
-are fixed. Local TAP USO coalescing and batched reads now improve delivery: the latest
-MTU-1500 read-ring repeats reach 4.94–5.28 / 6.23–6.48 Gbit/s under unlimited
-load. All five unlimited points exceed their paced predecessors in both
-directions. The corresponding 64-byte sweep also holds up under overload.
+are fixed. Local TAP USO coalescing and batched reads improve delivery.
+The iperf3 read-ring repeats reach 4.94–5.28 / 6.23–6.48 Gbit/s under unlimited
+load; their five unlimited points exceed their paced predecessors.
+The newer segmented-send/GRO-receive workload still shows declines,
+including a four-worker direction falling from 6.27 to 5.31 Gbit/s as actual
+offered load rises. After optimizing checksum completion, eight workers reach
+9.74–9.75 / 9.29–9.45 Gbit/s unlimited; a four-worker reverse direction still
+falls 4.8% as actual input increases.
+Overload stability remains unresolved.
 
 These short sweeps do not establish a plateau for every workload or the
 theoretical CPU ceiling. Neither the local **20 Gbit/s in each direction**
@@ -19,26 +24,26 @@ their absence does not explain away a scheduling or admission failure.
 ## Current performance gaps
 
 Status after the TAP readiness fix, per-peer payload limit, local TAP USO
-and bounded read rings.
+bounded read rings and partial-checksum completion.
 The split-pool, deadline-cache and lane-association experiments below are not
 in the runtime.
-The latest results use the 20-CPU single-socket profile and capped
-socket-buffer fallback below.
+The latest segmented-send results use 12 physical cores with four workers per
+daemon, or 20 with eight workers, and the capped socket-buffer fallback below.
 L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | The read-ring repeats deliver 4.94–5.28 / 6.23–6.48 Gbit/s of inner UDP payload under unlimited load | Even the better points need about 3.8× / 3.1× more delivered goodput. iperf3 still offers only about 13 Gbit/s each way. The new UDP_SEGMENT/GRO tool exceeds 20 Gbit/s over veth, but needs production TAP super-frame input for segmented tunnel tests. |
-| Goodput must plateau under excess traffic | Five MTU-1500 and three 64-byte corrected read-ring unlimited points exceed their paced predecessors in both directions; earlier baselines and a fixed-batch trial declined | The current 20-second samples pass that comparison. Longer runs, mixed traffic, more flows/sessions and the acceptance gate remain unverified. |
-| Small-frame overload must remain efficient | Read rings deliver 847–899k / 844–868k frames/s in three 64-byte unlimited points, compared with 729–737k / 714–734k with USO alone | The final 10M-per-flow sweep holds up under overload. Receiver errors are now substantial; mixed and non-coalescible traffic still need coverage. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Native-checksum segmented-send repeats deliver 9.74–9.75 / 9.29–9.45 Gbit/s with eight workers; ordinary iperf3 reaches 5.26–5.31 / 6.41 Gbit/s with four | Still about 2.1× short. Actual offered load is only about 10.5–12.5 Gbit/s with kernel segmentation before TAP reads. Full super-frame input remains unfinished. |
+| Goodput must plateau under excess traffic | Five MTU-1500 and three 64-byte corrected read-ring unlimited points exceed their paced predecessors in both directions; earlier baselines and a fixed-batch trial declined | The segmented-send/GRO workload fails the comparison: a four-worker direction drops 15.2% initially; after checksum optimization the reverse direction drops 4.8% with increased input. Longer runs, mixed traffic, more flows/sessions and the acceptance gate remain unverified. |
+| Small-frame overload must remain efficient | Native-checksum segmented sends deliver 1.22M / 1.06M frames/s with four workers and 1.55M / 1.58M with eight, using 64-byte frames | Both short sweeps hold up under overload. Eight-worker missing rates are 0.13% / 0.87%; mixed and non-coalescible traffic still need coverage. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
 | Use larger confirmed path MTUs | The runtime accepts a per-peer 1232–1452-byte payload assertion; a controlled 1452-byte sweep shows only a modest change | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. Configured capacity is not confirmed PMTU. |
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
 
-Loss under unlimited load is still high: the final read-ring MTU-1500
-points miss about 58–63% / 48–51% of offered frames despite zero admission
-pressure and worker queue drops. TAP ingress drops, outer socket overflows
+Loss under unlimited load is still high: the native-checksum eight-worker
+MTU-1500 points miss 7.3–7.4% / 15.8–16.9% of offered frames despite zero
+admission pressure and worker queue drops. TAP ingress drops, outer socket overflows
 and inner UDP receive-buffer errors are recorded. Their different units prevent
 an exact frame-loss decomposition.
 
@@ -1226,3 +1231,172 @@ sequence windows, argument bounds, ancillary validation, IPv4/IPv6,
 four concurrent sockets, 18/1472/8972-byte payloads and batches up to 64
 datagrams. Corrupting every byte of the checked payload body is detected. The send/receive
 test counts zero allocations and deallocations. Clippy and Rust 1.89 checks pass.
+
+## Partial TAP checksum completion: segmented sender sweeps
+
+The runtime now enables TUN_F_CSUM and completes bounded partial checksums
+in place. GSO read offloads stay disabled; the kernel still segments before
+TAP reads. This removes the generator's EIO prerequisite without changing
+the wire format, frame quotas, receive deadlines or per-turn budgets.
+`tap_checksums` counts completions before transmit admission.
+
+[These 12 normal-build points](benches/tap-udp-load.json) use the Rust generator
+with UDP_SEGMENT and a GRO-aware receiver. Each run has 16 flows per direction,
+20 seconds of sending and a two-second receiver tail. Four-worker daemons use
+eight cores plus four load-process cores; eight-worker daemons use sixteen plus
+four. The CPU sets are disjoint physical cores on the same socket.
+The daemon hash is
+`4446515549d0217d6e95b48a6abf88830580fb8510cc4399d91504af3eabff47`.
+
+These rows differ from iperf3 in burst shape, destination ports, receiver
+offloads and load-process placement. Compare paced and unlimited points
+within each sweep; they are not an isolated checksum-speed comparison.
+
+| Workers each | Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing % | Daemon CPU % |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 2 | 2.000 / 1.999 | 1.999 / 1.999 | 0.04 / 0.01 | 93.9 / 100.4 |
+| 4 | 8 | 7.966 / 7.953 | 6.266 / 5.271 | 21.34 / 33.73 | 316.7 / 325.0 |
+| 4 | 21 | 10.699 / 12.101 | 5.311 / 6.253 | 50.36 / 48.33 | 302.9 / 347.3 |
+| 4 | unlimited | 10.421 / 12.500 | 6.816 / 5.706 | 34.60 / 54.35 | 336.7 / 355.4 |
+| 4 | 21 | 10.589 / 12.648 | 6.698 / 5.554 | 36.75 / 56.09 | 336.4 / 357.2 |
+| 4 | unlimited | 10.904 / 12.672 | 6.528 / 5.765 | 40.13 / 54.50 | 332.2 / 359.1 |
+| 8 | 2 | 2.000 / 1.999 | 1.999 / 1.999 | 0.03 / 0.01 | 120.5 / 116.7 |
+| 8 | 8 | 7.974 / 7.996 | 7.921 / 7.926 | 0.67 / 0.88 | 406.9 / 395.0 |
+| 8 | 21 | 10.889 / 11.065 | 9.949 / 9.026 | 8.63 / 18.43 | 518.8 / 523.8 |
+| 8 | unlimited | 10.575 / 10.690 | 9.421 / 8.421 | 10.91 / 21.23 | 504.5 / 513.4 |
+| 8 | 21 | 11.156 / 11.012 | 9.589 / 8.497 | 14.05 / 22.84 | 522.5 / 527.1 |
+| 8 | unlimited | 10.666 / 11.957 | 9.789 / 8.921 | 8.21 / 25.39 | 510.7 / 530.0 |
+
+All points have zero corruption, duplicates, packets outside the duplicate
+window, admission-pressure rejections, worker queue drops, TAP errors and
+outer IPv6 fragmentation. Checksum completion counts track the accepted load frames; unrelated
+control traffic can add ordinary reads. Socket overflow and TAP ingress drops remain.
+
+The four-worker 8-to-21-requested transition is a verified decline:
+L→R delivery falls 15.2% while actual offered load rises from 7.97 to
+10.70 Gbit/s. The reverse direction gains throughput in the same transition.
+Later paced/unlimited comparisons also vary. The eight-worker first
+unlimited point is lower in both delivery and actual offered load than its
+paced predecessor, so that comparison alone does not prove collapse from
+greater input.
+
+Per-thread measurements expose substantial imbalance. In the four-worker
+declining point, left worker CPU is 96.8%, 94.2%, 44.8% and 67.2%.
+The fixed 16-flow set maps to transmit-lane counts 4/2/7/3 on the left and
+4/6/5/1 on the right. Receive ownership and learned TAP queue placement
+create different work distributions. These observations establish unused
+aggregate CPU alongside saturated workers; they do not yet explain every
+change between points or justify changing flow pinning.
+
+The unit tests cover TCP/UDP checksum offsets, IPv4/IPv6, VLANs, odd payload
+lengths, zero-checksum encoding and invalid metadata without modifying rejected
+frames. Ordinary and io_uring reads share the checked completion path.
+All 16 kernel tests pass. The reconnect storm forwards about 1.07 million
+frames per endpoint without corruption, duplicates or counted allocations.
+Full super-frame input and a stable plateau remain unfinished.
+
+### Profile and checksum arithmetic follow-up
+
+[The five-point diagnostic repeat](benches/worker-checksum-profile.json)
+uses the previous one-in-256-turn CPU-clock method. It does not reproduce
+the full initial 15.2% decline: its requested-8-Gbit point delivers
+6.43 / 5.76 Gbit/s, followed by 7.06 / 5.95 Gbit/s at requested 21 Gbit/s.
+Smaller later declines remain. Independent sweeps differ in scheduling and
+TAP queue placement; the initial failed point remains in the normal data.
+
+The profile puts TAP reads, checksum completion and dispatch at 36–40%
+of daemon CPU. Receive processing plus TAP delivery takes about 29–32%,
+transmit flush 17–19%, and epoll 2–4%. No read handler starts without a
+transmit buffer. The samples identify where CPU goes, but do not establish
+a complete cause for the changing per-direction goodput.
+
+A separate checksum probe found an avoidable byte swap per 16-bit input
+word. Summing native-endian words, folding carries and then swapping the
+result preserves the Internet checksum. At 1472 bytes, the hot calculation
+falls from 116–120 ns to 68–72 ns; at 9022 bytes, from 711–732 ns to
+359–380 ns. These are isolated calculation costs, not forwarding latency.
+The probe checks both formulations across lengths through 65,534 bytes;
+the production regression checks every aligned/unaligned length through
+MAX_FRAME_LEN against an independent network-order reference.
+
+The unchanged iperf3 workload retains its four-worker, 20-core profile.
+Both before and after the arithmetic change, each unlimited point exceeds
+its preceding paced point:
+
+| Checksum arithmetic | Requested/flow | Delivered Gbit/s | Missing % | Daemon CPU % |
+| --- | --- | ---: | ---: | ---: |
+| Per-word swap | 500M | 3.920 / 5.636 | 50.86 / 29.40 | 350.1 / 359.5 |
+| Per-word swap | unlimited | 5.049 / 6.013 | 58.50 / 50.89 | 327.9 / 327.1 |
+| Per-word swap | 500M | 3.884 / 5.637 | 51.45 / 29.40 | 349.1 / 358.6 |
+| Per-word swap | unlimited | 5.223 / 6.024 | 56.73 / 51.44 | 337.7 / 331.4 |
+| Native-word sum | 500M | 4.171 / 6.177 | 47.86 / 22.79 | 364.0 / 366.7 |
+| Native-word sum | unlimited | 5.264 / 6.407 | 57.44 / 48.02 | 337.2 / 329.9 |
+| Native-word sum | 500M | 4.155 / 6.224 | 47.89 / 22.03 | 367.3 / 369.6 |
+| Native-word sum | unlimited | 5.306 / 6.407 | 57.98 / 47.87 | 340.5 / 335.3 |
+
+The native-word build restores the reverse direction to about 6.41 Gbit/s
+in these two unlimited points, compared with about 6.02 Gbit/s before the
+arithmetic change. The final hash is
+`9645ae5a83b387ecc9437c2fce93c3c9f602a83b7871cb8997c92caf167bcb0d`.
+A separate three-second bidirectional TCP smoke test also passes at about
+1.98 / 1.95 Gbit/s. These checks do not resolve the segmented workload's
+remaining overload variation.
+
+### Native-checksum segmented-send repeat
+
+The same 20-second, 16-flow profiles were repeated with the final native-word
+checksum build above. Rates and loss use unique receiver sequences divided
+by the sender's measured duration; daemon CPU uses the before/sent snapshots.
+The JSON retains generator/receiver CPU, per-worker and per-core counters.
+These runs and the diagnostic profile ran separately from builds and tests.
+
+| Workers | Frame bytes | Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing % | Daemon CPU % |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 1514 | 8 | 7.964 / 7.993 | 6.490 / 5.931 | 18.51 / 25.80 | 310.2 / 312.5 |
+| 4 | 1514 | 21 | 10.574 / 12.394 | 6.860 / 5.645 | 35.12 / 54.45 | 334.2 / 353.1 |
+| 4 | 1514 | unlimited | 10.552 / 12.455 | 6.914 / 5.658 | 34.48 / 54.57 | 333.7 / 352.9 |
+| 4 | 1514 | 21 | 10.537 / 12.520 | 6.992 / 5.729 | 33.64 / 54.24 | 336.1 / 354.6 |
+| 4 | 1514 | unlimited | 11.247 / 12.155 | 6.974 / 5.722 | 37.99 / 52.93 | 336.7 / 354.2 |
+| 4 | 64 | 0.16 | 0.160 / 0.160 | 0.160 / 0.160 | 0.00 / 0.01 | 241.8 / 252.0 |
+| 4 | 64 | unlimited | 0.261 / 0.266 | 0.215 / 0.186 | 17.43 / 29.98 | 318.0 / 321.0 |
+| 8 | 1514 | 8 | 7.994 / 7.905 | 7.963 / 7.868 | 0.40 / 0.47 | 394.8 / 384.6 |
+| 8 | 1514 | 21 | 10.711 / 11.682 | 9.908 / 9.194 | 7.50 / 21.30 | 503.6 / 519.6 |
+| 8 | 1514 | unlimited | 10.515 / 11.371 | 9.752 / 9.454 | 7.26 / 16.86 | 500.0 / 520.8 |
+| 8 | 1514 | 21 | 10.458 / 11.279 | 9.570 / 9.203 | 8.49 / 18.41 | 492.1 / 514.6 |
+| 8 | 1514 | unlimited | 10.522 / 11.037 | 9.738 / 9.291 | 7.45 / 15.82 | 494.1 / 518.3 |
+| 8 | 64 | 0.16 | 0.160 / 0.160 | 0.160 / 0.160 | 0.00 / 0.00 | 272.0 / 275.3 |
+| 8 | 64 | unlimited | 0.273 / 0.280 | 0.273 / 0.277 | 0.13 / 0.87 | 454.5 / 472.4 |
+
+The four-worker reverse direction falls from 5.931 to 5.645 Gbit/s (4.8%)
+when actual offered load rises from 7.99 to 12.39 Gbit/s. Later points
+remain below that first paced result. The decline is unresolved. Eight
+workers reach about 9.74 / 9.29–9.45 Gbit/s unlimited, but actual offered
+load varies and remains below the gate's 21 Gbit/s request.
+
+For 64-byte frames, four workers deliver 907,752 / 908,202 frames/s paced
+and 1,224,374 / 1,059,330 unlimited. Eight deliver 907,278 / 906,953 paced
+and 1,549,763 / 1,576,089 unlimited. Both short sweeps improve under overload.
+These packets carry only 22 payload bytes; frame rate is more useful than
+payload goodput for this case.
+
+Drop attribution below uses endpoint L / R order, including the receiver
+drain. Socket overflow counts SKBs, which can contain multiple datagrams;
+TAP TX drops count inner frames. Inner UDP errors count receive-buffer failures.
+They cannot be added as if they had the same unit.
+
+| Native run | TAP TX drops | Transport socket overflow | Inner UDP errors | Expired frames |
+| --- | ---: | ---: | ---: | ---: |
+| rx-csum-native-4-1452-1514-16/4 | 4897364 / 8138761 | 189518 / 141985 | 4052 / 15 | 0 / 0 |
+| rx-csum-native-8-1452-1514-16/2 | 26576 / 2362663 | 63668 / 92435 | 3901 / 626 | 0 / 0 |
+| rx-csum-native-8-1452-1514-16/4 | 0 / 2400244 | 41785 / 98299 | 1936 / 462 | 0 / 0 |
+| rx-csum-native-4-1232-64-16/1 | 4315315 / 8499000 | 9687 / 20603 | 0 / 0 | 0 / 0 |
+| rx-csum-native-8-1232-64-16/1 | 17281 / 238390 | 1013 / 519 | 0 / 0 | 0 / 0 |
+
+All fourteen points have zero admission pressure, worker queue drops,
+corruption, duplicate sequences, out-of-window sequences, TAP errors and
+outer IPv6 fragmentation. The final reconnect test delivered about 1.10
+million frames per endpoint without corruption, duplicates, hot allocations
+or deallocations. All 16 kernel tests, the full release suite, Clippy and
+Rust 1.89 checks pass. These checks establish the checksum prerequisite;
+full TAP super-frame input, overload stability and both performance gates
+remain unfinished.

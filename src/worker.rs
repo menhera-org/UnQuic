@@ -1763,6 +1763,11 @@ impl Worker {
 
     fn read_tap(&mut self, session: usize, now: Duration) -> io::Result<()> {
         const _: () = assert!(BATCH_SIZE <= 64);
+        let checksums = self.sessions[session]
+            .tap
+            .as_ref()
+            .unwrap()
+            .completed_checksums;
         if self.tap_reader.as_ref().is_some_and(|r| r.enabled) {
             let count = self.sessions[session].tap_read_limit.min(
                 self.free
@@ -1780,7 +1785,7 @@ impl Worker {
             }
             let reader = self.tap_reader.as_mut().unwrap();
             let batch = reader.read(
-                self.sessions[session].tap.as_ref().unwrap(),
+                self.sessions[session].tap.as_mut().unwrap(),
                 &mut slices[..count],
             );
             let frames = batch.results[..count].iter().filter(|r| r.is_ok()).count() as u64;
@@ -1829,6 +1834,17 @@ impl Worker {
                 }
             }
         }
+        let completed = self.sessions[session]
+            .tap
+            .as_ref()
+            .unwrap()
+            .completed_checksums
+            .wrapping_sub(checksums);
+        self.counters.tap_checksums = self.counters.tap_checksums.wrapping_add(completed);
+        self.sessions[session].totals.tap_checksums = self.sessions[session]
+            .totals
+            .tap_checksums
+            .wrapping_add(completed);
         Ok(())
     }
 

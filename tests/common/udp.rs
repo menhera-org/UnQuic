@@ -71,3 +71,15 @@ pub fn repair(bytes: &mut [u8], v6: bool) {
     let check = !fold(pseudo + sum(&bytes[at..]));
     bytes[at + 6..at + 8].copy_from_slice(&(if check == 0 { 65535 } else { check }).to_be_bytes());
 }
+
+pub fn partial(bytes: &mut [u8], v6: bool) -> [u8; 10] {
+    let at = if v6 { 54 } else { 34 };
+    let pseudo =
+        sum(if v6 { &bytes[22..54] } else { &bytes[26..34] }) + 17 + (bytes.len() - at) as u32;
+    bytes[at + 6..at + 8].copy_from_slice(&fold(pseudo).to_be_bytes());
+    let mut header = [0u8; 10];
+    header[0] = 1;
+    header[6..8].copy_from_slice(&(at as u16).to_ne_bytes());
+    header[8..10].copy_from_slice(&6u16.to_ne_bytes());
+    header
+}

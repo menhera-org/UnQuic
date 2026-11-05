@@ -104,6 +104,7 @@ impl Tap {
                 frame_limit: mtu as usize + 22,
                 vnet: true,
                 uso: true,
+                completed_checksums: 0,
             });
         }
         request.ifr_ifru.ifru_mtu = mtu as libc::c_int;
@@ -128,6 +129,18 @@ impl Tap {
         })?;
         tap.set_carrier(false)?;
         Ok(tap)
+    }
+
+    pub(crate) fn enable_checksums(&self) -> io::Result<()> {
+        // SAFETY: TUNSETOFFLOAD takes an integer bitmask; every queue belongs to this TAP.
+        cvt(unsafe {
+            libc::ioctl(
+                self.queues[0].fd.as_raw_fd(),
+                libc::TUNSETOFFLOAD,
+                libc::TUN_F_CSUM as libc::c_ulong,
+            )
+        })?;
+        Ok(())
     }
 
     /// Returns the exact requested device name.
@@ -159,6 +172,7 @@ pub struct TapQueue {
     frame_limit: usize,
     vnet: bool,
     uso: bool,
+    pub(crate) completed_checksums: u64,
 }
 
 impl TapQueue {
@@ -169,6 +183,7 @@ impl TapQueue {
             frame_limit: MAX_FRAME_LEN,
             vnet: false,
             uso: false,
+            completed_checksums: 0,
         }
     }
 
@@ -216,18 +231,35 @@ impl TapQueue {
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
-        self.check_read(&header, n as usize)
+        self.finish_read(&header, n as usize, buffer)
     }
 
-    fn check_read(&self, header: &[u8; 10], mut n: usize) -> io::Result<usize> {
+    fn finish_read(
+        &mut self,
+        header: &[u8; 10],
+        mut n: usize,
+        buffer: &mut [u8],
+    ) -> io::Result<usize> {
         if self.vnet {
-            if n < header.len() || header[0] & !2 != 0 || header[1] != 0 {
+            if n < header.len() || header[0] > 2 || header[1] != 0 {
                 return Err(io::ErrorKind::InvalidData.into());
             }
             n -= header.len();
         }
-        if !(14..=self.frame_limit).contains(&n) {
+        if !(14..=self.frame_limit).contains(&n) || n > buffer.len() {
             return Err(io::ErrorKind::InvalidData.into());
+        }
+        if self.vnet && header[0] == 1 {
+            let start = u16::from_ne_bytes([header[6], header[7]]) as usize;
+            let field = start + u16::from_ne_bytes([header[8], header[9]]) as usize;
+            if start < 14 || field + 2 > n {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            // Match skb_checksum_help, including the mangled representation of zero.
+            let checksum = !uso::fold(uso::sum(&buffer[start..n]));
+            buffer[field..field + 2]
+                .copy_from_slice(&if checksum == 0 { 65535u16 } else { checksum }.to_be_bytes());
+            self.completed_checksums = self.completed_checksums.wrapping_add(1);
         }
         Ok(n)
     }
@@ -315,6 +347,115 @@ mod tests {
         }
         for (mtu, queues) in [(1499, 1), (9001, 1), (1500, 0), (1500, 65)] {
             assert!(Tap::create(c"unquic-test", mtu, queues, None).is_err());
+        }
+    }
+    #[test]
+    fn partial_checksums_complete_in_place_with_checked_metadata() {
+        let mut tap = TapQueue {
+            fd: std::fs::File::open("/dev/null").unwrap().into(),
+            frame_limit: MAX_FRAME_LEN,
+            vnet: true,
+            uso: false,
+            completed_checksums: 0,
+        };
+        for v6 in [false, true] {
+            for size in [0, 1, 2, 1471, 1472, 8900] {
+                let payload: Vec<_> = (0..size).map(|i| (i * 13) as u8).collect();
+                let expected = test_common::udp::frame(v6, 42, &payload);
+                let mut bytes = expected.clone();
+                let mut header = test_common::udp::partial(&mut bytes, v6);
+                for tags in [0, 1, 2] {
+                    let mut packet = bytes.clone();
+                    let mut want = expected.clone();
+                    for _ in 0..tags {
+                        packet.splice(12..12, [0x81, 0, 0, 1]);
+                        want.splice(12..12, [0x81, 0, 0, 1]);
+                    }
+                    let at = (if v6 { 54u16 } else { 34 }) + 4 * tags;
+                    header[6..8].copy_from_slice(&at.to_ne_bytes());
+                    let len = packet.len();
+                    assert_eq!(
+                        tap.finish_read(&header, len + 10, &mut packet).unwrap(),
+                        len
+                    );
+                    assert_eq!(packet, want);
+                }
+            }
+        }
+
+        for v6 in [false, true] {
+            for size in [1, 2, 1472] {
+                let at = if v6 { 54 } else { 34 };
+                let mut expected = test_common::udp::frame(v6, 42, &vec![0x5a; size]);
+                expected.splice(at..at + 8, [0u8; 20]);
+                expected[at + 12] = 0x50;
+                expected[at + 13] = 0x18;
+                let len = expected.len() - at;
+                if v6 {
+                    expected[20] = 6;
+                    expected[18..20].copy_from_slice(&(len as u16).to_be_bytes());
+                } else {
+                    expected[23] = 6;
+                    expected[16..18].copy_from_slice(&((len + 20) as u16).to_be_bytes());
+                    expected[24..26].fill(0);
+                    let checksum = !uso::fold(uso::sum(&expected[14..34]));
+                    expected[24..26].copy_from_slice(&checksum.to_be_bytes());
+                }
+                let pseudo = uso::sum(if v6 {
+                    &expected[22..54]
+                } else {
+                    &expected[26..34]
+                }) + 6
+                    + len as u32;
+                let checksum = !uso::fold(pseudo + uso::sum(&expected[at..]));
+                expected[at + 16..at + 18].copy_from_slice(
+                    &if checksum == 0 { 65535u16 } else { checksum }.to_be_bytes(),
+                );
+                let mut packet = expected.clone();
+                packet[at + 16..at + 18].copy_from_slice(&uso::fold(pseudo).to_be_bytes());
+                let mut header = [0u8; 10];
+                header[0] = 1;
+                header[6..8].copy_from_slice(&(at as u16).to_ne_bytes());
+                header[8..10].copy_from_slice(&16u16.to_ne_bytes());
+                tap.finish_read(&header, packet.len() + 10, &mut packet)
+                    .unwrap();
+                assert_eq!(packet, expected);
+            }
+        }
+        let mut zero = [0u8; 60];
+        zero[20..22].fill(255);
+        let mut header = [0u8; 10];
+        header[0] = 1;
+        header[6..8].copy_from_slice(&14u16.to_ne_bytes());
+        header[8..10].copy_from_slice(&6u16.to_ne_bytes());
+        tap.finish_read(&header, 70, &mut zero).unwrap();
+        assert_eq!(&zero[20..22], &[255, 255]);
+        assert_eq!(tap.completed_checksums, 43);
+
+        for (flags, gso, start, offset, length) in [
+            (3, 0, 14, 6, 70),
+            (4, 0, 14, 6, 70),
+            (1, 5, 14, 6, 70),
+            (1, 0, 0, 6, 70),
+            (1, 0, 59, 0, 70),
+            (1, 0, 14, 65535, 70),
+            (1, 0, 65535, 65535, 70),
+            (1, 0, 14, 6, 9),
+            (1, 0, 14, 6, 71),
+        ] {
+            let mut bytes = [7u8; 60];
+            header[0] = flags;
+            header[1] = gso;
+            header[6..8].copy_from_slice(&(start as u16).to_ne_bytes());
+            header[8..10].copy_from_slice(&(offset as u16).to_ne_bytes());
+            assert_eq!(
+                tap.finish_read(&header, length, &mut bytes)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(bytes, [7; 60]);
+            assert_eq!(tap.completed_checksums, 43);
         }
     }
 }

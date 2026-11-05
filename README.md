@@ -358,12 +358,16 @@ Worker/session counters expose read syscalls (`tap_read_calls`), submitted
 read requests (`tap_read_requests`), ring batches (`tap_read_batches`),
 valid ring frames (`tap_ring_frames`) and fallback events
 (`tap_read_fallbacks`). Startup fallback counts belong to workers.
+`tap_checksums` counts partial checksums completed before transmit admission.
 
 ## TAP write coalescing
 
-TAP queues use an internal 10-byte virtio header. Read offloads remain disabled:
-the runtime removes metadata and rejects unexpected GSO or partial-checksum
-input. Wire DATA still carries ordinary Ethernet frames.
+TAP queues use an internal 10-byte virtio header. The runtime enables checksum
+offload and completes partial Internet checksums in place after validating the
+metadata bounds. GSO read offloads remain disabled, so the kernel segments
+host super-frames before TAP reads. Wire DATA still carries ordinary Ethernet
+frames. Unknown metadata flags and unexpected GSO input are rejected.
+Standalone `Tap::create` keeps read offloads disabled until runtime setup.
 
 A receive flush may combine already-complete UDP frames into one USO
 `writev`, borrowing their payloads directly from reassembly slots. Supported

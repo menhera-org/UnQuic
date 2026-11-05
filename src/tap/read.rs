@@ -237,13 +237,13 @@ impl Reader {
         })
     }
 
-    pub(crate) fn read(&mut self, tap: &TapQueue, buffers: &mut [&mut [u8]]) -> Batch {
+    pub(crate) fn read(&mut self, tap: &mut TapQueue, buffers: &mut [&mut [u8]]) -> Batch {
         self.read_with(tap, buffers, enter)
     }
 
     fn read_with(
         &mut self,
-        tap: &TapQueue,
+        tap: &mut TapQueue,
         buffers: &mut [&mut [u8]],
         mut submit: impl FnMut(i32, u32, u32) -> io::Result<usize>,
     ) -> Batch {
@@ -346,7 +346,7 @@ impl Reader {
                         Err(io::Error::from_raw_os_error(-c.result))
                     }
                 } else {
-                    tap.check_read(&headers[i], c.result as usize)
+                    tap.finish_read(&headers[i], c.result as usize, buffers[i])
                 };
             }
             self.cq.atomic(self.params.cq.head).store(cq_tail, Release);
@@ -413,6 +413,7 @@ mod tests {
                 frame_limit: crate::MAX_FRAME_LEN,
                 vnet,
                 uso: false,
+                completed_checksums: 0,
             },
             b,
         )
@@ -426,7 +427,7 @@ mod tests {
         assert!(std::panic::catch_unwind(|| ring.sq.at::<[u8; 4097]>(0)).is_err());
         let before = std::fs::read_dir("/proc/self/task").unwrap().count();
         for vnet in [false, true] {
-            let (tap, sender) = queue(vnet);
+            let (mut tap, sender) = queue(vnet);
             let mut storage = vec![vec![0u8; crate::MAX_FRAME_LEN + 1]; CAPACITY];
             let mut buffers: Vec<_> = storage.iter_mut().map(Vec::as_mut_slice).collect();
             for count in [1, 2, 63, 64, 7, 64] {
@@ -437,13 +438,13 @@ mod tests {
                     }
                     sender.send(&frame).unwrap();
                 }
-                let batch = ring.read(&tap, &mut buffers[..count]);
+                let batch = ring.read(&mut tap, &mut buffers[..count]);
                 assert_eq!(batch.calls, 1);
                 for (i, result) in batch.results.into_iter().take(count).enumerate() {
                     assert_eq!(result.unwrap(), 14 + 31 * i);
                     assert!(buffers[i][..14 + 31 * i].iter().all(|&v| v == i as u8));
                 }
-                let empty = ring.read(&tap, &mut buffers);
+                let empty = ring.read(&mut tap, &mut buffers);
                 assert_eq!(empty.calls, 1);
                 assert!(
                     empty
@@ -455,7 +456,7 @@ mod tests {
             sender
                 .send(&vec![0; crate::MAX_FRAME_LEN + 1 + usize::from(vnet) * 10])
                 .unwrap();
-            let batch = ring.read(&tap, &mut buffers[..1]);
+            let batch = ring.read(&mut tap, &mut buffers[..1]);
             assert_eq!(
                 batch.results[0].as_ref().unwrap_err().kind(),
                 io::ErrorKind::InvalidData
@@ -466,13 +467,30 @@ mod tests {
                     frame[0] = flag;
                     frame[1] = gso;
                     sender.send(&frame).unwrap();
-                    let batch = ring.read(&tap, &mut buffers[..1]);
+                    let batch = ring.read(&mut tap, &mut buffers[..1]);
                     assert_eq!(
                         batch.results[0].as_ref().unwrap_err().kind(),
                         io::ErrorKind::InvalidData
                     );
                 }
             }
+        }
+
+        for v6 in [false, true] {
+            let (mut tap, sender) = queue(true);
+            let expected = super::super::test_common::udp::frame(v6, 7, &[0x5a; 1471]);
+            let mut frame = expected.clone();
+            let header = super::super::test_common::udp::partial(&mut frame, v6);
+            let wire = [header.as_slice(), frame.as_slice()].concat();
+            let mut bytes = [0u8; crate::MAX_FRAME_LEN + 1];
+            sender.send(&wire).unwrap();
+            assert_eq!(tap.read_frame(&mut bytes).unwrap(), expected.len());
+            assert_eq!(&bytes[..expected.len()], expected);
+            sender.send(&wire).unwrap();
+            let batch = ring.read(&mut tap, &mut [&mut bytes]);
+            assert_eq!(*batch.results[0].as_ref().unwrap(), expected.len());
+            assert_eq!(&bytes[..expected.len()], expected);
+            assert_eq!(tap.completed_checksums, 2);
         }
         assert!(ring.enabled);
         assert_eq!(
@@ -493,7 +511,7 @@ mod tests {
             let mut storage = vec![vec![0u8; crate::MAX_FRAME_LEN + 1]; CAPACITY];
             let mut buffers: Vec<_> = storage.iter_mut().map(Vec::as_mut_slice).collect();
             let mut calls = 0;
-            let batch = ring.read_with(&tap, &mut buffers, |fd, count, wait| {
+            let batch = ring.read_with(&mut tap, &mut buffers, |fd, count, wait| {
                 calls += 1;
                 if calls == 1 {
                     assert_eq!(enter(fd, 3, 0).unwrap(), 3);
@@ -531,9 +549,9 @@ mod tests {
         // An io_uring READV on an epoll descriptor is rejected without consuming input.
         let n = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         assert!(n >= 0);
-        let tap = TapQueue::test_fd(unsafe { OwnedFd::from_raw_fd(n) });
+        let mut tap = TapQueue::test_fd(unsafe { OwnedFd::from_raw_fd(n) });
         let mut bytes = [0u8; crate::MAX_FRAME_LEN + 1];
-        let batch = ring.read(&tap, &mut [&mut bytes]);
+        let batch = ring.read(&mut tap, &mut [&mut bytes]);
         assert!(!ring.enabled);
         assert_eq!(
             batch.results[0].as_ref().unwrap_err().kind(),
@@ -546,7 +564,7 @@ mod tests {
         use super::super::test_common::*;
         // SAFETY: only this test thread and its children enter the private namespace.
         check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
-        let tap = crate::tap::Tap::create(c"uq-read", 9000, 1, None).unwrap();
+        let mut tap = crate::tap::Tap::create(c"uq-read", 9000, 1, None).unwrap();
         assert!(
             std::process::Command::new("ip")
                 .args(["link", "set", "uq-read", "addrgenmode", "none"])
@@ -575,7 +593,7 @@ mod tests {
                 for frame in &frames {
                     raw_send(&sender, frame);
                 }
-                let batch = reader.read(&tap.queues[0], &mut buffers[..count]);
+                let batch = reader.read(&mut tap.queues[0], &mut buffers[..count]);
                 assert!(reader.enabled);
                 assert_eq!(batch.calls, 1);
                 for (i, result) in batch.results.into_iter().take(count).enumerate() {
@@ -584,7 +602,7 @@ mod tests {
                 }
             }
         }
-        let empty = reader.read(&tap.queues[0], &mut buffers);
+        let empty = reader.read(&mut tap.queues[0], &mut buffers);
         assert_eq!(empty.calls, 1);
         assert!(
             empty

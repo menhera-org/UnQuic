@@ -369,6 +369,7 @@ pub fn run(config: Config, control: Control) -> io::Result<()> {
     for (index, session) in shared.config.config().sessions.iter().enumerate() {
         let name = CString::new(session.tap_name()).map_err(|_| io::ErrorKind::InvalidInput)?;
         let tap = Tap::create(&name, session.inner_mtu, session.queue_count, session.mac)?;
+        tap.enable_checksums()?;
         for (worker, queue) in workers.iter_mut().zip(tap.into_queues()) {
             worker.attach_tap(index, queue)?;
         }

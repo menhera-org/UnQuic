@@ -65,13 +65,12 @@ on one socket. The four-worker defaults use daemon CPUs 0-7 and load CPUs 8-19. 
 eight-worker defaults use daemon CPUs 0-15 and one load process on each of
 CPUs 16-19. Verify the host's topology before using either layout.
 
-The current runtime disables read checksum/GSO offloads. On the tested
-kernel, a directly connected sender using UDP_SEGMENT therefore fails with
-EIO. The kernel test verifies that enabling checksum support removes that
-error, and enabling both USO flags produces a super-frame. Production
-super-frame input is the next implementation step; use SEGMENTS=1 for the
-current runtime. The direct veth measurements in BENCH.md establish harness
-capacity, not tunnel throughput.
+The runtime enables checksum offload and completes partial checksums after
+TAP reads. UDP_SEGMENT senders work, but the kernel still segments their
+super-frames before TAP reads. Production super-frame input remains unfinished.
+The kernel test also covers the older behavior: UDP_SEGMENT fails with EIO
+when all TAP read offloads are disabled. The direct veth measurements in
+BENCH.md establish harness capacity, not tunnel throughput.
 
 The Linux interfaces are described in [udp(7)](https://man7.org/linux/man-pages/man7/udp.7.html).
 The checksum prerequisite is visible in

@@ -148,6 +148,8 @@ metrics! {
     tap_read_batches: sum,
     /// Valid frames read through io_uring, before transmit admission.
     tap_ring_frames: sum,
+    /// Partial Internet checksums completed before transmit admission.
+    tap_checksums: sum,
     /// Workers without a read ring at startup, plus rings disabled after rejection.
     tap_read_fallbacks: sum,
     /// TAP frame write syscalls, including unsuccessful attempts and fallback retries.
