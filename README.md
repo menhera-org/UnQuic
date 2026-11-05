@@ -111,6 +111,13 @@ backpressure until delivery, discard or the original 100 ms deadline. Overlappin
 pieces keep the first retained bytes; changed frame lengths reject the datagram.
 Tests cover full queues, overlap, retirement and allocation-free operation.
 
+`pack::Lane` segments frames into baseline datagrams and keeps monotonic packet
+and frame identities. Every Ethernet frame length from 14 through 9022 bytes
+round-trips through the real encoder and reassembler in tests; a maximum frame
+uses eight datagrams. Flow selection handles VLAN stacks, IPv4 and IPv6
+extension headers, and keeps fragments on an address/protocol key. Encoding and
+flow hashing have allocation checks. Multi-record packing is still pending.
+
 The crate does not yet forward frames between peers. Worker ownership,
 batching/offloads, path-MTU probing, recovery, BBRv3, scheduled DNS
 refresh, the daemon and descriptor adoption remain to be implemented.

@@ -66,8 +66,8 @@ The target layout. Create files when their step arrives, not before.
 | `src/worker.rs` | Pinned worker loop: epoll, eventfd, timerfd | 1e |
 | `src/runtime.rs` | `run()`, `Control` handle, thread ownership | 1e |
 | `src/bin/unquic.rs` | Daemon and `gen-uuid` (feature `bin`) | 1f |
-| `src/reassembly.rs` | Receive windows, frame assembly, TAP write queue | 2 |
-| `src/pack.rs` | Outgoing record packing and segmentation | 2 |
+| `src/reassembly.rs` | Receive windows, frame assembly, TAP write queue | 1e, extended in 2 |
+| `src/pack.rs` | Flow selection, segmentation and record packing | 1e, extended in 2 |
 | `src/ack.rs` | ACK generation and processing | 3 |
 | `src/loss.rs` | RTT, loss detection, PTO (RFC 9002 parameters) | 3 |
 | `src/pmtu.rs` | DPLPMTUD per lane | 3 |
@@ -194,6 +194,9 @@ Tests cover all 64 workers, stale acknowledgments, retirement, generation
 exhaustion, and full command/reply queues. Worker loops, ownership tables and
 barrier integration remain. The reassembly/window foundation from stage 2 is
 also implemented because step 1e requires permanent duplicate suppression.
+Baseline segmentation and inner-flow selection are implemented in src/pack.rs.
+Tests cover every supported frame length, identity exhaustion, IP fragments,
+IPv6 extension headers and allocation-free operation.
 
 Implement the ownership rules of section 10 under "Worker ownership and
 routing (v1)".

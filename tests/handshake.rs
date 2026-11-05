@@ -769,3 +769,30 @@ fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
     let allocations = ALLOCATION_COUNT.replace(None);
     assert_eq!(allocations, Some(0));
 }
+
+#[test]
+fn segmentation_and_flow_selection_allocate_nothing() {
+    use unquic::{UnquicUuid, pack};
+    let (mut a, mut b) = sessions();
+    establish(&mut a, &mut b, 0, 1);
+    let mut lane =
+        pack::Lane::new(UnquicUuid::from_bytes([1; 16]), a.connection().unwrap(), 1).unwrap();
+    let mut frame = [0_u8; 9022];
+    frame[12..14].copy_from_slice(&0x86dd_u16.to_be_bytes());
+    frame[14] = 0x60;
+    frame[18..20].copy_from_slice(&8_u16.to_be_bytes());
+    frame[20] = 17;
+    let mut output = [0; 1232];
+    ALLOCATION_COUNT.set(Some(0));
+    for _ in 0..100 {
+        std::hint::black_box(pack::flow_hash(&frame));
+        let mut pieces = lane.frame(&frame).unwrap();
+        let mut count = 0;
+        while pieces.encode_next(&mut output).unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 8);
+    }
+    let allocations = ALLOCATION_COUNT.replace(None);
+    assert_eq!(allocations, Some(0));
+}
