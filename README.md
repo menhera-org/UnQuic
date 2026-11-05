@@ -152,7 +152,11 @@ extension headers, and keeps fragments on an address/protocol key. Encoding and
 flow hashing have allocation checks. The scatter/gather encoder borrows frame
 pieces directly; tests compare its wire bytes with the contiguous encoder.
 Batched socket calls, WouldBlock and invalid/truncated input paths also have
-allocation checks. Multi-record packing is still pending.
+allocation checks. The multi-record encoder now borrows several queued frames, packs frame tails
+with following heads, and flushes at queue exhaustion. Generated sequences,
+reversed arrival, duplicate packets, identity exhaustion and 14/60/64/128-byte
+bursts have tests. Two 1514-byte frames pack into three baseline datagrams.
+Worker integration of retained multi-frame batches is still pending.
 
 The runtime now forwards frames between TAPs with configured or supplied IPv6 peers.
 The isolated test exercises two workers, two peers and three sessions per endpoint,
@@ -163,7 +167,7 @@ through a VLAN upper device, exercising kernel tag materialization. Allocation
 instrumentation observes no allocations or deallocations during these forwarding
 checks. This is correctness coverage, not a throughput measurement.
 
-Multi-record packing, recovery, BBRv3,
+Worker multi-record packing, recovery, BBRv3,
 descriptor adoption and daemon process integration remain unfinished. No throughput
 target has been demonstrated.
 
@@ -245,7 +249,10 @@ absolute monotonic timers. No worker waits for another worker's queue.
 
 Current sends batch the pieces of one frame; packing multiple frames together
 remains pending. TAP I/O still requires one read or write per frame. No throughput
-target follows from the allocation checks alone.
+target follows from the allocation checks alone. Small-frame acceptance must
+report delivered frames per second, CPU and drops separately from large-frame
+Gbit/s. Multi-record packing reduces outer packet overhead; it does not remove
+TAP's per-frame read/write cost.
 
 ## Delivery and liveness
 
@@ -276,7 +283,10 @@ Transmit batches group adjacent equal-sized UDP payloads, with an optional
 shorter final payload, into UDP_SEGMENT messages. The kernel gathers wire
 prefixes and original frame slices directly; grouping adds no payload copy.
 Groups stay within 64 logical datagrams and a conservative 64 KiB outer-packet
-bound. Kernel capability/path errors disable GSO on that socket and retry through
+bound. SendDatagram now takes a borrowed list of slices, allowing multiple
+record prefixes and original frame pieces. A call uses at most 1024 descriptors
+and returns the complete datagram prefix it submitted when that budget fills;
+validation covers the entire input before any send. Callers retain the rest. Kernel capability/path errors disable GSO on that socket and retry through
 ordinary sendmmsg. Partial results count successful logical datagrams, so callers
 retain exactly the unsent suffix. An MTU error that also affects an ordinary
 datagram still returns EMSGSIZE.

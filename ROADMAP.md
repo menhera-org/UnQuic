@@ -299,7 +299,11 @@ pass the container forwarding/restart test and allocation checks. A mixed-cookie
 mixed-owner aggregate test verifies independent rejection and unchanged payload
 storage. Fixed receive pools remain below the directional frame/byte ceilings;
 per-origin transmit reservations enforce the same bounds through delayed returns.
-Multi-record packing and the frame storm/throughput tests remain. Partial completion, GSO/GRO boundaries, MTU errors and allocation
+The pure multi-record encoder and socket slice-list API are implemented, with
+borrowed payloads, bounded descriptors, generated frame-sequence reconstruction,
+reverse/duplicate delivery and small-frame burst tests. Worker integration must
+retain those batches across partial sends, expiry and connection barriers;
+it and the frame storm/throughput tests remain. Partial completion, GSO/GRO boundaries, MTU errors and allocation
 checks pass. The five frame-model regression cases
 now run against the real implementation in tests/reassembly.rs.
 
@@ -336,7 +340,9 @@ now run against the real implementation in tests/reassembly.rs.
   loopback in a `BENCH.md` table with kernel version and CPU model. These
   numbers are a baseline until a complete-transport run demonstrates at least
   20 Gbit/s of delivered inner goodput in each direction simultaneously at
-  inner MTU 1500. Report each direction separately, with loss, CPU including
+  inner MTU 1500. Also measure sustained small-frame bursts (60, 64 and 128 frame
+  bytes excluding FCS): delivered frames/s, drops and CPU per direction, with
+  single- and multiple-flow cases. Report each direction separately, with loss, CPU including
   softirq, core budget, flow count and the precise measurement layer. Keep
   this requirement open until a repeatable run passes.
 

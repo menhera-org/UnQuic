@@ -800,6 +800,23 @@ fn segmentation_and_flow_selection_allocate_nothing() {
         }
         assert_eq!(count, 8);
     }
+    let frames = [&frame[..60]; 256];
+    let mut packed = pack::Packed::new();
+    let mut encoder = lane.frames(&frames, unquic::BASE_UDP_PAYLOAD).unwrap();
+    let mut count = 0;
+    while let Some(packet) = encoder.encode_next_split(&mut packed).unwrap() {
+        let mut slices = [&[][..]; pack::PACKED_SLICES];
+        assert_eq!(
+            packed
+                .slices(&mut slices)
+                .iter()
+                .map(|part| part.len())
+                .sum::<usize>(),
+            packet.length
+        );
+        count += 1;
+    }
+    assert!(count < 20);
     let allocations = ALLOCATION_COUNT.replace(None);
     assert_eq!(allocations, Some(0));
 }
@@ -832,8 +849,7 @@ fn batched_socket_io_and_rejection_paths_allocate_nothing() {
         ReceiveDatagram::new(d),
     ];
     let outgoing = [SendDatagram {
-        prefix: b"head",
-        payload: b"tail",
+        parts: &[b"head", b"tail"],
     }; 4];
     ALLOCATION_COUNT.set(Some(0));
     for _ in 0..100 {

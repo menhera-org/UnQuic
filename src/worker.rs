@@ -1598,24 +1598,26 @@ impl Worker {
                 self.pending.push_back(buffer);
                 continue;
             }
-            let mut parts = [SendDatagram {
-                prefix: &[],
-                payload: &[],
-            }; 8];
+            let mut slices = [[&[][..]; 2]; 8];
             let mut offset = 0;
-            for (index, part) in parts.iter_mut().enumerate().take(buffer.count) {
+            for (index, parts) in slices.iter_mut().enumerate().take(buffer.count) {
                 let length = usize::from(buffer.lengths[index]);
-                *part = SendDatagram {
-                    prefix: &buffer.prefixes[index],
-                    payload: &buffer.bytes[offset..offset + length],
-                };
+                *parts = [
+                    &buffer.prefixes[index],
+                    &buffer.bytes[offset..offset + length],
+                ];
                 offset += length;
             }
+            let parts: [SendDatagram<'_>; 8] = std::array::from_fn(|index| SendDatagram {
+                parts: &slices[index],
+            });
             match socket.send_batch(&parts[buffer.first..buffer.count], BASE_UDP_PAYLOAD) {
                 Ok(sent) => {
                     let bytes = parts[buffer.first..buffer.first + sent]
                         .iter()
-                        .map(|part| (part.prefix.len() + part.payload.len() + 48) as u64)
+                        .map(|part| {
+                            (part.parts.iter().map(|bytes| bytes.len()).sum::<usize>() + 48) as u64
+                        })
                         .sum::<u64>();
                     self.counters.tx_outer_bytes = self.counters.tx_outer_bytes.wrapping_add(bytes);
                     let local = &mut self.sessions[buffer.session];

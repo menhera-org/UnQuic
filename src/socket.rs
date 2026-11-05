@@ -11,7 +11,7 @@ use crate::{
 use std::{
     ffi::{CStr, CString},
     io,
-    mem::{size_of, zeroed},
+    mem::{MaybeUninit, size_of, zeroed},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket},
     os::fd::{AsFd, AsRawFd, BorrowedFd},
     sync::atomic::{AtomicBool, Ordering},
@@ -21,6 +21,7 @@ use std::{
 pub const BATCH_SIZE: usize = 64;
 /// UDP payload ceiling under the configured 1500-byte outer IPv6 MTU.
 pub const MAX_UDP_PAYLOAD: usize = 1500 - 40 - 8;
+const MAX_VECTORS: usize = 1024;
 const GSO_MAX_BYTES: usize = 65_535 - 40 - 8;
 
 #[repr(C)]
@@ -29,13 +30,11 @@ struct Ancillary {
     data: [u8; size_of::<usize>()],
 }
 
-/// One outgoing datagram, optionally split into prefix and borrowed payload.
+/// One outgoing datagram gathered from borrowed wire prefixes and frame pieces.
 #[derive(Clone, Copy)]
 pub struct SendDatagram<'a> {
-    /// Wire prefix, or the whole datagram when payload is empty.
-    pub prefix: &'a [u8],
-    /// Borrowed frame piece; concatenated with prefix by the kernel.
-    pub payload: &'a [u8],
+    /// Slices concatenated in order by the kernel, without a payload copy.
+    pub parts: &'a [&'a [u8]],
 }
 
 /// One caller-owned receive buffer and its result metadata.
@@ -286,6 +285,8 @@ impl TransmitSocket {
     /// message without payload copies. Capability/path errors disable GSO and
     /// retry through ordinary sendmmsg. Partial results count logical datagrams,
     /// never GSO messages; retain the unsent suffix with its packet identities.
+    /// Each call submits at most 1024 slices, possibly shortening the batch.
+    /// A single datagram with more slices is rejected before any submission.
     pub fn send_batch(&self, datagrams: &[SendDatagram<'_>], limit: usize) -> io::Result<usize> {
         let gso = self.gso_enabled();
         match send_batch(self.socket.as_fd(), datagrams, limit, gso) {
@@ -325,16 +326,23 @@ fn send_batch(
     if datagrams.is_empty()
         || datagrams.len() > BATCH_SIZE
         || !(BASE_UDP_PAYLOAD..=MAX_UDP_PAYLOAD).contains(&limit)
-        || datagrams
-            .iter()
-            .any(|d| d.prefix.len().saturating_add(d.payload.len()) > limit)
     {
         return Err(io::ErrorKind::InvalidInput.into());
     }
-    let mut vectors = [libc::iovec {
-        iov_base: std::ptr::null_mut(),
-        iov_len: 0,
-    }; BATCH_SIZE * 2];
+    let mut lengths = [0; BATCH_SIZE];
+    for (data, length) in datagrams.iter().zip(&mut lengths) {
+        if data.parts.len() > MAX_VECTORS {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        *length = data
+            .parts
+            .iter()
+            .try_fold(0_usize, |sum, part| {
+                sum.checked_add(part.len()).filter(|n| *n <= limit)
+            })
+            .ok_or(io::ErrorKind::InvalidInput)?;
+    }
+    let mut vectors = [MaybeUninit::<libc::iovec>::uninit(); MAX_VECTORS];
     // SAFETY: zeroed headers/control buffers represent empty messages.
     let mut messages: [libc::mmsghdr; BATCH_SIZE] = unsafe { zeroed() };
     // SAFETY: all-zero cmsghdr and bytes are valid writable storage.
@@ -342,36 +350,43 @@ fn send_batch(
     let mut ends = [0; BATCH_SIZE];
     let mut count = 0;
     let mut first = 0;
-    while first < datagrams.len() {
-        let segment = datagrams[first].prefix.len() + datagrams[first].payload.len();
+    let mut used = 0;
+    while first < datagrams.len() && used + datagrams[first].parts.len() <= MAX_VECTORS {
+        let segment = lengths[first];
+        let base = used;
+        let mut slices = datagrams[first].parts.len();
         let mut end = first + 1;
         let mut bytes = segment;
         if gso && segment != 0 {
             while end < datagrams.len() {
-                let next = datagrams[end].prefix.len() + datagrams[end].payload.len();
-                if next == 0 || next > segment || bytes + next > GSO_MAX_BYTES {
+                let next = lengths[end];
+                if next == 0
+                    || next > segment
+                    || bytes + next > GSO_MAX_BYTES
+                    || used + slices + datagrams[end].parts.len() > MAX_VECTORS
+                {
                     break;
                 }
                 bytes += next;
+                slices += datagrams[end].parts.len();
                 end += 1;
                 if next < segment {
                     break;
                 }
             }
         }
-        for (index, data) in datagrams.iter().enumerate().take(end).skip(first) {
-            vectors[index * 2] = libc::iovec {
-                iov_base: data.prefix.as_ptr().cast_mut().cast(),
-                iov_len: data.prefix.len(),
-            };
-            vectors[index * 2 + 1] = libc::iovec {
-                iov_base: data.payload.as_ptr().cast_mut().cast(),
-                iov_len: data.payload.len(),
-            };
+        for data in &datagrams[first..end] {
+            for part in data.parts {
+                vectors[used].write(libc::iovec {
+                    iov_base: part.as_ptr().cast_mut().cast(),
+                    iov_len: part.len(),
+                });
+                used += 1;
+            }
         }
         let message = &mut messages[count].msg_hdr;
-        message.msg_iov = vectors[first * 2..].as_mut_ptr();
-        message.msg_iovlen = ((end - first) * 2) as _;
+        message.msg_iov = vectors[base..].as_mut_ptr().cast();
+        message.msg_iovlen = slices as _;
         if end - first > 1 {
             let control = &mut controls[count];
             // SAFETY: constant length fits this aligned ancillary structure.
@@ -387,7 +402,8 @@ fn send_batch(
         first = end;
     }
     // SAFETY: each header borrows live datagram slices and aligned ancillary
-    // storage. The kernel reads payloads and writes only message lengths.
+    // storage. All referenced iovecs were initialized above; unused slots are
+    // outside msg_iovlen. The kernel reads payloads and writes only message lengths.
     let sent = cvt(unsafe {
         libc::sendmmsg(
             fd.as_raw_fd(),
@@ -590,16 +606,14 @@ mod tests {
                 .enumerate()
                 .map(|(i, &n)| vec![i as u8; n])
                 .collect();
-            let outgoing: Vec<_> = data
+            let parts: Vec<_> = data
                 .iter()
                 .map(|bytes| {
                     let split = bytes.len().min(7);
-                    SendDatagram {
-                        prefix: &bytes[..split],
-                        payload: &bytes[split..],
-                    }
+                    [&bytes[..split], &bytes[split..]]
                 })
                 .collect();
+            let outgoing: Vec<_> = parts.iter().map(|parts| SendDatagram { parts }).collect();
             assert_eq!(
                 tx.send_batch(&outgoing, MAX_UDP_PAYLOAD).unwrap(),
                 lengths.len()
@@ -636,10 +650,8 @@ mod tests {
         rx.enable_gro().unwrap();
         let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
         let payload = [9; MAX_UDP_PAYLOAD];
-        let outgoing = [SendDatagram {
-            prefix: &payload,
-            payload: &[],
-        }; BATCH_SIZE];
+        let parts = [&payload[..]];
+        let outgoing = [SendDatagram { parts: &parts }; BATCH_SIZE];
         assert_eq!(
             tx.send_batch(&outgoing, MAX_UDP_PAYLOAD).unwrap(),
             BATCH_SIZE
@@ -683,8 +695,7 @@ mod tests {
         set_int(&tx.socket, libc::IPPROTO_UDP, libc::UDP_NO_CHECK6_TX, 1).unwrap();
         set_int(&rx.socket, libc::IPPROTO_UDP, libc::UDP_NO_CHECK6_RX, 1).unwrap();
         let outgoing = [SendDatagram {
-            prefix: b"prefix",
-            payload: b"payload",
+            parts: &[b"prefix", b"payload"],
         }; 2];
         assert_eq!(tx.send_batch(&outgoing, BASE_UDP_PAYLOAD).unwrap(), 2);
         assert!(!tx.gso_enabled());
@@ -697,8 +708,7 @@ mod tests {
         set_int(&tx.socket, libc::IPPROTO_IPV6, libc::IPV6_MTU, 1280).unwrap();
         tx.gso.store(true, Ordering::Relaxed);
         let large = [SendDatagram {
-            prefix: &[0; MAX_UDP_PAYLOAD],
-            payload: &[],
+            parts: &[&[0; MAX_UDP_PAYLOAD], &[]],
         }; 2];
         assert_eq!(
             tx.send_batch(&large, MAX_UDP_PAYLOAD)
@@ -842,16 +852,13 @@ mod tests {
         let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
         let outgoing = [
             SendDatagram {
-                prefix: b"head",
-                payload: b"tail",
+                parts: &[b"head", b"tail"],
             },
             SendDatagram {
-                prefix: &[7; BASE_UDP_PAYLOAD],
-                payload: &[],
+                parts: &[&[7; BASE_UDP_PAYLOAD], &[]],
             },
             SendDatagram {
-                prefix: b"last",
-                payload: &[],
+                parts: &[b"last", &[]],
             },
         ];
         assert_eq!(tx.send_batch(&outgoing, BASE_UDP_PAYLOAD).unwrap(), 3);
@@ -878,8 +885,7 @@ mod tests {
         let invalid = [
             outgoing[0],
             SendDatagram {
-                prefix: &[0; BASE_UDP_PAYLOAD],
-                payload: &[1],
+                parts: &[&[0; BASE_UDP_PAYLOAD], &[1]],
             },
         ];
         assert_eq!(
@@ -916,13 +922,11 @@ mod tests {
         .unwrap();
         let prefixes: Vec<_> = (0..BATCH_SIZE as u8).map(|id| [id; 16]).collect();
         let payload = [255; 1000];
-        let outgoing: Vec<_> = prefixes
+        let parts: Vec<_> = prefixes
             .iter()
-            .map(|prefix| SendDatagram {
-                prefix,
-                payload: &payload,
-            })
+            .map(|prefix| [&prefix[..], &payload[..]])
             .collect();
+        let outgoing: Vec<_> = parts.iter().map(|parts| SendDatagram { parts }).collect();
         let mut sent = 0;
         let mut calls = 0;
         while sent < BATCH_SIZE {
@@ -942,6 +946,48 @@ mod tests {
             rx.recv(&mut [0; 1]).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
+    }
+
+    #[test]
+    fn vectored_budget_returns_a_complete_prefix_and_validates_the_whole_batch() {
+        for gso in [false, true] {
+            let rx = receiver();
+            let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
+            tx.gso.store(gso, Ordering::Relaxed);
+            let parts = [&b"x"[..]; 500];
+            let outgoing = [SendDatagram { parts: &parts }; 3];
+            assert_eq!(tx.send_batch(&outgoing, BASE_UDP_PAYLOAD).unwrap(), 2);
+            for _ in 0..2 {
+                let mut bytes = [0; 500];
+                assert_eq!(rx.recv(&mut bytes).unwrap().0, 500);
+                assert_eq!(bytes, [b'x'; 500]);
+            }
+            assert_eq!(tx.send_batch(&outgoing[2..], BASE_UDP_PAYLOAD).unwrap(), 1);
+            assert_eq!(rx.recv(&mut [0; 500]).unwrap().0, 500);
+            let exact = [&b"x"[..]; MAX_VECTORS];
+            let boundary = [
+                SendDatagram { parts: &exact },
+                SendDatagram { parts: &[] },
+                SendDatagram { parts: &[b"tail"] },
+            ];
+            assert_eq!(tx.send_batch(&boundary, BASE_UDP_PAYLOAD).unwrap(), 2);
+            assert_eq!(rx.recv(&mut [0; MAX_VECTORS]).unwrap().0, MAX_VECTORS);
+            assert_eq!(rx.recv(&mut [0; 1]).unwrap().0, 0);
+            assert_eq!(tx.send_batch(&boundary[2..], BASE_UDP_PAYLOAD).unwrap(), 1);
+            assert_eq!(rx.recv(&mut [0; 4]).unwrap().0, 4);
+            let too_many = [&b""[..]; MAX_VECTORS + 1];
+            let invalid = [outgoing[0], outgoing[1], SendDatagram { parts: &too_many }];
+            assert_eq!(
+                tx.send_batch(&invalid, BASE_UDP_PAYLOAD)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                rx.recv(&mut [0; 500]).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
     }
 
     #[test]
