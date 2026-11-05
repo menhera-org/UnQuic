@@ -464,7 +464,7 @@ If a comparison already reaches the available underlay ceiling, report that fact
 
 # 15 Implementation stages
 
-**Current status:** stage 1 is in progress. Implemented foundations are
+**Current status:** stage 1 is complete; stage 2 is next. Implemented foundations are
 `UnquicUuid` parsing/provisioning, duplicate-checked cookie indexing,
 `MacAddress` validation, IPv6 sockets with separate receive/transmit APIs, and
 nonpersistent multiqueue TAP creation and frame I/O. The version-1 wire codec
@@ -505,7 +505,11 @@ connection generation. README.md defines byte accounting, lifetime, aggregation
 and currently unsupported gauges. Aggregate receive quotas, offloads, recovery
 and congestion control remain unfinished. Current liveness
 probes do not discover MTU: the UDP limit remains 1232 bytes until stage 3.
-No performance acceptance claim has been made.
+The foreground daemon now parses the documented TOML, provisions cookies through
+gen-uuid, refreshes hostnames through per-peer iphost helpers after readiness,
+and joins transport workers on SIGINT/SIGTERM. Tests cover delayed DNS, address
+refresh and signal cleanup. Double-fork readiness and service integration remain
+stage 4 work. No performance acceptance claim has been made.
 
 1. **Socket and device foundation.** Implement fixed receive-only sockets, dynamic transmit pools, IPv6/interface/VRF binding, UUID lookup, TAP ownership, and counters. Validate R01–R10 and the port invariants.
 

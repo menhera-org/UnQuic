@@ -86,6 +86,15 @@ impl fmt::Display for InvalidMacAddress {
 }
 impl std::error::Error for InvalidMacAddress {}
 
+#[cfg(feature = "bin")]
+impl<'de> serde::Deserialize<'de> for MacAddress {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,7 +6,7 @@
 //! selecting a bypassing resolver never triggers a system-resolver fallback.
 
 pub use iphost::{
-    ClientId, Dhcpv6ResolverConfig, FQDN, IpHost, IpHostResolver, Ipv6ResolverConfig,
+    BindDevice, ClientId, Dhcpv6ResolverConfig, FQDN, IpHost, IpHostResolver, Ipv6ResolverConfig,
     RaResolverConfig, Resolver, StaticResolverConfig,
 };
 use std::net::{IpAddr, Ipv6Addr};

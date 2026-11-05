@@ -24,8 +24,28 @@
 The crate requires Linux and declares Rust 1.89 or later. Use a
 `*-unknown-linux-musl` target for builds. The default build depends only on
 `libc`; enabling `dns` adds exactly `iphost 0.4.4` with RA and DHCPv6 support,
-without its default features. `bin`, `uuid-compat` and the CLI commands described
-in the design are not implemented yet. There is currently no executable to run.
+without its default features. `uuid-compat` adds lossless conversions to and from
+`uuid::Uuid`, with no UUID generation dependency. `bin` builds the daemon and
+enables `dns`, `serde`, `toml` and iphost's serde support. Neither feature is
+enabled by default.
+
+Build and run the foreground daemon:
+
+```sh
+cargo build --release --target x86_64-unknown-linux-musl --features bin
+./target/x86_64-unknown-linux-musl/release/unquic gen-uuid
+./target/x86_64-unknown-linux-musl/release/unquic run config.toml
+```
+
+Provision the printed cookie explicitly on both ends; startup never invents or
+changes a session cookie. The [configuration model](config-model.md) documents
+the TOML fields and resolver modes. Unknown fields fail, and parse errors report
+a byte position without echoing configuration text or cookies.
+
+The daemon stays in the foreground. It reports `TAPs ready` on stderr once all
+configured TAPs exist; SIGINT or SIGTERM requests shutdown and joins transport
+workers. Administrative interface setup remains external. Double-fork readiness,
+PID files, service integration and configuration reload are still pending.
 
 ## Implementation status
 
@@ -142,8 +162,8 @@ through a VLAN upper device, exercising kernel tag materialization. Allocation
 instrumentation observes no allocations or deallocations during these forwarding
 checks. This is correctness coverage, not a throughput measurement.
 
-Aggregate receive reservations, multi-record packing, GSO/GRO, recovery, BBRv3, scheduled
-DNS refresh, the daemon and descriptor adoption remain unfinished. No throughput
+Aggregate receive reservations, multi-record packing, GSO/GRO, recovery, BBRv3,
+descriptor adoption and daemon process integration remain unfinished. No throughput
 target has been demonstrated.
 
 ## Runtime lifecycle and ownership
@@ -293,7 +313,7 @@ cargo fmt --all -- --check
 cargo test --target x86_64-unknown-linux-musl --features dns
 ```
 
-The ignored `linux_foundation`, `linux_runtime` and worker polling tests require
+The ignored `linux_foundation`, `linux_runtime`, `cli` and worker polling tests require
 a disposable container with
 `/dev/net/tun`, `CAP_SYS_ADMIN`, `CAP_NET_ADMIN` and `CAP_NET_RAW`. It creates a
 fresh network and UTS namespaces before creating interfaces or changing the
@@ -320,8 +340,15 @@ ownership test fills both handoff rings and checks buffer returns, lane returns,
 commit completion and duplicate-install packet-number preservation. Counter tests
 cover lane reuse, duplicate/expiry accounting, reservation gauges, connection
 generations and peer aggregation after shutdown.
-Bridge/OVS/VRF matrices, offloads, Linux 5.0 qualification and performance
-acceptance remain open.
+The daemon test delays DNS answers until both TAPs exist, refreshes an AAAA
+record, observes DATA sent to the new IPv6 destination, checks forwarding and
+stops both processes with SIGTERM. Build it with `--all-features`; when copying
+test executables into a container, also copy the daemon and set
+`UNQUIC_TEST_BINARY` to its container path. Otherwise the test uses Cargo's
+built daemon path.
+
+Bridge/OVS/VRF matrices, real RA/DHCPv6 resolver networks, offloads, Linux 5.0
+qualification and performance acceptance remain open.
 
 ## License
 

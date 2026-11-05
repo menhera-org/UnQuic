@@ -4,7 +4,8 @@ Endpoints, peers and sessions form two one-to-many relationships: one endpoint
 can serve many peers, and one peer can carry many sessions. Names are resolved
 to immutable numeric indices at startup. Handshake roles are elected automatically.
 
-The following daemon TOML example is illustrative:
+The foreground daemon accepts this TOML shape. Replace the cookie placeholder
+with an explicitly provisioned UUID:
 
 ```toml
 [[endpoints]]
@@ -33,8 +34,9 @@ The core configuration contains only raw IPv6 addresses and numeric scope IDs.
 The optional `dns` feature depends on exactly `iphost v0.4.4` and uses its
 hostname types and resolvers to supply IPv6 addresses. A core peer may initially
 have no address; TAP creation and readiness do not wait for resolution. Resolver
-work runs outside packet workers. The daemon's TOML parser and refresh scheduling
-are still to be implemented. Library callers use
+work runs outside packet workers. The daemon starts one helper per hostname
+after TAP readiness; literals go directly into the core without a resolver.
+Library callers use
 `Control::supply_peer_address(peer_index, ipv6, scope_id)` after readiness.
 The configured peer port is unchanged; candidate data waits for a fresh
 handshake and worker commit. Submitting an update can return WouldBlock under
@@ -53,7 +55,9 @@ or port, and incoming packets never redirect the configured transmit destination
 
 Library callers construct `config::Config` directly. Only `Daemon` has field
 defaults; `Config::default()` contains empty endpoint, peer and session lists.
-The TOML example above is a proposed daemon format, not an implemented parser.
+The daemon defaults omitted `queue_count` and `tx_lanes` to one,
+`scope_id` to zero, and `refresh_seconds` to 60. Addresses, ports, session
+cookies and `inner_mtu` remain explicit. Unknown TOML fields are rejected.
 
 | Struct | Fields and constraints |
 | --- | --- |
@@ -81,10 +85,72 @@ TAP queue index selects its worker; TX lane index modulo worker count selects
 its owner. Queue and lane counts need not match. `path_group` is validated and
 retained, but congestion grouping has no runtime effect until stage 3.
 
-The daemon's future `host` field uses iphost's `IpHost`/`FQDN` types. The
+The daemon's `host` field uses iphost's `IpHost`/`FQDN` types. The
 current `dns::resolve_ipv6` helper blocks and may allocate or lock, so call it
 outside workers. It honors the selected resolver's cache-on-error policy and
 returns None when it has no usable IPv6 selection. It does not schedule refresh,
 choose a scope ID, submit an address or alter an active connection. A caller
 retains the old destination on resolution failure and retries address submission
 when the bounded control queue returns WouldBlock.
+
+## Daemon resolver selection
+
+Each peer has an optional `resolver` table. Omitting it selects `system`.
+`refresh_seconds` belongs to the peer and accepts 1–86400 seconds. Refresh
+runs that interval after each completed lookup; lookup latency adds to it.
+Each hostname has its own helper, so a slow lookup does not block another peer.
+
+| Mode | Additional fields | Resolution |
+| --- | --- | --- |
+| `system` | None | iphost's operating-system resolver |
+| `static` | Nonempty `nameservers` array of IP socket addresses; optional `bind_device` | Direct DNS queries to those servers |
+| `ra` | `interface` | DNS servers advertised through IPv6 Router Advertisements |
+| `dhcpv6` | `interface`; optional `client_mac` | Stateless DHCPv6 DNS discovery |
+| `ipv6` | `interface`; optional `client_mac` | iphost's combined discovery, preferring available DHCPv6 servers over RA |
+
+For example, place this table after a peer's fields and before the next
+`[[peers]]` or `[[sessions]]` table:
+
+```toml
+[peers.resolver]
+mode = "static"
+nameservers = ["[2001:db8::53]:53"]
+bind_device = "vrf-ngn"
+```
+
+IPv6 discovery can use a DUID-LL derived from an explicitly supplied interface MAC:
+
+```toml
+[peers.resolver]
+mode = "ipv6"
+interface = "eth0"
+client_mac = "02:00:00:00:00:01"
+```
+
+Omitting `client_mac` sends no DHCPv6 Client Identifier. Supply the actual
+interface MAC where the network requires a matching DUID-LL. It is independent
+of each session's TAP MAC. The daemon does not read a device MAC or invent a
+client identity. Other iphost ClientId forms remain available to library callers.
+
+Static and discovery modes never fall back to the system resolver. They do not
+require resolv.conf. System mode follows the operating system's resolver policy.
+RA uses iphost's raw ICMPv6 listener when permitted, otherwise its Linux netlink
+fallback observes advertisements processed by the kernel. DHCPv6 needs access
+to UDP port 546 and may conflict with another client; namespace identification
+needs SO_NETNS_COOKIE or, on older kernels, readable /proc/thread-self/ns/net.
+Interface binding and listener creation require the corresponding kernel
+permissions. These requirements do not delay TAP creation: failed resolver
+construction retries at the configured interval.
+
+A failed or empty lookup preserves the transport's selected address. A changed
+usable IPv6 result queues a candidate; WouldBlock retries every 100 ms while
+refreshes can replace the pending selection. Unchanged results do not restart
+connections. Link-local answers need the peer's explicit numeric `scope_id`.
+The daemon never derives a transmit address from received traffic.
+
+Resolver work may allocate, lock and create discovery threads; it is outside the
+packet path and the transport storage reservation. On shutdown the daemon joins
+transport workers and exits. It does not wait for blocked DNS helper threads:
+iphost's system lookup has no cancellable time bound. The process exit closes
+their descriptors. Real RA/DHCPv6 discovery has not yet been tested by this
+project's container suite.

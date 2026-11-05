@@ -12,9 +12,19 @@ description = "experimental user-space L2 encapsulation for kernel Linux"
 [dependencies]
 iphost = { version = "=0.4.4", default-features = false, features = ["ra", "dhcpv6"], optional = true }
 libc = "0.2.191"
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"], optional = true }
+uuid = { version = "1.29.0", default-features = false, optional = true }
 
 [features]
 dns = ["dep:iphost"]
+uuid-compat = ["dep:uuid"]
+bin = ["dns", "dep:serde", "dep:toml", "iphost/serde"]
+
+[[bin]]
+name = "unquic"
+path = "src/bin/unquic.rs"
+required-features = ["bin"]
 
 [[bench]]
 name = "cookie_lookup"

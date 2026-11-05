@@ -184,9 +184,43 @@ impl fmt::Display for DuplicateCookie {
 }
 impl std::error::Error for DuplicateCookie {}
 
+#[cfg(feature = "bin")]
+impl<'de> serde::Deserialize<'de> for UnquicUuid {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "uuid-compat")]
+impl From<::uuid::Uuid> for UnquicUuid {
+    fn from(value: ::uuid::Uuid) -> Self {
+        Self::from_bytes(*value.as_bytes())
+    }
+}
+
+#[cfg(feature = "uuid-compat")]
+impl From<UnquicUuid> for ::uuid::Uuid {
+    fn from(value: UnquicUuid) -> Self {
+        Self::from_bytes(*value.as_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "uuid-compat")]
+    #[test]
+    fn uuid_conversions_preserve_every_bit() {
+        for bytes in [[0; 16], [255; 16], [0x42; 16]] {
+            let external = ::uuid::Uuid::from_bytes(bytes);
+            let own = UnquicUuid::from(external);
+            assert_eq!(own.as_bytes(), &bytes);
+            assert_eq!(::uuid::Uuid::from(own), external);
+        }
+    }
 
     #[test]
     fn canonical_text_and_redacted_diagnostics() {

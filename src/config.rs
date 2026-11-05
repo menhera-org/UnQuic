@@ -27,6 +27,9 @@ pub struct Config {
 
 /// Daemon-wide resource limits.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "bin", derive(serde::Deserialize))]
+#[cfg_attr(feature = "bin", serde(deny_unknown_fields))]
+#[cfg_attr(feature = "bin", serde(default))]
 pub struct Daemon {
     /// Total transport storage ceiling, including metadata and queues.
     pub memory_limit: usize,
@@ -41,6 +44,8 @@ impl Default for Daemon {
 
 /// A fixed-port receive endpoint; source addresses are not admission filters.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "bin", derive(serde::Deserialize))]
+#[cfg_attr(feature = "bin", serde(deny_unknown_fields))]
 pub struct Endpoint {
     /// Unique local endpoint name.
     pub name: String,
@@ -49,6 +54,7 @@ pub struct Endpoint {
     /// Fixed nonzero receive-only port.
     pub listen_port: u16,
     /// Numeric interface index for a link-local listen address; otherwise zero.
+    #[cfg_attr(feature = "bin", serde(default))]
     pub scope_id: u32,
     /// Optional interface or VRF binding.
     pub bind_device: Option<CString>,
@@ -96,6 +102,8 @@ impl Peer {
 
 /// One Ethernet session. Handshake roles are elected, never configured.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "bin", derive(serde::Deserialize))]
+#[cfg_attr(feature = "bin", serde(deny_unknown_fields))]
 pub struct Session {
     /// Unique local session name.
     pub name: String,
@@ -110,7 +118,13 @@ pub struct Session {
     /// Interface MAC, or None for deterministic hostname/name derivation.
     pub mac: Option<MacAddress>,
     /// Number of TAP queues, from 1 through 64.
+    #[cfg_attr(feature = "bin", serde(default = "one_queue"))]
     pub queue_count: usize,
+}
+
+#[cfg(feature = "bin")]
+const fn one_queue() -> usize {
+    1
 }
 
 impl Session {

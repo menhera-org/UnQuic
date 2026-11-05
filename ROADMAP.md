@@ -74,7 +74,7 @@ The target layout. Create files when their step arrives, not before.
 | `src/bbr.rs` | BBRv3 (draft 07) | 3 |
 | `src/pacing.rs` | Grants, pacing deadlines | 3 |
 
-## Stage 1: socket and device foundation (in progress)
+## Stage 1: socket and device foundation — complete
 
 Goal: two daemons on one host forward Ethernet frames between two TAPs over
 UDP, with the real handshake, the real wire format and worker ownership, but
@@ -253,7 +253,17 @@ routing (v1)".
 Done when the container test passes and no worker ever blocks on another
 worker's queue.
 
-### 1f Daemon (`src/bin/unquic.rs`, feature `bin`)
+### 1f Daemon (`src/bin/unquic.rs`, feature `bin`) — complete
+
+Implemented feature-gated foreground run and UUID provisioning, TOML validation,
+lossless uuid-compat conversions, and per-peer iphost resolver selection. Hostname
+helpers start after TAP readiness and refresh candidates outside workers.
+Parser tests use the documented examples and check rejection and redacted errors.
+The isolated daemon test delays DNS until both TAPs exist, observes DATA sent to
+a refreshed IPv6 address, checks forwarding and SIGTERM cleanup. Default,
+all-feature and uuid-compat tests, Clippy, Rust 1.89 and aarch64 checks pass.
+RA/DHCPv6 operation on real resolver networks remains unverified.
+
 
 - Extend the existing `dns` feature with `uuid-compat` and `bin` as the
   README lists, with `bin` enabling `dns`, and `[[bin]]` gated on `bin`.
