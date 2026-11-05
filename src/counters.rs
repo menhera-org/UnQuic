@@ -52,6 +52,8 @@ pub enum PathMtuState {
     Confirmed = 3,
     /// The path cannot support the baseline.
     Failed = 4,
+    /// A larger ceiling was asserted by configuration, without path confirmation.
+    Configured = 5,
 }
 
 macro_rules! metrics {
@@ -126,7 +128,7 @@ metrics! {
     pacing_bytes_per_second: sum,
     /// Currently charged outer IP bytes in flight.
     bytes_in_flight: sum,
-    /// Current outer IP MTU in bytes, zero before lane initialization.
+    /// Current outer IP size ceiling; consult path_mtu_state for its basis.
     path_mtu_bytes: min_nonzero,
     /// Numeric PathMtuState value.
     path_mtu_state: mtu_state,
@@ -158,11 +160,12 @@ fn min_nonzero(a: u64, b: u64) -> u64 {
     }
 }
 fn mtu_state(a: u64, b: u64) -> u64 {
-    // Aggregate precedence: failed, probing, baseline, confirmed, unknown.
+    // Aggregate precedence: failed, probing, baseline, configured, confirmed, unknown.
     let rank = |state| match state {
-        4 => 4,
-        2 => 3,
-        1 => 2,
+        4 => 5,
+        2 => 4,
+        1 => 3,
+        5 => 2,
         3 => 1,
         _ => 0,
     };
@@ -238,6 +241,16 @@ mod tests {
             path_mtu_bytes: 1500,
             ..Snapshot::default()
         };
+        total.merge(Snapshot {
+            path_mtu_state: PathMtuState::Configured as u64,
+            ..Snapshot::default()
+        });
+        assert_eq!(total.path_mtu_state, 5);
+        total.merge(Snapshot {
+            path_mtu_state: PathMtuState::Confirmed as u64,
+            ..Snapshot::default()
+        });
+        assert_eq!(total.path_mtu_state, 5);
         total.merge(Snapshot {
             tx_outer_bytes: 1,
             rtt_ns: 20,

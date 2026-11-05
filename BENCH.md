@@ -1,10 +1,10 @@
 # Release transport overload investigation
 
 The original throughput collapse is reproduced and its receive-admission
-failure is fixed. A later TAP readiness busy loop is now fixed too. The latest
-20-second MTU-1500 and 64-byte repeats deliver at least as much under unlimited
-load as at preceding paced saturation points. Broader plateau validation
-remains open. Neither the local **20 Gbit/s in each direction** gate nor the
+failure is fixed. A later TAP readiness busy loop is now fixed too. Subsequent
+20-second MTU-1500 sweeps still show smaller rate-dependent declines: up to
+8.3% when increasing paced load and 2.2% from paced to unlimited load.
+The strict plateau requirement remains unmet. Neither the local **20 Gbit/s in each direction** gate nor the
 real **5 Gbit/s under loss** gate has passed.
 
 This report separates that remaining decline from the earlier near-total
@@ -13,22 +13,23 @@ their absence does not explain away a scheduling or admission failure.
 
 ## Current performance gaps
 
-Status after the TAP readiness fix. The latest MTU-1500 and 64-byte results
-use the 20-CPU single-socket profile and capped socket-buffer fallback below.
+Status after the TAP readiness fix and per-peer payload-limit comparison.
+The latest results use the 20-CPU single-socket profile and capped
+socket-buffer fallback below.
 L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Repeated 16-flow unlimited points deliver 3.67–3.77 / 4.98–5.07 Gbit/s of inner UDP payload | Roughly 5.3× / 3.9× more delivered goodput is needed even relative to the better unlimited point. The gate is not close to passing. |
-| Goodput must plateau under excess traffic | The latest MTU-1500 and 64-byte repeats have no paced-to-unlimited decline | The verified readiness busy loop is fixed. Longer runs, more frame mixes and broader flow/session coverage remain unverified. Removing the earlier admission cascade does not satisfy the plateau requirement. |
+| At least 20 Gbit/s each way at inner MTU 1500 | At 1452-byte outer payload, repeated 16-flow unlimited points deliver 3.83–3.87 / 4.95–5.03 Gbit/s of inner UDP payload | Roughly 5.2× / 4.0× more delivered goodput is needed even relative to the better unlimited point. The gate is not close to passing. |
+| Goodput must plateau under excess traffic | The latest payload-limit sweep has up to 8.3% decline between paced rates and 2.2% from paced to unlimited; the preceding 64-byte repeats had none | The verified readiness busy loop is fixed. Rate-dependent declines persist and need further profiling. Longer runs, more frame mixes and broader flow/session coverage remain unverified. Removing the earlier admission cascade does not satisfy the plateau requirement. |
 | Small-frame overload must remain efficient | With 64-byte frames and 16 flows, unlimited delivery is 483–486k / 523–537k frames/s, above preceding paced points | Repeated 20-second comparisons pass; the complete small-frame acceptance profile remains unfinished. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
-| Use larger confirmed path MTUs | The runtime still sends at the 1232-byte UDP baseline | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. No performance gain from larger outer packets has been demonstrated. |
+| Use larger confirmed path MTUs | The runtime accepts a per-peer 1232–1452-byte payload assertion; a controlled 1452-byte sweep shows only a modest change | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. Configured capacity is not confirmed PMTU. |
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
 
-Loss under unlimited load is still high: the recorded MTU-1500 16-flow point
-misses about 71% / 60% of offered frames despite zero admission-pressure
+Loss under unlimited load is still high: the latest 1452-byte MTU-1500 points
+miss about 69% / 59–60% of offered frames despite zero admission-pressure
 rejections and zero worker queue drops. TAP ingress drops and outer socket
 overflows account for visible loss locations; their different units prevent
 an exact frame-loss decomposition. Inner UDP receive-buffer errors are recorded
@@ -435,7 +436,7 @@ A3 is implemented with exact deadlines; A4's counter publication and A8's
 queue setup are implemented. A9's contiguous copy is implemented; the two
 record-cache prototypes were slower and were discarded. C4's gate is specified
 above. A1 needs a decision on flow pinning or stable steering. A2 now has ordered group creation, kernel steering and lifecycle tests. The remaining A4 scheduling
-changes, A5–A7, the B0 cost probes, B1–B3 and the C1–C3 generator/CPU work
+changes, A6–A7, the B0 cost probes, B1–B3 and the C1–C3 generator/CPU work
 remain unfinished. B4 remains deferred as requested.
 
 ## Audit follow-up: receive steering
@@ -538,3 +539,75 @@ The JSON also retains an earlier four-point, 15-second after-fix sweep whose
 first point overlapped a Clippy check; its annotation excludes it from this
 comparison. The clean repeats support the readiness fix. They do not establish
 the theoretical CPU ceiling, the five-run acceptance gate, or loss recovery.
+
+## Configured outer payload comparison (audit A5)
+
+Each peer now accepts `outer_payload_limit = 1232..1452`, default 1232,
+through configuration, packing and both send APIs. A larger value asserts
+underlay capacity for every destination path; it is not discovered PMTU.
+Counters distinguish configured state (5) from baseline (1) and confirmed
+(3). Fragmentation stays disabled, and EMSGSIZE still drops the unsent batch
+and counts a socket error.
+
+Config tests reject 1231 and 1453 and cover omitted/default and explicit limits.
+Existing pack round trips cover both endpoints of the range. The container
+runtime test mixes baseline and 1452-byte peers, forwards split 1514-byte
+frames and checks session/lane MTU states. The release suite, eight worker
+kernel tests, 42-second runtime/reconnect test, Clippy and Rust 1.89 check pass.
+
+The same normal release binary ran both sweeps below: `b5d233e` plus A5,
+SHA-256
+`3b12cdd5c92c71ffc7bc2e3e686afc7b98ae728f2f97d2635aeca7e47331bb02`.
+Each point lasts 20 seconds with 16 flows per direction, inner MTU 1500,
+the single-socket 20-CPU profile and the same queue settings. The only
+configuration difference is `OUTER_PAYLOAD_LIMIT=1232` or `1452` in
+`benches/tap_transport.sh`. No builds or tests ran concurrently. Both
+sweeps retain their daemons between rates. The baseline sweep precedes
+the 1452 sweep, so this is not a randomized estimate of a small speedup.
+
+Goodput and missing fractions are L→R / R→L; CPU and socket overflow are
+left / right. CPU 100% denotes one occupied core.
+
+| UDP ceiling | Requested/flow | Delivered Gbit/s | Missing % | Daemon CPU % | Socket overflow SKBs |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1232 | 125M | 1.995 / 1.987 | 0.25 / 0.67 | 317.2 / 327.0 | 10,973 / 2,183 |
+| 1232 | 250M | 3.415 / 3.946 | 14.63 / 1.34 | 360.1 / 355.8 | 19,727 / 96,840 |
+| 1232 | 500M | 3.132 / 4.921 | 60.71 / 37.84 | 369.8 / 363.6 | 89,748 / 71,731 |
+| 1232 | unlimited | 3.611 / 4.954 | 71.74 / 59.74 | 350.9 / 339.1 | 66,691 / 46,122 |
+| 1232 | 500M | 3.254 / 5.060 | 59.33 / 36.57 | 375.5 / 372.7 | 51,392 / 111,501 |
+| 1232 | unlimited | 3.853 / 4.952 | 69.70 / 61.02 | 352.7 / 341.2 | 58,416 / 58,017 |
+| 1452 | 125M | 1.996 / 1.994 | 0.19 / 0.32 | 322.1 / 332.0 | 5,255 / 1,815 |
+| 1452 | 250M | 3.469 / 3.951 | 13.27 / 1.21 | 361.6 / 360.0 | 18,048 / 95,299 |
+| 1452 | 500M | 3.321 / 5.055 | 58.35 / 36.81 | 372.9 / 365.1 | 64,692 / 144,685 |
+| 1452 | unlimited | 3.867 / 4.955 | 69.26 / 59.84 | 348.0 / 339.9 | 84,764 / 114,525 |
+| 1452 | 500M | 3.294 / 5.026 | 58.66 / 37.17 | 365.5 / 367.2 | 62,819 / 133,579 |
+| 1452 | unlimited | 3.829 / 5.031 | 69.58 / 59.34 | 350.8 / 342.3 | 77,427 / 122,061 |
+
+Admission-pressure rejections, worker queue drops and socket errors are zero
+throughout. Baseline expiry counts are 0 / 0, 0 / 0, 22 / 4, 2 / 0,
+0 / 6 and 55 / 2; at 1452, only the second 500M point expires frames
+(0 / 2). All outer fragmentation and reassembly counters remain zero.
+Socket overflow counts aggregates, so their increase at 1452 cannot be
+converted directly into lost inner frames.
+
+| Ceiling, unlimited repeat | Actual offered Gbit/s, L→R / R→L | Generator CPU %, left / right | TAP ingress drops, left / right | Inner UDP buffer errors, left / right |
+| --- | ---: | ---: | ---: | ---: |
+| 1232, run 1 | 12.82 / 12.35 | 519.1 / 493.1 | 13,891,994 / 10,804,041 | 14,608 / 3,298 |
+| 1232, run 2 | 12.75 / 12.75 | 517.1 / 495.8 | 12,908,766 / 11,608,035 | 36,889 / 15,180 |
+| 1452, run 1 | 12.71 / 12.38 | 517.5 / 497.1 | 13,205,861 / 11,289,819 | 14,554 / 11,949 |
+| 1452, run 2 | 12.64 / 12.42 | 518.1 / 496.5 | 13,065,089 / 11,343,942 | 8,662 / 8,173 |
+
+The 1452-byte unlimited repeats average 3.85 / 4.99 Gbit/s, versus
+3.73 / 4.95 at 1232: about 3.1% / 0.8% higher. Individual comparisons vary;
+this is not evidence that a larger ceiling solves the throughput gap.
+TAP ingress drops and outer socket overflows still dominate visible loss
+locations. Their different units and sampling boundaries prevent an exact
+loss decomposition. Raw records include receiver loss, process/per-core CPU,
+transport counters and kernel counters in the overload JSON.
+
+The strict plateau condition also remains unmet. At 1232, increasing the
+paced rate from 250M to 500M per flow reduces L→R delivery by 8.3%;
+the corresponding 1452 decrease is 4.3%. One baseline paced-to-unlimited
+repeat falls 2.2% in reverse, and one 1452 repeat falls 2.0%.
+Neither missing recovery nor absent congestion control is sufficient
+attribution. Continue profiling and the remaining pool/scheduling work.

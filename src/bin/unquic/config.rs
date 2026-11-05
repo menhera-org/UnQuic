@@ -37,6 +37,8 @@ struct FilePeer {
     scope_id: u32,
     #[serde(default = "one")]
     tx_lanes: usize,
+    #[serde(default = "outer_payload_limit")]
+    outer_payload_limit: usize,
     path_group: Option<String>,
     #[serde(default)]
     resolver: ResolverConfig,
@@ -46,6 +48,9 @@ struct FilePeer {
 
 const fn one() -> usize {
     1
+}
+const fn outer_payload_limit() -> usize {
+    unquic::BASE_UDP_PAYLOAD
 }
 const fn refresh() -> u64 {
     60
@@ -200,6 +205,7 @@ impl Loaded {
                 peer_port: peer.peer_port,
                 scope_id: peer.scope_id,
                 tx_lanes: peer.tx_lanes,
+                outer_payload_limit: peer.outer_payload_limit,
                 path_group: peer.path_group,
             });
         }
@@ -254,6 +260,7 @@ mod tests {
             ));
             assert_eq!(loaded.lookups[0].refresh, Duration::from_secs(60));
             assert_eq!(loaded.config.peers[0].address, None);
+            assert_eq!(loaded.config.peers[0].outer_payload_limit, 1232);
             assert_eq!(loaded.config.sessions[0].queue_count, 1);
             assert_eq!(loaded.config.daemon.memory_limit, 256 * 1024 * 1024);
             loaded.config.validate().unwrap();
@@ -266,6 +273,18 @@ mod tests {
             Some("2001:db8::1".parse().unwrap())
         );
         loaded.config.validate().unwrap();
+    }
+
+    #[test]
+    fn configured_outer_limit_reaches_the_core() {
+        for limit in [1232, 1300, 1452] {
+            let text = sample().replace(
+                "tx_lanes = 4",
+                &format!("tx_lanes = 4\nouter_payload_limit = {limit}"),
+            );
+            let config = Loaded::parse(&text).unwrap().config.validate().unwrap();
+            assert_eq!(config.config().peers[0].outer_payload_limit, limit);
+        }
     }
 
     #[test]
@@ -322,6 +341,16 @@ mod tests {
             ("test.example.invalid", "::", "peers.address"),
             ("test.example.invalid", "fe80::1", "peers.address"),
             ("test.example.invalid", "::ffff:192.0.2.1", "peers.address"),
+            (
+                "tx_lanes = 4",
+                "tx_lanes = 4\nouter_payload_limit = 1231",
+                "peers.outer_payload_limit",
+            ),
+            (
+                "tx_lanes = 4",
+                "tx_lanes = 4\nouter_payload_limit = 1453",
+                "peers.outer_payload_limit",
+            ),
             ("tx_lanes = 4", "tx_lanes = 0", "peers.tx_lanes"),
             ("tx_lanes = 4", "tx_lanes = 65", "peers.tx_lanes"),
             (

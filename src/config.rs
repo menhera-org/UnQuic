@@ -86,6 +86,8 @@ pub struct Peer {
     pub scope_id: u32,
     /// Number of local transmit lanes, from 1 through 64.
     pub tx_lanes: usize,
+    /// Asserted outer UDP payload ceiling, 1232..=1452 bytes; no PMTU discovery.
+    pub outer_payload_limit: usize,
     /// Explicit congestion group, or None to share the endpoint's binding scope.
     pub path_group: Option<String>,
 }
@@ -270,6 +272,15 @@ impl Config {
                     "peers.tx_lanes",
                     index,
                     "must be from 1 through 64",
+                ));
+            }
+            if !(crate::BASE_UDP_PAYLOAD..=crate::socket::MAX_UDP_PAYLOAD)
+                .contains(&peer.outer_payload_limit)
+            {
+                return Err(invalid(
+                    "peers.outer_payload_limit",
+                    index,
+                    "must be from 1232 through 1452",
                 ));
             }
             if peer

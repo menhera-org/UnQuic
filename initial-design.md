@@ -521,7 +521,10 @@ records the release throughput/CPU baseline; overload loss is severe and the
 throughput gate has not passed. Receive-side ACK scheduling/range construction
 is implemented over the existing bitmap; sender-history validation and runtime
 ACK routing are not yet connected. Recovery and congestion control remain unfinished. Current liveness
-probes do not discover MTU: the UDP limit remains 1232 bytes until stage 3.
+probes do not discover MTU. The UDP limit defaults to 1232 bytes; an interim
+per-peer `outer_payload_limit` accepts 1232–1452 as an operator assertion for
+all destination paths. Larger configured limits report configured state, not
+confirmed PMTU. Stage 3 must replace this assertion with per-lane discovery.
 The foreground daemon now parses the documented TOML, provisions cookies through
 gen-uuid, refreshes hostnames through per-peer iphost helpers after readiness,
 and joins transport workers on SIGINT/SIGTERM. Tests cover delayed DNS, address

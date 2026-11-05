@@ -65,6 +65,7 @@ fn config(name: &str, port: u16, remote: u16) -> Config {
             peer_port: remote,
             scope_id: 0,
             tx_lanes: 4,
+            outer_payload_limit: unquic::BASE_UDP_PAYLOAD,
             path_group: None,
         }],
         sessions: vec![Session {
@@ -88,6 +89,7 @@ fn config(name: &str, port: u16, remote: u16) -> Config {
     let mut peer2 = config.peers[0].clone();
     peer2.name = "peer2".into();
     peer2.tx_lanes = 2;
+    peer2.outer_payload_limit = 1452;
     config.peers.push(peer2);
     config.sessions.extend([second, third]);
     config
@@ -371,7 +373,7 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
     for (left_name, right_name) in [(c"uq-left-b", c"uq-right-b"), (c"uq-left-c", c"uq-right-c")] {
         let source = raw_socket(left_name, 0x88b5);
         let target = raw_socket(right_name, 0x88b5);
-        let mut frame = [0x5a; 60];
+        let mut frame = [0x5a; 1514];
         frame[12..14].copy_from_slice(&0x88b5_u16.to_be_bytes());
         raw_send(&source, &frame);
         until(Duration::from_secs(2), || {
@@ -398,7 +400,10 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
             let totals = control.session_counters(session).unwrap();
             assert!(totals.tx_outer_bytes > 60);
             assert!(totals.rx_outer_bytes > 60);
-            assert_eq!(totals.path_mtu_bytes, 1280);
+            let mtu = if session == 2 { 1500 } else { 1280 };
+            let state = if session == 2 { 5 } else { 1 };
+            assert_eq!(totals.path_mtu_bytes, mtu);
+            assert_eq!(totals.path_mtu_state, state);
             let lanes = if session == 2 { 2 } else { 4 };
             assert!((1..=lanes).any(|lane| {
                 control
@@ -411,7 +416,8 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
                     snapshot.generation,
                     control.session(session).unwrap().generation
                 );
-                assert_eq!(snapshot.counters.path_mtu_bytes, 1280);
+                assert_eq!(snapshot.counters.path_mtu_bytes, mtu);
+                assert_eq!(snapshot.counters.path_mtu_state, state);
             }
         }
         assert!(control.session_counters(3).is_none());

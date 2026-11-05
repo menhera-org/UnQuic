@@ -436,7 +436,7 @@ impl TxBatch {
         }
     }
 
-    fn prepare(&mut self, lane: &mut pack::Lane) -> Result<(), pack::PackError> {
+    fn prepare(&mut self, lane: &mut pack::Lane, limit: usize) -> Result<(), pack::PackError> {
         let mut inputs = [pack::FrameInput {
             id: 0,
             bytes: &[],
@@ -450,8 +450,7 @@ impl TxBatch {
                 offset: frame.offset,
             };
         }
-        self.plan
-            .prepare(lane, &inputs[..self.len], BASE_UDP_PAYLOAD)
+        self.plan.prepare(lane, &inputs[..self.len], limit)
     }
 
     fn compact(&mut self) {
@@ -1926,6 +1925,7 @@ impl Worker {
             return Ok(());
         }
         let peer = self.shared.config.peer_for_session(session).unwrap();
+        let limit = self.shared.config.config().peers[peer].outer_payload_limit;
         let path = self.sessions[session].path;
         let tx = &self.transmit[peer].paths[path].lanes[lane];
         if tx.socket.is_none() {
@@ -1937,7 +1937,7 @@ impl Worker {
         }
         if batch.plan.is_empty()
             && batch
-                .prepare(self.sessions[session].tx[lane].as_mut().unwrap())
+                .prepare(self.sessions[session].tx[lane].as_mut().unwrap(), limit)
                 .is_err()
         {
             self.clear_batch(batch);
@@ -1972,7 +1972,7 @@ impl Worker {
                 .socket
                 .as_ref()
                 .unwrap()
-                .send_batch(&packets[..count], BASE_UDP_PAYLOAD)
+                .send_batch(&packets[..count], limit)
         };
         match result {
             Ok(sent) => self.submitted_batch(session, lane, batch, sent),
@@ -2167,7 +2167,9 @@ impl Worker {
         let Some(socket) = &self.transmit[peer].paths[path].lanes[0].socket else {
             return Ok(None);
         };
-        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        let limit = self.shared.config.config().peers[peer].outer_payload_limit;
+        let mut storage = [0; crate::socket::MAX_UDP_PAYLOAD];
+        let bytes = &mut storage[..limit];
         let packet = if record.is_handshake() {
             let header = Header {
                 cookie: self.shared.config.config().sessions[session].cookie,
@@ -2176,18 +2178,18 @@ impl Worker {
                 record_area_len: 0,
                 packet_number: 0,
             };
-            wire::encode_datagram(header, &[record], &mut bytes)
+            wire::encode_datagram(header, &[record], bytes)
                 .ok()
                 .map(|length| pack::Packet { number: 0, length })
         } else {
             self.sessions[session].tx[0]
                 .as_mut()
-                .and_then(|lane| lane.record(record, &mut bytes).ok())
+                .and_then(|lane| lane.record(record, bytes).ok())
         };
         let Some(packet) = packet else {
             return Ok(None);
         };
-        match socket.send(&bytes[..packet.length], BASE_UDP_PAYLOAD) {
+        match socket.send(&bytes[..packet.length], limit) {
             Ok(()) => {
                 self.counters.tx_outer_bytes = self
                     .counters
@@ -2282,7 +2284,20 @@ impl Worker {
                 local.rx_index.fill(0);
                 local.connection = command.connection;
                 local.path = path;
-                let cookie = self.shared.config.config().sessions[session].cookie;
+                let config = self.shared.config.config();
+                let cookie = config.sessions[session].cookie;
+                let peer = self.shared.config.peer_for_session(session).unwrap();
+                let limit = config.peers[peer].outer_payload_limit;
+                let (mtu, mtu_state) = if command.connection.is_none() {
+                    (0, 0)
+                } else {
+                    let state = if limit == BASE_UDP_PAYLOAD {
+                        crate::counters::PathMtuState::Baseline
+                    } else {
+                        crate::counters::PathMtuState::Configured
+                    };
+                    ((limit + 48) as u64, state as u64)
+                };
                 for (index, lane) in local.tx.iter_mut().enumerate() {
                     *lane = command
                         .connection
@@ -2290,8 +2305,8 @@ impl Worker {
                         .map(|c| pack::Lane::new(cookie, c, index as u16 + 1).unwrap());
                     if index % self.shared.workers() == self.id {
                         local.tx_totals[index] = Snapshot {
-                            path_mtu_bytes: if lane.is_some() { 1280 } else { 0 },
-                            path_mtu_state: u64::from(lane.is_some()),
+                            path_mtu_bytes: mtu,
+                            path_mtu_state: mtu_state,
                             ..Snapshot::default()
                         };
                         self.shared.transmit_counters[session][index].replace(
@@ -2302,12 +2317,8 @@ impl Worker {
                     }
                 }
                 local.tx_dirty = 0;
-                local.totals.path_mtu_bytes = if command.connection.is_some() {
-                    1280
-                } else {
-                    0
-                };
-                local.totals.path_mtu_state = u64::from(command.connection.is_some());
+                local.totals.path_mtu_bytes = mtu;
+                local.totals.path_mtu_state = mtu_state;
                 local.installed = Some(command);
                 local.acknowledged = Some(command);
             }
@@ -3052,7 +3063,10 @@ mod tests {
         assert_eq!(workers[0].ready.len(), 1);
         let mut batch = workers[0].sessions[0].batches[0].take().unwrap();
         batch
-            .prepare(workers[0].sessions[0].tx[0].as_mut().unwrap())
+            .prepare(
+                workers[0].sessions[0].tx[0].as_mut().unwrap(),
+                BASE_UDP_PAYLOAD,
+            )
             .unwrap();
         assert!(batch.plan.len() > 1);
         let mut last_packet = batch.plan.packet(batch.plan.len() - 1).unwrap().number;
@@ -3131,7 +3145,10 @@ mod tests {
         workers[0].flush_frames(Duration::ZERO).unwrap();
         let mut batch = workers[0].sessions[0].batches[0].take().unwrap();
         batch
-            .prepare(workers[0].sessions[0].tx[0].as_mut().unwrap())
+            .prepare(
+                workers[0].sessions[0].tx[0].as_mut().unwrap(),
+                BASE_UDP_PAYLOAD,
+            )
             .unwrap();
         let tail = batch.plan.packet(2).unwrap();
         workers[0].submitted_batch(0, 0, &mut batch, 2);
@@ -3190,7 +3207,7 @@ mod tests {
             local.batches[0]
                 .as_mut()
                 .unwrap()
-                .prepare(local.tx[0].as_mut().unwrap())
+                .prepare(local.tx[0].as_mut().unwrap(), BASE_UDP_PAYLOAD)
                 .unwrap();
             workers[0].command(
                 session,
@@ -3246,6 +3263,7 @@ mod tests {
                 peer_port: 40001,
                 scope_id: 0,
                 tx_lanes: 2,
+                outer_payload_limit: BASE_UDP_PAYLOAD,
                 path_group: None,
             }],
             sessions: vec![ConfigSession {

@@ -9,6 +9,8 @@ for number in "$3" "$4"; do
     case "$number" in ''|*[!0-9]*) exit 2;; esac
     [ "$number" -ge 1 ] && [ "$number" -le 60 ] || exit 2
 done
+case "${OUTER_PAYLOAD_LIMIT:-1232}" in ''|*[!0-9]*) exit 2;; esac
+[ "${OUTER_PAYLOAD_LIMIT:-1232}" -ge 1232 ] && [ "${OUTER_PAYLOAD_LIMIT:-1232}" -le 1452 ] || exit 2
 mkdir "$5"
 # A private mount namespace keeps ip-netns bind mounts out of the caller.
 exec unshare -m -n --propagation private sh -s -- "$@" <<'BENCH'
@@ -55,6 +57,7 @@ endpoint = "rx"
 host = "::1"
 peer_port = $remote
 tx_lanes = 4
+outer_payload_limit = ${OUTER_PAYLOAD_LIMIT:-1232}
 [[sessions]]
 name = "uq-$side"
 peer = "peer"

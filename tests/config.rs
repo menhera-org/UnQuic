@@ -22,6 +22,7 @@ fn config() -> Config {
                 peer_port: 40001 + i,
                 scope_id: 0,
                 tx_lanes: 4,
+                outer_payload_limit: unquic::BASE_UDP_PAYLOAD,
                 path_group: None,
             })
             .collect(),
@@ -188,4 +189,21 @@ fn unresolved_peers_and_configuration_boundaries_are_allowed() {
     let validated = c.validate().unwrap();
     assert_eq!(validated.config().peers[0].address, None);
     assert!(Config::default().validate().is_ok());
+}
+
+#[test]
+fn outer_payload_limits_are_bounded_per_peer() {
+    for limit in [1232, 1300, 1452] {
+        let mut c = config();
+        c.peers[1].outer_payload_limit = limit;
+        let valid = c.validate().unwrap();
+        assert_eq!(valid.config().peers[0].outer_payload_limit, 1232);
+        assert_eq!(valid.config().peers[1].outer_payload_limit, limit);
+    }
+    for limit in [0, 1231, 1453, usize::MAX] {
+        let mut c = config();
+        c.peers[1].outer_payload_limit = limit;
+        let error = c.validate().err().unwrap();
+        assert_eq!(error.field, "peers.outer_payload_limit");
+    }
 }

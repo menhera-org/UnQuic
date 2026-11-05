@@ -56,14 +56,14 @@ or port, and incoming packets never redirect the configured transmit destination
 Library callers construct `config::Config` directly. Only `Daemon` has field
 defaults; `Config::default()` contains empty endpoint, peer and session lists.
 The daemon defaults omitted `queue_count` and `tx_lanes` to one,
-`scope_id` to zero, and `refresh_seconds` to 60. Addresses, ports, session
+`scope_id` to zero, `outer_payload_limit` to 1232, and `refresh_seconds` to 60. Addresses, ports, session
 cookies and `inner_mtu` remain explicit. Unknown TOML fields are rejected.
 
 | Struct | Fields and constraints |
 | --- | --- |
 | `Daemon` | `memory_limit`: nonzero bytes, default 256 MiB |
 | `Endpoint` | Unique nonempty `name`; IPv6 `listen_address` (unspecified allowed); nonzero `listen_port`; numeric `scope_id`; optional interface/VRF `bind_device` |
-| `Peer` | Unique nonempty `name`; existing `endpoint` name; optional unicast IPv6 `address`; nonzero `peer_port`; numeric `scope_id`; `tx_lanes` 1–64; optional nonempty `path_group` |
+| `Peer` | Unique nonempty `name`; existing `endpoint` name; optional unicast IPv6 `address`; nonzero `peer_port`; numeric `scope_id`; `tx_lanes` 1–64; `outer_payload_limit` 1232–1452; optional nonempty `path_group` |
 | `Session` | Unique nonempty `name`; existing `peer` name; unique `UnquicUuid` cookie; optional `tap_name`; `inner_mtu` 1500–9000; optional checked `MacAddress`; `queue_count` 1–64 |
 
 Names cannot contain NUL. Effective TAP names must be unique, fit in 15 bytes,
@@ -92,6 +92,17 @@ returns None when it has no usable IPv6 selection. It does not schedule refresh,
 choose a scope ID, submit an address or alter an active connection. A caller
 retains the old destination on resolution failure and retries address submission
 when the bounded control queue returns WouldBlock.
+
+A peer's `outer_payload_limit` caps UDP payload bytes on all its transmit
+lanes and sessions. The default 1232 fits the IPv6 minimum MTU. A larger value
+asserts that every path to that peer, including future DNS candidates, supports
+that payload plus 48 bytes of IPv6/UDP headers. For example, 1452 requires a
+1500-byte outer path without extension headers. This is an operator assertion;
+the runtime does not discover or confirm PMTU. Sockets forbid fragmentation.
+An EMSGSIZE send failure drops the affected batch's unsent frames and counts a
+socket error; it does not lower the configured ceiling. Prefer the default
+unless the path capacity is known. Stage 3 replaces this interim assertion
+with per-lane discovery.
 
 ## Daemon resolver selection
 

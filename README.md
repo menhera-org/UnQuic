@@ -59,7 +59,8 @@ features. Its direct, RA and DHCPv6 resolver modes are available.
 Receive sockets use fixed nonzero ports and expose no send method. Transmit
 sockets inherit their receiver's binding scope, use stable dynamic ports, and
 disable IPv6 fragmentation. Send APIs take a lane payload limit from 1232 through
-1452 bytes; the runtime still supplies the unprobed 1232-byte baseline. Batched
+1452 bytes; each peer defaults to 1232 and can assert a larger ceiling with
+`outer_payload_limit`. Batched
 sends handle up to 64 logical datagrams per syscall. Sends can
 gather a wire prefix and original frame slice without copying the piece into an
 intermediate packet buffer. Partial sends return the successful prefix; each
@@ -433,19 +434,22 @@ session, peer and lane totals together.
 
 Counts and occupancy gauges sum across owners. RTT and feedback delay use the
 maximum; path MTU uses the smallest nonzero value. Aggregate MTU state prefers
-failed, probing, baseline, confirmed, then unknown. The current active TX lanes
-report outer MTU 1280 and baseline state. RTT, feedback delay, repairs, pacing
+failed, probing, baseline, configured, confirmed, then unknown. Active TX lanes
+report the configured payload ceiling plus 48 bytes: baseline state (1) at
+1280, configured state (5) above it. Configured does not mean path-confirmed. RTT, feedback delay, repairs, pacing
 and bytes-in-flight remain zero until recovery and congestion control are
 implemented. Cumulative counts wrap modulo 2^64.
 
 ## Path MTU status
 
-Path MTU discovery is not implemented. Every runtime send uses a 1232-byte UDP
-payload limit. Transmit sockets set `IPV6_DONTFRAG` and `IPV6_PMTUDISC_DO`;
+Path MTU discovery is not implemented. The per-peer `outer_payload_limit`
+defaults to 1232 UDP payload bytes and accepts values through 1452. Raising it
+asserts that every current and future path to that peer supports the larger
+outer packets; the runtime does not confirm that assertion. Transmit sockets set `IPV6_DONTFRAG` and `IPV6_PMTUDISC_DO`;
 GSO segments remain subject to that limit. Inner TAP MTU stays configured, and
 the transport splits Ethernet frames into DATA pieces.
 
-| Size, without outer extension headers | Current baseline | Confirmed 1500-byte path |
+| Size, without outer extension headers | Default baseline | Asserted 1500-byte path |
 | --- | ---: | ---: |
 | Outer IPv6 packet | 1280 bytes | 1500 bytes |
 | UDP payload | 1232 bytes | 1452 bytes |
@@ -456,8 +460,8 @@ At the baseline, a 1514-byte Ethernet frame becomes pieces of 1164 and 350
 bytes; a 9022-byte frame needs eight datagrams. These are transport pieces,
 not outer IPv6 fragments.
 
-The socket API accepts a caller-supplied limit through 1452 bytes, but does not
-verify that the path supports it. The runtime has no `IPV6_RECVERR` error-queue processing
+Both the runtime and socket API enforce the supplied limit. The runtime has
+no `IPV6_RECVERR` error-queue processing
 or Packet Too Big validation. If ordinary sending returns EMSGSIZE after any
 GSO fallback, it counts a socket error and drops the affected batch's unsent
 frames.

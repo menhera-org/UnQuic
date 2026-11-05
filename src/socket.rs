@@ -348,7 +348,7 @@ impl TransmitSocket {
     /// Sends one complete UDP payload within a caller-supplied lane limit.
     ///
     /// Limits must be 1232 through 1452 bytes; callers start at 1232 and raise
-    /// them only after path confirmation (or for a deliberate padded probe).
+    /// them after path confirmation, an explicit operator assertion, or for a probe.
     ///
     /// Returns kernel errors, including `WouldBlock` and `EMSGSIZE`, unchanged.
     /// A successful return means socket submission, not remote acceptance.
