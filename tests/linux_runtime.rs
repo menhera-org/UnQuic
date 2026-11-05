@@ -128,6 +128,142 @@ fn until(timeout: Duration, mut predicate: impl FnMut() -> bool) {
     }
 }
 
+fn storm_frame(bytes: &mut [u8; 1514], direction: usize, sequence: usize) -> usize {
+    let length = [60, 64, 128, 1514][sequence % 4];
+    for (index, byte) in bytes[..length].iter_mut().enumerate() {
+        *byte = (sequence ^ (sequence >> 8) ^ index) as u8;
+    }
+    bytes[..12].copy_from_slice(&[2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0]);
+    bytes[11] = ((sequence / 32) % 16) as u8;
+    bytes[12..14].copy_from_slice(&0x88b5_u16.to_be_bytes());
+    bytes[14..18].copy_from_slice(b"UQST");
+    bytes[18] = direction as u8;
+    bytes[19..27].copy_from_slice(&(sequence as u64).to_be_bytes());
+    length
+}
+
+fn frame_storm() {
+    let sockets = [
+        raw_socket(c"uq-left", 0x88b5),
+        raw_socket(c"uq-right", 0x88b5),
+    ];
+    let monitor = raw_socket(c"lo", libc::ETH_P_IPV6 as u16);
+    for socket in &sockets {
+        let enabled = 1_i32;
+        // SAFETY: enabled is a readable integer; this changes only the test capture socket.
+        check(unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_PACKET,
+                libc::PACKET_IGNORE_OUTGOING,
+                (&enabled as *const i32).cast(),
+                size_of_val(&enabled) as _,
+            )
+        });
+    }
+    const LIMIT: usize = 1 << 24;
+    let mut seen = [vec![0_u64; LIMIT / 64], vec![0_u64; LIMIT / 64]];
+    let mut sent = [0; 2];
+    let mut received = [0; 2];
+    let mut output = [0; 1514];
+    let mut input = [0; 65_536];
+    let mut packed = false;
+    let start = Instant::now();
+    let send_until = start + Duration::from_secs(10);
+    let drain_until = send_until + Duration::from_millis(200);
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    DEALLOCATIONS.store(0, Ordering::Relaxed);
+    COUNTING.store(true, Ordering::SeqCst);
+    while Instant::now() < drain_until {
+        let sending = Instant::now() < send_until;
+        if sending {
+            for direction in 0..2 {
+                for _ in 0..64 {
+                    assert!(sent[direction] < LIMIT);
+                    let length = storm_frame(&mut output, direction, sent[direction]);
+                    // SAFETY: output is readable; the bound AF_PACKET socket supplies the interface/protocol.
+                    let n = unsafe {
+                        libc::send(
+                            sockets[direction].as_raw_fd(),
+                            output.as_ptr().cast(),
+                            length,
+                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        )
+                    };
+                    if n < 0 {
+                        let error = io::Error::last_os_error();
+                        assert!(
+                            matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                            ) || error.raw_os_error() == Some(libc::ENOBUFS),
+                            "{error}"
+                        );
+                        break;
+                    }
+                    assert_eq!(n as usize, length);
+                    sent[direction] += 1;
+                }
+            }
+        }
+        for direction in 0..2 {
+            for _ in 0..256 {
+                let Some(length) = raw_read(&sockets[1 - direction], &mut input) else {
+                    break;
+                };
+                assert!(length >= 27);
+                assert_eq!(&input[14..18], b"UQST");
+                assert_eq!(input[18], direction as u8);
+                let sequence = u64::from_be_bytes(input[19..27].try_into().unwrap()) as usize;
+                assert!(sequence < sent[direction]);
+                let expected = storm_frame(&mut output, direction, sequence);
+                assert_eq!(length, expected);
+                assert_eq!(&input[..length], &output[..expected]);
+                let word = &mut seen[direction][sequence / 64];
+                let bit = 1_u64 << (sequence % 64);
+                assert_eq!(*word & bit, 0, "duplicate frame");
+                *word |= bit;
+                received[direction] += 1;
+            }
+        }
+        if !packed {
+            for _ in 0..128 {
+                let Some(length) = raw_read(&monitor, &mut input) else {
+                    break;
+                };
+                // Capture can contain a GSO aggregate: validate its first logical UDP payload.
+                if length < 110
+                    || input[20] != 17
+                    || !matches!(u16::from_be_bytes([input[56], input[57]]), 40100 | 40101)
+                {
+                    continue;
+                }
+                let end = 110 + usize::from(u16::from_be_bytes([input[100], input[101]]));
+                if end <= length
+                    && let Ok(packet) = unquic::wire::Datagram::decode(&input[62..end])
+                {
+                    packed |= packet
+                        .records()
+                        .filter(|record| matches!(record, unquic::wire::Record::Data { .. }))
+                        .count()
+                        > 1;
+                }
+            }
+        }
+        if !sending {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    COUNTING.store(false, Ordering::SeqCst);
+    assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
+    assert!(packed, "no multi-frame DATA packet observed");
+    assert!(received.iter().all(|count| *count > 1000));
+    eprintln!(
+        "10 s frame storm: sent={sent:?}, delivered={received:?}; no corruption or duplicates"
+    );
+}
+
 #[test]
 #[ignore = "requires disposable container with tun and network namespace capabilities"]
 fn workers_forward_both_directions_and_reconnect_after_restart() {
@@ -226,6 +362,7 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
         assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
         assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
     }
+    frame_storm();
     for (left_name, right_name) in [(c"uq-left-b", c"uq-right-b"), (c"uq-left-c", c"uq-right-c")] {
         let source = raw_socket(left_name, 0x88b5);
         let target = raw_socket(right_name, 0x88b5);

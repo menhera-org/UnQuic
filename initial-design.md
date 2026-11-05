@@ -508,11 +508,14 @@ Worker sends and receives now use these offloads with ordinary-I/O fallback.
 An unchanged GRO buffer can cross session and lane owners; each segment is
 validated independently. Fixed receive pools and per-origin frame reservations
 keep each session below the directional frame/byte limits without shared hot
-reservations. The pure multi-record packer now borrows frame slices and shares
-datagrams across frame boundaries; the socket API gathers those slices within
-a fixed descriptor budget. Generated sequences and small-frame bursts have
-round-trip, reordering, duplicate and allocation tests. Worker integration of
-multi-frame batches, recovery and congestion control remain unfinished. Current liveness
+reservations. Workers now pack multiple frames per datagram and retain batches
+through partial sends. Metadata uses frame indices/ranges without payload copies
+or self-references; expiry preserves live frames and quiescence drains batches.
+The socket API gathers original slices within a fixed descriptor budget.
+Generated sequences, small-frame bursts and partial batches have regression tests.
+A ten-second bidirectional TAP storm checks observed packing, integrity, duplicate
+suppression and zero allocations/deallocations, while reporting drops. Dedicated
+throughput measurements, recovery and congestion control remain unfinished. Current liveness
 probes do not discover MTU: the UDP limit remains 1232 bytes until stage 3.
 The foreground daemon now parses the documented TOML, provisions cookies through
 gen-uuid, refreshes hostnames through per-peer iphost helpers after readiness,

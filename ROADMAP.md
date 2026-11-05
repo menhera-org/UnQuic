@@ -299,11 +299,14 @@ pass the container forwarding/restart test and allocation checks. A mixed-cookie
 mixed-owner aggregate test verifies independent rejection and unchanged payload
 storage. Fixed receive pools remain below the directional frame/byte ceilings;
 per-origin transmit reservations enforce the same bounds through delayed returns.
-The pure multi-record encoder and socket slice-list API are implemented, with
-borrowed payloads, bounded descriptors, generated frame-sequence reconstruction,
-reverse/duplicate delivery and small-frame burst tests. Worker integration must
-retain those batches across partial sends, expiry and connection barriers;
-it and the frame storm/throughput tests remain. Partial completion, GSO/GRO boundaries, MTU errors and allocation
+The multi-record encoder and socket slice-list API are integrated into workers,
+with borrowed payloads, bounded descriptors and round-robin batch service.
+Batch metadata uses indices/ranges so original buffers can remain owned across
+partial sends. Tests cover generated sequences, reverse/duplicate delivery,
+small-frame bursts, releasing early slots, individual expiry and quiescence with
+full return queues. The ten-second bidirectional TAP storm verifies integrity,
+duplicate suppression, observed packing and zero allocations/deallocations while
+reporting frame drops. Dedicated throughput measurements remain. Partial completion, GSO/GRO boundaries, MTU errors and allocation
 checks pass. The five frame-model regression cases
 now run against the real implementation in tests/reassembly.rs.
 
@@ -322,9 +325,9 @@ now run against the real implementation in tests/reassembly.rs.
   of 100 ms, and the resource limits of section 8.2 (8192 frames, 64 MiB
   payload per direction, 256 MiB daemon ceiling). Reservation before
   acceptance; a datagram that cannot be fully reserved is dropped whole.
-- `tap.rs`: optional `IFF_VNET_HDR` stays off in v1; add `read_batch` using
-  one `read` per frame in a loop until `EAGAIN`, with the buffer pool owned
-  by the worker.
+- TAP reads: optional `IFF_VNET_HDR` stays off in v1. The worker already loops
+  over at most 64 reads per ready TAP, stopping at EAGAIN or pool exhaustion.
+  Keep buffer ownership there; no separate batch wrapper is needed.
 - Preallocated buffer pools and descriptor rings in the worker; no allocation
   on the data path after startup. Verify by a test that counts allocations
   with a global allocator wrapper in the test binary.

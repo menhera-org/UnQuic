@@ -152,11 +152,12 @@ extension headers, and keeps fragments on an address/protocol key. Encoding and
 flow hashing have allocation checks. The scatter/gather encoder borrows frame
 pieces directly; tests compare its wire bytes with the contiguous encoder.
 Batched socket calls, WouldBlock and invalid/truncated input paths also have
-allocation checks. The multi-record encoder now borrows several queued frames, packs frame tails
-with following heads, and flushes at queue exhaustion. Generated sequences,
-reversed arrival, duplicate packets, identity exhaustion and 14/60/64/128-byte
-bursts have tests. Two 1514-byte frames pack into three baseline datagrams.
-Worker integration of retained multi-frame batches is still pending.
+allocation checks. The multi-record encoder packs frame tails with following
+heads and flushes at queue exhaustion. Retained metadata addresses original
+buffers by frame index and byte range, without self-references or payload copies.
+Generated sequences, reversed arrival, duplicate packets, identity exhaustion
+and small-frame bursts have tests. Two 1514-byte frames pack into three baseline
+datagrams. Workers now use this encoder and retain partial batches.
 
 The runtime now forwards frames between TAPs with configured or supplied IPv6 peers.
 The isolated test exercises two workers, two peers and three sessions per endpoint,
@@ -167,7 +168,7 @@ through a VLAN upper device, exercising kernel tag materialization. Allocation
 instrumentation observes no allocations or deallocations during these forwarding
 checks. This is correctness coverage, not a throughput measurement.
 
-Worker multi-record packing, recovery, BBRv3,
+Recovery, BBRv3,
 descriptor adoption and daemon process integration remain unfinished. No throughput
 target has been demonstrated.
 
@@ -240,16 +241,22 @@ including handoff and return-queue delays. Compile-time bounds and quota tests
 check these limits; no shared reservation lock or atomic is needed.
 
 Transmit DATA uses scatter/gather slices of the original frame buffer.
-Partial sends retain the unsent suffix with its original packet numbers until
-submission, connection retirement or the current 100 ms sender deadline.
+Partial sends retain the unsent suffix with its original packet numbers.
+Only successful submissions advance frame offsets and release completed buffers.
+If a frame reaches its 100 ms deadline, it is removed; remaining frames keep their
+IDs and submitted offsets and are repacked with fresh packet numbers. Connection
+retirement discards every queued batch before the worker acknowledges quiescence.
 Receive reassembly copies pieces into fixed frame slots and retains complete
 frames through TAP backpressure until delivery or expiry. Workers batch socket
 I/O and notifications, update epoll write interests only when needed, and arm
 absolute monotonic timers. No worker waits for another worker's queue.
 
-Current sends batch the pieces of one frame; packing multiple frames together
-remains pending. TAP I/O still requires one read or write per frame. No throughput
-target follows from the allocation checks alone. Small-frame acceptance must
+Each owned transmit lane reserves metadata for 64 frames and 64 datagrams.
+A bounded round-robin queue serves ready session/lane batches. One batch may
+contain several frames; a long queue continues across batches without resetting
+frame identities. Batch storage and scheduling entries count toward startup's
+memory reservation. TAP I/O still requires one read or write per frame. No
+throughput target follows from allocation checks alone. Small-frame acceptance must
 report delivered frames per second, CPU and drops separately from large-frame
 Gbit/s. Multi-record packing reduces outer packet overhead; it does not remove
 TAP's per-frame read/write cost.
@@ -382,7 +389,8 @@ not outer IPv6 fragments.
 The socket API accepts a caller-supplied limit through 1452 bytes, but does not
 verify that the path supports it. The runtime has no `IPV6_RECVERR` error-queue processing
 or Packet Too Big validation. If ordinary sending returns EMSGSIZE after any
-GSO fallback, it counts a socket error and drops that frame's unsent remainder.
+GSO fallback, it counts a socket error and drops the affected batch's unsent
+frames.
 It neither lowers the limit nor resizes the TAP. Other nontransient send errors
 follow the same path; WouldBlock and interrupted sends retain the remainder
 until its deadline.
@@ -458,12 +466,20 @@ migration and migration back, unchanged-address updates, multiple peers/sessions
 shutdown cleanup, forwarding allocation checks, and
 TAP readiness with an unavailable receive address and unresolved peer. A worker
 ownership test fills both handoff rings and checks buffer returns, lane returns,
-commit completion and duplicate-install packet-number preservation. It also
+commit completion and duplicate-install packet-number preservation. Transmit
+batch tests cover successful prefixes, releasing early frame slots while later
+packets remain, expiry without discarding live frames, and quiescence with full
+return queues. The ownership test also
 routes one unchanged GRO buffer across two sessions and two workers with bad
 siblings, verifies byte accounting and returns frame reservations through full
 queues. Counter tests
 cover lane reuse, duplicate/expiry accounting, reservation gauges, connection
 generations and peer aggregation after shutdown.
+The runtime test also sends 60-, 64-, 128- and 1514-byte bursts in both directions
+for ten seconds, checks every captured frame for corruption and duplicates, and
+observes multi-record DATA on loopback. It checks zero allocations/deallocations
+throughout that interval and reports sent/delivered counts, including drops.
+This instrumented debug test is not a throughput benchmark.
 The daemon test delays DNS answers until both TAPs exist, refreshes an AAAA
 record, observes DATA sent to the new IPv6 destination, checks forwarding and
 stops both processes with SIGTERM. Build it with `--all-features`; when copying

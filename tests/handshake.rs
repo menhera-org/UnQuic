@@ -800,23 +800,29 @@ fn segmentation_and_flow_selection_allocate_nothing() {
         }
         assert_eq!(count, 8);
     }
-    let frames = [&frame[..60]; 256];
-    let mut packed = pack::Packed::new();
-    let mut encoder = lane.frames(&frames, unquic::BASE_UDP_PAYLOAD).unwrap();
-    let mut count = 0;
-    while let Some(packet) = encoder.encode_next_split(&mut packed).unwrap() {
+    let frames = [&frame[..60]; pack::BATCH_CAPACITY];
+    let inputs = std::array::from_fn::<_, { pack::BATCH_CAPACITY }, _>(|index| pack::FrameInput {
+        id: lane.start_frame(frames[index].len()).unwrap(),
+        bytes: frames[index],
+        offset: 0,
+    });
+    let mut batch = pack::Batch::new();
+    batch
+        .prepare(&mut lane, &inputs, unquic::BASE_UDP_PAYLOAD)
+        .unwrap();
+    assert!(batch.len() < 6);
+    for packet in 0..batch.len() {
         let mut slices = [&[][..]; pack::PACKED_SLICES];
         assert_eq!(
-            packed
-                .slices(&mut slices)
+            batch
+                .slices(packet, &frames, &mut slices)
+                .unwrap()
                 .iter()
                 .map(|part| part.len())
                 .sum::<usize>(),
-            packet.length
+            batch.packet(packet).unwrap().length
         );
-        count += 1;
     }
-    assert!(count < 20);
     let allocations = ALLOCATION_COUNT.replace(None);
     assert_eq!(allocations, Some(0));
 }
