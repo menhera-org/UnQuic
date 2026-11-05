@@ -478,8 +478,9 @@ for larger sets, with an allocation check and repeatable benchmark. The optional
 iphost resolution layer supplies IPv6 candidates above the raw-address core.
 Atomic counters now cover the section 12 totals and gauges with explicit units
 and allocation-free snapshots. The fixed SPSC worker handoff ring has concurrent,
-wraparound, ownership and Miri tests. Session dispatch, barriers and the owned
-worker runtime remain unimplemented. The crate does
+wraparound, ownership and Miri tests. A pure two-phase commit barrier tracks
+quiescence and installation, with full-queue and stale-acknowledgment tests.
+Session dispatch and the owned worker runtime remain unimplemented. The crate does
 not yet provide end-to-end Ethernet transport, and no performance acceptance
 claim has been made.
 

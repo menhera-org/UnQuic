@@ -189,7 +189,10 @@ with `Acquire`. No locks, no strings in the hot path.
 The 1024-entry SPSC queue is implemented with cached cursors and fixed storage.
 Tests cover full-ring ownership, cursor wraparound, endpoint destruction and
 one million ordered transfers. Miri also checks the queue with thread preemption.
-Worker loops, ownership tables, commit barriers and runtime integration remain.
+The pure two-phase commit barrier is implemented in src/handshake/barrier.rs.
+Tests cover all 64 workers, stale acknowledgments, retirement, generation
+exhaustion, and full command/reply queues. Worker loops, ownership tables and
+barrier integration remain.
 
 Implement the ownership rules of section 10 under "Worker ownership and
 routing (v1)".

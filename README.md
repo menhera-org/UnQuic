@@ -70,7 +70,10 @@ The pure handshake state machine elects roles automatically, negotiates frame
 limits, retries lost flights, and preserves active state through replacement.
 Tags come from nonblocking kernel randomness; tests inject deterministic tags
 and monotonic times. Commit, retirement and carrier changes are returned to the
-caller. The worker barrier and actual network dispatch remain to be implemented.
+caller. The pure two-phase barrier tracks quiescence and installation across up
+to 64 workers. Commands stay pending when queues are full; stale, duplicate and
+unpublished acknowledgments cannot advance it. Actual worker integration and
+network dispatch remain to be implemented.
 Tests cover simultaneous startup, equal tags, each lost flight, stale replay,
 role reversal, either/both endpoint restarts, reply limits and liveness deadlines.
 
@@ -96,7 +99,9 @@ batch totals; snapshots perform no allocation or locking.
 The worker handoff foundation is a fixed 1024-entry SPSC ring with exclusive
 producer/consumer handles and cached cursors. Push/pop use no locks, allocations
 or syscalls. Wraparound, full-ring ownership, destruction and concurrent transfer
-have unit tests and Miri coverage; worker notification is not yet integrated.
+have unit tests and Miri coverage. Barrier tests fill command and reply queues
+and check that draining both directions permits replacement to finish without
+losing control messages. Worker notification is not yet integrated.
 
 The crate does not yet forward frames between peers. Worker ownership,
 batching/offloads, path-MTU probing, recovery, BBRv3, scheduled DNS

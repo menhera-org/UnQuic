@@ -704,3 +704,29 @@ fn cookie_lookups_allocate_nothing_in_both_storage_modes() {
         assert_eq!(allocations, Some(0));
     }
 }
+
+#[test]
+fn commit_barriers_allocate_nothing() {
+    use unquic::handshake::barrier::{Barrier, Progress};
+    let mut barrier = Barrier::new(64).unwrap();
+    ALLOCATION_COUNT.set(Some(0));
+    for _ in 0..100 {
+        barrier.begin(None).unwrap();
+        for phase in [Progress::Quiesced, Progress::Complete] {
+            for worker in 0..64 {
+                let command = barrier.pending(worker).unwrap();
+                assert!(barrier.sent(worker, command));
+                assert_eq!(
+                    barrier.acknowledge(worker, command),
+                    if worker == 63 {
+                        phase
+                    } else {
+                        Progress::Waiting
+                    }
+                );
+            }
+        }
+    }
+    let allocations = ALLOCATION_COUNT.replace(None);
+    assert_eq!(allocations, Some(0));
+}

@@ -5,6 +5,8 @@
 //! Apply commit/retirement effects through the worker barrier before using a new
 //! connection. This module owns no sockets, TAPs, clocks or congestion state.
 
+pub mod barrier;
+
 pub use crate::wire::Params;
 use crate::{sys, wire::Record};
 use std::{fmt, io, num::NonZeroU128, time::Duration};
