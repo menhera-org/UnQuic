@@ -116,8 +116,8 @@ record type and every rejection rule has a failing input.
 
 Implemented with automatic tag election, nonblocking tag generation, pure
 liveness transitions and protocol regression tests in `tests/handshake.rs`.
-The four handshake model tests now exercise real types. The five frame-window
-model tests remain in `tests/frame_model.rs` until stage 2 replaces them.
+The handshake and frame-window model cases now exercise real types in
+`tests/handshake.rs` and `tests/reassembly.rs`; the old model files are removed.
 Musl tests, Clippy, formatting and the isolated foundation kernel test pass.
 
 Implement sections 5.1 and 5.2 as a pure state machine with no I/O.
@@ -143,8 +143,8 @@ Implement sections 5.1 and 5.2 as a pure state machine with no I/O.
   `EAGAIN` means "retry later", everything else is an error. The state
   machine takes tags as input so tests use fixtures.
 - Tests: port the handshake cases from `tests/design_model.rs` to run against
-  these real types. Keep its frame-window cases in `tests/frame_model.rs` for
-  stage 2, then delete the old mixed model file. Add the message-loss, duplicate,
+  these real types. Port the frame-window cases to real reassembly types when
+  that module lands, then delete the model files. Add the message-loss, duplicate,
   reorder, simultaneous start and restart cases listed under "Protocol and
   ownership regression cases" in section 14.1.
 
@@ -192,7 +192,8 @@ one million ordered transfers. Miri also checks the queue with thread preemption
 The pure two-phase commit barrier is implemented in src/handshake/barrier.rs.
 Tests cover all 64 workers, stale acknowledgments, retirement, generation
 exhaustion, and full command/reply queues. Worker loops, ownership tables and
-barrier integration remain.
+barrier integration remain. The reassembly/window foundation from stage 2 is
+also implemented because step 1e requires permanent duplicate suppression.
 
 Implement the ownership rules of section 10 under "Worker ownership and
 routing (v1)".
@@ -218,10 +219,10 @@ routing (v1)".
 - Data path in this stage: a TAP frame becomes enough DATA records to fit the baseline
   payload ceiling (up to eight pieces for a 9022-byte frame), in separate datagrams of at most 1232 bytes of UDP payload, sent on the lane
   chosen by the flow key of section 8.3. The receiver assembles by frame ID
-  into a per-lane table bounded to 64 incomplete frames and writes complete
-  frames to its TAP queue. No ACKs, no repair, no windows yet; that is
-  stage 2 and 3. Duplicate suppression by frame ID is already required so
-  a frame never reaches the TAP twice.
+  into a per-lane table bounded to 64 incomplete or queued complete frames and
+  writes complete frames to its TAP queue. Permanent packet/frame windows and
+  TAP-write retention are pulled forward from stage 2 so the first runtime
+  cannot redeliver delayed repairs. ACKs and repair remain in stage 3.
 - Container test `tests/linux_runtime.rs`: two runtimes in one network
   namespace on loopback with different fixed ports and automatically elected
   roles, each with one TAP. Assert the handshake completes, carrier rises
@@ -255,6 +256,12 @@ worker's queue.
 
 Goal: the packet rate and CPU baseline of section 13 can be measured.
 
+The receive foundation is implemented early for step 1e: fixed frame storage,
+whole-datagram reservation, permanent packet/frame windows, terminal bits,
+100 ms expiry and retained TAP-write entries. Actual worker routing, global
+memory accounting and batched I/O remain. The five frame-model regression cases
+now run against the real implementation in tests/reassembly.rs.
+
 - `socket.rs`: `recv_batch` with `recvmmsg`, `send_batch` with `sendmmsg`,
   UDP GSO via `UDP_SEGMENT` and GRO via `UDP_GRO` with runtime detection and
   a fallback path that stays correct. On GRO receive, split by the returned
@@ -276,8 +283,8 @@ Goal: the packet rate and CPU baseline of section 13 can be measured.
 - Preallocated buffer pools and descriptor rings in the worker; no allocation
   on the data path after startup. Verify by a test that counts allocations
   with a global allocator wrapper in the test binary.
-- Tests: window tests ported from `tests/frame_model.rs` to real types;
-  delete that model file once the replacement tests pass, GRO split boundaries, partial
+- Tests: retain the real window tests in `tests/reassembly.rs`; the old model
+  file has been removed. Add GRO split boundaries, partial
   `sendmmsg` completion returns the unsent entries, container test extended
   with a 10 s bidirectional frame storm and a check that no frame is
   duplicated or corrupted.

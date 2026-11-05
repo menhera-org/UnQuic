@@ -730,3 +730,42 @@ fn commit_barriers_allocate_nothing() {
     let allocations = ALLOCATION_COUNT.replace(None);
     assert_eq!(allocations, Some(0));
 }
+
+#[test]
+fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
+    use unquic::{
+        UnquicUuid,
+        reassembly::{Admission, Lane},
+        wire::{Datagram, Header, encode_datagram},
+    };
+    let mut lane = Lane::new(1, 9022).unwrap();
+    let mut packet = [0; 1232];
+    let header = Header {
+        cookie: UnquicUuid::from_bytes([1; 16]),
+        receive_tag: 2,
+        lane: 1,
+        record_area_len: 0,
+        packet_number: 1,
+    };
+    let record = Record::Data {
+        frame_id: (1 << 48) | 1,
+        total_len: 60,
+        offset: 0,
+        bytes: &[3; 60],
+    };
+    let len = encode_datagram(header, &[record], &mut packet).unwrap();
+    let datagram = Datagram::decode(&packet[..len]).unwrap();
+    ALLOCATION_COUNT.set(Some(0));
+    for _ in 0..100 {
+        assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Fresh);
+        assert_eq!(lane.front(Duration::ZERO).unwrap().bytes, &[3; 60]);
+        assert!(lane.finish_front());
+        lane.reset(1, 9022).unwrap();
+        assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Fresh);
+        assert_eq!(lane.expire(Duration::from_millis(100)), 1);
+        lane.retire();
+        lane.reset(1, 9022).unwrap();
+    }
+    let allocations = ALLOCATION_COUNT.replace(None);
+    assert_eq!(allocations, Some(0));
+}

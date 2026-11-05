@@ -103,6 +103,14 @@ have unit tests and Miri coverage. Barrier tests fill command and reply queues
 and check that draining both directions permits replacement to finish without
 losing control messages. Worker notification is not yet integrated.
 
+`reassembly::Lane` now reserves a complete datagram before applying its records,
+with 64 fixed frame slots and separate 65536-entry packet and frame windows.
+Permanent lower bounds and terminal bits prevent delivery after replay, expiry,
+abandonment or window reuse. Complete frames remain queued through TAP
+backpressure until delivery, discard or the original 100 ms deadline. Overlapping
+pieces keep the first retained bytes; changed frame lengths reject the datagram.
+Tests cover full queues, overlap, retirement and allocation-free operation.
+
 The crate does not yet forward frames between peers. Worker ownership,
 batching/offloads, path-MTU probing, recovery, BBRv3, scheduled DNS
 refresh, the daemon and descriptor adoption remain to be implemented.

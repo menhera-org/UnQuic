@@ -16,6 +16,7 @@ pub mod counters;
 pub mod dns;
 pub mod handshake;
 pub mod mac;
+pub mod reassembly;
 mod sha256;
 pub mod socket;
 pub mod spsc;

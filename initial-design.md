@@ -227,6 +227,8 @@ After full wire validation, reserve all storage needed by a datagram before appl
 
 DATA for a frame already delivered, abandoned, expired, or below the frame window is terminal: discard it without allocating or writing to TAP again. Such duplicates can be packet-ACKed; when the frame was discarded rather than delivered, schedule a bounded FRAME_ABANDON if still useful. Packet ACKs never promise reliable frame delivery. A receiver may later abandon previously ACKed pieces at the frame deadline or on a TAP error and reports this when possible; it never retracts packet ACKs.
 
+Overlapping DATA keeps the first retained byte at each offset. A changed total frame length rejects the whole datagram before applying records; later pieces cannot resize accepted storage.
+
 A complete frame enters a bounded TAP-write queue once. While queued it remains ineligible for a second enqueue. A successful full-frame write marks it delivered; `EAGAIN` retains that same entry until writable or expired. Other write failures, including an unexpected short write, discard it and mark it terminal; never retry a partial frame as another Ethernet frame. Expiry or abandonment of an incomplete/queued frame also marks it terminal before releasing buffers.
 
 ## 8.2 Bounded duplicate history
@@ -480,6 +482,9 @@ Atomic counters now cover the section 12 totals and gauges with explicit units
 and allocation-free snapshots. The fixed SPSC worker handoff ring has concurrent,
 wraparound, ownership and Miri tests. A pure two-phase commit barrier tracks
 quiescence and installation, with full-queue and stale-acknowledgment tests.
+The receive foundation now has fixed frame storage, whole-datagram reservation,
+permanent packet/frame windows, expiry and a retained TAP-write queue. Its tests
+replace the frame model, including pressure, repair and allocation checks.
 Session dispatch and the owned worker runtime remain unimplemented. The crate does
 not yet provide end-to-end Ethernet transport, and no performance acceptance
 claim has been made.
