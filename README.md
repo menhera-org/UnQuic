@@ -306,8 +306,8 @@ frame identities. Planning stops before starting a frame that would cross the
 GSO aggregate's byte limit. The final UDP datagram may be short. Thus local
 aggregate drops do not leave orphan pieces in adjacent batches. Individual
 on-wire datagram losses still require the planned bounded selective repair. Batch storage and scheduling entries count toward startup's
-memory reservation. TAP reads still require one syscall per frame. Eligible
-UDP frames share a TAP write as described below. No throughput target follows
+memory reservation. Available read rings batch TAP reads, and eligible UDP
+frames share a TAP write as described below. No throughput target follows
 from allocation checks alone. Small-frame acceptance must report delivered
 frames per second, CPU and drops separately from large-frame Gbit/s.
 
@@ -333,6 +333,31 @@ lane or its usable MTU. After 3 seconds without feedback the session becomes
 degraded and attempts replacement while retaining its active connection. After
 30 seconds it retires that connection and lowers carrier through the worker
 barrier. Recovery and per-lane path monitoring remain stage 3 work.
+
+## TAP read batching
+
+Each worker attempts to create one 64-entry io_uring for its TAP queues.
+A read batch borrows existing pool buffers and submits `READV` with
+`RWF_NOWAIT`; the virtio header has a separate iovec, so frame bytes need
+no shift or copy. Every submitted completion is drained before buffers are
+forwarded or returned. No request crosses a worker turn. The batch size
+follows recent occupancy, from 1 to 64 frames, and cannot consume the RX reserve.
+
+Initialization failure or an unsupported read operation keeps ordinary reads.
+Partial submissions and interruptions preserve accepted results; unsubmitted
+requests can be withdrawn because there is no SQPOLL thread. Disabled rings
+retain their mappings until shutdown. Three page-rounded mappings per worker
+count toward the memory reservation. No hot-path allocation or lock is added.
+
+An unrecoverable enter failure with outstanding completions, or a violated
+ring invariant while kernel pointers are live, aborts the process. Returning
+borrowed storage in that state would be unsafe. Ordinary capability failures
+and interruptions use the fallback and retry paths above.
+
+Worker/session counters expose read syscalls (`tap_read_calls`), submitted
+read requests (`tap_read_requests`), ring batches (`tap_read_batches`),
+valid ring frames (`tap_ring_frames`) and fallback events
+(`tap_read_fallbacks`). Startup fallback counts belong to workers.
 
 ## TAP write coalescing
 

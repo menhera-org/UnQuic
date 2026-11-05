@@ -1,10 +1,10 @@
 # Release transport overload investigation
 
 The original receive-admission collapse and a later TAP readiness busy loop
-are fixed. Local TAP USO coalescing now improves delivery: the final
-MTU-1500 build reaches 4.38–4.56 / 5.87–5.90 Gbit/s under unlimited load.
-Both unlimited points exceed their paced predecessors in both directions.
-The corresponding 64-byte sweeps also hold up under overload.
+are fixed. Local TAP USO coalescing and batched reads now improve delivery: the latest
+MTU-1500 read-ring repeats reach 4.94–5.28 / 6.23–6.48 Gbit/s under unlimited
+load. All five unlimited points exceed their paced predecessors in both
+directions. The corresponding 64-byte sweep also holds up under overload.
 
 These short sweeps do not establish a plateau for every workload or the
 theoretical CPU ceiling. Neither the local **20 Gbit/s in each direction**
@@ -18,7 +18,8 @@ their absence does not explain away a scheduling or admission failure.
 
 ## Current performance gaps
 
-Status after the TAP readiness fix, per-peer payload limit and local TAP USO.
+Status after the TAP readiness fix, per-peer payload limit, local TAP USO
+and bounded read rings.
 The split-pool, deadline-cache and lane-association experiments below are not
 in the runtime.
 The latest results use the 20-CPU single-socket profile and capped
@@ -27,16 +28,16 @@ L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | The final USO repeat delivers 4.38–4.56 / 5.87–5.90 Gbit/s of inner UDP payload under unlimited load | Even the better points need about 4.4× / 3.4× more delivered goodput. The generator still offers only about 13 Gbit/s each way. |
-| Goodput must plateau under excess traffic | Six MTU-1500 and six 64-byte USO unlimited points exceed their paced predecessors in both directions; earlier baselines declined | The current 20-second samples pass that comparison. Longer runs, mixed traffic, more flows/sessions and the acceptance gate remain unverified. |
-| Small-frame overload must remain efficient | The final build delivers 729–737k / 714–734k frames/s in two 64-byte unlimited points, compared with 419–480k / 455–518k in the last unchanged baseline | Both 5M- and 10M-per-flow sweeps hold up under overload. Mixed and non-coalescible traffic still need coverage. |
+| At least 20 Gbit/s each way at inner MTU 1500 | The read-ring repeats deliver 4.94–5.28 / 6.23–6.48 Gbit/s of inner UDP payload under unlimited load | Even the better points need about 3.8× / 3.1× more delivered goodput. The generator still offers only about 13 Gbit/s each way. |
+| Goodput must plateau under excess traffic | Five MTU-1500 and three 64-byte corrected read-ring unlimited points exceed their paced predecessors in both directions; earlier baselines and a fixed-batch trial declined | The current 20-second samples pass that comparison. Longer runs, mixed traffic, more flows/sessions and the acceptance gate remain unverified. |
+| Small-frame overload must remain efficient | Read rings deliver 847–899k / 844–868k frames/s in three 64-byte unlimited points, compared with 729–737k / 714–734k with USO alone | The final 10M-per-flow sweep holds up under overload. Receiver errors are now substantial; mixed and non-coalescible traffic still need coverage. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
 | Use larger confirmed path MTUs | The runtime accepts a per-peer 1232–1452-byte payload assertion; a controlled 1452-byte sweep shows only a modest change | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. Configured capacity is not confirmed PMTU. |
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
 
-Loss under unlimited load is still high: the final USO MTU-1500
-points miss about 64–66% / 54–56% of offered frames despite zero admission
+Loss under unlimited load is still high: the final read-ring MTU-1500
+points miss about 58–63% / 48–51% of offered frames despite zero admission
 pressure and worker queue drops. TAP ingress drops, outer socket overflows
 and inner UDP receive-buffer errors are recorded. Their different units prevent
 an exact frame-loss decomposition.
@@ -1033,3 +1034,132 @@ delivery with zero allocations and deallocations while counting; the existing
 storm also checks corruption, duplicates and zero worker queue drops.
 Clippy, formatting and Rust 1.89 checks pass. Real old-kernel capability
 fallback remains untested; descriptor fault tests cover its control flow.
+
+## Bounded TAP read rings (audit B2)
+
+Workers now submit nonblocking `READV` batches through one io_uring each.
+Headers and frame buffers remain separate iovecs. The existing pool and
+64-frame per-event ceiling remain unchanged; every accepted completion is
+drained before forwarding or returning buffers. Unsupported rings or operations
+fall back to ordinary reads. Ring mappings count toward startup's memory
+reservation. [README](README.md#tap-read-batching) describes the failure policy.
+
+The first fixed-batch trial improved MTU-1500 unlimited delivery to
+4.95–5.21 / 5.97–6.18 Gbit/s, but its second reverse point declined 1.6%
+from paced overload. At 2 Gbit/s, batches averaged only 3.9 / 4.1 valid frames;
+daemon CPU rose to 357% / 366%, against about 326% / 334% with USO alone.
+The old decline is recorded; it is not attributed solely to empty reads.
+
+Occupancy-based sizing reduced light-load CPU. Its first formula also shrank
+the next batch when the pool supplied fewer buffers than requested, even if
+every read succeeded. A regression now verifies that pool pressure preserves
+the larger hint. Only a genuinely short batch reduces it; a full batch grows
+it, up to 64. The two six-point exploratory sweeps remain in the data file
+as `tap_ring_fixed_trial` and `tap_ring_adaptive_trial`.
+
+The first corrected build's SHA-256 is
+`51fcbeec140ab3ff4cfef6e90ab655de7f4174328620d4bc9f7c050a7b95dd95`.
+These 14 normal-build points retain the four-worker, 16-flow, 20-second,
+single-socket profile. No own builds or other tests ran during measurements.
+Independent sweeps still differ in scheduling and kernel flow placement.
+
+| Frame bytes | Sweep | Requested/flow | Delivered Gbit/s | Missing % | Daemon CPU % |
+| ---: | --- | --- | ---: | ---: | ---: |
+| 1514 | MTU | 125M | 1.999 / 1.989 | 0.06 / 0.54 | 335.1 / 336.6 |
+| 1514 | MTU | 250M | 3.802 / 3.959 | 4.93 / 1.03 | 358.2 / 360.1 |
+| 1514 | MTU | 500M | 4.090 / 6.015 | 48.74 / 24.81 | 353.5 / 356.7 |
+| 1514 | MTU | unlimited | 5.077 / 6.313 | 60.54 / 50.35 | 330.6 / 325.5 |
+| 1514 | MTU | 500M | 3.972 / 5.954 | 50.19 / 25.42 | 355.0 / 365.0 |
+| 1514 | MTU | unlimited | 5.037 / 6.230 | 60.12 / 51.09 | 331.3 / 327.7 |
+| 1514 | MTU repeat | 500M | 4.107 / 6.089 | 48.51 / 23.88 | 358.2 / 368.3 |
+| 1514 | MTU repeat | unlimited | 4.936 / 6.244 | 61.83 / 50.70 | 323.4 / 322.1 |
+| 1514 | MTU repeat | 500M | 4.084 / 5.980 | 48.80 / 25.12 | 354.8 / 360.3 |
+| 1514 | MTU repeat | unlimited | 4.977 / 6.306 | 62.81 / 50.08 | 329.4 / 325.7 |
+| 64 | small | 10M | 0.134 / 0.127 | 16.01 / 20.39 | 354.0 / 350.3 |
+| 64 | small | unlimited | 0.153 / 0.149 | 28.36 / 31.02 | 314.8 / 316.0 |
+| 64 | small | 10M | 0.129 / 0.127 | 19.11 / 20.89 | 348.0 / 360.2 |
+| 64 | small | unlimited | 0.149 / 0.149 | 28.15 / 32.36 | 313.5 / 313.1 |
+
+The final bounds-hardened build, SHA-256
+`6d038d3c4705b90c4643e7c5a3f6118c26702def35ef3be28f86ed341e445a80`,
+retains the same batching policy. Its four additional points are recorded as
+`tap_ring_checked`:
+
+| Frame bytes | Requested/flow | Delivered Gbit/s | Missing % | Daemon CPU % |
+| ---: | --- | ---: | ---: | ---: |
+| 1514 | 500M | 4.268 / 6.304 | 46.53 / 21.19 | 357.3 / 367.3 |
+| 1514 | unlimited | 5.277 / 6.480 | 57.94 / 47.83 | 324.6 / 336.6 |
+| 64 | 10M | 0.140 / 0.132 | 12.35 / 17.19 | 359.7 / 355.0 |
+| 64 | unlimited | 0.158 / 0.153 | 23.10 / 27.11 | 320.9 / 318.2 |
+
+The final MTU unlimited point reports 10.54 / 7.80 million TAP TX drops,
+135,599 / 113,894 socket-overflow SKBs, 40,569 / 53,669 inner UDP
+receive-buffer errors and 7 / 0 expired frames. The final small-frame point
+delivers 899,068 / 868,229 frames/s.
+
+All five corrected MTU-1500 unlimited points and three small-frame unlimited
+points exceed their preceding paced points in both directions. USO alone
+delivered 4.38–4.56 / 5.87–5.90 Gbit/s and 729–737k / 714–734k frames/s.
+The read-ring small-frame points reach 847–899k / 844–868k frames/s.
+
+Under MTU-1500 unlimited load, each read syscall returns an average of
+24.8–26.9 valid frames. Empty requests account for 1.2–2.5% on the left and
+6.0–6.9% on the right. At 2 Gbit/s, the sizing rule allows roughly one empty
+request per valid frame and averages 2.1 / 2.5 valid frames per syscall.
+Those requests share an enter syscall; they are not separate kernel entries.
+
+All 30 new normal-build points have zero admission-pressure rejections,
+worker queue drops, TAP errors and outer IPv6 fragmentation. No read ring
+fell back at startup or during the sweeps. In the last point of the first corrected MTU-1500 repeat, TAP TX drops were 11.61 / 9.66 million, socket overflow was
+66,622 / 164,297 SKBs, inner UDP receive-buffer errors were 49,175 / 23,265,
+and frame expiry was zero. These counters name different stages and units.
+
+Small-frame receiver pressure is more visible: unlimited points report
+443–466k / 694–796k inner UDP receive-buffer errors. The iperf3 receiver
+processes still have two CPUs each and do not use UDP GRO. This warrants the
+planned GRO-aware generator/receiver, but does not account for every missing
+frame or establish a CPU ceiling.
+
+### Profile after read batching
+
+[The sampled profile](benches/worker-read-ring-profile.json) uses the same
+one-in-256-turn method and clock calibration as B1. It is a separate diagnostic
+build and is excluded from normal throughput comparisons.
+
+| Stage | Paced 500M/flow CPU share, left/right % | Unlimited CPU share, left/right % |
+| --- | ---: | ---: |
+| TAP reads and frame dispatch | 25.4 / 32.2 | 28.0 / 31.2 |
+| Receive processing, including interleaved TAP delivery | 29.8 / 19.2 | 28.6 / 23.6 |
+| Final TAP delivery | 17.7 / 14.1 | 15.6 / 14.0 |
+| Transmit flush | 14.3 / 19.1 | 16.1 / 18.4 |
+| epoll wait | 2.1 / 3.6 | 1.9 / 2.3 |
+
+Estimated unlimited CPU was 332% / 325%, against process measurements of
+330% / 326%. No TAP read handler began without an available transmit buffer.
+The read category still includes frame dispatch. Receive processing and TAP
+delivery together remain about 44% / 38% of sampled CPU.
+
+The results remain below the audit's projections and the 20 Gbit/s gate.
+The current generator offers only about 13 Gbit/s each way at MTU 1500.
+C2's concurrent UDP_SEGMENT/UDP_GRO tool is the next measurement prerequisite;
+production super-frame TAP reads, the eight-worker profile and the full
+acceptance gate remain unfinished.
+
+### Read-ring correctness checks
+
+Tests cover batches of 1, 2, 63 and 64 real TAP frames at 60, 1514 and
+9014 bytes, byte order, metadata validation and empty reads. Every full batch
+uses one enter syscall; no extra kernel I/O worker threads appeared.
+Fault injection submits a real prefix before reporting EINTR or EPERM,
+verifying exact completion accounting, withdrawal of unsubmitted work and
+ordinary-read delivery of the remainder. Another test exercises operation
+rejection. The pool-pressure regression checks the next batch and the RX reserve.
+
+The full release suite, all 16 ignored kernel unit tests, Clippy and Rust
+1.89 checks pass. The reconnect/runtime storm read about 843,000 frames per
+endpoint through rings with no fallback, corruption, duplicates, allocations
+or deallocations during its counted interval. The USO capture test now ignores
+unrelated bridge multicast reports by source MAC; fixture frames and duplicate
+checks remain byte-exact. A real thread-local seccomp filter denies ring setup;
+the worker then reads through the ordinary path and counts the fallback.
+Older kernels remain untested.

@@ -345,8 +345,11 @@ now run against the real implementation in tests/reassembly.rs.
   metadata; checksum/GSO read offloads remain disabled. Compatible complete
   UDP frames can share a lossless USO TAP write, preserving per-flow order,
   backpressure and the existing receive deadline. Other frames use single writes.
-  The direct cost probe verifies potential io_uring read savings; production
-  read batching and super-frame input remain unfinished.
+  Workers use bounded nonblocking io_uring read batches when available,
+  draining completions before releasing buffers and falling back to plain reads
+  on unsupported kernels. Corrected read-ring sweeps deliver about 5.0 / 6.3
+  Gbit/s and hold up under overload; the 20 Gbit/s gate and super-frame input
+  remain unfinished.
 - Preallocated buffer pools and descriptor rings in the worker; no allocation
   on the data path after startup. Verify by a test that counts allocations
   with a global allocator wrapper in the test binary.

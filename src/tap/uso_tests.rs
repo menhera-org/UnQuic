@@ -1,7 +1,6 @@
 //! Byte-exact kernel USO checks in a disposable network namespace.
-#[path = "../../tests/common/mod.rs"]
-mod common;
 use super::TapQueue;
+use super::test_common as common;
 use common::*;
 use std::{
     net::UdpSocket,
@@ -27,6 +26,9 @@ fn disable_offloads(socket: &UdpSocket, name: &std::ffi::CStr) {
         assert_eq!(value[1], 0, "offload {get:#x} remains enabled");
     }
 }
+fn fixture(bytes: &[u8]) -> bool {
+    bytes.get(6..11) == Some(&[2, 0, 0, 0, 0])
+}
 fn receive(capture: &OwnedFd) -> Vec<u8> {
     let mut bytes = vec![0; 65536];
     let mut length = 0;
@@ -34,8 +36,9 @@ fn receive(capture: &OwnedFd) -> Vec<u8> {
         let Some(n) = raw_read(capture, &mut bytes) else {
             return false;
         };
+        // Ignore bridge multicast reports, which use a different source MAC.
         length = n;
-        true
+        fixture(&bytes[..n])
     });
     bytes.truncate(length);
     bytes
@@ -274,7 +277,9 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
         }
     }
     let mut extra = [0; 65536];
-    assert!(raw_read(&capture, &mut extra).is_none());
+    while let Some(n) = raw_read(&capture, &mut extra) {
+        assert!(!fixture(&extra[..n]), "unexpected duplicate fixture frame");
+    }
 }
 
 #[test]

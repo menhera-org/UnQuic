@@ -140,6 +140,16 @@ metrics! {
     affinity_failures: sum,
     /// Operational socket errors, excluding WouldBlock and Interrupted.
     socket_errors: sum,
+    /// TAP read/readv/io_uring_enter syscalls, including unsuccessful attempts.
+    tap_read_calls: sum,
+    /// Submitted TAP READV requests or plain read calls, including empty reads.
+    tap_read_requests: sum,
+    /// Bounded io_uring TAP read batches attempted.
+    tap_read_batches: sum,
+    /// Valid frames read through io_uring, before transmit admission.
+    tap_ring_frames: sum,
+    /// Workers without a read ring at startup, plus rings disabled after rejection.
+    tap_read_fallbacks: sum,
     /// TAP frame write syscalls, including unsuccessful attempts and fallback retries.
     tap_write_calls: sum,
     /// Successful TAP USO writes representing two or more original frames.

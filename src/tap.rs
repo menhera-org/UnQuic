@@ -5,6 +5,12 @@
 //! bridge membership, addresses and administrative state. Queues can be moved
 //! out of the Tap for per-worker ownership; any queue can control carrier.
 
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_common;
+
+mod read;
+pub(crate) use read::Reader;
 mod uso;
 #[cfg(test)]
 #[path = "tap/uso_tests.rs"]
@@ -210,7 +216,10 @@ impl TapQueue {
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
-        let mut n = n as usize;
+        self.check_read(&header, n as usize)
+    }
+
+    fn check_read(&self, header: &[u8; 10], mut n: usize) -> io::Result<usize> {
         if self.vnet {
             if n < header.len() || header[0] & !2 != 0 || header[1] != 0 {
                 return Err(io::ErrorKind::InvalidData.into());

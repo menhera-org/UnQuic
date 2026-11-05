@@ -384,6 +384,7 @@ struct Session {
     tap_writable: bool,
     tap_readable: bool,
     tap_blocked: bool,
+    tap_read_limit: usize,
     tap_retry: Duration,
     connection: Option<Connection>,
     path: usize,
@@ -499,6 +500,7 @@ struct PeerControl {
 }
 
 pub(crate) struct Worker {
+    tap_reader: Option<crate::tap::Reader>,
     id: usize,
     shared: Arc<Shared>,
     control: Control,
@@ -529,6 +531,7 @@ pub(crate) struct Worker {
 impl Worker {
     pub fn storage_bytes(config: &crate::config::Config, workers: usize) -> Option<usize> {
         let mut per_worker = size_of::<Self>()
+            .checked_add(crate::tap::Reader::storage_bytes()?)?
             .checked_add(BUFFERS.checked_mul(size_of::<Buffer>() + size_of::<Box<Buffer>>())?)?
             .checked_add(workers.checked_mul(
                 size_of::<Option<Producer<Event>>>() + size_of::<Option<Consumer<Event>>>(),
@@ -633,6 +636,7 @@ impl Worker {
                 tap_writable: false,
                 tap_readable: true,
                 tap_blocked: false,
+                tap_read_limit: 8,
                 tap_retry: Duration::ZERO,
                 connection: None,
                 path: 0,
@@ -681,7 +685,13 @@ impl Worker {
             .iter()
             .map(|s| s.batches.iter().filter(|b| b.is_some()).count())
             .sum();
+        let tap_reader = crate::tap::Reader::new().ok();
+        let counters = Snapshot {
+            tap_read_fallbacks: u64::from(tap_reader.is_none()),
+            ..Snapshot::default()
+        };
         Ok(Self {
+            tap_reader,
             id,
             control,
             reactor: Reactor::new(Arc::clone(&shared.wakes[id]))?,
@@ -726,7 +736,7 @@ impl Worker {
             received: VecDeque::with_capacity(count * BUFFERS),
             ready: VecDeque::with_capacity(batch_count),
             notifications: 0,
-            counters: Snapshot::default(),
+            counters,
             setup_due: Duration::ZERO,
             retry_due: None,
             shared,
@@ -1752,68 +1762,133 @@ impl Worker {
     }
 
     fn read_tap(&mut self, session: usize, now: Duration) -> io::Result<()> {
-        for _ in 0..BATCH_SIZE {
-            if self.free.len() <= RECEIVE_BUFFERS - self.rx_retained {
-                break;
+        const _: () = assert!(BATCH_SIZE <= 64);
+        if self.tap_reader.as_ref().is_some_and(|r| r.enabled) {
+            let count = self.sessions[session].tap_read_limit.min(
+                self.free
+                    .len()
+                    .saturating_sub(RECEIVE_BUFFERS - self.rx_retained),
+            );
+            if count == 0 {
+                return Ok(());
             }
-            let Some(mut buffer) = self.free.pop() else {
-                break;
+            let mut buffers: [Option<Box<Buffer>>; BATCH_SIZE] =
+                std::array::from_fn(|i| if i < count { self.free.pop() } else { None });
+            let mut slices: [&mut [u8]; BATCH_SIZE] = std::array::from_fn(|_| &mut [][..]);
+            for (slice, buffer) in slices.iter_mut().zip(&mut buffers).take(count) {
+                *slice = &mut buffer.as_mut().unwrap().bytes[..MAX_FRAME_LEN + 1];
+            }
+            let reader = self.tap_reader.as_mut().unwrap();
+            let batch = reader.read(
+                self.sessions[session].tap.as_ref().unwrap(),
+                &mut slices[..count],
+            );
+            let frames = batch.results[..count].iter().filter(|r| r.is_ok()).count() as u64;
+            let limit = &mut self.sessions[session].tap_read_limit;
+            // A full read limited by pool availability says nothing about TAP occupancy.
+            *limit = if frames as usize == count {
+                (*limit * 2).min(BATCH_SIZE)
+            } else {
+                (frames as usize * 2).clamp(1, BATCH_SIZE)
             };
-            let result = self.sessions[session]
-                .tap
-                .as_mut()
-                .unwrap()
-                .read_frame(&mut buffer.bytes[..MAX_FRAME_LEN + 1]);
-            match result {
-                Ok(length) => {
-                    buffer.length = length;
-                    buffer.session = session;
-                    let Some(connection) = self.sessions[session].connection else {
-                        self.release(buffer);
-                        continue;
-                    };
-                    let local = &mut self.sessions[session];
-                    if local.tx_retained
-                        >= frame_quota(self.shared.config.config().sessions[session].queue_count)
-                    {
-                        self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
-                        local.totals.queue_drops = local.totals.queue_drops.wrapping_add(1);
-                        self.release(buffer);
-                        continue;
-                    }
-                    local.tx_retained += 1;
-                    buffer.tx_reserved = true;
-                    buffer.tag = connection.local_tag().get();
-                    buffer.lane = pack::flow_hash(&buffer.bytes[..length]) as usize
-                        % self.sessions[session].tx.len();
-                    buffer.deadline = now + reassembly::FRAME_LIFETIME;
-                    let owner = buffer.lane % self.shared.workers();
-                    if owner == self.id {
-                        self.frame(buffer, now)?;
-                    } else if let Err(Event::Frame(buffer)) = self.push(owner, Event::Frame(buffer))
-                    {
-                        self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
-                        self.sessions[session].totals.queue_drops =
-                            self.sessions[session].totals.queue_drops.wrapping_add(1);
-                        self.release(buffer);
-                    }
+            for totals in [&mut self.counters, &mut self.sessions[session].totals] {
+                totals.tap_read_calls = totals.tap_read_calls.wrapping_add(batch.calls);
+                totals.tap_read_requests = totals.tap_read_requests.wrapping_add(batch.requests);
+                totals.tap_read_batches = totals.tap_read_batches.wrapping_add(1);
+                totals.tap_ring_frames = totals.tap_ring_frames.wrapping_add(frames);
+                totals.tap_read_fallbacks = totals
+                    .tap_read_fallbacks
+                    .wrapping_add(u64::from(!reader.enabled));
+            }
+            for (buffer, result) in buffers.into_iter().zip(batch.results).take(count) {
+                self.read_tap_result(session, now, buffer.unwrap(), result)?;
+            }
+        } else {
+            for _ in 0..BATCH_SIZE {
+                if self.free.len() <= RECEIVE_BUFFERS - self.rx_retained {
+                    break;
                 }
-                Err(error) => {
-                    self.release(buffer);
-                    if !transient(&error) {
-                        self.counters.tap_errors = self.counters.tap_errors.wrapping_add(1);
-                        self.sessions[session].totals.tap_errors =
-                            self.sessions[session].totals.tap_errors.wrapping_add(1);
-                        let local = &mut self.sessions[session];
-                        self.reactor.remove(local.tap.as_ref().unwrap().as_fd())?;
-                        local.tap_registered = false;
-                        local.tap_retry = now + Duration::from_secs(1);
-                    }
+                let Some(mut buffer) = self.free.pop() else {
+                    break;
+                };
+                self.counters.tap_read_calls = self.counters.tap_read_calls.wrapping_add(1);
+                self.counters.tap_read_requests = self.counters.tap_read_requests.wrapping_add(1);
+                self.sessions[session].totals.tap_read_requests = self.sessions[session]
+                    .totals
+                    .tap_read_requests
+                    .wrapping_add(1);
+                self.sessions[session].totals.tap_read_calls =
+                    self.sessions[session].totals.tap_read_calls.wrapping_add(1);
+                let result = self.sessions[session]
+                    .tap
+                    .as_mut()
+                    .unwrap()
+                    .read_frame(&mut buffer.bytes[..MAX_FRAME_LEN + 1]);
+                if self.read_tap_result(session, now, buffer, result)? {
                     break;
                 }
             }
         }
         Ok(())
+    }
+
+    fn read_tap_result(
+        &mut self,
+        session: usize,
+        now: Duration,
+        mut buffer: Box<Buffer>,
+        result: io::Result<usize>,
+    ) -> io::Result<bool> {
+        match result {
+            Ok(length) => {
+                buffer.length = length;
+                buffer.session = session;
+                let Some(connection) = self.sessions[session].connection else {
+                    self.release(buffer);
+                    return Ok(false);
+                };
+                let local = &mut self.sessions[session];
+                if local.tx_retained
+                    >= frame_quota(self.shared.config.config().sessions[session].queue_count)
+                {
+                    self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
+                    local.totals.queue_drops = local.totals.queue_drops.wrapping_add(1);
+                    self.release(buffer);
+                    return Ok(false);
+                }
+                local.tx_retained += 1;
+                buffer.tx_reserved = true;
+                buffer.tag = connection.local_tag().get();
+                buffer.lane = pack::flow_hash(&buffer.bytes[..length]) as usize
+                    % self.sessions[session].tx.len();
+                buffer.deadline = now + reassembly::FRAME_LIFETIME;
+                let owner = buffer.lane % self.shared.workers();
+                if owner == self.id {
+                    self.frame(buffer, now)?;
+                } else if let Err(Event::Frame(buffer)) = self.push(owner, Event::Frame(buffer)) {
+                    self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
+                    self.sessions[session].totals.queue_drops =
+                        self.sessions[session].totals.queue_drops.wrapping_add(1);
+                    self.release(buffer);
+                }
+            }
+            Err(error) => {
+                self.release(buffer);
+                if !transient(&error) {
+                    self.counters.tap_errors = self.counters.tap_errors.wrapping_add(1);
+                    self.sessions[session].totals.tap_errors =
+                        self.sessions[session].totals.tap_errors.wrapping_add(1);
+                    let local = &mut self.sessions[session];
+                    if local.tap_registered {
+                        self.reactor.remove(local.tap.as_ref().unwrap().as_fd())?;
+                    }
+                    local.tap_registered = false;
+                    local.tap_retry = now + Duration::from_secs(1);
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn expired(&mut self, buffer: &Buffer, now: Duration) -> bool {
@@ -2796,7 +2871,7 @@ mod tests {
         for _ in 0..BUFFERS {
             tap.send(&[0; 60]).unwrap();
         }
-        for _ in 0..3 {
+        for _ in 0..8 {
             worker.read_tap(0, Duration::ZERO).unwrap();
         }
         assert_eq!(worker.pending.len(), BUFFERS - RECEIVE_BUFFERS);
@@ -2832,6 +2907,94 @@ mod tests {
         assert_eq!(worker.pending.len(), RECEIVE_BUFFERS);
         assert_eq!(worker.counters.admission_pressure, 0);
         assert_eq!(worker.counters.expired_frames, 0);
+    }
+
+    #[test]
+    #[ignore = "kernel seccomp test; run in a disposable container"]
+    fn denied_read_ring_setup_keeps_plain_tap_reads() {
+        let mut filter = [
+            libc::sock_filter {
+                code: 0x20,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            libc::sock_filter {
+                code: 0x15,
+                jt: 0,
+                jf: 1,
+                k: libc::SYS_io_uring_setup as u32,
+            },
+            libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            },
+            libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            },
+        ];
+        let program = libc::sock_fprog {
+            len: filter.len() as _,
+            filter: filter.as_mut_ptr(),
+        };
+        // SAFETY: restricts only this test thread; the initialized BPF program denies one syscall.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(
+                libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program),
+                0
+            );
+        }
+        let (mut worker, tap) = receive_worker();
+        assert!(worker.tap_reader.is_none());
+        assert_eq!(worker.counters.tap_read_fallbacks, 1);
+        worker.sessions[0].tx.truncate(1);
+        tap.send(&[0; 60]).unwrap();
+        worker.read_tap(0, Duration::ZERO).unwrap();
+        assert_eq!(worker.pending.len(), 1);
+        assert_eq!(worker.counters.tap_read_batches, 0);
+        assert_eq!(worker.counters.tap_ring_frames, 0);
+        assert_eq!(worker.counters.tap_read_calls, 2);
+        assert_eq!(worker.counters.tap_read_requests, 2);
+    }
+
+    #[test]
+    #[ignore = "kernel ring test; run in a disposable container"]
+    fn pool_pressure_does_not_shrink_the_tap_read_budget() {
+        let (mut worker, tap) = receive_worker();
+        assert!(worker.tap_reader.as_ref().unwrap().enabled);
+        worker.sessions[0].tx.truncate(1);
+        worker.sessions[0].tap_read_limit = BATCH_SIZE;
+        let held = worker.free.split_off(RECEIVE_BUFFERS + 1);
+        tap.send(&[0; 60]).unwrap();
+        worker.read_tap(0, Duration::ZERO).unwrap();
+        assert_eq!(worker.sessions[0].tap_read_limit, BATCH_SIZE);
+        assert_eq!(worker.pending.len(), 1);
+        assert_eq!(worker.free.len(), RECEIVE_BUFFERS);
+        worker.free.extend(held);
+        for _ in 0..BATCH_SIZE {
+            tap.send(&[0; 60]).unwrap();
+        }
+        worker.read_tap(0, Duration::ZERO).unwrap();
+        assert_eq!(worker.pending.len(), BATCH_SIZE + 1);
+        assert_eq!(worker.counters.tap_read_requests, (BATCH_SIZE + 1) as u64);
+        assert_eq!(worker.counters.tap_ring_frames, (BATCH_SIZE + 1) as u64);
+        assert_eq!(worker.counters.tap_read_calls, 2);
+        worker.read_tap(0, Duration::ZERO).unwrap();
+        assert_eq!(worker.sessions[0].tap_read_limit, 1);
+        for _ in 0..2 {
+            tap.send(&[0; 60]).unwrap();
+        }
+        worker.read_tap(0, Duration::ZERO).unwrap();
+        assert_eq!(worker.sessions[0].tap_read_limit, 2);
+        worker.read_tap(0, Duration::ZERO).unwrap();
+        assert_eq!(worker.pending.len(), BATCH_SIZE + 3);
+        assert_eq!(worker.counters.queue_drops, 0);
     }
 
     #[test]

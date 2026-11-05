@@ -1,0 +1,329 @@
+{
+  "revision": "fd8341b plus TAP read rings with corrected occupancy sizing and temporary stage timing",
+  "sha256": "66e5e4aa32868dd5fe857c349258c42e5ca1e5fe39d9a1b507f713e2fe22bbaf",
+  "profile": "one_socket_20",
+  "frame_bytes": 1514,
+  "flows": 16,
+  "outer_payload_limit": 1452,
+  "seconds_per_point": 20,
+  "sample_every_turns": 256,
+  "timing_clock": "CLOCK_THREAD_CPUTIME_ID",
+  "method": "Complete monotonic-second bins only. Each sampled turn calibrates one clock interval with consecutive reads; each stage's accumulated clock baselines are subtracted after aggregation. Tiny negative dispatch residuals remain visible. No nested TAP-write timing. Counts cover every turn, not just sampled turns. No concurrent build/test jobs during these measurements.",
+  "stages": [
+    "queues/control/setup/timers",
+    "receive processing including interleaved TAP delivery",
+    "transmit flush",
+    "final TAP delivery",
+    "notifications/counters/read interests/deadlines",
+    "epoll wait",
+    "ready-event dispatch",
+    "TAP read and frame dispatch",
+    "UDP recvmmsg"
+  ],
+  "count_columns": [
+    "TAP frames read",
+    "decoded records",
+    "reserved (always zero)",
+    "processed datagrams including handoffs",
+    "RX-budget exhaustion turns",
+    "processed UDP bytes including handoffs",
+    "TAP read handler calls",
+    "TAP read handler calls without an available TX buffer"
+  ],
+  "caveat": "Instrumented measurements; approximate CPU attribution, not the production throughput gate. Independently started runs may differ in kernel scheduling.",
+  "source_artifact": "rx-ring-profile-1452-1514-16/worker-profile.rs in the raw archive",
+  "runs": [
+    {
+      "point": 0,
+      "name": "rx-ring-profile-1452-1514-16/0",
+      "start": 1347638,
+      "end": 1347657,
+      "sides": [
+        {
+          "seconds": 19,
+          "turns": 684366,
+          "counts": [
+            8093541,
+            19614898,
+            0,
+            10874479,
+            212551,
+            15256359724,
+            518361,
+            0
+          ],
+          "ns": [
+            7882702,
+            79498770,
+            40327396,
+            48909413,
+            8787675,
+            9158735,
+            7621098,
+            67705402,
+            21179773
+          ],
+          "clock_costs": [
+            3907403,
+            3907403,
+            3907403,
+            3907403,
+            3907403,
+            3907403,
+            7827968,
+            3064933,
+            2658002
+          ],
+          "corrected_ns": [
+            3975299,
+            75591367,
+            36419993,
+            45002010,
+            4880272,
+            5251332,
+            -206870,
+            64640469,
+            18521771
+          ],
+          "stage_percent": [
+            1.5646123937980154,
+            29.751520495020454,
+            14.334311061843893,
+            17.71205199705034,
+            1.920794902799872,
+            2.0668380242965676,
+            -0.08142063424788813,
+            25.441426906080878,
+            7.289864853357864
+          ],
+          "estimated_cpu_percent": 342.3334979368421,
+          "frames_in_per_s": 425975.84210526315,
+          "tap_empty_percent": 0
+        },
+        {
+          "seconds": 19,
+          "turns": 1308863,
+          "counts": [
+            10328978,
+            13332712,
+            0,
+            7362153,
+            141280,
+            10378147606,
+            926310,
+            0
+          ],
+          "ns": [
+            13610134,
+            58524426,
+            58081527,
+            44897923,
+            17688859,
+            16793503,
+            12862078,
+            91634431,
+            16088649
+          ],
+          "clock_costs": [
+            7014239,
+            7014239,
+            7014239,
+            7014239,
+            7014239,
+            7014239,
+            12475028,
+            5293921,
+            2314956
+          ],
+          "corrected_ns": [
+            6595895,
+            51510187,
+            51067288,
+            37883684,
+            10674620,
+            9779264,
+            387050,
+            86340510,
+            13773693
+          ],
+          "stage_percent": [
+            2.461042900843268,
+            19.219344764805868,
+            19.054091461085815,
+            14.135059998072999,
+            3.98288598745122,
+            3.648813124325378,
+            0.14441507252183167,
+            32.21514278057598,
+            5.139203910317646
+          ],
+          "estimated_cpu_percent": 361.1111626105263,
+          "frames_in_per_s": 543630.4210526316,
+          "tap_empty_percent": 0
+        }
+      ],
+      "requested_per_flow": "500M",
+      "observed": {
+        "measurement_seconds": 20.18999999994412,
+        "udp_payload_gbps": [
+          3.999228875436199,
+          5.870793897684264
+        ],
+        "missing_percent": [
+          49.86160373339099,
+          26.45087166522073
+        ],
+        "daemon_cpu_percent": [
+          345.66617137292303,
+          355.8692422000934
+        ]
+      }
+    },
+    {
+      "point": 1,
+      "name": "rx-ring-profile-1452-1514-16/1",
+      "start": 1347659,
+      "end": 1347678,
+      "sides": [
+        {
+          "seconds": 19,
+          "turns": 582445,
+          "counts": [
+            10345158,
+            20717840,
+            0,
+            11249695,
+            283313,
+            16060034398,
+            403769,
+            0
+          ],
+          "ns": [
+            7628223,
+            73860816,
+            43144584,
+            41838456,
+            7527681,
+            7890468,
+            6195208,
+            71545725,
+            17471432
+          ],
+          "clock_costs": [
+            3317554,
+            3317554,
+            3317554,
+            3317554,
+            3317554,
+            3317554,
+            6254950,
+            2370285,
+            1869854
+          ],
+          "corrected_ns": [
+            4310669,
+            70543262,
+            39827030,
+            38520902,
+            4210127,
+            4572914,
+            -59742,
+            69175440,
+            15601578
+          ],
+          "stage_percent": [
+            1.7473169470979137,
+            28.594502894137378,
+            16.14376897682866,
+            15.61433384982654,
+            1.7065625443601673,
+            1.8536171832774238,
+            -0.024216243245195484,
+            28.040060286455514,
+            6.324053561261599
+          ],
+          "estimated_cpu_percent": 332.3987267368421,
+          "frames_in_per_s": 544482,
+          "tap_empty_percent": 0
+        },
+        {
+          "seconds": 19,
+          "turns": 705185,
+          "counts": [
+            11258226,
+            17510139,
+            0,
+            9503618,
+            239599,
+            13577520443,
+            419731,
+            0
+          ],
+          "ns": [
+            10402819,
+            60920192,
+            48388912,
+            37646180,
+            9467235,
+            9513157,
+            6627392,
+            77707155,
+            14729257
+          ],
+          "clock_costs": [
+            3899104,
+            3899104,
+            3899104,
+            3899104,
+            3899104,
+            3899104,
+            6690022,
+            2389302,
+            1643311
+          ],
+          "corrected_ns": [
+            6503715,
+            57021088,
+            44489808,
+            33747076,
+            5568131,
+            5614053,
+            -62630,
+            75317853,
+            13085946
+          ],
+          "stage_percent": [
+            2.6954489180100016,
+            23.63225171357495,
+            18.43869309095997,
+            13.986393851852563,
+            2.3076983968836196,
+            2.326730658477625,
+            -0.025956851697063358,
+            31.21530162002584,
+            5.423438601912493
+          ],
+          "estimated_cpu_percent": 325.09984336842103,
+          "frames_in_per_s": 592538.2105263158,
+          "tap_empty_percent": 0
+        }
+      ],
+      "requested_per_flow": "0",
+      "observed": {
+        "measurement_seconds": 20.209999999962747,
+        "udp_payload_gbps": [
+          5.183375745067573,
+          6.129071580179461
+        ],
+        "missing_percent": [
+          58.81909806607233,
+          52.467197525243826
+        ],
+        "daemon_cpu_percent": [
+          330.1830776849233,
+          325.7298367150982
+        ]
+      }
+    }
+  ]
+}

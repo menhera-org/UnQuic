@@ -444,9 +444,21 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
     }
     frame_storm();
     for control in [&left.control, &right.control] {
+        let mut ring_frames = 0;
+        let mut fallbacks = 0;
         for worker in 0..2 {
-            assert_eq!(control.worker_counters(worker).unwrap().queue_drops, 0);
+            let counters = control.worker_counters(worker).unwrap();
+            assert_eq!(counters.queue_drops, 0);
+            ring_frames += counters.tap_ring_frames;
+            fallbacks += counters.tap_read_fallbacks;
         }
+        if fallbacks == 0 {
+            assert!(
+                ring_frames > 0,
+                "the allocation check must exercise available read rings"
+            );
+        }
+        println!("TAP ring frames={ring_frames} fallbacks={fallbacks}");
     }
     // The earlier capture sockets also accumulated storm traffic; free space before reuse.
     for socket in [&a, &b] {
