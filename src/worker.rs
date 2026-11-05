@@ -2104,11 +2104,32 @@ impl Worker {
         let lane = local.rx[slot].as_mut().unwrap();
         let mut writable = false;
         if let Some(tap) = &mut local.tap {
-            for _ in 0..BATCH_SIZE {
-                let Some(frame) = lane.front(now) else { break };
-                let length = frame.bytes.len();
-                match tap.write_frame(frame.bytes) {
-                    Ok(()) => {
+            let mut budget = BATCH_SIZE;
+            while budget != 0 {
+                let uso = tap.uso_enabled();
+                let (mask, result) = tap.write_batch(lane.ready_frames(now).take(budget));
+                if mask == 0 {
+                    break;
+                }
+                let attempted = mask.count_ones() as usize;
+                debug_assert!(attempted <= budget);
+                let fallback = u64::from(uso && !tap.uso_enabled());
+                for totals in [
+                    &mut self.counters,
+                    &mut local.totals,
+                    &mut local.rx_totals[slot],
+                ] {
+                    totals.tap_write_calls = totals.tap_write_calls.wrapping_add(1 + fallback);
+                    totals.tap_uso_fallbacks = totals.tap_uso_fallbacks.wrapping_add(fallback);
+                    if attempted > 1 && result.is_ok() {
+                        totals.tap_uso_batches = totals.tap_uso_batches.wrapping_add(1);
+                        totals.tap_uso_frames =
+                            totals.tap_uso_frames.wrapping_add(attempted as u64);
+                    }
+                }
+                local.rx_dirty |= 1_u64 << slot;
+                match result {
+                    Ok(length) => {
                         self.counters.delivered_frame_bytes = self
                             .counters
                             .delivered_frame_bytes
@@ -2128,14 +2149,18 @@ impl Worker {
                         break;
                     }
                     Err(_) => {
-                        self.counters.tap_errors = self.counters.tap_errors.wrapping_add(1);
-                        local.totals.tap_errors = local.totals.tap_errors.wrapping_add(1);
-                        local.rx_totals[slot].tap_errors =
-                            local.rx_totals[slot].tap_errors.wrapping_add(1);
+                        self.counters.tap_errors =
+                            self.counters.tap_errors.wrapping_add(attempted as u64);
+                        local.totals.tap_errors =
+                            local.totals.tap_errors.wrapping_add(attempted as u64);
+                        local.rx_totals[slot].tap_errors = local.rx_totals[slot]
+                            .tap_errors
+                            .wrapping_add(attempted as u64);
                         local.rx_dirty |= 1_u64 << slot;
                     }
                 }
-                lane.finish_front();
+                lane.finish_ready(mask);
+                budget -= attempted;
             }
         }
         writable

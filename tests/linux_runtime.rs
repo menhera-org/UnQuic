@@ -145,6 +145,82 @@ fn storm_frame(bytes: &mut [u8; 1514], direction: usize, sequence: usize) -> usi
     length
 }
 
+fn uso_delivery_allocates_nothing(net: &UdpSocket) {
+    let control = UdpSocket::bind("0.0.0.0:0").unwrap();
+    let mut req = request(c"uq-right");
+    let mut addr = libc::sockaddr {
+        sa_family: libc::AF_INET as _,
+        sa_data: [0; 14],
+    };
+    for (dst, src) in addr.sa_data[2..6].iter_mut().zip([198u8, 18, 0, 2]) {
+        *dst = src as _;
+    }
+    req.ifr_ifru.ifru_addr = addr;
+    // SAFETY: this changes only the test's TAP in its private network namespace.
+    check(unsafe { libc::ioctl(control.as_raw_fd(), libc::SIOCSIFADDR as _, &req) });
+    let receiver = UdpSocket::bind("198.18.0.2:9999").unwrap();
+    receiver.set_nonblocking(true).unwrap();
+    let gro = 1i32;
+    // SAFETY: UDP_GRO reads one initialized integer from its exact ABI buffer.
+    check(unsafe {
+        libc::setsockopt(
+            receiver.as_raw_fd(),
+            libc::SOL_UDP,
+            libc::UDP_GRO,
+            (&gro as *const i32).cast(),
+            size_of_val(&gro) as _,
+        )
+    });
+    let source = raw_socket(c"uq-left", libc::ETH_P_IP as u16);
+    let destination_mac = mac_address(net, c"uq-right");
+    let source_mac = mac_address(net, c"uq-left");
+    let frames: Vec<_> = (0..512u16)
+        .map(|sequence| {
+            let mut payload = [0x5a; 1472];
+            payload[..2].copy_from_slice(&sequence.to_be_bytes());
+            let mut frame = common::udp::frame(false, sequence, &payload);
+            frame[..6].copy_from_slice(destination_mac.as_bytes());
+            frame[6..12].copy_from_slice(source_mac.as_bytes());
+            frame
+        })
+        .collect();
+    let mut input = [0u8; 65536];
+    let mut seen = [false; 512];
+    let mut coalesced = false;
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    DEALLOCATIONS.store(0, Ordering::Relaxed);
+    COUNTING.store(true, Ordering::SeqCst);
+    for batch in frames.chunks(32) {
+        for frame in batch {
+            raw_send(&source, frame);
+        }
+        let mut received = 0;
+        until(Duration::from_secs(2), || match receiver.recv(&mut input) {
+            Ok(n) => {
+                assert_eq!(n % 1472, 0);
+                coalesced |= n > 1472;
+                for payload in input[..n].chunks(1472) {
+                    let sequence = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+                    assert!(sequence < seen.len() && !seen[sequence]);
+                    assert_eq!(payload, &frames[sequence][42..]);
+                    seen[sequence] = true;
+                    received += 1;
+                }
+                received == batch.len()
+            }
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+                false
+            }
+        });
+    }
+    COUNTING.store(false, Ordering::SeqCst);
+    assert!(seen.iter().all(|&v| v));
+    assert!(coalesced, "the allocation check must exercise USO delivery");
+    assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
+}
+
 fn frame_storm() {
     let sockets = [
         raw_socket(c"uq-left", 0x88b5),
@@ -305,6 +381,7 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
                 && right.control.session(session).unwrap().carrier
         })
     });
+    uso_delivery_allocates_nothing(&net);
     let a = raw_socket(c"uq-left", libc::ETH_P_ALL as u16);
     let b = raw_socket(c"uq-right", libc::ETH_P_ALL as u16);
     for fd in [&a, &b] {

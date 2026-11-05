@@ -140,7 +140,15 @@ metrics! {
     affinity_failures: sum,
     /// Operational socket errors, excluding WouldBlock and Interrupted.
     socket_errors: sum,
-    /// Operational TAP errors, excluding WouldBlock and Interrupted.
+    /// TAP frame write syscalls, including unsuccessful attempts and fallback retries.
+    tap_write_calls: sum,
+    /// Successful TAP USO writes representing two or more original frames.
+    tap_uso_batches: sum,
+    /// Original frames delivered in successful multi-frame TAP USO writes.
+    tap_uso_frames: sum,
+    /// TAP queues that disabled USO after a kernel capability rejection.
+    tap_uso_fallbacks: sum,
+    /// Frames discarded after permanent TAP write errors, plus TAP read errors.
     tap_errors: sum,
 }
 

@@ -306,11 +306,10 @@ frame identities. Planning stops before starting a frame that would cross the
 GSO aggregate's byte limit. The final UDP datagram may be short. Thus local
 aggregate drops do not leave orphan pieces in adjacent batches. Individual
 on-wire datagram losses still require the planned bounded selective repair. Batch storage and scheduling entries count toward startup's
-memory reservation. TAP I/O still requires one read or write per frame. No
-throughput target follows from allocation checks alone. Small-frame acceptance must
-report delivered frames per second, CPU and drops separately from large-frame
-Gbit/s. Multi-record packing reduces outer packet overhead; it does not remove
-TAP's per-frame read/write cost.
+memory reservation. TAP reads still require one syscall per frame. Eligible
+UDP frames share a TAP write as described below. No throughput target follows
+from allocation checks alone. Small-frame acceptance must report delivered
+frames per second, CPU and drops separately from large-frame Gbit/s.
 
 ## Delivery and liveness
 
@@ -334,6 +333,32 @@ lane or its usable MTU. After 3 seconds without feedback the session becomes
 degraded and attempts replacement while retaining its active connection. After
 30 seconds it retires that connection and lowers carrier through the worker
 barrier. Recovery and per-lane path monitoring remain stage 3 work.
+
+## TAP write coalescing
+
+TAP queues use an internal 10-byte virtio header. Read offloads remain disabled:
+the runtime removes metadata and rejects unexpected GSO or partial-checksum
+input. Wire DATA still carries ordinary Ethernet frames.
+
+A receive flush may combine already-complete UDP frames into one USO
+`writev`, borrowing their payloads directly from reassembly slots. Supported
+frames are untagged IPv4 without options, with DF set, or plain IPv6 without
+extension headers. IP/UDP lengths and checksums must be valid; UDP checksums
+must be present. Headers must match apart from lengths, checksums and consecutive
+IPv4 IDs. The final payload may be shorter. Other frames use ordinary writes.
+
+Grouping preserves order within the existing flow-hash definition and may
+pass frames from other flows. An incompatible frame in the same flow stops
+grouping. A flush still handles at most 64 frames per lane, with no wait for
+more traffic; each aggregate is at most 65,535 bytes. No new frame storage,
+heap allocation or lock is required.
+
+WouldBlock and Interrupted retain every selected frame. A successful write
+releases exactly those frames; a permanent failure makes them terminal.
+EINVAL or EOPNOTSUPP disables USO on that TAP queue and retries a single frame.
+Counters report TAP write calls, successful USO batches and frames, and offload
+fallbacks as `tap_write_calls`, `tap_uso_batches`, `tap_uso_frames` and
+`tap_uso_fallbacks`. Delivered bytes count the original Ethernet frames.
 
 ## Socket offloads
 

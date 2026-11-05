@@ -555,6 +555,38 @@ impl Lane {
         })
     }
 
+    pub(crate) fn ready_frames(&mut self, now: Duration) -> impl Iterator<Item = &[u8]> {
+        self.expire(now);
+        self.ready.iter().map(|&slot| {
+            let frame = &self.frames[usize::from(slot)];
+            &frame.bytes[..usize::from(frame.length)]
+        })
+    }
+
+    pub(crate) fn finish_ready(&mut self, mask: u64) {
+        if mask == 1 {
+            self.finish_front();
+            return;
+        }
+        let mut slots = [0u8; FRAME_CAPACITY];
+        let mut count = 0;
+        let mut index = 0;
+        self.ready.retain(|&slot| {
+            let remove = mask & (1 << index) != 0;
+            index += 1;
+            if remove {
+                slots[count] = slot;
+                count += 1;
+            }
+            !remove
+        });
+        for &slot in &slots[..count] {
+            let slot = usize::from(slot);
+            self.terminal.mark(self.frames[slot].sequence);
+            self.release_storage(slot);
+        }
+    }
+
     /// Marks the head frame terminal and releases its storage.
     ///
     /// Used for either full TAP delivery or permanent write failure.
@@ -604,6 +636,19 @@ impl Lane {
     }
 
     fn release(&mut self, slot: usize) {
+        if self
+            .ready
+            .front()
+            .is_some_and(|&queued| usize::from(queued) == slot)
+        {
+            self.ready.pop_front();
+        } else {
+            self.ready.retain(|&queued| usize::from(queued) != slot);
+        }
+        self.release_storage(slot);
+    }
+
+    fn release_storage(&mut self, slot: usize) {
         let mut hole = hash(self.frames[slot].sequence);
         while self.index[hole] != slot as u8 {
             hole = (hole + 1) % INDEX_LEN;
@@ -618,15 +663,6 @@ impl Lane {
                 hole = at;
             }
             at = (at + 1) % INDEX_LEN;
-        }
-        if self
-            .ready
-            .front()
-            .is_some_and(|&queued| usize::from(queued) == slot)
-        {
-            self.ready.pop_front();
-        } else {
-            self.ready.retain(|&queued| usize::from(queued) != slot);
         }
         self.retained_bytes -= usize::from(self.frames[slot].length);
         self.frames[slot].sequence = 0;
@@ -651,6 +687,58 @@ fn validate(id: u16, frame_limit: u16) -> Result<(), LaneError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn batch_completion_releases_only_selected_slots_and_preserves_other_frames() {
+        let mut lane = Lane::new(1, 9022).unwrap();
+        let mut bytes = [0; 256];
+        for sequence in 1..=64u64 {
+            let payload = [sequence as u8; 60];
+            let n = crate::wire::encode_datagram(
+                crate::wire::Header {
+                    cookie: crate::UnquicUuid::from_bytes([1; 16]),
+                    receive_tag: 1,
+                    lane: 1,
+                    packet_number: sequence,
+                    record_area_len: 0,
+                },
+                &[crate::wire::Record::Data {
+                    frame_id: (1 << 48) | sequence,
+                    total_len: 60,
+                    offset: 0,
+                    bytes: &payload,
+                }],
+                &mut bytes,
+            )
+            .unwrap();
+            assert_eq!(
+                lane.admit(
+                    &crate::wire::Datagram::decode(&bytes[..n]).unwrap(),
+                    Duration::ZERO
+                ),
+                Admission::Fresh
+            );
+        }
+        lane.finish_ready(0x5555_5555_5555_5555);
+        assert_eq!(lane.retained_frames(), 32);
+        assert_eq!(lane.retained_bytes(), 32 * 60);
+        assert_eq!(
+            lane.ready_frames(Duration::ZERO)
+                .map(|f| f[0])
+                .collect::<Vec<_>>(),
+            (2..=64).step_by(2).collect::<Vec<_>>()
+        );
+        for sequence in 1..=64 {
+            assert_eq!(lane.terminal.old(sequence), sequence % 2 == 1);
+            assert_eq!(lane.find(sequence).is_none(), sequence % 2 == 1);
+        }
+        lane.finish_ready(1);
+        assert!(lane.terminal.old(2));
+        lane.finish_ready(u64::MAX);
+        assert_eq!(lane.retained_frames(), 0);
+        assert_eq!(lane.retained_bytes(), 0);
+        assert_eq!(lane.free.len(), FRAME_CAPACITY);
+        assert_eq!(lane.ready_frames(Duration::ZERO).count(), 0);
+    }
     #[test]
     fn contiguous_copy_preserves_coverage_overlap_and_reused_slots() {
         let mut frame = Frame::empty();

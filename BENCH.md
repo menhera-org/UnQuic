@@ -1,14 +1,16 @@
 # Release transport overload investigation
 
-The original throughput collapse is reproduced and its receive-admission
-failure is fixed. A later TAP readiness busy loop is now fixed too. Subsequent
-20-second MTU-1500 sweeps still show rate-dependent declines: the latest
-unchanged MTU-1500 baseline repeat falls 5.7% in reverse under unlimited load.
-The latest 64-byte baseline repeat falls 9.1% / 5.1%.
+The original receive-admission collapse and a later TAP readiness busy loop
+are fixed. Local TAP USO coalescing now improves delivery: the final
+MTU-1500 build reaches 4.38–4.56 / 5.87–5.90 Gbit/s under unlimited load.
+Both unlimited points exceed their paced predecessors in both directions.
+The corresponding 64-byte sweeps also hold up under overload.
+
+These short sweeps do not establish a plateau for every workload or the
+theoretical CPU ceiling. Neither the local **20 Gbit/s in each direction**
+gate nor the real **5 Gbit/s under loss** gate has passed.
 Split-pool, deadline-cache and first-reader lane-association trials were rejected
 and reverted after measurements.
-The strict plateau requirement remains unmet. Neither the local **20 Gbit/s in each direction** gate nor the
-real **5 Gbit/s under loss** gate has passed.
 
 This report separates that remaining decline from the earlier near-total
 collapse. Recovery, congestion control and PMTU discovery remain unfinished;
@@ -16,7 +18,7 @@ their absence does not explain away a scheduling or admission failure.
 
 ## Current performance gaps
 
-Status after the TAP readiness fix and per-peer payload-limit comparison.
+Status after the TAP readiness fix, per-peer payload limit and local TAP USO.
 The split-pool, deadline-cache and lane-association experiments below are not
 in the runtime.
 The latest results use the 20-CPU single-socket profile and capped
@@ -25,20 +27,19 @@ L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | The latest unchanged 1452-byte baseline repeats deliver 3.79–3.84 / 4.87–5.09 Gbit/s of inner UDP payload under unlimited load | Roughly 5.2× / 3.9× more delivered goodput is needed even relative to the better unlimited point. The gate is not close to passing. |
-| Goodput must plateau under excess traffic | An unchanged MTU-1500 baseline repeat declines 5.7% in reverse; the latest 64-byte repeat declines 9.1% / 5.1% | The verified readiness busy loop is fixed. Rate-dependent declines persist and need further profiling. Longer runs, more frame mixes and broader flow/session coverage remain unverified. Removing the earlier admission cascade does not satisfy the plateau requirement. |
-| Small-frame overload must remain efficient | The latest unchanged 64-byte, 16-flow unlimited points deliver 419–480k / 455–518k frames/s | The second repeat falls below its paced predecessor in both directions. Earlier passing repeats do not establish a sustained plateau; the small-frame gate remains open. |
+| At least 20 Gbit/s each way at inner MTU 1500 | The final USO repeat delivers 4.38–4.56 / 5.87–5.90 Gbit/s of inner UDP payload under unlimited load | Even the better points need about 4.4× / 3.4× more delivered goodput. The generator still offers only about 13 Gbit/s each way. |
+| Goodput must plateau under excess traffic | Six MTU-1500 and six 64-byte USO unlimited points exceed their paced predecessors in both directions; earlier baselines declined | The current 20-second samples pass that comparison. Longer runs, mixed traffic, more flows/sessions and the acceptance gate remain unverified. |
+| Small-frame overload must remain efficient | The final build delivers 729–737k / 714–734k frames/s in two 64-byte unlimited points, compared with 419–480k / 455–518k in the last unchanged baseline | Both 5M- and 10M-per-flow sweeps hold up under overload. Mixed and non-coalescible traffic still need coverage. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
 | Use larger confirmed path MTUs | The runtime accepts a per-peer 1232–1452-byte payload assertion; a controlled 1452-byte sweep shows only a modest change | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. Configured capacity is not confirmed PMTU. |
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
 
-Loss under unlimited load is still high: the latest unchanged 1452-byte MTU-1500 points
-miss about 70% / 59–61% of offered frames despite zero admission-pressure
-rejections and zero worker queue drops. TAP ingress drops and outer socket
-overflows account for visible loss locations; their different units prevent
-an exact frame-loss decomposition. Inner UDP receive-buffer errors are recorded
-and are too small to explain the observed 64-byte goodput decline.
+Loss under unlimited load is still high: the final USO MTU-1500
+points miss about 64–66% / 54–56% of offered frames despite zero admission
+pressure and worker queue drops. TAP ingress drops, outer socket overflows
+and inner UDP receive-buffer errors are recorded. Their different units prevent
+an exact frame-loss decomposition.
 
 Earlier single-socket runs still declined. Calibrated profiling then found
 TAP wakeups with no available transmit buffer; the final follow-up below verifies
@@ -891,11 +892,10 @@ That extrapolation excludes outer transport work and scheduling. The probes
 justify evaluating B1 and B2, but do not establish the target as achievable.
 
 USO payload delivery is verified for groups of 1, 2, 16, 43 and 44.
-Byte-exact Ethernet/IP reconstruction, short final segments, IPv6 and mixed
-traffic have not been verified. Header construction and checksum/coalescibility
-checks are excluded from the write timing. B1 must validate those cases before
-production use; B3 super-frame reads remain unmeasured. The daemon's TAP path
-is unchanged.
+At this probe revision, byte-exact Ethernet/IP reconstruction, short final
+segments, IPv6 and mixed traffic had not been verified. Header construction and checksum/coalescibility
+checks are excluded from the write timing. The B1 checks below cover those cases; B3 super-frame reads remain unmeasured.
+The probe itself did not change the daemon's TAP path.
 
 To reproduce, build the probe, then copy the printed executable path into a
 disposable container with `/dev/net/tun`, `CAP_NET_ADMIN`, iproute2 and
@@ -909,3 +909,127 @@ taskset -c 0 ./tap_cost --run-in-container
 Without the explicit argument the probe exits before creating a namespace.
 Clippy, formatting and Rust 1.89 compilation pass. The three container runs
 completed all payload, completion-count, empty-ring and queue-overflow checks.
+
+## Lossless local TAP USO (audit B1)
+
+Complete compatible UDP frames now share a TAP `writev`. Payloads stay in
+their reassembly slots; only the first Ethernet/IP/UDP header is copied.
+Grouping preserves per-flow order, caps each write at 64 frames and 65,535
+bytes, and never waits for more traffic. Plain writes remain the fallback.
+Receive admission, ACK eligibility, frame deadlines and storage limits are
+unchanged. Transient writes retain all selected frames; kernel capability
+rejection disables USO on that queue.
+
+The initial checksum loop cost 1.051–1.090 µs per 1472 bytes in a standalone
+release probe. Exact two-byte chunks reduced it to 120–123 ns, with the same
+sum at every length from 0 through 65,534. These are wall-time measurements
+over two million calls per case, repeated three times on CPU 0, with hot
+buffers. They isolate the loop cost, not end-to-end gain. The final code uses
+the equivalent `as_chunks::<2>()` array-slice API; the regression also checks
+odd lengths and unaligned input.
+
+The first six-point USO trial retained the slow loop. Its unlimited points
+delivered 3.08–3.78 / 4.80–4.94 Gbit/s; the first forward point declined 4.6%
+from paced overload. Those results remain in the data file as
+`uso_scalar_trial`. The following sweeps use exact-pair accumulation.
+They retain the existing 20-second, four-worker, 16-flow, single-socket
+profile. No builds or other own tests ran during measurements; CPUs were
+not exclusively reserved.
+
+| Frame bytes | Sweep | Requested/flow | Delivered Gbit/s | Missing % | Daemon CPU % |
+| ---: | --- | --- | ---: | ---: | ---: |
+| 1514 | MTU | 125M | 1.995 / 1.988 | 0.23 / 0.58 | 326.1 / 333.6 |
+| 1514 | MTU | 250M | 3.611 / 3.938 | 9.72 / 1.56 | 352.2 / 355.9 |
+| 1514 | MTU | 500M | 3.509 / 5.413 | 55.69 / 32.33 | 355.9 / 365.1 |
+| 1514 | MTU | unlimited | 4.387 / 5.798 | 66.88 / 55.27 | 342.5 / 335.2 |
+| 1514 | MTU | 500M | 3.621 / 5.047 | 54.58 / 36.90 | 343.5 / 346.8 |
+| 1514 | MTU | unlimited | 4.311 / 5.686 | 67.29 / 55.50 | 337.1 / 330.1 |
+| 1514 | MTU repeat | 500M | 3.123 / 5.015 | 60.68 / 37.01 | 315.6 / 357.7 |
+| 1514 | MTU repeat | unlimited | 4.119 / 5.484 | 67.76 / 57.35 | 319.8 / 329.5 |
+| 1514 | MTU repeat | 500M | 3.557 / 5.199 | 55.08 / 35.02 | 346.2 / 351.4 |
+| 1514 | MTU repeat | unlimited | 4.680 / 5.640 | 64.30 / 56.57 | 343.9 / 332.4 |
+| 64 | small | 5M | 0.078 / 0.079 | 2.48 / 1.65 | 354.3 / 362.5 |
+| 64 | small | unlimited | 0.130 / 0.126 | 37.76 / 39.48 | 329.0 / 319.4 |
+| 64 | small | 5M | 0.077 / 0.078 | 3.68 / 2.53 | 352.6 / 361.2 |
+| 64 | small | unlimited | 0.133 / 0.127 | 34.52 / 39.31 | 330.9 / 320.6 |
+| 64 | small, high | 10M | 0.107 / 0.113 | 33.07 / 29.24 | 346.2 / 355.9 |
+| 64 | small, high | unlimited | 0.114 / 0.128 | 47.59 / 37.16 | 309.6 / 312.8 |
+| 64 | small, high | 10M | 0.107 / 0.108 | 33.22 / 32.30 | 341.4 / 344.4 |
+| 64 | small, high | unlimited | 0.127 / 0.131 | 40.18 / 38.85 | 324.3 / 319.5 |
+
+The unchanged MTU-1500 baseline preceding this work delivered
+3.79–3.84 / 4.87–5.09 Gbit/s under unlimited load. These are independently
+started sweeps, so the difference also includes scheduling and kernel flow
+placement variation. All normal-build points, actual offered rates, per-core
+ticks and drop counters are in [the data file](benches/tap_transport-overload.json).
+
+Under MTU-1500 unlimited load, 97.2–98.0% of delivered frames used USO,
+averaging 6.65–7.31 frames per coalesced write. For 64-byte frames, about
+99% used USO, averaging 10.2–11.5 frames per coalesced write. No offload
+fallbacks or TAP errors occurred. These counters measure actual use of the
+optimization, independently of throughput.
+
+All 32 new normal-build points have zero admission-pressure rejections,
+worker queue drops and outer IPv6 fragmentation. Loss is still substantial:
+in the last exact-pair MTU repeat, TAP TX drops were 12.32 / 11.03 million,
+socket overflow was 82,629 / 121,590 SKBs, and inner UDP receive-buffer errors
+were 114,791 / 67,647. Expiry was 0 / 256 frames. Those left/right counters
+name different stages and units; they cannot be added into a frame-loss total.
+
+
+The final `as_chunks::<2>()` build repeats the overload comparison at both
+frame sizes. Its binary SHA-256 is
+`a47b8149bc80dd7c54e59ec1e80c9d5495851845006e3542f879a58b3bf7e638`.
+
+| Frame bytes | Requested/flow | Delivered Gbit/s | Missing % | Daemon CPU % |
+| ---: | --- | ---: | ---: | ---: |
+| 1514 | 500M | 3.587 / 5.443 | 55.00 / 31.77 | 356.8 / 362.7 |
+| 1514 | unlimited | 4.380 / 5.869 | 65.83 / 54.00 | 328.9 / 332.0 |
+| 1514 | 500M | 3.564 / 5.442 | 55.31 / 31.97 | 356.2 / 361.8 |
+| 1514 | unlimited | 4.561 / 5.904 | 64.42 / 56.07 | 341.2 / 341.1 |
+| 64 | 10M | 0.110 / 0.114 | 30.95 / 28.84 | 353.8 / 360.4 |
+| 64 | unlimited | 0.128 / 0.126 | 36.43 / 38.40 | 328.1 / 318.1 |
+| 64 | 10M | 0.103 / 0.109 | 35.48 / 31.96 | 335.9 / 342.3 |
+| 64 | unlimited | 0.130 / 0.129 | 39.59 / 39.80 | 326.0 / 321.8 |
+
+Each final unlimited point exceeds its paced predecessor in both directions.
+Small-frame unlimited delivery is 729–737k / 714–734k frames/s. Neither
+the five-run 60-second gate nor the real-path target has been tested here.
+
+### Remaining CPU cost
+
+[A diagnostic profile](benches/worker-uso-profile.json) samples one turn in
+256, subtracts a clock-pair calibration and retains only complete one-second
+bins. It records 19 seconds per point. Its instrumented binary is separate
+from all normal-build throughput results.
+
+| Stage | Paced 500M/flow CPU share, left/right % | Unlimited CPU share, left/right % |
+| --- | ---: | ---: |
+| TAP reads and frame dispatch | 30.0 / 38.8 | 35.4 / 40.4 |
+| Receive processing, including interleaved TAP delivery | 26.6 / 15.9 | 25.6 / 20.6 |
+| Final TAP delivery | 18.1 / 13.2 | 14.3 / 12.6 |
+| Transmit flush | 13.5 / 18.0 | 14.2 / 16.0 |
+| epoll wait | 2.1 / 3.2 | 1.5 / 1.7 |
+
+No TAP read call began without a transmit buffer. Estimated sampled CPU was
+346% / 350% under unlimited load, against process measurements of 339% / 341%.
+The read category includes frame hashing and handoff, so it is not a syscall-only
+measurement. B0 independently measured lower cost for batched reads; B2 is the
+next experiment. This profile does not establish a theoretical CPU maximum.
+
+### Correctness checks
+
+Kernel tests compare every byte after veth segmentation with ordinary writes
+for IPv4 and IPv6, groups of 1, 2, 43 and 44, short final segments, IPv4 ID
+wrap, zero-result UDP checksums, the 64-frame limit and the aggregate-byte
+limit. They cover header mismatches, invalid checksums, same-flow barriers,
+cross-flow grouping, backpressure, short writes, capability rejection and
+unexpected virtio metadata. Reassembly tests verify exact slot release,
+retained ordering and duplicate suppression.
+
+The full release suite, all 11 ignored kernel unit tests, TAP/socket foundation
+test and reconnect/runtime storm pass. The runtime test verifies coalesced UDP
+delivery with zero allocations and deallocations while counting; the existing
+storm also checks corruption, duplicates and zero worker queue drops.
+Clippy, formatting and Rust 1.89 checks pass. Real old-kernel capability
+fallback remains untested; descriptor fault tests cover its control flow.

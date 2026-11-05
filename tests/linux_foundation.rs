@@ -76,7 +76,7 @@ fn kernel_socket_and_tap_invariants() {
             queue_flags & (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_MULTI_QUEUE),
             libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_MULTI_QUEUE
         );
-        assert_eq!(queue_flags & libc::IFF_VNET_HDR, 0);
+        assert_ne!(queue_flags & libc::IFF_VNET_HDR, 0);
         assert_ne!(
             unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
             0

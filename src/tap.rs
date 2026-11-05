@@ -5,6 +5,11 @@
 //! bridge membership, addresses and administrative state. Queues can be moved
 //! out of the Tap for per-worker ownership; any queue can control carrier.
 
+mod uso;
+#[cfg(test)]
+#[path = "tap/uso_tests.rs"]
+mod uso_tests;
+
 use crate::{
     MAX_FRAME_LEN, MacAddress,
     sys::{cvt, invalid, udp_socket},
@@ -29,8 +34,9 @@ pub struct Tap {
 impl Tap {
     /// Creates a named TAP with MTU 1500..9000 and 1..64 queues.
     ///
-    /// Uses IFF_TAP, IFF_NO_PI and IFF_MULTI_QUEUE with checksum/GSO offloads
-    /// disabled. Any failure closes all queues created by this call.
+    /// Uses IFF_TAP, IFF_NO_PI, IFF_MULTI_QUEUE and internal virtio metadata.
+    /// Read checksum/GSO offloads stay disabled; eligible writes may use USO.
+    /// Any failure closes all queues created by this call.
     /// Sets the supplied MAC; None derives a Menhera MAC-M address from the
     /// current UTS hostname and interface name using SHA-256.
     /// Administrative state is left to the caller or network manager.
@@ -77,15 +83,21 @@ impl Tap {
             request.ifr_ifru.ifru_flags = (libc::IFF_TAP
                 | libc::IFF_NO_PI
                 | libc::IFF_MULTI_QUEUE
+                | libc::IFF_VNET_HDR
                 | if i == 0 { libc::IFF_TUN_EXCL } else { 0 })
                 as libc::c_short;
             // SAFETY: TUNSETIFF reads/writes the initialized ifreq.
             cvt(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &mut request) })?;
             // SAFETY: TUNSETOFFLOAD takes an integer bitmask, not a pointer.
             cvt(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETOFFLOAD, 0 as libc::c_ulong) })?;
+            let header_len = 10i32;
+            // SAFETY: TUNSETVNETHDRSZ reads one initialized integer.
+            cvt(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETVNETHDRSZ, &header_len) })?;
             tap.queues.push(TapQueue {
                 fd,
                 frame_limit: mtu as usize + 22,
+                vnet: true,
+                uso: true,
             });
         }
         request.ifr_ifru.ifru_mtu = mtu as libc::c_int;
@@ -139,6 +151,8 @@ impl Tap {
 pub struct TapQueue {
     fd: OwnedFd,
     frame_limit: usize,
+    vnet: bool,
+    uso: bool,
 }
 
 impl TapQueue {
@@ -147,6 +161,8 @@ impl TapQueue {
         Self {
             fd,
             frame_limit: MAX_FRAME_LEN,
+            vnet: false,
+            uso: false,
         }
     }
 
@@ -168,18 +184,39 @@ impl TapQueue {
         if buffer.len() <= MAX_FRAME_LEN {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        // SAFETY: buffer is writable for its full length.
+        let mut header = [0u8; 10];
+        let iov = [
+            libc::iovec {
+                iov_base: header.as_mut_ptr().cast(),
+                iov_len: header.len(),
+            },
+            libc::iovec {
+                iov_base: buffer.as_mut_ptr().cast(),
+                iov_len: buffer.len(),
+            },
+        ];
+        // SAFETY: both buffers are writable for their declared lengths.
         let n = unsafe {
-            libc::read(
-                self.fd.as_raw_fd(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-            )
+            if self.vnet {
+                libc::readv(self.fd.as_raw_fd(), iov.as_ptr(), 2)
+            } else {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            }
         };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
-        let n = n as usize;
+        let mut n = n as usize;
+        if self.vnet {
+            if n < header.len() || header[0] & !2 != 0 || header[1] != 0 {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            n -= header.len();
+        }
         if !(14..=self.frame_limit).contains(&n) {
             return Err(io::ErrorKind::InvalidData.into());
         }
@@ -194,15 +231,61 @@ impl TapQueue {
         if !(14..=self.frame_limit).contains(&frame.len()) {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        // SAFETY: frame is readable for exactly its length.
-        let n = unsafe { libc::write(self.fd.as_raw_fd(), frame.as_ptr().cast(), frame.len()) };
+        let header = [0u8; 10];
+        let iov = [
+            libc::iovec {
+                iov_base: header.as_ptr().cast_mut().cast(),
+                iov_len: header.len(),
+            },
+            libc::iovec {
+                iov_base: frame.as_ptr().cast_mut().cast(),
+                iov_len: frame.len(),
+            },
+        ];
+        // SAFETY: header and frame are readable for their declared lengths.
+        let n = unsafe {
+            if self.vnet {
+                libc::writev(self.fd.as_raw_fd(), iov.as_ptr(), 2)
+            } else {
+                libc::write(self.fd.as_raw_fd(), frame.as_ptr().cast(), frame.len())
+            }
+        };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
-        if n as usize != frame.len() {
+        if n as usize != frame.len() + if self.vnet { header.len() } else { 0 } {
             return Err(io::ErrorKind::WriteZero.into());
         }
         Ok(())
+    }
+
+    pub(crate) fn uso_enabled(&self) -> bool {
+        self.uso
+    }
+
+    /// The mask names every attempted frame, even when the write fails.
+    pub(crate) fn write_batch<'a>(
+        &mut self,
+        mut frames: impl Iterator<Item = &'a [u8]>,
+    ) -> (u64, io::Result<usize>) {
+        let Some(first) = frames.next() else {
+            return (0, Ok(0));
+        };
+        if self.uso
+            && (14..=self.frame_limit).contains(&first.len())
+            && let Some((mask, result)) =
+                uso::write(self.fd.as_raw_fd(), first, frames, self.frame_limit)
+        {
+            if result
+                .as_ref()
+                .is_err_and(|e| matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)))
+            {
+                self.uso = false;
+            } else {
+                return (mask, result);
+            }
+        }
+        (1, self.write_frame(first).map(|()| first.len()))
     }
 }
 

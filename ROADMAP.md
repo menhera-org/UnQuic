@@ -318,7 +318,9 @@ duplicate suppression, observed packing and zero allocations/deallocations while
 reporting frame drops. The release baseline in BENCH.md now records single- and
 multiple-flow small-frame and MTU-1500 traffic, per-direction delivery/loss, process
 CPU and per-core CPU/softirq. The original admission-pressure collapse is fixed;
-remaining multi-flow declines under excess load are still under investigation.
+local TAP USO improves both MTU-1500 and small-frame delivery, and the latest
+20-second sweeps hold up under excess load. Broader plateau checks and the
+measured CPU ceiling remain open.
 The final throughput gate remains open. Partial completion, GSO/GRO boundaries, MTU errors
 and allocation checks pass. The five frame-model regression cases
 now run against the real implementation in tests/reassembly.rs.
@@ -339,9 +341,12 @@ now run against the real implementation in tests/reassembly.rs.
   payload per direction, 256 MiB daemon ceiling). Reservation before
   acceptance; under pressure, validated tails may complete existing frames,
   but no packet is ACK-eligible until all its nonterminal DATA is retained.
-- TAP reads: optional `IFF_VNET_HDR` stays off in v1. The worker already loops
-  over at most 64 reads per ready TAP, stopping at EAGAIN or pool exhaustion.
-  Keep buffer ownership there; no separate batch wrapper is needed.
+- TAP reads retain the 64-frame budget and strip internal `IFF_VNET_HDR`
+  metadata; checksum/GSO read offloads remain disabled. Compatible complete
+  UDP frames can share a lossless USO TAP write, preserving per-flow order,
+  backpressure and the existing receive deadline. Other frames use single writes.
+  The direct cost probe verifies potential io_uring read savings; production
+  read batching and super-frame input remain unfinished.
 - Preallocated buffer pools and descriptor rings in the worker; no allocation
   on the data path after startup. Verify by a test that counts allocations
   with a global allocator wrapper in the test binary.
