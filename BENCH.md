@@ -12,15 +12,15 @@ their absence does not explain away a scheduling or admission failure.
 
 ## Current performance gaps
 
-Status at `1affb30`. The latest MTU-1500 results use the 20-CPU single-socket
+Status after the receive-steering follow-up. The latest MTU-1500 results use the 20-CPU single-socket
 profile and capped socket-buffer fallback described below. Small-frame results
 still refer to `a69f88d`; they have not been rerun after the audit changes.
 L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Repeated 16-flow unlimited points deliver 3.06–3.07 / 4.09–4.20 Gbit/s of inner UDP payload | Roughly 6.5× / 4.8× more delivered goodput is needed even relative to the better unlimited point. The gate is not close to passing. |
-| Goodput must plateau under excess traffic | MTU-1500 reverse goodput falls from 4.30–4.35 Gbit/s at paced saturation to 4.09–4.20 Gbit/s unlimited | A 2.3–5.8% decline remains in this sweep. Removing the earlier admission cascade does not satisfy the plateau requirement. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Repeated 16-flow unlimited points deliver 2.76–3.49 / 3.53–4.86 Gbit/s of inner UDP payload | Roughly 5.7× / 4.1× more delivered goodput is needed even relative to the better unlimited point. The gate is not close to passing. |
+| Goodput must plateau under excess traffic | The repeated MTU-1500 unlimited point falls from 3.15 / 4.74 Gbit/s paced to 2.76 / 3.53 Gbit/s | A 12.5% / 25.6% decline remains; the preceding unlimited point did not decline. Removing the earlier admission cascade does not satisfy the plateau requirement. |
 | Small-frame overload must remain efficient | With 64-byte frames and 16 flows, reverse delivery falls from 448,939 to 390,617 frames/s | The 13% decline remains unresolved. The 60-byte multi-flow and small-frame single-flow cases are substantially steadier; they do not prove the 64-byte case fixed. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
@@ -28,7 +28,7 @@ L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
 
 Loss under unlimited load is still high: the recorded MTU-1500 16-flow point
-misses about 76% / 67% of offered frames despite zero admission-pressure
+misses about 78% / 72% of offered frames despite zero admission-pressure
 rejections and zero worker queue drops. TAP ingress drops and outer socket
 overflows account for visible loss locations; their different units prevent
 an exact frame-loss decomposition. Inner UDP receive-buffer errors are recorded
@@ -241,7 +241,7 @@ The admission-pressure cascade disappears in these after runs. Remaining losses
 are visible at TAP ingress and the outer receive sockets, with smaller losses
 at the inner receiver. That locates drops; it does not yet explain the remaining
 goodput decline. Outer IPv6 fragment creation and reassembly deltas are zero
-throughout all 77 recorded points.
+throughout all 83 recorded points.
 
 ## CPU and profiling
 
@@ -432,7 +432,47 @@ not yet been measured.
 A3 is implemented with exact deadlines; A4's counter publication and A8's
 queue setup are implemented. A9's contiguous copy is implemented; the two
 record-cache prototypes were slower and were discarded. C4's gate is specified
-above. A1 needs a decision on flow pinning or stable steering. A2 still needs
-ordered group creation and lifecycle tests. The remaining A4 scheduling
+above. A1 needs a decision on flow pinning or stable steering. A2 now has ordered group creation, kernel steering and lifecycle tests. The remaining A4 scheduling
 changes, A5–A7, the B0 cost probes, B1–B3 and the C1–C3 generator/CPU work
 remain unfinished. B4 remains deferred as requested.
+
+## Audit follow-up: receive steering
+
+The control worker binds all reuseport sockets in worker order and transfers
+them through bounded queues. Failed binds discard the partial group. A full
+handoff queue retains its socket; no connection starts before all members are
+installed. Classic BPF uses cookie/lane fields with the same 32-bit wrapping
+arithmetic as registration. Ordinary forwarding remains available when steering
+fails, during initial registration, and when a session uses fewer workers.
+
+Three- and four-member socket tests check bind-order selection and wrapping
+arithmetic. Worker tests cover bind retry, full handoff queues, stable installed
+descriptors and registration on the designated owner. Release/default tests,
+Clippy and all container worker, runtime, foundation and CLI cases pass,
+including the forwarding storm's allocation checks.
+
+The 15-second, 16-flow single-socket sweep retains the queue settings from the
+previous run:
+
+| Requested/flow | Delivered Gbit/s | Missing % | Daemon CPU % | Socket overflow SKBs |
+| --- | ---: | ---: | ---: | ---: |
+| 125M | 1.996 / 1.985 | 0.19 / 0.75 | 319.0 / 334.8 | 8,594 / 1,088 |
+| 250M | 3.360 / 3.875 | 15.90 / 3.11 | 353.4 / 357.3 | 31,212 / 50,669 |
+| 500M | 3.087 / 4.823 | 61.25 / 39.71 | 367.0 / 369.2 | 81,553 / 42,064 |
+| unlimited | 3.486 / 4.861 | 72.13 / 61.88 | 364.8 / 379.7 | 98,226 / 37,173 |
+| 500M | 3.150 / 4.741 | 60.08 / 40.73 | 363.6 / 362.5 | 83,767 / 57,489 |
+| unlimited | 2.756 / 3.527 | 77.90 / 71.89 | 363.2 / 370.9 | 86,533 / 51,684 |
+
+Every worker received traffic at every point. Socket errors, worker queue drops
+and admission-pressure rejections are zero throughout; the JSON includes
+per-worker distribution checks. Expiry counts are 0 / 0, 0 / 0, 0 / 5,
+0 / 0, 624 / 53 and 1 / 1. Outer fragmentation counters remain zero.
+
+The last unlimited point falls 12.5% / 25.6% below the preceding paced point.
+Inner UDP receive-buffer errors are only 6,655 / 2,456 frames, too few to
+explain that decline. TAP ingress accepts more frames than at the previous
+unlimited point (7.79 / 8.94 million versus 5.79 / 7.54 million), while
+transport delivery falls. That observation warrants profiling the balance
+between transmit intake and receive delivery. It does not establish that
+balance as the cause. Fewer socket-overflow SKBs alone do not imply fewer
+lost logical datagrams because aggregate sizes can differ.

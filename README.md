@@ -231,11 +231,18 @@ state before confirmation.
 
 The worker count is the largest session queue count. Each worker owns one
 reuseport receive socket per endpoint, its assigned TAP queues and transmit
-lanes. The control owner registers remote lanes before admission and publishes
-their owners. It distributes consecutive lane IDs across the session's workers,
-with a session-index offset, so a reuseport hash collision does not pin several
-lanes' reassembly and TAP writes to one worker. Datagrams that arrive on another
-worker move through SPSC queues as owned buffers. Full data queues drop without ACK; buffer returns, barrier
+lanes. The control worker binds each endpoint's entire receive group in worker
+order, then transfers sockets through bounded control queues. A failed bind
+closes the partial group before retrying. Connections wait until all members
+are installed.
+
+Classic reuseport BPF selects a socket using the lane minus one plus the
+cookie's low 32 bits, with 32-bit wrapping addition, modulo the worker count.
+The control owner registers remote lanes with the same sum modulo the session's
+queue count. Steering failure counts as a socket error and retains ordinary
+reuseport hashing. Handshakes, initial registration, mixed-cookie GRO aggregates,
+and sessions with fewer queues may still cross workers. Datagrams that arrive
+on another worker move through SPSC queues as owned buffers. Full data queues drop without ACK; buffer returns, barrier
 messages and pending lane retirements remain bounded and retry.
 
 Startup reserves 128 packet/frame buffers per worker, each with 64 KiB of

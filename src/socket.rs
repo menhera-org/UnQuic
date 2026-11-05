@@ -162,6 +162,43 @@ impl ReceiveSocket {
         Ok(value as usize)
     }
 
+    pub(crate) fn steer_group(&self, members: usize) -> io::Result<()> {
+        if !(1..=64).contains(&members) {
+            return Err(invalid("receive group requires 1..64 sockets"));
+        }
+        let instruction = |code: u32, k| libc::sock_filter {
+            code: code as u16,
+            jt: 0,
+            jf: 0,
+            k,
+        };
+        // UDP payload offsets; cBPF arithmetic wraps at 32 bits.
+        let mut code = [
+            instruction(libc::BPF_LD | libc::BPF_H | libc::BPF_ABS, 36),
+            instruction(libc::BPF_ALU | libc::BPF_SUB | libc::BPF_K, 1),
+            instruction(libc::BPF_MISC | libc::BPF_TAX, 0),
+            instruction(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 16),
+            instruction(libc::BPF_ALU | libc::BPF_ADD | libc::BPF_X, 0),
+            instruction(libc::BPF_ALU | libc::BPF_MOD | libc::BPF_K, members as u32),
+            instruction(libc::BPF_RET | libc::BPF_A, 0),
+        ];
+        let program = libc::sock_fprog {
+            len: code.len() as u16,
+            filter: code.as_mut_ptr(),
+        };
+        // SAFETY: the initialized program and instructions live through setsockopt.
+        cvt(unsafe {
+            libc::setsockopt(
+                self.socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ATTACH_REUSEPORT_CBPF,
+                (&program as *const libc::sock_fprog).cast(),
+                size_of::<libc::sock_fprog>() as libc::socklen_t,
+            )
+        })?;
+        Ok(())
+    }
+
     /// Enables GRO when supported; false leaves ordinary receives in use.
     ///
     /// Call during socket setup. Thereafter use recv_batch and split each result
@@ -917,6 +954,51 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn reuseport_steering_matches_payload_fields_and_wrapping_owner_arithmetic() {
+        for members in [3, 4] {
+            let first = receiver();
+            let address = first.local_addr();
+            let mut group = vec![first];
+            for _ in 1..members {
+                group.push(ReceiveSocket::bind(address, None).unwrap());
+            }
+            group[0].steer_group(members).unwrap();
+            assert!(group[0].steer_group(0).is_err());
+            assert!(group[0].steer_group(65).is_err());
+            let sender = UdpSocket::bind("[::1]:0").unwrap();
+            for (lane, cookie) in [
+                (1_u16, 0_u32),
+                (2, 0),
+                (3, 0),
+                (4, 0),
+                (1, 1),
+                (2, u32::MAX),
+                (0, 0),
+            ] {
+                let mut bytes = [0_u8; 64];
+                bytes[36..38].copy_from_slice(&lane.to_be_bytes());
+                bytes[16..20].copy_from_slice(&cookie.to_be_bytes());
+                let owner = cookie.wrapping_add(u32::from(lane).wrapping_sub(1)) as usize % members;
+                sender.send_to(&bytes, address).unwrap();
+                for (index, socket) in group.iter().enumerate() {
+                    let mut received = [0; 64];
+                    match socket.recv(&mut received) {
+                        Ok((length, _)) => {
+                            assert_eq!(index, owner);
+                            assert_eq!(length, bytes.len());
+                            assert_eq!(received, bytes);
+                        }
+                        Err(error) => {
+                            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                            assert_ne!(index, owner);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

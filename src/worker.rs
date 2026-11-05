@@ -332,6 +332,10 @@ impl Buffer {
 }
 
 pub(crate) enum Event {
+    Receive {
+        endpoint: usize,
+        socket: ReceiveSocket,
+    },
     Packet(Box<Buffer>),
     Frame(Box<Buffer>),
     Free(Box<Buffer>),
@@ -505,6 +509,7 @@ pub(crate) struct Worker {
     controls: Vec<SessionControl>,
     receive: Vec<Option<ReceiveSocket>>,
     receive_overflow: Vec<u32>,
+    pending_receive: VecDeque<(usize, usize, ReceiveSocket)>,
     receive_enabled: bool,
     rx_retained: usize,
     transmit: Vec<PeerPaths>,
@@ -572,6 +577,13 @@ impl Worker {
         per_worker
             .checked_mul(workers)?
             .checked_add(batches)?
+            .checked_add(
+                config
+                    .endpoints
+                    .len()
+                    .checked_mul(workers)?
+                    .checked_mul(size_of::<(usize, usize, ReceiveSocket)>())?,
+            )?
             .checked_add(config.peers.len().checked_mul(size_of::<PeerControl>())?)?
             .checked_add(config.sessions.len().checked_mul(
                 size_of::<SessionControl>() + LANES * size_of::<Box<reassembly::Lane>>(),
@@ -676,6 +688,11 @@ impl Worker {
             incoming: (0..count).map(|_| None).collect(),
             receive: (0..config.endpoints.len()).map(|_| None).collect(),
             receive_overflow: vec![0; config.endpoints.len()],
+            pending_receive: VecDeque::with_capacity(if id == 0 {
+                config.endpoints.len() * count
+            } else {
+                0
+            }),
             receive_enabled: true,
             rx_retained: 0,
             transmit: config
@@ -749,6 +766,7 @@ impl Worker {
             if now >= self.setup_due {
                 self.setup(now)?;
             }
+            more |= self.distribute_receivers();
             self.addresses(now)?;
             self.progress_barriers(now)?;
             self.timers(now)?;
@@ -1103,35 +1121,85 @@ impl Worker {
         Ok(())
     }
 
+    fn install_receiver(&mut self, endpoint: usize, mut socket: ReceiveSocket) -> io::Result<()> {
+        self.counters.receive_buffer_fallbacks += u64::from(socket.buffer_fallback);
+        match socket.receive_buffer_limit() {
+            Ok(bytes) => self.counters.receive_buffer_bytes += bytes as u64,
+            Err(_) => self.counters.socket_errors += 1,
+        }
+        if socket.enable_gro().is_err() {
+            self.counters.socket_errors += 1;
+        }
+        self.reactor.add(
+            socket.as_fd(),
+            endpoint as u64 + 2,
+            if self.receive_enabled {
+                libc::EPOLLIN as u32
+            } else {
+                0
+            },
+        )?;
+        self.receive[endpoint] = Some(socket);
+        self.shared.bound[endpoint].fetch_or(1_u64 << self.id, Ordering::Release);
+        Ok(())
+    }
+
+    fn distribute_receivers(&mut self) -> bool {
+        for _ in 0..BATCH_SIZE {
+            let Some((owner, endpoint, socket)) = self.pending_receive.pop_front() else {
+                return false;
+            };
+            if let Err(Event::Receive { endpoint, socket }) =
+                self.push(owner, Event::Receive { endpoint, socket })
+            {
+                self.pending_receive.push_front((owner, endpoint, socket));
+                break;
+            }
+        }
+        !self.pending_receive.is_empty()
+    }
+
     fn setup(&mut self, now: Duration) -> io::Result<()> {
         self.setup_due = now + Duration::from_secs(1);
-        let config = self.shared.config.config();
-        for (index, endpoint) in config.endpoints.iter().enumerate() {
-            if self.receive[index].is_none() {
-                match ReceiveSocket::bind(endpoint.socket_addr(), endpoint.bind_device.as_deref()) {
-                    Ok(mut socket) => {
-                        self.counters.receive_buffer_fallbacks += u64::from(socket.buffer_fallback);
-                        match socket.receive_buffer_limit() {
-                            Ok(bytes) => self.counters.receive_buffer_bytes += bytes as u64,
-                            Err(_) => self.counters.socket_errors += 1,
+        let shared = Arc::clone(&self.shared);
+        let config = shared.config.config();
+        if self.id == 0 {
+            for (index, endpoint) in config.endpoints.iter().enumerate() {
+                if self.receive[index].is_some() {
+                    continue;
+                }
+                let mut group: [Option<ReceiveSocket>; 64] = std::array::from_fn(|_| None);
+                let mut failed = false;
+                for slot in &mut group[..shared.workers()] {
+                    match ReceiveSocket::bind(
+                        endpoint.socket_addr(),
+                        endpoint.bind_device.as_deref(),
+                    ) {
+                        Ok(socket) => *slot = Some(socket),
+                        Err(_) => {
+                            self.counters.socket_errors += 1;
+                            failed = true;
+                            break;
                         }
-                        if socket.enable_gro().is_err() {
-                            self.counters.socket_errors =
-                                self.counters.socket_errors.wrapping_add(1);
-                        }
-                        self.reactor.add(
-                            socket.as_fd(),
-                            index as u64 + 2,
-                            if self.receive_enabled {
-                                libc::EPOLLIN as u32
-                            } else {
-                                0
-                            },
-                        )?;
-                        self.receive[index] = Some(socket);
-                        self.shared.bound[index].fetch_or(1_u64 << self.id, Ordering::Release);
                     }
-                    Err(_) => self.counters.socket_errors += 1,
+                }
+                if failed {
+                    continue; // Dropping every member makes a bind retry start a fresh group.
+                }
+                if group[0]
+                    .as_ref()
+                    .unwrap()
+                    .steer_group(shared.workers())
+                    .is_err()
+                {
+                    // Kernel steering is optional; protocol ownership still routes every packet.
+                    self.counters.socket_errors += 1;
+                }
+                self.install_receiver(index, group[0].take().unwrap())?;
+                for (owner, socket) in group.into_iter().enumerate().skip(1) {
+                    if let Some(socket) = socket {
+                        self.pending_receive.push_back((owner, index, socket));
+                    }
                 }
             }
         }
@@ -1211,6 +1279,10 @@ impl Worker {
                 let Some(event) = event else { break };
                 more |= index + 1 == BATCH_SIZE;
                 match event {
+                    Event::Receive { endpoint, socket } => {
+                        self.install_receiver(endpoint, socket)?;
+                        self.setup_due = now;
+                    }
                     Event::Packet(buffer) => self.received.push_back(buffer),
                     Event::Frame(buffer) => self.frame(buffer, now)?,
                     Event::Free(buffer) => self.release(buffer),
@@ -1501,7 +1573,8 @@ impl Worker {
                 self.sessions[session].connection.unwrap().max_frame_len,
             )
             .unwrap();
-            let owner = (usize::from(header.lane - 1) + session)
+            let cookie_low = u32::from_be_bytes(header.cookie.as_bytes()[12..].try_into().unwrap());
+            let owner = cookie_low.wrapping_add(u32::from(header.lane) - 1) as usize
                 % self.shared.config.config().sessions[session].queue_count;
             // Publication may precede installation; an early packet is dropped without ACK.
             self.shared.owners[session][lane_id].store(owner as u8 + 1, Ordering::Release);
@@ -2515,6 +2588,65 @@ mod tests {
 
     #[test]
     #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn receive_group_retries_binds_and_retains_sockets_when_handoff_is_full() {
+        let (shared, mut workers) = test_workers();
+        let (tx, rx) = crate::spsc::channel();
+        workers[0].outgoing[1] = Some(tx);
+        workers[1].incoming[0] = Some(rx);
+        let occupied = std::net::UdpSocket::bind("[::1]:40000").unwrap();
+        workers[0].setup(Duration::ZERO).unwrap();
+        assert!(workers[0].receive[0].is_none());
+        assert!(workers[0].pending_receive.is_empty());
+        assert_eq!(shared.bound[0].load(Ordering::Acquire), 0);
+        drop(occupied);
+        for _ in 0..crate::spsc::CAPACITY {
+            assert!(
+                workers[0]
+                    .push(
+                        1,
+                        Event::ProbeFeedback {
+                            session: 0,
+                            tag: 0,
+                            packet: 0,
+                            length: 0,
+                        }
+                    )
+                    .is_ok()
+            );
+        }
+        workers[0].setup(Duration::from_secs(1)).unwrap();
+        assert!(workers[0].receive[0].is_some());
+        assert_eq!(workers[0].pending_receive.len(), 1);
+        assert!(!shared.peer_bound(0));
+        assert!(workers[0].distribute_receivers());
+        assert_eq!(workers[0].pending_receive.len(), 1);
+        for _ in 0..32 {
+            workers[1].drain_queues(Duration::from_secs(1)).unwrap();
+            workers[0].distribute_receivers();
+        }
+        assert!(workers[0].pending_receive.is_empty());
+        assert!(workers[1].receive[0].is_some());
+        assert!(shared.peer_bound(0));
+        assert_eq!(workers[0].counters.queue_drops, 0);
+        assert_eq!(workers[1].counters.queue_drops, 0);
+        let descriptors: Vec<_> = workers
+            .iter()
+            .map(|w| w.receive[0].as_ref().unwrap().as_fd().as_raw_fd())
+            .collect();
+        for worker in &mut workers {
+            worker.setup(Duration::from_secs(2)).unwrap();
+        }
+        assert_eq!(
+            descriptors,
+            workers
+                .iter()
+                .map(|w| w.receive[0].as_ref().unwrap().as_fd().as_raw_fd())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
     fn colliding_receive_flows_register_on_distinct_owners() {
         let (first, _tap) = receive_worker();
         let mut second = Worker::new(1, Arc::clone(&first.shared), Control::new()).unwrap();
@@ -2562,7 +2694,7 @@ mod tests {
                 worker.flush_returns();
             }
         }
-        for (lane, owner) in [(8, 1), (9, 0)] {
+        for (lane, owner) in [(8, 0), (9, 1)] {
             assert_eq!(
                 workers[0].shared.owners[0][lane].load(Ordering::Acquire),
                 owner as u8 + 1
@@ -3268,12 +3400,12 @@ mod tests {
                 Header {
                     cookie: crate::UnquicUuid::from_bytes([1; 16]),
                     receive_tag: replacement.local_tag().get(),
-                    lane: 7,
+                    lane: 8,
                     record_area_len: 0,
                     packet_number: number,
                 },
                 &[Record::Data {
-                    frame_id: (7_u64 << 48) | 1,
+                    frame_id: (8_u64 << 48) | 1,
                     total_len: 60,
                     offset: 0,
                     bytes: &[5; 30],
@@ -3289,7 +3421,7 @@ mod tests {
                 .receive_counters
                 .iter()
                 .filter_map(|c| c.snapshot())
-                .find(|c| c.lane == 7)
+                .find(|c| c.lane == 8)
                 .unwrap();
             assert_eq!(lane.generation, generation);
             assert_eq!(
@@ -3305,7 +3437,7 @@ mod tests {
             .receive_counters
             .iter()
             .filter_map(|c| c.snapshot())
-            .find(|c| c.lane == 7)
+            .find(|c| c.lane == 8)
             .unwrap();
         let totals = shared.session_counters[0].snapshot();
         assert_eq!(totals.rx_outer_bytes, lane.counters.rx_outer_bytes);
