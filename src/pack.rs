@@ -8,11 +8,11 @@
 use crate::{
     BASE_UDP_PAYLOAD, MAX_FRAME_LEN, UnquicUuid,
     handshake::Connection,
-    wire::{Header, Record, WireError, encode_datagram},
+    wire::{DATA_PREFIX_LEN, Header, Record, WireError, encode_data_prefix, encode_datagram},
 };
 use std::{collections::hash_map::DefaultHasher, fmt, hash::Hasher};
 
-const DATA_OVERHEAD: usize = 48 + 4 + 16;
+const DATA_OVERHEAD: usize = DATA_PREFIX_LEN;
 const MAX_SEQUENCE: u64 = 0x0000_ffff_ffff_ffff;
 
 /// Encoding failure, with exhausted identities requiring a new connection.
@@ -124,6 +124,14 @@ impl Lane {
     }
 }
 
+/// One scatter/gather DATA piece, without copying its payload bytes.
+pub struct Piece<'a> {
+    /// Encoded packet identity and combined prefix/payload length.
+    pub packet: Packet,
+    /// Original frame bytes to send immediately after the encoded prefix.
+    pub bytes: &'a [u8],
+}
+
 /// A borrowed frame split into complete baseline datagrams.
 pub struct Frame<'a> {
     lane: &'a mut Lane,
@@ -131,7 +139,44 @@ pub struct Frame<'a> {
     id: u64,
     offset: usize,
 }
-impl Frame<'_> {
+impl<'a> Frame<'a> {
+    /// Encodes a prefix while borrowing piece bytes directly from the frame.
+    ///
+    /// Each prefix and returned byte slice form one scatter/gather datagram.
+    /// The slice borrows the original frame, so several pieces can be prepared
+    /// in separate prefix buffers and submitted together in one sendmmsg call.
+    pub fn encode_next_split(
+        &mut self,
+        prefix: &mut [u8; DATA_PREFIX_LEN],
+    ) -> Result<Option<Piece<'a>>, PackError> {
+        if self.offset == self.bytes.len() {
+            return Ok(None);
+        }
+        if self.lane.header.packet_number == 0 {
+            return Err(PackError::Exhausted);
+        }
+        let end = self
+            .bytes
+            .len()
+            .min(self.offset + BASE_UDP_PAYLOAD - DATA_PREFIX_LEN);
+        let bytes = &self.bytes[self.offset..end];
+        let record = Record::Data {
+            frame_id: self.id,
+            total_len: self.bytes.len() as u32,
+            offset: self.offset as u32,
+            bytes,
+        };
+        let length =
+            encode_data_prefix(self.lane.header, record, prefix).map_err(PackError::Wire)?;
+        let number = self.lane.header.packet_number;
+        self.lane.header.packet_number = number.checked_add(1).unwrap_or(0);
+        self.offset = end;
+        Ok(Some(Piece {
+            packet: Packet { number, length },
+            bytes,
+        }))
+    }
+
     /// Allocated frame identity, unchanged across every piece.
     pub const fn id(&self) -> u64 {
         self.id

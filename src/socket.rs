@@ -16,6 +16,39 @@ use std::{
     os::fd::{AsFd, AsRawFd, BorrowedFd},
 };
 
+/// Maximum number of logical datagrams in one batched syscall.
+pub const BATCH_SIZE: usize = 64;
+
+/// One outgoing datagram, optionally split into prefix and borrowed payload.
+#[derive(Clone, Copy)]
+pub struct SendDatagram<'a> {
+    /// Wire prefix, or the whole datagram when payload is empty.
+    pub prefix: &'a [u8],
+    /// Borrowed frame piece; concatenated with prefix by the kernel.
+    pub payload: &'a [u8],
+}
+
+/// One caller-owned receive buffer and its result metadata.
+pub struct ReceiveDatagram<'a> {
+    /// Storage filled directly by recvmmsg.
+    pub buffer: &'a mut [u8],
+    /// Whole datagram length, which can exceed buffer.len() on truncation.
+    pub length: usize,
+    /// A truncated entry is consumed but must never be parsed.
+    pub truncated: bool,
+}
+
+impl<'a> ReceiveDatagram<'a> {
+    /// Describes writable storage without allocation.
+    pub const fn new(buffer: &'a mut [u8]) -> Self {
+        Self {
+            buffer,
+            length: 0,
+            truncated: false,
+        }
+    }
+}
+
 /// A fixed-port receive socket. The API provides no send operation.
 ///
 /// Reuseport members must be created before connections become active and kept
@@ -50,6 +83,15 @@ impl ReceiveSocket {
         })
     }
 
+    /// Receives up to BATCH_SIZE datagrams directly into caller-owned buffers.
+    ///
+    /// Returns the completed prefix of entries; later entries are unchanged.
+    /// Each truncated entry is reported separately so valid siblings survive.
+    /// Source tuples are not requested: protocol admission uses cookie and state.
+    pub fn recv_batch(&self, datagrams: &mut [ReceiveDatagram<'_>]) -> io::Result<usize> {
+        recv_batch(self.socket.as_fd(), datagrams)
+    }
+
     /// Returns the fixed receive address and port.
     pub const fn local_addr(&self) -> SocketAddrV6 {
         self.address
@@ -78,18 +120,12 @@ impl ReceiveSocket {
             return Err(io::Error::last_os_error());
         }
         if n as usize > payload.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated UDP datagram",
-            ));
+            return Err(io::ErrorKind::InvalidData.into());
         }
         if len as usize != size_of::<libc::sockaddr_in6>()
             || source.sin6_family != libc::AF_INET6 as libc::sa_family_t
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected UDP address family",
-            ));
+            return Err(io::ErrorKind::InvalidData.into());
         }
         Ok((
             n as usize,
@@ -164,13 +200,22 @@ impl TransmitSocket {
     /// A successful return means socket submission, not remote acceptance.
     pub fn send(&self, payload: &[u8]) -> io::Result<()> {
         if payload.len() > BASE_UDP_PAYLOAD {
-            return Err(invalid("UDP payload exceeds the unprobed IPv6 baseline"));
+            return Err(io::ErrorKind::InvalidInput.into());
         }
         let n = self.socket.send(payload)?;
         if n != payload.len() {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "short UDP send"));
+            return Err(io::ErrorKind::WriteZero.into());
         }
         Ok(())
+    }
+
+    /// Submits up to BATCH_SIZE scatter/gather datagrams in one syscall.
+    ///
+    /// Each combined payload must fit the 1232-byte baseline. All entries are
+    /// checked before submission. A partial result counts only the successful
+    /// prefix; the caller retains the unsent suffix and its packet identities.
+    pub fn send_batch(&self, datagrams: &[SendDatagram<'_>]) -> io::Result<usize> {
+        send_batch(self.socket.as_fd(), datagrams)
     }
 
     /// Retrieves and clears the socket's pending asynchronous error.
@@ -183,6 +228,90 @@ impl AsFd for TransmitSocket {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.socket.as_fd()
     }
+}
+
+fn send_batch(fd: BorrowedFd<'_>, datagrams: &[SendDatagram<'_>]) -> io::Result<usize> {
+    if datagrams.is_empty()
+        || datagrams.len() > BATCH_SIZE
+        || datagrams
+            .iter()
+            .any(|d| d.prefix.len().saturating_add(d.payload.len()) > BASE_UDP_PAYLOAD)
+    {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let mut vectors = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; BATCH_SIZE * 2];
+    // SAFETY: zeroed message headers represent empty addresses/control buffers.
+    let mut messages: [libc::mmsghdr; BATCH_SIZE] = unsafe { zeroed() };
+    for (i, datagram) in datagrams.iter().enumerate() {
+        vectors[i * 2] = libc::iovec {
+            iov_base: datagram.prefix.as_ptr().cast_mut().cast(),
+            iov_len: datagram.prefix.len(),
+        };
+        vectors[i * 2 + 1] = libc::iovec {
+            iov_base: datagram.payload.as_ptr().cast_mut().cast(),
+            iov_len: datagram.payload.len(),
+        };
+        messages[i].msg_hdr.msg_iov = vectors[i * 2..].as_mut_ptr();
+        messages[i].msg_hdr.msg_iovlen = if datagram.payload.is_empty() { 1 } else { 2 };
+    }
+    // SAFETY: each initialized header points at live immutable datagram slices;
+    // sendmmsg reads their bytes and writes only the message length fields.
+    let count = cvt(unsafe {
+        libc::sendmmsg(
+            fd.as_raw_fd(),
+            messages.as_mut_ptr(),
+            datagrams.len() as u32,
+            (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as _,
+        )
+    })? as usize;
+    debug_assert!(
+        messages[..count]
+            .iter()
+            .zip(datagrams)
+            .all(|(message, data)| message.msg_len as usize
+                == data.prefix.len() + data.payload.len())
+    );
+    Ok(count)
+}
+
+fn recv_batch(fd: BorrowedFd<'_>, datagrams: &mut [ReceiveDatagram<'_>]) -> io::Result<usize> {
+    if datagrams.is_empty() || datagrams.len() > BATCH_SIZE {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let mut vectors = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; BATCH_SIZE];
+    // SAFETY: zeroed headers request no source addresses or ancillary data.
+    let mut messages: [libc::mmsghdr; BATCH_SIZE] = unsafe { zeroed() };
+    for (i, datagram) in datagrams.iter_mut().enumerate() {
+        vectors[i] = libc::iovec {
+            iov_base: datagram.buffer.as_mut_ptr().cast(),
+            iov_len: datagram.buffer.len(),
+        };
+        messages[i].msg_hdr.msg_iov = &mut vectors[i];
+        messages[i].msg_hdr.msg_iovlen = 1;
+    }
+    // SAFETY: every header names one exclusive writable slice. MSG_DONTWAIT
+    // makes timeout unnecessary; MSG_TRUNC reports the whole datagram length.
+    let count = cvt(unsafe {
+        libc::recvmmsg(
+            fd.as_raw_fd(),
+            messages.as_mut_ptr(),
+            datagrams.len() as u32,
+            (libc::MSG_DONTWAIT | libc::MSG_TRUNC) as _,
+            std::ptr::null_mut(),
+        )
+    })? as usize;
+    for (message, datagram) in messages[..count].iter().zip(datagrams) {
+        datagram.length = message.msg_len as usize;
+        datagram.truncated = message.msg_hdr.msg_flags & libc::MSG_TRUNC != 0
+            || datagram.length > datagram.buffer.len();
+    }
+    Ok(count)
 }
 
 fn validate_address(address: SocketAddrV6) -> io::Result<()> {
@@ -375,6 +504,112 @@ mod tests {
         );
         assert_eq!(option(tx.as_fd(), libc::IPPROTO_IPV6, libc::IPV6_TCLASS), 0);
         assert!(tx.take_error().unwrap().is_none());
+    }
+
+    #[test]
+    fn batch_scatter_send_and_truncation_preserve_datagram_boundaries() {
+        let rx = receiver();
+        let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
+        let outgoing = [
+            SendDatagram {
+                prefix: b"head",
+                payload: b"tail",
+            },
+            SendDatagram {
+                prefix: &[7; BASE_UDP_PAYLOAD],
+                payload: &[],
+            },
+            SendDatagram {
+                prefix: b"last",
+                payload: &[],
+            },
+        ];
+        assert_eq!(tx.send_batch(&outgoing).unwrap(), 3);
+        let mut buffers = [[0; 8]; 4];
+        let mut incoming: Vec<_> = buffers
+            .iter_mut()
+            .map(|b| ReceiveDatagram::new(b))
+            .collect();
+        incoming[3].length = 99;
+        assert_eq!(rx.recv_batch(&mut incoming).unwrap(), 3);
+        assert_eq!(incoming[0].buffer, b"headtail");
+        assert_eq!(incoming[0].length, 8);
+        assert!(!incoming[0].truncated);
+        assert_eq!(incoming[1].length, BASE_UDP_PAYLOAD);
+        assert!(incoming[1].truncated);
+        assert_eq!(&incoming[2].buffer[..incoming[2].length], b"last");
+        assert!(!incoming[2].truncated);
+        assert_eq!(incoming[3].length, 99);
+        assert_eq!(
+            rx.recv_batch(&mut incoming).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(incoming[3].length, 99);
+        let invalid = [
+            outgoing[0],
+            SendDatagram {
+                prefix: &[0; BASE_UDP_PAYLOAD],
+                payload: &[1],
+            },
+        ];
+        assert_eq!(
+            tx.send_batch(&invalid).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            rx.recv_batch(&mut incoming).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(tx.send_batch(&[]).is_err());
+        assert!(rx.recv_batch(&mut []).is_err());
+    }
+
+    #[test]
+    fn partial_sendmmsg_returns_only_sent_prefix_and_retries_preserve_order() {
+        use std::os::unix::net::UnixDatagram;
+        let (tx, rx) = UnixDatagram::pair().unwrap();
+        tx.set_nonblocking(true).unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let capacity = 2048_i32;
+        // SAFETY: capacity is a readable integer socket option.
+        cvt(unsafe {
+            libc::setsockopt(
+                tx.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&capacity as *const i32).cast(),
+                size_of::<i32>() as libc::socklen_t,
+            )
+        })
+        .unwrap();
+        let prefixes: Vec<_> = (0..BATCH_SIZE as u8).map(|id| [id; 16]).collect();
+        let payload = [255; 1000];
+        let outgoing: Vec<_> = prefixes
+            .iter()
+            .map(|prefix| SendDatagram {
+                prefix,
+                payload: &payload,
+            })
+            .collect();
+        let mut sent = 0;
+        let mut calls = 0;
+        while sent < BATCH_SIZE {
+            let count = send_batch(tx.as_fd(), &outgoing[sent..]).unwrap();
+            assert!(count > 0 && count < BATCH_SIZE);
+            let mut input = [0; 1016];
+            for expected in sent..sent + count {
+                assert_eq!(rx.recv(&mut input).unwrap(), input.len());
+                assert_eq!(&input[..16], &[expected as u8; 16]);
+                assert_eq!(&input[16..], &payload);
+            }
+            sent += count;
+            calls += 1;
+        }
+        assert!(calls > 1);
+        assert_eq!(
+            rx.recv(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

@@ -9,6 +9,8 @@ use std::fmt;
 
 /// Common header length in bytes.
 pub const HEADER_LEN: usize = 48;
+/// Common header plus one DATA record's fixed fields, excluding its piece bytes.
+pub const DATA_PREFIX_LEN: usize = HEADER_LEN + 4 + 16;
 /// Maximum number of records in one datagram.
 pub const MAX_RECORDS: usize = 64;
 /// Maximum number of ranges in one ACK record.
@@ -334,9 +336,7 @@ impl Record<'_> {
                 offset,
                 bytes,
             } => {
-                body[..8].copy_from_slice(&frame_id.to_be_bytes());
-                body[8..12].copy_from_slice(&total_len.to_be_bytes());
-                body[12..16].copy_from_slice(&offset.to_be_bytes());
+                encode_data_fields(frame_id, total_len, offset, body);
                 body[16..].copy_from_slice(bytes);
             }
             Self::Ack {
@@ -610,6 +610,41 @@ pub fn encode_datagram(
         at += record.encode(&mut output[at..])?;
     }
     Ok(length)
+}
+
+/// Encodes only the fixed prefix of one DATA datagram for scatter/gather I/O.
+///
+/// The supplied record must be DATA. Send this prefix and its borrowed bytes as
+/// two buffers in the same datagram. Returns their combined length. Validation
+/// matches encode_datagram and finishes before modifying output.
+pub fn encode_data_prefix(
+    mut header: Header,
+    data: Record<'_>,
+    output: &mut [u8; DATA_PREFIX_LEN],
+) -> Result<usize, WireError> {
+    let Record::Data {
+        frame_id,
+        total_len,
+        offset,
+        bytes,
+    } = data
+    else {
+        return Err(WireError::Data);
+    };
+    data.validate()?;
+    data.validate_context(header, 1)?;
+    let length = data.encoded_len();
+    header.record_area_len = length as u16;
+    header.encode((&mut output[..HEADER_LEN]).try_into().unwrap());
+    output[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&[1, 0, (length >> 8) as u8, length as u8]);
+    encode_data_fields(frame_id, total_len, offset, &mut output[HEADER_LEN + 4..]);
+    Ok(DATA_PREFIX_LEN + bytes.len())
+}
+
+fn encode_data_fields(frame_id: u64, total_len: u32, offset: u32, body: &mut [u8]) {
+    body[..8].copy_from_slice(&frame_id.to_be_bytes());
+    body[8..12].copy_from_slice(&total_len.to_be_bytes());
+    body[12..16].copy_from_slice(&offset.to_be_bytes());
 }
 
 fn decode_record(input: &[u8]) -> Result<(Record<'_>, usize), WireError> {

@@ -487,7 +487,9 @@ permanent packet/frame windows, expiry and a retained TAP-write queue. Its tests
 replace the frame model, including pressure, repair and allocation checks.
 Baseline segmentation and inner-flow selection now cover the full frame-size
 range, VLANs and IPv4/IPv6 fragments, with allocation and exhaustion tests.
-Session dispatch and the owned worker runtime remain unimplemented. The crate does
+Batched socket APIs use recvmmsg and scatter/gather sendmmsg, with original
+frame slices, partial-completion tests and allocation checks. Session dispatch
+and the owned worker runtime remain unimplemented. The crate does
 not yet provide end-to-end Ethernet transport, and no performance acceptance
 claim has been made.
 

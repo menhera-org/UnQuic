@@ -30,7 +30,10 @@ features. Its direct, RA and DHCPv6 resolver modes are available.
 Receive sockets use fixed nonzero ports and expose no send method. Transmit
 sockets inherit their receiver's binding scope, use stable dynamic ports, and
 disable IPv6 fragmentation. Sends are limited to the unprobed 1232-byte UDP
-baseline. Truncated receives are rejected. TAP creation leaves the device
+baseline. Batched send/receive handles up to 64 datagrams per syscall. Sends can
+gather a wire prefix and original frame slice without copying the piece into an
+intermediate packet buffer. Partial sends return the successful prefix; each
+truncated receive is flagged independently. Single receives reject truncation. TAP creation leaves the device
 administratively down with carrier down, uses ordinary Ethernet frames without
 virtio metadata, and closes all newly opened queues if setup fails. Queues can
 be moved out of the `Tap` for per-worker ownership, and any queue controls
@@ -116,10 +119,13 @@ and frame identities. Every Ethernet frame length from 14 through 9022 bytes
 round-trips through the real encoder and reassembler in tests; a maximum frame
 uses eight datagrams. Flow selection handles VLAN stacks, IPv4 and IPv6
 extension headers, and keeps fragments on an address/protocol key. Encoding and
-flow hashing have allocation checks. Multi-record packing is still pending.
+flow hashing have allocation checks. The scatter/gather encoder borrows frame
+pieces directly; tests compare its wire bytes with the contiguous encoder.
+Batched socket calls, WouldBlock and invalid/truncated input paths also have
+allocation checks. Multi-record packing is still pending.
 
 The crate does not yet forward frames between peers. Worker ownership,
-batching/offloads, path-MTU probing, recovery, BBRv3, scheduled DNS
+worker batch integration, offloads, path-MTU probing, recovery, BBRv3, scheduled DNS
 refresh, the daemon and descriptor adoption remain to be implemented.
 There is no throughput claim for this foundation.
 

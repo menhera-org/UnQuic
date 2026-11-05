@@ -210,3 +210,45 @@ fn malformed_ip_and_non_ip_use_ethernet_fallback_without_payload_hashing() {
         std::hint::black_box(flow_hash(&frame[..end]));
     }
 }
+
+#[test]
+fn scatter_gather_pieces_borrow_original_frame_and_match_contiguous_encoding() {
+    use unquic::wire::{DATA_PREFIX_LEN, encode_data_prefix, encode_datagram};
+    let mut sender = sender();
+    let original = [42; MAX_FRAME_LEN];
+    let mut frame = sender.frame(&original).unwrap();
+    let mut prefixes = [[0; DATA_PREFIX_LEN]; 8];
+    let mut pieces = Vec::new();
+    for prefix in &mut prefixes {
+        let piece = frame.encode_next_split(prefix).unwrap().unwrap();
+        let start = piece.bytes.as_ptr() as usize - original.as_ptr() as usize;
+        assert_eq!(piece.bytes, &original[start..start + piece.bytes.len()]);
+        assert!(start + piece.bytes.len() <= original.len());
+        pieces.push(piece);
+    }
+    assert!(
+        frame
+            .encode_next_split(&mut [0; DATA_PREFIX_LEN])
+            .unwrap()
+            .is_none()
+    );
+    for (prefix, piece) in prefixes.iter().zip(pieces) {
+        let mut packet = prefix.to_vec();
+        packet.extend_from_slice(piece.bytes);
+        assert_eq!(packet.len(), piece.packet.length);
+        let datagram = Datagram::decode(&packet).unwrap();
+        let record = datagram.records().next().unwrap();
+        let mut contiguous = [0; BASE_UDP_PAYLOAD];
+        let length = encode_datagram(datagram.header(), &[record], &mut contiguous).unwrap();
+        assert_eq!(&contiguous[..length], packet);
+        let mut separate = [0; DATA_PREFIX_LEN];
+        assert_eq!(
+            encode_data_prefix(datagram.header(), record, &mut separate).unwrap(),
+            length
+        );
+        assert_eq!(separate, *prefix);
+        let saved = separate;
+        assert!(encode_data_prefix(datagram.header(), Record::Probe, &mut separate).is_err());
+        assert_eq!(separate, saved);
+    }
+}

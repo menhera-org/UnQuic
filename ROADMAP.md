@@ -196,7 +196,10 @@ barrier integration remain. The reassembly/window foundation from stage 2 is
 also implemented because step 1e requires permanent duplicate suppression.
 Baseline segmentation and inner-flow selection are implemented in src/pack.rs.
 Tests cover every supported frame length, identity exhaustion, IP fragments,
-IPv6 extension headers and allocation-free operation.
+IPv6 extension headers and allocation-free operation. Scatter/gather encoding
+borrows original frame bytes, and the socket APIs now batch up to 64 datagrams
+per syscall. Tests cover partial submissions, independent truncation flags and
+allocation-free I/O/error paths; worker integration remains.
 
 Implement the ownership rules of section 10 under "Worker ownership and
 routing (v1)".
@@ -262,7 +265,9 @@ Goal: the packet rate and CPU baseline of section 13 can be measured.
 The receive foundation is implemented early for step 1e: fixed frame storage,
 whole-datagram reservation, permanent packet/frame windows, terminal bits,
 100 ms expiry and retained TAP-write entries. Actual worker routing, global
-memory accounting and batched I/O remain. The five frame-model regression cases
+memory accounting, GSO/GRO and worker batch integration remain. recvmmsg and
+scatter/gather sendmmsg are implemented at the baseline payload size; partial
+completion and truncation tests pass. The five frame-model regression cases
 now run against the real implementation in tests/reassembly.rs.
 
 - `socket.rs`: `recv_batch` with `recvmmsg`, `send_batch` with `sendmmsg`,

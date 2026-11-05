@@ -158,7 +158,7 @@ impl TapQueue {
     /// InvalidData. WouldBlock and Interrupted leave retry policy to the worker.
     pub fn read_frame(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.len() <= MAX_FRAME_LEN {
-            return Err(invalid("TAP read buffer must hold MAX_FRAME_LEN + 1 bytes"));
+            return Err(io::ErrorKind::InvalidInput.into());
         }
         // SAFETY: buffer is writable for its full length.
         let n = unsafe {
@@ -173,10 +173,7 @@ impl TapQueue {
         }
         let n = n as usize;
         if !(14..=self.frame_limit).contains(&n) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid TAP frame length",
-            ));
+            return Err(io::ErrorKind::InvalidData.into());
         }
         Ok(n)
     }
@@ -187,7 +184,7 @@ impl TapQueue {
     /// expired. Other errors discard the frame in the transport.
     pub fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
         if !(14..=self.frame_limit).contains(&frame.len()) {
-            return Err(invalid("invalid TAP frame length"));
+            return Err(io::ErrorKind::InvalidInput.into());
         }
         // SAFETY: frame is readable for exactly its length.
         let n = unsafe { libc::write(self.fd.as_raw_fd(), frame.as_ptr().cast(), frame.len()) };
@@ -195,10 +192,7 @@ impl TapQueue {
             return Err(io::Error::last_os_error());
         }
         if n as usize != frame.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "short TAP frame write",
-            ));
+            return Err(io::ErrorKind::WriteZero.into());
         }
         Ok(())
     }
