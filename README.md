@@ -5,7 +5,7 @@
 - Development language: pure Rust.
 - Dependencies: none except `libc`. Everything else (UUID types, congestion control) is written in-tree. The UUID type is named `UnquicUuid` to avoid collisions with external UUID types. Write C-like Rust, optimized for performance.
 - Dependencies exceptions: feature-gate all the other deps: `dns` pulls `iphost v0.4.4` - otherwise the endpoints are configured manually. `uuid-compat` pulls in `uuid` crate, and the conversions from/into the in-tree UUID types. `bin` pulls in `serde` and `toml`, and enables `dns`. Obtain random bytes through Linux's `getrandom(2)` via `libc::getrandom()`, without an additional crate. The `unquic gen-uuid` subcommand generates session cookies; the daemon never generates a session cookie at runtime.
-- Protocol baseline: explicit initiator/responder roles, random connection receive tags from `libc::getrandom()`, bounded selective repair, and one in-tree BBRv3 controller per direction and path group. No wall-clock epochs or persistent restart counters.
+- Protocol baseline: automatic handshake role election, random connection receive tags from `libc::getrandom()`, bounded selective repair, and one in-tree BBRv3 controller per direction and path group. No wall-clock epochs or persistent restart counters.
 - Crate shape: library only. The daemon binary exists only when the `bin` feature is enabled.
 - Use `libc` for syscalls and socket options where appropriate; use `const fn` wherever a function can be one.
 - No async runtime: plain pinned threads with batched syscalls. `tokio` gives one syscall per packet, no GSO/GRO, cross-core task migration, and 1 ms timers, all wrong for a few always-busy sockets. See section 10 of the design.
@@ -62,10 +62,18 @@ and ACK ranges, and encodes into caller-owned buffers without allocation.
 tests exercise malformed lengths, reserved fields, lane identities, ACK ranges,
 and handshake isolation.
 
-The crate does not yet establish sessions or forward frames between peers.
-Handshake state, worker ownership, counters, batching/offloads, path-MTU
-probing, recovery, BBRv3, DNS, the daemon and descriptor adoption remain to be
-implemented. There is no throughput claim for this foundation.
+The pure handshake state machine elects roles automatically, negotiates frame
+limits, retries lost flights, and preserves active state through replacement.
+Tags come from nonblocking kernel randomness; tests inject deterministic tags
+and monotonic times. Commit, retirement and carrier changes are returned to the
+caller. The worker barrier and actual network dispatch remain to be implemented.
+Tests cover simultaneous startup, equal tags, each lost flight, stale replay,
+role reversal, either/both endpoint restarts, reply limits and liveness deadlines.
+
+The crate does not yet forward frames between peers. Configuration validation,
+worker ownership, counters, batching/offloads, path-MTU probing, recovery,
+BBRv3, DNS, the daemon and descriptor adoption remain to be implemented.
+There is no throughput claim for this foundation.
 
 ## Validation
 

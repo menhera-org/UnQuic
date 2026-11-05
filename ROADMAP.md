@@ -106,17 +106,27 @@ Implement section 6 exactly.
 Done when a buffer can be parsed and re-encoded to identical bytes for every
 record type and every rejection rule has a failing input.
 
-### 1b Handshake (`src/handshake.rs`)
+### 1b Handshake (`src/handshake.rs`) — complete
+
+Implemented with automatic tag election, nonblocking tag generation, pure
+liveness transitions and 16 protocol regression tests in `tests/handshake.rs`.
+The four handshake model tests now exercise real types. The five frame-window
+model tests remain in `tests/frame_model.rs` until stage 2 replaces them.
+Musl tests, Clippy, formatting and the isolated foundation kernel test pass.
 
 Implement sections 5.1 and 5.2 as a pure state machine with no I/O.
 
-- `Role` (initiator or responder), `Tag` (nonzero 128-bit), `Params`
+- `Role` (elected initiator or responder), `Tag` (nonzero 128-bit), `Params`
   (12 bytes from section 5.2), `Connection` (confirmed `(I, R)` pair plus
   negotiated params).
 - `Session` state: configured, establishing, active, degraded, inactive, plus
   the one pending attempt. Inputs: a decoded handshake record with its
   monotonic receive time, or a timer tick. Outputs: zero or more records to
   send, carrier up or down, and a commit event carrying the new connection.
+- Elect roles automatically when unchallenged HELLOs cross: lower tag stays
+  initiator; the other endpoint chooses a fresh responder tag. Equal tags
+  restart with fresh randomness. Freeze roles once challenged and keep the
+  active role separate from the pending role.
 - The responder resends its existing challenge for the same pending `I` and
   identical parameters; a changed body with the same `I` is invalid. Pending
   attempts expire after 10 s. HELLO and CONFIRM retransmit every second. Apply
@@ -126,22 +136,26 @@ Implement sections 5.1 and 5.2 as a pure state machine with no I/O.
 - Tag generation lives in `src/sys.rs`: `getrandom` with `GRND_NONBLOCK`;
   `EAGAIN` means "retry later", everything else is an error. The state
   machine takes tags as input so tests use fixtures.
-- Tests: port every case from `tests/design_model.rs` to run against these
-  real types, then delete the model file. Add the message-loss, duplicate,
+- Tests: port the handshake cases from `tests/design_model.rs` to run against
+  these real types. Keep its frame-window cases in `tests/frame_model.rs` for
+  stage 2, then delete the old mixed model file. Add the message-loss, duplicate,
   reorder, simultaneous start and restart cases listed under "Protocol and
   ownership regression cases" in section 14.1.
 
-Done when every design-model case passes against the real types and the
-model file is gone.
+Done when every handshake model case passes against real types, the old mixed
+model file is gone, and the frame tests remain available for stage 2.
 
 ### 1c Configuration types (`src/config.rs`)
 
 Plain structs the daemon fills from TOML and a library user fills by hand:
-`Daemon` (listen address, listen port, memory ceiling), `Peer` (name,
-resolved `SocketAddrV6` or FQDN, port, bind device, lane count, path group),
-`Session` (name, peer, cookie, role, TAP name, inner MTU, optional MAC,
-queue count). `validate()` returns the first error: duplicate cookies via
-`CookieIndex`, unknown peer names, bad roles, MTU out of range, port zero.
+`Daemon` (memory ceiling), named `Endpoint` (listen address, listen port,
+optional bind device), `Peer` (name, endpoint name, IPv6 host or FQDN,
+peer port, lane count, path group), `Session` (name, peer, cookie,
+TAP name defaulting to session name, inner MTU, optional MAC, queue count).
+Roles are elected and have no configuration field. Follow
+[config-model.md](config-model.md). `validate()` returns the first error:
+duplicate names or cookies via `CookieIndex`, unknown endpoint or peer names,
+MTU out of range, port zero.
 Hosts given as FQDN are allowed only with the `dns` feature; without it the
 validator rejects them. No file or environment access here.
 
@@ -182,8 +196,8 @@ routing (v1)".
   stage 2 and 3. Duplicate suppression by frame ID is already required so
   a frame never reaches the TAP twice.
 - Container test `tests/linux_runtime.rs`: two runtimes in one network
-  namespace on loopback with different fixed ports, one initiator and one
-  responder, each with one TAP. Assert the handshake completes, carrier rises
+  namespace on loopback with different fixed ports and automatically elected
+  roles, each with one TAP. Assert the handshake completes, carrier rises
   on both TAPs, a frame written to one TAP arrives unchanged on the other in
   both directions for 60, 1514, 1518 and 9022 bytes, carrier drops within
   30 s after one runtime shuts down, and the surviving runtime reconnects
@@ -233,8 +247,8 @@ Goal: the packet rate and CPU baseline of section 13 can be measured.
 - Preallocated buffer pools and descriptor rings in the worker; no allocation
   on the data path after startup. Verify by a test that counts allocations
   with a global allocator wrapper in the test binary.
-- Tests: window tests ported from `tests/design_model.rs` frame cases
-  (already moved in 1b, extend here), GRO split boundaries, partial
+- Tests: window tests ported from `tests/frame_model.rs` to real types;
+  delete that model file once the replacement tests pass, GRO split boundaries, partial
   `sendmmsg` completion returns the unsent entries, container test extended
   with a 10 s bidirectional frame storm and a check that no frame is
   duplicated or corrupted.
@@ -267,7 +281,7 @@ Goal: a production candidate under loss.
   burst cap of min(send quantum, 16 datagrams), `timerfd` deadlines, the
   separate 4 MiB/s control-traffic ceiling with a 16-datagram burst.
 - Liveness from section 5.3: PROBE once per second on idle, degraded after
-  3 s, inactive after 30 s, replacement handshake by the initiator.
+  3 s, inactive after 30 s, replacement handshake with automatic election.
 - Tests: the BBR and feedback cases under "Protocol and ownership regression
   cases" in section 14.1; a container test with `tc netem` loss and reorder
   inside the namespace proving no duplicate delivery and bounded memory; a

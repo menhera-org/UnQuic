@@ -47,7 +47,7 @@ The requirement identifiers below describe commitments established for this proj
 
 - **R03 Endpoint configuration.** Identify each peer by an FQDN or IPv6 literal and a fixed UDP receive port.
 
-- **R04 Receive port.** Each daemon has one fixed UDP port number used exclusively for receiving protocol traffic. It never sends protocol packets from this port.
+- **R04 Receive port.** Each named endpoint has a fixed UDP port number used exclusively for receiving protocol traffic. The daemon never sends protocol packets from its configured receive ports.
 
 - **R05 Transmit ports.** Maintain several dynamically allocated source ports per destination. Data, ACKs, probes, repair traffic, and session-control messages all leave through these dynamic ports and target the peer's fixed receive port.
 
@@ -93,7 +93,7 @@ The initial minimum kernel target is Linux 5.0, with offload fallbacks; qualify 
 
 # 4 Socket and peer model
 
-Each daemon receives on its configured fixed port. It creates a pool of dynamic-port transmit sockets for each destination and keeps their source ports stable while the sockets remain active. The source port is not randomly changed for every packet.
+Each endpoint receives on its configured fixed port. It creates a pool of dynamic-port transmit sockets for each destination and keeps their source ports stable while the sockets remain active. The source port is not randomly changed for every packet.
 
 | Traffic | Source socket | Destination socket |
 | - | - | - |
@@ -108,7 +108,7 @@ The fixed receive port may be implemented by several sockets in a `SO_REUSEPORT`
 
 Dynamic transmit sockets may use UDP `connect()` for destination selection and error handling. Normal protocol responses still arrive on the fixed receive port. The daemon must separately handle asynchronous socket errors and ICMPv6 feedback associated with transmit sockets. Deployments must permit inbound traffic to the fixed port explicitly; reverse protocol traffic is not necessarily the reverse five-tuple of an outbound datagram.
 
-Use one fixed receive port number across configured binding scopes. If a daemon serves several VRFs, create the necessary receive sockets in those scopes using the same number. Apply `SO_BINDTODEVICE` before transmission to the selected interface or VRF; avoid depending on global cross-VRF socket acceptance. [S5]
+Configure each receive endpoint's address, port and binding scope explicitly. Endpoints in different VRFs may share a port number; endpoints may also use different port numbers. Apply `SO_BINDTODEVICE` before transmission to the selected interface or VRF; avoid depending on global cross-VRF socket acceptance. [S5]
 
 Resolve FQDNs to IPv6 addresses outside the packet-processing loop. Select and validate a destination address, keep it stable during a path generation, and refresh DNS asynchronously. DNS failure should not immediately tear down a working path. Address changes require path validation and new path measurements. DNS lookup routing must be configured separately if resolution itself must use a particular VRF.
 
@@ -120,9 +120,11 @@ The cookie is a bearer value, without confidentiality or cryptographic payload i
 
 ## 5.1 Connection identity and roles
 
-Each session configures `role = "initiator"` at one endpoint and `role = "responder"` at the other. The roles control establishment only; Ethernet traffic is bidirectional. Reject missing or invalid local roles. Two initiators or two responders cannot establish; report a role mismatch when observable, without changing TAP readiness.
+Roles are elected per attempt; neither endpoint configures a role. Both endpoints may start with HELLO. When two unchallenged HELLO attempts cross, compare their nonzero tags as unsigned 128-bit integers: the lower tag remains I and its sender remains the initiator. The other endpoint abandons its outgoing attempt, generates a fresh R (not its abandoned HELLO tag), and replies with CHALLENGE. This switch retains the original pending deadline. Equal tags abandon the local attempt and require a fresh tag; the send limits still apply. If HELLO arrives before a local attempt exists, accept it as a responder directly.
 
-Use independent, nonzero 128-bit random receive tags, I chosen by the initiator and R by the responder. Reject R equal to I. Established initiator-to-responder packets carry R; responder-to-initiator packets carry I. A connection is the confirmed pair (I, R), scoped by the configured cookie. Tags have no order and are never derived from a clock or persisted. A new connection resets packet/frame accounting only after confirmation. Data and feedback must match the current local receive tag and validated peer address/binding scope; they never establish or replace a connection. Different tags in each direction also reject reflected packets.
+Election applies only while waiting for the first challenge. Once an endpoint has sent CHALLENGE or accepted one, its pending pair and role are fixed until confirmation or expiry; unrelated HELLOs are ignored. An active connection retains its own role while a replacement is pending, and a replacement may elect the opposite role. Roles control establishment and directional tag selection only; Ethernet traffic is bidirectional.
+
+Use independent, nonzero 128-bit random receive tags, I chosen by the initiator and R by the responder. Reject R equal to I. Established initiator-to-responder packets carry R; responder-to-initiator packets carry I. A connection is the confirmed pair (I, R), scoped by the configured cookie. Tag ordering is used only to break a simultaneous-HELLO tie; it never expresses freshness. Tags are never derived from a clock or persisted. Neither tag of an active pair may be reused by its replacement. A new connection resets packet/frame accounting only after confirmation. Data and feedback must match the current local receive tag and validated peer address/binding scope; they never establish or replace a connection. Different tags in each direction also reject reflected packets.
 
 Generate tags with `libc::getrandom()` using `GRND_NONBLOCK`, handling short reads and interruptions. If entropy is not ready, retry establishment later; report other errors and keep carrier down without a weak fallback. Randomness is needed only for establishment, not per packet. TAP creation/readiness proceeds independently. All durations below use monotonic time; no wall-clock value goes on the wire.
 
@@ -130,24 +132,24 @@ Generate tags with `libc::getrandom()` using `GRND_NONBLOCK`, handling short rea
 
 Handshake packets contain exactly one handshake record, a zero receive tag, lane zero, and packet number zero. They are not packet-ACKed. Both endpoints send from dynamic ports to the configured fixed port. Validate the cookie, version, record, configured peer address and binding scope before handling it. The advertised fixed port must match configuration; a packet cannot redirect replies to an arbitrary endpoint.
 
-1. The initiator creates fresh I and sends HELLO(I, initiator parameters).
+1. Either endpoint creates fresh I and sends HELLO(I, initiator parameters); simultaneous attempts use the election rule above.
 2. The responder records a pending candidate, creates fresh R, and sends CHALLENGE(I, R, responder parameters). It preserves any active connection.
 3. The initiator accepts CHALLENGE only for its pending I, fixes R and the peer parameters, and sends CONFIRM(I, R). A different R or changed parameters for that attempt is ignored.
 4. The responder accepts CONFIRM only for its exact pending pair, installs that connection, and sends READY(I, R). The initiator installs it only on READY matching its exact pending pair. DATA arriving before local installation is dropped and can be repaired normally after establishment.
 
 Parameters are fixed receive port (2 bytes), maximum inner frame size (2), mandatory features (4), and optional features (4). All integers are big-endian. Mandatory feature bits are zero in v1; reject unsupported mandatory bits. Optional bits are zero on send and ignored if unknown. The negotiated frame ceiling is the smaller advertised size, which must be between 1514 and 9022 bytes. If the local configured MTU/tag depth requires frames exceeding that ceiling, reject the candidate, report the mismatch, and keep carrier down if no compatible connection is already active. This does not remove TAPs or retract daemon readiness.
 
-There is at most one active connection and one pending handshake per session. A pending attempt lasts 10 seconds without extension by duplicates. The initiator retransmits HELLO every second until it has a challenge, then CONFIRM every second until READY; after expiry it starts again with fresh I. For the same pending I and identical parameters, the responder resends its existing challenge, not a new R. While a candidate is pending, other HELLOs are ignored until it expires or commits. A changed HELLO body with the same I is invalid. Send the first reply for each new handshake phase immediately. Limit repeated replies and retransmissions of a phase to once per second, and cap all handshake traffic at four datagrams per second per session with a burst of four; suppress excess duplicates.
+There is at most one active connection and one pending handshake per session. A pending attempt lasts 10 seconds without extension by duplicates. The initiator retransmits HELLO every second until it has a challenge, then CONFIRM every second until READY; after expiry either endpoint starts again with fresh I, even if it was responding. An explicitly requested replacement continues until confirmation, including while the old connection remains healthy. For the same pending I and identical parameters, the responder resends its existing challenge, not a new R. While a candidate is pending, other HELLOs are ignored until it expires or commits, except for the unchallenged election above. A changed HELLO body with the same I is invalid. Send the first reply for each new handshake phase immediately. Limit repeated replies and retransmissions of a phase to once per second, and cap all handshake traffic at four datagrams per second per session with a burst of four; suppress excess duplicates.
 
-Remember the active pair and its negotiated parameters. Duplicate CONFIRM for that pair resends READY without resetting packet, frame, or congestion state; duplicate READY is a no-op. HELLO for the active I can only repeat its existing challenge. A different HELLO can create a pending candidate but cannot clear active state. After a process restart, lost candidate state is never reconstructed from CONFIRM or READY: a new HELLO must obtain a fresh challenge. Thus an old HELLO plus old CONFIRM cannot install a connection after a restart. Delayed messages for an older pair cannot overwrite a later connection. Loss of READY is handled by repeated CONFIRM. Explicit roles make simultaneous startup and simultaneous restart follow this same exchange without election.
+Remember the active pair and its negotiated parameters. Duplicate CONFIRM for that pair resends READY without resetting packet, frame, or congestion state; duplicate READY is a no-op. At the active responder, HELLO for the active I can only repeat its existing challenge. The active initiator ignores such a reflected HELLO. Duplicate CONFIRM is answered only by the active responder; duplicate READY never changes state. A different HELLO can create a pending candidate but cannot clear active state. After a process restart, lost candidate state is never reconstructed from CONFIRM or READY: a new HELLO must obtain a fresh challenge. Thus an old HELLO plus old CONFIRM cannot install a connection after a restart. Delayed messages for an older pair cannot overwrite a later connection. Loss of READY is handled by repeated CONFIRM. Simultaneous startup and restart use the same bounded tag election. A restarted endpoint never adopts an abandoned HELLO tag as R, so delayed CONFIRM cannot bypass the fresh challenge.
 
 A new connection commit discards the old connection's packet, frame, pending-write, and lane state through a worker barrier. Events and queued transmissions carry their connection tags and are rechecked before use; stale events cannot affect the replacement. Cancel outstanding grants, reconcile all successful sends, and report any remaining unacknowledged old transmissions as lost exactly once before releasing their congestion charges; replacing a connection must not manufacture free inflight credit. A commit must not reset counters under a retained tag. Re-exec without a versioned transport-state handover starts a fresh handshake even if TAP descriptors survive.
 
 ## 5.3 Liveness, path changes, and lanes
 
-States are configured, establishing, active, degraded, and inactive. TAP existence determines daemon readiness independently of these states. A confirmed connection becomes active and raises carrier. On an idle connection, send an ACK-eliciting PROBE once per second in each direction. Only an ACK newly covering an outstanding ACK-eliciting packet, or the first matching PROBE_REPLY for an unanswered probe, demonstrates feedback for that direction; repeated old packets do not refresh it. After 3 seconds without such feedback, enter degraded, keep congestion-limited traffic and probes running, and let the initiator start a replacement handshake. After 30 seconds, enter inactive and lower carrier; discard the active connection using the same worker barrier and congestion-accounting settlement as replacement. The initiator continues attempts; a responder waits for HELLO. Valid fresh feedback can restore a degraded connection before replacement or inactivity.
+States are configured, establishing, active, degraded, and inactive. TAP existence determines daemon readiness independently of these states. A confirmed connection becomes active and raises carrier. On an idle connection, send an ACK-eliciting PROBE once per second in each direction. Only an ACK newly covering an outstanding ACK-eliciting packet, or the first matching PROBE_REPLY for an unanswered probe, demonstrates feedback for that direction; repeated old packets do not refresh it. After 3 seconds without such feedback, enter degraded, keep congestion-limited traffic and probes running, and let either endpoint start a replacement handshake. After 30 seconds, enter inactive and lower carrier; discard the active connection using the same worker barrier and congestion-accounting settlement as replacement. Both endpoints continue attempts with fresh election tags. Valid fresh feedback can restore a degraded connection before replacement or inactivity.
 
-Resolve addresses outside workers. Keep the active address stable while it works; a DNS failure keeps it. For a changed address, allow one candidate address alongside the active address and require a new handshake before using it for data. The initiator attempts the candidate; a responder accepts HELLO only from an explicitly configured/resolved candidate. Retire the old address on commit. Do not learn a new destination from an arbitrary packet. Reset path measurements for an address or binding change; a session-only reconnect on an unchanged path must not grant an independent congestion budget.
+Resolve addresses outside workers. Keep the active address stable while it works; a DNS failure keeps it. For a changed address, allow one candidate address alongside the active address and require a new handshake before using it for data. Either endpoint may attempt the candidate; an endpoint accepts HELLO only from an explicitly configured/resolved candidate. Retire the old address on commit. Do not learn a new destination from an arbitrary packet. Reset path measurements for an address or binding change; a session-only reconnect on an unchanged path must not grant an independent congestion budget.
 
 Lane IDs are 16-bit, nonzero, allocated monotonically per sending direction within a connection, with at most 64 active lanes. Zero is reserved for handshake packets. Never reuse an ID or reset its packet counter within that connection. Start a new handshake before exhausting IDs. Each lane uses one fixed source-address/source-port/destination/binding tuple. A tuple change retires the lane; it is not an implicit migration. Freeze receive reuseport membership while connections are active; changing worker/socket membership requires fresh connections, while keeping TAPs.
 
@@ -334,33 +336,34 @@ Keep TAP names, MAC configuration, and device identity stable across ordinary pe
 
 # 12 Configuration and operations
 
-Separate daemon-wide receive configuration, peer transport configuration, and per-session Ethernet configuration. One peer may carry multiple sessions; shared lanes or separate lane pools must still observe the appropriate aggregate congestion budget.
+Separate daemon-wide resource limits, named receive endpoints, peer transport configuration, and per-session Ethernet configuration. One peer may carry multiple sessions; shared lanes or separate lane pools must still observe the appropriate aggregate congestion budget.
 
 An illustrative configuration shape follows. Names and default values are proposed, and the cookie is a placeholder. The file is TOML, parsed with `serde` and `toml` under the `bin` feature; the library core takes already-parsed values and never touches the file.
 
 ```toml
-[daemon]
+[[endpoints]]
+name = "default"
 listen_address = "::"
 listen_port = 40000
+bind_device = "vrf-ngn"
 
 [[peers]]
 name = "peer-a"
+endpoint = "default"
 host = "peer-a.example.net"
-port = 40000
-bind_device = "vrf-ngn"
+peer_port = 40000
 tx_lanes = 4
 
 [[sessions]]
 name = "ngn-a"
 peer = "peer-a"
 cookie = "<uuid-v4>"
-role = "initiator" # configure the other endpoint as responder
-tap_name = "tap-ngn-a"
+tap_name = "tap-ngn-a" # optional; defaults to the session name
 inner_mtu = 2400
 # mac = "02:00:00:00:00:01" # optional; omit to derive from hostname and TAP name
 ```
 
-Support IPv6-literal hosts always, and FQDN hosts when the `dns` feature is enabled, which the daemon always has; resolution runs on a helper thread so the packet loop never blocks. A library user without `dns` configures endpoints as literals only. `bind_device` is per peer because peers may live in different VRFs; the daemon creates one receive socket per distinct device on the single configured port, as section 4 requires. Define scope identifiers for link-local literals if those addresses are supported. Cookie changes are explicit administrative operations; do not silently replace a configured cookie during reconnect.
+Support IPv6-literal hosts always, and FQDN hosts when the `dns` feature is enabled, which the daemon always has; resolution runs on a helper thread so the packet loop never blocks. A library user without `dns` configures endpoints as literals only. Each peer references a named endpoint containing its local listen address, fixed port and optional binding device. The daemon creates a receive socket set per endpoint; different endpoints may use different ports or VRFs. Peer `host` and `peer_port` specify the remote destination. See [config-model.md](config-model.md) for the configuration shape. Define scope identifiers for link-local literals if those addresses are supported. Cookie changes are explicit administrative operations; do not silently replace a configured cookie during reconnect.
 
 Resolver selection must be configurable. `iphost`'s `ipv6`, `ra`, and `dhcpv6` modes bypass system resolvers and must work without `/etc/resolv.conf`. Using FQDNs or enabling the `dns` feature does not imply use of the system resolver. Do not silently fall back to the system resolver when a mode that bypasses it was selected. IPv6-literal endpoints require no resolver.
 
@@ -425,7 +428,7 @@ Functional tests need only what any Linux host or container can provide: a kerne
 
 The implementation must exercise these cases with deterministic loss, reordering, clock-independent randomness fixtures, and bounded queues. A test-only executable model in `tests/design_model.rs` checks the handshake and frame-window invariants before the transport exists; it is not a substitute for socket/TAP tests.
 
-- Lose each handshake message, duplicate every message, start both roles together, restart either or both endpoints, replay old HELLO/CONFIRM/READY after a newer connection, and change the wall clock. Only the current pending exchange may commit; duplicate confirmation never resets active counters. A pending attempt must not evict working data state.
+- Lose each handshake message, duplicate every message, start both endpoints together with either tag order and equal-tag collisions, restart either or both endpoints, replay old HELLO/CONFIRM/READY after a newer connection, and change the wall clock. Only the current pending exchange may commit; duplicate confirmation never resets active counters. A pending attempt must not evict working data state.
 - Confirm the responder, lose READY, and resend CONFIRM. The responder repeats READY without reinstalling state; the initiator eventually commits. If a responder restarts between challenge and confirmation, the old confirmation is rejected and a fresh attempt succeeds.
 - Deliver FRAME_ABANDON before a frame's first piece and verify that reordered data cannot recreate it. Deliver a frame, lose its ACK, retire its lane, then deliver old pieces and attempted repairs on another lane. The frame reaches TAP once. After the frame window advances or a lane retires, even a repair carrying a new packet number cannot recreate it.
 - Fill reassembly, TAP-write, and handoff queues. Unreserved datagrams are not ACKed; accepted frames either complete once or become terminal. Expired completion bits never reopen sequence numbers below a window floor. Exercise memory ceilings with many sessions and lanes.
@@ -460,8 +463,11 @@ validates complete datagrams before dispatch and has fixed byte vectors for all
 eleven record types in tests/vectors/wire-v1. TAP creation accepts an
 optional MAC and leaves administrative state unchanged. Tests cover the public
 types, loopback socket invariants and live TAP behavior in an isolated network
-namespace; see README.md for commands and coverage limits. Handshake state and session dispatch,
-counters and the owned worker runtime are not yet implemented. The crate does
+namespace; see README.md for commands and coverage limits. The pure handshake
+state machine implements automatic role election, bounded retries, negotiated
+parameters, replacement and liveness transitions using supplied monotonic times.
+Commit and carrier events still require runtime integration. Configuration,
+session dispatch, counters and the owned worker runtime are not yet implemented. The crate does
 not yet provide end-to-end Ethernet transport, and no performance acceptance
 claim has been made.
 
@@ -489,7 +495,7 @@ Maintain a clear distinction between a throughput experiment and an interoperabl
 | Controller implementation | Decided: in-tree BBRv3 draft 07, one owner/budget per direction and path group (section 9) |
 | Retry and frame deadlines | Initial two-repair limit and bounded RTT-based sender / 100 ms receiver deadlines (section 8); tune by measurement |
 | Reordering policy | Decided: flow-to-lane pinning, immediate completed-frame delivery; extra reorder buffering deferred |
-| Restart protocol | Decided: explicit roles, random directional receive tags, HELLO/CHALLENGE/CONFIRM/READY (section 5) |
+| Restart protocol | Decided: automatic tag election, random directional receive tags, HELLO/CHALLENGE/CONFIRM/READY (section 5) |
 | Abandonment protocol | Decided: transport-acceptance ACKs, bounded advisory abandonment, permanent window floors and lane tombstones (sections 6 and 8) |
 | Wire layout | v1: 48-byte common header and exact record bodies (section 6); interoperability vectors required before release |
 | Worker and lane counts | Start small; determine from queue and CPU measurements |

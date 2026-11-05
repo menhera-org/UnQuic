@@ -1,8 +1,8 @@
 //! Linux foundations for UnQuic's unencrypted Ethernet transport.
 //!
-//! This crate currently provides identity types, the v1 wire codec, IPv6 UDP
-//! sockets and TAP ownership.
-//! It does not yet establish sessions or forward Ethernet frames.
+//! This crate provides identity types, the v1 wire codec, a pure handshake state
+//! machine, IPv6 UDP sockets and TAP ownership. Network dispatch and Ethernet
+//! forwarding are not yet implemented.
 //! Callers supply configuration explicitly; the library reads no configuration
 //! files or environment variables and writes no diagnostic output.
 #![deny(missing_docs)]
@@ -10,6 +10,7 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("UnQuic requires the Linux kernel");
 
+pub mod handshake;
 pub mod mac;
 mod sha256;
 pub mod socket;
