@@ -189,7 +189,7 @@ The fixed v1 record bodies are below. Sizes exclude the 4-byte record prefix.
 | 9 | READY | I (16), R (16); 32 bytes |
 | 10 | LANE_RETIRE | Retired sender lane (2), reserved zero (2); 4 bytes |
 
-Established packets may mix records except handshake records, which are always isolated. DATA's frame ID is `(lane_id << 48) | frame_sequence`; the low 48 bits start at 1 and increase for each new frame on that lane. Its high bits must match the datagram's lane. Frame sequences never wrap or reset under that connection tag; retire the lane before exhaustion. A frame's total length is 14 through the negotiated frame ceiling. Offsets and lengths must fit that total without integer overflow. Reject inconsistent totals and conflicting overlaps for an incomplete frame. Identical overlaps are duplicates. Every repair preserves the frame ID and offsets.
+Established packets may mix records except handshake records, which are always isolated. DATA's frame ID is `(lane_id << 48) | frame_sequence`; the low 48 bits start at 1 and increase for each new frame on that lane. Its high bits must match the datagram's lane. Frame sequences never wrap or reset under that connection tag; retire the lane before exhaustion. A frame's total length is 14 through the negotiated frame ceiling. Offsets and lengths must fit that total without integer overflow. Reject inconsistent total lengths for an incomplete frame. Overlaps keep the first retained bytes, as section 8.1 specifies; fully covered pieces are duplicates. Every repair preserves the frame ID and offsets.
 
 Every established physical transmission, including control and ACK-only packets, gets a new packet number starting at 1 on its lane. Retries use new numbers. Never reuse a number after a failed or partially successful batched send; track which allocated numbers actually reached a successful send syscall. Records refer only to the current connection; neither an ACK nor an abandonment record can reach a retired connection through an old tag.
 
@@ -430,7 +430,7 @@ Functional tests need only what any Linux host or container can provide: a kerne
 
 ### Protocol and ownership regression cases
 
-The implementation must exercise these cases with deterministic loss, reordering, clock-independent randomness fixtures, and bounded queues. A test-only executable model in `tests/design_model.rs` checks the handshake and frame-window invariants before the transport exists; it is not a substitute for socket/TAP tests.
+The implementation must exercise these cases with deterministic loss, reordering, clock-independent randomness fixtures, and bounded queues. The real handshake and reassembly implementations are exercised in `tests/handshake.rs` and `tests/reassembly.rs`; the earlier test-only model has been removed. These tests complement the socket/TAP container tests.
 
 - Lose each handshake message, duplicate every message, start both endpoints together with either tag order and equal-tag collisions, restart either or both endpoints, replay old HELLO/CONFIRM/READY after a newer connection, and change the wall clock. Only the current pending exchange may commit; duplicate confirmation never resets active counters. A pending attempt must not evict working data state.
 - Deliver valid-cookie, current-tag packets from changed source addresses and

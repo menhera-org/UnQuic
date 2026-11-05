@@ -13,9 +13,10 @@ section 15 of the design and the "Implementation status" section of
   (`dns`, `uuid-compat`, `bin`) are the only exceptions, as the README lists.
 - Every public item has a doc comment. Every `unsafe` block has a `// SAFETY:`
   comment on the line above. Use `const fn` where a function can be one.
-- The library never touches ordinary files, environment variables or stdio.
+- The transport core never touches ordinary files, environment variables or stdio.
   Kernel interfaces (sockets, ioctls, `/dev/net/tun`, `timerfd`, `eventfd`,
-  `epoll`, `getrandom`) are fine.
+  `epoll`, `getrandom`) are fine. The optional iphost layer uses the selected
+  resolver's facilities as documented in config-model.md.
 - No async runtime, no wall-clock values on the wire, no host-specific facts in
   the repository.
 - No locks or allocations on hot paths. Protocol transitions take supplied
@@ -342,6 +343,10 @@ now run against the real implementation in tests/reassembly.rs.
 ## Stage 3: recovery and congestion control
 
 Goal: a production candidate under loss.
+
+Session liveness already uses matching small probes on local lane 1. Per-lane
+MTU probing, ACK-based feedback, recovery and congestion control are still
+pending; README.md documents the baseline send-error behavior.
 
 - `ack.rs`: ACK scheduling (16 packets or 1 ms, immediate on gap), at most
   32 newest ranges, delay capped at 1000 µs, per-lane once-per-millisecond

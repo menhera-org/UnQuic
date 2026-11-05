@@ -13,9 +13,9 @@
 - Performance targets: local container tests must sustain at least 20 Gbit/s in each direction simultaneously at inner MTU 1500, with CPU use reported. The deployment target is at least 5 Gbit/s over real routed IPv6 10G-EPON access lines with 4.5–7.5 ms RTT and nonzero packet loss. Neither target has been demonstrated; section 14.2 of the design defines the acceptance work.
 - No async runtime: plain pinned threads with batched syscalls. `tokio` gives one syscall per packet, no GSO/GRO, cross-core task migration, and 1 ms timers, all wrong for a few always-busy sockets. See section 10 of the design.
 - Platform contract: assume the Linux kernel and only the interfaces, files, and permissions needed by the selected features, such as `/dev/net/tun` for TAP creation and `/etc/resolv.conf` when using `iphost`'s system resolver. Its configurable `ipv6`, `ra`, and `dhcpv6` modes bypass system resolvers. Document each additional host assumption with the feature that needs it. Make no assumptions about the surrounding userspace: no required XDG or other freedesktop.org conventions, GNU userspace, Android or ChromeOS facilities, systemd, or D-Bus dependencies. Binaries are built for `*-unknown-linux-musl` targets.
-- Library I/O: no ordinary filesystem access except `/etc/resolv.conf` through `iphost` when its system resolver is selected; no environment-variable reads or stdio. Kernel interfaces such as `/dev/net/tun`, sockets, and ioctls are allowed. Application configuration-file handling and command-line I/O belong to the caller or daemon.
+- Library I/O: the transport core reads no ordinary files or environment variables and writes no diagnostics. Kernel interfaces such as `/dev/net/tun`, sockets, and ioctls are allowed. The optional iphost layer uses the selected resolver's operating-system facilities; see [resolver requirements](config-model.md#daemon-resolver-selection). Application configuration-file handling and command-line I/O belong to the caller or daemon.
 - Future optional integration: systemd support without linking to systemd or D-Bus libraries, DEB/RPM packaging, and restarts that preserve TAPs by retaining and handing over their file descriptors, following rs-l2tpd's descriptor-preservation approach. These additions must leave standalone operation and the library I/O boundary intact.
-- Startup readiness: every configured TAP interface exists, whether newly created or adopted. The daemon forks and its original parent exits successfully only at readiness, so any init system or launcher can wait for that exit status. This works without systemd and does not wait for network connectivity or peer handshakes. When used, the optional embedded systemd unit must make both `network.target` and `network-online.target` require and wait for daemon readiness; the daemon must not depend on either target or any wait-online service.
+- Planned daemon readiness: every configured TAP interface exists, whether newly created or adopted. The daemon forks and its original parent exits successfully only at readiness, so any init system or launcher can wait for that exit status. This works without systemd and does not wait for network connectivity or peer handshakes. When used, the optional embedded systemd unit must make both `network.target` and `network-online.target` require and wait for daemon readiness; the daemon must not depend on either target or any wait-online service.
 - TAP configuration: creation accepts `Option<MacAddress>`. The in-tree `MacAddress` type accepts nonzero unicast addresses, whether globally or locally administered. `None` derives a stable address in Menhera's `60:a4:34:4x:xx:xx` MAC-M range from the current UTS hostname and interface name using SHA-256. UnQuic sets the configured MTU and optional MAC but leaves administrative state, addressing and bridge membership to the caller or network manager (for example, systemd-networkd or ifupdown). Transport state controls carrier, independently of administrative state.
 - Design: see [initial-design.md](initial-design.md). Implementation order and per-step acceptance: see [ROADMAP.md](ROADMAP.md).
 
@@ -26,7 +26,7 @@ The crate requires Linux and declares Rust 1.89 or later. Use a
 `libc`; enabling `dns` adds exactly `iphost 0.4.4` with RA and DHCPv6 support,
 without its default features. `uuid-compat` adds lossless conversions to and from
 `uuid::Uuid`, with no UUID generation dependency. `bin` builds the daemon and
-enables `dns`, `serde`, `toml` and iphost's serde support. Neither feature is
+enables `dns`, `serde`, `toml` and iphost's serde support. No optional feature is
 enabled by default.
 
 Build and run the foreground daemon:
@@ -247,6 +247,29 @@ Current sends batch the pieces of one frame; packing multiple frames together
 remains pending. TAP I/O still requires one read or write per frame. No throughput
 target follows from the allocation checks alone.
 
+## Delivery and liveness
+
+The current runtime sends each DATA piece once. It retains a frame only until
+all pieces have been submitted, the connection changes, or its 100 ms sender
+deadline expires. It does not yet generate data ACKs, retain sent data for repair,
+or apply congestion control. A lost piece can therefore prevent that entire
+frame from reaching TAP. Receive expiry starts at the first retained piece and
+does not move when duplicates arrive.
+
+Completed frames are delivered as they become available, without a per-flow
+reorder queue. A flow hashes to one transmit lane; increasing `tx_lanes` spreads
+multiple flows but does not stripe a single flow. Queue counts and lane counts
+are independent, and peers need not use identical values.
+
+Liveness currently sends a 52-byte UDP PROBE on local lane 1 every second,
+including during data traffic. Only the first reply matching the outstanding
+probe's packet number and payload length refreshes feedback; ordinary DATA and
+old replies do not. This checks the session's control path, not every transmit
+lane or its usable MTU. After 3 seconds without feedback the session becomes
+degraded and attempts replacement while retaining its active connection. After
+30 seconds it retires that connection and lowers carrier through the worker
+barrier. Recovery and per-lane path monitoring remain stage 3 work.
+
 ## Socket offloads
 
 Transmit batches group adjacent equal-sized UDP payloads, with an optional
@@ -330,15 +353,58 @@ implemented. Cumulative counts wrap modulo 2^64.
 
 ## Path MTU status
 
-Path MTU discovery is not implemented. UDP payloads are currently limited to
-1232 bytes, fitting IPv6's 1280-byte minimum MTU; transmit sockets disable outer
-fragmentation. Inner MTU is unchanged, and DATA records carry frame pieces.
+Path MTU discovery is not implemented. Every runtime send uses a 1232-byte UDP
+payload limit. Transmit sockets set `IPV6_DONTFRAG` and `IPV6_PMTUDISC_DO`;
+GSO segments remain subject to that limit. Inner TAP MTU stays configured, and
+the transport splits Ethernet frames into DATA pieces.
+
+| Size, without outer extension headers | Current baseline | Planned confirmed ceiling |
+| --- | ---: | ---: |
+| Outer IPv6 packet | 1280 bytes | 1500 bytes |
+| UDP payload | 1232 bytes | 1452 bytes |
+| Frame bytes in a single DATA record | 1164 bytes | 1384 bytes |
+
+Each DATA datagram has a 48-byte UnQuic header and a 20-byte record prefix.
+At the baseline, a 1514-byte Ethernet frame becomes pieces of 1164 and 350
+bytes; a 9022-byte frame needs eight datagrams. These are transport pieces,
+not outer IPv6 fragments.
+
+The socket API accepts a caller-supplied limit through 1452 bytes, but does not
+verify that the path supports it. The runtime has no `IPV6_RECVERR` error-queue processing
+or Packet Too Big validation. If ordinary sending returns EMSGSIZE after any
+GSO fallback, it counts a socket error and drops that frame's unsent remainder.
+It neither lowers the limit nor resizes the TAP. Other nontransient send errors
+follow the same path; WouldBlock and interrupted sends retain the remainder
+until its deadline.
 
 The planned per-lane discovery follows RFC 8899: padded PROBE packets test
-larger payloads up to 1452 bytes for a 1500-byte outer MTU, and matching
-PROBE_REPLY records confirm receipt. EMSGSIZE and validated ICMPv6 Packet Too
-Big feedback lower the limit and schedule re-probing. The current runtime uses
-small probes only for liveness; they do not raise the payload limit.
+larger sizes, and a reply matching a live probe confirms its exact size.
+EMSGSIZE and validated ICMPv6 Packet Too Big feedback will lower the limit and
+schedule re-probing. A path below the 1280-byte baseline must fail explicitly.
+The current small liveness probes do not establish that a full DATA packet fits.
+
+## Operational checks
+
+Readiness, carrier and administrative link state are separate. The daemon
+currently exposes readiness and errors on stderr; detailed counters and session
+state are available through the library's `Control` API.
+
+| Observation | Check |
+| --- | --- |
+| Startup fails before readiness | Configuration validation, `memory_limit`, TAP name availability and permission to open/create TAP queues |
+| TAP exists but is administratively down | External network-manager configuration; UnQuic never brings the interface up |
+| TAP is ready but carrier stays down | Peer address availability, receive binding, configured fixed ports, matching cookies and compatible negotiated frame ceilings |
+| Carrier drops despite incoming DATA | Fresh matching PROBE_REPLY traffic must return to the configured fixed port; DATA alone does not refresh liveness |
+| Carrier is up but frames expire | Queue drops, TAP write errors, underlay loss and socket errors; small probes do not test DATA-sized delivery |
+| Throughput stays low with many lanes | Flow count, worker/receive distribution and CPU use; one flow remains on one lane |
+
+Both directions send from dynamic source ports to configured fixed receive
+ports. Replies use the configured peer address and fixed port, never the
+observed source tuple. Network filtering must permit that traffic pattern.
+
+Cookies and receive tags travel in cleartext. They provide session admission
+and stale-connection rejection, with no payload encryption or cryptographic
+authentication. See the [security boundary](initial-design.md#5-session-cookie-and-lifecycle).
 
 ## Validation
 
@@ -388,8 +454,8 @@ test executables into a container, also copy the daemon and set
 `UNQUIC_TEST_BINARY` to its container path. Otherwise the test uses Cargo's
 built daemon path.
 
-Bridge/OVS/VRF matrices, real RA/DHCPv6 resolver networks, offloads, Linux 5.0
-qualification and performance acceptance remain open.
+Bridge/OVS/VRF matrices, real RA/DHCPv6 resolver networks, physical-NIC offload
+qualification, Linux 5.0 qualification and performance acceptance remain open.
 
 ## License
 

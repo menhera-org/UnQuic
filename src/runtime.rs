@@ -80,6 +80,9 @@ impl Control {
     }
 
     /// Whether every configured TAP exists in the running instance.
+    ///
+    /// This does not imply administrative link-up, carrier, a bound socket or a
+    /// connected peer. It becomes false when run returns.
     pub fn ready(&self) -> bool {
         self.0.ready.load(Ordering::Acquire)
     }
@@ -113,6 +116,8 @@ impl Control {
     /// for this peer is already queued, or the bounded command ring is full.
     /// Updates serialize while sessions still use both address slots.
     /// This cold control operation takes a mutex; packet workers never take it.
+    /// InvalidInput rejects an invalid peer index or address/scope combination;
+    /// BrokenPipe means shutdown was requested or run has stopped.
     pub fn supply_peer_address(
         &self,
         peer: usize,
@@ -275,6 +280,12 @@ impl Shared {
 ///
 /// Initial addresses come from Config. The caller can supply initial or refreshed
 /// IPv6 candidates through Control after TAP readiness.
+///
+/// InvalidInput reports configuration errors; OutOfMemory reports a reservation
+/// above the configured ceiling or accounting overflow. Reusing a Control
+/// returns AlreadyExists. Device, thread and fatal worker errors propagate.
+/// A shutdown request does not skip validation or device setup. After return,
+/// retained Control clones keep final counters and metadata, but no TAP queues.
 pub fn run(config: Config, control: Control) -> io::Result<()> {
     if control.0.started.swap(true, Ordering::AcqRel) {
         return Err(io::ErrorKind::AlreadyExists.into());
