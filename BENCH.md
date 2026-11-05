@@ -32,8 +32,8 @@ overflows account for visible loss locations; their different units prevent
 an exact frame-loss decomposition. Inner UDP receive-buffer errors are recorded
 and are too small to explain the observed 64-byte goodput decline.
 
-The next investigation is a repeated single-socket CPU-placement comparison,
-followed by worker/kernel profiling of any decline that persists. No remaining
+The single-socket follow-up below still shows a 64-byte decline. The next
+investigation is worker/kernel profiling with repeatable socket placement. No remaining
 decline is attributed solely to missing congestion control, recovery or PMTU.
 The absence of those features is a separate production-performance gap.
 
@@ -164,6 +164,43 @@ delivery falls from 448,939 frames/s at 10M per flow to 390,617 unlimited.
 Inner UDP receive-buffer drops are too few to explain that decline. Further
 worker/kernel profiling is required.
 
+## Single-socket follow-up
+
+A separate 15-second-per-point sweep uses the same `a69f88d` binary and
+transport settings, with all 20 test CPUs on socket 0. Daemons remain on 0–3
+and 4–7; left sender/receiver use 8–11 / 12–13, right sender/receiver 14–17 /
+18–19. Receiver sets shrink from four CPUs to two, and outer sockets are new.
+This is a different measurement profile, not an isolated NUMA A/B comparison.
+
+Both cases have 16 flows each way. Rows retain sweep order; goodput and
+frames/s pairs are L→R / R→L, process CPU is left / right.
+
+| Frame bytes | Requested/flow | Delivered Gbit/s | Delivered frames/s | Daemon CPU % |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | 3M | 0.047 / 0.047 | 269840 / 269875 | 329.1 / 323.1 |
+| 64 | 10M | 0.072 / 0.086 | 407914 / 488792 | 360.8 / 327.3 |
+| 64 | unlimited | 0.073 / 0.078 | 414808 / 443111 | 354.2 / 337.7 |
+| 64 | 10M | 0.070 / 0.085 | 396069 / 485555 | 359.3 / 314.1 |
+| 64 | unlimited | 0.078 / 0.083 | 443767 / 469521 | 359.8 / 335.2 |
+| 1514 | 125M | 1.972 / 1.912 | 167432 / 162329 | 328.2 / 351.1 |
+| 1514 | 250M | 2.738 / 2.279 | 232547 / 193570 | 315.8 / 327.9 |
+| 1514 | 500M | 2.613 / 2.099 | 221920 / 178208 | 344.5 / 344.7 |
+| 1514 | unlimited | 2.878 / 2.706 | 244354 / 229766 | 291.9 / 279.6 |
+| 1514 | 500M | 2.727 / 2.215 | 231554 / 188060 | 351.6 / 348.4 |
+| 1514 | unlimited | 2.850 / 2.602 | 241988 / 221000 | 361.7 / 352.2 |
+
+The 64-byte reverse direction falls from 488,792 to 443,111 frames/s on the
+first paced/unlimited pair (9.3%), and from 485,555 to 469,521 on the second
+(3.3%). Moving all work onto one socket therefore does not eliminate the
+observed decline. This does not identify its cause.
+
+MTU-1500 unlimited points deliver 2.878 / 2.706 and 2.850 / 2.602 Gbit/s,
+above their preceding 500M-per-flow points. There is no unlimited-load decline
+in this particular sweep, but the 24-CPU profile's decline remains unexplained.
+Neither profile establishes a universal CPU ceiling or meets the throughput
+gate. All follow-up points have zero admission-pressure and worker queue-drop
+counts; isolated expiry events and socket overflow remain in the data.
+
 ## Drop attribution
 
 The following unlimited MTU-1500 points use **left / right endpoint** order.
@@ -188,7 +225,7 @@ The admission-pressure cascade disappears in these after runs. Remaining losses
 are visible at TAP ingress and the outer receive sockets, with smaller losses
 at the inner receiver. That locates drops; it does not yet explain the remaining
 goodput decline. Outer IPv6 fragment creation and reassembly deltas are zero
-throughout all 54 recorded points.
+throughout all 65 recorded points.
 
 ## CPU and profiling
 
