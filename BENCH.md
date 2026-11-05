@@ -12,13 +12,15 @@ their absence does not explain away a scheduling or admission failure.
 
 ## Current performance gaps
 
-Status at `a69f88d`; the numbers below use the recorded 24-CPU local profile.
+Status at `1affb30`. The latest MTU-1500 results use the 20-CPU single-socket
+profile and capped socket-buffer fallback described below. Small-frame results
+still refer to `a69f88d`; they have not been rerun after the audit changes.
 L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Repeated 16-flow unlimited points deliver 2.44–2.57 / 3.00–3.08 Gbit/s of inner UDP payload | Roughly 8× / 6.5× more delivered goodput is needed even relative to the better unlimited point. The gate is not close to passing. |
-| Goodput must plateau under excess traffic | MTU-1500 reverse goodput falls from 3.38–3.44 Gbit/s at paced saturation to 3.00–3.08 Gbit/s unlimited | A roughly 9–13% decline remains. Removing the earlier admission cascade does not satisfy the plateau requirement. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Repeated 16-flow unlimited points deliver 3.06–3.07 / 4.09–4.20 Gbit/s of inner UDP payload | Roughly 6.5× / 4.8× more delivered goodput is needed even relative to the better unlimited point. The gate is not close to passing. |
+| Goodput must plateau under excess traffic | MTU-1500 reverse goodput falls from 4.30–4.35 Gbit/s at paced saturation to 4.09–4.20 Gbit/s unlimited | A 2.3–5.8% decline remains in this sweep. Removing the earlier admission cascade does not satisfy the plateau requirement. |
 | Small-frame overload must remain efficient | With 64-byte frames and 16 flows, reverse delivery falls from 448,939 to 390,617 frames/s | The 13% decline remains unresolved. The 60-byte multi-flow and small-frame single-flow cases are substantially steadier; they do not prove the 64-byte case fixed. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
@@ -26,7 +28,7 @@ L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
 
 Loss under unlimited load is still high: the recorded MTU-1500 16-flow point
-misses about 81% / 76% of offered frames despite zero admission-pressure
+misses about 76% / 67% of offered frames despite zero admission-pressure
 rejections and zero worker queue drops. TAP ingress drops and outer socket
 overflows account for visible loss locations; their different units prevent
 an exact frame-loss decomposition. Inner UDP receive-buffer errors are recorded
@@ -159,7 +161,7 @@ the theoretical CPU maximum or a load-independent plateau.
 
 ## Small frames
 
-These are unlimited-load points from the current revision. The data file also
+These are unlimited-load points from `a69f88d`. The data file also
 contains the preceding paced points and repeated 60-byte overload points.
 
 | Frame bytes | Flows | Delivered frames/s | Delivered Gbit/s | Missing % | Daemon CPU % |
@@ -239,7 +241,7 @@ The admission-pressure cascade disappears in these after runs. Remaining losses
 are visible at TAP ingress and the outer receive sockets, with smaller losses
 at the inner receiver. That locates drops; it does not yet explain the remaining
 goodput decline. Outer IPv6 fragment creation and reassembly deltas are zero
-throughout all 65 recorded points.
+throughout all 77 recorded points.
 
 ## CPU and profiling
 
