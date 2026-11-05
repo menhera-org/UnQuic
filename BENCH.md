@@ -611,3 +611,47 @@ the corresponding 1452 decrease is 4.3%. One baseline paced-to-unlimited
 repeat falls 2.2% in reverse, and one 1452 repeat falls 2.0%.
 Neither missing recovery nor absent congestion control is sufficient
 attribution. Continue profiling and the remaining pool/scheduling work.
+
+## Split-pool trial rejected (audit A6)
+
+A trial separated each worker's shared pool into 1024 transmit buffers of
+9023 bytes and 32 GRO receive buffers of 64 KiB. Startup accounting included
+both payload stores and their ownership queues. Cross-worker buffer returns
+kept their original pools; transmit reservations still obeyed the per-session
+frame and byte limits. Receive work and TAP reads retained their 64-record/
+64-read budgets. No deadline was shortened.
+
+The release suite, eight worker kernel regressions and the runtime allocation/
+reconnect test passed. Added assertions covered both pool sizes, payload
+accounting, independent exhaustion and return through full handoff queues.
+Clippy flagged the retained `Vec<Box<Buffer>>` ownership pools after their
+inline payload became a boxed slice; that lint was not resolved because
+the performance trial was rejected.
+
+The following six 20-second points used the same 1452-byte configuration,
+16 flows and CPU/queue placement as A5, with no concurrent builds or tests.
+The experimental binary's SHA-256 is
+`b89b8d055e17a078867a6bdd1a652944ace8b3bd70847dcc015bbe0dc506de5f`.
+Its worker/runtime sources accompany the raw results; the JSON marks this
+variant experimental. **The pool expansion was reverted and is not in the
+current runtime.**
+
+| Requested/flow | Delivered Gbit/s, L→R / R→L | Missing % | Daemon CPU %, left / right | Worker queue drops, left / right | Expiries, left / right | Socket overflow SKBs, left / right |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 125M | 1.999 / 1.994 | 0.02 / 0.28 | 321.4 / 330.6 | 0 / 0 | 0 / 0 | 4,371 / 190 |
+| 250M | 3.474 / 3.950 | 13.16 / 1.26 | 359.9 / 353.2 | 0 / 0 | 76 / 0 | 18,685 / 94,243 |
+| 500M | 3.248 / 5.071 | 58.98 / 36.45 | 371.7 / 361.9 | 52 / 4,699 | 1,591 / 849 | 104,261 / 108,317 |
+| unlimited | 3.492 / 5.168 | 72.69 / 58.89 | 361.6 / 343.6 | 4,414 / 12,042 | 622 / 201 | 94,937 / 130,170 |
+| 500M | 3.309 / 5.012 | 58.58 / 37.34 | 359.1 / 354.1 | 114 / 2,013 | 1,889 / 1,683 | 103,382 / 141,942 |
+| unlimited | 3.472 / 5.065 | 73.24 / 59.87 | 349.5 / 333.9 | 7,912 / 21,693 | 958 / 1,391 | 117,637 / 105,407 |
+
+Unlimited goodput averages 3.48 / 5.12 Gbit/s, compared with A5's
+3.85 / 4.99: about 9.5% lower forward and 2.5% higher reverse.
+Admission-pressure rejections, socket errors and outer fragmentation remain
+zero, but worker queue drops and expiries increase. The drop counters alone
+do not establish why forward CPU efficiency worsens.
+
+A6 therefore remains open. More storage has not fixed the remaining decline.
+Next, profile the pending-frame scans and work admitted versus drained per
+turn, then repeat the pool trial after any verified scheduling fix. Preserve
+the current bounded admission, ACK and TAP-backpressure behavior throughout.
