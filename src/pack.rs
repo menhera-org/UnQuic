@@ -479,29 +479,10 @@ impl Batch {
 /// when fragmentable extension headers precede the transport header. Malformed
 /// IP uses only the Ethernet key. The hash is local, never a wire value.
 pub fn flow_hash(frame: &[u8]) -> u64 {
+    let (link, ip) = flow_key(frame);
     let mut hash = DefaultHasher::new();
-    if frame.len() < 14 {
-        hash.write(frame);
-        return hash.finish();
-    }
-    let mut offset = 14;
-    let mut protocol = u16::from_be_bytes([frame[12], frame[13]]);
-    while matches!(protocol, 0x8100 | 0x88a8 | 0x9100) {
-        let Some(tag) = frame.get(offset..offset + 4) else {
-            hash.write(&frame[..offset]);
-            return hash.finish();
-        };
-        protocol = u16::from_be_bytes([tag[2], tag[3]]);
-        offset += 4;
-    }
-    hash.write(&frame[..offset]);
-    let ip = &frame[offset..];
-    let key = match protocol {
-        0x0800 => ipv4(ip),
-        0x86dd => ipv6(ip),
-        _ => None,
-    };
-    if let Some((addresses, protocol, ports)) = key {
+    hash.write(link);
+    if let Some((addresses, protocol, ports)) = ip {
         hash.write(addresses);
         hash.write_u8(protocol);
         hash.write(ports);
@@ -509,7 +490,33 @@ pub fn flow_hash(frame: &[u8]) -> u64 {
     hash.finish()
 }
 
+pub(crate) fn is_udp_flow(frame: &[u8]) -> bool {
+    matches!(flow_key(frame).1, Some((_, 17, ports)) if ports.len() == 4)
+}
+
 type IpKey<'a> = (&'a [u8], u8, &'a [u8]);
+
+fn flow_key(frame: &[u8]) -> (&[u8], Option<IpKey<'_>>) {
+    if frame.len() < 14 {
+        return (frame, None);
+    }
+    let mut offset = 14;
+    let mut protocol = u16::from_be_bytes([frame[12], frame[13]]);
+    while matches!(protocol, 0x8100 | 0x88a8 | 0x9100) {
+        let Some(tag) = frame.get(offset..offset + 4) else {
+            return (&frame[..offset], None);
+        };
+        protocol = u16::from_be_bytes([tag[2], tag[3]]);
+        offset += 4;
+    }
+    let ip = &frame[offset..];
+    let key = match protocol {
+        0x0800 => ipv4(ip),
+        0x86dd => ipv6(ip),
+        _ => None,
+    };
+    (&frame[..offset], key)
+}
 
 fn ports(protocol: u8, payload: &[u8]) -> Option<&[u8]> {
     if matches!(protocol, 6 | 17 | 33 | 132 | 136) {
@@ -576,6 +583,33 @@ fn ipv6(ip: &[u8]) -> Option<IpKey<'_>> {
 mod tests {
     use super::*;
     use crate::handshake::{Params, Role, Tag};
+
+    #[test]
+    fn only_parseable_unfragmented_udp_flows_use_local_lanes() {
+        for v6 in [false, true] {
+            let frame = crate::tap::test_common::udp::frame(v6, 1, &[7; 22]);
+            assert!(is_udp_flow(&frame));
+            for end in 0..frame.len() {
+                assert!(!is_udp_flow(&frame[..end]));
+            }
+            let mut tagged = frame.clone();
+            tagged.splice(12..12, [0x81, 0, 0, 7]);
+            assert!(is_udp_flow(&tagged));
+            let mut tcp = frame.clone();
+            tcp[if v6 { 20 } else { 23 }] = 6;
+            assert!(!is_udp_flow(&tcp));
+            let mut fragment = frame;
+            if v6 {
+                fragment[20] = 44;
+                let length = u16::from_be_bytes([fragment[18], fragment[19]]) + 8;
+                fragment[18..20].copy_from_slice(&length.to_be_bytes());
+                fragment.splice(54..54, [17, 0, 0, 1, 0, 0, 0, 1]);
+            } else {
+                fragment[20] = 0x20;
+            }
+            assert!(!is_udp_flow(&fragment));
+        }
+    }
 
     pub(super) fn lane() -> Lane {
         let params = Params {

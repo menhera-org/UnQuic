@@ -19,6 +19,8 @@ section 15 of the design and the "Implementation status" section of
   resolver's facilities as documented in config-model.md.
 - No async runtime, no wall-clock values on the wire, no host-specific facts in
   the repository.
+- Keep strict flow pinning unless measured handoff costs justify relaxing it.
+  A frame and its repairs always stay on their originally selected lane.
 - Do not use eBPF; production deployment cannot depend on permission to load it.
   Classic socket BPF receive steering keeps its ordinary-hashing fallback.
 - No locks or allocations on hot paths. Protocol transitions take supplied
@@ -323,6 +325,12 @@ CPU and per-core CPU/softirq. The original admission-pressure collapse is fixed;
 local TAP USO improves both MTU-1500 and small-frame delivery. The sampled
 UDP-input sweeps still show small overload declines with eight workers.
 Plateau checks and the measured CPU ceiling remain open.
+Unfragmented UDP now uses the TAP reader's owned lanes when a session has a
+queue on every worker; measured handoff savings justify relaxing pinning there.
+TCP, fragments, other protocols and sessions with fewer queues retain strict
+hashing. TAP queue migration may reorder UDP frames; a frame and its repairs
+keep one lane. The expanded benchmark history measures this reordering without
+changing transport storage or admission. See BENCH.md for UDP/TCP comparisons.
 The final throughput gate remains open. Partial completion, GSO/GRO boundaries, MTU errors
 and allocation checks pass. The five frame-model regression cases
 now run against the real implementation in tests/reassembly.rs.

@@ -322,13 +322,18 @@ frame from reaching TAP. Receive expiry starts at the first retained piece and
 does not move when duplicates arrive.
 
 Completed frames are delivered as they become available, without a per-flow
-reorder queue. A flow hashes to one transmit lane; increasing `tx_lanes` spreads
-multiple flows but does not stripe a single flow. Queue counts and lane counts
-are independent, and peers need not use identical values. If Linux moves a flow
-to another TAP queue, its lane stays fixed and the reading worker hands frames
-to the lane owner. This remains the baseline; flow pinning may be relaxed only
-where measurements show a performance benefit. A frame and its repairs must
-stay on one lane. eBPF is excluded from deployment.
+reorder queue. For unfragmented UDP in sessions with a TAP queue on every worker,
+each reader hashes among its own transmit lanes. This removes measured handoff costs. The hash
+stays stable while TAP queue placement stays stable; Linux queue migration may
+put later frames of the same flow on another lane and cause reordering.
+A frame's pieces and any future repairs stay on its original lane.
+
+TCP, fragmented IP and other traffic retain strict flow hashing. Sessions
+with fewer TAP queues than global workers also retain strict flow hashing
+across all transmit lanes, so those workers still provide transmit capacity.
+A reader owning no transmit lane also retains hashing and handoffs. Queue and
+lane counts remain independent; peers need not use identical values. eBPF is
+excluded from deployment.
 
 Liveness currently sends a 52-byte UDP PROBE on local lane 1 every second,
 including during data traffic. Only the first reply matching the outstanding
@@ -387,7 +392,7 @@ may cross the byte target. Sessions take turns, and each session preserves
 input order. The existing pool supplies both raw input and output buffers,
 with one output buffer reserved for progress. Both copies count toward the
 session's transmit byte limit until released. Wire DATA remains ordinary
-Ethernet frames, with unchanged flow pinning and packet-admission rules.
+Ethernet frames on the input's selected lane, with unchanged packet-admission rules.
 
 A receive flush may combine already-complete UDP frames into one USO
 `writev`, borrowing their payloads directly from reassembly slots. Supported
@@ -396,7 +401,7 @@ extension headers. IP/UDP lengths and checksums must be valid; UDP checksums
 must be present. Headers must match apart from lengths, checksums and consecutive
 IPv4 IDs. The final payload may be shorter. Other frames use ordinary writes.
 
-Grouping preserves order within the existing flow-hash definition and may
+Within a receive lane, grouping preserves order within the existing flow-hash definition and may
 pass frames from other flows. An incompatible frame in the same flow stops
 grouping. A flush still handles at most 64 frames per lane, with no wait for
 more traffic; each aggregate is at most 65,535 bytes. No new frame storage,
@@ -569,7 +574,7 @@ state are available through the library's `Control` API.
 | TAP is ready but carrier stays down | Peer address availability, receive binding, configured fixed ports, matching cookies and compatible negotiated frame ceilings |
 | Carrier drops despite incoming DATA | Fresh matching PROBE_REPLY traffic must return to the configured fixed port; DATA alone does not refresh liveness |
 | Carrier is up but frames expire | Queue drops, TAP write errors, underlay loss and socket errors; small probes do not test DATA-sized delivery |
-| Throughput stays low with many lanes | Flow count, worker/receive distribution and CPU use; one flow remains on one lane |
+| Throughput stays low with many lanes | Flow count, TAP queue placement, worker/receive distribution and CPU use; each frame stays on one lane |
 
 Both directions send from dynamic source ports to configured fixed receive
 ports. Replies use the configured peer address and fixed port, never the

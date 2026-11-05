@@ -11,6 +11,8 @@ for number in "$3" "$4"; do
 done
 case "${OUTER_PAYLOAD_LIMIT:-1232}" in ''|*[!0-9]*) exit 2;; esac
 [ "${OUTER_PAYLOAD_LIMIT:-1232}" -ge 1232 ] && [ "${OUTER_PAYLOAD_LIMIT:-1232}" -le 1452 ] || exit 2
+case "${TAP_TXQUEUELEN:-10000}" in ''|*[!0-9]*) exit 2;; esac
+[ "${TAP_TXQUEUELEN:-10000}" -ge 1 ] && [ "${TAP_TXQUEUELEN:-10000}" -le 10000 ] || exit 2
 case "${WORKERS:-4}" in 4|8) ;; *) echo "WORKERS must be 4 or 8" >&2; exit 2;; esac
 case "${UDP_LOAD:-}" in ''|/*) ;; *) echo "UDP_LOAD must be an absolute path" >&2; exit 2;; esac
 case "${BITRATE:-0}" in
@@ -109,7 +111,7 @@ for side in left right; do
     done
     ip link set "uq-$side" netns "uq-$side"
     netip "uq-$side" link set lo up
-    netip "uq-$side" link set "uq-$side" txqueuelen 10000
+    netip "uq-$side" link set "uq-$side" txqueuelen "${TAP_TXQUEUELEN:-10000}"
     netip "uq-$side" link set "uq-$side" up
 done
 netip uq-left addr add 10.77.0.1/24 dev uq-left

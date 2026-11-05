@@ -302,6 +302,20 @@ const fn frame_quota(workers: usize) -> usize {
     }
 }
 
+fn tap_lane(frame: &[u8], worker: usize, workers: usize, queues: usize, lanes: usize) -> usize {
+    // A session with fewer TAP queues still needs its other transmit workers.
+    if queues < workers || worker >= lanes || !pack::is_udp_flow(frame) {
+        return pack::flow_hash(frame) as usize % lanes;
+    }
+    let count = (lanes - 1 - worker) / workers + 1;
+    let slot = if count == 1 {
+        0
+    } else {
+        pack::flow_hash(frame) as usize % count
+    };
+    worker + slot * workers
+}
+
 /// Pool entries move through queues by ownership, including on rejection.
 pub(crate) struct Buffer {
     origin: usize,
@@ -1916,8 +1930,13 @@ impl Worker {
                 local.tx_bytes += length;
                 buffer.tx_reserved = true;
                 buffer.tag = connection.local_tag().get();
-                buffer.lane = pack::flow_hash(&buffer.bytes[..length]) as usize
-                    % self.sessions[session].tx.len();
+                buffer.lane = tap_lane(
+                    &buffer.bytes[..length],
+                    self.id,
+                    self.shared.workers(),
+                    self.shared.config.config().sessions[session].queue_count,
+                    self.sessions[session].tx.len(),
+                );
                 buffer.deadline = now + reassembly::FRAME_LIFETIME;
                 if buffer.segments.is_some() || !self.sessions[session].tap_inputs.is_empty() {
                     if buffer.segments.is_some() {
@@ -3110,6 +3129,46 @@ mod tests {
         assert_eq!(worker.counters.tap_ring_frames, 0);
         assert_eq!(worker.counters.tap_read_calls, 2);
         assert_eq!(worker.counters.tap_read_requests, 2);
+    }
+
+    #[test]
+    fn tap_lanes_stay_local_when_available_and_bound_every_configuration() {
+        let frames = [
+            crate::tap::test_common::udp::frame(false, 1, &[7; 22]),
+            crate::tap::test_common::udp::frame(true, 1, &[9; 22]),
+        ];
+        for workers in 1..=64 {
+            for lanes in 1..=64 {
+                for worker in 0..workers {
+                    for frame in &frames {
+                        let lane = tap_lane(frame, worker, workers, workers, lanes);
+                        assert!(lane < lanes);
+                        if worker < lanes {
+                            assert_eq!(lane % workers, worker);
+                        } else {
+                            assert_eq!(lane, pack::flow_hash(frame) as usize % lanes);
+                        }
+                        assert_eq!(lane, tap_lane(frame, worker, workers, workers, lanes));
+                        if workers > 1 && worker < workers - 1 {
+                            assert_eq!(
+                                tap_lane(frame, worker, workers, workers - 1, lanes),
+                                pack::flow_hash(frame) as usize % lanes
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for mut frame in frames {
+            let at = if frame[12..14] == [8, 0] { 23 } else { 20 };
+            frame[at] = 6;
+            for worker in 0..2 {
+                assert_eq!(
+                    tap_lane(&frame, worker, 2, 2, 2),
+                    pack::flow_hash(&frame) as usize % 2
+                );
+            }
+        }
     }
 
     #[test]

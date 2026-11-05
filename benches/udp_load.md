@@ -27,8 +27,12 @@ consume credits and sequence numbers; failed sends consume neither. The
 actual offered rate can be below the request and must be reported.
 
 Receivers expand GRO messages before validating each datagram's run ID,
-sequence number, length and entire payload. Each flow tracks 128 blocks of
-64 sequence numbers. Reordering within the window does not count as loss.
+sequence number, length and entire payload. Each flow tracks 262,144 blocks of
+64 sequence numbers (16,777,216 positions), using 4 MiB of startup-allocated
+tag and bitmap storage. The maximum 64-flow configuration reserves 256 MiB for
+these histories per process. This covers the test TAP queues' delayed
+super-frames without allocating while traffic runs. Earlier measurements used
+an 8,192-position window. Reordering within the window does not count as loss.
 `too_old` reports packets outside the window whose duplicate status cannot
 be established. Such packets are excluded from unique delivery; a nonzero
 count invalidates an exact loss claim. `invalid` includes corrupt payloads,
@@ -70,9 +74,13 @@ into later runs. A failed child fails the run.
 counts. `DAEMON_LEFT_CPUS` and `DAEMON_RIGHT_CPUS` override daemon placement.
 The existing `GENERATOR_*_CPUS` and `RECEIVER_*_CPUS` variables select the
 four load-process CPU sets. Explicitly choose non-overlapping physical cores
-on one socket. The four-worker defaults use daemon CPUs 0-7 and load CPUs 8-19. The
-eight-worker defaults use daemon CPUs 0-15 and one load process on each of
+on one socket. The four-worker defaults use daemon CPUs 0-7 and load CPUs 8-19.
+The eight-worker defaults use daemon CPUs 0-15 and one load process on each of
 CPUs 16-19. Verify the host's topology before using either layout.
+
+`TAP_TXQUEUELEN` sets the test TAP queue length (1–10,000; default 10,000).
+With USO input, each entry can hold a whole super-frame, so record this value
+and compare shorter queues before attributing a decline to the transport.
 
 The runtime enables checksum offload and completes partial checksums after
 TAP reads. With USO support, UDP_SEGMENT super-frames reach the runtime in

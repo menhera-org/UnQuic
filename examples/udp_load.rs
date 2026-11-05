@@ -13,7 +13,8 @@ extern "C" fn snapshot(_: libc::c_int) {
 }
 
 const MAGIC: [u8; 4] = *b"UQL1";
-const WORDS: usize = 128;
+// Cover delayed super-frames across the harness's eight 10,000-entry TAP queues.
+const WORDS: usize = 1 << 18;
 const MAX_BYTES: usize = 65_487;
 
 struct Config {
@@ -81,8 +82,8 @@ impl Config {
 
 // Tags avoid clearing the entire bitmap on a large sequence gap.
 struct Window {
-    tags: [u64; WORDS],
-    bits: [u64; WORDS],
+    tags: Box<[u64]>,
+    bits: Box<[u64]>,
     next: u64,
     unique: u64,
     duplicates: u64,
@@ -92,8 +93,8 @@ struct Window {
 impl Window {
     fn new() -> Self {
         Self {
-            tags: [u64::MAX; WORDS],
-            bits: [0; WORDS],
+            tags: vec![u64::MAX; WORDS].into_boxed_slice(),
+            bits: vec![0; WORDS].into_boxed_slice(),
             next: 0,
             unique: 0,
             duplicates: 0,
@@ -575,16 +576,32 @@ mod tests {
             w.record(n);
         }
         assert_eq!((w.unique, w.next, w.duplicates, w.reordered), (4, 4, 2, 2));
-        w.record(8192);
+        let span = (WORDS * 64) as u64;
+        w.record(span);
         w.record(1);
-        w.record(8192);
+        w.record(span);
         w.record(64);
         w.record(64);
-        assert_eq!((w.unique, w.next, w.too_old, w.duplicates), (6, 8193, 1, 4));
+        assert_eq!(
+            (w.unique, w.next, w.too_old, w.duplicates),
+            (6, span + 1, 1, 4)
+        );
         w.record(1 << 50);
         w.record((1 << 50) - 1);
         w.record(1 << 50);
         assert_eq!((w.unique, w.duplicates), (8, 5));
+    }
+
+    #[test]
+    fn delayed_super_frames_are_counted_once_without_hot_allocations() {
+        let mut w = Window::new();
+        without_allocations(|| {
+            let far = 8 * 10_000 * 64;
+            for n in [0, far, 8192, 1, far - 1, 8192, far, 1] {
+                w.record(n);
+            }
+        });
+        assert_eq!((w.unique, w.duplicates, w.too_old), (5, 3, 0));
     }
 
     #[test]

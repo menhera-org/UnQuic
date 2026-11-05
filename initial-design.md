@@ -246,7 +246,10 @@ Initial resource limits are 8192 retained transmit frames and 8192 receive frame
 Use RFC 9002 sections 5 and 6 for RTT estimation, per-lane packet/time loss detection, and probe timeouts, with these transport parameters: initial RTT 333 ms, maximum ACK delay 1 ms, timer granularity 1 ms for loss detection, packet threshold 3, and time threshold 9/8. Pacing has its own finer schedule. ACK delay cannot reduce a sample below observed minimum RTT. Apply packet thresholds only within one lane, never across unrelated packet-number spaces. [S9]
 
 At frame admission, set its sender deadline to `now + clamp(4 * smoothed_rtt, 20 ms, 100 ms)`. The receiver deadline is 100 ms after the first retained piece and is not extended by repairs or duplicates. The two-repair limit and the deadline both apply. Deliver completed frames immediately in v1; do not add a per-flow reorder queue before measurements justify one. Pin each inner flow to a lane, with a fallback key of MAC addresses, VLAN stack, and EtherType for non-IP or unparseable traffic. Fragmented IP traffic uses a consistent address/protocol key without transport ports for all fragments. Strict flow pinning is the baseline. It may be relaxed where measurements show
-that cross-worker handoffs harm performance; retain it otherwise. A lane change
+that cross-worker handoffs harm performance; retain it otherwise. Current
+measurements justify reader-local lanes for unfragmented UDP when a session has
+a TAP queue on every worker. TCP, fragmented IP and other traffic retain strict pinning. Hash among that reader's owned lanes. Keep strict hashing across all
+lanes for sessions using fewer queues, or when the reader owns no lane. A lane change
 applies only to new frames: a frame's pieces and repairs stay on its original lane.
 Any such change must document possible cross-lane reordering and verify overload
 behavior. eBPF is excluded because production hosts may prohibit loading programs.
@@ -566,7 +569,7 @@ Maintain a clear distinction between a throughput experiment and an interoperabl
 | Maximum inner MTU and tag depth | Fixed: MTU 9000 with two VLAN tags, 9022-byte frame ceiling (section 3) |
 | Controller implementation | Decided: in-tree BBRv3 draft 07, one owner/budget per direction and path group (section 9) |
 | Retry and frame deadlines | Initial two-repair limit and bounded RTT-based sender / 100 ms receiver deadlines (section 8); tune by measurement |
-| Reordering policy | Decided: flow-to-lane pinning, immediate completed-frame delivery; extra reorder buffering deferred |
+| Reordering policy | Decided: unfragmented UDP hashes within each reader's owned lanes when all workers have TAP queues; strict flow hashing otherwise. Queue migration may reorder new frames. Immediate completed-frame delivery; extra reorder buffering deferred |
 | Restart protocol | Decided: automatic tag election, random directional receive tags, HELLO/CHALLENGE/CONFIRM/READY (section 5) |
 | Abandonment protocol | Decided: transport-acceptance ACKs, bounded advisory abandonment, permanent window floors and lane tombstones (sections 6 and 8) |
 | Wire layout | v1: 48-byte common header and exact record bodies (section 6); interoperability vectors required before release |

@@ -82,11 +82,18 @@ storage accounting is a separate startup check before TAP creation.
 
 The worker count is the largest session `queue_count`, or one for no sessions.
 TAP queue index selects its worker; TX lane index modulo worker count selects
-its owner. Queue and lane counts need not match. A flow keeps its hashed lane
-when Linux moves it to another TAP queue; workers hand frames to the lane owner.
-This is the current baseline. Flow pinning may be relaxed where measured
-handoff costs justify it; otherwise retain it. eBPF is not an implementation option. `path_group` is validated and
-retained, but congestion grouping has no runtime effect until stage 3.
+its owner. Queue and lane counts need not match. Unfragmented UDP in a session with a TAP queue on
+every worker hashes among the reading worker's own lanes. TAP queue migration
+can change a flow's lane for new frames and cause reordering. A frame and its
+repairs keep the originally selected lane.
+
+TCP, fragmented IP and other traffic retain strict hashing. Sessions with
+fewer TAP queues than global workers also retain strict hashing across
+all lanes to use the other transmit workers. Readers with no owned lane also
+retain hashing and handoffs. Multiples of the worker count give each reader the
+same number of lane choices, but are not required. eBPF is excluded.
+`path_group` is validated and retained, but congestion grouping has no runtime
+effect until stage 3.
 
 The daemon's `host` field uses iphost's `IpHost`/`FQDN` types. The
 current `dns::resolve_ipv6` helper blocks and may allocate or lock, so call it

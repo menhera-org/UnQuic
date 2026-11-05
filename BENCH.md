@@ -1,12 +1,12 @@
 # Release transport overload investigation
 
 The original receive-admission collapse and a later TAP readiness busy loop
-are fixed. Bounded UDP super-frame input now reaches 14.44–14.77 / 11.00–11.05
-Gbit/s under unlimited load with eight workers, measured between receiver
-snapshots rather than including the drain. Matched checksum-only controls
-deliver 9.45 / 8.81 Gbit/s. Some paced/unlimited pairs still decline by
-1.8–2.6%; four workers also lose reverse delivery as input rises from 8 to
-21 Gbit/s. Overload stability remains unresolved.
+are fixed. Bounded UDP super-frame input and conditional worker-local lanes
+now deliver 17.69 / 16.25 Gbit/s paced and 17.95 / 17.07 unlimited in the
+latest eight-worker pair, using 500-entry test TAP queues. Strict-pinning
+controls deliver about 15.2 / 11.5–11.7 Gbit/s with the same queue size.
+Earlier local-lane repeats still decline by 2–3% in one direction; 10,000-entry
+queues produce larger declines. Overload stability remains unresolved.
 
 These short sweeps do not establish a plateau for every workload or the
 theoretical CPU ceiling. Neither the local **20 Gbit/s in each direction**
@@ -21,7 +21,8 @@ their absence does not explain away a scheduling or admission failure.
 ## Current performance gaps
 
 Status after the TAP readiness fix, per-peer payload limit, local TAP USO
-bounded read rings, partial-checksum completion and UDP super-frame input.
+bounded read rings, partial-checksum completion, UDP super-frame input and
+conditional worker-local lanes for unfragmented UDP.
 The split-pool, deadline-cache and lane-association experiments below are not
 in the runtime.
 The latest segmented-send results use 12 physical cores with four workers per
@@ -30,16 +31,16 @@ L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Bounded UDP input delivers 14.44–14.77 / 11.00–11.05 Gbit/s unlimited with eight workers, from 24.29–25.25 / 30.12–30.43 Gbit/s actually offered | Still about 1.35× / 1.81× short. TCP super-frame input remains unfinished. |
-| Goodput must plateau under excess traffic | Earlier read-ring sweeps improved under overload; sampled UDP-input sweeps still decline | Eight-worker paced/unlimited pairs lose up to 2.6%. Four-worker reverse delivery falls 6.8% between requested 8 and 21 Gbit/s. Longer runs, mixed traffic, more flows/sessions and the acceptance gate remain unverified. |
-| Small-frame overload must remain efficient | UDP input delivers 1.75M / 2.13M frames/s with four workers and 3.60–3.62M / 3.06–3.08M with eight, using 64-byte frames | Unlimited delivery exceeds paced delivery in these short sweeps, with high overload loss. Mixed and non-coalescible traffic still need coverage. |
+| At least 20 Gbit/s each way at inner MTU 1500 | The UDP-only local-lane build delivers 17.95 / 17.07 Gbit/s unlimited with eight workers and 500-entry test TAP queues, from 32.05 / 31.69 Gbit/s offered | Still about 1.11× / 1.17× short in this pair. TCP super-frame input remains unfinished. |
+| Goodput must plateau under excess traffic | The latest UDP-only pair improves in both directions, but preceding local-lane repeats still decline | Shorter test queues reduce the long tail but do not establish a plateau: earlier left-side repeats lose 2–3%. With 10,000-entry queues, one pair loses 8.3%. Longer runs, mixed traffic and more flows/sessions remain unverified. |
+| Small-frame overload must remain efficient | The UDP-only local-lane build delivers 6.05M / 6.08M 64-byte frames/s with eight workers | The local-lane paced/unlimited sweep improves under overload, with high loss. Mixed and non-coalescible traffic still need coverage. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
 | Use larger confirmed path MTUs | The runtime accepts a per-peer 1232–1452-byte payload assertion; a controlled 1452-byte sweep shows only a modest change | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. Configured capacity is not confirmed PMTU. |
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
 
-Loss under unlimited load is still high: the UDP-input eight-worker
-MTU-1500 points miss 37.3–37.9% / 59.9–60.4% of offered frames despite zero
+Loss under unlimited load is still high: the latest UDP-only eight-worker
+MTU-1500 point misses 43.44% / 45.62% of offered frames despite zero
 admission pressure and worker queue drops. TAP ingress drops, outer socket overflows
 and inner UDP receive-buffer errors are recorded. Their different units prevent
 an exact frame-loss decomposition.
@@ -1564,3 +1565,107 @@ tests, foundation and reconnect tests, Clippy and Rust 1.89 checks pass.
 The reconnect test includes byte-checked UDP super-frame delivery and checks
 for steady-state allocations and deallocations. TCP input, the overload
 plateau and both throughput gates remain unfinished.
+
+## Conditional UDP lane locality (audit A1 follow-up)
+
+The user permitted relaxing pinning where measurements show a benefit, while
+retaining it otherwise, and excluded eBPF. The runtime now hashes parseable,
+unfragmented UDP among the TAP reader's owned lanes when every worker has a
+queue for that session. A reader with no owned lane uses the original hash
+and handoff. Sessions with fewer TAP queues than global workers also retain
+strict hashing so their other workers can transmit. TCP, IP fragments and
+other traffic keep strict flow pinning.
+
+A UDP flow can move to a new lane when Linux changes its TAP queue. A frame's
+pieces and future repairs keep its original lane. The change adds no flow
+table, eviction policy, allocation, lock or wire-format field. Tests cover
+all worker/lane counts through 64, fallback configurations, protocol gating,
+VLANs, truncated headers and both IP fragment formats.
+
+### Reordering and measurement validity
+
+[All lane-selection experiments](benches/tap-local-lanes.json) are retained.
+The first all-protocol trial exceeded the load tool's 8,192-sequence history:
+millions of late records could not be classified as new or duplicate, so
+those points are invalid. They are not evidence of data corruption or exact
+loss. The tool now reserves a 16,777,216-position tagged bitmap per flow at
+startup, with 4 MiB of storage per flow and no traffic-time allocations.
+It still reports and rejects out-of-window observations.
+
+Corrected runs have zero invalid, duplicate and out-of-window records.
+Reordering is real: one 10,000-entry-queue local-lane unlimited point reordered
+15.55M / 14.78M of 27.56M / 26.95M delivered frames; its strict-pinning control
+reordered 2.09M / 1.75M of 26.85M / 20.21M. Extending the tracker measures this
+traffic; it does not fix reordering or increase the transport's buffers.
+
+The first TCP comparison also argues against applying locality universally.
+With eight workers, 16 streams each way, 20 seconds, 500-entry TAP queues and
+64-KiB writes, [strict pinning delivers](benches/tap-local-tcp.json)
+5.565 / 5.845 Gbit/s at 646.9% / 660.6% daemon CPU, with
+49,976 / 39,391 sender retransmissions. The all-protocol local-lane trial
+delivers 7.178 / 5.691 Gbit/s at 664.8% / 682.8% CPU, with
+89,689 / 97,356 retransmissions. Worker pressure, queue drops and expiry
+are zero in both. This mixed result is why TCP keeps strict pinning.
+
+### UDP controls and remaining declines
+
+The following are simultaneous 16-flow, 20-second release runs with the wider
+sequence tracker. Both daemons use eight workers. Delivery uses receiver
+before/sent samples; missing rates include the final drain. The local-lane
+prototype uses the same UDP selection as the final build, but also changed
+TCP before the protocol guard was added.
+
+| Selection / queue length | Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| local trial / 10000 | 21 | 20.885 / 20.854 | 17.564 / 15.657 | 14.82 / 24.28 | 630.1 / 621.1 |
+| local trial / 10000 | unlimited | 20.708 / 21.863 | 16.099 / 15.578 | 20.41 / 27.28 | 595.5 / 599.4 |
+| strict / 10000 | 21 | 20.664 / 20.832 | 14.790 / 11.054 | 24.98 / 41.72 | 580.8 / 564.9 |
+| strict / 10000 | unlimited | 23.158 / 27.398 | 12.764 / 10.687 | 41.33 / 57.04 | 558.1 / 553.6 |
+| strict / 500 | 21 | 20.838 / 20.817 | 15.254 / 11.539 | 26.11 / 43.93 | 571.3 / 564.5 |
+| strict / 500 | unlimited | 31.902 / 37.569 | 15.164 / 11.738 | 52.00 / 68.39 | 628.2 / 636.8 |
+| local trial / 500 | 21 | 20.906 / 20.927 | 17.544 / 15.953 | 15.40 / 23.18 | 588.0 / 584.2 |
+| local trial / 500 | unlimited | 28.818 / 28.480 | 17.012 / 16.873 | 40.35 / 40.22 | 728.2 / 738.8 |
+| local trial / 500 | 21 | 20.917 / 20.942 | 17.079 / 16.021 | 17.68 / 22.88 | 581.7 / 572.5 |
+| local trial / 500 | unlimited | 26.937 / 28.275 | 16.753 / 16.907 | 37.15 / 39.61 | 719.5 / 710.1 |
+| UDP-only local / 500 | 21 | 20.891 / 20.913 | 17.692 / 16.247 | 14.62 / 21.68 | 581.6 / 582.8 |
+| UDP-only local / 500 | unlimited | 32.047 / 31.689 | 17.945 / 17.073 | 43.44 / 45.62 | 687.8 / 688.4 |
+
+The initial 500-entry local-lane pair improved under overload, but two
+subsequent pairs lost 3.0% and 1.9% L→R. The final UDP-only pair improves;
+one pair cannot establish a plateau. Short queues reduce retained tails from
+hundreds of thousands or millions of frames to tens of thousands in most
+points. They also change offered load and loss. This is a useful kernel-queue
+diagnostic, not a replacement for the transport investigation. The daemon
+does not set administrative queue length; the harness exposes
+`TAP_TXQUEUELEN` for reproducible comparisons.
+
+Four-worker local-lane UDP trials deliver 7.859 / 7.722 Gbit/s at an 8 Gbit/s
+request, 9.779 / 8.874 at 21 Gbit/s, and 9.843 / 8.803 unlimited.
+Daemon CPU is 232.8% / 230.1%, 365.3% / 396.3%, and 367.7% / 396.1%.
+The unlimited reverse direction still declines slightly. Ordinary iperf3
+UDP reaches 5.173 / 4.975 paced and 6.063 / 6.152 unlimited with four workers,
+versus 3.958 / 5.527 and 4.778 / 5.914 in the strict-pinning comparison.
+The paced reverse regression remains visible.
+
+For 64-byte frames, the eight-worker local-lane trial delivers 3.488 / 3.352
+million frames/s at a 40 Mbit/s-per-flow request and 5.866 / 5.743 million
+unlimited. Missing rates rise from 2.24% / 5.97% to 62.77% / 65.71%;
+daemon CPU rises from 425.5% / 418.9% to 767.9% / 770.5%.
+The final UDP-only build's unlimited check delivers
+6.054 / 6.082 million frames/s,
+missing 62.20 / 61.85% at
+770.0 / 783.3% daemon CPU.
+
+| Final UDP-only run | TAP TX drops (SKBs) | Socket overflow (SKBs) | Inner UDP errors | Expired frames |
+| --- | ---: | ---: | ---: | ---: |
+| rx-udp-local-final-8-1452-1514-16/0 | 45658 / 24920 | 420396 / 207342 | 3230 / 5380 | 0 / 0 |
+| rx-udp-local-final-8-1452-1514-16/1 | 388601 / 345077 | 635117 / 463544 | 25435 / 27980 | 4 / 4 |
+| rx-udp-local-final-8-1452-64-16 | 3108819 / 3023234 | 397226 / 289134 | 918 / 4688 | 0 / 0 |
+
+All valid UDP points have zero worker admission pressure, queue drops and
+outer fragmentation. SKB drop counts cannot be summed with logical frame
+loss. The release suite, protocol-gating tests, all 18 kernel library tests,
+load-tool kernel tests, reconnect/allocation test, Clippy and Rust 1.89
+checks pass. The final UDP-only binary SHA-256 is
+`83f262aa576b3f7ddf8ec5a324a9a490e4b58f8e238a7e84691ad27cbe932885`.
+The local 20 Gbit/s gate, stable overload plateau and real-path gate remain open.
