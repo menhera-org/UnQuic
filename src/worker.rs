@@ -149,7 +149,10 @@ impl Reactor {
     }
 
     pub(crate) fn arm(&mut self, deadline: Option<Duration>) -> io::Result<()> {
-        if self.deadline == deadline {
+        // An earlier wake still services a later deadline; do not postpone it each turn.
+        if self.deadline == deadline
+            || matches!((self.deadline, deadline), (Some(armed), Some(due)) if armed <= due)
+        {
             return Ok(());
         }
         let value = match deadline {
@@ -3488,6 +3491,25 @@ mod tests {
         wake.notify().unwrap();
         assert_eq!(reactor.wait(&mut events, 1000).unwrap(), 1);
         reactor.drain(WAKE_TOKEN).unwrap();
+        let now = monotonic_now().unwrap();
+        reactor.arm(Some(now + Duration::from_secs(2))).unwrap();
+        let armed = reactor.deadline.unwrap();
+        assert_eq!(armed, now + Duration::from_secs(2));
+        reactor.arm(Some(now + Duration::from_secs(3))).unwrap();
+        assert_eq!(reactor.deadline, Some(armed));
+        reactor.arm(Some(now + Duration::from_secs(1))).unwrap();
+        assert!(reactor.deadline.unwrap() < armed);
+        reactor.arm(None).unwrap();
+        assert_eq!(reactor.deadline, None);
+        assert_eq!(reactor.wait(&mut events, 0).unwrap(), 0);
+        reactor
+            .arm(Some(monotonic_now().unwrap() + Duration::from_millis(1)))
+            .unwrap();
+        assert_eq!(reactor.wait(&mut events, 1000).unwrap(), 1);
+        assert_eq!({ events[0].u64 }, TIMER_TOKEN);
+        reactor.drain(TIMER_TOKEN).unwrap();
+        assert_eq!(reactor.deadline, None);
+        // A fired timer must be armed again even when the next deadline is later.
         reactor
             .arm(Some(monotonic_now().unwrap() + Duration::from_millis(1)))
             .unwrap();

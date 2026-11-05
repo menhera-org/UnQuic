@@ -37,6 +37,20 @@ investigation is worker/kernel profiling with repeatable socket placement. No re
 decline is attributed solely to missing congestion control, recovery or PMTU.
 The absence of those features is a separate production-performance gap.
 
+## Local acceptance gate
+
+The local gate uses five 60-second bidirectional release runs at inner MTU
+1500, with 16 flows per direction and 21 Gbit/s paced offered load per
+direction. Every run must deliver at least 20 Gbit/s of UDP payload each way
+with fewer than 1% missing frames. Unlimited-load delivery must be no lower
+than paced delivery. Report actual offered load: a generator that cannot
+reach the requested rate cannot establish the gate.
+
+Record daemon and generator CPU, per-core IRQ/softirq time, and all transport,
+socket, TAP and receiver drop counters. Keep the four-worker results as a
+comparison; also test eight workers, queues and lanes per daemon with explicit
+CPU placement. These criteria are not yet met.
+
 ## Profile and method
 
 | Field | Value |
@@ -293,3 +307,56 @@ and profile samples for this investigation.
 [tap_transport-baseline.json](benches/tap_transport-baseline.json) preserves
 the earlier `74adc30` unlimited-load baseline, which used the older
 `--bidir` generator profile and is not directly comparable to these sweeps.
+
+## Audit follow-up: contiguous reassembly copy and timer rearming
+
+The common in-order reassembly path now copies each piece as one slice and
+clears only the coverage words used by the frame. The overlap path retains
+the first bytes received, including an out-of-order tail followed by an
+overlapping prefix. Slot-reuse and coverage-boundary regressions cover both
+paths.
+
+A pinned release CPU benchmark, `cargo bench --bench reassembly --target
+x86_64-unknown-linux-musl`, decodes and admits one million frames per size.
+Packets are prepared before timing; completions drain every 16 frames.
+Two runs before/after give the following ranges. These exclude socket and
+TAP work and do not establish end-to-end throughput.
+
+| Frame bytes | Before ns/frame | After ns/frame |
+| ---: | ---: | ---: |
+| 60 | 253–256 | 233–245 |
+| 64 | 257–279 | 240–252 |
+| 128 | 286–293 | 244–253 |
+| 1514 | 1056–1194 | 437–446 |
+| 9022 | 5517–6093 | 1587–1757 |
+
+The 15-second, 16-flow TAP sweep uses the single-socket CPU placement above.
+The binary contains only the reassembly change on top of `ec2939b`; timer
+rearming changes are excluded. New sockets mean this is not an isolated
+comparison with the previous sweep's reuseport placement.
+
+| Requested/flow | Delivered Gbit/s | Missing % | Daemon CPU % | Socket overflow SKBs |
+| --- | ---: | ---: | ---: | ---: |
+| 250M | 2.675 / 3.618 | 33.13 / 9.54 | 356.5 / 337.1 | 75,614 / 240,952 |
+| 500M | 3.081 / 3.767 | 61.46 / 52.90 | 366.6 / 364.1 | 256,820 / 191,784 |
+| unlimited | 3.045 / 3.466 | 76.95 / 73.42 | 360.4 / 352.5 | 240,720 / 198,908 |
+
+Admission-pressure and worker-queue drops are zero in all three points.
+Expiry counts are 0 / 0, 2 / 0 and 0 / 1 respectively. Outer fragmentation
+and reassembly counters remain zero. Unlimited reverse goodput falls 8.0%
+from the paced saturation point: the plateau requirement remains open.
+The JSON dataset includes all three points, CPU and drop counters.
+
+Audit item A3 now retains an already armed timer when it will wake at or
+before the requested deadline. Cancellation, earlier deadlines, firing and
+rearming have kernel regression coverage. Deadlines remain exact: rounding
+the shared timer to milliseconds would conflict with the planned
+100-microsecond pacing grants. Its transport gain has not yet been measured.
+
+A1 cannot safely assume permanent TAP queue pinning. Linux 6.8's
+[`tun_flow_update` and `tun_automq_select_queue`](https://github.com/torvalds/linux/blob/v6.8/drivers/net/tun.c#L445-L509)
+can change a flow's queue after receive-side learning. Selecting a lane
+solely from the reading worker would change that flow's lane. Stable
+steering must be established before replacing the current flow hash.
+The audit's per-operation costs combine different runs and are estimates,
+not a measured CPU ceiling.

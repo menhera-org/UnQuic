@@ -157,6 +157,7 @@ struct Frame {
     sequence: u64,
     length: u16,
     remaining: u16,
+    prefix_len: u16,
     deadline: Duration,
     covered: [u64; MAX_FRAME_LEN.div_ceil(64)],
     bytes: [u8; MAX_FRAME_LEN],
@@ -167,6 +168,7 @@ impl Frame {
             sequence: 0,
             length: 0,
             remaining: 0,
+            prefix_len: 0,
             deadline: Duration::ZERO,
             covered: [0; MAX_FRAME_LEN.div_ceil(64)],
             bytes: [0; MAX_FRAME_LEN],
@@ -177,12 +179,25 @@ impl Frame {
         self.sequence = sequence;
         self.length = length;
         self.remaining = length;
+        self.prefix_len = 0;
         self.deadline = now.saturating_add(FRAME_LIFETIME);
-        self.covered.fill(0);
+        self.covered[..usize::from(length).div_ceil(64)].fill(0);
     }
 
     fn piece(&mut self, offset: usize, bytes: &[u8]) {
         let end = offset + bytes.len();
+        // Bulk-copy an append only while no out-of-order bytes exist beyond the prefix.
+        if !bytes.is_empty()
+            && offset == usize::from(self.prefix_len)
+            && self.remaining == self.length - self.prefix_len
+        {
+            self.bytes[offset..end].copy_from_slice(bytes);
+            self.covered[offset / 64..end.div_ceil(64)].fill(u64::MAX);
+            self.covered[(end - 1) / 64] &= u64::MAX >> (63 - (end - 1) % 64);
+            self.remaining -= bytes.len() as u16;
+            self.prefix_len = end as u16;
+            return;
+        }
         let mut start = offset;
         while start < end {
             let bit = start % 64;
@@ -635,6 +650,66 @@ fn validate(id: u16, frame_limit: u16) -> Result<(), LaneError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contiguous_copy_preserves_coverage_overlap_and_reused_slots() {
+        let mut frame = Frame::empty();
+        let first = [0x3c; MAX_FRAME_LEN];
+        let rest = [0x5a; MAX_FRAME_LEN];
+        for length in [14, 60, 64, 65, 128, 1514, MAX_FRAME_LEN] {
+            for offset in [0, 1, 63, 64, 65, length / 2, length - 1] {
+                if offset >= length {
+                    continue;
+                }
+                for count in [1, 7, 63, 64, 65, length - offset] {
+                    if count > length - offset {
+                        continue;
+                    }
+                    frame.covered.fill(u64::MAX);
+                    frame.start(1, length as u16, Duration::ZERO);
+                    frame.piece(offset, &first[..count]);
+                    assert_eq!(frame.remaining as usize, length - count);
+                    assert_eq!(
+                        frame.covered[..length.div_ceil(64)]
+                            .iter()
+                            .map(|word| word.count_ones() as usize)
+                            .sum::<usize>(),
+                        count
+                    );
+                    frame.piece(offset, &rest[..count]);
+                    assert_eq!(frame.remaining as usize, length - count);
+                    frame.piece(0, &rest[..length]);
+                    assert_eq!(frame.remaining, 0);
+                    for (at, &byte) in frame.bytes[..length].iter().enumerate() {
+                        assert_eq!(
+                            byte,
+                            if (offset..offset + count).contains(&at) {
+                                0x3c
+                            } else {
+                                0x5a
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        frame.start(2, 128, Duration::ZERO);
+        frame.piece(0, &first[..60]);
+        frame.piece(80, &first[..20]);
+        frame.piece(60, &rest[..68]);
+        assert_eq!(frame.remaining, 0);
+        assert_eq!(&frame.bytes[60..80], &rest[..20]);
+        assert_eq!(&frame.bytes[80..100], &first[..20]);
+        assert_eq!(&frame.bytes[100..128], &rest[..28]);
+
+        frame.start(3, 128, Duration::ZERO);
+        for offset in (0..128).step_by(7) {
+            frame.piece(offset, &first[..(128 - offset).min(7)]);
+            assert_eq!(usize::from(frame.prefix_len), (offset + 7).min(128));
+        }
+        assert_eq!(frame.remaining, 0);
+        assert_eq!(&frame.bytes[..128], &first[..128]);
+    }
 
     #[test]
     fn window_clears_departing_bits_without_reopening_old_numbers() {
