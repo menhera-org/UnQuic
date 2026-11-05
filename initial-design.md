@@ -8,7 +8,7 @@ Encryption is deliberately absent. A session UUID is the sole session admission 
 
 This initial design distinguishes **confirmed requirements**, **proposed implementation choices**, and **open decisions**. It is a basis for prototyping and review; the byte-level protocol and performance acceptance profile are not yet frozen.
 
-The project is named UnQuic and is written in pure Rust, built for `*-unknown-linux-musl` targets (see README.md). The library core depends only on `libc`; the transport, congestion controller, and UUID types are implemented in-tree, calling the kernel through `libc` wherever a syscall or socket option is needed. The crate is a library; the daemon binary is built only with the `bin` feature. Optional Cargo features pull in further crates: `dns` for FQDN resolution, `uuid-compat` for conversions to the `uuid` crate, and `bin` for the daemon's config parsing. Random bytes come from Linux's `getrandom(2)` through `libc::getrandom()`, without an additional crate or filesystem access. `bin` enables `dns`, so the daemon always accepts FQDN hosts. Functions that can be `const fn` should be.
+The project is named UnQuic and is written in pure Rust, built for `*-unknown-linux-musl` targets (see README.md). The library core depends only on `libc`; the transport, congestion controller, and UUID types are implemented in-tree, calling the kernel through `libc` wherever a syscall or socket option is needed. The in-tree UUID type is named `UnquicUuid` to avoid collisions with external UUID types. The crate is a library; the daemon binary is built only with the `bin` feature. Optional Cargo features pull in further crates: `dns` for FQDN resolution, `uuid-compat` for conversions to the `uuid` crate, and `bin` for the daemon's config parsing. Random bytes come from Linux's `getrandom(2)` through `libc::getrandom()`, without an additional crate or filesystem access. `bin` enables `dns`, so the daemon always accepts FQDN hosts. Functions that can be `const fn` should be.
 
 **Platform contract:** Linux means the kernel only. Host assumptions are limited to the interfaces, files, and permissions needed by the selected features: for example, `/dev/net/tun` for TAP creation and `/etc/resolv.conf` when using `iphost`'s system resolver. Document each additional assumption with the feature that needs it; do not infer a distribution or userspace environment from the presence of the Linux kernel. Standalone operation must not depend on XDG or other freedesktop.org conventions, GNU userspace, Android or ChromeOS facilities, systemd, or D-Bus. Future optional systemd integration and DEB/RPM packaging are allowed; configuration and startup must also work without them. Do not link against systemd or D-Bus libraries.
 
@@ -306,6 +306,17 @@ The following independent configurations should work with existing bridge device
 
 These examples do not imply that all attachments can coexist on the same lower device. Preserve normal Linux stacking constraints. The daemon retains the TAP file descriptors when OVS uses it as a system port. [S16, S17]
 
+**TAP creation decisions:** accept `Option<MacAddress>` for the interface MAC.
+`MacAddress` is an in-tree checked type that rejects the all-zero address and
+multicast addresses, including broadcast. Both globally and locally administered
+unicast addresses are valid. `Some(mac)` sets that address during setup;
+`None` keeps the kernel-generated address. The library sets the configured MTU
+and optional MAC but never brings the interface administratively up. The caller
+or a network manager such as systemd-networkd or ifupdown owns administrative
+state, addressing and bridge membership. Carrier remains under transport
+control and is independent of administrative state. The interface MAC does not
+replace source or destination MACs in transported frames.
+
 Keep TAP names, MAC configuration, and device identity stable across ordinary peer reconnects. Session failure changes carrier according to a defined policy; it does not delete the interface or its VLAN/macvlan children.
 
 **Future restart support:** retain and hand over TAP queue file descriptors across daemon re-exec so the TAPs and their existing attachments survive. Follow rs-l2tpd's descriptor-preservation approach: it preserves L2TP tunnel sockets, while UnQuic would preserve TAP descriptors. Optional systemd descriptor storage may also retain descriptors across a crash for the next process to adopt. The daemon handles descriptor announcements, environment variables, and re-exec; the library receives explicitly supplied, validated descriptors. Define and version the handover format before implementing adoption. Preserving TAPs does not itself preserve userspace transport state or guarantee uninterrupted forwarding.
@@ -335,6 +346,7 @@ cookie = "<uuid-v4>"
 role = "initiator" # configure the other endpoint as responder
 tap_name = "tap-ngn-a"
 inner_mtu = 2400
+# mac = "02:00:00:00:00:01" # optional; omit to keep the kernel-generated MAC
 ```
 
 Support IPv6-literal hosts always, and FQDN hosts when the `dns` feature is enabled, which the daemon always has; resolution runs on a helper thread so the packet loop never blocks. A library user without `dns` configures endpoints as literals only. `bind_device` is per peer because peers may live in different VRFs; the daemon creates one receive socket per distinct device on the single configured port, as section 4 requires. Define scope identifiers for link-local literals if those addresses are supported. Cookie changes are explicit administrative operations; do not silently replace a configured cookie during reconnect.
@@ -429,6 +441,17 @@ If a comparison already reaches the available underlay ceiling, report that fact
 
 # 15 Implementation stages
 
+**Current status:** stage 1 is in progress. Implemented foundations are
+`UnquicUuid` parsing/provisioning, duplicate-checked cookie indexing,
+`MacAddress` validation, IPv6 sockets with separate receive/transmit APIs, and
+nonpersistent multiqueue TAP creation and frame I/O. TAP creation accepts an
+optional MAC and leaves administrative state unchanged. Tests cover the public
+types, loopback socket invariants and live TAP behavior in an isolated network
+namespace; see README.md for commands and coverage limits. Session dispatch,
+counters and the owned worker runtime are not yet implemented. The crate does
+not yet provide end-to-end Ethernet transport, and no performance acceptance
+claim has been made.
+
 1. **Socket and device foundation.** Implement fixed receive-only sockets, dynamic transmit pools, IPv6/interface/VRF binding, UUID lookup, TAP ownership, and counters. Validate R01–R10 and the port invariants.
 
 2. **Batched transport.** Implement frame records, packing, bounded reassembly, UDP GSO/GRO, and TAP offload handling. Establish CPU and packet-rate baselines against L2TPv3.
@@ -459,6 +482,8 @@ Maintain a clear distinction between a throughput experiment and an interoperabl
 | Worker and lane counts | Start small; determine from queue and CPU measurements |
 | Feedback routing | Decided: per-worker-pair bounded SPSC queues, eventfd wakeups, explicit lane owners (section 10) |
 | Library API | Decided: library owns worker threads, blocking run plus control handle (section 3) |
+| Public identity types | Decided: in-tree `UnquicUuid` and checked nonzero unicast `MacAddress` |
+| TAP MAC and administrative state | Decided: `Option<MacAddress>`; None keeps the generated MAC. The caller/network manager brings interfaces up; transport controls carrier (section 11) |
 | DNS refresh and address migration | Keep a working address; one candidate and a new handshake for change (section 5) |
 | Inner offload representation | Experimental, negotiated extension |
 | ECN and DSCP policy | Decided: outer Not-ECT and DSCP zero; preserve inner fields; ECN feedback deferred |
