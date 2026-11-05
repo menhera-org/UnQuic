@@ -1,10 +1,11 @@
 # Release transport overload investigation
 
 The original throughput collapse is reproduced and its receive-admission
-failure is fixed. The strict overload plateau requirement remains **open**:
-some multi-flow directions still deliver less at unlimited load than at a
-paced saturation point. Neither the local **20 Gbit/s in each direction**
-gate nor the real **5 Gbit/s under loss** gate has passed.
+failure is fixed. A later TAP readiness busy loop is now fixed too. The latest
+20-second MTU-1500 and 64-byte repeats deliver at least as much under unlimited
+load as at preceding paced saturation points. Broader plateau validation
+remains open. Neither the local **20 Gbit/s in each direction** gate nor the
+real **5 Gbit/s under loss** gate has passed.
 
 This report separates that remaining decline from the earlier near-total
 collapse. Recovery, congestion control and PMTU discovery remain unfinished;
@@ -12,32 +13,31 @@ their absence does not explain away a scheduling or admission failure.
 
 ## Current performance gaps
 
-Status after the receive-steering follow-up. The latest MTU-1500 results use the 20-CPU single-socket
-profile and capped socket-buffer fallback described below. Small-frame results
-still refer to `a69f88d`; they have not been rerun after the audit changes.
+Status after the TAP readiness fix. The latest MTU-1500 and 64-byte results
+use the 20-CPU single-socket profile and capped socket-buffer fallback below.
 L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Repeated 16-flow unlimited points deliver 2.76–3.49 / 3.53–4.86 Gbit/s of inner UDP payload | Roughly 5.7× / 4.1× more delivered goodput is needed even relative to the better unlimited point. The gate is not close to passing. |
-| Goodput must plateau under excess traffic | The repeated MTU-1500 unlimited point falls from 3.15 / 4.74 Gbit/s paced to 2.76 / 3.53 Gbit/s | A 12.5% / 25.6% decline remains; the preceding unlimited point did not decline. Removing the earlier admission cascade does not satisfy the plateau requirement. |
-| Small-frame overload must remain efficient | With 64-byte frames and 16 flows, reverse delivery falls from 448,939 to 390,617 frames/s | The 13% decline remains unresolved. The 60-byte multi-flow and small-frame single-flow cases are substantially steadier; they do not prove the 64-byte case fixed. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Repeated 16-flow unlimited points deliver 3.67–3.77 / 4.98–5.07 Gbit/s of inner UDP payload | Roughly 5.3× / 3.9× more delivered goodput is needed even relative to the better unlimited point. The gate is not close to passing. |
+| Goodput must plateau under excess traffic | The latest MTU-1500 and 64-byte repeats have no paced-to-unlimited decline | The verified readiness busy loop is fixed. Longer runs, more frame mixes and broader flow/session coverage remain unverified. Removing the earlier admission cascade does not satisfy the plateau requirement. |
+| Small-frame overload must remain efficient | With 64-byte frames and 16 flows, unlimited delivery is 483–486k / 523–537k frames/s, above preceding paced points | Repeated 20-second comparisons pass; the complete small-frame acceptance profile remains unfinished. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
 | Use larger confirmed path MTUs | The runtime still sends at the 1232-byte UDP baseline | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. No performance gain from larger outer packets has been demonstrated. |
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
 
 Loss under unlimited load is still high: the recorded MTU-1500 16-flow point
-misses about 78% / 72% of offered frames despite zero admission-pressure
+misses about 71% / 60% of offered frames despite zero admission-pressure
 rejections and zero worker queue drops. TAP ingress drops and outer socket
 overflows account for visible loss locations; their different units prevent
 an exact frame-loss decomposition. Inner UDP receive-buffer errors are recorded
 and are too small to explain the observed 64-byte goodput decline.
 
-The single-socket follow-up below still shows a 64-byte decline. The next
-investigation is worker/kernel profiling with repeatable socket placement. No remaining
-decline is attributed solely to missing congestion control, recovery or PMTU.
-The absence of those features is a separate production-performance gap.
+Earlier single-socket runs still declined. Calibrated profiling then found
+TAP wakeups with no available transmit buffer; the final follow-up below verifies
+their removal. Missing congestion control, recovery and PMTU remain separate
+production-performance gaps.
 
 ## Local acceptance gate
 
@@ -241,7 +241,7 @@ The admission-pressure cascade disappears in these after runs. Remaining losses
 are visible at TAP ingress and the outer receive sockets, with smaller losses
 at the inner receiver. That locates drops; it does not yet explain the remaining
 goodput decline. Outer IPv6 fragment creation and reassembly deltas are zero
-throughout all 83 recorded points.
+throughout all 95 recorded points.
 
 ## CPU and profiling
 
@@ -265,7 +265,9 @@ and final TAP flush together accounted for 37%, including those TAP writes.
 The profile exposed the idle receive polling fixed in `a69f88d`. Its timings
 include startup and sampling overhead and are excluded from throughput tables.
 The data retains per-worker samples and turn counts; they are directional
-evidence for further profiling, not a cycle-accurate cost model.
+evidence for further profiling, not a cycle-accurate cost model. These old
+shares include uncalibrated clock-read costs; use the calibrated follow-up
+below for CPU attribution.
 
 The next comparisons must control CPU/socket placement and repeat the remaining
 64-byte and MTU-1500 declines. Neither NUMA placement nor absent recovery is a
@@ -476,3 +478,63 @@ transport delivery falls. That observation warrants profiling the balance
 between transmit intake and receive delivery. It does not establish that
 balance as the cause. Fewer socket-overflow SKBs alone do not imply fewer
 lost logical datagrams because aggregate sizes can differ.
+
+## TAP readiness under transmit-buffer pressure
+
+A readable TAP stayed in epoll's read set after its transmit buffer share was
+exhausted. Under unlimited traffic, 89.8–90.2% / 92.0–92.3% of TAP-read
+dispatches could not obtain a buffer. Returning immediately from `read_tap`
+did not clear level-triggered readiness, so epoll repeatedly woke the worker.
+
+Workers now suppress TAP read interest until a transmit buffer is available.
+TAP write readiness remains active for backpressure; writable-only events no
+longer call `read_tap`. Existing buffer-return notifications wake the owner.
+The change adds no buffer storage, allocations, locks or shorter deadlines.
+
+Kernel regressions verify read suppression, resumption after buffer return,
+and `EPOLLOUT` delivery while reads are disabled. Release/default suites,
+Clippy, the worker regressions and the forwarding/reconnect allocation test
+pass.
+
+[Calibrated profile data](benches/worker-turn-profile.json) records CPU stages
+every 256 turns and counts all TAP dispatches in complete one-second bins.
+The clock baseline is measured with consecutive thread-CPU clock reads and
+subtracted after aggregation. Tiny negative dispatch residuals are retained
+as measurement noise. Nested TAP-write timing is disabled. Uncalibrated
+prototypes overestimated CPU and are excluded from quantitative attribution.
+
+| Unlimited-load diagnostic | Before, left / right | After, left / right |
+| --- | ---: | ---: |
+| No-buffer TAP dispatches | 89.8–90.2% / 92.0–92.3% | 0% / 0% |
+| Worker turns/second, summed per daemon | 147–155k / 233–246k | 21k / 29k |
+| Estimated epoll share of thread CPU | about 5% / 7.4–7.5% | about 1.1% / 1.6% |
+
+These instrumented runs establish the polling waste and its removal; they
+are separate from production throughput measurements. A discarded after-fix
+diagnostic run overlapped compilation and is not used in the comparison.
+
+The following normal release runs used 16 flows, 20 seconds per point and the
+same single-socket CPU and queue settings. No build/test work from this
+investigation ran concurrently. Directions stay L→R / R→L; CPU and socket
+overflow stay left / right.
+
+| Frame bytes | Requested/flow | Delivered | Missing % | Daemon CPU % | Socket overflow SKBs |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1514 | 500M | 3.195 / 5.034 Gbit/s | 59.92 / 37.06 | 375.2 / 371.2 | 79,802 / 64,579 |
+| 1514 | unlimited | 3.674 / 5.071 Gbit/s | 71.69 / 59.46 | 348.5 / 342.8 | 59,116 / 48,618 |
+| 1514 | 500M | 3.123 / 4.944 Gbit/s | 60.56 / 38.03 | 370.7 / 368.5 | 88,037 / 74,714 |
+| 1514 | unlimited | 3.766 / 4.977 Gbit/s | 70.72 / 60.28 | 352.0 / 337.3 | 60,824 / 44,396 |
+| 64 | 10M | 459,018 / 515,432 frames/s | 49.36 / 43.10 | 366.5 / 361.6 | 45 / 67,460 |
+| 64 | unlimited | 486,206 / 522,829 frames/s | 59.44 / 54.95 | 342.2 / 327.7 | 3,307 / 37,282 |
+| 64 | 10M | 466,916 / 523,618 frames/s | 48.51 / 42.20 | 364.1 / 354.6 | 1,602 / 47,179 |
+| 64 | unlimited | 482,957 / 537,309 frames/s | 59.57 / 54.02 | 343.7 / 330.3 | 2,080 / 32,250 |
+
+Admission-pressure and worker-queue drops are zero in all eight points.
+Expiry counts in row order are 3 / 2, 0 / 0, 0 / 0, 141 / 0,
+0 / 0, 0 / 268, 0 / 0 and 0 / 0. Outer fragmentation counters stay zero.
+Every unlimited point exceeds its preceding paced point in both directions.
+
+The JSON also retains an earlier four-point, 15-second after-fix sweep whose
+first point overlapped a Clippy check; its annotation excludes it from this
+comparison. The clean repeats support the readiness fix. They do not establish
+the theoretical CPU ceiling, the five-run acceptance gate, or loss recovery.

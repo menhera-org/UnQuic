@@ -286,7 +286,9 @@ toward the memory ceiling. Workers drain a lane after 16 completions, on admissi
 pressure, and at the end of each turn. TX, timers, control queues and readiness
 polling run between receive turns. Ready-event service rotates so busy endpoints
 share the receive reserve. TAP WouldBlock retains frames and waits for
-EPOLLOUT before another write attempt.
+EPOLLOUT before another write attempt. When the transmit buffer share is
+exhausted, workers suppress TAP read interest while retaining write readiness.
+Buffer returns wake the owner; reads resume when a transmit buffer is available.
 
 On pressure, fully validated pieces for existing frames may complete them.
 After TAP delivery frees slots, admission retries once. New DATA storage, packet

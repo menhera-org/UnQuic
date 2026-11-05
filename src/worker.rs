@@ -382,6 +382,7 @@ struct Session {
     tap: Option<TapQueue>,
     tap_registered: bool,
     tap_writable: bool,
+    tap_readable: bool,
     tap_blocked: bool,
     tap_retry: Duration,
     connection: Option<Connection>,
@@ -631,6 +632,7 @@ impl Worker {
                 tap: None,
                 tap_registered: false,
                 tap_writable: false,
+                tap_readable: true,
                 tap_blocked: false,
                 tap_retry: Duration::ZERO,
                 connection: None,
@@ -740,6 +742,7 @@ impl Worker {
         )?;
         self.sessions[session].tap = Some(tap);
         self.sessions[session].tap_registered = true;
+        self.sessions[session].tap_readable = true;
         Ok(())
     }
 
@@ -823,7 +826,9 @@ impl Worker {
                         if event.events & libc::EPOLLOUT as u32 != 0 {
                             self.sessions[session].tap_blocked = false;
                         }
-                        self.read_tap(session, now)?;
+                        if event.events & libc::EPOLLIN as u32 != 0 {
+                            self.read_tap(session, now)?;
+                        }
                     }
                     2 => {
                         let peer = ((token as u32) >> 7) as usize;
@@ -1265,6 +1270,7 @@ impl Worker {
                     .add(tap.as_fd(), TAP_TOKEN | index as u64, libc::EPOLLIN as u32)?;
                 session.tap_registered = true;
                 session.tap_writable = false;
+                session.tap_readable = true;
                 session.tap_blocked = false;
             }
         }
@@ -2037,6 +2043,7 @@ impl Worker {
     }
 
     fn flush_taps(&mut self, now: Duration) -> io::Result<()> {
+        let readable = self.free.len() > RECEIVE_BUFFERS - self.rx_retained;
         for session in 0..self.sessions.len() {
             let mut writable = false;
             for slot in 0..LANES {
@@ -2073,13 +2080,17 @@ impl Worker {
             if !writable {
                 local.tap_blocked = false;
             }
-            if local.tap_registered && local.tap_writable != writable {
+            if local.tap_registered
+                && (local.tap_writable != writable || local.tap_readable != readable)
+            {
                 self.reactor.modify(
                     local.tap.as_ref().unwrap().as_fd(),
                     TAP_TOKEN | session as u64,
-                    (libc::EPOLLIN | if writable { libc::EPOLLOUT } else { 0 }) as u32,
+                    (if readable { libc::EPOLLIN } else { 0 }
+                        | if writable { libc::EPOLLOUT } else { 0 }) as u32,
                 )?;
                 local.tap_writable = writable;
+                local.tap_readable = readable;
             }
         }
         Ok(())
@@ -2754,12 +2765,16 @@ mod tests {
         }
         assert_eq!(worker.pending.len(), BUFFERS - RECEIVE_BUFFERS);
         assert!(worker.free.is_empty());
+        worker.flush_taps(Duration::ZERO).unwrap();
+        assert!(!worker.sessions[0].tap_readable);
+        assert_eq!(worker.reactor.wait(&mut events, 0).unwrap(), 0);
 
         worker.drain_packets(Duration::ZERO).unwrap();
         assert_eq!(worker.rx_retained, 0);
         worker.receive_interest(true).unwrap();
         let count = worker.reactor.wait(&mut events, 0).unwrap();
         assert!(events[..count].iter().any(|event| event.u64 == 2));
+        assert!(!events[..count].iter().any(|event| event.u64 == TAP_TOKEN));
         assert_eq!(worker.free.len(), RECEIVE_BUFFERS);
         worker.read_tap(0, Duration::ZERO).unwrap();
         assert_eq!(worker.free.len(), RECEIVE_BUFFERS);
@@ -2773,6 +2788,12 @@ mod tests {
             worker.release(buffer);
         }
         assert_eq!(worker.free.len(), BUFFERS);
+        worker.flush_taps(Duration::ZERO).unwrap();
+        assert!(worker.sessions[0].tap_readable);
+        let count = worker.reactor.wait(&mut events, 0).unwrap();
+        assert!(events[..count].iter().any(|event| event.u64 == TAP_TOKEN));
+        worker.read_tap(0, Duration::ZERO).unwrap();
+        assert_eq!(worker.pending.len(), RECEIVE_BUFFERS);
         assert_eq!(worker.counters.admission_pressure, 0);
         assert_eq!(worker.counters.expired_frames, 0);
     }
@@ -2917,7 +2938,18 @@ mod tests {
                 }]
             );
             if blocked {
+                let retained = std::mem::take(&mut worker.free);
+                worker.flush_taps(now).unwrap();
+                assert!(!worker.sessions[0].tap_readable);
+                assert!(worker.sessions[0].tap_writable);
+                let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+                assert_eq!(worker.reactor.wait(&mut events, 0).unwrap(), 0);
                 while rx.recv(&mut bytes).is_ok() {}
+                assert_eq!(worker.reactor.wait(&mut events, 0).unwrap(), 1);
+                assert_eq!({ events[0].u64 }, TAP_TOKEN);
+                assert_ne!(events[0].events & libc::EPOLLOUT as u32, 0);
+                assert_eq!(events[0].events & libc::EPOLLIN as u32, 0);
+                worker.free = retained;
             }
             worker.sessions[0].tap_blocked = false; // Simulate EPOLLOUT after draining.
             worker.flush_taps(now).unwrap();
