@@ -432,8 +432,7 @@ A small Rust kernel probe verified classic reuseport BPF payload offsets
 32-bit wrapping addition before modulo. The production owner calculation
 must use the same wrapping arithmetic. This probe does not establish group
 lifecycle correctness. Loading an eBPF socket-filter program returned
-`EPERM`; `io_uring_setup` succeeded. TAP USO and io_uring read costs have
-not yet been measured.
+`EPERM`; `io_uring_setup` succeeded. TAP USO and io_uring read costs were subsequently measured in the B0 follow-up below.
 
 ### Audit work still open
 
@@ -443,8 +442,8 @@ record-cache prototypes were slower and were discarded. C4's gate is specified
 above. A1's immutable lane-association trial below was rejected; strict pinning
 still needs stable steering for dependable locality. A2 now has ordered group
 creation, kernel steering and lifecycle tests. The remaining A4 scheduling
-changes, A6–A7, the B0 cost probes, B1–B3 and the C1–C3 generator/CPU work
-remain unfinished. B4 remains deferred as requested.
+changes, A6–A7, B1–B3 and the C1–C3 generator/CPU work remain unfinished.
+B0's isolated TAP cost probes are recorded below. B4 remains deferred as requested.
 
 ## Audit follow-up: receive steering
 
@@ -838,3 +837,75 @@ unchanged tuple can outlive the queue on which its first frame arrived.
 The bounded table would also fall back permanently after saturation.
 The trial is reverted. A1 remains open; changing lanes after migration would
 weaken the agreed pinning rule, so the runtime keeps deterministic hashing.
+
+## Direct TAP cost probes (audit B0)
+
+[The probe](benches/tap_cost.rs) measures the four requested TAP operations
+with prebuilt 1514-byte Ethernet/IPv4/UDP frames (1472-byte UDP payload).
+It creates a private network namespace and fresh nonpersistent TAPs.
+Three sequential release runs used CPU 0 on socket 0, with the kernel,
+CPU model and build settings above; no builds or other tests ran concurrently.
+[All results](benches/tap-cost.json) include CPU timing and whole-loop wall time.
+The binary SHA-256 is
+`07559fef8982913fa9d20b44b8338f81cd9043a0aab1bcedbaab48b5067047b5`.
+
+Each case runs 8192 batches. Plain reads and writes use 64 frames per batch.
+USO writes use one `writev` per aggregate: a 10-byte virtio header, a
+42-byte Ethernet/IP/UDP header and borrowed payload slices. TAP checksum and
+segmentation offloads for reads stay disabled. Each write is followed by UDP
+receives that verify every payload and its position in the batch; the listener
+does not enable UDP GRO.
+
+| Operation | Frames per syscall | Thread CPU ns/frame, three runs |
+| --- | ---: | ---: |
+| Plain prequeued TAP read | 1 | 1184.89 / 1166.16 / 1219.68 |
+| io_uring prequeued TAP read | 64 | 599.86 / 604.14 / 721.88 |
+| Plain TAP write | 1 | 2409.99 / 2420.98 / 2553.64 |
+| USO writev | 1 | 2348.32 / 2335.67 / 2484.66 |
+| USO writev | 2 | 1837.19 / 1921.03 / 1844.82 |
+| USO writev | 16 | 612.32 / 648.70 / 663.25 |
+| USO writev | 43 | 524.11 / 570.38 / 547.17 |
+| USO writev | 44 | 505.44 / 520.62 / 534.15 |
+
+Timing uses `CLOCK_THREAD_CPUTIME_ID` around each I/O batch and subtracts
+the mean of 10,000 back-to-back clock pairs (938–988 ns in these runs).
+Packet construction, generator sends, receiver drains and payload checks
+are outside the CPU interval. The wall interval includes those operations.
+These are isolated costs with hot buffers, not end-to-end throughput or a
+measured production CPU ceiling.
+
+The ring submits 64 `IORING_OP_READ` operations with `RWF_NOWAIT` and
+harvests 64 completions per enter. Every populated completion returned one
+1514-byte frame with the expected payload. An empty batch returned 64
+`EAGAIN` completions; there were no dropped SQEs or CQ overflows, and
+the process had one task after both read cases.
+Linux 6.8 explicitly marks
+[TAP as supporting nonblocking I/O](https://github.com/torvalds/linux/blob/v6.8/drivers/net/tun.c#L3305-L3306).
+This verifies useful batching on this kernel; availability on other kernels
+and sandbox policies still requires a plain-read fallback.
+
+Plain TAP costs alone would consume roughly 6.1–6.4 core-seconds per daemon
+at 20 Gbit/s of UDP payload each way if these per-frame costs persisted:
+the payload target requires about 1.70 million frames/s in each direction.
+That extrapolation excludes outer transport work and scheduling. The probes
+justify evaluating B1 and B2, but do not establish the target as achievable.
+
+USO payload delivery is verified for groups of 1, 2, 16, 43 and 44.
+Byte-exact Ethernet/IP reconstruction, short final segments, IPv6 and mixed
+traffic have not been verified. Header construction and checksum/coalescibility
+checks are excluded from the write timing. B1 must validate those cases before
+production use; B3 super-frame reads remain unmeasured. The daemon's TAP path
+is unchanged.
+
+To reproduce, build the probe, then copy the printed executable path into a
+disposable container with `/dev/net/tun`, `CAP_NET_ADMIN`, iproute2 and
+taskset. Inside that container run the second command:
+
+```sh
+cargo bench --bench tap_cost --all-features --target x86_64-unknown-linux-musl --no-run
+taskset -c 0 ./tap_cost --run-in-container
+```
+
+Without the explicit argument the probe exits before creating a namespace.
+Clippy, formatting and Rust 1.89 compilation pass. The three container runs
+completed all payload, completion-count, empty-ring and queue-overflow checks.

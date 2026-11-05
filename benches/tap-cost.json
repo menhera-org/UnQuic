@@ -1,0 +1,234 @@
+{
+  "date": "2026-11-05",
+  "source": "benches/tap_cost.rs",
+  "build": {
+    "rust": "1.99.1",
+    "target": "x86_64-unknown-linux-musl",
+    "profile": "release",
+    "opt_level": 3,
+    "lto": true,
+    "strip": true,
+    "codegen_units": 1
+  },
+  "sha256": "07559fef8982913fa9d20b44b8338f81cd9043a0aab1bcedbaab48b5067047b5",
+  "kernel": "Linux 6.8.0-147-generic",
+  "cpu": "Intel Xeon Gold 6138 @ 2.00GHz",
+  "placement": "one thread pinned to CPU 0, a physical core on socket 0",
+  "frame_bytes": 1514,
+  "payload_bytes": 1472,
+  "rounds": 8192,
+  "method": "Calibrated CLOCK_THREAD_CPUTIME_ID around each I/O batch, subtract the mean of 10000 back-to-back clock pairs. Per-batch preparation, sending for read tests, receiving for write tests and payload verification are outside the CPU timing. Wall time covers the entire loop. Each case creates a fresh nonpersistent TAP in a private network namespace. No concurrent builds or tests.",
+  "read_batch": 64,
+  "read_modes": "Plain nonblocking read or 64 IORING_OP_READ submissions with RWF_NOWAIT; all completions validated. An empty ring batch must complete with EAGAIN. Process task count checked after timed reads.",
+  "write_modes": "Plain write of 64 prebuilt frames, or writev of one VNET_HDR + Ethernet/IPv4/UDP header and 1/2/16/43/44 payload slices. UDP listener without UDP_GRO verifies every delivered payload in order. TUNSETOFFLOAD remains zero.",
+  "limits": "Isolated hot-buffer syscall costs, not end-to-end goodput or the production CPU ceiling. Construction/checksum/coalescibility checks excluded from timed writes. UDP payload checks do not prove byte-exact Ethernet/IP reconstruction, partial-tail behavior, IPv6, mixed traffic or all supported kernels.",
+  "runs": [
+    {
+      "run": 1,
+      "clock_pair_cost_ns": 960,
+      "empty_ring_nowait_completions": 64,
+      "operations": [
+        {
+          "operation": "plain_read",
+          "frames": 524288,
+          "cpu_ns_per_frame": 1184.89,
+          "wall_seconds": 2.647,
+          "tasks": 1
+        },
+        {
+          "operation": "io_uring_read",
+          "frames": 524288,
+          "cpu_ns_per_frame": 599.86,
+          "wall_seconds": 2.267,
+          "tasks": 1
+        },
+        {
+          "operation": "plain_write",
+          "segments": 1,
+          "frames": 524288,
+          "cpu_ns_per_frame": 2409.99,
+          "wall_seconds": 2.581,
+          "delivered": 524288
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 1,
+          "frames": 8192,
+          "cpu_ns_per_frame": 2348.32,
+          "wall_seconds": 0.055,
+          "delivered": 8192
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 2,
+          "frames": 16384,
+          "cpu_ns_per_frame": 1837.19,
+          "wall_seconds": 0.089,
+          "delivered": 16384
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 16,
+          "frames": 131072,
+          "cpu_ns_per_frame": 612.32,
+          "wall_seconds": 0.421,
+          "delivered": 131072
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 43,
+          "frames": 352256,
+          "cpu_ns_per_frame": 524.11,
+          "wall_seconds": 1.122,
+          "delivered": 352256
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 44,
+          "frames": 360448,
+          "cpu_ns_per_frame": 505.44,
+          "wall_seconds": 1.109,
+          "delivered": 360448
+        }
+      ]
+    },
+    {
+      "run": 2,
+      "clock_pair_cost_ns": 938,
+      "empty_ring_nowait_completions": 64,
+      "operations": [
+        {
+          "operation": "plain_read",
+          "frames": 524288,
+          "cpu_ns_per_frame": 1166.16,
+          "wall_seconds": 2.474,
+          "tasks": 1
+        },
+        {
+          "operation": "io_uring_read",
+          "frames": 524288,
+          "cpu_ns_per_frame": 604.14,
+          "wall_seconds": 2.182,
+          "tasks": 1
+        },
+        {
+          "operation": "plain_write",
+          "segments": 1,
+          "frames": 524288,
+          "cpu_ns_per_frame": 2420.98,
+          "wall_seconds": 2.602,
+          "delivered": 524288
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 1,
+          "frames": 8192,
+          "cpu_ns_per_frame": 2335.67,
+          "wall_seconds": 0.055,
+          "delivered": 8192
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 2,
+          "frames": 16384,
+          "cpu_ns_per_frame": 1921.03,
+          "wall_seconds": 0.092,
+          "delivered": 16384
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 16,
+          "frames": 131072,
+          "cpu_ns_per_frame": 648.7,
+          "wall_seconds": 0.444,
+          "delivered": 131072
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 43,
+          "frames": 352256,
+          "cpu_ns_per_frame": 570.38,
+          "wall_seconds": 1.212,
+          "delivered": 352256
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 44,
+          "frames": 360448,
+          "cpu_ns_per_frame": 520.62,
+          "wall_seconds": 1.141,
+          "delivered": 360448
+        }
+      ]
+    },
+    {
+      "run": 3,
+      "clock_pair_cost_ns": 988,
+      "empty_ring_nowait_completions": 64,
+      "operations": [
+        {
+          "operation": "plain_read",
+          "frames": 524288,
+          "cpu_ns_per_frame": 1219.68,
+          "wall_seconds": 2.588,
+          "tasks": 1
+        },
+        {
+          "operation": "io_uring_read",
+          "frames": 524288,
+          "cpu_ns_per_frame": 721.88,
+          "wall_seconds": 2.599,
+          "tasks": 1
+        },
+        {
+          "operation": "plain_write",
+          "segments": 1,
+          "frames": 524288,
+          "cpu_ns_per_frame": 2553.64,
+          "wall_seconds": 2.756,
+          "delivered": 524288
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 1,
+          "frames": 8192,
+          "cpu_ns_per_frame": 2484.66,
+          "wall_seconds": 0.058,
+          "delivered": 8192
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 2,
+          "frames": 16384,
+          "cpu_ns_per_frame": 1844.82,
+          "wall_seconds": 0.09,
+          "delivered": 16384
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 16,
+          "frames": 131072,
+          "cpu_ns_per_frame": 663.25,
+          "wall_seconds": 0.455,
+          "delivered": 131072
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 43,
+          "frames": 352256,
+          "cpu_ns_per_frame": 547.17,
+          "wall_seconds": 1.174,
+          "delivered": 352256
+        },
+        {
+          "operation": "uso_writev",
+          "segments": 44,
+          "frames": 360448,
+          "cpu_ns_per_frame": 534.15,
+          "wall_seconds": 1.174,
+          "delivered": 360448
+        }
+      ]
+    }
+  ]
+}
