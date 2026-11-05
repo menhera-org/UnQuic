@@ -272,6 +272,20 @@ impl Session {
         Ok(effects)
     }
 
+    /// Discards only the unconfirmed attempt when its configured path changes.
+    ///
+    /// Active state and its feedback deadline are preserved. The owner starts a
+    /// fresh attempt with reconnect once the candidate sockets are ready.
+    pub fn cancel_pending(&mut self, now: Duration) -> Result<(), HandshakeError> {
+        self.advance(now)?;
+        self.pending = None;
+        self.connecting = self.active.is_none();
+        if self.active.is_none() && self.state != State::Inactive {
+            self.state = State::Configured;
+        }
+        Ok(())
+    }
+
     /// Next time-based transition or initiator retransmission to service.
     ///
     /// The owner may wake sooner for received input. If entropy is unavailable,

@@ -192,7 +192,7 @@ one million ordered transfers. Miri also checks the queue with thread preemption
 The pure two-phase commit barrier is implemented in src/handshake/barrier.rs.
 Tests cover all 64 workers, stale acknowledgments, retirement, generation
 exhaustion, and full command/reply queues. Worker loops, ownership tables and
-barrier integration now forward frames with initially configured IPv6 peers. The reassembly/window foundation from stage 2 is
+barrier integration now forward frames with configured or supplied IPv6 peers. The reassembly/window foundation from stage 2 is
 also implemented because step 1e requires permanent duplicate suppression.
 Baseline segmentation and inner-flow selection are implemented in src/pack.rs.
 Tests cover every supported frame length, identity exhaustion, IP fragments,
@@ -204,8 +204,12 @@ buffers and retained partial-send suffixes. Its container test covers two worker
 four TX lanes, both forwarding directions, VLAN materialization at 9022 bytes,
 carrier loss and restart recovery, with allocation/deallocation checks during
 forwarding. Startup checks reserved storage before TAP creation. Candidate
-address updates, separate session/peer/lane counters and broader ownership/
-pressure tests remain before 1e can be called complete.
+addresses now pass through a bounded control queue and prepare a second socket
+set before new handshakes. Tests cover initial supply, an unreachable candidate,
+migration and migration back, unchanged-address updates, and two peers/three
+sessions per endpoint. Receive readiness is independent per endpoint.
+Separate session/peer/lane counters and broader ownership/pressure tests remain
+before 1e can be called complete.
 
 Implement the ownership rules of section 10 under "Worker ownership and
 routing (v1)".

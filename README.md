@@ -127,15 +127,16 @@ pieces directly; tests compare its wire bytes with the contiguous encoder.
 Batched socket calls, WouldBlock and invalid/truncated input paths also have
 allocation checks. Multi-record packing is still pending.
 
-The runtime now forwards frames between TAPs with configured IPv6 peers.
-The isolated test exercises two workers and four transmit lanes per endpoint,
+The runtime now forwards frames between TAPs with configured or supplied IPv6 peers.
+The isolated test exercises two workers, two peers and three sessions per endpoint,
+with four transmit lanes for the first peer,
 automatic role election, bidirectional 60-, 1514-, 1518- and 9022-byte forwarding,
 carrier loss and reconnection after peer restart. The largest frame enters
 through a VLAN upper device, exercising kernel tag materialization. Allocation
 instrumentation observes no allocations or deallocations during these forwarding
 checks. This is correctness coverage, not a throughput measurement.
 
-Address updates, separate session/peer/lane counter publication, aggregate
+Separate session/peer/lane counter publication, aggregate
 receive reservations, multi-record packing, GSO/GRO, recovery, BBRv3, scheduled
 DNS refresh, the daemon and descriptor adoption remain unfinished. No throughput
 target has been demonstrated.
@@ -152,9 +153,29 @@ queues before run returns; `stopped()` then becomes true.
 
 Readiness means every configured TAP exists. Administrative state remains the
 network manager's responsibility. Receive bindings and missing transmit sockets
-retry without deleting ready TAPs. In this implementation, peer addresses come
-from the initial configuration; a peer with no address remains waiting because
-the candidate-address control method is not implemented yet.
+retry without deleting ready TAPs. Each endpoint becomes usable independently;
+an unavailable endpoint does not block peers on another endpoint.
+
+Call `supply_peer_address(peer_index, ipv6, scope_id)` after readiness to supply
+an initial address or candidate. The peer's configured port stays fixed. The
+method queues a bounded command and wakes the control owner; success means
+queued, not connected. WouldBlock means retry later because startup or a queued
+update still occupies that slot. Invalid, multicast, unspecified and IPv4-mapped
+addresses fail; link-local candidates require a nonzero scope ID.
+
+Each peer reserves two transmit socket sets. Sessions keep using their active
+set while fresh handshakes run on the candidate. Each session switches through
+its commit barrier; duplicate active-connection replies still use its active
+path. A newer candidate can replace a failed uncommitted one. If sessions
+currently use both sets, one further update waits until a set is free.
+Supplying the selected address again leaves connection numbering unchanged.
+A session status includes the last completed local barrier generation so callers
+can observe replacement. Status fields are sampled independently.
+
+The control queue's mutex serializes caller threads only. Workers consume its
+SPSC endpoint without locking; DNS work stays in the caller or resolution
+helper. Socket preparation is cold lifecycle work and does not replace packet
+state before confirmation.
 
 The worker count is the largest session queue count. Each worker owns one
 reuseport receive socket per endpoint, its assigned TAP queues and transmit
@@ -219,7 +240,9 @@ VLAN/QinQ bytes, carrier transitions and deletion after the last queue closes.
 Maximum-size QinQ is currently checked in the TAP-write direction; testing its
 TAP-read direction through VLAN upper devices belongs to the composition tests.
 Run every ignored test binary, including the library unit-test binary. The
-runtime test also covers shutdown cleanup, forwarding allocation checks, and
+runtime test also covers initial address supply, failed-candidate preservation,
+migration and migration back, unchanged-address updates, multiple peers/sessions,
+shutdown cleanup, forwarding allocation checks, and
 TAP readiness with an unavailable receive address and unresolved peer. A worker
 ownership test fills both handoff rings and checks buffer returns, lane returns,
 commit completion and duplicate-install packet-number preservation.

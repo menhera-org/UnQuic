@@ -2,7 +2,7 @@
 //!
 //! This crate provides identity types, the v1 wire codec, a pure handshake state
 //! machine, IPv6 UDP sockets, TAP ownership and a worker runtime for configured
-//! IPv6 peers. Address updates, recovery and congestion control remain unfinished.
+//! IPv6 peers and confirmed address updates. Recovery and congestion control remain unfinished.
 //! Callers supply configuration explicitly; the library reads no configuration
 //! files or environment variables and writes no diagnostic output.
 #![deny(missing_docs)]

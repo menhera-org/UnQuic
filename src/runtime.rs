@@ -1,7 +1,7 @@
 //! Thread ownership and control for the Linux transport.
 //!
 //! All transport storage is reserved before TAP readiness. Runtime workers own
-//! packet state; the control handle only reads published status or requests exit.
+//! packet state; the control handle reads status and queues cold address updates.
 
 use crate::{
     config::{Config, Validated},
@@ -15,8 +15,9 @@ use std::{
     ffi::CString,
     io,
     mem::size_of,
+    net::{Ipv6Addr, SocketAddrV6},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
 };
@@ -32,6 +33,8 @@ pub struct SessionStatus {
     pub state: State,
     /// Last successfully applied TAP carrier state.
     pub carrier: bool,
+    /// Last completed local commit barrier; zero before the first connection.
+    pub generation: u64,
 }
 
 /// Startup, statistics and shutdown handle. A handle belongs to one run only.
@@ -47,13 +50,23 @@ struct ControlState {
     shared: OnceLock<Arc<Shared>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct AddressRequest {
+    pub peer: usize,
+    pub address: SocketAddrV6,
+}
+
 pub(crate) struct Shared {
     pub config: Validated,
     pub wakes: Vec<Arc<Wake>>,
     pub owners: Vec<Box<[AtomicU8]>>,
     pub status: Vec<AtomicU8>,
+    pub generations: Vec<AtomicU64>,
     pub counters: Vec<Counters>,
-    pub bound: AtomicU64,
+    pub bound: Vec<AtomicU64>,
+    pub requests: Mutex<spsc::Producer<AddressRequest>>,
+    pub address_pending: Vec<AtomicBool>,
+    pub address_ready: Vec<AtomicU64>,
 }
 
 impl Control {
@@ -86,6 +99,59 @@ impl Control {
         self.0.shutdown.load(Ordering::Acquire)
     }
 
+    /// Queues an IPv6 candidate for a configured peer without changing its port.
+    ///
+    /// Call after readiness. Resolution belongs to the caller. A new address
+    /// carries data only after a fresh handshake and worker commit barrier.
+    /// A pending candidate preserves the old connection and transmit sockets.
+    ///
+    /// WouldBlock means startup has not published the control queue, an update
+    /// for this peer is already queued, or the bounded command ring is full.
+    /// Updates serialize while sessions still use both address slots.
+    /// This cold control operation takes a mutex; packet workers never take it.
+    pub fn supply_peer_address(
+        &self,
+        peer: usize,
+        address: Ipv6Addr,
+        scope_id: u32,
+    ) -> io::Result<()> {
+        if !crate::config::unicast(address) || (address.is_unicast_link_local() && scope_id == 0) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        if self.quitting() || self.stopped() {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let shared = self.0.shared.get().ok_or(io::ErrorKind::WouldBlock)?;
+        let configured = shared
+            .config
+            .config()
+            .peers
+            .get(peer)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        let pending = &shared.address_pending[peer];
+        pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| io::ErrorKind::WouldBlock)?;
+        let request = AddressRequest {
+            peer,
+            address: SocketAddrV6::new(address, configured.peer_port, 0, scope_id),
+        };
+        let result = shared
+            .requests
+            .lock()
+            .map_err(|_| io::Error::from(io::ErrorKind::Other))
+            .and_then(|mut queue| {
+                queue
+                    .try_push(request)
+                    .map_err(|_| io::ErrorKind::WouldBlock.into())
+            });
+        if result.is_err() {
+            pending.store(false, Ordering::Release);
+            return result;
+        }
+        shared.wakes[0].notify()
+    }
+
     /// Samples a session by its index in Config.sessions, without allocation.
     pub fn session(&self, index: usize) -> Option<SessionStatus> {
         let value = self
@@ -104,6 +170,7 @@ impl Control {
                 _ => State::Configured,
             },
             carrier: value & 8 != 0,
+            generation: self.0.shared.get()?.generations[index].load(Ordering::Acquire),
         })
     }
 
@@ -118,8 +185,9 @@ impl Shared {
         self.wakes.len()
     }
 
-    pub fn all_bound(&self) -> bool {
-        self.bound.load(Ordering::Acquire) == u64::MAX >> (64 - self.workers())
+    pub fn peer_bound(&self, peer: usize) -> bool {
+        let endpoint = self.config.endpoint_for_peer(peer).unwrap();
+        self.bound[endpoint].load(Ordering::Acquire) == u64::MAX >> (64 - self.workers())
     }
 
     pub fn publish_state(&self, session: usize, state: State, carrier: bool) {
@@ -140,8 +208,8 @@ impl Shared {
 /// never delay it. The caller manages administrative link state. All workers
 /// are joined and newly created TAPs are closed before this returns.
 ///
-/// This initial runtime accepts the raw IPv6 destinations present in Config.
-/// Supplying refreshed candidates is a separate, unfinished roadmap item.
+/// Initial addresses come from Config. The caller can supply initial or refreshed
+/// IPv6 candidates through Control after TAP readiness.
 pub fn run(config: Config, control: Control) -> io::Result<()> {
     if control.0.started.swap(true, Ordering::AcqRel) {
         return Err(io::ErrorKind::AlreadyExists.into());
@@ -172,6 +240,12 @@ pub fn run(config: Config, control: Control) -> io::Result<()> {
         ));
     }
     let sessions = config.config().sessions.len();
+    let peers = config.config().peers.len();
+    let endpoints = config.config().endpoints.len();
+    if peers > (u32::MAX as usize >> 7) {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let (request_tx, request_rx) = spsc::channel();
     let wakes = (0..count)
         .map(|_| Wake::new().map(Arc::new))
         .collect::<io::Result<Vec<_>>>()?;
@@ -182,12 +256,17 @@ pub fn run(config: Config, control: Control) -> io::Result<()> {
             .map(|_| (0..65_536).map(|_| AtomicU8::new(0)).collect())
             .collect(),
         status: (0..sessions).map(|_| AtomicU8::new(0)).collect(),
+        generations: (0..sessions).map(|_| AtomicU64::new(0)).collect(),
         counters: (0..count).map(|_| Counters::new()).collect(),
-        bound: AtomicU64::new(0),
+        bound: (0..endpoints).map(|_| AtomicU64::new(0)).collect(),
+        requests: Mutex::new(request_tx),
+        address_pending: (0..peers).map(|_| AtomicBool::new(false)).collect(),
+        address_ready: (0..peers * count).map(|_| AtomicU64::new(0)).collect(),
     });
     let mut workers = (0..count)
         .map(|id| Worker::new(id, Arc::clone(&shared), control.clone()))
         .collect::<io::Result<Vec<_>>>()?;
+    workers[0].requests = Some(request_rx);
     for from in 0..count {
         for to in 0..count {
             if from != to {
@@ -237,6 +316,7 @@ pub fn run(config: Config, control: Control) -> io::Result<()> {
 fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
     let raw = config.config();
     let sessions = raw.sessions.len();
+    let commands = spsc::CAPACITY * size_of::<AddressRequest>() + 512;
     let queues = workers.checked_mul(workers - 1)?.checked_mul(
         spsc::CAPACITY
             .checked_mul(size_of::<Event>())?
@@ -246,7 +326,7 @@ fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
         .checked_mul(LANES)?
         .checked_mul(reassembly::Lane::storage_bytes())?;
     let shared = sessions
-        .checked_mul(65_536 + size_of::<Box<[AtomicU8]>>() + 1)?
+        .checked_mul(65_536 + size_of::<Box<[AtomicU8]>>() + 1 + size_of::<AtomicU64>())?
         .checked_add(workers.checked_mul(STACK_BYTES + size_of::<Counters>() + 256)?)?;
     // Config owns caller-supplied capacities; count those even when mostly empty.
     let mut configuration = raw
@@ -291,6 +371,11 @@ fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
         .checked_add(sessions.checked_mul(128)?)?;
     [
         Worker::storage_bytes(raw, workers)?,
+        commands,
+        raw.endpoints.len().checked_mul(size_of::<AtomicU64>())?,
+        raw.peers
+            .len()
+            .checked_mul(1 + workers.checked_mul(size_of::<AtomicU64>())?)?,
         queues,
         reassembly,
         shared,
@@ -305,6 +390,40 @@ fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_validation_and_startup_shutdown_errors_precede_queue_access() {
+        let control = Control::new();
+        for address in [
+            Ipv6Addr::UNSPECIFIED,
+            Ipv6Addr::from([0xff; 16]),
+            "::ffff:127.0.0.1".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+        ] {
+            assert_eq!(
+                control
+                    .supply_peer_address(0, address, 0)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(
+            control
+                .supply_peer_address(0, Ipv6Addr::LOCALHOST, 0)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        control.shutdown();
+        assert_eq!(
+            control
+                .supply_peer_address(0, Ipv6Addr::LOCALHOST, 0)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
 
     #[test]
     fn memory_ceiling_and_single_use_fail_before_opening_devices() {

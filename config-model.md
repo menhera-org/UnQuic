@@ -34,7 +34,11 @@ The optional `dns` feature depends on exactly `iphost v0.4.4` and uses its
 hostname types and resolvers to supply IPv6 addresses. A core peer may initially
 have no address; TAP creation and readiness do not wait for resolution. Resolver
 work runs outside packet workers. The daemon's TOML parser and refresh scheduling
-are still to be implemented.
+are still to be implemented. Library callers use
+`Control::supply_peer_address(peer_index, ipv6, scope_id)` after readiness.
+The configured peer port is unchanged; candidate data waits for a fresh
+handshake and worker commit. Submitting an update can return WouldBlock under
+backpressure, so a resolver helper retains and retries its selected address.
 
 `tap_name` defaults to the session name. `mac` may be omitted for deterministic
 derivation. The core accepts MTUs from 1500 through 9000 and queue/lane counts

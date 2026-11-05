@@ -208,3 +208,24 @@ pub fn add_vlan(control: &UdpSocket, lower: &CStr, vid: u16) {
     // SAFETY: initialized ADD_VLAN_CMD argument with a terminated lower name.
     check(unsafe { libc::ioctl(control.as_raw_fd(), 0x8983 as _, &mut request) });
 }
+
+pub fn add_ipv6(control: &UdpSocket, name: &CStr, address: std::net::Ipv6Addr) {
+    #[repr(C)]
+    struct Request {
+        address: libc::in6_addr,
+        prefix_len: u32,
+        index: i32,
+    }
+    // SAFETY: name is a valid NUL-terminated interface name.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    assert_ne!(index, 0);
+    let request = Request {
+        address: libc::in6_addr {
+            s6_addr: address.octets(),
+        },
+        prefix_len: 128,
+        index: index as i32,
+    };
+    // SAFETY: request has Linux in6_ifreq layout; the control fd is IPv6.
+    check(unsafe { libc::ioctl(control.as_raw_fd(), libc::SIOCSIFADDR as _, &request) });
+}

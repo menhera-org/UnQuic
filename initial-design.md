@@ -491,13 +491,16 @@ Baseline segmentation and inner-flow selection now cover the full frame-size
 range, VLANs and IPv4/IPv6 fragments, with allocation and exhaustion tests.
 Batched socket APIs use recvmmsg and scatter/gather sendmmsg, with original
 frame slices, partial-completion tests and allocation checks. The owned worker
-runtime now forwards frames between TAPs for initially configured IPv6 peers.
+runtime now forwards frames between TAPs for configured or supplied IPv6 peers.
 Its container test covers two workers/four transmit lanes per endpoint,
 bidirectional 60/1514/1518/9022-byte frames, kernel VLAN tag materialization,
 carrier loss and reconnection after restart. Forwarding checks observe no
 allocations or deallocations. Readiness, buffer ownership, memory reservations
 and remaining runtime gaps are documented in README.md. Candidate-address
-updates, per-session/peer/lane counter publication, aggregate receive quotas,
+updates preserve active paths through fresh handshakes and worker barriers.
+Tests cover failed candidates, migration back, unchanged destinations, multiple
+peers/sessions and independent endpoint readiness. Per-session/peer/lane counter
+publication, aggregate receive quotas,
 offloads, recovery and congestion control remain unfinished. Current liveness
 probes do not discover MTU: the UDP limit remains 1232 bytes until stage 3.
 No performance acceptance claim has been made.

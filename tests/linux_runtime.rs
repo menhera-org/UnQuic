@@ -49,11 +49,11 @@ unsafe impl GlobalAlloc for Allocator {
 }
 
 fn config(name: &str, port: u16, remote: u16) -> Config {
-    Config {
+    let mut config = Config {
         daemon: Daemon::default(),
         endpoints: vec![Endpoint {
             name: "rx".into(),
-            listen_address: Ipv6Addr::LOCALHOST,
+            listen_address: Ipv6Addr::UNSPECIFIED,
             listen_port: port,
             scope_id: 0,
             bind_device: None,
@@ -76,7 +76,21 @@ fn config(name: &str, port: u16, remote: u16) -> Config {
             mac: None,
             queue_count: 2,
         }],
-    }
+    };
+    let mut second = config.sessions[0].clone();
+    second.name = format!("{name}-b");
+    second.cookie = unquic::UnquicUuid::from_bytes([2; 16]);
+    second.queue_count = 1;
+    let mut third = second.clone();
+    third.name = format!("{name}-c");
+    third.cookie = unquic::UnquicUuid::from_bytes([3; 16]);
+    third.peer = "peer2".into();
+    let mut peer2 = config.peers[0].clone();
+    peer2.name = "peer2".into();
+    peer2.tx_lanes = 2;
+    config.peers.push(peer2);
+    config.sessions.extend([second, third]);
+    config
 }
 
 struct Running {
@@ -121,7 +135,16 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
     check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
     let net = UdpSocket::bind("[::]:0").unwrap();
     up(&net, c"lo");
-    let mut left = Running::start(config("uq-left", 40100, 40101));
+    let mut left_config = config("uq-left", 40100, 40101);
+    left_config.peers[0].address = None;
+    left_config.endpoints.push(Endpoint {
+        name: "unavailable".into(),
+        listen_address: "fd00::ffff".parse().unwrap(),
+        listen_port: 40120,
+        scope_id: 0,
+        bind_device: None,
+    });
+    let mut left = Running::start(left_config);
     let mut right = Running::start(config("uq-right", 40101, 40100));
     until(Duration::from_secs(5), || {
         left.control.ready() && right.control.ready()
@@ -130,8 +153,18 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
     assert_eq!(flags(&net, c"uq-right") & libc::IFF_UP as i16, 0);
     up(&net, c"uq-left");
     up(&net, c"uq-right");
+    for name in [c"uq-left-b", c"uq-left-c", c"uq-right-b", c"uq-right-c"] {
+        up(&net, name);
+    }
+    assert!(!left.control.session(0).unwrap().carrier);
+    left.control
+        .supply_peer_address(0, Ipv6Addr::LOCALHOST, 0)
+        .unwrap();
     until(Duration::from_secs(5), || {
-        left.control.session(0).unwrap().carrier && right.control.session(0).unwrap().carrier
+        (0..3).all(|session| {
+            left.control.session(session).unwrap().carrier
+                && right.control.session(session).unwrap().carrier
+        })
     });
     let a = raw_socket(c"uq-left", libc::ETH_P_ALL as u16);
     let b = raw_socket(c"uq-right", libc::ETH_P_ALL as u16);
@@ -193,6 +226,64 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
         assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
         assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
     }
+    for (left_name, right_name) in [(c"uq-left-b", c"uq-right-b"), (c"uq-left-c", c"uq-right-c")] {
+        let source = raw_socket(left_name, 0x88b5);
+        let target = raw_socket(right_name, 0x88b5);
+        let mut frame = [0x5a; 60];
+        frame[12..14].copy_from_slice(&0x88b5_u16.to_be_bytes());
+        raw_send(&source, &frame);
+        until(Duration::from_secs(2), || {
+            raw_read(&target, &mut capture).is_some_and(|n| capture[..n] == frame)
+        });
+        raw_send(&target, &frame);
+        until(Duration::from_secs(2), || {
+            raw_read(&source, &mut capture).is_some_and(|n| capture[..n] == frame)
+        });
+    }
+    let old_generation = left.control.session(0).unwrap().generation;
+    left.control
+        .supply_peer_address(0, "fd99::1".parse().unwrap(), 0)
+        .unwrap();
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(left.control.session(0).unwrap().generation, old_generation);
+    assert!(left.control.session(0).unwrap().carrier);
+    let frame = [0x5a; 60];
+    raw_send(&a, &frame);
+    until(Duration::from_secs(2), || {
+        capture_frame(&b, &mut capture).is_some_and(|n| capture[..n] == frame)
+    });
+    let candidate = "fd00::2".parse().unwrap();
+    add_ipv6(&net, c"lo", candidate);
+    until(Duration::from_secs(2), || {
+        match left.control.supply_peer_address(0, candidate, 0) {
+            Ok(()) => true,
+            Err(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                false
+            }
+        }
+    });
+    until(Duration::from_secs(5), || {
+        left.control.session(0).unwrap().generation > old_generation
+    });
+    assert!(left.control.session(0).unwrap().carrier);
+    raw_send(&a, &frame);
+    until(Duration::from_secs(2), || {
+        capture_frame(&b, &mut capture).is_some_and(|n| capture[..n] == frame)
+    });
+    let migrated = left.control.session(0).unwrap().generation;
+    left.control
+        .supply_peer_address(0, Ipv6Addr::LOCALHOST, 0)
+        .unwrap();
+    until(Duration::from_secs(5), || {
+        left.control.session(0).unwrap().generation > migrated
+    });
+    let restored = left.control.session(0).unwrap().generation;
+    left.control
+        .supply_peer_address(0, Ipv6Addr::LOCALHOST, 0)
+        .unwrap();
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(left.control.session(0).unwrap().generation, restored);
     right.stop();
     until(Duration::from_secs(32), || {
         !left.control.session(0).unwrap().carrier

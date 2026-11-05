@@ -257,13 +257,13 @@ use crate::{
     },
     pack,
     reassembly::{self, Admission},
-    runtime::{BUFFERS, Control, LANES, Shared},
+    runtime::{AddressRequest, BUFFERS, Control, LANES, Shared},
     socket::{BATCH_SIZE, ReceiveDatagram, ReceiveSocket, SendDatagram, TransmitSocket},
     spsc::{Consumer, Producer},
     tap::TapQueue,
     wire::{self, DATA_PREFIX_LEN, Datagram, Header, Record},
 };
-use std::{collections::VecDeque, sync::atomic::Ordering};
+use std::{collections::VecDeque, net::SocketAddrV6, sync::atomic::Ordering};
 
 const TAP_TOKEN: u64 = 1 << 32;
 const TX_TOKEN: u64 = 2 << 32;
@@ -299,7 +299,9 @@ pub(crate) enum Event {
     Barrier {
         session: usize,
         command: Command,
+        path: usize,
     },
+    Address(AddressChange),
     Acknowledge {
         session: usize,
         worker: usize,
@@ -331,6 +333,7 @@ struct Session {
     tap_writable: bool,
     tap_retry: Duration,
     connection: Option<Connection>,
+    path: usize,
     rx_index: Box<[u8]>,
     rx: Vec<Option<Box<reassembly::Lane>>>,
     free: Vec<Box<reassembly::Lane>>,
@@ -351,11 +354,38 @@ struct SessionControl {
     retry: Duration,
     probe_due: Duration,
     probe: Option<(u64, u16)>,
+    handshake_path: usize,
+    install_path: usize,
 }
 
 struct Tx {
     socket: Option<TransmitSocket>,
     blocked: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AddressChange {
+    request: AddressRequest,
+    path: usize,
+    generation: u64,
+}
+
+struct Path {
+    address: Option<SocketAddrV6>,
+    lanes: Vec<Tx>,
+}
+
+struct PeerPaths {
+    paths: [Path; 2],
+    generation: u64,
+    preparing: Option<AddressChange>,
+}
+
+#[derive(Default)]
+struct PeerControl {
+    pending: Option<AddressRequest>,
+    change: Option<AddressChange>,
+    unsent: u64,
 }
 
 pub(crate) struct Worker {
@@ -368,7 +398,9 @@ pub(crate) struct Worker {
     sessions: Vec<Session>,
     controls: Vec<SessionControl>,
     receive: Vec<Option<ReceiveSocket>>,
-    transmit: Vec<Vec<Tx>>,
+    transmit: Vec<PeerPaths>,
+    pub requests: Option<Consumer<AddressRequest>>,
+    peer_controls: Vec<PeerControl>,
     free: Vec<Box<Buffer>>,
     returns: Vec<Vec<Box<Buffer>>>,
     pending: VecDeque<Box<Buffer>>,
@@ -407,8 +439,8 @@ impl Worker {
         }
         for peer in &config.peers {
             per_worker = per_worker
-                .checked_add(size_of::<Vec<Tx>>())?
-                .checked_add(peer.tx_lanes.checked_mul(size_of::<Tx>())?)?;
+                .checked_add(size_of::<PeerPaths>())?
+                .checked_add(peer.tx_lanes.checked_mul(2 * size_of::<Tx>())?)?;
         }
         for session in &config.sessions {
             let peer = config.peers.iter().find(|p| p.name == session.peer)?;
@@ -419,6 +451,7 @@ impl Worker {
         }
         per_worker
             .checked_mul(workers)?
+            .checked_add(config.peers.len().checked_mul(size_of::<PeerControl>())?)?
             .checked_add(config.sessions.len().checked_mul(
                 size_of::<SessionControl>() + LANES * size_of::<Box<reassembly::Lane>>(),
             )?)
@@ -457,6 +490,8 @@ impl Worker {
                     retry: Duration::ZERO,
                     probe_due: Duration::ZERO,
                     probe: None,
+                    handshake_path: 0,
+                    install_path: 0,
                 });
             }
             sessions.push(Session {
@@ -465,6 +500,7 @@ impl Worker {
                 tap_writable: false,
                 tap_retry: Duration::ZERO,
                 connection: None,
+                path: 0,
                 rx_index: vec![0; 65_536].into_boxed_slice(),
                 rx: (0..LANES).map(|_| None).collect(),
                 free,
@@ -504,14 +540,23 @@ impl Worker {
             transmit: config
                 .peers
                 .iter()
-                .map(|p| {
-                    (0..p.tx_lanes)
-                        .map(|_| Tx {
-                            socket: None,
-                            blocked: false,
-                        })
-                        .collect()
+                .map(|peer| PeerPaths {
+                    paths: std::array::from_fn(|slot| Path {
+                        address: if slot == 0 { peer.socket_addr() } else { None },
+                        lanes: (0..peer.tx_lanes)
+                            .map(|_| Tx {
+                                socket: None,
+                                blocked: false,
+                            })
+                            .collect(),
+                    }),
+                    generation: 0,
+                    preparing: None,
                 })
+                .collect(),
+            requests: None,
+            peer_controls: (0..if id == 0 { config.peers.len() } else { 0 })
+                .map(|_| PeerControl::default())
                 .collect(),
             sessions,
             controls,
@@ -557,13 +602,16 @@ impl Worker {
             if now >= self.setup_due {
                 self.setup(now)?;
             }
+            self.addresses(now)?;
             self.progress_barriers(now)?;
             self.timers(now)?;
             self.flush_frames(now)?;
             self.flush_taps(now)?;
             self.flush_notifications()?;
             more |= self.pending.iter().any(|b| {
-                !self.transmit[self.shared.config.peer_for_session(b.session).unwrap()][b.lane]
+                !self.transmit[self.shared.config.peer_for_session(b.session).unwrap()].paths
+                    [self.sessions[b.session].path]
+                    .lanes[b.lane]
                     .blocked
             });
             self.shared.counters[self.id].publish(&self.counters);
@@ -593,9 +641,10 @@ impl Worker {
                 match token >> 32 {
                     1 => self.read_tap(token as u32 as usize, now)?,
                     2 => {
-                        let peer = ((token as u32) >> 6) as usize;
+                        let peer = ((token as u32) >> 7) as usize;
+                        let path = ((token as u32) >> 6 & 1) as usize;
                         let lane = token as usize & 63;
-                        let tx = &mut self.transmit[peer][lane];
+                        let tx = &mut self.transmit[peer].paths[path].lanes[lane];
                         if tx.blocked {
                             self.reactor.remove(tx.socket.as_ref().unwrap().as_fd())?;
                             tx.blocked = false;
@@ -658,6 +707,140 @@ impl Worker {
                 .iter()
                 .any(|s| s.command.is_some() || s.acknowledged.is_some() || s.retire_pending != 0)
             || self.controls.iter().any(|s| s.barrier.is_active())
+            || self.peer_controls.iter().any(|p| p.unsent != 0)
+    }
+
+    fn address(&mut self, change: AddressChange) -> io::Result<()> {
+        let paths = &mut self.transmit[change.request.peer];
+        if change.generation <= paths.generation {
+            return Ok(());
+        }
+        let path = &mut paths.paths[change.path];
+        for tx in &mut path.lanes {
+            if tx.blocked {
+                self.reactor.remove(tx.socket.as_ref().unwrap().as_fd())?;
+            }
+            tx.socket = None;
+            tx.blocked = false;
+        }
+        path.address = Some(change.request.address);
+        paths.generation = change.generation;
+        paths.preparing = Some(change);
+        self.setup_due = Duration::ZERO;
+        Ok(())
+    }
+
+    fn addresses(&mut self, now: Duration) -> io::Result<()> {
+        if let Some(requests) = &mut self.requests {
+            for _ in 0..BATCH_SIZE {
+                let Some(request) = requests.try_pop() else {
+                    break;
+                };
+                debug_assert!(self.peer_controls[request.peer].pending.is_none());
+                self.peer_controls[request.peer].pending = Some(request);
+            }
+        }
+        for peer in 0..self.peer_controls.len() {
+            if let Some(request) = self.peer_controls[peer].pending {
+                let mut used = [false; 2];
+                let mut barrier = false;
+                for (index, session) in self.sessions.iter().enumerate() {
+                    if self.shared.config.peer_for_session(index) == Some(peer) {
+                        if session.connection.is_some() {
+                            used[session.path] = true;
+                        }
+                        barrier |= self.controls[index].barrier.is_active();
+                    }
+                }
+                if barrier {
+                    continue;
+                }
+                let selected = self
+                    .controls
+                    .iter()
+                    .enumerate()
+                    .find(|(session, _)| {
+                        self.shared.config.peer_for_session(*session) == Some(peer)
+                    })
+                    .map_or(0, |(_, control)| control.handshake_path);
+                if (self.peer_controls[peer].change.is_none()
+                    && self.transmit[peer].paths[selected].address == Some(request.address))
+                    || self.peer_controls[peer]
+                        .change
+                        .is_some_and(|change| change.request.address == request.address)
+                {
+                    self.peer_controls[peer].pending = None;
+                    self.shared.address_pending[peer].store(false, Ordering::Release);
+                    continue;
+                }
+                if used == [true, true] {
+                    continue;
+                }
+                let path = if used[0] { 1 } else { 0 };
+                let generation = self.transmit[peer]
+                    .generation
+                    .checked_add(1)
+                    .ok_or(io::ErrorKind::Other)?;
+                let change = AddressChange {
+                    request,
+                    path,
+                    generation,
+                };
+                for session in 0..self.controls.len() {
+                    if self.shared.config.peer_for_session(session) == Some(peer) {
+                        self.controls[session].state.cancel_pending(now).unwrap();
+                        self.controls[session].handshake_path = self.sessions[session].path;
+                        self.controls[session].retry = now + Duration::from_millis(100);
+                    }
+                }
+                self.peer_controls[peer].pending = None;
+                self.peer_controls[peer].change = Some(change);
+                self.peer_controls[peer].unsent = u64::MAX >> (64 - self.shared.workers());
+            }
+            let Some(change) = self.peer_controls[peer].change else {
+                continue;
+            };
+            let publishing = self.peer_controls[peer].unsent != 0;
+            for worker in 0..self.shared.workers() {
+                let bit = 1_u64 << worker;
+                if self.peer_controls[peer].unsent & bit == 0 {
+                    continue;
+                }
+                if worker == self.id {
+                    self.address(change)?;
+                } else if self.push(worker, Event::Address(change)).is_err() {
+                    continue;
+                }
+                self.peer_controls[peer].unsent &= !bit;
+            }
+            if publishing && self.peer_controls[peer].unsent == 0 {
+                self.shared.address_pending[peer].store(false, Ordering::Release);
+            }
+            if self.peer_controls[peer].unsent == 0
+                && (0..self.shared.workers()).all(|worker| {
+                    self.shared.address_ready[peer * self.shared.workers() + worker]
+                        .load(Ordering::Acquire)
+                        == change.generation
+                })
+            {
+                self.peer_controls[peer].change = None;
+                for session in 0..self.controls.len() {
+                    if self.shared.config.peer_for_session(session) != Some(peer) {
+                        continue;
+                    }
+                    self.controls[session].handshake_path = change.path;
+                    let mut effects = self.controls[session].state.reconnect(now, None).unwrap();
+                    if effects.needs_tag {
+                        effects = self.controls[session]
+                            .state
+                            .reconnect(now, Tag::generate()?)
+                            .unwrap();
+                    }
+                    self.effects(session, effects, now)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn setup(&mut self, now: Duration) -> io::Result<()> {
@@ -670,44 +853,59 @@ impl Worker {
                         self.reactor
                             .add(socket.as_fd(), index as u64 + 2, libc::EPOLLIN as u32)?;
                         self.receive[index] = Some(socket);
+                        self.shared.bound[index].fetch_or(1_u64 << self.id, Ordering::Release);
                     }
                     Err(_) => self.counters.socket_errors += 1,
                 }
             }
         }
-        if self.receive.iter().all(Option::is_some) {
-            self.shared
-                .bound
-                .fetch_or(1_u64 << self.id, Ordering::Release);
-        }
-        for (index, peer) in config.peers.iter().enumerate() {
-            let Some(address) = peer.socket_addr() else {
-                continue;
-            };
+        for index in 0..config.peers.len() {
             let endpoint = self.shared.config.endpoint_for_peer(index).unwrap();
             let Some(receiver) = &self.receive[endpoint] else {
                 continue;
             };
-            for (lane, tx) in self.transmit[index].iter_mut().enumerate() {
-                if lane % self.shared.workers() != self.id || tx.socket.is_some() {
+            let paths = &mut self.transmit[index];
+            for path in &mut paths.paths {
+                let Some(address) = path.address else {
                     continue;
-                }
-                // A dynamic port must differ from every configured fixed port.
-                for _ in 0..16 {
-                    match TransmitSocket::connect(receiver, address) {
-                        Ok(socket) => {
-                            let port = socket.local_addr()?.port();
-                            if config.endpoints.iter().any(|e| e.listen_port == port) {
-                                continue;
+                };
+                for (lane, tx) in path.lanes.iter_mut().enumerate() {
+                    if lane % self.shared.workers() != self.id || tx.socket.is_some() {
+                        continue;
+                    }
+                    // A dynamic port must differ from every configured fixed port.
+                    for _ in 0..16 {
+                        match TransmitSocket::connect(receiver, address) {
+                            Ok(socket) => {
+                                let port = socket.local_addr()?.port();
+                                if config.endpoints.iter().any(|e| e.listen_port == port) {
+                                    continue;
+                                }
+                                tx.socket = Some(socket);
+                                break;
                             }
-                            tx.socket = Some(socket);
-                            break;
-                        }
-                        Err(_) => {
-                            self.counters.socket_errors += 1;
-                            break;
+                            Err(_) => {
+                                self.counters.socket_errors += 1;
+                                break;
+                            }
                         }
                     }
+                }
+            }
+            if let Some(change) = paths.preparing
+                && paths.paths[change.path]
+                    .lanes
+                    .iter()
+                    .enumerate()
+                    .all(|(lane, tx)| {
+                        lane % self.shared.workers() != self.id || tx.socket.is_some()
+                    })
+            {
+                self.shared.address_ready[index * self.shared.workers() + self.id]
+                    .store(change.generation, Ordering::Release);
+                paths.preparing = None;
+                if self.id != 0 {
+                    self.notifications |= 1;
                 }
             }
         }
@@ -754,7 +952,12 @@ impl Worker {
                         }
                     }
                     Event::LaneFree { session, lane } => self.sessions[session].free.push(lane),
-                    Event::Barrier { session, command } => self.command(session, command),
+                    Event::Barrier {
+                        session,
+                        command,
+                        path,
+                    } => self.command(session, command, path),
+                    Event::Address(change) => self.address(change)?,
                     Event::Acknowledge {
                         session,
                         worker,
@@ -871,8 +1074,15 @@ impl Worker {
                 }
                 return Ok(());
             }
-            if !self.controls[session].barrier.is_active() && self.shared.all_bound() {
+            let peer = self.shared.config.peer_for_session(session).unwrap();
+            if !self.controls[session].barrier.is_active() && self.shared.peer_bound(peer) {
                 let record = datagram.records().next().unwrap();
+                if self.peer_controls[peer].change.is_some()
+                    && !active_flight(self.sessions[session].connection, record)
+                {
+                    self.release(buffer);
+                    return Ok(());
+                }
                 if let Ok(mut effects) = self.controls[session].state.on_record(record, now, None) {
                     if effects.needs_tag {
                         effects = self.controls[session]
@@ -1111,7 +1321,8 @@ impl Worker {
                 continue;
             }
             let peer = self.shared.config.peer_for_session(buffer.session).unwrap();
-            let tx = &mut self.transmit[peer][buffer.lane];
+            let path = self.sessions[buffer.session].path;
+            let tx = &mut self.transmit[peer].paths[path].lanes[buffer.lane];
             let Some(socket) = &tx.socket else {
                 self.release(buffer);
                 continue;
@@ -1147,7 +1358,8 @@ impl Worker {
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    let token = TX_TOKEN | ((peer as u64) << 6) | buffer.lane as u64;
+                    let token =
+                        TX_TOKEN | ((peer as u64) << 7) | ((path as u64) << 6) | buffer.lane as u64;
                     self.reactor
                         .add(socket.as_fd(), token, libc::EPOLLOUT as u32)?;
                     tx.blocked = true;
@@ -1244,7 +1456,13 @@ impl Worker {
         record: Record<'static>,
     ) -> io::Result<Option<(u64, u16)>> {
         let peer = self.shared.config.peer_for_session(session).unwrap();
-        let Some(socket) = &self.transmit[peer][0].socket else {
+        let path =
+            if record.is_handshake() && !active_flight(self.sessions[session].connection, record) {
+                self.controls[session].handshake_path
+            } else {
+                self.sessions[session].path
+            };
+        let Some(socket) = &self.transmit[peer].paths[path].lanes[0].socket else {
             return Ok(None);
         };
         let mut bytes = [0; BASE_UDP_PAYLOAD];
@@ -1288,6 +1506,7 @@ impl Worker {
                 .begin(effects.commit)
                 .map_err(|_| io::ErrorKind::Other)?;
             self.controls[session].effects = effects;
+            self.controls[session].install_path = self.controls[session].handshake_path;
         } else {
             self.apply_effects(session, effects, now)?;
         }
@@ -1315,7 +1534,7 @@ impl Worker {
         Ok(())
     }
 
-    fn command(&mut self, session: usize, command: Command) {
+    fn command(&mut self, session: usize, command: Command, path: usize) {
         let local = &mut self.sessions[session];
         if local.installed.is_some_and(|old| {
             old.generation > command.generation
@@ -1339,6 +1558,7 @@ impl Worker {
             Phase::Install => {
                 local.rx_index.fill(0);
                 local.connection = command.connection;
+                local.path = path;
                 let cookie = self.shared.config.config().sessions[session].cookie;
                 for (index, lane) in local.tx.iter_mut().enumerate() {
                     *lane = command
@@ -1367,6 +1587,7 @@ impl Worker {
                 self.controls[session].probe = None;
             }
             Progress::Complete => {
+                self.shared.generations[session].store(command.generation, Ordering::Release);
                 let effects = std::mem::take(&mut self.controls[session].effects);
                 self.apply_effects(session, effects, now)?;
             }
@@ -1401,9 +1622,16 @@ impl Worker {
                 if let Some(command) = self.controls[session].barrier.pending(worker) {
                     if worker == self.id {
                         self.controls[session].barrier.sent(worker, command);
-                        self.command(session, command);
+                        self.command(session, command, self.controls[session].install_path);
                     } else if self
-                        .push(worker, Event::Barrier { session, command })
+                        .push(
+                            worker,
+                            Event::Barrier {
+                                session,
+                                command,
+                                path: self.controls[session].install_path,
+                            },
+                        )
                         .is_ok()
                     {
                         self.controls[session].barrier.sent(worker, command);
@@ -1444,12 +1672,13 @@ impl Worker {
     }
 
     fn timers(&mut self, now: Duration) -> io::Result<()> {
-        if !self.shared.all_bound() {
-            return Ok(());
-        }
         for session in 0..self.controls.len() {
             let peer = self.shared.config.peer_for_session(session).unwrap();
-            if self.transmit[peer][0].socket.is_none() || self.controls[session].barrier.is_active()
+            if !self.shared.peer_bound(peer)
+                || self.transmit[peer].paths[self.controls[session].handshake_path].lanes[0]
+                    .socket
+                    .is_none()
+                || self.controls[session].barrier.is_active()
             {
                 continue;
             }
@@ -1460,7 +1689,7 @@ impl Worker {
                 .max(self.controls[session].retry);
             if now >= due {
                 let mut effects = self.controls[session].state.on_timer(now, None).unwrap();
-                if effects.needs_tag {
+                if effects.needs_tag && self.peer_controls[peer].change.is_none() {
                     let next = self.controls[session]
                         .state
                         .on_timer(now, Tag::generate()?)
@@ -1490,8 +1719,10 @@ impl Worker {
         let mut due = self.setup_due;
         for (index, control) in self.controls.iter().enumerate() {
             let peer = self.shared.config.peer_for_session(index).unwrap();
-            if self.shared.all_bound()
-                && self.transmit[peer][0].socket.is_some()
+            if self.shared.peer_bound(peer)
+                && self.transmit[peer].paths[control.handshake_path].lanes[0]
+                    .socket
+                    .is_some()
                 && !control.barrier.is_active()
             {
                 if let Some(deadline) = control.state.deadline() {
@@ -1513,6 +1744,29 @@ impl Worker {
             due = due.min(frame.deadline);
         }
         Some(due.max(now))
+    }
+}
+
+fn active_flight(connection: Option<Connection>, record: Record<'_>) -> bool {
+    let Some(connection) = connection else {
+        return false;
+    };
+    match record {
+        Record::Hello { initiator, .. } => initiator == connection.initiator.get(),
+        Record::Challenge {
+            initiator,
+            responder,
+            ..
+        }
+        | Record::Confirm {
+            initiator,
+            responder,
+        }
+        | Record::Ready {
+            initiator,
+            responder,
+        } => initiator == connection.initiator.get() && responder == connection.responder.get(),
+        _ => false,
     }
 }
 
@@ -1570,8 +1824,12 @@ mod tests {
             wakes: (0..2).map(|_| Arc::new(Wake::new().unwrap())).collect(),
             owners: vec![(0..65_536).map(|_| AtomicU8::new(0)).collect()],
             status: vec![AtomicU8::new(0)],
+            generations: vec![AtomicU64::new(0)],
             counters: (0..2).map(|_| crate::counters::Counters::new()).collect(),
-            bound: AtomicU64::new(0),
+            bound: vec![AtomicU64::new(0)],
+            requests: std::sync::Mutex::new(crate::spsc::channel().0),
+            address_pending: vec![std::sync::atomic::AtomicBool::new(false)],
+            address_ready: (0..2).map(|_| AtomicU64::new(0)).collect(),
         });
         let mut workers: [Worker; 2] =
             std::array::from_fn(|id| Worker::new(id, Arc::clone(&shared), Control::new()).unwrap());
@@ -1625,7 +1883,7 @@ mod tests {
             connection: Some(connection),
         };
         for worker in &mut workers {
-            worker.command(0, initial);
+            worker.command(0, initial, 0);
             worker.sessions[0].acknowledged = None;
         }
         let mut lane = workers[0].sessions[0].free.pop().unwrap();
@@ -1675,13 +1933,14 @@ mod tests {
                     .number,
                 1
             );
-            worker.command(0, command);
+            worker.command(0, command, 0);
             worker.command(
                 0,
                 Command {
                     phase: Phase::Quiesce,
                     ..command
                 },
+                0,
             );
             assert_eq!(worker.sessions[0].connection, Some(replacement));
             assert_eq!(

@@ -884,3 +884,32 @@ fn deadlines_track_retries_pending_expiry_and_feedback_without_polling() {
     a.on_timer(time(15), tag(7)).unwrap();
     assert_eq!(a.deadline(), Some(time(16)));
 }
+
+#[test]
+fn cancelling_an_old_path_preserves_active_state_and_rejects_its_pending_flights() {
+    let (mut waiting, _) = sessions();
+    waiting.reconnect(time(1), tag(100)).unwrap();
+    waiting.cancel_pending(time(2)).unwrap();
+    assert_eq!(waiting.state(), State::Configured);
+    assert!(!waiting.is_pending());
+    assert_eq!(waiting.deadline(), Some(time(2)));
+    let (mut a, mut b) = sessions();
+    establish(&mut a, &mut b, 10, 1);
+    let active = a.connection().unwrap();
+    let hello = a.reconnect(time(11), tag(10)).unwrap().send.unwrap();
+    let challenge = receive(&mut b, hello, 11, 11).send.unwrap();
+    a.cancel_pending(time(12)).unwrap();
+    assert_eq!(a.connection(), Some(active));
+    assert!(!a.is_pending());
+    assert_eq!(a.deadline(), Some(time(13)));
+    assert!(
+        a.on_record(challenge, time(12), tag(20))
+            .unwrap()
+            .commit
+            .is_none()
+    );
+    assert!(!a.is_pending());
+    let new_hello = a.reconnect(time(12), tag(20)).unwrap().send.unwrap();
+    assert_ne!(encoded(hello), encoded(new_hello));
+    assert_eq!(a.connection(), Some(active));
+}
