@@ -8,7 +8,11 @@ Encryption is deliberately absent. A session UUID is the sole session admission 
 
 This initial design distinguishes **confirmed requirements**, **proposed implementation choices**, and **open decisions**. It is a basis for prototyping and review; the byte-level protocol and performance acceptance profile are not yet frozen.
 
-The project is named UnQuic and is written in pure Rust, built for `*-unknown-linux-musl` targets (see README.md). The library core depends only on `libc`; the transport, congestion controller, and UUID types are implemented in-tree, calling the kernel through `libc` wherever a syscall or socket option is needed. The crate is a library; the daemon binary is built only with the `bin` feature. Optional Cargo features pull in further crates: `dns` for FQDN resolution, `uuid-compat` for conversions to the `uuid` crate, and `bin` for the daemon's config parsing and random cookie generation. `bin` enables `dns`, so the daemon always accepts FQDN hosts. Functions that can be `const fn` should be.
+The project is named UnQuic and is written in pure Rust, built for `*-unknown-linux-musl` targets (see README.md). The library core depends only on `libc`; the transport, congestion controller, and UUID types are implemented in-tree, calling the kernel through `libc` wherever a syscall or socket option is needed. The crate is a library; the daemon binary is built only with the `bin` feature. Optional Cargo features pull in further crates: `dns` for FQDN resolution, `uuid-compat` for conversions to the `uuid` crate, and `bin` for the daemon's config parsing. Random bytes come from Linux's `getrandom(2)` through `libc::getrandom()`, without an additional crate or filesystem access. `bin` enables `dns`, so the daemon always accepts FQDN hosts. Functions that can be `const fn` should be.
+
+**Platform contract:** Linux means the kernel only. Require the kernel APIs, device access, and permissions needed by the transport, and make no assumptions about the surrounding distribution or userspace. Standalone operation must not depend on XDG or other freedesktop.org conventions, GNU userspace, Android or ChromeOS facilities, systemd, or D-Bus. Future optional systemd integration and DEB/RPM packaging are allowed; configuration and startup must also work without them. Do not link against systemd or D-Bus libraries.
+
+**Library I/O boundary:** the library must not access ordinary filesystem files, read environment variables, or use stdio. Access to kernel interfaces, including opening `/dev/net/tun`, sockets, and ioctls, is allowed. The caller or daemon handles configuration files and command-line I/O and supplies explicit configuration to the library.
 
 # 1 Deployment and motivation
 
@@ -112,7 +116,7 @@ Resolve FQDNs to IPv6 addresses outside the packet-processing loop. Select and v
 
 Carry the session UUID as 16 binary bytes in every protocol datagram, including feedback and control. All lanes for the session use the same configured cookie. Reject duplicate local session-cookie configurations and reject unknown cookies before allocating per-packet state or sending a response.
 
-**Proposed generation rule:** require UUIDv4 generated from a cryptographically secure random source. The `unquic gen-uuid` subcommand does this with the `getrandom` crate and is its only user; the daemon never generates a UUID at runtime. UUIDv4 has 122 random bits in a 128-bit field; arbitrary UUID versions do not provide the same unpredictability. Provision the cookie out of band and use a public session label for logs and metrics. The full cookie must not appear in routine diagnostics. [S6]
+**Proposed generation rule:** require UUIDv4 generated from a cryptographically secure random source. The `unquic gen-uuid` subcommand obtains random bytes through `libc::getrandom()` with flags set to zero, handling interrupted calls and short reads and reporting other failures without a weaker fallback. The daemon never generates a session cookie at runtime. UUIDv4 has 122 random bits in a 128-bit field; arbitrary UUID versions do not provide the same unpredictability. Provision the cookie out of band and use a public session label for logs and metrics. The full cookie must not appear in routine diagnostics. [S6]
 
 The cookie checks possession of a shared bearer value. It provides neither confidentiality nor cryptographic payload integrity. An observer who learns it can forge traffic or feedback. This is the deliberately accepted deployment boundary, analogous to the blind-injection protection of an L2TPv3 cookie. [S7]
 
@@ -252,7 +256,9 @@ The following independent configurations should work with existing bridge device
 
 These examples do not imply that all attachments can coexist on the same lower device. Preserve normal Linux stacking constraints. The daemon retains the TAP file descriptors when OVS uses it as a system port. [S16, S17]
 
-Keep TAP names, MAC configuration, and device identity stable across ordinary peer reconnects. Persistent TAP ownership and reattachment across process restart are proposed operational features. Session failure changes carrier according to a defined policy; it does not delete the interface or its VLAN/macvlan children.
+Keep TAP names, MAC configuration, and device identity stable across ordinary peer reconnects. Session failure changes carrier according to a defined policy; it does not delete the interface or its VLAN/macvlan children.
+
+**Future restart support:** retain and hand over TAP queue file descriptors across daemon re-exec so the TAPs and their existing attachments survive. Follow rs-l2tpd's descriptor-preservation approach: it preserves L2TP tunnel sockets, while UnQuic would preserve TAP descriptors. Optional systemd descriptor storage may also retain descriptors across a crash for the next process to adopt. The daemon handles descriptor announcements, environment variables, and re-exec; the library receives explicitly supplied, validated descriptors. Define and version the handover format before implementing adoption. Preserving TAPs does not itself preserve userspace transport state or guarantee uninterrupted forwarding.
 
 # 12 Configuration and operations
 
@@ -288,7 +294,15 @@ Record kernel version, CPU model, active cores and frequency, NIC/driver, queue 
 
 Bound every queue, ACK history, incomplete-frame table, completion cache, and retained transmit-buffer set. Define behavior on allocation pressure, device removal, interface renaming, DNS failure, path change, and daemon restart. Configuration reload must preserve unrelated sessions.
 
-Keep privileges limited to what is needed to create/configure TAPs and bind sockets; allow attaching to appropriately provisioned devices. The exact service-management and privilege model is an implementation decision.
+Keep privileges limited to what is needed to create/configure TAPs and bind sockets; allow attaching to appropriately provisioned devices. The daemon must run directly without a service manager. Future optional systemd integration may implement notification and descriptor-store protocols directly over Unix sockets with descriptor passing, without linking against systemd or D-Bus libraries. Keep this integration in the daemon and preserve the library I/O boundary. DEB/RPM packaging may supply service units and distribution-specific installation hooks; these must not become prerequisites for standalone operation. The exact privilege model is an implementation decision.
+
+## 12.1 Startup readiness and optional systemd unit
+
+Readiness means that all configured TAP interfaces exist, whether newly created or adopted through descriptor handover. Report readiness exactly once after this condition holds. Do not report success while any configured TAP is missing. TAP carrier may remain down; readiness does not require DNS resolution, an underlay address or route, a binding interface or VRF to appear, a peer handshake, or working forwarding. TAP creation and adoption must therefore proceed independently of underlay socket setup and peer establishment. Later session degradation changes carrier and diagnostics, not the completed startup readiness signal.
+
+Follow rs-l2tpd's daemon startup model: double-fork, let the original parent wait for the daemon's readiness report, and exit that parent successfully only after all configured TAPs exist. If startup fails or the daemon dies before readiness, the parent reports failure. Keep process management, PID-file handling, and readiness reporting in the daemon; the library exposes the TAP state needed to determine readiness without using files, environment variables, or stdio for that report.
+
+The future embedded systemd unit and packaged copies must use the same readiness contract and unit template: `Before=network-online.target` in `[Unit]`, `RequiredBy=network-online.target` in `[Install]`, and `Type=forking`, `PIDFile=`, `TimeoutStartSec=infinity`, and `Restart=on-failure` in `[Service]`. Publish the daemon PID file before the parent reports success. Enabling the unit must install the target's requirement on the service. The service must not require, want, or be ordered after `network-online.target` or any wait-online service. This lets the TAPs exist before network configuration needs them and avoids waiting for connectivity that may itself depend on those TAPs. Foreground operation remains available without systemd.
 
 # 13 Performance budget
 
@@ -323,7 +337,7 @@ Functional tests need only what any Linux host or container can provide: a kerne
 
 - **V02 Session correctness:** test valid/unknown cookies, duplicate configuration, malformed records, bad ACK ranges, duplicate and reordered datagrams, late originals after repairs, and no duplicate Ethernet delivery.
 
-- **V03 Lifecycle:** test restart epochs, delayed old packets, lane replacement, loss of all feedback, peer reboot, DNS address changes, and persistent TAP reattachment.
+- **V03 Lifecycle:** test restart epochs, delayed old packets, lane replacement, loss of all feedback, peer reboot, DNS address changes, and persistent TAP reattachment. Verify that startup readiness is withheld while any configured TAP is missing and succeeds once all exist despite unavailable DNS, underlay bindings, routes, or peers. For optional systemd integration, verify that the enabled embedded/packaged unit makes `network-online.target` require and wait for readiness, without a reverse dependency or wait-online dependency.
 
 - **V04 Ethernet composition:** test Linux bridge, OVS system ports, VLAN/QinQ, macvlan, multiple MACs, multicast, broadcast, and non-IP/LLC traffic. Verify frame contents and MTU handling.
 
