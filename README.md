@@ -93,6 +93,11 @@ Fields have explicit units, and a snapshot samples fields independently rather
 than promising a coherent transport-state transaction. Workers will publish
 batch totals; snapshots perform no allocation or locking.
 
+The worker handoff foundation is a fixed 1024-entry SPSC ring with exclusive
+producer/consumer handles and cached cursors. Push/pop use no locks, allocations
+or syscalls. Wraparound, full-ring ownership, destruction and concurrent transfer
+have unit tests and Miri coverage; worker notification is not yet integrated.
+
 The crate does not yet forward frames between peers. Worker ownership,
 batching/offloads, path-MTU probing, recovery, BBRv3, scheduled DNS
 refresh, the daemon and descriptor adoption remain to be implemented.

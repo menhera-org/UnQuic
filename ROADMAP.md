@@ -184,7 +184,12 @@ One struct of `AtomicU64` per session, per peer and per lane, with the names
 section 12 lists. Workers increment with `Relaxed`; the control handle reads
 with `Acquire`. No locks, no strings in the hot path.
 
-### 1e Worker runtime (`src/spsc.rs`, `src/worker.rs`, `src/runtime.rs`)
+### 1e Worker runtime (`src/spsc.rs`, `src/worker.rs`, `src/runtime.rs`) — in progress
+
+The 1024-entry SPSC queue is implemented with cached cursors and fixed storage.
+Tests cover full-ring ownership, cursor wraparound, endpoint destruction and
+one million ordered transfers. Miri also checks the queue with thread preemption.
+Worker loops, ownership tables, commit barriers and runtime integration remain.
 
 Implement the ownership rules of section 10 under "Worker ownership and
 routing (v1)".
@@ -207,8 +212,8 @@ routing (v1)".
   then sockets, then spawns workers, then blocks until `Control::shutdown`.
   `Control` exposes counters, per-session state, carrier state, shutdown and
   a method to supply a new candidate peer address.
-- Data path in this stage: a TAP frame becomes one or two DATA records in
-  separate datagrams of at most 1232 bytes of UDP payload, sent on the lane
+- Data path in this stage: a TAP frame becomes enough DATA records to fit the baseline
+  payload ceiling (up to eight pieces for a 9022-byte frame), in separate datagrams of at most 1232 bytes of UDP payload, sent on the lane
   chosen by the flow key of section 8.3. The receiver assembles by frame ID
   into a per-lane table bounded to 64 incomplete frames and writes complete
   frames to its TAP queue. No ACKs, no repair, no windows yet; that is
@@ -234,8 +239,8 @@ worker's queue.
 - Subcommands: `gen-uuid` prints one UUIDv4 from `UnquicUuid::new_v4` and
   exits; `run <config.toml>` parses TOML with `serde` and `toml` into
   `config::*`, validates, and calls `runtime::run` in the foreground.
-- Resolution: with `iphost`, resolve FQDN peers before `run` and refresh on a
-  helper thread, feeding results through `Control`. The resolver mode is a
+- Resolution: use the iphost layer on a helper thread after TAP readiness,
+  feeding initial addresses and refreshed candidates through `Control`. The resolver mode is a
   config field; never fall back to the system resolver when a bypassing mode
   was selected.
 - Readiness and double-fork from section 12.1 come in stage 4, not here.

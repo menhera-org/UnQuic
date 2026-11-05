@@ -477,8 +477,9 @@ indices. Cookie lookup uses short scans for small sets and randomized hashing
 for larger sets, with an allocation check and repeatable benchmark. The optional
 iphost resolution layer supplies IPv6 candidates above the raw-address core.
 Atomic counters now cover the section 12 totals and gauges with explicit units
-and allocation-free snapshots. Session dispatch and the owned worker runtime
-remain unimplemented. The crate does
+and allocation-free snapshots. The fixed SPSC worker handoff ring has concurrent,
+wraparound, ownership and Miri tests. Session dispatch, barriers and the owned
+worker runtime remain unimplemented. The crate does
 not yet provide end-to-end Ethernet transport, and no performance acceptance
 claim has been made.
 

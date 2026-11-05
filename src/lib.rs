@@ -18,6 +18,7 @@ pub mod handshake;
 pub mod mac;
 mod sha256;
 pub mod socket;
+pub mod spsc;
 mod sys;
 pub mod tap;
 pub mod uuid;
