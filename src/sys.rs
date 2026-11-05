@@ -26,17 +26,20 @@ pub(crate) fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+pub(crate) fn getrandom(bytes: &mut [u8], flags: libc::c_uint) -> io::Result<usize> {
+    // Full LTO can merge libc's getrandom with std's nullable weak symbol.
+    // SAFETY: SYS_getrandom takes a writable buffer, its length and unsigned flags.
+    let count =
+        unsafe { libc::syscall(libc::SYS_getrandom, bytes.as_mut_ptr(), bytes.len(), flags) };
+    if count < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(count as usize)
+    }
+}
+
 pub(crate) fn random_tag() -> io::Result<Option<u128>> {
-    random_tag_with(|bytes| {
-        // SAFETY: bytes is writable for its entire length.
-        let count =
-            unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), libc::GRND_NONBLOCK) };
-        if count < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(count as usize)
-        }
-    })
+    random_tag_with(|bytes| getrandom(bytes, libc::GRND_NONBLOCK))
 }
 
 fn random_tag_with(

@@ -4,8 +4,8 @@
 - 'Encapsulation' instead of 'VPN': people blindly expect a VPN to encrypt, and 'VPN' is a commercially contaminated marketing word.
 - Development language: pure Rust.
 - Dependencies: none except `libc`. Everything else (UUID types, congestion control) is written in-tree. The UUID type is named `UnquicUuid` to avoid collisions with external UUID types. Write C-like Rust, optimized for performance.
-- Dependencies exceptions: feature-gate all the other deps: `dns` pulls `iphost v0.4.4` - otherwise the endpoints are configured manually. `uuid-compat` pulls in `uuid` crate, and the conversions from/into the in-tree UUID types. `bin` pulls in `serde` and `toml`, and enables `dns`. Obtain random bytes through Linux's `getrandom(2)` via `libc::getrandom()`, without an additional crate. The `unquic gen-uuid` subcommand generates session cookies; the daemon never generates a session cookie at runtime.
-- Protocol baseline: automatic handshake role election, random connection receive tags from `libc::getrandom()`, bounded selective repair, and one in-tree BBRv3 controller per direction and path group. No wall-clock epochs or persistent restart counters.
+- Dependencies exceptions: feature-gate all the other deps: `dns` pulls `iphost v0.4.4` - otherwise the endpoints are configured manually. `uuid-compat` pulls in `uuid` crate, and the conversions from/into the in-tree UUID types. `bin` pulls in `serde` and `toml`, and enables `dns`. Obtain random bytes through Linux's `getrandom(2)` via `libc::syscall(SYS_getrandom, ...)`, without an additional crate. The `unquic gen-uuid` subcommand generates session cookies; the daemon never generates a session cookie at runtime.
+- Protocol baseline: automatic handshake role election, random connection receive tags from `libc::syscall(SYS_getrandom, ...)`, bounded selective repair, and one in-tree BBRv3 controller per direction and path group. No wall-clock epochs or persistent restart counters.
 - Crate shape: library only. The daemon binary exists only when the `bin` feature is enabled.
 - Use `libc` for syscalls and socket options where appropriate; use `const fn` wherever a function can be one.
 - Receive admission: bound receive sockets accept packets by cookie, wire validity and protocol state, regardless of source address or port. Peer addresses select transmit destinations only.
@@ -440,7 +440,13 @@ cargo test --target x86_64-unknown-linux-musl
 cargo clippy --target x86_64-unknown-linux-musl --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo test --target x86_64-unknown-linux-musl --features dns
+cargo test --release --all-features --target x86_64-unknown-linux-musl
 ```
+
+The release profile uses full LTO. Randomness goes through the Linux syscall
+directly: an optimized musl build otherwise called a null `getrandom` symbol
+after merging with [std's weak declaration](https://doc.rust-lang.org/src/std/sys/random/linux.rs.html).
+The existing CLI provisioning test covers this failure when run in release mode.
 
 The ignored `linux_foundation`, `linux_runtime`, `cli` and worker polling tests require
 a disposable container with

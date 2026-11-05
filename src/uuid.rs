@@ -35,12 +35,8 @@ impl UnquicUuid {
     /// may retry.
     pub fn new_v4() -> io::Result<Self> {
         let mut bytes = [0; 16];
-        // SAFETY: bytes is writable for exactly the supplied length.
-        let n = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if n as usize != bytes.len() {
+        let n = crate::sys::getrandom(&mut bytes, 0)?;
+        if n != bytes.len() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "getrandom returned fewer bytes than requested",
