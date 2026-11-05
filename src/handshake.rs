@@ -272,6 +272,28 @@ impl Session {
         Ok(effects)
     }
 
+    /// Next time-based transition or initiator retransmission to service.
+    ///
+    /// The owner may wake sooner for received input. If entropy is unavailable,
+    /// it must back off before retrying an immediate deadline.
+    pub fn deadline(&self) -> Option<Duration> {
+        let mut next = self.active.map(|active| {
+            active.feedback + Duration::from_secs(if self.state == State::Active { 3 } else { 30 })
+        });
+        if let Some(pending) = self.pending {
+            let mut due = pending.started + ATTEMPT;
+            if pending.role == Role::Initiator {
+                let retry = pending.last_send.map_or(self.now, |last| last + SECOND);
+                let token = self.now + TOKEN.saturating_sub(self.budget);
+                due = due.min(retry.max(token));
+            }
+            next = Some(next.map_or(due, |current| current.min(due)));
+        } else if self.connecting || self.state != State::Active {
+            next = Some(self.now);
+        }
+        next.map(|due| due.max(self.now))
+    }
+
     /// Records validated fresh feedback for the currently confirmed local tag.
     ///
     /// A stale worker event for a replaced tag has no effect.

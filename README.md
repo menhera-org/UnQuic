@@ -76,8 +76,8 @@ Tags come from nonblocking kernel randomness; tests inject deterministic tags
 and monotonic times. Commit, retirement and carrier changes are returned to the
 caller. The pure two-phase barrier tracks quiescence and installation across up
 to 64 workers. Commands stay pending when queues are full; stale, duplicate and
-unpublished acknowledgments cannot advance it. Actual worker integration and
-network dispatch remain to be implemented.
+unpublished acknowledgments cannot advance it. The runtime applies this barrier
+before changing connection state, carrier or sending the responder's READY.
 Tests cover simultaneous startup, equal tags, each lost flight, stale replay,
 role reversal, either/both endpoint restarts, reply limits and liveness deadlines.
 
@@ -98,14 +98,16 @@ Reproduce the lookup comparison with
 lane owners. Updates use Relaxed ordering; snapshots read with Acquire ordering.
 Fields have explicit units, and a snapshot samples fields independently rather
 than promising a coherent transport-state transaction. Workers will publish
-batch totals; snapshots perform no allocation or locking.
+batch totals; snapshots perform no allocation or locking. The runtime currently
+publishes worker totals. Separate session, peer and lane publication remains open.
 
 The worker handoff foundation is a fixed 1024-entry SPSC ring with exclusive
 producer/consumer handles and cached cursors. Push/pop use no locks, allocations
 or syscalls. Wraparound, full-ring ownership, destruction and concurrent transfer
 have unit tests and Miri coverage. Barrier tests fill command and reply queues
 and check that draining both directions permits replacement to finish without
-losing control messages. Worker notification is not yet integrated.
+losing control messages. Workers now notify destinations through eventfd once per
+handoff batch and keep draining queues while retrying retained control work.
 
 `reassembly::Lane` now reserves a complete datagram before applying its records,
 with 64 fixed frame slots and separate 65536-entry packet and frame windows.
@@ -125,10 +127,67 @@ pieces directly; tests compare its wire bytes with the contiguous encoder.
 Batched socket calls, WouldBlock and invalid/truncated input paths also have
 allocation checks. Multi-record packing is still pending.
 
-The crate does not yet forward frames between peers. Worker ownership,
-worker batch integration, offloads, path-MTU probing, recovery, BBRv3, scheduled DNS
-refresh, the daemon and descriptor adoption remain to be implemented.
-There is no throughput claim for this foundation.
+The runtime now forwards frames between TAPs with configured IPv6 peers.
+The isolated test exercises two workers and four transmit lanes per endpoint,
+automatic role election, bidirectional 60-, 1514-, 1518- and 9022-byte forwarding,
+carrier loss and reconnection after peer restart. The largest frame enters
+through a VLAN upper device, exercising kernel tag materialization. Allocation
+instrumentation observes no allocations or deallocations during these forwarding
+checks. This is correctness coverage, not a throughput measurement.
+
+Address updates, separate session/peer/lane counter publication, aggregate
+receive reservations, multi-record packing, GSO/GRO, recovery, BBRv3, scheduled
+DNS refresh, the daemon and descriptor adoption remain unfinished. No throughput
+target has been demonstrated.
+
+## Runtime lifecycle and ownership
+
+`runtime::run(config, control)` validates configuration and checks reserved
+transport storage against `daemon.memory_limit` before creating TAPs. It blocks
+until shutdown or a fatal worker error. Clone `runtime::Control` before calling
+run on a thread; use `ready()`, `session(index)`, `worker_counters(index)` and
+`shutdown()` from the caller. Indices follow configuration order. A control
+handle is single-use. Shutdown wakes workers, joins them and closes their TAP
+queues before run returns; `stopped()` then becomes true.
+
+Readiness means every configured TAP exists. Administrative state remains the
+network manager's responsibility. Receive bindings and missing transmit sockets
+retry without deleting ready TAPs. In this implementation, peer addresses come
+from the initial configuration; a peer with no address remains waiting because
+the candidate-address control method is not implemented yet.
+
+The worker count is the largest session queue count. Each worker owns one
+reuseport receive socket per endpoint, its assigned TAP queues and transmit
+lanes. The control owner registers remote lanes before admission and publishes
+their owners. Datagrams that arrive on another worker move through SPSC queues
+as owned buffers. Full data queues drop without ACK; buffer returns, barrier
+messages and pending lane retirements remain bounded and retry.
+
+Startup reserves 128 packet/frame buffers per worker and 64 receive-lane tables
+per session. Each lane has 64 frame slots. The memory check includes these
+stores, handoff rings, indices, configuration capacities, thread stacks and an
+allocator allowance. These conservative reservations can reject large
+configurations before startup; shared aggregate receive quotas are still pending.
+
+Transmit DATA uses scatter/gather slices of the original frame buffer.
+Partial sends retain the unsent suffix with its original packet numbers until
+submission, connection retirement or the current 100 ms sender deadline.
+Receive reassembly copies pieces into fixed frame slots and retains complete
+frames through TAP backpressure until delivery or expiry. Workers batch socket
+I/O and notifications, update epoll write interests only when needed, and arm
+absolute monotonic timers. No worker waits for another worker's queue.
+
+## Path MTU status
+
+Path MTU discovery is not implemented. UDP payloads are currently limited to
+1232 bytes, fitting IPv6's 1280-byte minimum MTU; transmit sockets disable outer
+fragmentation. Inner MTU is unchanged, and DATA records carry frame pieces.
+
+The planned per-lane discovery follows RFC 8899: padded PROBE packets test
+larger payloads up to 1452 bytes for a 1500-byte outer MTU, and matching
+PROBE_REPLY records confirm receipt. EMSGSIZE and validated ICMPv6 Packet Too
+Big feedback lower the limit and schedule re-probing. The current runtime uses
+small probes only for liveness; they do not raise the payload limit.
 
 ## Validation
 
@@ -141,7 +200,8 @@ cargo fmt --all -- --check
 cargo test --target x86_64-unknown-linux-musl --features dns
 ```
 
-The ignored `linux_foundation` test requires a disposable container with
+The ignored `linux_foundation`, `linux_runtime` and worker polling tests require
+a disposable container with
 `/dev/net/tun`, `CAP_SYS_ADMIN`, `CAP_NET_ADMIN` and `CAP_NET_RAW`. It creates a
 fresh network and UTS namespaces before creating interfaces or changing the
 hostname. Run the built
@@ -158,6 +218,11 @@ multiqueue frame I/O,
 VLAN/QinQ bytes, carrier transitions and deletion after the last queue closes.
 Maximum-size QinQ is currently checked in the TAP-write direction; testing its
 TAP-read direction through VLAN upper devices belongs to the composition tests.
+Run every ignored test binary, including the library unit-test binary. The
+runtime test also covers shutdown cleanup, forwarding allocation checks, and
+TAP readiness with an unavailable receive address and unresolved peer. A worker
+ownership test fills both handoff rings and checks buffer returns, lane returns,
+commit completion and duplicate-install packet-number preservation.
 Bridge/OVS/VRF matrices, offloads, Linux 5.0 qualification and performance
 acceptance remain open.
 

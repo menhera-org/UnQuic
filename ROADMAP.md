@@ -192,14 +192,20 @@ one million ordered transfers. Miri also checks the queue with thread preemption
 The pure two-phase commit barrier is implemented in src/handshake/barrier.rs.
 Tests cover all 64 workers, stale acknowledgments, retirement, generation
 exhaustion, and full command/reply queues. Worker loops, ownership tables and
-barrier integration remain. The reassembly/window foundation from stage 2 is
+barrier integration now forward frames with initially configured IPv6 peers. The reassembly/window foundation from stage 2 is
 also implemented because step 1e requires permanent duplicate suppression.
 Baseline segmentation and inner-flow selection are implemented in src/pack.rs.
 Tests cover every supported frame length, identity exhaustion, IP fragments,
 IPv6 extension headers and allocation-free operation. Scatter/gather encoding
 borrows original frame bytes, and the socket APIs now batch up to 64 datagrams
 per syscall. Tests cover partial submissions, independent truncation flags and
-allocation-free I/O/error paths; worker integration remains.
+allocation-free I/O/error paths. The runtime now uses those APIs, preallocated
+buffers and retained partial-send suffixes. Its container test covers two workers,
+four TX lanes, both forwarding directions, VLAN materialization at 9022 bytes,
+carrier loss and restart recovery, with allocation/deallocation checks during
+forwarding. Startup checks reserved storage before TAP creation. Candidate
+address updates, separate session/peer/lane counters and broader ownership/
+pressure tests remain before 1e can be called complete.
 
 Implement the ownership rules of section 10 under "Worker ownership and
 routing (v1)".
@@ -266,8 +272,9 @@ at inner MTU 1500, with CPU use reported.
 
 The receive foundation is implemented early for step 1e: fixed frame storage,
 whole-datagram reservation, permanent packet/frame windows, terminal bits,
-100 ms expiry and retained TAP-write entries. Actual worker routing, global
-memory accounting, GSO/GRO and worker batch integration remain. recvmmsg and
+100 ms expiry and retained TAP-write entries. Worker routing, initial memory
+reservation checks and batch integration now exist. Aggregate receive quotas,
+GSO/GRO, multi-record packing and the frame storm/throughput tests remain. recvmmsg and
 scatter/gather sendmmsg are implemented at the baseline payload size; partial
 completion and truncation tests pass. The five frame-model regression cases
 now run against the real implementation in tests/reassembly.rs.
@@ -298,6 +305,9 @@ now run against the real implementation in tests/reassembly.rs.
   `sendmmsg` completion returns the unsent entries, container test extended
   with a 10 s bidirectional frame storm and a check that no frame is
   duplicated or corrupted.
+- If existing generators cannot exercise concurrent sockets and the complete
+  TAP-to-TAP path, write a small Rust traffic generator for those measurements.
+  Keep generator implementation out of the runtime and report its CPU separately.
 - Measure: record frames per second and CPU per core on the container
   loopback in a `BENCH.md` table with kernel version and CPU model. These
   numbers are a baseline until a complete-transport run demonstrates at least

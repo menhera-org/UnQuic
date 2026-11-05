@@ -1,8 +1,8 @@
 //! Linux foundations for UnQuic's unencrypted Ethernet transport.
 //!
 //! This crate provides identity types, the v1 wire codec, a pure handshake state
-//! machine, IPv6 UDP sockets and TAP ownership. Network dispatch and Ethernet
-//! forwarding are not yet implemented.
+//! machine, IPv6 UDP sockets, TAP ownership and a worker runtime for configured
+//! IPv6 peers. Address updates, recovery and congestion control remain unfinished.
 //! Callers supply configuration explicitly; the library reads no configuration
 //! files or environment variables and writes no diagnostic output.
 #![deny(missing_docs)]
@@ -18,6 +18,7 @@ pub mod handshake;
 pub mod mac;
 pub mod pack;
 pub mod reassembly;
+pub mod runtime;
 mod sha256;
 pub mod socket;
 pub mod spsc;
@@ -25,6 +26,7 @@ mod sys;
 pub mod tap;
 pub mod uuid;
 pub mod wire;
+mod worker;
 
 pub use mac::MacAddress;
 pub use uuid::UnquicUuid;

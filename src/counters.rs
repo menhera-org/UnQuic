@@ -72,6 +72,11 @@ macro_rules! metrics {
             /// Creates a zeroed set without allocation.
             pub const fn new() -> Self { Self { $($name: Counter::new(),)+ } }
 
+            /// Publishes cumulative totals from this set's exclusive worker owner.
+            pub(crate) fn publish(&self, values: &Snapshot) {
+                $(self.$name.set(values.$name);)+
+            }
+
             /// Reads all fields without locking or allocating.
             pub fn snapshot(&self) -> Snapshot { Snapshot { $($name: self.$name.get(),)+ } }
         }

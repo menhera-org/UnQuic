@@ -1,0 +1,221 @@
+//! End-to-end worker tests; never change the host network namespace.
+mod common;
+use common::*;
+use std::{
+    io,
+    net::{Ipv6Addr, UdpSocket},
+    os::fd::AsRawFd,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+use unquic::{
+    config::{Config, Daemon, Endpoint, Peer, Session},
+    runtime::{self, Control},
+};
+
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+struct Allocator;
+static COUNTING: AtomicBool = AtomicBool::new(false);
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static DEALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+#[global_allocator]
+static ALLOCATOR: Allocator = Allocator;
+// SAFETY: every operation forwards the unchanged allocation contract to System.
+unsafe impl GlobalAlloc for Allocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if COUNTING.load(Ordering::Relaxed) {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: layout and returned ownership are forwarded unchanged.
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        if COUNTING.load(Ordering::Relaxed) {
+            DEALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: pointer and layout describe the caller's live System allocation.
+        unsafe { System.dealloc(pointer, layout) }
+    }
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        if COUNTING.load(Ordering::Relaxed) {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: pointer, layout and new size are forwarded unchanged.
+        unsafe { System.realloc(pointer, layout, size) }
+    }
+}
+
+fn config(name: &str, port: u16, remote: u16) -> Config {
+    Config {
+        daemon: Daemon::default(),
+        endpoints: vec![Endpoint {
+            name: "rx".into(),
+            listen_address: Ipv6Addr::LOCALHOST,
+            listen_port: port,
+            scope_id: 0,
+            bind_device: None,
+        }],
+        peers: vec![Peer {
+            name: "peer".into(),
+            endpoint: "rx".into(),
+            address: Some(Ipv6Addr::LOCALHOST),
+            peer_port: remote,
+            scope_id: 0,
+            tx_lanes: 4,
+            path_group: None,
+        }],
+        sessions: vec![Session {
+            name: name.into(),
+            peer: "peer".into(),
+            cookie: "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap(),
+            tap_name: None,
+            inner_mtu: 9000,
+            mac: None,
+            queue_count: 2,
+        }],
+    }
+}
+
+struct Running {
+    control: Control,
+    thread: Option<JoinHandle<io::Result<()>>>,
+}
+impl Running {
+    fn start(config: Config) -> Self {
+        let control = Control::new();
+        let worker_control = control.clone();
+        let thread = Some(thread::spawn(move || runtime::run(config, worker_control)));
+        Self { control, thread }
+    }
+    fn stop(&mut self) {
+        self.control.shutdown();
+        self.thread.take().unwrap().join().unwrap().unwrap();
+        assert!(self.control.stopped());
+        assert!(!self.control.ready());
+    }
+}
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.control.shutdown();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn until(timeout: Duration, mut predicate: impl FnMut() -> bool) {
+    let end = Instant::now() + timeout;
+    while !predicate() {
+        assert!(Instant::now() < end, "runtime test timed out");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+#[ignore = "requires disposable container with tun and network namespace capabilities"]
+fn workers_forward_both_directions_and_reconnect_after_restart() {
+    // SAFETY: this test thread and its subsequently spawned workers use a fresh namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let net = UdpSocket::bind("[::]:0").unwrap();
+    up(&net, c"lo");
+    let mut left = Running::start(config("uq-left", 40100, 40101));
+    let mut right = Running::start(config("uq-right", 40101, 40100));
+    until(Duration::from_secs(5), || {
+        left.control.ready() && right.control.ready()
+    });
+    assert_eq!(flags(&net, c"uq-left") & libc::IFF_UP as i16, 0);
+    assert_eq!(flags(&net, c"uq-right") & libc::IFF_UP as i16, 0);
+    up(&net, c"uq-left");
+    up(&net, c"uq-right");
+    until(Duration::from_secs(5), || {
+        left.control.session(0).unwrap().carrier && right.control.session(0).unwrap().carrier
+    });
+    let a = raw_socket(c"uq-left", libc::ETH_P_ALL as u16);
+    let b = raw_socket(c"uq-right", libc::ETH_P_ALL as u16);
+    for fd in [&a, &b] {
+        let enabled = 1_i32;
+        // SAFETY: enabled is readable for the supplied option length.
+        check(unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_PACKET,
+                libc::PACKET_AUXDATA,
+                (&enabled as *const i32).cast(),
+                size_of_val(&enabled) as _,
+            )
+        });
+    }
+    add_vlan(&net, c"uq-left", 7);
+    add_vlan(&net, c"uq-right", 7);
+    up(&net, c"uq-left.7");
+    up(&net, c"uq-right.7");
+    let a_vlan = raw_socket(c"uq-left.7", libc::ETH_P_ALL as u16);
+    let b_vlan = raw_socket(c"uq-right.7", libc::ETH_P_ALL as u16);
+    let mut capture = [0; 10_000];
+    for length in [60, 1514, 1518, 9022] {
+        let mut frame = vec![0x5a; length];
+        frame[..6].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
+        frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
+        frame[12..14].copy_from_slice(&0x88b5_u16.to_be_bytes());
+        if length == 1518 {
+            frame[12..18].copy_from_slice(&[0x81, 0, 0, 7, 0x88, 0xb5]);
+        }
+        if length == 9022 {
+            frame[12..22].copy_from_slice(&[0x81, 0, 0, 7, 0x81, 0, 0, 8, 0x88, 0xb5]);
+        }
+        let outgoing = if length == 9022 {
+            [&frame[..12], &frame[16..]].concat()
+        } else {
+            frame.clone()
+        };
+        let sources = if length == 9022 {
+            [&a_vlan, &b_vlan]
+        } else {
+            [&a, &b]
+        };
+        ALLOCATIONS.store(0, Ordering::Relaxed);
+        DEALLOCATIONS.store(0, Ordering::Relaxed);
+        COUNTING.store(true, Ordering::SeqCst);
+        for (source, target) in [(sources[0], &b), (sources[1], &a)] {
+            while capture_frame(target, &mut capture).is_some() {}
+            raw_send(source, &outgoing);
+            until(Duration::from_secs(2), || {
+                let Some(n) = capture_frame(target, &mut capture) else {
+                    return false;
+                };
+                capture[..n] == frame
+            });
+        }
+        COUNTING.store(false, Ordering::SeqCst);
+        assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+        assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
+    }
+    right.stop();
+    until(Duration::from_secs(32), || {
+        !left.control.session(0).unwrap().carrier
+    });
+    let mut replacement = Running::start(config("uq-right", 40101, 40100));
+    until(Duration::from_secs(5), || replacement.control.ready());
+    up(&net, c"uq-right");
+    until(Duration::from_secs(5), || {
+        left.control.session(0).unwrap().carrier && replacement.control.session(0).unwrap().carrier
+    });
+    replacement.stop();
+    left.stop();
+
+    let mut unavailable = config("uq-wait", 40110, 40111);
+    unavailable.endpoints[0].listen_address = "fd00::1".parse().unwrap();
+    unavailable.peers[0].address = None;
+    let mut waiting = Running::start(unavailable);
+    until(Duration::from_secs(5), || waiting.control.ready());
+    until(Duration::from_secs(2), || {
+        waiting.control.worker_counters(0).unwrap().socket_errors != 0
+    });
+    assert!(waiting.control.ready());
+    assert!(!waiting.control.session(0).unwrap().carrier);
+    assert_eq!(flags(&net, c"uq-wait") & libc::IFF_UP as i16, 0);
+    waiting.stop();
+}

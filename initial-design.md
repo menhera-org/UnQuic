@@ -475,7 +475,7 @@ types, loopback socket invariants and live TAP behavior in an isolated network
 namespace; see README.md for commands and coverage limits. The pure handshake
 state machine implements automatic role election, bounded retries, negotiated
 parameters, replacement and liveness transitions using supplied monotonic times.
-Commit and carrier events still require runtime integration. Configuration
+The runtime now applies commit and carrier events through the worker barrier. Configuration
 validation now freezes named endpoint/peer/session relationships into numeric
 indices. Cookie lookup uses short scans for small sets and randomized hashing
 for larger sets, with an allocation check and repeatable benchmark. The optional
@@ -490,10 +490,17 @@ replace the frame model, including pressure, repair and allocation checks.
 Baseline segmentation and inner-flow selection now cover the full frame-size
 range, VLANs and IPv4/IPv6 fragments, with allocation and exhaustion tests.
 Batched socket APIs use recvmmsg and scatter/gather sendmmsg, with original
-frame slices, partial-completion tests and allocation checks. Session dispatch
-and the owned worker runtime remain unimplemented. The crate does
-not yet provide end-to-end Ethernet transport, and no performance acceptance
-claim has been made.
+frame slices, partial-completion tests and allocation checks. The owned worker
+runtime now forwards frames between TAPs for initially configured IPv6 peers.
+Its container test covers two workers/four transmit lanes per endpoint,
+bidirectional 60/1514/1518/9022-byte frames, kernel VLAN tag materialization,
+carrier loss and reconnection after restart. Forwarding checks observe no
+allocations or deallocations. Readiness, buffer ownership, memory reservations
+and remaining runtime gaps are documented in README.md. Candidate-address
+updates, per-session/peer/lane counter publication, aggregate receive quotas,
+offloads, recovery and congestion control remain unfinished. Current liveness
+probes do not discover MTU: the UDP limit remains 1232 bytes until stage 3.
+No performance acceptance claim has been made.
 
 1. **Socket and device foundation.** Implement fixed receive-only sockets, dynamic transmit pools, IPv6/interface/VRF binding, UUID lookup, TAP ownership, and counters. Validate R01–R10 and the port invariants.
 

@@ -47,10 +47,7 @@ fn random_tag_with(
     while filled < bytes.len() {
         match read(&mut bytes[filled..]) {
             Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "getrandom returned no bytes",
-                ));
+                return Err(io::ErrorKind::UnexpectedEof.into());
             }
             Ok(count) => filled += count,
             Err(error) => match error.kind() {

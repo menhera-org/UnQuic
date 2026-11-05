@@ -861,3 +861,26 @@ fn batched_socket_io_and_rejection_paths_allocate_nothing() {
     let allocations = ALLOCATION_COUNT.replace(None);
     assert_eq!(allocations, Some(0));
 }
+
+#[test]
+fn deadlines_track_retries_pending_expiry_and_feedback_without_polling() {
+    let (mut a, mut b) = sessions();
+    assert_eq!(a.deadline(), Some(Duration::ZERO));
+    let hello = a.on_timer(time(10), tag(1)).unwrap().send.unwrap();
+    assert_eq!(a.deadline(), Some(time(11)));
+    let challenge = receive(&mut b, hello, 10, 2).send.unwrap();
+    assert_eq!(b.deadline(), Some(time(20)));
+    let confirm = receive(&mut a, challenge, 10, 3).send.unwrap();
+    assert_eq!(a.deadline(), Some(time(11)));
+    let ready = receive(&mut b, confirm, 10, 4).send.unwrap();
+    receive(&mut a, ready, 10, 5);
+    assert_eq!(a.deadline(), Some(time(13)));
+    a.on_feedback(a.connection().unwrap().local_tag(), time(12))
+        .unwrap();
+    assert_eq!(a.deadline(), Some(time(15)));
+    a.on_timer(time(15), None).unwrap();
+    assert_eq!(a.state(), State::Degraded);
+    assert_eq!(a.deadline(), Some(time(15))); // Owner must retry entropy with backoff.
+    a.on_timer(time(15), tag(7)).unwrap();
+    assert_eq!(a.deadline(), Some(time(16)));
+}
