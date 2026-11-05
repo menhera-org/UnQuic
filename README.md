@@ -230,8 +230,10 @@ state before confirmation.
 The worker count is the largest session queue count. Each worker owns one
 reuseport receive socket per endpoint, its assigned TAP queues and transmit
 lanes. The control owner registers remote lanes before admission and publishes
-their owners. Datagrams that arrive on another worker move through SPSC queues
-as owned buffers. Full data queues drop without ACK; buffer returns, barrier
+their owners. It distributes consecutive lane IDs across the session's workers,
+with a session-index offset, so a reuseport hash collision does not pin several
+lanes' reassembly and TAP writes to one worker. Datagrams that arrive on another
+worker move through SPSC queues as owned buffers. Full data queues drop without ACK; buffer returns, barrier
 messages and pending lane retirements remain bounded and retry.
 
 Startup reserves 128 packet/frame buffers per worker, each with 64 KiB of
@@ -261,8 +263,10 @@ IDs and submitted offsets and are repacked with fresh packet numbers. Connection
 retirement discards every queued batch before the worker acknowledges quiescence.
 Receive reassembly copies pieces into 64 fixed frame slots per lane and retains
 complete frames through TAP backpressure until delivery or the original 100 ms
-expiry. Receive work yields after 64 logical datagrams, 128 records or 64 KiB of
-UDP payload, counting GRO-expanded segments and handoffs. A final datagram is
+expiry. Receive work yields after 64 logical datagrams, 64 records or 64 KiB of
+UDP payload, counting GRO-expanded segments and handoffs. The record bound
+matches the 64-frame TAP-read batch so small-frame receive bursts cannot take
+twice the work allowance of the reverse direction. A final datagram is
 indivisible and may exceed the record/byte target; malformed record areas are
 charged the maximum 64 records. Unprocessed GRO bytes stay in their original
 pooled buffer. The bounded pending queue stores only buffer ownership and counts

@@ -289,7 +289,9 @@ local acceptance requires at least 20 Gbit/s in each direction simultaneously
 at inner MTU 1500, with CPU use reported.
 
 Receive processing now budgets expanded datagrams/records/bytes and interleaves
-TAP delivery. Existing-frame tails can progress under pressure without ACKing
+TAP delivery. The record budget matches the TAP-read batch for small-frame
+bidirectional fairness. Lane IDs determine receive ownership independently of
+reuseport collisions, so consecutive lanes spread across workers. Existing-frame tails can progress under pressure without ACKing
 unretained new pieces. Regression tests cover over-capacity bursts, GRO budgets,
 TAP WouldBlock and packed tails/heads; admission, queue, expiry and socket drops
 have separate counters. Release rate sweeps and residual overload analysis are

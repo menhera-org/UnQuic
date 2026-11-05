@@ -120,6 +120,7 @@ impl Drop for Running {
     }
 }
 
+#[track_caller]
 fn until(timeout: Duration, mut predicate: impl FnMut() -> bool) {
     let end = Instant::now() + timeout;
     while !predicate() {
@@ -363,6 +364,10 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
         assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
     }
     frame_storm();
+    // The earlier capture sockets also accumulated storm traffic; free space before reuse.
+    for socket in [&a, &b] {
+        while capture_frame(socket, &mut capture).is_some() {}
+    }
     for (left_name, right_name) in [(c"uq-left-b", c"uq-right-b"), (c"uq-left-c", c"uq-right-c")] {
         let source = raw_socket(left_name, 0x88b5);
         let target = raw_socket(right_name, 0x88b5);

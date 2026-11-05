@@ -283,7 +283,7 @@ struct ReceiveBudget {
 
 impl ReceiveBudget {
     fn exhausted(&self) -> bool {
-        self.datagrams >= 64 || self.records >= 128 || self.bytes >= 64 * 1024
+        self.datagrams >= BATCH_SIZE || self.records >= BATCH_SIZE || self.bytes >= 64 * 1024
     }
 }
 // Receive quotas follow from fixed lane/slot counts, without shared reservations.
@@ -1457,7 +1457,8 @@ impl Worker {
                 self.sessions[session].connection.unwrap().max_frame_len,
             )
             .unwrap();
-            let owner = buffer.origin % self.shared.config.config().sessions[session].queue_count;
+            let owner = (usize::from(header.lane - 1) + session)
+                % self.shared.config.config().sessions[session].queue_count;
             // Publication may precede installation; an early packet is dropped without ACK.
             self.shared.owners[session][lane_id].store(owner as u8 + 1, Ordering::Release);
             if owner != self.id {
@@ -2470,6 +2471,74 @@ mod tests {
 
     #[test]
     #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn colliding_receive_flows_register_on_distinct_owners() {
+        let (first, _tap) = receive_worker();
+        let mut second = Worker::new(1, Arc::clone(&first.shared), Control::new()).unwrap();
+        second.command(
+            0,
+            Command {
+                generation: 1,
+                phase: Phase::Install,
+                connection: first.sessions[0].connection,
+            },
+            0,
+        );
+        let mut workers = [first, second];
+        for from in 0..2 {
+            let (tx, rx) = crate::spsc::channel();
+            workers[from].outgoing[1 - from] = Some(tx);
+            workers[1 - from].incoming[from] = Some(rx);
+        }
+        // Both new lanes arrive on the same socket owner, as with reuseport collisions.
+        for lane in [8_u16, 9] {
+            let mut buffer = workers[0].free.pop().unwrap();
+            buffer.length = wire::encode_datagram(
+                Header {
+                    cookie: crate::UnquicUuid::from_bytes([1; 16]),
+                    receive_tag: 1,
+                    lane,
+                    packet_number: 1,
+                    record_area_len: 0,
+                },
+                &[Record::Data {
+                    frame_id: (u64::from(lane) << 48) | 1,
+                    total_len: 60,
+                    offset: 0,
+                    bytes: &[5; 30],
+                }],
+                &mut buffer.bytes,
+            )
+            .unwrap();
+            workers[0].received.push_back(buffer);
+        }
+        for _ in 0..4 {
+            for worker in &mut workers {
+                worker.drain_queues(Duration::ZERO).unwrap();
+                worker.drain_packets(Duration::ZERO).unwrap();
+                worker.flush_returns();
+            }
+        }
+        for (lane, owner) in [(8, 1), (9, 0)] {
+            assert_eq!(
+                workers[0].shared.owners[0][lane].load(Ordering::Acquire),
+                owner as u8 + 1
+            );
+            let slot = workers[owner].sessions[0].rx_index[lane];
+            assert_ne!(slot, 0);
+            assert_eq!(
+                workers[owner].sessions[0].rx[usize::from(slot - 1)]
+                    .as_ref()
+                    .unwrap()
+                    .retained_frames(),
+                1
+            );
+        }
+        assert_eq!(workers[0].free.len(), BUFFERS);
+        assert_eq!(workers[1].free.len(), BUFFERS);
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
     fn receive_and_transmit_cannot_exhaust_each_others_buffers() {
         let (mut worker, tap) = receive_worker();
         worker.sessions[0].tx.truncate(1);
@@ -2540,7 +2609,7 @@ mod tests {
             }
             assert!(worker.drain_packets(Duration::ZERO).unwrap());
             let first_bytes = worker.counters.delivered_frame_bytes;
-            assert_eq!(first_bytes, if records == 1 { 64 * 60 } else { 128 * 60 });
+            assert_eq!(first_bytes, 64 * 60);
             // Remaining work must yield to the caller, even inside one aggregate.
             assert!(!worker.received.is_empty());
             let mut delivered = 0;
