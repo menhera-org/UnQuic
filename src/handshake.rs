@@ -1,6 +1,7 @@
 //! Four-message handshake, driven by monotonic elapsed time and supplied tags.
 //!
-//! Validate the datagram, cookie, peer address and binding scope before dispatch.
+//! Validate the datagram and cookie on the bound receive socket before dispatch.
+//! Sender addresses and ports do not participate in protocol admission.
 //! Apply commit/retirement effects through the worker barrier before using a new
 //! connection. This module owns no sockets, TAPs, clocks or congestion state.
 
@@ -286,7 +287,7 @@ impl Session {
 
     /// Handles one decoded handshake record. Unexpected identities are ignored.
     ///
-    /// The caller must first validate the complete datagram and configured peer.
+    /// The caller must first validate the complete datagram and session cookie.
     /// A missing fresh tag leaves HELLO unaccepted; retry with a tag or let the
     /// peer retransmit. Errors never install or remove a confirmed connection.
     pub fn on_record(
@@ -295,7 +296,7 @@ impl Session {
         now: Duration,
         fresh: Option<Tag>,
     ) -> Result<Effects, HandshakeError> {
-        if !record.is_handshake() || record.encode(&mut [0; 48]).is_err() {
+        if !record.is_handshake() || record.validate().is_err() {
             return Err(HandshakeError::Record);
         }
         self.advance(now)?;

@@ -5,4 +5,12 @@ edition = "2024"
 rust-version = "1.89"
 
 [dependencies]
+iphost = { version = "=0.4.4", default-features = false, features = ["ra", "dhcpv6"], optional = true }
 libc = "0.2.191"
+
+[features]
+dns = ["dep:iphost"]
+
+[[bench]]
+name = "cookie_lookup"
+harness = false

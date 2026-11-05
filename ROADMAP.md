@@ -18,6 +18,12 @@ section 15 of the design and the "Implementation status" section of
   `epoll`, `getrandom`) are fine.
 - No async runtime, no wall-clock values on the wire, no host-specific facts in
   the repository.
+- No locks or allocations on hot paths. Protocol transitions take supplied
+  monotonic time and make no syscalls. Batch socket I/O, queue notifications
+  and timer updates; measure before claiming a performance improvement.
+- Receive admission checks cookies, wire validity and protocol state on the
+  bound socket, regardless of sender address or port. Transmit destinations
+  come only from configuration or the optional resolution layer.
 - Integers on the wire are big-endian and encoded explicitly. Never cast a
   struct to bytes.
 - A new branch, parser, state machine or table gets a unit test that fails
@@ -109,7 +115,7 @@ record type and every rejection rule has a failing input.
 ### 1b Handshake (`src/handshake.rs`) — complete
 
 Implemented with automatic tag election, nonblocking tag generation, pure
-liveness transitions and 16 protocol regression tests in `tests/handshake.rs`.
+liveness transitions and protocol regression tests in `tests/handshake.rs`.
 The four handshake model tests now exercise real types. The five frame-window
 model tests remain in `tests/frame_model.rs` until stage 2 replaces them.
 Musl tests, Clippy, formatting and the isolated foundation kernel test pass.
@@ -145,19 +151,27 @@ Implement sections 5.1 and 5.2 as a pure state machine with no I/O.
 Done when every handshake model case passes against real types, the old mixed
 model file is gone, and the frame tests remain available for stage 2.
 
-### 1c Configuration types (`src/config.rs`)
+### 1c Configuration types (`src/config.rs`) — complete
+
+Implemented raw IPv6 configuration with immutable numeric references and
+one-to-many endpoint/peer/session relationships. The optional `dns` layer uses
+iphost 0.4.4 directly. Default and DNS-enabled tests, Clippy, formatting, aarch64
+checking and the isolated foundation kernel tests pass. Cookie lookup has a
+repeatable benchmark; lookup and handshake transitions have allocation checks.
 
 Plain structs the daemon fills from TOML and a library user fills by hand:
 `Daemon` (memory ceiling), named `Endpoint` (listen address, listen port,
-optional bind device), `Peer` (name, endpoint name, IPv6 host or FQDN,
-peer port, lane count, path group), `Session` (name, peer, cookie,
+optional bind device), `Peer` (name, endpoint name, optional raw IPv6 address,
+peer port, numeric scope ID, lane count, path group), `Session` (name, peer, cookie,
 TAP name defaulting to session name, inner MTU, optional MAC, queue count).
 Roles are elected and have no configuration field. Follow
 [config-model.md](config-model.md). `validate()` returns the first error:
 duplicate names or cookies via `CookieIndex`, unknown endpoint or peer names,
 MTU out of range, port zero.
-Hosts given as FQDN are allowed only with the `dns` feature; without it the
-validator rejects them. No file or environment access here.
+The core accepts raw IPv6 addresses only; None leaves a peer waiting for an
+address without delaying TAP readiness. The optional `dns` layer uses
+`iphost v0.4.4` types and resolution to supply IPv6 candidates. It stays outside
+the core validator and packet workers. No file or environment access here.
 
 ### 1d Counters (`src/counters.rs`)
 
@@ -208,8 +222,10 @@ worker's queue.
 
 ### 1f Daemon (`src/bin/unquic.rs`, feature `bin`)
 
-- Add the `dns`, `uuid-compat` and `bin` features to `Cargo.toml` as the
+- Extend the existing `dns` feature with `uuid-compat` and `bin` as the
   README lists, with `bin` enabling `dns`, and `[[bin]]` gated on `bin`.
+  The core keeps raw IPv6 addresses; daemon TOML hosts use iphost types and
+  the optional resolution layer feeds candidates into the core.
 - Subcommands: `gen-uuid` prints one UUIDv4 from `UnquicUuid::new_v4` and
   exits; `run <config.toml>` parses TOML with `serde` and `toml` into
   `config::*`, validates, and calls `runtime::run` in the foreground.

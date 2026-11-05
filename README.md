@@ -8,6 +8,8 @@
 - Protocol baseline: automatic handshake role election, random connection receive tags from `libc::getrandom()`, bounded selective repair, and one in-tree BBRv3 controller per direction and path group. No wall-clock epochs or persistent restart counters.
 - Crate shape: library only. The daemon binary exists only when the `bin` feature is enabled.
 - Use `libc` for syscalls and socket options where appropriate; use `const fn` wherever a function can be one.
+- Receive admission: bound receive sockets accept packets by cookie, wire validity and protocol state, regardless of source address or port. Peer addresses select transmit destinations only.
+- Performance contract: no locks or allocations in hot paths. State transitions make no syscalls; workers batch I/O, notifications and timer updates. Performance claims require measurements.
 - No async runtime: plain pinned threads with batched syscalls. `tokio` gives one syscall per packet, no GSO/GRO, cross-core task migration, and 1 ms timers, all wrong for a few always-busy sockets. See section 10 of the design.
 - Platform contract: assume the Linux kernel and only the interfaces, files, and permissions needed by the selected features, such as `/dev/net/tun` for TAP creation and `/etc/resolv.conf` when using `iphost`'s system resolver. Its configurable `ipv6`, `ra`, and `dhcpv6` modes bypass system resolvers. Document each additional host assumption with the feature that needs it. Make no assumptions about the surrounding userspace: no required XDG or other freedesktop.org conventions, GNU userspace, Android or ChromeOS facilities, systemd, or D-Bus dependencies. Binaries are built for `*-unknown-linux-musl` targets.
 - Library I/O: no ordinary filesystem access except `/etc/resolv.conf` through `iphost` when its system resolver is selected; no environment-variable reads or stdio. Kernel interfaces such as `/dev/net/tun`, sockets, and ioctls are allowed. Application configuration-file handling and command-line I/O belong to the caller or daemon.
@@ -21,7 +23,9 @@
 The first foundation provides `UnquicUuid` parsing and UUIDv4 provisioning,
 duplicate-checked cookie lookup, checked `MacAddress` values, IPv6 receive and
 transmit sockets, and nonpersistent multiqueue TAP ownership. Frame I/O and
-cookie lookup allocate no memory. The only dependency remains `libc`.
+cookie lookup allocate no memory. The default build depends only on `libc`;
+`dns` enables exactly `iphost v0.4.4`, without its default Tokio, tracing or serde
+features. Its direct, RA and DHCPv6 resolver modes are available.
 
 Receive sockets use fixed nonzero ports and expose no send method. Transmit
 sockets inherit their receiver's binding scope, use stable dynamic ports, and
@@ -70,9 +74,22 @@ caller. The worker barrier and actual network dispatch remain to be implemented.
 Tests cover simultaneous startup, equal tags, each lost flight, stale replay,
 role reversal, either/both endpoint restarts, reply limits and liveness deadlines.
 
-The crate does not yet forward frames between peers. Configuration validation,
-worker ownership, counters, batching/offloads, path-MTU probing, recovery,
-BBRv3, DNS, the daemon and descriptor adoption remain to be implemented.
+`config::Config::validate` checks names, references, ports, addresses/scopes,
+MTUs, queue/lane counts, TAP names and cookie uniqueness. It returns an immutable
+configuration with numeric endpoint/peer/session indices. One endpoint serves
+many peers; one peer serves many sessions. Core peers hold raw IPv6 addresses
+or await a supplied address. The optional `dns` layer exposes iphost's types and a blocking resolver for
+helper threads; it returns IPv6 candidates without changing the active
+transport destination itself.
+
+Cookie dispatch uses a short scan through 16 sessions and a randomized hash
+table above that. Allocation-counting tests cover lookup and handshake paths.
+Reproduce the lookup comparison with
+`cargo bench --target x86_64-unknown-linux-musl --bench cookie_lookup`.
+
+The crate does not yet forward frames between peers. Worker ownership,
+counters, batching/offloads, path-MTU probing, recovery, BBRv3, scheduled DNS
+refresh, the daemon and descriptor adoption remain to be implemented.
 There is no throughput claim for this foundation.
 
 ## Validation
@@ -83,6 +100,7 @@ Run the ordinary tests and lint checks with a Linux musl target:
 cargo test --target x86_64-unknown-linux-musl
 cargo clippy --target x86_64-unknown-linux-musl --all-targets -- -D warnings
 cargo fmt --all -- --check
+cargo test --target x86_64-unknown-linux-musl --features dns
 ```
 
 The ignored `linux_foundation` test requires a disposable container with

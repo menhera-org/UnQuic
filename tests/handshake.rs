@@ -633,3 +633,74 @@ fn equal_tag_without_entropy_defers_and_does_not_reuse_the_collision() {
         Some(Record::Hello { initiator: 2, .. })
     ));
 }
+
+thread_local! {
+    static ALLOCATION_COUNT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+struct CountingAllocator;
+
+// SAFETY: allocation and deallocation use the same System allocator unchanged.
+unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let _ = ALLOCATION_COUNT.try_with(|count| {
+            if let Some(value) = count.get() {
+                count.set(Some(value + 1));
+            }
+        });
+        // SAFETY: forward the caller's valid layout to System.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: pointer and layout came from the same System allocator.
+        unsafe { std::alloc::System.dealloc(pointer, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+#[test]
+fn state_transitions_allocate_nothing() {
+    let (mut a, mut b) = sessions();
+    ALLOCATION_COUNT.set(Some(0));
+    // Check that this thread's counter observes allocations.
+    drop(std::hint::black_box(Box::new(1_u64)));
+    let observed = ALLOCATION_COUNT.replace(Some(0));
+    for round in 0..100 {
+        let now = round * 2;
+        establish(&mut a, &mut b, now, 10 + round as u128 * 10);
+        a.on_feedback(a.connection().unwrap().local_tag(), time(now + 1))
+            .unwrap();
+        b.on_feedback(b.connection().unwrap().local_tag(), time(now + 1))
+            .unwrap();
+        a.on_timer(time(now + 1), None).unwrap();
+        b.on_timer(time(now + 1), None).unwrap();
+    }
+    a.on_timer(time(240), tag(10000)).unwrap();
+    let count = ALLOCATION_COUNT.replace(None);
+    assert_eq!(observed, Some(1));
+    assert_eq!(count, Some(0));
+}
+
+#[test]
+fn cookie_lookups_allocate_nothing_in_both_storage_modes() {
+    use unquic::{UnquicUuid, uuid::CookieIndex};
+    for count in [4, 1024] {
+        let keys: Vec<_> = (0..count)
+            .map(|i: u128| UnquicUuid::from_bytes(i.to_be_bytes()))
+            .collect();
+        let index = CookieIndex::new(keys.iter().copied()).unwrap();
+        ALLOCATION_COUNT.set(Some(0));
+        for (expected, cookie) in keys.into_iter().enumerate() {
+            assert_eq!(std::hint::black_box(index.find(cookie)), Some(expected));
+            assert_eq!(
+                index.find(UnquicUuid::from_bytes(u128::MAX.to_be_bytes())),
+                None
+            );
+        }
+        let allocations = ALLOCATION_COUNT.replace(None);
+        assert_eq!(allocations, Some(0));
+    }
+}

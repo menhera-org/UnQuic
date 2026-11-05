@@ -10,6 +10,9 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("UnQuic requires the Linux kernel");
 
+pub mod config;
+#[cfg(feature = "dns")]
+pub mod dns;
 pub mod handshake;
 pub mod mac;
 mod sha256;

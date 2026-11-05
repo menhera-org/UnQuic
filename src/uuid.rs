@@ -1,12 +1,18 @@
 //! In-tree UUID representation and explicit cookie provisioning.
 
-use std::{fmt, io, str::FromStr};
+use std::{
+    collections::HashMap,
+    fmt,
+    hash::{Hash, Hasher},
+    io,
+    str::FromStr,
+};
 
 /// A UUID in network byte order.
 ///
 /// Debug output hides the value because session cookies are bearer secrets.
 /// Display deliberately exposes it for provisioning; do not use it in logs.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UnquicUuid([u8; 16]);
 
 impl UnquicUuid {
@@ -43,6 +49,14 @@ impl UnquicUuid {
         bytes[6] = (bytes[6] & 0x0f) | 0x40;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
         Ok(Self(bytes))
+    }
+}
+
+impl Hash for UnquicUuid {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Cookies are fixed-width; a slice-length prefix would add no information.
+        state.write(&self.0);
     }
 }
 
@@ -110,31 +124,52 @@ const fn hex(byte: u8) -> Result<u8, ParseUuidError> {
 
 /// Immutable cookie index. Construction rejects duplicate local cookies.
 ///
-/// Lookups allocate nothing and take O(log n) comparisons. Values remain in the
-/// caller's configuration order; only this index is sorted.
-pub struct CookieIndex(Vec<(UnquicUuid, usize)>);
+/// Small configurations use a short linear scan; larger ones use the standard
+/// library's randomized hash table. Lookups allocate nothing and take no locks.
+/// Returned indices always refer to the caller's original configuration order.
+pub struct CookieIndex(CookieLookup);
+
+enum CookieLookup {
+    Small(Vec<(UnquicUuid, usize)>),
+    Large(HashMap<UnquicUuid, usize>),
+}
 
 impl CookieIndex {
-    /// Builds an index from cookies in configuration order.
+    /// Builds the lookup table once at startup.
     pub fn new(cookies: impl IntoIterator<Item = UnquicUuid>) -> Result<Self, DuplicateCookie> {
-        let mut entries: Vec<_> = cookies
+        let entries: Vec<_> = cookies
             .into_iter()
             .enumerate()
-            .map(|(i, cookie)| (cookie, i))
+            .map(|(index, cookie)| (cookie, index))
             .collect();
-        entries.sort_unstable_by_key(|entry| entry.0);
-        if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return Err(DuplicateCookie);
+        // Short contiguous scans beat hashing for small session sets.
+        if entries.len() <= 16 {
+            for (at, entry) in entries.iter().enumerate() {
+                if entries[..at].iter().any(|previous| previous.0 == entry.0) {
+                    return Err(DuplicateCookie);
+                }
+            }
+            return Ok(Self(CookieLookup::Small(entries)));
         }
-        Ok(Self(entries))
+        let mut table = HashMap::with_capacity(entries.len());
+        for (cookie, index) in entries {
+            if table.insert(cookie, index).is_some() {
+                return Err(DuplicateCookie);
+            }
+        }
+        Ok(Self(CookieLookup::Large(table)))
     }
 
-    /// Finds a configuration index without allocating state for unknown cookies.
+    /// Finds a configuration index without allocating for known or unknown cookies.
+    #[inline]
     pub fn find(&self, cookie: UnquicUuid) -> Option<usize> {
-        self.0
-            .binary_search_by_key(&cookie, |entry| entry.0)
-            .ok()
-            .map(|i| self.0[i].1)
+        match &self.0 {
+            CookieLookup::Small(entries) => entries
+                .iter()
+                .find(|entry| entry.0 == cookie)
+                .map(|entry| entry.1),
+            CookieLookup::Large(table) => table.get(&cookie).copied(),
+        }
     }
 }
 

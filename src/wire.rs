@@ -413,7 +413,7 @@ impl Record<'_> {
         Ok(length)
     }
 
-    fn validate(self) -> Result<(), WireError> {
+    pub(crate) fn validate(self) -> Result<(), WireError> {
         if self.encoded_len() > u16::MAX as usize {
             return Err(WireError::Length);
         }
