@@ -306,8 +306,11 @@ partial sends. Tests cover generated sequences, reverse/duplicate delivery,
 small-frame bursts, releasing early slots, individual expiry and quiescence with
 full return queues. The ten-second bidirectional TAP storm verifies integrity,
 duplicate suppression, observed packing and zero allocations/deallocations while
-reporting frame drops. Dedicated throughput measurements remain. Partial completion, GSO/GRO boundaries, MTU errors and allocation
-checks pass. The five frame-model regression cases
+reporting frame drops. The release baseline in BENCH.md now records single- and
+multiple-flow small-frame and MTU-1500 traffic, per-direction delivery/loss, process
+CPU and per-core CPU/softirq. Unlimited offered load causes severe loss; the final
+throughput gate remains open. Partial completion, GSO/GRO boundaries, MTU errors
+and allocation checks pass. The five frame-model regression cases
 now run against the real implementation in tests/reassembly.rs.
 
 - `socket.rs`: `recv_batch` with `recvmmsg`, `send_batch` with `sendmmsg`,

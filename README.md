@@ -170,7 +170,8 @@ checks. This is correctness coverage, not a throughput measurement.
 
 Recovery, BBRv3,
 descriptor adoption and daemon process integration remain unfinished. No throughput
-target has been demonstrated.
+target has been demonstrated. [BENCH.md](BENCH.md) records the release
+TAP-to-TAP baseline, including severe overload loss, small-frame rates and CPU.
 
 ## Runtime lifecycle and ownership
 

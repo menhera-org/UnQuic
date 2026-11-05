@@ -514,8 +514,9 @@ or self-references; expiry preserves live frames and quiescence drains batches.
 The socket API gathers original slices within a fixed descriptor budget.
 Generated sequences, small-frame bursts and partial batches have regression tests.
 A ten-second bidirectional TAP storm checks observed packing, integrity, duplicate
-suppression and zero allocations/deallocations, while reporting drops. Dedicated
-throughput measurements, recovery and congestion control remain unfinished. Current liveness
+suppression and zero allocations/deallocations, while reporting drops. BENCH.md
+records the release throughput/CPU baseline; overload loss is severe and the
+throughput gate has not passed. Recovery and congestion control remain unfinished. Current liveness
 probes do not discover MTU: the UDP limit remains 1232 bytes until stage 3.
 The foreground daemon now parses the documented TOML, provisions cookies through
 gen-uuid, refreshes hostnames through per-peer iphost helpers after readiness,
