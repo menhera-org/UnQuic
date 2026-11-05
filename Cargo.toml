@@ -3,6 +3,11 @@ name = "unquic"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
+authors = ["metastable-void <mori@menhera.ad.jp>"]
+license = "Apache-2.0 OR MPL-2.0"
+readme = "README.md"
+repository = "https://github.com/menhera-org/UnQuic"
+description = "experimental user-space L2 encapsulation for kernel Linux"
 
 [dependencies]
 iphost = { version = "=0.4.4", default-features = false, features = ["ra", "dhcpv6"], optional = true }
