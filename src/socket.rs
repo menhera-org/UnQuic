@@ -14,10 +14,20 @@ use std::{
     mem::{size_of, zeroed},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket},
     os::fd::{AsFd, AsRawFd, BorrowedFd},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 /// Maximum number of logical datagrams in one batched syscall.
 pub const BATCH_SIZE: usize = 64;
+/// UDP payload ceiling under the configured 1500-byte outer IPv6 MTU.
+pub const MAX_UDP_PAYLOAD: usize = 1500 - 40 - 8;
+const GSO_MAX_BYTES: usize = 65_535 - 40 - 8;
+
+#[repr(C)]
+struct Ancillary {
+    header: libc::cmsghdr,
+    data: [u8; size_of::<usize>()],
+}
 
 /// One outgoing datagram, optionally split into prefix and borrowed payload.
 #[derive(Clone, Copy)]
@@ -36,6 +46,8 @@ pub struct ReceiveDatagram<'a> {
     pub length: usize,
     /// A truncated entry is consumed but must never be parsed.
     pub truncated: bool,
+    /// GRO segment size, or zero for an ordinary datagram.
+    pub segment_size: usize,
 }
 
 impl<'a> ReceiveDatagram<'a> {
@@ -45,7 +57,25 @@ impl<'a> ReceiveDatagram<'a> {
             buffer,
             length: 0,
             truncated: false,
+            segment_size: 0,
         }
+    }
+
+    /// Borrows each logical UDP payload, including a shorter final GRO segment.
+    ///
+    /// Rejects payload or ancillary truncation; each returned slice still needs
+    /// independent wire/cookie/state validation. Empty UDP is one empty slice.
+    pub fn segments(&self) -> io::Result<impl ExactSizeIterator<Item = &[u8]>> {
+        if self.truncated || self.length > self.buffer.len() {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let size = if self.segment_size == 0 {
+            self.length.max(1)
+        } else {
+            self.segment_size
+        };
+        Ok((0..self.length.div_ceil(size).max(1))
+            .map(move |index| &self.buffer[index * size..((index + 1) * size).min(self.length)]))
     }
 }
 
@@ -57,6 +87,7 @@ pub struct ReceiveSocket {
     socket: UdpSocket,
     address: SocketAddrV6,
     device: Option<CString>,
+    gro: bool,
 }
 
 impl ReceiveSocket {
@@ -80,10 +111,34 @@ impl ReceiveSocket {
             socket,
             address,
             device: device.map(CStr::to_owned),
+            gro: false,
         })
     }
 
-    /// Receives up to BATCH_SIZE datagrams directly into caller-owned buffers.
+    /// Enables GRO when supported; false leaves ordinary receives in use.
+    ///
+    /// Call during socket setup. Thereafter use recv_batch and split each result
+    /// with ReceiveDatagram::segments; recv cannot represent a GRO aggregate.
+    pub fn enable_gro(&mut self) -> io::Result<bool> {
+        if self.gro {
+            return Ok(true);
+        }
+        match set_int(&self.socket, libc::IPPROTO_UDP, libc::UDP_GRO, 1) {
+            Ok(()) => {
+                self.gro = true;
+                Ok(true)
+            }
+            Err(error) if offload_unavailable(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Whether GRO was enabled successfully on this socket.
+    pub const fn gro_enabled(&self) -> bool {
+        self.gro
+    }
+
+    /// Receives up to BATCH_SIZE buffers, each containing one or more datagrams.
     ///
     /// Returns the completed prefix of entries; later entries are unchanged.
     /// Each truncated entry is reported separately so valid siblings survive.
@@ -102,6 +157,9 @@ impl ReceiveSocket {
     /// A rejected datagram is consumed. No partially received payload may be
     /// parsed. Returns `WouldBlock` when the receive queue is empty.
     pub fn recv(&self, payload: &mut [u8]) -> io::Result<(usize, SocketAddrV6)> {
+        if self.gro {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
         // SAFETY: all-zero sockaddr_in6 is a valid writable output buffer.
         let mut source: libc::sockaddr_in6 = unsafe { zeroed() };
         let mut len = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
@@ -147,10 +205,11 @@ impl AsFd for ReceiveSocket {
 
 /// A connected, stable dynamic-port socket targeting the peer's fixed port.
 ///
-/// This foundation sends at the IPv6 baseline size until path-MTU probing is
-/// implemented. It supplies no protocol scheduling or congestion control.
+/// The caller supplies a validated per-lane payload limit. This API supplies no
+/// path probing, protocol scheduling or congestion control.
 pub struct TransmitSocket {
     socket: UdpSocket,
+    gso: AtomicBool,
 }
 
 impl TransmitSocket {
@@ -186,7 +245,10 @@ impl TransmitSocket {
             ));
         }
         socket.connect(peer)?;
-        Ok(Self { socket })
+        Ok(Self {
+            socket,
+            gso: AtomicBool::new(true),
+        })
     }
 
     /// Returns the selected source address and dynamic port.
@@ -194,12 +256,20 @@ impl TransmitSocket {
         local_address(&self.socket)
     }
 
-    /// Sends one complete UDP payload of at most 1232 bytes.
+    /// Whether GSO attempts remain enabled; support is learned on actual sends.
+    pub fn gso_enabled(&self) -> bool {
+        self.gso.load(Ordering::Relaxed)
+    }
+
+    /// Sends one complete UDP payload within a caller-supplied lane limit.
+    ///
+    /// Limits must be 1232 through 1452 bytes; callers start at 1232 and raise
+    /// them only after path confirmation (or for a deliberate padded probe).
     ///
     /// Returns kernel errors, including `WouldBlock` and `EMSGSIZE`, unchanged.
     /// A successful return means socket submission, not remote acceptance.
-    pub fn send(&self, payload: &[u8]) -> io::Result<()> {
-        if payload.len() > BASE_UDP_PAYLOAD {
+    pub fn send(&self, payload: &[u8], limit: usize) -> io::Result<()> {
+        if !(BASE_UDP_PAYLOAD..=MAX_UDP_PAYLOAD).contains(&limit) || payload.len() > limit {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         let n = self.socket.send(payload)?;
@@ -211,11 +281,20 @@ impl TransmitSocket {
 
     /// Submits up to BATCH_SIZE scatter/gather datagrams in one syscall.
     ///
-    /// Each combined payload must fit the 1232-byte baseline. All entries are
-    /// checked before submission. A partial result counts only the successful
-    /// prefix; the caller retains the unsent suffix and its packet identities.
-    pub fn send_batch(&self, datagrams: &[SendDatagram<'_>]) -> io::Result<usize> {
-        send_batch(self.socket.as_fd(), datagrams)
+    /// All entries must fit the supplied 1232..=1452-byte lane limit. Adjacent
+    /// equal-sized datagrams (with an optional shorter last one) share a GSO
+    /// message without payload copies. Capability/path errors disable GSO and
+    /// retry through ordinary sendmmsg. Partial results count logical datagrams,
+    /// never GSO messages; retain the unsent suffix with its packet identities.
+    pub fn send_batch(&self, datagrams: &[SendDatagram<'_>], limit: usize) -> io::Result<usize> {
+        let gso = self.gso_enabled();
+        match send_batch(self.socket.as_fd(), datagrams, limit, gso) {
+            Err(error) if gso && offload_unavailable(&error) => {
+                self.gso.store(false, Ordering::Relaxed);
+                send_batch(self.socket.as_fd(), datagrams, limit, false)
+            }
+            result => result,
+        }
     }
 
     /// Retrieves and clears the socket's pending asynchronous error.
@@ -230,12 +309,25 @@ impl AsFd for TransmitSocket {
     }
 }
 
-fn send_batch(fd: BorrowedFd<'_>, datagrams: &[SendDatagram<'_>]) -> io::Result<usize> {
+fn offload_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOPROTOOPT | libc::EOPNOTSUPP | libc::EINVAL | libc::EIO | libc::EMSGSIZE)
+    )
+}
+
+fn send_batch(
+    fd: BorrowedFd<'_>,
+    datagrams: &[SendDatagram<'_>],
+    limit: usize,
+    gso: bool,
+) -> io::Result<usize> {
     if datagrams.is_empty()
         || datagrams.len() > BATCH_SIZE
+        || !(BASE_UDP_PAYLOAD..=MAX_UDP_PAYLOAD).contains(&limit)
         || datagrams
             .iter()
-            .any(|d| d.prefix.len().saturating_add(d.payload.len()) > BASE_UDP_PAYLOAD)
+            .any(|d| d.prefix.len().saturating_add(d.payload.len()) > limit)
     {
         return Err(io::ErrorKind::InvalidInput.into());
     }
@@ -243,38 +335,68 @@ fn send_batch(fd: BorrowedFd<'_>, datagrams: &[SendDatagram<'_>]) -> io::Result<
         iov_base: std::ptr::null_mut(),
         iov_len: 0,
     }; BATCH_SIZE * 2];
-    // SAFETY: zeroed message headers represent empty addresses/control buffers.
+    // SAFETY: zeroed headers/control buffers represent empty messages.
     let mut messages: [libc::mmsghdr; BATCH_SIZE] = unsafe { zeroed() };
-    for (i, datagram) in datagrams.iter().enumerate() {
-        vectors[i * 2] = libc::iovec {
-            iov_base: datagram.prefix.as_ptr().cast_mut().cast(),
-            iov_len: datagram.prefix.len(),
-        };
-        vectors[i * 2 + 1] = libc::iovec {
-            iov_base: datagram.payload.as_ptr().cast_mut().cast(),
-            iov_len: datagram.payload.len(),
-        };
-        messages[i].msg_hdr.msg_iov = vectors[i * 2..].as_mut_ptr();
-        messages[i].msg_hdr.msg_iovlen = if datagram.payload.is_empty() { 1 } else { 2 };
+    // SAFETY: all-zero cmsghdr and bytes are valid writable storage.
+    let mut controls: [Ancillary; BATCH_SIZE] = unsafe { zeroed() };
+    let mut ends = [0; BATCH_SIZE];
+    let mut count = 0;
+    let mut first = 0;
+    while first < datagrams.len() {
+        let segment = datagrams[first].prefix.len() + datagrams[first].payload.len();
+        let mut end = first + 1;
+        let mut bytes = segment;
+        if gso && segment != 0 {
+            while end < datagrams.len() {
+                let next = datagrams[end].prefix.len() + datagrams[end].payload.len();
+                if next == 0 || next > segment || bytes + next > GSO_MAX_BYTES {
+                    break;
+                }
+                bytes += next;
+                end += 1;
+                if next < segment {
+                    break;
+                }
+            }
+        }
+        for (index, data) in datagrams.iter().enumerate().take(end).skip(first) {
+            vectors[index * 2] = libc::iovec {
+                iov_base: data.prefix.as_ptr().cast_mut().cast(),
+                iov_len: data.prefix.len(),
+            };
+            vectors[index * 2 + 1] = libc::iovec {
+                iov_base: data.payload.as_ptr().cast_mut().cast(),
+                iov_len: data.payload.len(),
+            };
+        }
+        let message = &mut messages[count].msg_hdr;
+        message.msg_iov = vectors[first * 2..].as_mut_ptr();
+        message.msg_iovlen = ((end - first) * 2) as _;
+        if end - first > 1 {
+            let control = &mut controls[count];
+            // SAFETY: constant length fits this aligned ancillary structure.
+            control.header.cmsg_len = unsafe { libc::CMSG_LEN(2) } as _;
+            control.header.cmsg_level = libc::IPPROTO_UDP;
+            control.header.cmsg_type = libc::UDP_SEGMENT;
+            control.data[..2].copy_from_slice(&(segment as u16).to_ne_bytes());
+            message.msg_control = (control as *mut Ancillary).cast();
+            message.msg_controllen = size_of::<Ancillary>() as _;
+        }
+        ends[count] = end;
+        count += 1;
+        first = end;
     }
-    // SAFETY: each initialized header points at live immutable datagram slices;
-    // sendmmsg reads their bytes and writes only the message length fields.
-    let count = cvt(unsafe {
+    // SAFETY: each header borrows live datagram slices and aligned ancillary
+    // storage. The kernel reads payloads and writes only message lengths.
+    let sent = cvt(unsafe {
         libc::sendmmsg(
             fd.as_raw_fd(),
             messages.as_mut_ptr(),
-            datagrams.len() as u32,
+            count as u32,
             (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as _,
         )
     })? as usize;
-    debug_assert!(
-        messages[..count]
-            .iter()
-            .zip(datagrams)
-            .all(|(message, data)| message.msg_len as usize
-                == data.prefix.len() + data.payload.len())
-    );
-    Ok(count)
+    Ok(if sent == 0 { 0 } else { ends[sent - 1] })
 }
 
 fn recv_batch(fd: BorrowedFd<'_>, datagrams: &mut [ReceiveDatagram<'_>]) -> io::Result<usize> {
@@ -285,8 +407,10 @@ fn recv_batch(fd: BorrowedFd<'_>, datagrams: &mut [ReceiveDatagram<'_>]) -> io::
         iov_base: std::ptr::null_mut(),
         iov_len: 0,
     }; BATCH_SIZE];
-    // SAFETY: zeroed headers request no source addresses or ancillary data.
+    // SAFETY: zeroed headers request no source addresses.
     let mut messages: [libc::mmsghdr; BATCH_SIZE] = unsafe { zeroed() };
+    // SAFETY: all-zero cmsghdr and bytes are valid writable storage.
+    let mut controls: [Ancillary; BATCH_SIZE] = unsafe { zeroed() };
     for (i, datagram) in datagrams.iter_mut().enumerate() {
         vectors[i] = libc::iovec {
             iov_base: datagram.buffer.as_mut_ptr().cast(),
@@ -294,6 +418,8 @@ fn recv_batch(fd: BorrowedFd<'_>, datagrams: &mut [ReceiveDatagram<'_>]) -> io::
         };
         messages[i].msg_hdr.msg_iov = &mut vectors[i];
         messages[i].msg_hdr.msg_iovlen = 1;
+        messages[i].msg_hdr.msg_control = (&mut controls[i] as *mut Ancillary).cast();
+        messages[i].msg_hdr.msg_controllen = size_of::<Ancillary>() as _;
     }
     // SAFETY: every header names one exclusive writable slice. MSG_DONTWAIT
     // makes timeout unnecessary; MSG_TRUNC reports the whole datagram length.
@@ -306,12 +432,33 @@ fn recv_batch(fd: BorrowedFd<'_>, datagrams: &mut [ReceiveDatagram<'_>]) -> io::
             std::ptr::null_mut(),
         )
     })? as usize;
-    for (message, datagram) in messages[..count].iter().zip(datagrams) {
+    for ((message, control), datagram) in messages[..count].iter().zip(&controls).zip(datagrams) {
         datagram.length = message.msg_len as usize;
-        datagram.truncated = message.msg_hdr.msg_flags & libc::MSG_TRUNC != 0
-            || datagram.length > datagram.buffer.len();
+        let segment = gro_segment(&message.msg_hdr, control);
+        datagram.segment_size = segment.unwrap_or(0);
+        datagram.truncated = message.msg_hdr.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
+            || datagram.length > datagram.buffer.len()
+            || segment.is_none();
     }
     Ok(count)
+}
+
+fn gro_segment(message: &libc::msghdr, control: &Ancillary) -> Option<usize> {
+    if message.msg_controllen == 0 {
+        return Some(0);
+    }
+    // SAFETY: only computes the platform control-message length.
+    let expected = unsafe { libc::CMSG_LEN(4) } as usize;
+    if (message.msg_controllen as usize) < expected
+        || (message.msg_controllen as usize) > size_of::<Ancillary>()
+        || control.header.cmsg_len as usize != expected
+        || control.header.cmsg_level != libc::IPPROTO_UDP
+        || control.header.cmsg_type != libc::UDP_GRO
+    {
+        return None;
+    }
+    let size = i32::from_ne_bytes(control.data[..4].try_into().unwrap());
+    (size > 0 && size <= u16::MAX as i32).then_some(size as usize)
 }
 
 fn validate_address(address: SocketAddrV6) -> io::Result<()> {
@@ -431,6 +578,187 @@ mod tests {
     }
 
     #[test]
+    fn gso_and_plain_sends_preserve_every_logical_boundary_with_gro() {
+        for gso in [false, true] {
+            let mut rx = receiver();
+            rx.enable_gro().unwrap();
+            let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
+            tx.gso.store(gso, Ordering::Relaxed);
+            let lengths = [1232, 1232, 700, 1452, 1452, 0, 20, 20, 10];
+            let data: Vec<_> = lengths
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| vec![i as u8; n])
+                .collect();
+            let outgoing: Vec<_> = data
+                .iter()
+                .map(|bytes| {
+                    let split = bytes.len().min(7);
+                    SendDatagram {
+                        prefix: &bytes[..split],
+                        payload: &bytes[split..],
+                    }
+                })
+                .collect();
+            assert_eq!(
+                tx.send_batch(&outgoing, MAX_UDP_PAYLOAD).unwrap(),
+                lengths.len()
+            );
+            let mut buffers = vec![[0; 8192]; lengths.len()];
+            let mut incoming: Vec<_> = buffers
+                .iter_mut()
+                .map(|b| ReceiveDatagram::new(b))
+                .collect();
+            let count = rx.recv_batch(&mut incoming).unwrap();
+            let mut logical = 0;
+            for received in &incoming[..count] {
+                for packet in received.segments().unwrap() {
+                    assert_eq!(packet, data[logical]);
+                    logical += 1;
+                }
+            }
+            assert_eq!(logical, lengths.len());
+            if gso && tx.gso_enabled() && rx.gro_enabled() {
+                assert_eq!(incoming[0].segment_size, 1232);
+                assert_eq!(incoming[0].length, 1232 * 2 + 700);
+                assert!(count < logical);
+                assert_eq!(
+                    rx.recv(&mut [0; 8]).unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gso_limits_split_large_batches_and_truncation_does_not_hide_siblings() {
+        let mut rx = receiver();
+        rx.enable_gro().unwrap();
+        let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
+        let payload = [9; MAX_UDP_PAYLOAD];
+        let outgoing = [SendDatagram {
+            prefix: &payload,
+            payload: &[],
+        }; BATCH_SIZE];
+        assert_eq!(
+            tx.send_batch(&outgoing, MAX_UDP_PAYLOAD).unwrap(),
+            BATCH_SIZE
+        );
+        let mut buffers = vec![vec![0; 65_536]; BATCH_SIZE];
+        let mut incoming: Vec<_> = buffers
+            .iter_mut()
+            .map(|b| ReceiveDatagram::new(b))
+            .collect();
+        let count = rx.recv_batch(&mut incoming).unwrap();
+        let mut logical = 0;
+        for received in &incoming[..count] {
+            for packet in received.segments().unwrap() {
+                assert_eq!(packet, payload);
+                logical += 1;
+            }
+        }
+        assert_eq!(logical, BATCH_SIZE);
+        if rx.gro_enabled() && tx.gso_enabled() {
+            assert!(count >= 2);
+        }
+
+        tx.send_batch(&outgoing[..2], MAX_UDP_PAYLOAD).unwrap();
+        tx.send(b"last", BASE_UDP_PAYLOAD).unwrap();
+        let mut small = [[0; 8]; 4];
+        let mut incoming: Vec<_> = small.iter_mut().map(|b| ReceiveDatagram::new(b)).collect();
+        let count = rx.recv_batch(&mut incoming).unwrap();
+        assert!(incoming[0].truncated);
+        assert!(incoming[0].segments().is_err());
+        assert_eq!(
+            incoming[count - 1].segments().unwrap().next().unwrap(),
+            b"last"
+        );
+    }
+
+    #[test]
+    fn checksum_offload_failure_retries_without_gso_and_mtu_errors_survive() {
+        let rx = receiver();
+        let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
+        // Force a real GSO-incompatible socket setting; only these test sockets omit checksums.
+        set_int(&tx.socket, libc::IPPROTO_UDP, libc::UDP_NO_CHECK6_TX, 1).unwrap();
+        set_int(&rx.socket, libc::IPPROTO_UDP, libc::UDP_NO_CHECK6_RX, 1).unwrap();
+        let outgoing = [SendDatagram {
+            prefix: b"prefix",
+            payload: b"payload",
+        }; 2];
+        assert_eq!(tx.send_batch(&outgoing, BASE_UDP_PAYLOAD).unwrap(), 2);
+        assert!(!tx.gso_enabled());
+        for _ in 0..2 {
+            let mut bytes = [0; 32];
+            let (n, _) = rx.recv(&mut bytes).unwrap();
+            assert_eq!(&bytes[..n], b"prefixpayload");
+        }
+        set_int(&tx.socket, libc::IPPROTO_UDP, libc::UDP_NO_CHECK6_TX, 0).unwrap();
+        set_int(&tx.socket, libc::IPPROTO_IPV6, libc::IPV6_MTU, 1280).unwrap();
+        tx.gso.store(true, Ordering::Relaxed);
+        let large = [SendDatagram {
+            prefix: &[0; MAX_UDP_PAYLOAD],
+            payload: &[],
+        }; 2];
+        assert_eq!(
+            tx.send_batch(&large, MAX_UDP_PAYLOAD)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EMSGSIZE)
+        );
+        assert_eq!(
+            rx.recv(&mut [0; 32]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        for limit in [0, BASE_UDP_PAYLOAD - 1, MAX_UDP_PAYLOAD + 1, usize::MAX] {
+            assert_eq!(
+                tx.send_batch(&outgoing, limit).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                tx.send(b"small", limit).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn ancillary_layout_and_malformed_gro_metadata_are_checked() {
+        // SAFETY: these calls only calculate ABI sizes, and zeroed headers are valid storage.
+        let (length, space, mut message, mut control): (_, _, libc::msghdr, Ancillary) =
+            unsafe { (libc::CMSG_LEN(4), libc::CMSG_SPACE(4), zeroed(), zeroed()) };
+        assert_eq!(size_of::<Ancillary>(), space as usize);
+        // SAFETY: only computes the ancillary-data offset.
+        assert_eq!(
+            std::mem::offset_of!(Ancillary, data),
+            unsafe { libc::CMSG_LEN(0) } as usize
+        );
+        assert_eq!(gro_segment(&message, &control), Some(0));
+        message.msg_controllen = space as _;
+        control.header.cmsg_len = length as _;
+        control.header.cmsg_level = libc::IPPROTO_UDP;
+        control.header.cmsg_type = libc::UDP_GRO;
+        for size in [-1_i32, 0, 1, 1232, 65535, 65536] {
+            control.data[..4].copy_from_slice(&size.to_ne_bytes());
+            assert_eq!(
+                gro_segment(&message, &control),
+                (1..=65535).contains(&size).then_some(size as usize)
+            );
+        }
+        message.msg_controllen = (length - 1) as _;
+        assert_eq!(gro_segment(&message, &control), None);
+        message.msg_controllen = space as _;
+        control.header.cmsg_len = (length - 1) as _;
+        assert_eq!(gro_segment(&message, &control), None);
+        let mut empty = [];
+        let received = ReceiveDatagram::new(&mut empty);
+        assert_eq!(
+            received.segments().unwrap().collect::<Vec<_>>(),
+            vec![&[] as &[u8]]
+        );
+    }
+
+    #[test]
     fn stable_dynamic_ports_bidirectional_fixed_port_delivery_and_truncation() {
         let a = receiver();
         let b = receiver();
@@ -444,22 +772,24 @@ mod tests {
             assert_ne!(source.port(), a.local_addr().port());
             assert!(!ports.contains(&source.port()));
             ports.push(source.port());
-            lane.send(b"hello").unwrap();
+            lane.send(b"hello", BASE_UDP_PAYLOAD).unwrap();
             let mut bytes = [0; 32];
             let (n, from) = b.recv(&mut bytes).unwrap();
             assert_eq!(&bytes[..n], b"hello");
             assert_eq!(from, source);
-            lane.send(b"again").unwrap();
+            lane.send(b"again", BASE_UDP_PAYLOAD).unwrap();
             assert_eq!(b.recv(&mut bytes).unwrap().1, source);
         }
-        reply.send(b"reply").unwrap();
+        reply.send(b"reply", BASE_UDP_PAYLOAD).unwrap();
         let mut bytes = [0; 32];
         assert_eq!(a.recv(&mut bytes).unwrap().1, reply.local_addr().unwrap());
         assert_eq!(
             a.recv(&mut bytes).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
-        lanes[0].send(&[0; BASE_UDP_PAYLOAD]).unwrap();
+        lanes[0]
+            .send(&[0; BASE_UDP_PAYLOAD], BASE_UDP_PAYLOAD)
+            .unwrap();
         assert_eq!(
             b.recv(&mut bytes).unwrap_err().kind(),
             io::ErrorKind::InvalidData
@@ -470,7 +800,7 @@ mod tests {
         );
         assert_eq!(
             lanes[0]
-                .send(&[0; BASE_UDP_PAYLOAD + 1])
+                .send(&[0; BASE_UDP_PAYLOAD + 1], BASE_UDP_PAYLOAD)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidInput
@@ -524,7 +854,7 @@ mod tests {
                 payload: &[],
             },
         ];
-        assert_eq!(tx.send_batch(&outgoing).unwrap(), 3);
+        assert_eq!(tx.send_batch(&outgoing, BASE_UDP_PAYLOAD).unwrap(), 3);
         let mut buffers = [[0; 8]; 4];
         let mut incoming: Vec<_> = buffers
             .iter_mut()
@@ -553,14 +883,16 @@ mod tests {
             },
         ];
         assert_eq!(
-            tx.send_batch(&invalid).unwrap_err().kind(),
+            tx.send_batch(&invalid, BASE_UDP_PAYLOAD)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput
         );
         assert_eq!(
             rx.recv_batch(&mut incoming).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
-        assert!(tx.send_batch(&[]).is_err());
+        assert!(tx.send_batch(&[], BASE_UDP_PAYLOAD).is_err());
         assert!(rx.recv_batch(&mut []).is_err());
     }
 
@@ -594,7 +926,7 @@ mod tests {
         let mut sent = 0;
         let mut calls = 0;
         while sent < BATCH_SIZE {
-            let count = send_batch(tx.as_fd(), &outgoing[sent..]).unwrap();
+            let count = send_batch(tx.as_fd(), &outgoing[sent..], BASE_UDP_PAYLOAD, false).unwrap();
             assert!(count > 0 && count < BATCH_SIZE);
             let mut input = [0; 1016];
             for expected in sent..sent + count {

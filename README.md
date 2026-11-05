@@ -58,8 +58,9 @@ features. Its direct, RA and DHCPv6 resolver modes are available.
 
 Receive sockets use fixed nonzero ports and expose no send method. Transmit
 sockets inherit their receiver's binding scope, use stable dynamic ports, and
-disable IPv6 fragmentation. Sends are limited to the unprobed 1232-byte UDP
-baseline. Batched send/receive handles up to 64 datagrams per syscall. Sends can
+disable IPv6 fragmentation. Send APIs take a lane payload limit from 1232 through
+1452 bytes; the runtime still supplies the unprobed 1232-byte baseline. Batched
+sends handle up to 64 logical datagrams per syscall. Sends can
 gather a wire prefix and original frame slice without copying the piece into an
 intermediate packet buffer. Partial sends return the successful prefix; each
 truncated receive is flagged independently. Single receives reject truncation. TAP creation leaves the device
@@ -162,7 +163,8 @@ through a VLAN upper device, exercising kernel tag materialization. Allocation
 instrumentation observes no allocations or deallocations during these forwarding
 checks. This is correctness coverage, not a throughput measurement.
 
-Aggregate receive reservations, multi-record packing, GSO/GRO, recovery, BBRv3,
+Aggregate receive reservations, multi-record packing, worker GRO integration,
+recovery, BBRv3,
 descriptor adoption and daemon process integration remain unfinished. No throughput
 target has been demonstrated.
 
@@ -235,8 +237,34 @@ I/O and notifications, update epoll write interests only when needed, and arm
 absolute monotonic timers. No worker waits for another worker's queue.
 
 Current sends batch the pieces of one frame; packing multiple frames together
-and UDP GSO/GRO remain pending. TAP I/O still requires one read or write per
-frame. No throughput target follows from the allocation checks alone.
+remains pending. TAP I/O still requires one read or write per frame. No throughput
+target follows from the allocation checks alone.
+
+## Socket offloads
+
+Transmit batches group adjacent equal-sized UDP payloads, with an optional
+shorter final payload, into UDP_SEGMENT messages. The kernel gathers wire
+prefixes and original frame slices directly; grouping adds no payload copy.
+Groups stay within 64 logical datagrams and a conservative 64 KiB outer-packet
+bound. Kernel capability/path errors disable GSO on that socket and retry through
+ordinary sendmmsg. Partial results count successful logical datagrams, so callers
+retain exactly the unsent suffix. An MTU error that also affects an ordinary
+datagram still returns EMSGSIZE.
+
+ReceiveSocket::enable_gro attempts UDP_GRO during setup and reports whether it
+succeeded. recv_batch then reports the coalesced length and segment size in each
+ReceiveDatagram. Its segments() iterator borrows the logical UDP payloads,
+including a shorter final segment. Payload truncation, ancillary truncation and
+invalid GRO metadata reject that buffer. Each segment still needs independent
+wire, cookie and connection validation. The single-datagram recv API refuses a
+GRO-enabled socket because it cannot represent the aggregate.
+
+Worker sends use GSO now; worker receives have not enabled GRO yet. The socket
+tests cover GSO and ordinary sends, empty datagrams, short final segments,
+large-batch splitting, malformed metadata, truncation and real checksum-offload
+failure with fallback. Allocation checks include offload and fallback paths.
+These APIs follow the Linux [UDP socket options](https://man7.org/linux/man-pages/man7/udp.7.html);
+they do not implement path probing or promise a throughput increase.
 
 ## Statistics and accounting
 

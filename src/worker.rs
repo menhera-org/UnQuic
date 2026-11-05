@@ -1526,7 +1526,7 @@ impl Worker {
                 };
                 offset += length;
             }
-            match socket.send_batch(&parts[buffer.first..buffer.count]) {
+            match socket.send_batch(&parts[buffer.first..buffer.count], BASE_UDP_PAYLOAD) {
                 Ok(sent) => {
                     let bytes = parts[buffer.first..buffer.first + sent]
                         .iter()
@@ -1708,7 +1708,7 @@ impl Worker {
         let Some(packet) = packet else {
             return Ok(None);
         };
-        match socket.send(&bytes[..packet.length]) {
+        match socket.send(&bytes[..packet.length], BASE_UDP_PAYLOAD) {
             Ok(()) => {
                 self.counters.tx_outer_bytes = self
                     .counters

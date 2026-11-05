@@ -28,7 +28,8 @@ fn kernel_socket_and_tap_invariants() {
     let rx = ReceiveSocket::bind("[::1]:40000".parse().unwrap(), Some(c"lo")).unwrap();
     let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
     let capture = raw_socket(c"lo", libc::ETH_P_IPV6 as u16);
-    tx.send(&[0x5a; BASE_UDP_PAYLOAD]).unwrap();
+    tx.send(&[0x5a; BASE_UDP_PAYLOAD], BASE_UDP_PAYLOAD)
+        .unwrap();
     let mut packet = [0; 2048];
     wait_for(|| {
         let Some(n) = raw_read(&capture, &mut packet) else {

@@ -464,7 +464,7 @@ If a comparison already reaches the available underlay ceiling, report that fact
 
 # 15 Implementation stages
 
-**Current status:** stage 1 is complete; stage 2 is next. Implemented foundations are
+**Current status:** stage 1 is complete; stage 2 is in progress. Implemented foundations are
 `UnquicUuid` parsing/provisioning, duplicate-checked cookie indexing,
 `MacAddress` validation, IPv6 sockets with separate receive/transmit APIs, and
 nonpersistent multiqueue TAP creation and frame I/O. The version-1 wire codec
@@ -502,8 +502,11 @@ Tests cover failed candidates, migration back, unchanged destinations, multiple
 peers/sessions and independent endpoint readiness. Workers publish per-session,
 per-peer and per-lane counters in batches; lane snapshots include the local
 connection generation. README.md defines byte accounting, lifetime, aggregation
-and currently unsupported gauges. Aggregate receive quotas, offloads, recovery
-and congestion control remain unfinished. Current liveness
+and currently unsupported gauges. Socket APIs now support caller-supplied payload
+limits, scatter/gather UDP GSO with fallback, and validated UDP GRO splitting.
+Worker GSO sends pass the forwarding tests; worker receive offload, aggregate
+receive quotas, multi-record packing, recovery and congestion control remain
+unfinished. Current liveness
 probes do not discover MTU: the UDP limit remains 1232 bytes until stage 3.
 The foreground daemon now parses the documented TOML, provisions cookies through
 gen-uuid, refreshes hostnames through per-peer iphost helpers after readiness,

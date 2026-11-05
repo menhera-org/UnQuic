@@ -281,7 +281,7 @@ RA/DHCPv6 operation on real resolver networks remains unverified.
 - Test: a unit test that parses the example configuration from section 12
   and a rejection test for each `validate()` rule.
 
-## Stage 2: batched transport
+## Stage 2: batched transport — in progress
 
 Goal: the packet rate and CPU baseline of section 13 can be measured. Final
 local acceptance requires at least 20 Gbit/s in each direction simultaneously
@@ -290,10 +290,14 @@ at inner MTU 1500, with CPU use reported.
 The receive foundation is implemented early for step 1e: fixed frame storage,
 whole-datagram reservation, permanent packet/frame windows, terminal bits,
 100 ms expiry and retained TAP-write entries. Worker routing, initial memory
-reservation checks and batch integration now exist. Aggregate receive quotas,
-GSO/GRO, multi-record packing and the frame storm/throughput tests remain. recvmmsg and
-scatter/gather sendmmsg are implemented at the baseline payload size; partial
-completion and truncation tests pass. The five frame-model regression cases
+reservation checks and batch integration now exist. Socket sends now accept
+caller-supplied lane limits and group scatter/gather datagrams through UDP_SEGMENT,
+with a tested ordinary-send fallback. Receive sockets can enable UDP_GRO and
+borrow each logical segment after ancillary/truncation checks. Worker GSO sends
+pass the container forwarding/restart test; worker GRO integration remains.
+Aggregate receive quotas, multi-record packing and the frame storm/throughput
+tests remain. Partial completion, GSO/GRO boundaries, MTU errors and allocation
+checks pass. The five frame-model regression cases
 now run against the real implementation in tests/reassembly.rs.
 
 - `socket.rs`: `recv_batch` with `recvmmsg`, `send_batch` with `sendmmsg`,

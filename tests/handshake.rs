@@ -808,7 +808,7 @@ fn segmentation_and_flow_selection_allocate_nothing() {
 fn batched_socket_io_and_rejection_paths_allocate_nothing() {
     use unquic::socket::{ReceiveDatagram, ReceiveSocket, SendDatagram, TransmitSocket};
     // Select an ephemeral test port, then bind the public fixed-port API.
-    let rx = (0..16)
+    let mut rx = (0..16)
         .find_map(|_| {
             let probe = std::net::UdpSocket::bind("[::1]:0").unwrap();
             let std::net::SocketAddr::V6(address) = probe.local_addr().unwrap() else {
@@ -837,7 +837,10 @@ fn batched_socket_io_and_rejection_paths_allocate_nothing() {
     }; 4];
     ALLOCATION_COUNT.set(Some(0));
     for _ in 0..100 {
-        assert_eq!(tx.send_batch(&outgoing).unwrap(), 4);
+        assert_eq!(
+            tx.send_batch(&outgoing, unquic::BASE_UDP_PAYLOAD).unwrap(),
+            4
+        );
         assert_eq!(rx.recv_batch(&mut incoming).unwrap(), 4);
         for packet in &incoming {
             assert_eq!(packet.length, 8);
@@ -849,15 +852,66 @@ fn batched_socket_io_and_rejection_paths_allocate_nothing() {
             std::io::ErrorKind::WouldBlock
         );
         assert_eq!(
-            tx.send_batch(&[]).unwrap_err().kind(),
+            tx.send_batch(&[], unquic::BASE_UDP_PAYLOAD)
+                .unwrap_err()
+                .kind(),
             std::io::ErrorKind::InvalidInput
         );
-        tx.send(b"too long").unwrap();
+        tx.send(b"too long", unquic::BASE_UDP_PAYLOAD).unwrap();
         assert_eq!(
             rx.recv(&mut [0; 1]).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
     }
+    rx.enable_gro().unwrap();
+    let mut buffers = [[0; 64]; 4];
+    let [a, b, c, d] = &mut buffers;
+    let mut incoming = [
+        ReceiveDatagram::new(a),
+        ReceiveDatagram::new(b),
+        ReceiveDatagram::new(c),
+        ReceiveDatagram::new(d),
+    ];
+    for fallback in [false, true] {
+        if fallback {
+            use std::os::fd::{AsFd, AsRawFd};
+            for (fd, option) in [
+                (tx.as_fd(), libc::UDP_NO_CHECK6_TX),
+                (rx.as_fd(), libc::UDP_NO_CHECK6_RX),
+            ] {
+                let enabled = 1_i32;
+                // SAFETY: this readable integer changes only the isolated test socket.
+                assert_eq!(
+                    unsafe {
+                        libc::setsockopt(
+                            fd.as_raw_fd(),
+                            libc::IPPROTO_UDP,
+                            option,
+                            (&enabled as *const i32).cast(),
+                            std::mem::size_of::<i32>() as _,
+                        )
+                    },
+                    0
+                );
+            }
+        }
+        for _ in 0..100 {
+            assert_eq!(
+                tx.send_batch(&outgoing, unquic::BASE_UDP_PAYLOAD).unwrap(),
+                4
+            );
+            let count = rx.recv_batch(&mut incoming).unwrap();
+            let mut logical = 0;
+            for received in &incoming[..count] {
+                for packet in received.segments().unwrap() {
+                    assert_eq!(packet, b"headtail");
+                    logical += 1;
+                }
+            }
+            assert_eq!(logical, 4);
+        }
+    }
+    assert!(!tx.gso_enabled());
     let allocations = ALLOCATION_COUNT.replace(None);
     assert_eq!(allocations, Some(0));
 }
