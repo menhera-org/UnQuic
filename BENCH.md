@@ -2,8 +2,10 @@
 
 The original throughput collapse is reproduced and its receive-admission
 failure is fixed. A later TAP readiness busy loop is now fixed too. Subsequent
-20-second MTU-1500 sweeps still show smaller rate-dependent declines: up to
-8.3% when increasing paced load and 2.2% from paced to unlimited load.
+20-second MTU-1500 sweeps still show rate-dependent declines: the latest
+unchanged baseline repeat falls 5.7% in reverse under unlimited load.
+Split-pool and deadline-cache trials failed to establish a throughput gain
+and were reverted.
 The strict plateau requirement remains unmet. Neither the local **20 Gbit/s in each direction** gate nor the
 real **5 Gbit/s under loss** gate has passed.
 
@@ -14,22 +16,23 @@ their absence does not explain away a scheduling or admission failure.
 ## Current performance gaps
 
 Status after the TAP readiness fix and per-peer payload-limit comparison.
+The split-pool and deadline-cache experiments below are not in the runtime.
 The latest results use the 20-CPU single-socket profile and capped
 socket-buffer fallback below.
 L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | At 1452-byte outer payload, repeated 16-flow unlimited points deliver 3.83–3.87 / 4.95–5.03 Gbit/s of inner UDP payload | Roughly 5.2× / 4.0× more delivered goodput is needed even relative to the better unlimited point. The gate is not close to passing. |
-| Goodput must plateau under excess traffic | The latest payload-limit sweep has up to 8.3% decline between paced rates and 2.2% from paced to unlimited; the preceding 64-byte repeats had none | The verified readiness busy loop is fixed. Rate-dependent declines persist and need further profiling. Longer runs, more frame mixes and broader flow/session coverage remain unverified. Removing the earlier admission cascade does not satisfy the plateau requirement. |
-| Small-frame overload must remain efficient | With 64-byte frames and 16 flows, unlimited delivery is 483–486k / 523–537k frames/s, above preceding paced points | Repeated 20-second comparisons pass; the complete small-frame acceptance profile remains unfinished. |
+| At least 20 Gbit/s each way at inner MTU 1500 | The latest unchanged 1452-byte baseline repeats deliver 3.79–3.84 / 4.87–5.09 Gbit/s of inner UDP payload under unlimited load | Roughly 5.2× / 3.9× more delivered goodput is needed even relative to the better unlimited point. The gate is not close to passing. |
+| Goodput must plateau under excess traffic | An unchanged baseline repeat declines 5.7% in reverse; rejected deadline-cache trials decline up to 11.9% / 5.6% | The verified readiness busy loop is fixed. Rate-dependent declines persist and need further profiling. Longer runs, more frame mixes and broader flow/session coverage remain unverified. Removing the earlier admission cascade does not satisfy the plateau requirement. |
+| Small-frame overload must remain efficient | The earlier 64-byte, 16-flow baseline delivered 483–486k / 523–537k frames/s, above preceding paced points | Repeated 20-second comparisons pass; the complete small-frame acceptance profile remains unfinished. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
 | Use larger confirmed path MTUs | The runtime accepts a per-peer 1232–1452-byte payload assertion; a controlled 1452-byte sweep shows only a modest change | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. Configured capacity is not confirmed PMTU. |
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
 
-Loss under unlimited load is still high: the latest 1452-byte MTU-1500 points
-miss about 69% / 59–60% of offered frames despite zero admission-pressure
+Loss under unlimited load is still high: the latest unchanged 1452-byte MTU-1500 points
+miss about 70% / 59–61% of offered frames despite zero admission-pressure
 rejections and zero worker queue drops. TAP ingress drops and outer socket
 overflows account for visible loss locations; their different units prevent
 an exact frame-loss decomposition. Inner UDP receive-buffer errors are recorded
@@ -655,3 +658,96 @@ A6 therefore remains open. More storage has not fixed the remaining decline.
 Next, profile the pending-frame scans and work admitted versus drained per
 turn, then repeat the pool trial after any verified scheduling fix. Preserve
 the current bounded admission, ACK and TAP-backpressure behavior throughout.
+
+## Backlog profiling and rejected deadline-cache trial (audit A4)
+
+[Backlog profile data](benches/worker-backlog-profile.json) compares the
+unchanged runtime, the rejected split-pool trial and transmit-deadline caching.
+It samples thread CPU every 256 turns with a measured clock baseline, and
+counts queue work on every turn. Results below aggregate four workers per
+endpoint over complete one-second bins. Instrumented throughput is kept
+separate from the normal release results.
+
+| Diagnostic | Current-sized pools, before cache | Rejected split-pool trial | Current-sized pools, cached |
+| --- | ---: | ---: | ---: |
+| TX deadline frame entries examined/second | 0.37–1.11 million | 5.82–13.09 million | 1,329–2,886 |
+| Approximate deadline CPU share | −0.02% to 0.14% | 0.70% to 1.73% | −0.15% to −0.03% |
+| Largest pending queue on one worker | 353 frames | 3,048 frames | 336 frames |
+| Pending examinations rotated past a full/prepared batch | 13–30% | 15–33% | 14–30% |
+
+Negative corrected CPU shares are measurement noise, not negative work.
+Caching demonstrably removes repeated scans; this timer cost was too small
+to explain the whole pool regression. All diagnostic queue drops in the
+split-pool trial came from transmit handoffs, with no receive-queue or
+transmit-quota drops. Pending depth and expiry also rose. Those observations
+narrow the investigation without establishing a complete causal explanation.
+
+The trial cached an early transmit expiry, lowered it when a frame arrived
+with an earlier deadline, and rescanned pending frames and batches when the
+cached deadline arrived. A removed frame could leave one harmless early wake.
+Handoffs and queue rotation make a front-only deadline incorrect. Frame
+lifetimes, receive budgets and ACK admission are unchanged. A kernel regression
+covers out-of-order arrival, movement into batches, expiry and early release.
+The release suite, all nine worker kernel tests, runtime allocation/reconnect
+test, Clippy and Rust 1.89 check pass.
+
+Uninstrumented release measurements below use 1452-byte outer payload, 16 flows,
+20 seconds per point and the same single-socket CPU/queue settings.
+Rows are chronological: cached sweep, unchanged baseline repeat, cached
+repeat. No builds or tests ran concurrently. The cached binary SHA-256 is
+`1f53efbfa05f53e3a9b0483ee850aef3866df68de3a1e8ecd1eaa99fd5930a1d`.
+
+| Runtime | Requested/flow | Delivered Gbit/s, L→R / R→L | Missing % | Daemon CPU %, left / right | Socket overflow SKBs, left / right |
+| --- | --- | ---: | ---: | ---: | ---: |
+| cached | 125M | 1.987 / 1.985 | 0.64 / 0.74 | 315.3 / 326.6 | 11,895 / 6,516 |
+| cached | 250M | 3.380 / 3.932 | 15.50 / 1.69 | 350.8 / 349.6 | 23,696 / 107,541 |
+| cached | 500M | 3.319 / 4.902 | 58.34 / 38.72 | 360.5 / 353.2 | 81,578 / 132,288 |
+| cached | unlimited | 2.925 / 4.672 | 77.22 / 62.30 | 302.7 / 326.1 | 199,424 / 90,988 |
+| cached | 500M | 3.402 / 5.007 | 57.31 / 37.40 | 363.7 / 357.9 | 77,410 / 136,070 |
+| cached | unlimited | 4.001 / 4.837 | 68.02 / 61.96 | 343.7 / 335.5 | 81,931 / 106,813 |
+| unchanged | 500M | 3.405 / 5.171 | 57.43 / 35.22 | 375.7 / 366.4 | 70,208 / 122,601 |
+| unchanged | unlimited | 3.841 / 4.875 | 70.17 / 60.73 | 347.1 / 343.0 | 86,869 / 109,611 |
+| unchanged | 500M | 3.388 / 5.058 | 57.48 / 36.60 | 367.8 / 362.1 | 80,943 / 135,387 |
+| unchanged | unlimited | 3.789 / 5.092 | 69.96 / 59.09 | 355.0 / 341.0 | 82,250 / 118,378 |
+| cached | 500M | 3.377 / 4.883 | 57.78 / 38.95 | 355.0 / 350.2 | 103,095 / 131,737 |
+| cached | unlimited | 3.414 / 4.611 | 74.07 / 65.82 | 318.1 / 320.3 | 132,562 / 89,094 |
+| cached | 500M | 3.379 / 5.022 | 57.60 / 37.05 | 363.6 / 364.3 | 79,951 / 128,507 |
+| cached | unlimited | 3.936 / 4.920 | 69.07 / 61.98 | 349.5 / 339.6 | 88,503 / 113,341 |
+
+Admission-pressure rejections, worker queue drops and socket errors are zero
+in every point. Expiry ranges from 0 to 88 / 0 to 3 frames per point.
+Outer fragmentation remains zero. Full process/per-core CPU, generator CPU,
+TAP drops and inner UDP errors remain in the overload JSON.
+
+The slower cached unlimited points coincide with more user/system CPU ticks
+on the assigned cores than in the daemon process totals: about 35 and 14
+percentage points on the left. Other points have small negative differences.
+These counters have different sampling boundaries and accounting scopes;
+they identify neither a competing process nor the cause of the decline.
+Both points remain in the report.
+
+No throughput gain is established for caching. The unchanged baseline also
+has a reverse-direction decline, and the cached runs still fail the strict
+plateau requirement. Continue the scheduling/ownership investigation; do not
+attribute the unresolved decline to absent congestion control or recovery.
+
+The cached variant also ran four 20-second points with 64-byte Ethernet frames,
+16 flows and the default 1232-byte outer payload:
+
+| Requested/flow | Delivered frames/s, L→R / R→L | Missing % | Daemon CPU %, left / right | Socket overflow SKBs, left / right |
+| --- | ---: | ---: | ---: | ---: |
+| 10M | 457256 / 509137 | 49.54 / 43.99 | 362.1 / 358.3 | 917 / 60,059 |
+| unlimited | 459418 / 511070 | 61.96 / 56.49 | 339.3 / 322.3 | 2,209 / 51,239 |
+| 10M | 455936 / 510052 | 49.80 / 43.66 | 357.3 / 355.7 | 1,978 / 50,203 |
+| unlimited | 484720 / 499875 | 60.95 / 58.92 | 337.9 / 326.4 | 1,597 / 49,459 |
+
+These points have zero admission pressure, worker queue drops, expiry and
+outer fragmentation. The final reverse unlimited point declines 2.0%
+from its paced predecessor. The trial does not establish a small-frame
+throughput gain either.
+
+**The deadline cache was reverted.** Its scan reduction is verified, but
+current-pool scan cost is small and the throughput repeats do not justify
+adding it now. The tested source remains with the raw results for a future
+larger-queue comparison. A4's scheduling work remains open; the next
+priority is reducing transmit ownership handoffs while preserving flow pinning.
