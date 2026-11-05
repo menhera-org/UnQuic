@@ -96,7 +96,7 @@ impl ReceiveSocket {
             SocketAddrV6::new(
                 Ipv6Addr::from(source.sin6_addr.s6_addr),
                 u16::from_be(source.sin6_port),
-                u32::from_be(source.sin6_flowinfo),
+                source.sin6_flowinfo,
                 source.sin6_scope_id,
             ),
         ))

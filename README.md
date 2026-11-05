@@ -28,7 +28,9 @@ sockets inherit their receiver's binding scope, use stable dynamic ports, and
 disable IPv6 fragmentation. Sends are limited to the unprobed 1232-byte UDP
 baseline. Truncated receives are rejected. TAP creation leaves the device
 administratively down with carrier down, uses ordinary Ethernet frames without
-virtio metadata, and closes all newly opened queues if setup fails.
+virtio metadata, and closes all newly opened queues if setup fails. Queues can
+be moved out of the `Tap` for per-worker ownership, and any queue controls
+carrier.
 
 ```rust,no_run
 use unquic::{MacAddress, tap::Tap};

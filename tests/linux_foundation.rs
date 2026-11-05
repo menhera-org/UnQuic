@@ -335,7 +335,12 @@ fn kernel_socket_and_tap_invariants() {
     );
     tap.set_carrier(false).unwrap();
     wait_for(|| flags(&control, tap.name()) & libc::IFF_RUNNING as i16 == 0);
-    drop(tap);
+    let queues = tap.into_queues();
+    queues[1].set_carrier(true).unwrap();
+    wait_for(|| flags(&control, c"uq-test") & libc::IFF_RUNNING as i16 != 0);
+    queues[1].set_carrier(false).unwrap();
+    wait_for(|| flags(&control, c"uq-test") & libc::IFF_RUNNING as i16 == 0);
+    drop(queues);
     assert_eq!(unsafe { libc::if_nametoindex(c"uq-test".as_ptr()) }, 0);
     // The same name becomes available again after the last queue is closed.
     let generated = Tap::create(c"uq-test", 1500, 1, None).unwrap();

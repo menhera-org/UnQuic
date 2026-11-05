@@ -23,42 +23,27 @@ impl UnquicUuid {
     /// Generates a UUIDv4 for explicit provisioning.
     ///
     /// Blocks until kernel randomness is available. Session establishment must
-    /// never call this to replace a configured cookie.
+    /// never call this to replace a configured cookie. Requests of at most
+    /// 256 bytes complete in one call once the kernel pool is initialized;
+    /// an interrupted call during early boot returns an error and the caller
+    /// may retry.
     pub fn new_v4() -> io::Result<Self> {
         let mut bytes = [0; 16];
-        fill_random(&mut bytes, |remaining| {
-            // SAFETY: remaining is writable for exactly the supplied length.
-            let n = unsafe { libc::getrandom(remaining.as_mut_ptr().cast(), remaining.len(), 0) };
-            if n < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(n as usize)
-            }
-        })?;
+        // SAFETY: bytes is writable for exactly the supplied length.
+        let n = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n as usize != bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "getrandom returned fewer bytes than requested",
+            ));
+        }
         bytes[6] = (bytes[6] & 0x0f) | 0x40;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
         Ok(Self(bytes))
     }
-}
-
-fn fill_random(
-    mut bytes: &mut [u8],
-    mut read: impl FnMut(&mut [u8]) -> io::Result<usize>,
-) -> io::Result<()> {
-    while !bytes.is_empty() {
-        match read(bytes) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "getrandom returned no bytes",
-                ));
-            }
-            Ok(n) => bytes = &mut bytes[n..],
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
 }
 
 impl fmt::Debug for UnquicUuid {
@@ -204,33 +189,6 @@ mod tests {
             assert_eq!(id.0[8] >> 6, 2);
             assert_eq!(id.to_string().parse::<UnquicUuid>(), Ok(id));
         }
-    }
-
-    #[test]
-    fn randomness_handles_short_reads_interrupts_and_failure() {
-        let mut bytes = [0; 5];
-        let mut calls = 0;
-        fill_random(&mut bytes, |out| {
-            calls += 1;
-            if calls == 1 {
-                return Err(io::ErrorKind::Interrupted.into());
-            }
-            let n = out.len().min(2);
-            out[..n].fill(calls);
-            Ok(n)
-        })
-        .unwrap();
-        assert_eq!(bytes, [2, 2, 3, 3, 4]);
-        assert_eq!(
-            fill_random(&mut bytes, |_| Ok(0)).unwrap_err().kind(),
-            io::ErrorKind::UnexpectedEof
-        );
-        assert_eq!(
-            fill_random(&mut bytes, |_| Err(io::ErrorKind::PermissionDenied.into()))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::PermissionDenied
-        );
     }
 
     #[test]

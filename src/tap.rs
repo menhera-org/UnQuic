@@ -2,7 +2,8 @@
 //!
 //! Requires /dev/net/tun and CAP_NET_ADMIN in the device's network namespace.
 //! Devices start administratively down with carrier down. The caller configures
-//! bridge membership, addresses and administrative state.
+//! bridge membership, addresses and administrative state. Queues can be moved
+//! out of the Tap for per-worker ownership; any queue can control carrier.
 
 use crate::{
     MAX_FRAME_LEN, MacAddress,
@@ -119,12 +120,15 @@ impl Tap {
         &mut self.queues
     }
 
+    /// Gives each queue to its worker. Closing the last queue deletes the
+    /// nonpersistent device, so the caller must keep at least one alive.
+    pub fn into_queues(self) -> Vec<TapQueue> {
+        self.queues
+    }
+
     /// Changes carrier without removing the TAP or its upper devices.
     pub fn set_carrier(&self, up: bool) -> io::Result<()> {
-        let value = libc::c_int::from(up);
-        // SAFETY: TUNSETCARRIER reads an integer through a valid pointer.
-        cvt(unsafe { libc::ioctl(self.queues[0].fd.as_raw_fd(), libc::TUNSETCARRIER, &value) })?;
-        Ok(())
+        self.queues[0].set_carrier(up)
     }
 }
 
@@ -135,6 +139,15 @@ pub struct TapQueue {
 }
 
 impl TapQueue {
+    /// Changes carrier for the whole device without removing the TAP or
+    /// its upper devices. Any queue of the device may be used.
+    pub fn set_carrier(&self, up: bool) -> io::Result<()> {
+        let value = libc::c_int::from(up);
+        // SAFETY: TUNSETCARRIER reads an integer through a valid pointer.
+        cvt(unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::TUNSETCARRIER, &value) })?;
+        Ok(())
+    }
+
     /// Reads one complete Ethernet frame without metadata or FCS.
     ///
     /// The buffer must hold MAX_FRAME_LEN + 1 bytes so oversized frames cannot
