@@ -366,6 +366,11 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
         assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
     }
     frame_storm();
+    for control in [&left.control, &right.control] {
+        for worker in 0..2 {
+            assert_eq!(control.worker_counters(worker).unwrap().queue_drops, 0);
+        }
+    }
     // The earlier capture sockets also accumulated storm traffic; free space before reuse.
     for socket in [&a, &b] {
         while capture_frame(socket, &mut capture).is_some() {}

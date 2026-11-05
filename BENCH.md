@@ -3,9 +3,10 @@
 The original throughput collapse is reproduced and its receive-admission
 failure is fixed. A later TAP readiness busy loop is now fixed too. Subsequent
 20-second MTU-1500 sweeps still show rate-dependent declines: the latest
-unchanged baseline repeat falls 5.7% in reverse under unlimited load.
-Split-pool and deadline-cache trials failed to establish a throughput gain
-and were reverted.
+unchanged MTU-1500 baseline repeat falls 5.7% in reverse under unlimited load.
+The latest 64-byte baseline repeat falls 9.1% / 5.1%.
+Split-pool, deadline-cache and first-reader lane-association trials were rejected
+and reverted after measurements.
 The strict plateau requirement remains unmet. Neither the local **20 Gbit/s in each direction** gate nor the
 real **5 Gbit/s under loss** gate has passed.
 
@@ -16,7 +17,8 @@ their absence does not explain away a scheduling or admission failure.
 ## Current performance gaps
 
 Status after the TAP readiness fix and per-peer payload-limit comparison.
-The split-pool and deadline-cache experiments below are not in the runtime.
+The split-pool, deadline-cache and lane-association experiments below are not
+in the runtime.
 The latest results use the 20-CPU single-socket profile and capped
 socket-buffer fallback below.
 L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
@@ -24,8 +26,8 @@ L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
 | At least 20 Gbit/s each way at inner MTU 1500 | The latest unchanged 1452-byte baseline repeats deliver 3.79–3.84 / 4.87–5.09 Gbit/s of inner UDP payload under unlimited load | Roughly 5.2× / 3.9× more delivered goodput is needed even relative to the better unlimited point. The gate is not close to passing. |
-| Goodput must plateau under excess traffic | An unchanged baseline repeat declines 5.7% in reverse; rejected deadline-cache trials decline up to 11.9% / 5.6% | The verified readiness busy loop is fixed. Rate-dependent declines persist and need further profiling. Longer runs, more frame mixes and broader flow/session coverage remain unverified. Removing the earlier admission cascade does not satisfy the plateau requirement. |
-| Small-frame overload must remain efficient | The earlier 64-byte, 16-flow baseline delivered 483–486k / 523–537k frames/s, above preceding paced points | Repeated 20-second comparisons pass; the complete small-frame acceptance profile remains unfinished. |
+| Goodput must plateau under excess traffic | An unchanged MTU-1500 baseline repeat declines 5.7% in reverse; the latest 64-byte repeat declines 9.1% / 5.1% | The verified readiness busy loop is fixed. Rate-dependent declines persist and need further profiling. Longer runs, more frame mixes and broader flow/session coverage remain unverified. Removing the earlier admission cascade does not satisfy the plateau requirement. |
+| Small-frame overload must remain efficient | The latest unchanged 64-byte, 16-flow unlimited points deliver 419–480k / 455–518k frames/s | The second repeat falls below its paced predecessor in both directions. Earlier passing repeats do not establish a sustained plateau; the small-frame gate remains open. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
 | Use larger confirmed path MTUs | The runtime accepts a per-peer 1232–1452-byte payload assertion; a controlled 1452-byte sweep shows only a modest change | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. Configured capacity is not confirmed PMTU. |
@@ -438,7 +440,9 @@ not yet been measured.
 A3 is implemented with exact deadlines; A4's counter publication and A8's
 queue setup are implemented. A9's contiguous copy is implemented; the two
 record-cache prototypes were slower and were discarded. C4's gate is specified
-above. A1 needs a decision on flow pinning or stable steering. A2 now has ordered group creation, kernel steering and lifecycle tests. The remaining A4 scheduling
+above. A1's immutable lane-association trial below was rejected; strict pinning
+still needs stable steering for dependable locality. A2 now has ordered group
+creation, kernel steering and lifecycle tests. The remaining A4 scheduling
 changes, A6–A7, the B0 cost probes, B1–B3 and the C1–C3 generator/CPU work
 remain unfinished. B4 remains deferred as requested.
 
@@ -751,3 +755,86 @@ current-pool scan cost is small and the throughput repeats do not justify
 adding it now. The tested source remains with the raw results for a future
 larger-queue comparison. A4's scheduling work remains open; the next
 priority is reducing transmit ownership handoffs while preserving flow pinning.
+
+## Rejected first-reader lane associations (audit A1)
+
+A bounded trial chose a new flow's lane on its first TAP reader and kept that
+association when later frames arrived on another queue. Each session used
+4096 atomic entries (32 KiB), four probes at most, no eviction and the original
+hash rule on probe exhaustion. Immutable entries and fallback preserved
+pinning under concurrent insertion, collisions and saturation. Runtime startup
+accounted for the storage; the hot path allocated nothing and took no lock.
+
+The release suite, nine worker kernel cases, allocation/reconnect test,
+Clippy and Rust 1.89 check passed. New cases moved a flow between simulated
+TAP queues and checked buffer return; concurrent insertions and full tables
+kept their original lanes. The storm now also asserts zero worker queue
+drops. Correctness checks did not establish a performance gain.
+
+Normal release sweeps used 16 flows, 20 seconds per point, four workers per
+daemon and the same single-socket placement. The MTU-1500 trials used a
+1452-byte outer payload ceiling. No builds or tests ran during measurements.
+The trial binary SHA-256 is
+`a631745537fab5ac2f85fd6b0c8ff30a570cc58d6fd7aaf18f723012cc76eec0`;
+its source accompanies the raw results. The first sweep improved forward
+unlimited goodput, but the repeat lost reverse throughput and ended with a
+6.6% reverse decline from its preceding paced point.
+
+| Runtime | Requested/flow | Delivered Gbit/s, L→R / R→L | Missing % | Daemon CPU %, left / right | Socket overflow SKBs, left / right |
+| --- | --- | ---: | ---: | ---: | ---: |
+| trial | 125M | 1.998 / 1.998 | 0.10 / 0.10 | 276.4 / 317.7 | 602 / 1,017 |
+| trial | 250M | 3.195 / 3.233 | 20.13 / 19.16 | 329.7 / 360.2 | 65,298 / 56,524 |
+| trial | 500M | 4.450 / 4.530 | 44.21 / 43.37 | 367.5 / 376.9 | 32,326 / 131,544 |
+| trial | unlimited | 4.896 / 4.807 | 60.27 / 61.50 | 372.9 / 368.8 | 61,508 / 204,295 |
+| trial | 500M | 4.622 / 4.643 | 42.01 / 41.76 | 373.2 / 378.2 | 35,701 / 107,159 |
+| trial | unlimited | 4.924 / 4.846 | 61.07 / 61.22 | 373.2 / 363.6 | 75,393 / 198,315 |
+| trial repeat | 250M | 3.771 / 3.188 | 5.71 / 20.31 | 325.8 / 359.2 | 74,161 / 37,640 |
+| trial repeat | 500M | 4.202 / 4.177 | 46.93 / 47.60 | 358.6 / 359.5 | 34,414 / 128,321 |
+| trial repeat | unlimited | 4.422 / 4.267 | 65.32 / 66.91 | 342.7 / 337.2 | 76,378 / 170,770 |
+| trial repeat | 500M | 4.274 / 4.266 | 46.40 / 46.67 | 360.5 / 363.6 | 36,126 / 112,688 |
+| trial repeat | unlimited | 4.459 / 3.986 | 62.50 / 69.12 | 339.8 / 338.3 | 69,358 / 182,260 |
+
+The 64-byte comparison used the default 1232-byte outer ceiling. Forward
+unlimited delivery declined 6.7% and 9.9% in the trial. Its forward rates were
+also below both subsequent unchanged baseline unlimited points. Reverse
+delivery improved, so the change redistributed throughput rather than
+providing a dependable gain in both directions.
+
+| Runtime | Requested/flow | Delivered frames/s, L→R / R→L | Missing % | Daemon CPU %, left / right | Socket overflow SKBs, left / right |
+| --- | --- | ---: | ---: | ---: | ---: |
+| trial | 10M | 383022 / 609213 | 57.77 / 32.98 | 354.8 / 346.8 | 42,414 / 9,178 |
+| trial | unlimited | 357475 / 713413 | 70.07 / 41.00 | 362.6 / 326.9 | 68,836 / 46 |
+| trial | 10M | 386589 / 611601 | 57.34 / 32.02 | 353.6 / 346.1 | 49,470 / 2,856 |
+| trial | unlimited | 348299 / 701002 | 69.97 / 40.85 | 359.6 / 322.6 | 80,118 / 212 |
+| unchanged | 10M | 453031 / 503777 | 49.66 / 44.58 | 350.2 / 353.7 | 5,441 / 73,003 |
+| unchanged | unlimited | 479686 / 517970 | 58.73 / 57.50 | 335.4 / 326.4 | 1,589 / 35,796 |
+| unchanged | 10M | 460797 / 479321 | 49.28 / 47.11 | 344.9 / 339.2 | 1,370 / 72,607 |
+| unchanged | unlimited | 418902 / 454667 | 64.24 / 62.50 | 325.0 / 326.0 | 33,123 / 37,701 |
+
+The unchanged baseline's final unlimited point declined 9.1% / 5.1% from
+its paced predecessor. The plateau failure therefore persists without the
+trial. All 19 normal points have zero admission-pressure rejections, worker
+queue drops, socket errors and outer fragmentation. MTU-1500 expiry is at
+most 3 / 5 frames per point; all eight small-frame points have zero expiry.
+Process/per-core CPU, generator CPU, TAP drops and inner UDP errors are
+retained in the overload JSON. These counters identify loss locations but
+do not establish the cause of each rate-dependent decline.
+
+A separate [handoff counter profile](benches/worker-handoff-profile.json)
+counts every TAP frame over complete one-second bins. It adds no per-frame
+clock calls. Instrumented goodput remains separate from normal results.
+
+| Runtime | Requested/flow | TX handoffs as % of TAP frames, left / right | Diagnostic delivered Gbit/s, L→R / R→L |
+| --- | --- | ---: | ---: |
+| unchanged | 500M | 62.65 / 88.41 | 3.304 / 5.016 |
+| unchanged | unlimited | 62.53 / 90.82 | 3.821 / 4.802 |
+| trial | 500M | 20.30 / 100.00 | 4.039 / 4.415 |
+| trial | unlimited | 17.67 / 100.00 | 4.393 / 4.373 |
+
+There were no failed handoffs in these diagnostic bins. First-reader
+associations reduced left-side crossings but nearly every right-side frame
+still crossed workers. They do not establish stable TAP placement; the
+unchanged tuple can outlive the queue on which its first frame arrived.
+The bounded table would also fall back permanently after saturation.
+The trial is reverted. A1 remains open; changing lanes after migration would
+weaken the agreed pinning rule, so the runtime keeps deterministic hashing.

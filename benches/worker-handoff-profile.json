@@ -1,0 +1,358 @@
+{
+  "revision": "65857f0",
+  "trial": "immutable first-reader flow/lane associations, reverted",
+  "profile": "one_socket_20",
+  "frame_bytes": 1514,
+  "outer_payload_limit": 1452,
+  "flows": 16,
+  "seconds_per_point": 20,
+  "rates_per_flow": [
+    "500M",
+    "unlimited"
+  ],
+  "method": "Counters on every TAP frame; complete monotonic-second bins only. No additional per-frame clocks. Instrumented goodput is diagnostic, separate from normal release results.",
+  "columns": [
+    "locally owned frames",
+    "handoff attempts",
+    "failed handoffs"
+  ],
+  "side_order": [
+    "left",
+    "right"
+  ],
+  "sources": "worker-profile.rs in each rx-handoffs-{before,after}-1514-16 directory in the raw archive; trial pack/runtime sources in rx-flow-local-1452-1514-16",
+  "sha256": {
+    "before": "da4765f7138548438565287a27733e734c5050d404c01ba6d7061d3b223f864a",
+    "after": "67088e1263bb51095a81123e0903278d785f0f4a3aa83bbe77bce51d31eb59e8"
+  },
+  "points": [
+    {
+      "name": "rx-handoffs-before-1514-16",
+      "point": 0,
+      "first_second": 1339748,
+      "end_second_exclusive": 1339767,
+      "sides": [
+        {
+          "bins": 76,
+          "workers": [
+            [
+              375692,
+              1137753,
+              0
+            ],
+            [
+              1532605,
+              763251,
+              0
+            ],
+            [
+              279634,
+              1097307,
+              0
+            ],
+            [
+              504756,
+              1519093,
+              0
+            ]
+          ],
+          "total": [
+            2692687,
+            4517404,
+            0
+          ],
+          "handoff_percent": 62.65391102553352
+        },
+        {
+          "bins": 76,
+          "workers": [
+            [
+              1016619,
+              1524964,
+              0
+            ],
+            [
+              0,
+              1615622,
+              0
+            ],
+            [
+              0,
+              3004202,
+              0
+            ],
+            [
+              0,
+              1613450,
+              0
+            ]
+          ],
+          "total": [
+            1016619,
+            7758238,
+            0
+          ],
+          "handoff_percent": 88.41440948838255
+        }
+      ],
+      "delivered_gbps": [
+        3.3035733974885653,
+        5.015559347371354
+      ],
+      "missing_percent": [
+        58.58654617165975,
+        37.30121766302496
+      ],
+      "process_cpu_percent": [
+        364.1277641260977,
+        359.4594594578144
+      ]
+    },
+    {
+      "name": "rx-handoffs-before-1514-16",
+      "point": 1,
+      "first_second": 1339768,
+      "end_second_exclusive": 1339788,
+      "sides": [
+        {
+          "bins": 80,
+          "workers": [
+            [
+              607174,
+              1399384,
+              0
+            ],
+            [
+              1762953,
+              915368,
+              0
+            ],
+            [
+              295333,
+              1362350,
+              0
+            ],
+            [
+              379637,
+              1404435,
+              0
+            ]
+          ],
+          "total": [
+            3045097,
+            5081537,
+            0
+          ],
+          "handoff_percent": 62.529418699057935
+        },
+        {
+          "bins": 80,
+          "workers": [
+            [
+              926696,
+              1387500,
+              0
+            ],
+            [
+              278,
+              2509183,
+              0
+            ],
+            [
+              244,
+              2695467,
+              0
+            ],
+            [
+              0,
+              2580124,
+              0
+            ]
+          ],
+          "total": [
+            927218,
+            9172274,
+            0
+          ],
+          "handoff_percent": 90.81916199349433
+        }
+      ],
+      "delivered_gbps": [
+        3.8212471230663767,
+        4.8018818872171485
+      ],
+      "missing_percent": [
+        68.59423949065773,
+        62.71766526761643
+      ],
+      "process_cpu_percent": [
+        343.88206388442455,
+        339.16461916694743
+      ]
+    },
+    {
+      "name": "rx-handoffs-after-1514-16",
+      "point": 0,
+      "first_second": 1339790,
+      "end_second_exclusive": 1339810,
+      "sides": [
+        {
+          "bins": 80,
+          "workers": [
+            [
+              2553099,
+              367416,
+              0
+            ],
+            [
+              725126,
+              1451283,
+              0
+            ],
+            [
+              2175425,
+              0,
+              0
+            ],
+            [
+              1686998,
+              8,
+              0
+            ]
+          ],
+          "total": [
+            7140648,
+            1818707,
+            0
+          ],
+          "handoff_percent": 20.299530490755195
+        },
+        {
+          "bins": 80,
+          "workers": [
+            [
+              0,
+              1687012,
+              0
+            ],
+            [
+              10,
+              3141719,
+              0
+            ],
+            [
+              2,
+              1686997,
+              0
+            ],
+            [
+              1,
+              1256817,
+              0
+            ]
+          ],
+          "total": [
+            13,
+            7772545,
+            0
+          ],
+          "handoff_percent": 99.99983274489557
+        }
+      ],
+      "delivered_gbps": [
+        4.039400264439768,
+        4.414926494604103
+      ],
+      "missing_percent": [
+        49.34370642394131,
+        44.614685793470755
+      ],
+      "process_cpu_percent": [
+        367.07859614467804,
+        364.1127039054267
+      ]
+    },
+    {
+      "name": "rx-handoffs-after-1514-16",
+      "point": 1,
+      "first_second": 1339811,
+      "end_second_exclusive": 1339830,
+      "sides": [
+        {
+          "bins": 76,
+          "workers": [
+            [
+              2548144,
+              333113,
+              0
+            ],
+            [
+              862577,
+              1464603,
+              0
+            ],
+            [
+              2725044,
+              0,
+              0
+            ],
+            [
+              2238883,
+              0,
+              0
+            ]
+          ],
+          "total": [
+            8374648,
+            1797716,
+            0
+          ],
+          "handoff_percent": 17.672548878510444
+        },
+        {
+          "bins": 76,
+          "workers": [
+            [
+              0,
+              1782013,
+              0
+            ],
+            [
+              1,
+              2392584,
+              0
+            ],
+            [
+              0,
+              2386578,
+              0
+            ],
+            [
+              0,
+              1486693,
+              0
+            ]
+          ],
+          "total": [
+            1,
+            8047868,
+            0
+          ],
+          "handoff_percent": 99.99998757435043
+        }
+      ],
+      "delivered_gbps": [
+        4.39316497262588,
+        4.373010409514912
+      ],
+      "missing_percent": [
+        65.37234651033552,
+        66.09296206571818
+      ],
+      "process_cpu_percent": [
+        348.0693069274835,
+        337.42574257114603
+      ]
+    }
+  ]
+}
