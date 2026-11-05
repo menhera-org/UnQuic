@@ -114,7 +114,7 @@ Resolve FQDNs to IPv6 addresses outside the packet-processing loop. Select and v
 
 # 5 Session cookie and lifecycle
 
-Carry the configured session UUID as 16 binary bytes in every datagram. Reject duplicate local cookies and unknown cookies before allocating packet state or replying. The `unquic gen-uuid` subcommand generates UUIDv4 cookies using `libc::getrandom()` with flags zero; handle interruptions and short reads, and fail rather than substitute weaker randomness. Provision the cookie out of band and use a public session label in diagnostics. The daemon never generates or replaces the configured session cookie. [S6]
+Carry the configured session UUID as 16 binary bytes in every datagram. Reject duplicate local cookies and unknown cookies before allocating packet state or replying. The `unquic gen-uuid` subcommand generates UUIDv4 cookies using `libc::getrandom()` with flags zero; a short read or interruption is an error the operator retries, never a reason to substitute weaker randomness. Provision the cookie out of band and use a public session label in diagnostics. The daemon never generates or replaces the configured session cookie. [S6]
 
 The cookie is a bearer value, without confidentiality or cryptographic payload integrity. An observer who learns it can forge data and feedback. The following handshake prevents accidental stale-state adoption; it does not change that accepted security boundary. [S7]
 
