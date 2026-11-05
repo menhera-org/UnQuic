@@ -168,6 +168,14 @@ through a VLAN upper device, exercising kernel tag materialization. Allocation
 instrumentation observes no allocations or deallocations during these forwarding
 checks. This is correctness coverage, not a throughput measurement.
 
+Receive ACK scheduling now follows storage admission: sixteen accepted
+ACK-eliciting packets or one millisecond, immediate feedback on a new gap,
+and rate-limited duplicate feedback. Reassembly's `ack_deadline` and `take_ack`
+APIs construct at most the newest 32 ranges from the existing receive bitmap.
+Tests cover pressure rejection, reordering, window wrap, delay calculation and
+allocation-free construction. Workers do not yet transmit or process these
+ACKs; retained sender history and bounded feedback routing remain stage-3 work.
+
 Recovery, BBRv3,
 descriptor adoption and daemon process integration remain unfinished. No throughput
 target has been demonstrated. [BENCH.md](BENCH.md) records the release

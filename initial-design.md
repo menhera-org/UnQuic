@@ -516,7 +516,9 @@ Generated sequences, small-frame bursts and partial batches have regression test
 A ten-second bidirectional TAP storm checks observed packing, integrity, duplicate
 suppression and zero allocations/deallocations, while reporting drops. BENCH.md
 records the release throughput/CPU baseline; overload loss is severe and the
-throughput gate has not passed. Recovery and congestion control remain unfinished. Current liveness
+throughput gate has not passed. Receive-side ACK scheduling/range construction
+is implemented over the existing bitmap; sender-history validation and runtime
+ACK routing are not yet connected. Recovery and congestion control remain unfinished. Current liveness
 probes do not discover MTU: the UDP limit remains 1232 bytes until stage 3.
 The foreground daemon now parses the documented TOML, provisions cookies through
 gen-uuid, refreshes hostnames through per-peer iphost helpers after readiness,

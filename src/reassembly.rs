@@ -7,7 +7,8 @@
 
 use crate::{
     MAX_FRAME_LEN,
-    wire::{Datagram, Record},
+    ack::Schedule,
+    wire::{AckRange, AckRanges, Datagram, MAX_ACK_RANGES, Record},
 };
 use std::{collections::VecDeque, fmt, mem::size_of, time::Duration};
 
@@ -105,6 +106,46 @@ impl Window {
         self.bits[(number as usize / 64) % WORDS] |= 1 << (number % 64);
     }
 
+    fn ranges(&self, highest: u64, output: &mut [AckRange; MAX_ACK_RANGES]) -> usize {
+        let mut cursor = highest;
+        let mut count = 0;
+        while count < output.len() {
+            let Some(end) = self.last_bit(cursor, true) else {
+                break;
+            };
+            let start = self.last_bit(end, false).map_or(self.lower, |gap| gap + 1);
+            output[count] = AckRange { start, end };
+            count += 1;
+            if start == self.lower {
+                break;
+            }
+            cursor = start - 1;
+        }
+        count
+    }
+
+    fn last_bit(&self, mut number: u64, set: bool) -> Option<u64> {
+        while number >= self.lower {
+            let base = number & !63;
+            let mut bits = self.bits[(number as usize / 64) % WORDS];
+            if !set {
+                bits = !bits;
+            }
+            bits &= u64::MAX >> (63 - number % 64);
+            if base <= self.lower {
+                bits &= u64::MAX << (self.lower % 64);
+            }
+            if bits != 0 {
+                return Some(base + 63 - u64::from(bits.leading_zeros()));
+            }
+            if base <= self.lower {
+                break;
+            }
+            number = base - 1;
+        }
+        None
+    }
+
     fn reset(&mut self) {
         self.lower = 1;
         self.bits.fill(0);
@@ -177,6 +218,7 @@ pub struct Lane {
     frame_limit: u16,
     retired: bool,
     packets: Window,
+    ack: Schedule,
     terminal: Window,
     frames: Box<[Frame]>,
     index: [u8; INDEX_LEN],
@@ -197,6 +239,7 @@ impl Lane {
             frame_limit,
             retired: false,
             packets: Window::new(),
+            ack: Schedule::new(),
             terminal: Window::new(),
             frames: (0..FRAME_CAPACITY).map(|_| Frame::empty()).collect(),
             index: [EMPTY; INDEX_LEN],
@@ -252,6 +295,30 @@ impl Lane {
         self.deadline
     }
 
+    /// Earliest pending ACK construction time, independent of frame expiry.
+    pub const fn ack_deadline(&self) -> Option<Duration> {
+        self.ack.deadline
+    }
+
+    /// Constructs due feedback using at most the newest 32 receive-window ranges.
+    ///
+    /// Reserve feedback-queue space before calling: this consumes the pending
+    /// schedule. The caller supplies a fresh local transmit packet number and
+    /// applies the path group's control-traffic limit. No allocation or I/O occurs.
+    pub fn take_ack<'a>(
+        &mut self,
+        now: Duration,
+        output: &'a mut [AckRange; MAX_ACK_RANGES],
+    ) -> Option<Record<'a>> {
+        let delay_us = self.ack.take(now)?;
+        let count = self.packets.ranges(self.ack.highest, output);
+        Some(Record::Ack {
+            lane: self.id,
+            delay_us,
+            ranges: AckRanges::new(&output[..count]).unwrap(),
+        })
+    }
+
     /// Recycles storage for a new connection or a never-used remote lane ID.
     ///
     /// Call only after the old owner's commit/retirement barrier and preserve
@@ -264,6 +331,7 @@ impl Lane {
         self.expired_frames = 0;
         self.duplicate_pieces = 0;
         self.packets.reset();
+        self.ack = Schedule::new();
         self.terminal.reset();
         self.clear_frames();
         Ok(())
@@ -272,6 +340,7 @@ impl Lane {
     /// Drops retained frames and rejects all later packets until reset.
     pub fn retire(&mut self) {
         self.retired = true;
+        self.ack = Schedule::new();
         self.clear_frames();
     }
 
@@ -300,12 +369,17 @@ impl Lane {
         }
         self.expire(now);
         if self.packets.old(header.packet_number) {
+            if datagram.records().any(Record::ack_eliciting) {
+                self.ack.duplicate(now);
+            }
             return Admission::Duplicate;
         }
         let mut reservations = [(0_u64, 0_u16); 64];
         let mut count = 0;
         let mut highest = 0;
+        let mut eliciting = false;
         for record in datagram.records() {
+            eliciting |= record.ack_eliciting();
             match record {
                 Record::Data {
                     frame_id,
@@ -398,6 +472,7 @@ impl Lane {
             }
         }
         self.packets.mark(header.packet_number);
+        self.ack.accepted(header.packet_number, eliciting, now);
         Admission::Fresh
     }
 
@@ -601,6 +676,24 @@ mod tests {
             seen.insert(number);
             seen = seen.split_off(&lower);
             assert_eq!(window.lower, lower);
+            let mut actual = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
+            let count = window.ranges(highest, &mut actual);
+            let mut expected: Vec<AckRange> = Vec::new();
+            for &number in seen.iter().rev() {
+                if let Some(last) = expected.last_mut()
+                    && last.start.checked_sub(1) == Some(number)
+                {
+                    last.start = number;
+                } else if expected.len() == MAX_ACK_RANGES {
+                    break;
+                } else {
+                    expected.push(AckRange {
+                        start: number,
+                        end: number,
+                    });
+                }
+            }
+            assert_eq!(&actual[..count], expected);
             for candidate in [
                 number,
                 lower,
@@ -615,6 +708,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn ack_ranges_cross_words_and_wrap_without_including_old_aliases() {
+        let mut window = Window::new();
+        let mut output = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
+        assert_eq!(window.ranges(0, &mut output), 0);
+        for number in 1..=WINDOW_LEN as u64 + 1 {
+            window.mark(number);
+        }
+        assert_eq!(window.ranges(WINDOW_LEN as u64 + 1, &mut output), 1);
+        assert_eq!(
+            output[0],
+            AckRange {
+                start: 2,
+                end: 65_537
+            }
+        );
+        window.mark(u64::MAX);
+        assert_eq!(window.ranges(u64::MAX, &mut output), 1);
+        assert_eq!(
+            output[0],
+            AckRange {
+                start: u64::MAX,
+                end: u64::MAX
+            }
+        );
+        for n in 1..=130 {
+            window.mark(u64::MAX - n);
+        }
+        assert_eq!(window.ranges(u64::MAX, &mut output), 1);
+        assert_eq!(
+            output[0],
+            AckRange {
+                start: u64::MAX - 130,
+                end: u64::MAX
+            }
+        );
     }
 
     #[test]

@@ -755,11 +755,19 @@ fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
     };
     let len = encode_datagram(header, &[record], &mut packet).unwrap();
     let datagram = Datagram::decode(&packet[..len]).unwrap();
+    let mut ranges = [unquic::wire::AckRange { start: 0, end: 0 }; unquic::wire::MAX_ACK_RANGES];
+    let mut feedback = [0; 1232];
     ALLOCATION_COUNT.set(Some(0));
     for _ in 0..100 {
         assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Fresh);
         assert_eq!(lane.front(Duration::ZERO).unwrap().bytes, &[3; 60]);
         assert!(lane.finish_front());
+        assert_eq!(lane.ack_deadline(), Some(Duration::from_millis(1)));
+        let ack = lane
+            .take_ack(Duration::from_millis(1), &mut ranges)
+            .unwrap();
+        let length = encode_datagram(header, &[ack], &mut feedback).unwrap();
+        assert!(Datagram::decode(&feedback[..length]).is_ok());
         lane.reset(1, 9022).unwrap();
         assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Fresh);
         assert_eq!(lane.expire(Duration::from_millis(100)), 1);

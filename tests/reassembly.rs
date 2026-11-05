@@ -447,3 +447,220 @@ fn accounting_tracks_reservations_duplicates_expiry_and_reset() {
     assert_eq!(lane.expired_frames(), 0);
     assert_eq!(lane.duplicate_pieces(), 0);
 }
+
+#[test]
+fn feedback_excludes_rejected_packets_and_survives_frame_delivery() {
+    use unquic::wire::{AckRange, MAX_ACK_RANGES};
+    let mut lane = Lane::new(1, 1514).unwrap();
+    let mut ranges = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
+    for sequence in 1..=64 {
+        assert_eq!(
+            admit(
+                &mut lane,
+                sequence,
+                &[piece(sequence, 0, &[1])],
+                Duration::ZERO
+            ),
+            Admission::Fresh
+        );
+    }
+    let Some(Record::Ack {
+        lane: 1,
+        delay_us: 0,
+        ranges: accepted,
+    }) = lane.take_ack(Duration::ZERO, &mut ranges)
+    else {
+        panic!("expected feedback")
+    };
+    assert_eq!(
+        accepted.iter().collect::<Vec<_>>(),
+        [AckRange { start: 1, end: 64 }]
+    );
+    assert_eq!(
+        admit(
+            &mut lane,
+            1000,
+            &[Record::Probe, piece(65, 0, &[1])],
+            Duration::ZERO
+        ),
+        Admission::Pressure
+    );
+    let too_large = Record::Data {
+        frame_id: id(1, 1),
+        total_len: 1600,
+        offset: 0,
+        bytes: &[1],
+    };
+    assert_eq!(
+        admit(&mut lane, 65, &[too_large], Duration::ZERO),
+        Admission::Invalid
+    );
+    assert_eq!(lane.ack_deadline(), None);
+    assert!(
+        lane.take_ack(Duration::from_millis(1), &mut ranges)
+            .is_none()
+    );
+
+    assert_eq!(
+        admit(&mut lane, 65, &[piece(1, 1, &[1; 59])], Duration::ZERO),
+        Admission::Fresh
+    );
+    assert_eq!(lane.front(Duration::ZERO).unwrap().id, id(1, 1));
+    lane.finish_front();
+    let Some(Record::Ack {
+        ranges: accepted, ..
+    }) = lane.take_ack(Duration::from_millis(1), &mut ranges)
+    else {
+        panic!("expected feedback")
+    };
+    assert_eq!(
+        accepted.iter().collect::<Vec<_>>(),
+        [AckRange { start: 1, end: 65 }]
+    );
+
+    assert_eq!(
+        admit(
+            &mut lane,
+            65,
+            &[piece(1, 1, &[1; 59])],
+            Duration::from_millis(1)
+        ),
+        Admission::Duplicate
+    );
+    assert_eq!(lane.ack_deadline(), Some(Duration::from_millis(2)));
+    lane.retire();
+    assert_eq!(lane.ack_deadline(), None);
+    assert!(lane.take_ack(Duration::MAX, &mut ranges).is_none());
+    lane.reset(2, 1514).unwrap();
+    assert_eq!(
+        admit(&mut lane, 1, &[Record::Probe], Duration::ZERO),
+        Admission::Fresh
+    );
+    assert!(matches!(
+        lane.take_ack(Duration::from_millis(1), &mut ranges),
+        Some(Record::Ack { lane: 2, .. })
+    ));
+}
+
+#[test]
+fn feedback_uses_newest_ranges_then_recovers_merged_older_ranges() {
+    use unquic::wire::{AckRange, MAX_ACK_RANGES};
+    let mut lane = Lane::new(1, 1514).unwrap();
+    let mut output = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
+    for number in (1..=67).step_by(2) {
+        admit(&mut lane, number, &[Record::Probe], Duration::ZERO);
+    }
+    let Some(Record::Ack { ranges, .. }) = lane.take_ack(Duration::ZERO, &mut output) else {
+        panic!()
+    };
+    assert_eq!(ranges.len(), 32);
+    assert_eq!(ranges.iter().next(), Some(AckRange { start: 67, end: 67 }));
+    assert_eq!(ranges.iter().last(), Some(AckRange { start: 5, end: 5 }));
+    for number in (2..=66).step_by(2) {
+        admit(&mut lane, number, &[Record::Probe], Duration::ZERO);
+    }
+    let record = lane.take_ack(Duration::ZERO, &mut output).unwrap();
+    let encoded = bytes(2, 1, &[record]);
+    let decoded = Datagram::decode(&encoded).unwrap();
+    let Some(Record::Ack {
+        lane: 1, ranges, ..
+    }) = decoded.records().next()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        ranges.iter().collect::<Vec<_>>(),
+        [AckRange { start: 1, end: 67 }]
+    );
+
+    let high = 3 * WINDOW_LEN as u64;
+    admit(&mut lane, high, &[Record::Probe], Duration::ZERO);
+    let Some(Record::Ack { ranges, .. }) = lane.take_ack(Duration::ZERO, &mut output) else {
+        panic!()
+    };
+    assert_eq!(
+        ranges.iter().collect::<Vec<_>>(),
+        [AckRange {
+            start: high,
+            end: high
+        }]
+    );
+    admit(&mut lane, 1, &[Record::Probe], Duration::from_millis(1));
+    let Some(Record::Ack { ranges, .. }) = lane.take_ack(Duration::from_millis(1), &mut output)
+    else {
+        panic!()
+    };
+    assert_eq!(
+        ranges.iter().collect::<Vec<_>>(),
+        [AckRange {
+            start: high,
+            end: high
+        }]
+    );
+}
+
+#[test]
+fn only_ack_eliciting_records_schedule_feedback() {
+    use unquic::wire::{AckRange, AckRanges, MAX_ACK_RANGES};
+    let ranges = [AckRange { start: 1, end: 1 }];
+    for (record, expected) in [
+        (Record::Padding { length: 0 }, false),
+        (
+            Record::Ack {
+                lane: 1,
+                delay_us: 0,
+                ranges: AckRanges::new(&ranges).unwrap(),
+            },
+            false,
+        ),
+        (
+            Record::ProbeReply {
+                lane: 1,
+                packet_number: 1,
+                payload_len: 1232,
+            },
+            false,
+        ),
+        (Record::Probe, true),
+        (
+            Record::FrameAbandon {
+                lane: 1,
+                origin: 0,
+                reason: 1,
+                frame_id: id(1, 1),
+            },
+            true,
+        ),
+        (
+            Record::FrameAbandon {
+                lane: 1,
+                origin: 1,
+                reason: 1,
+                frame_id: id(1, 1),
+            },
+            true,
+        ),
+        (Record::LaneRetire { lane: 2 }, true),
+    ] {
+        let mut lane = Lane::new(1, 1514).unwrap();
+        assert_eq!(
+            admit(&mut lane, 1, &[record], Duration::ZERO),
+            Admission::Fresh
+        );
+        let mut output = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
+        assert_eq!(
+            lane.take_ack(Duration::from_millis(1), &mut output)
+                .is_some(),
+            expected
+        );
+        assert_eq!(
+            admit(&mut lane, 1, &[record], Duration::from_millis(2)),
+            Admission::Duplicate
+        );
+        assert_eq!(
+            lane.take_ack(Duration::from_millis(2), &mut output)
+                .is_some(),
+            expected
+        );
+    }
+}

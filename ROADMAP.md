@@ -356,9 +356,14 @@ now run against the real implementation in tests/reassembly.rs.
 
 Goal: a production candidate under loss.
 
-Session liveness already uses matching small probes on local lane 1. Per-lane
-MTU probing, ACK-based feedback, recovery and congestion control are still
-pending; README.md documents the baseline send-error behavior.
+Session liveness already uses matching small probes on local lane 1.
+Receive-side ACK scheduling and range construction now use the existing
+reassembly bitmap, with no second history or hot-path allocations. Tests cover
+thresholds, gaps, duplicate rate limits, pressure rejection, word/window wrap,
+maximum packet numbers, and reset/retirement. Sender-history validation and
+worker feedback routing remain pending, so the runtime still emits no packet
+ACKs. Per-lane MTU probing, recovery and congestion control are also pending;
+README.md documents the baseline send-error behavior.
 
 - `ack.rs`: ACK scheduling (16 packets or 1 ms, immediate on gap), at most
   32 newest ranges, delay capped at 1000 µs, per-lane once-per-millisecond
