@@ -29,3 +29,9 @@ required-features = ["bin"]
 [[bench]]
 name = "cookie_lookup"
 harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
