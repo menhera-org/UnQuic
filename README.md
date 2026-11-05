@@ -87,8 +87,14 @@ table above that. Allocation-counting tests cover lookup and handshake paths.
 Reproduce the lookup comparison with
 `cargo bench --target x86_64-unknown-linux-musl --bench cookie_lookup`.
 
+`counters::Counters` provides atomic totals and gauges for session, peer and
+lane owners. Updates use Relaxed ordering; snapshots read with Acquire ordering.
+Fields have explicit units, and a snapshot samples fields independently rather
+than promising a coherent transport-state transaction. Workers will publish
+batch totals; snapshots perform no allocation or locking.
+
 The crate does not yet forward frames between peers. Worker ownership,
-counters, batching/offloads, path-MTU probing, recovery, BBRv3, scheduled DNS
+batching/offloads, path-MTU probing, recovery, BBRv3, scheduled DNS
 refresh, the daemon and descriptor adoption remain to be implemented.
 There is no throughput claim for this foundation.
 
@@ -122,3 +128,12 @@ Maximum-size QinQ is currently checked in the TAP-write direction; testing its
 TAP-read direction through VLAN upper devices belongs to the composition tests.
 Bridge/OVS/VRF matrices, offloads, Linux 5.0 qualification and performance
 acceptance remain open.
+
+## License
+
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- Mozilla Public License, Version 2.0 ([LICENSE-MPL](LICENSE-MPL))
+
+at your option.

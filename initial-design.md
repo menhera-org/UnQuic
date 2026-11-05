@@ -369,7 +369,7 @@ The core configuration and transport use raw IPv6 addresses. The optional `dns` 
 
 Resolver selection must be configurable. `iphost`'s `ipv6`, `ra`, and `dhcpv6` modes bypass system resolvers and must work without `/etc/resolv.conf`. Using FQDNs or enabling the `dns` feature does not imply use of the system resolver. Do not silently fall back to the system resolver when a mode that bypasses it was selected. IPv6-literal endpoints require no resolver.
 
-Expose per-session, per-peer, and per-lane counters for delivered frame bytes, outer bytes, repairs, duplicates, expired frames, queue drops, reassembly occupancy, RTT, feedback delay, pacing rate, bytes in flight, and path-MTU state. Distinguish malformed/unknown-cookie packets from operational loss without logging secrets.
+Expose per-session, per-peer, and per-lane counters for delivered frame bytes, outer bytes, repairs, duplicates, expired frames, queue drops, reassembly occupancy, RTT, feedback delay, pacing rate, bytes in flight, and path-MTU state. Distinguish malformed/unknown-cookie packets from operational loss without logging secrets. Keep counter sets with their worker owners and publish batch totals where possible. Updates use Relaxed atomics and control reads use Acquire; snapshots sample fields independently and never serve as synchronization for transport state. RTT and feedback delay use nanoseconds, pacing uses outer IP bytes per second, and byte/occupancy gauges state their units.
 
 Record kernel version, CPU model, active cores and frequency, NIC/driver, queue mapping, offload state, binding scope, and effective socket-buffer limits in diagnostic output. Include socket overflow and softnet/NIC drops in performance investigations.
 
@@ -476,7 +476,9 @@ validation now freezes named endpoint/peer/session relationships into numeric
 indices. Cookie lookup uses short scans for small sets and randomized hashing
 for larger sets, with an allocation check and repeatable benchmark. The optional
 iphost resolution layer supplies IPv6 candidates above the raw-address core.
-Session dispatch, counters and the owned worker runtime remain unimplemented. The crate does
+Atomic counters now cover the section 12 totals and gauges with explicit units
+and allocation-free snapshots. Session dispatch and the owned worker runtime
+remain unimplemented. The crate does
 not yet provide end-to-end Ethernet transport, and no performance acceptance
 claim has been made.
 

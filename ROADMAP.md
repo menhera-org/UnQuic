@@ -173,7 +173,12 @@ address without delaying TAP readiness. The optional `dns` layer uses
 `iphost v0.4.4` types and resolution to supply IPv6 candidates. It stays outside
 the core validator and packet workers. No file or environment access here.
 
-### 1d Counters (`src/counters.rs`)
+### 1d Counters (`src/counters.rs`) — complete
+
+Implemented atomic totals and gauges with explicit units, Relaxed updates,
+Acquire reads and independent snapshots. Owner sets are cache-line aligned;
+concurrent-update and wraparound tests pass. Runtime publication remains part
+of 1e. Full musl tests, Clippy, formatting and the isolated kernel test pass.
 
 One struct of `AtomicU64` per session, per peer and per lane, with the names
 section 12 lists. Workers increment with `Relaxed`; the control handle reads

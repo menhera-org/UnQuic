@@ -11,6 +11,7 @@
 compile_error!("UnQuic requires the Linux kernel");
 
 pub mod config;
+pub mod counters;
 #[cfg(feature = "dns")]
 pub mod dns;
 pub mod handshake;
