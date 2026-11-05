@@ -360,3 +360,77 @@ solely from the reading worker would change that flow's lane. Stable
 steering must be established before replacing the current flow hash.
 The audit's per-operation costs combine different runs and are estimates,
 not a measured CPU ceiling.
+
+Two record-cache prototypes were rejected after measurement with the same
+CPU benchmark. A 64-element decoded-record array took 732 ns per 1514-byte
+frame; compact 16-byte DATA descriptors took 532–540 ns. Both were slower
+than the retained implementation's 437–446 ns. These experiments do not prove
+every possible cache slower; they rule out adopting these two layouts
+without further work. Neither prototype is in the runtime.
+
+Counter publication now occurs after one millisecond or 256 turns, rather
+than every turn; shutdown always publishes. A quiet worker publishes remaining
+totals on its next wake, so these snapshots are not an immediate completion
+barrier. The release forwarding/reconnect test still passes its allocation
+and counter checks.
+
+The timer/counter follow-up uses the same 15-second, 16-flow, single-socket
+profile, with fresh sockets and alternating paced/unlimited points:
+
+| Requested/flow | Delivered Gbit/s | Missing % | Daemon CPU % | Socket overflow SKBs |
+| --- | ---: | ---: | ---: | ---: |
+| 500M | 2.757 / 3.776 | 65.52 / 52.79 | 356.2 / 358.6 | 323,085 / 205,708 |
+| unlimited | 3.054 / 3.486 | 76.88 / 72.82 | 296.6 / 294.2 | 247,826 / 147,674 |
+| 500M | 2.809 / 3.635 | 64.87 / 53.94 | 359.6 / 355.0 | 310,715 / 188,256 |
+| unlimited | 2.486 / 3.008 | 80.64 / 75.17 | 328.3 / 339.0 | 332,164 / 174,194 |
+
+Admission pressure and worker queue drops remain zero. Expiry counts are
+0 / 0, 0 / 5, 2 / 0 and 100 / 165. Fragmentation counters remain zero.
+The second unlimited point declines in both directions. These results do
+not establish a transport gain from timer/counter changes.
+
+## Audit follow-up: kernel queues
+
+Receive sockets request 8 MiB with `SO_RCVBUFFORCE`, fall back to
+`SO_RCVBUF` on `EPERM`, and report the fallback count and actual kernel
+accounting capacity. Other option failures fail socket setup and contribute
+to socket-error counters. The benchmark sets only its own TAPs'
+`txqueuelen` to 10,000 before bringing them up.
+
+Every receive socket in this run used the fallback and reported 425,984
+bytes. This verifies the capped fallback, **not** an 8 MiB queue. The
+privileged success branch remains unverified here. No host sysctl was changed.
+The same 15-second single-socket profile gives:
+
+| Requested/flow | Delivered Gbit/s | Missing % | Daemon CPU % | Socket overflow SKBs |
+| --- | ---: | ---: | ---: | ---: |
+| 250M | 2.729 / 3.593 | 30.84 / 10.16 | 351.3 / 344.0 | 56,508 / 186,339 |
+| 500M | 2.985 / 4.297 | 62.50 / 46.09 | 360.6 / 353.2 | 175,386 / 185,752 |
+| unlimited | 3.069 / 4.200 | 76.01 / 67.00 | 365.8 / 366.1 | 189,733 / 176,080 |
+| 500M | 3.069 / 4.347 | 61.12 / 45.65 | 364.0 / 358.8 | 160,108 / 174,041 |
+| unlimited | 3.058 / 4.093 | 76.33 / 67.05 | 369.3 / 361.3 | 171,086 / 159,876 |
+
+Admission pressure and worker queue drops remain zero. Expiry counts are
+0 / 0, 0 / 1, 156 / 0, 0 / 0 and 297 / 358. No outer fragmentation or
+reassembly is recorded. Unlimited reverse delivery still declines 2.3% and
+5.8% from the preceding paced points. Larger queues have not established
+the plateau or throughput gate; differences from earlier sweeps also include
+fresh reuseport placement.
+
+A small Rust kernel probe verified classic reuseport BPF payload offsets
+36 (lane) and 16 (cookie low word), socket indexes in bind order, and
+32-bit wrapping addition before modulo. The production owner calculation
+must use the same wrapping arithmetic. This probe does not establish group
+lifecycle correctness. Loading an eBPF socket-filter program returned
+`EPERM`; `io_uring_setup` succeeded. TAP USO and io_uring read costs have
+not yet been measured.
+
+### Audit work still open
+
+A3 is implemented with exact deadlines; A4's counter publication and A8's
+queue setup are implemented. A9's contiguous copy is implemented; the two
+record-cache prototypes were slower and were discarded. C4's gate is specified
+above. A1 needs a decision on flow pinning or stable steering. A2 still needs
+ordered group creation and lifecycle tests. The remaining A4 scheduling
+changes, A5–A7, the B0 cost probes, B1–B3 and the C1–C3 generator/CPU work
+remain unfinished. B4 remains deferred as requested.

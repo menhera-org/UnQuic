@@ -740,6 +740,8 @@ impl Worker {
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 128];
         let mut immediate = true;
         let mut event_start = 0;
+        let mut publish_due = Duration::ZERO;
+        let mut publish_turns = 0_u8;
         while !self.control.quitting() {
             let now = monotonic_now()?;
             let mut more = self.drain_queues(now)?;
@@ -766,7 +768,12 @@ impl Worker {
                         .blocked
                 });
             self.receive_interest(more)?;
-            self.publish_counters();
+            publish_turns = publish_turns.wrapping_add(1);
+            if now >= publish_due || publish_turns == 0 {
+                self.publish_counters();
+                publish_due = now + Duration::from_millis(1);
+                publish_turns = 0;
+            }
             let mut deadline = self.deadline(now);
             if self.has_backpressure() {
                 let due = self.retry_due.get_or_insert(now + RETRY);
@@ -1103,6 +1110,11 @@ impl Worker {
             if self.receive[index].is_none() {
                 match ReceiveSocket::bind(endpoint.socket_addr(), endpoint.bind_device.as_deref()) {
                     Ok(mut socket) => {
+                        self.counters.receive_buffer_fallbacks += u64::from(socket.buffer_fallback);
+                        match socket.receive_buffer_limit() {
+                            Ok(bytes) => self.counters.receive_buffer_bytes += bytes as u64,
+                            Err(_) => self.counters.socket_errors += 1,
+                        }
                         if socket.enable_gro().is_err() {
                             self.counters.socket_errors =
                                 self.counters.socket_errors.wrapping_add(1);

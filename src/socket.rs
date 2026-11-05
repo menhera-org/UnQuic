@@ -22,6 +22,7 @@ pub const BATCH_SIZE: usize = 64;
 /// UDP payload ceiling under the configured 1500-byte outer IPv6 MTU.
 pub const MAX_UDP_PAYLOAD: usize = 1500 - 40 - 8;
 const MAX_VECTORS: usize = 1024;
+const RECEIVE_QUEUE_BYTES: i32 = 8 * 1024 * 1024;
 pub(crate) const GSO_MAX_BYTES: usize = 65_535 - 40 - 8;
 
 #[repr(C)]
@@ -90,6 +91,7 @@ pub struct ReceiveSocket {
     address: SocketAddrV6,
     device: Option<CString>,
     gro: bool,
+    pub(crate) buffer_fallback: bool,
 }
 
 impl ReceiveSocket {
@@ -108,6 +110,24 @@ impl ReceiveSocket {
         let socket = configured_socket(device)?;
         set_int(&socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
         set_int(&socket, libc::SOL_SOCKET, libc::SO_RXQ_OVFL, 1)?;
+        let buffer_fallback = match set_int(
+            &socket,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUFFORCE,
+            RECEIVE_QUEUE_BYTES,
+        ) {
+            Ok(()) => false,
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                set_int(
+                    &socket,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    RECEIVE_QUEUE_BYTES,
+                )?;
+                true
+            }
+            Err(error) => return Err(error),
+        };
         bind(&socket, address)?;
         let address = local_address(&socket)?;
         Ok(Self {
@@ -115,7 +135,31 @@ impl ReceiveSocket {
             address,
             device: device.map(CStr::to_owned),
             gro: false,
+            buffer_fallback,
         })
+    }
+
+    /// Kernel receive-queue accounting limit, including Linux's doubled overhead allowance.
+    ///
+    /// Setup requests 8 MiB with SO_RCVBUFFORCE; on EPERM it uses SO_RCVBUF,
+    /// which may be capped by the kernel's rmem_max.
+    pub fn receive_buffer_limit(&self) -> io::Result<usize> {
+        let mut value = 0_i32;
+        let mut length = size_of::<i32>() as libc::socklen_t;
+        // SAFETY: value and length describe writable integer option storage.
+        cvt(unsafe {
+            libc::getsockopt(
+                self.socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&mut value as *mut i32).cast(),
+                &mut length,
+            )
+        })?;
+        if length as usize != size_of::<i32>() || value < 0 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(value as usize)
     }
 
     /// Enables GRO when supported; false leaves ordinary receives in use.
@@ -880,6 +924,15 @@ mod tests {
         let rx = receiver();
         let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
         assert_eq!(option(rx.as_fd(), libc::SOL_SOCKET, libc::SO_REUSEPORT), 1);
+        let queue_bytes = rx.receive_buffer_limit().unwrap();
+        assert_eq!(
+            queue_bytes,
+            option(rx.as_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF) as usize
+        );
+        assert!(queue_bytes > 0);
+        if !rx.buffer_fallback {
+            assert_eq!(queue_bytes, 2 * RECEIVE_QUEUE_BYTES as usize);
+        }
         for fd in [rx.as_fd(), tx.as_fd()] {
             assert_eq!(option(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY), 1);
             // SAFETY: these fcntl operations take no pointer arguments.

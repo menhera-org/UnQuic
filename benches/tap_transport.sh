@@ -78,6 +78,7 @@ for side in left right; do
     done
     ip link set "uq-$side" netns "uq-$side"
     netip "uq-$side" link set lo up
+    netip "uq-$side" link set "uq-$side" txqueuelen 10000
     netip "uq-$side" link set "uq-$side" up
 done
 netip uq-left addr add 10.77.0.1/24 dev uq-left

@@ -123,7 +123,9 @@ table above that. Allocation-counting tests cover lookup and handshake paths.
 Reproduce the lookup comparison with
 `cargo bench --target x86_64-unknown-linux-musl --bench cookie_lookup`.
 
-Workers publish local counter totals once per loop batch. Control reads worker,
+Workers publish local counter totals after one millisecond or 256 loop turns,
+and once at shutdown. Quiet workers publish remaining totals on their next wake.
+Control reads worker,
 session, peer and lane snapshots without locks or allocation. Session and peer
 totals survive reconnection; lane snapshots identify their connection generation.
 See the accounting rules below.
@@ -403,6 +405,13 @@ GRO means these are not necessarily logical datagrams. The kernel reports a
 cumulative 32-bit count on subsequent receives; wrap is handled, but a final
 drop burst without a later receive may not yet appear. Use namespace UDP
 receive-buffer error counters alongside it.
+
+Each receive socket requests 8 MiB with `SO_RCVBUFFORCE`. On `EPERM` it falls
+back to `SO_RCVBUF`, subject to the kernel's configured limit. Worker counters
+report `receive_buffer_fallbacks` and `receive_buffer_bytes`: the latter sums
+the actual kernel accounting limits, including Linux's doubled overhead
+allowance. It is a capacity gauge, not current occupancy. These kernel queues
+are outside `daemon.memory_limit`; each worker owns one per receive endpoint.
 
 Send SIGUSR1 to the foreground daemon to print independently sampled worker
 counters to stderr. Formatting runs in the daemon's supervisory thread, outside

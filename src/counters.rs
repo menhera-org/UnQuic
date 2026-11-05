@@ -110,6 +110,10 @@ metrics! {
     admission_pressure: sum,
     /// Socket receive drops reported by SO_RXQ_OVFL, in kernel skb units.
     socket_overflow: sum,
+    /// Receive sockets that fell back from SO_RCVBUFFORCE to SO_RCVBUF.
+    receive_buffer_fallbacks: sum,
+    /// Sum of receive-socket kernel accounting limits, including overhead allowance.
+    receive_buffer_bytes: sum,
     /// Currently retained incomplete or queued receive frames.
     reassembly_frames: sum,
     /// Sum of full frame lengths reserved by retained receive slots.
