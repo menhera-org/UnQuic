@@ -1,5 +1,6 @@
 //! Checked Ethernet unicast addresses.
-use std::{fmt, str::FromStr};
+use crate::{sha256::sha256, sys::cvt};
+use std::{ffi::CStr, fmt, io, str::FromStr};
 
 /// A nonzero, unicast Ethernet address.
 ///
@@ -15,6 +16,27 @@ impl MacAddress {
         } else {
             Ok(Self(bytes))
         }
+    }
+
+    /// Derives a stable address in Menhera's 60:a4:34:4x:xx:xx MAC-M range.
+    ///
+    /// Hashes the exact hostname bytes, one NUL, and the interface name bytes
+    /// with SHA-256, without a trailing NUL or case normalization. Digest bytes
+    /// `h` map to `[0x60, 0xa4, 0x34, 0x40 | (h[0] & 0x0f), h[1], h[2]]`.
+    /// The 20-bit suffix can collide; use an explicit address to resolve one.
+    pub fn from_names(hostname: &CStr, interface: &CStr) -> Self {
+        let hash = sha256(&[hostname.to_bytes_with_nul(), interface.to_bytes()]);
+        Self([0x60, 0xa4, 0x34, 0x40 | (hash[0] & 0x0f), hash[1], hash[2]])
+    }
+
+    pub(crate) fn for_interface(interface: &CStr) -> io::Result<Self> {
+        // Linux limits the hostname to 64 bytes, excluding the terminating NUL.
+        let mut hostname = [0u8; 65];
+        // SAFETY: hostname is writable for the supplied length.
+        cvt(unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), hostname.len()) })?;
+        let hostname = CStr::from_bytes_until_nul(&hostname)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "unterminated hostname"))?;
+        Ok(Self::from_names(hostname, interface))
     }
 
     /// Returns the six bytes in Ethernet wire order.
@@ -67,6 +89,31 @@ impl std::error::Error for InvalidMacAddress {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derived_addresses_match_independent_hash_vectors() {
+        for (host, interface, expected) in [
+            (c"unquic-test-host", c"uq-test", "60:a4:34:49:63:0a"),
+            (c"host", c"tap0", "60:a4:34:42:d7:f0"),
+            (c"host", c"tap1", "60:a4:34:44:84:2a"),
+            (c"Host", c"tap0", "60:a4:34:42:f2:ab"),
+        ] {
+            let mac = MacAddress::from_names(host, interface);
+            assert_eq!(mac.to_string(), expected);
+            assert_eq!(MacAddress::new(*mac.as_bytes()), Ok(mac));
+        }
+        let mut host = [b'a'; 65];
+        host[64] = 0;
+        let host = CStr::from_bytes_with_nul(&host).unwrap();
+        assert_eq!(
+            MacAddress::from_names(host, c"bbbbbbbbbbbbbbb").to_string(),
+            "60:a4:34:4d:c9:8a"
+        );
+        assert_ne!(
+            MacAddress::from_names(c"ab", c"c"),
+            MacAddress::from_names(c"a", c"bc")
+        );
+    }
 
     #[test]
     fn validates_all_first_octets_and_rejects_zero() {

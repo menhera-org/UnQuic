@@ -10,6 +10,7 @@
 compile_error!("UnQuic requires the Linux kernel");
 
 pub mod mac;
+mod sha256;
 pub mod socket;
 mod sys;
 pub mod tap;

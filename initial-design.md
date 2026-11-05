@@ -309,13 +309,24 @@ These examples do not imply that all attachments can coexist on the same lower d
 **TAP creation decisions:** accept `Option<MacAddress>` for the interface MAC.
 `MacAddress` is an in-tree checked type that rejects the all-zero address and
 multicast addresses, including broadcast. Both globally and locally administered
-unicast addresses are valid. `Some(mac)` sets that address during setup;
-`None` keeps the kernel-generated address. The library sets the configured MTU
-and optional MAC but never brings the interface administratively up. The caller
-or a network manager such as systemd-networkd or ifupdown owns administrative
+unicast addresses are valid. `Some(mac)` sets that address during setup.
+For `None`, read the current UTS hostname with `gethostname` and hash the exact
+bytes `<hostname>\0<interface name>` using in-tree SHA-256. Include one NUL
+separator, no trailing NUL, and no case normalization. Map the first three digest
+bytes `h` to `[0x60, 0xa4, 0x34, 0x40 | (h[0] & 0x0f), h[1], h[2]]`, within
+Menhera's `60:a4:34:4x:xx:xx` MAC-M range. Hostname lookup failure aborts creation without a
+random fallback; an explicit MAC bypasses lookup. The 20-bit suffix can collide,
+and identical name pairs produce identical addresses. Configure explicit MACs
+to resolve duplicates on the same Ethernet network. Name changes affect future
+creation only; existing devices retain their MAC.
+
+The library sets the configured MTU and chosen MAC but never brings the
+interface administratively up. The caller or a network manager such as
+systemd-networkd or ifupdown owns administrative
 state, addressing and bridge membership. Carrier remains under transport
-control and is independent of administrative state. The interface MAC does not
-replace source or destination MACs in transported frames.
+control and is independent of administrative state. Queues can move out of the
+`Tap` into their owning workers; any queue can set carrier for the device. The
+interface MAC does not replace source or destination MACs in transported frames.
 
 Keep TAP names, MAC configuration, and device identity stable across ordinary peer reconnects. Session failure changes carrier according to a defined policy; it does not delete the interface or its VLAN/macvlan children.
 
@@ -346,7 +357,7 @@ cookie = "<uuid-v4>"
 role = "initiator" # configure the other endpoint as responder
 tap_name = "tap-ngn-a"
 inner_mtu = 2400
-# mac = "02:00:00:00:00:01" # optional; omit to keep the kernel-generated MAC
+# mac = "02:00:00:00:00:01" # optional; omit to derive from hostname and TAP name
 ```
 
 Support IPv6-literal hosts always, and FQDN hosts when the `dns` feature is enabled, which the daemon always has; resolution runs on a helper thread so the packet loop never blocks. A library user without `dns` configures endpoints as literals only. `bind_device` is per peer because peers may live in different VRFs; the daemon creates one receive socket per distinct device on the single configured port, as section 4 requires. Define scope identifiers for link-local literals if those addresses are supported. Cookie changes are explicit administrative operations; do not silently replace a configured cookie during reconnect.
@@ -483,7 +494,7 @@ Maintain a clear distinction between a throughput experiment and an interoperabl
 | Feedback routing | Decided: per-worker-pair bounded SPSC queues, eventfd wakeups, explicit lane owners (section 10) |
 | Library API | Decided: library owns worker threads, blocking run plus control handle (section 3) |
 | Public identity types | Decided: in-tree `UnquicUuid` and checked nonzero unicast `MacAddress` |
-| TAP MAC and administrative state | Decided: `Option<MacAddress>`; None keeps the generated MAC. The caller/network manager brings interfaces up; transport controls carrier (section 11) |
+| TAP MAC and administrative state | Decided: `Option<MacAddress>`; None derives a Menhera MAC-M address using SHA-256 over hostname, NUL and interface name. The caller/network manager brings interfaces up; any owned queue controls carrier (section 11) |
 | DNS refresh and address migration | Keep a working address; one candidate and a new handshake for change (section 5) |
 | Inner offload representation | Experimental, negotiated extension |
 | ECN and DSCP policy | Decided: outer Not-ECT and DSCP zero; preserve inner fields; ECN feedback deferred |

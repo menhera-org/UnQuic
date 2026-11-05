@@ -13,7 +13,7 @@
 - Library I/O: no ordinary filesystem access except `/etc/resolv.conf` through `iphost` when its system resolver is selected; no environment-variable reads or stdio. Kernel interfaces such as `/dev/net/tun`, sockets, and ioctls are allowed. Application configuration-file handling and command-line I/O belong to the caller or daemon.
 - Future optional integration: systemd support without linking to systemd or D-Bus libraries, DEB/RPM packaging, and restarts that preserve TAPs by retaining and handing over their file descriptors, following rs-l2tpd's descriptor-preservation approach. These additions must leave standalone operation and the library I/O boundary intact.
 - Startup readiness: every configured TAP interface exists, whether newly created or adopted. The daemon forks and its original parent exits successfully only at readiness, so any init system or launcher can wait for that exit status. This works without systemd and does not wait for network connectivity or peer handshakes. When used, the optional embedded systemd unit must make both `network.target` and `network-online.target` require and wait for daemon readiness; the daemon must not depend on either target or any wait-online service.
-- TAP configuration: creation accepts `Option<MacAddress>`. The in-tree `MacAddress` type accepts nonzero unicast addresses, whether globally or locally administered. `None` keeps the kernel-generated MAC. UnQuic sets the configured MTU and optional MAC but leaves administrative state, addressing and bridge membership to the caller or network manager (for example, systemd-networkd or ifupdown). Transport state controls carrier, independently of administrative state.
+- TAP configuration: creation accepts `Option<MacAddress>`. The in-tree `MacAddress` type accepts nonzero unicast addresses, whether globally or locally administered. `None` derives a stable address in Menhera's `60:a4:34:4x:xx:xx` MAC-M range from the current UTS hostname and interface name using SHA-256. UnQuic sets the configured MTU and optional MAC but leaves administrative state, addressing and bridge membership to the caller or network manager (for example, systemd-networkd or ifupdown). Transport state controls carrier, independently of administrative state.
 - Design: see [initial-design.md](initial-design.md).
 
 ## Implementation status
@@ -31,6 +31,19 @@ administratively down with carrier down, uses ordinary Ethernet frames without
 virtio metadata, and closes all newly opened queues if setup fails. Queues can
 be moved out of the `Tap` for per-worker ownership, and any queue controls
 carrier.
+
+Default MACs hash the exact bytes `<hostname>\0<interface name>`, with one NUL
+separator and no trailing NUL or case normalization. For digest `h`, the address
+is `[0x60, 0xa4, 0x34, 0x40 | (h[0] & 0x0f), h[1], h[2]]`. For example,
+hostname `unquic-test-host` and interface `uq-test` produce
+`60:a4:34:49:63:0a`. The library reads the hostname with `gethostname` and
+hashes it in-tree without allocations or extra dependencies. A hostname lookup
+failure aborts creation; an explicit MAC bypasses lookup. Name changes affect
+future creation only.
+
+The suffix has 20 bits, so collisions are possible; identical hostname/interface
+pairs always produce identical MACs. Set an explicit MAC where needed to avoid
+duplicates on the same Ethernet network.
 
 ```rust,no_run
 use unquic::{MacAddress, tap::Tap};
@@ -59,7 +72,8 @@ cargo fmt --all -- --check
 
 The ignored `linux_foundation` test requires a disposable container with
 `/dev/net/tun`, `CAP_SYS_ADMIN`, `CAP_NET_ADMIN` and `CAP_NET_RAW`. It creates a
-fresh network namespace before creating or changing interfaces. Run the built
+fresh network and UTS namespaces before creating interfaces or changing the
+hostname. Run the built
 test executable there with `--ignored`, or run this command inside the container
 if a Rust toolchain and the source are available:
 
@@ -68,7 +82,8 @@ cargo test --target x86_64-unknown-linux-musl --test linux_foundation -- --ignor
 ```
 
 The kernel test checks actual IPv6 UDP headers and port use, explicit device
-binding, TAP flags/MTU/MAC, administrative state, multiqueue frame I/O,
+binding, TAP flags/MTU/MAC, deterministic MAC recreation, administrative state,
+multiqueue frame I/O,
 VLAN/QinQ bytes, carrier transitions and deletion after the last queue closes.
 Maximum-size QinQ is currently checked in the TAP-write direction; testing its
 TAP-read direction through VLAN upper devices belongs to the composition tests.

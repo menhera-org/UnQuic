@@ -31,7 +31,8 @@ impl Tap {
     ///
     /// Uses IFF_TAP, IFF_NO_PI and IFF_MULTI_QUEUE with checksum/GSO offloads
     /// disabled. Any failure closes all queues created by this call.
-    /// Sets the supplied MAC; None keeps the kernel-generated address.
+    /// Sets the supplied MAC; None derives a Menhera MAC-M address from the
+    /// current UTS hostname and interface name using SHA-256.
     /// Administrative state is left to the caller or network manager.
     pub fn create(
         name: &CStr,
@@ -50,6 +51,10 @@ impl Tap {
         if !(1500..=9000).contains(&mtu) || !(1..=64).contains(&queue_count) {
             return Err(invalid("TAP requires MTU 1500..9000 and 1..64 queues"));
         }
+        let mac = match mac {
+            Some(mac) => mac,
+            None => MacAddress::for_interface(name)?,
+        };
         // SAFETY: all-zero ifreq is valid before its fields are populated.
         let mut request: libc::ifreq = unsafe { zeroed() };
         for (dst, &src) in request.ifr_name.iter_mut().zip(name.to_bytes()) {
@@ -87,24 +92,22 @@ impl Tap {
         let control = udp_socket()?;
         // SAFETY: SIOCSIFMTU reads the interface name and integer MTU from ifreq.
         cvt(unsafe { libc::ioctl(control.as_raw_fd(), libc::SIOCSIFMTU as _, &request) })?;
-        if let Some(mac) = mac {
-            let mut address = libc::sockaddr {
-                sa_family: libc::ARPHRD_ETHER,
-                sa_data: [0; 14],
-            };
-            for (dst, &src) in address.sa_data.iter_mut().zip(mac.as_bytes()) {
-                *dst = src as libc::c_char;
-            }
-            request.ifr_ifru.ifru_hwaddr = address;
-            // SAFETY: SIOCSIFHWADDR reads an initialized Ethernet sockaddr.
-            cvt(unsafe {
-                libc::ioctl(
-                    tap.queues[0].fd.as_raw_fd(),
-                    libc::SIOCSIFHWADDR as _,
-                    &request,
-                )
-            })?;
+        let mut address = libc::sockaddr {
+            sa_family: libc::ARPHRD_ETHER,
+            sa_data: [0; 14],
+        };
+        for (dst, &src) in address.sa_data.iter_mut().zip(mac.as_bytes()) {
+            *dst = src as libc::c_char;
         }
+        request.ifr_ifru.ifru_hwaddr = address;
+        // SAFETY: SIOCSIFHWADDR reads an initialized Ethernet sockaddr.
+        cvt(unsafe {
+            libc::ioctl(
+                tap.queues[0].fd.as_raw_fd(),
+                libc::SIOCSIFHWADDR as _,
+                &request,
+            )
+        })?;
         tap.set_carrier(false)?;
         Ok(tap)
     }

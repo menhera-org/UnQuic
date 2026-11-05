@@ -1,4 +1,4 @@
-//! Live kernel checks. Every interface belongs to a fresh network namespace.
+//! Live kernel checks in fresh network and UTS namespaces.
 use std::{
     ffi::CStr,
     io,
@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 use unquic::{
-    BASE_UDP_PAYLOAD, MAX_FRAME_LEN,
+    BASE_UDP_PAYLOAD, MAX_FRAME_LEN, MacAddress,
     socket::{ReceiveSocket, TransmitSocket},
     tap::Tap,
 };
@@ -25,6 +25,20 @@ fn request(name: &CStr) -> libc::ifreq {
         *dst = src as libc::c_char;
     }
     req
+}
+
+fn mac_address(control: &UdpSocket, name: &CStr) -> MacAddress {
+    let mut req = request(name);
+    // SAFETY: SIOCGIFHWADDR writes the hardware address into this ifreq.
+    check(unsafe { libc::ioctl(control.as_raw_fd(), libc::SIOCGIFHWADDR as _, &mut req) });
+    // SAFETY: the ioctl populated this union field.
+    let actual = unsafe { req.ifr_ifru.ifru_hwaddr };
+    assert_eq!(actual.sa_family, libc::ARPHRD_ETHER);
+    let mut bytes = [0; 6];
+    for (dst, &src) in bytes.iter_mut().zip(&actual.sa_data) {
+        *dst = src as u8;
+    }
+    MacAddress::new(bytes).unwrap()
 }
 
 fn flags(control: &UdpSocket, name: &CStr) -> libc::c_short {
@@ -178,8 +192,11 @@ fn capture_frame(fd: &OwnedFd, buffer: &mut [u8]) -> Option<usize> {
 #[test]
 #[ignore = "requires isolated container, /dev/net/tun, CAP_SYS_ADMIN, CAP_NET_ADMIN and CAP_NET_RAW"]
 fn kernel_socket_and_tap_invariants() {
-    // SAFETY: unshare changes only this test thread's network namespace.
-    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    // SAFETY: unshare changes only this test thread's network and UTS namespaces.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET | libc::CLONE_NEWUTS) });
+    let hostname = b"unquic-test-host";
+    // SAFETY: hostname is readable for its length; the UTS namespace is private.
+    check(unsafe { libc::sethostname(hostname.as_ptr().cast(), hostname.len()) });
     let control = UdpSocket::bind("[::]:0").unwrap();
     up(&control, c"lo");
 
@@ -215,18 +232,7 @@ fn kernel_socket_and_tap_invariants() {
     let mac = "02:aa:bb:cc:dd:ee".parse::<unquic::MacAddress>().unwrap();
     let mut tap = Tap::create(c"uq-test", 9000, 2, Some(mac)).unwrap();
     assert_eq!(flags(&control, tap.name()) & libc::IFF_UP as i16, 0);
-    let mut mac_req = request(tap.name());
-    // SAFETY: SIOCGIFHWADDR writes the hardware address into this ifreq.
-    check(unsafe { libc::ioctl(control.as_raw_fd(), libc::SIOCGIFHWADDR as _, &mut mac_req) });
-    let actual = unsafe { mac_req.ifr_ifru.ifru_hwaddr };
-    assert_eq!(actual.sa_family, libc::ARPHRD_ETHER);
-    assert_eq!(
-        actual.sa_data[..6]
-            .iter()
-            .map(|&v| v as u8)
-            .collect::<Vec<_>>(),
-        mac.as_bytes()
-    );
+    assert_eq!(mac_address(&control, tap.name()), mac);
     assert_eq!(tap.name(), c"uq-test");
     assert_eq!(tap.queues().len(), 2);
     assert!(Tap::create(c"uq-test", 1500, 1, None).is_err());
@@ -342,17 +348,37 @@ fn kernel_socket_and_tap_invariants() {
     wait_for(|| flags(&control, c"uq-test") & libc::IFF_RUNNING as i16 == 0);
     drop(queues);
     assert_eq!(unsafe { libc::if_nametoindex(c"uq-test".as_ptr()) }, 0);
-    // The same name becomes available again after the last queue is closed.
-    let generated = Tap::create(c"uq-test", 1500, 1, None).unwrap();
-    assert_eq!(flags(&control, generated.name()) & libc::IFF_UP as i16, 0);
-    let mut req = request(generated.name());
-    // SAFETY: SIOCGIFHWADDR writes the hardware address into this ifreq.
-    check(unsafe { libc::ioctl(control.as_raw_fd(), libc::SIOCGIFHWADDR as _, &mut req) });
-    let actual = unsafe { req.ifr_ifru.ifru_hwaddr };
-    let mut bytes = [0; 6];
-    for (dst, &src) in bytes.iter_mut().zip(&actual.sa_data) {
-        *dst = src as u8;
+    // Recreating a TAP with the same names must reproduce the exact address.
+    let expected: MacAddress = "60:a4:34:49:63:0a".parse().unwrap();
+    for _ in 0..2 {
+        let generated = Tap::create(c"uq-test", 1500, 1, None).unwrap();
+        assert_eq!(flags(&control, generated.name()) & libc::IFF_UP as i16, 0);
+        assert_eq!(mac_address(&control, generated.name()), expected);
     }
-    assert!(unquic::MacAddress::new(bytes).is_ok());
-    drop(generated);
+    let other = Tap::create(c"uq-other", 1500, 1, None).unwrap();
+    assert_eq!(
+        mac_address(&control, other.name()).to_string(),
+        "60:a4:34:4b:28:5e"
+    );
+    let hostname = b"another-test-host";
+    // SAFETY: hostname is readable for its length; the UTS namespace is private.
+    check(unsafe { libc::sethostname(hostname.as_ptr().cast(), hostname.len()) });
+    // A hostname change affects future creation, not an existing device.
+    assert_eq!(
+        mac_address(&control, other.name()).to_string(),
+        "60:a4:34:4b:28:5e"
+    );
+    let changed = Tap::create(c"uq-test", 1500, 1, None).unwrap();
+    assert_eq!(
+        mac_address(&control, changed.name()).to_string(),
+        "60:a4:34:48:1b:53"
+    );
+    let hostname = [b'a'; 64];
+    // SAFETY: hostname is readable for its length; the UTS namespace is private.
+    check(unsafe { libc::sethostname(hostname.as_ptr().cast(), hostname.len()) });
+    let maximum = Tap::create(c"bbbbbbbbbbbbbbb", 1500, 1, None).unwrap();
+    assert_eq!(
+        mac_address(&control, maximum.name()).to_string(),
+        "60:a4:34:4d:c9:8a"
+    );
 }
