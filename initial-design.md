@@ -215,15 +215,17 @@ Packing should use data already available to the worker. Flush promptly when the
 
 Construct UDP GSO buffers as sequences of complete UDP payloads, each with its own common header. All but the final segment in a GSO submission have the configured segment size. GSO does not create custom protocol headers. A partially filled tail ends that submission or is sent separately; avoid wasteful padding merely to force batching.
 
+For fresh DATA, end planned batches on frame boundaries within the GSO aggregate byte limit. Dropping a local aggregate then drops whole groups of frames rather than leaving orphan pieces in neighboring aggregates. This does not change per-datagram recovery on the routed path or permit outer IP fragmentation.
+
 A missing datagram may contain pieces of several frames. Recover its still-needed content selectively and keep completion independent across frames. Packing must not become a connection-wide ordered stream.
 
 # 8 Loss recovery and ordering
 
-Use selective repair of missing byte ranges with bounded persistence. Keep original payloads until every range is acknowledged, abandoned, or expired; an ACK means transport acceptance, not successful TAP or application delivery. Repairs retain frame identity but get new packet numbers. At most two repair transmissions may cover any byte range, and do not repair while another known outstanding copy already covers it. Whole-frame delivery is best effort; unrelated frames never wait for it. [S1]
+Use selective repair of missing byte ranges with bounded persistence. Moving fragmentation into UDP does not by itself prevent split-count loss amplification: this repair mechanism must recover missing pieces, rather than routinely losing whole frames when one piece is lost. Keep original payloads until every range is acknowledged, abandoned, or expired; an ACK means transport acceptance, not successful TAP or application delivery. Repairs retain frame identity but get new packet numbers. At most two repair transmissions may cover any byte range, and do not repair while another known outstanding copy already covers it. Whole-frame delivery is best effort; unrelated frames never wait for it. [S1]
 
 ## 8.1 Acceptance, delivery, and pressure
 
-After full wire validation, reserve all storage needed by a datagram before applying any of it. For new nonterminal DATA, ACK eligibility starts only after its bytes are retained by the reassembly owner. A full handoff queue, unavailable reassembly slot, or failed payload reservation drops the whole datagram without ACKing or marking its packet number received. Do not evict an unrelated accepted frame just to accept the new packet. This makes receiver overload visible as loss to the sender's congestion controller.
+Validate the entire datagram, including every frame length, before retaining any DATA. Packet ACK eligibility starts only after all nonterminal DATA bytes are retained by the reassembly owner. If new frames cannot obtain slots, retain validated pieces for existing frames without allocating new slots, advancing packet/frame windows or applying control records. Drain completed frames to TAP and retry the same datagram once when slots were freed. If it still cannot fit, discard its unretained pieces without ACKing or marking the packet received. Frame coverage and terminal history suppress duplicate delivery on retry. A full handoff queue drops the datagram without ACK. Never evict an unrelated accepted frame to admit a new packet.
 
 DATA for a frame already delivered, abandoned, expired, or below the frame window is terminal: discard it without allocating or writing to TAP again. Such duplicates can be packet-ACKed; when the frame was discarded rather than delivered, schedule a bounded FRAME_ABANDON if still useful. Packet ACKs never promise reliable frame delivery. A receiver may later abandon previously ACKed pieces at the frame deadline or on a TAP error and reports this when possible; it never retracts packet ACKs.
 
@@ -484,7 +486,7 @@ Atomic counters now cover the section 12 totals and gauges with explicit units
 and allocation-free snapshots. The fixed SPSC worker handoff ring has concurrent,
 wraparound, ownership and Miri tests. A pure two-phase commit barrier tracks
 quiescence and installation, with full-queue and stale-acknowledgment tests.
-The receive foundation now has fixed frame storage, whole-datagram reservation,
+The receive foundation now has fixed frame storage, whole-packet ACK admission with existing-frame progress under pressure,
 permanent packet/frame windows, expiry and a retained TAP-write queue. Its tests
 replace the frame model, including pressure, repair and allocation checks.
 Baseline segmentation and inner-flow selection now cover the full frame-size

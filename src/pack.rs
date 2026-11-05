@@ -8,7 +8,7 @@
 use crate::{
     BASE_UDP_PAYLOAD, MAX_FRAME_LEN, UnquicUuid,
     handshake::Connection,
-    socket::MAX_UDP_PAYLOAD,
+    socket::{GSO_MAX_BYTES, MAX_UDP_PAYLOAD},
     wire::{
         DATA_PREFIX_LEN, HEADER_LEN, Header, MAX_RECORDS, Record, WireError, encode_data_prefix,
         encode_datagram,
@@ -377,8 +377,9 @@ impl Batch {
     ///
     /// All inputs are validated before changing the lane or this batch. Packet
     /// exhaustion can produce a shorter batch; it errors when no packet can be
-    /// produced. Frames may remain partly or wholly unplanned when the batch
-    /// fills. Keep their IDs and advance offsets using pieces() after submission.
+    /// produced. Batches end on frame boundaries within one GSO byte budget,
+    /// except at packet-number exhaustion. Keep unplanned frames' IDs and advance
+    /// offsets using pieces() only after submission.
     /// Only prepare again after submitting or discarding the previous batch.
     pub fn prepare(
         &mut self,
@@ -407,8 +408,8 @@ impl Batch {
         let mut frame = 0;
         let mut offset = frames.first().map_or(0, |frame| frame.offset);
         let mut pieces = 0;
-        while frame < frames.len() && self.count < BATCH_CAPACITY && lane.header.packet_number != 0
-        {
+        let packet_limit = BATCH_CAPACITY.min(GSO_MAX_BYTES / limit);
+        while frame < frames.len() && self.count < packet_limit && lane.header.packet_number != 0 {
             let first = pieces;
             let mut length = HEADER_LEN;
             while frame < frames.len()
@@ -416,6 +417,12 @@ impl Batch {
                 && length + RECORD_PREFIX_LEN < limit
             {
                 let input = &frames[frame];
+                // Keep complete frames within one GSO aggregate under socket overload.
+                let available = limit - length - RECORD_PREFIX_LEN
+                    + (packet_limit - self.count - 1) * (limit - DATA_PREFIX_LEN);
+                if input.bytes.len() - offset > available {
+                    break;
+                }
                 let end = input
                     .bytes
                     .len()
@@ -443,6 +450,9 @@ impl Batch {
                     frame += 1;
                     offset = frames.get(frame).map_or(0, |frame| frame.offset);
                 }
+            }
+            if pieces == first {
+                break;
             }
             let plan = &mut self.packets[self.count];
             let mut header = lane.header;

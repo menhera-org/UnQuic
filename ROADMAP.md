@@ -288,8 +288,15 @@ Goal: the packet rate and CPU baseline of section 13 can be measured. Final
 local acceptance requires at least 20 Gbit/s in each direction simultaneously
 at inner MTU 1500, with CPU use reported.
 
+Receive processing now budgets expanded datagrams/records/bytes and interleaves
+TAP delivery. Existing-frame tails can progress under pressure without ACKing
+unretained new pieces. Regression tests cover over-capacity bursts, GRO budgets,
+TAP WouldBlock and packed tails/heads; admission, queue, expiry and socket drops
+have separate counters. Release rate sweeps and residual overload analysis are
+recorded in BENCH.md; neither throughput acceptance gate is closed.
+
 The receive foundation is implemented early for step 1e: fixed frame storage,
-whole-datagram reservation, permanent packet/frame windows, terminal bits,
+whole-packet ACK admission, permanent packet/frame windows, terminal bits,
 100 ms expiry and retained TAP-write entries. Worker routing, initial memory
 reservation checks and batch integration now exist. Socket sends now accept
 caller-supplied lane limits and group scatter/gather datagrams through UDP_SEGMENT,
@@ -327,7 +334,8 @@ now run against the real implementation in tests/reassembly.rs.
   TAP-write queue of section 8.1 with `EAGAIN` retention, receiver deadline
   of 100 ms, and the resource limits of section 8.2 (8192 frames, 64 MiB
   payload per direction, 256 MiB daemon ceiling). Reservation before
-  acceptance; a datagram that cannot be fully reserved is dropped whole.
+  acceptance; under pressure, validated tails may complete existing frames,
+  but no packet is ACK-eligible until all its nonterminal DATA is retained.
 - TAP reads: optional `IFF_VNET_HDR` stays off in v1. The worker already loops
   over at most 64 reads per ready TAP, stopping at EAGAIN or pool exhaustion.
   Keep buffer ownership there; no separate batch wrapper is needed.

@@ -535,6 +535,7 @@ impl Record<'_> {
 pub struct Datagram<'a> {
     header: Header,
     area: &'a [u8],
+    pub(crate) record_count: usize,
 }
 
 impl<'a> Datagram<'a> {
@@ -558,7 +559,11 @@ impl<'a> Datagram<'a> {
         if count == 0 {
             return Err(WireError::RecordCount);
         }
-        Ok(Self { header, area })
+        Ok(Self {
+            header,
+            area,
+            record_count: count,
+        })
     }
 
     /// Returns the validated header.

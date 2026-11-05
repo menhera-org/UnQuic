@@ -128,7 +128,7 @@ fn packet_replay_and_frame_repair_cannot_redeliver_after_window_reuse() {
 }
 
 #[test]
-fn pressure_rejects_whole_datagram_without_ack_or_window_advancement() {
+fn pressure_retains_existing_tails_without_ack_or_window_advancement() {
     let mut lane = Lane::new(1, 9022).unwrap();
     for sequence in 1..=FRAME_CAPACITY as u64 {
         assert_eq!(
@@ -148,7 +148,7 @@ fn pressure_rejects_whole_datagram_without_ack_or_window_advancement() {
         Admission::Pressure
     );
     assert_eq!(lane.lower_bounds(), (1, 1));
-    assert!(lane.front(Duration::ZERO).is_none());
+    assert_eq!(lane.front(Duration::ZERO).unwrap().bytes, &[7; 60]);
     assert_eq!(lane.retained_frames(), FRAME_CAPACITY);
     // A packet rejected by pressure has not consumed its packet number.
     assert_eq!(
@@ -663,4 +663,58 @@ fn only_ack_eliciting_records_schedule_feedback() {
             expected
         );
     }
+}
+
+#[test]
+fn pressure_validates_all_lengths_and_defers_controls_until_full_admission() {
+    let mut lane = Lane::new(1, 1514).unwrap();
+    for sequence in 1..=64 {
+        admit(
+            &mut lane,
+            sequence,
+            &[piece(sequence, 0, &[7; 30])],
+            Duration::ZERO,
+        );
+    }
+    let tail = piece(1, 30, &[7; 30]);
+    let wrong = Record::Data {
+        frame_id: id(1, 2),
+        total_len: 61,
+        offset: 0,
+        bytes: &[0],
+    };
+    assert_eq!(
+        admit(
+            &mut lane,
+            65,
+            &[tail, piece(65, 0, &[9; 30]), wrong],
+            Duration::ZERO
+        ),
+        Admission::Invalid
+    );
+    assert!(lane.front(Duration::ZERO).is_none());
+    let abandon = Record::FrameAbandon {
+        lane: 1,
+        origin: 0,
+        reason: 1,
+        frame_id: id(1, 2),
+    };
+    let records = [tail, piece(65, 0, &[9; 30]), abandon];
+    assert_eq!(
+        admit(&mut lane, 65, &records, Duration::ZERO),
+        Admission::Pressure
+    );
+    assert_eq!(lane.retained_frames(), 64); // The abandon did not run.
+    assert_eq!(lane.front(Duration::ZERO).unwrap().bytes, &[7; 60]);
+    lane.finish_front();
+    assert_eq!(
+        admit(&mut lane, 65, &records, Duration::ZERO),
+        Admission::Fresh
+    );
+    assert_eq!(lane.retained_frames(), 63);
+    assert_eq!(
+        admit(&mut lane, 65, &records, Duration::ZERO),
+        Admission::Duplicate
+    );
+    assert!(lane.front(Duration::ZERO).is_none());
 }

@@ -106,6 +106,10 @@ metrics! {
     expired_frames: sum,
     /// Entries rejected because a bounded queue was full.
     queue_drops: sum,
+    /// Datagrams not fully admitted because receive frame storage was full.
+    admission_pressure: sum,
+    /// Socket receive drops reported by SO_RXQ_OVFL, in kernel skb units.
+    socket_overflow: sum,
     /// Currently retained incomplete or queued receive frames.
     reassembly_frames: sum,
     /// Sum of full frame lengths reserved by retained receive slots.

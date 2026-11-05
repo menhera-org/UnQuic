@@ -534,3 +534,75 @@ fn packed_datagrams_send_original_slices_through_the_socket_batch() {
     }
     assert_eq!(delivered, 2);
 }
+
+#[test]
+fn dropping_alternate_gso_batches_leaves_no_orphan_frames() {
+    for limit in [BASE_UDP_PAYLOAD, unquic::socket::MAX_UDP_PAYLOAD] {
+        for size in [60, 1514, MAX_FRAME_LEN] {
+            let mut sender = sender();
+            let mut receiver = ReceiveLane::new(1, MAX_FRAME_LEN as u16).unwrap();
+            let frames: Vec<_> = (0..256).map(|i| vec![i as u8; size]).collect();
+            let mut delivered = 0;
+            let mut expected = 0;
+            let mut batches = 0;
+            for frames in frames.chunks(pack::BATCH_CAPACITY) {
+                let mut inputs: Vec<_> = frames
+                    .iter()
+                    .map(|bytes| pack::FrameInput {
+                        id: sender.start_frame(bytes.len()).unwrap(),
+                        bytes,
+                        offset: 0,
+                    })
+                    .collect();
+                while !inputs.is_empty() {
+                    let mut batch = pack::Batch::new();
+                    batch.prepare(&mut sender, &inputs, limit).unwrap();
+                    assert!(!batch.is_empty());
+                    assert!(
+                        (0..batch.len())
+                            .map(|i| batch.packet(i).unwrap().length)
+                            .sum::<usize>()
+                            <= 65_535 - 40 - 8
+                    );
+                    let borrowed: Vec<_> = inputs.iter().map(|input| input.bytes).collect();
+                    let mut offsets = vec![0; inputs.len()];
+                    for packet in 0..batch.len() {
+                        let mut slices = [&[][..]; pack::PACKED_SLICES];
+                        let bytes: Vec<_> = batch
+                            .slices(packet, &borrowed, &mut slices)
+                            .unwrap()
+                            .iter()
+                            .flat_map(|part| part.iter().copied())
+                            .collect();
+                        for (frame, range) in batch.pieces(packet).unwrap() {
+                            offsets[frame] = range.end;
+                        }
+                        if batches % 2 == 0 {
+                            assert_eq!(
+                                receiver.admit(&Datagram::decode(&bytes).unwrap(), Duration::ZERO),
+                                Admission::Fresh
+                            );
+                            while let Some(frame) = receiver.front(Duration::ZERO) {
+                                let index = (frame.id & 0x0000_ffff_ffff_ffff) as usize - 1;
+                                assert!(frame.bytes.iter().all(|&byte| byte == index as u8));
+                                delivered += 1;
+                                receiver.finish_front();
+                            }
+                        }
+                    }
+                    let completed = offsets.iter().filter(|&&offset| offset == size).count();
+                    assert!(completed > 0);
+                    assert!(offsets.iter().all(|&offset| offset == 0 || offset == size));
+                    assert_eq!(receiver.retained_frames(), 0);
+                    if batches % 2 == 0 {
+                        expected += completed;
+                    }
+                    inputs.drain(..completed);
+                    batches += 1;
+                }
+            }
+            assert_eq!(delivered, expected);
+            assert!(delivered > 0 && delivered < frames.len());
+        }
+    }
+}

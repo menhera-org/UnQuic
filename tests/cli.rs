@@ -62,6 +62,20 @@ impl Running {
         Self { child, _file: file }
     }
     fn stop(&mut self) {
+        // SAFETY: request a snapshot from this fixture's live child.
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as _, libc::SIGUSR1) },
+            0
+        );
+        let mut diagnostic = String::new();
+        {
+            use std::io::BufRead;
+            let mut stderr = std::io::BufReader::new(self.child.stderr.as_mut().unwrap());
+            while !diagnostic.contains("socket_overflow:") {
+                assert_ne!(stderr.read_line(&mut diagnostic).unwrap(), 0);
+            }
+        }
+        assert!(diagnostic.contains("admission_pressure:"));
         // SAFETY: this PID belongs to the child held and reaped by this fixture.
         assert_eq!(
             unsafe { libc::kill(self.child.id() as _, libc::SIGTERM) },
@@ -69,7 +83,6 @@ impl Running {
         );
         until(|| self.child.try_wait().unwrap().is_some());
         assert!(self.child.wait().unwrap().success());
-        let mut diagnostic = String::new();
         self.child
             .stderr
             .as_mut()

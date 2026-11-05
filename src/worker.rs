@@ -269,6 +269,23 @@ const TAP_TOKEN: u64 = 1 << 32;
 const TX_TOKEN: u64 = 2 << 32;
 const RETRY: Duration = Duration::from_millis(1);
 const RECEIVE_BYTES: usize = 65_536;
+// A bounded GRO backlog must not consume the transmit pool (or vice versa).
+const RECEIVE_BUFFERS: usize = 8;
+const _: () = assert!(RECEIVE_BUFFERS <= BATCH_SIZE && RECEIVE_BUFFERS < BUFFERS);
+
+// Yield at datagram boundaries; one final datagram may exceed the record/byte target.
+#[derive(Default)]
+struct ReceiveBudget {
+    datagrams: usize,
+    records: usize,
+    bytes: usize,
+}
+
+impl ReceiveBudget {
+    fn exhausted(&self) -> bool {
+        self.datagrams >= 64 || self.records >= 128 || self.bytes >= 64 * 1024
+    }
+}
 // Receive quotas follow from fixed lane/slot counts, without shared reservations.
 const _: () = assert!(LANES * reassembly::FRAME_CAPACITY <= 8192);
 const _: () = assert!(LANES * reassembly::FRAME_CAPACITY * MAX_FRAME_LEN <= 64 * 1024 * 1024);
@@ -287,6 +304,7 @@ pub(crate) struct Buffer {
     origin: usize,
     rx_counted: bool,
     tx_reserved: bool,
+    rx_reserved: bool,
     offset: usize,
     segment_size: usize,
     session: usize,
@@ -357,6 +375,7 @@ struct Session {
     tap: Option<TapQueue>,
     tap_registered: bool,
     tap_writable: bool,
+    tap_blocked: bool,
     tap_retry: Duration,
     connection: Option<Connection>,
     path: usize,
@@ -482,12 +501,15 @@ pub(crate) struct Worker {
     sessions: Vec<Session>,
     controls: Vec<SessionControl>,
     receive: Vec<Option<ReceiveSocket>>,
+    receive_overflow: Vec<u32>,
+    rx_retained: usize,
     transmit: Vec<PeerPaths>,
     pub requests: Option<Consumer<AddressRequest>>,
     peer_controls: Vec<PeerControl>,
     free: Vec<Box<Buffer>>,
     returns: Vec<Vec<Box<Buffer>>>,
     pending: VecDeque<Box<Buffer>>,
+    received: VecDeque<Box<Buffer>>,
     ready: VecDeque<(usize, usize)>,
     notifications: u64,
     counters: Snapshot,
@@ -505,14 +527,14 @@ impl Worker {
             .checked_add(
                 workers
                     .checked_mul(BUFFERS)?
-                    .checked_mul(2 * size_of::<Box<Buffer>>())?,
+                    .checked_mul(3 * size_of::<Box<Buffer>>())?,
             )?
             .checked_add(workers.checked_mul(size_of::<Vec<Box<Buffer>>>())?)?
             .checked_add(
                 config
                     .endpoints
                     .len()
-                    .checked_mul(size_of::<Option<ReceiveSocket>>())?,
+                    .checked_mul(size_of::<Option<ReceiveSocket>>() + size_of::<u32>())?,
             )?;
         for endpoint in &config.endpoints {
             per_worker = per_worker.checked_add(
@@ -593,6 +615,7 @@ impl Worker {
                 tap: None,
                 tap_registered: false,
                 tap_writable: false,
+                tap_blocked: false,
                 tap_retry: Duration::ZERO,
                 connection: None,
                 path: 0,
@@ -624,6 +647,7 @@ impl Worker {
                     origin: id,
                     rx_counted: false,
                     tx_reserved: false,
+                    rx_reserved: false,
                     offset: 0,
                     segment_size: 0,
                     session: 0,
@@ -647,6 +671,8 @@ impl Worker {
             outgoing: (0..count).map(|_| None).collect(),
             incoming: (0..count).map(|_| None).collect(),
             receive: (0..config.endpoints.len()).map(|_| None).collect(),
+            receive_overflow: vec![0; config.endpoints.len()],
+            rx_retained: 0,
             transmit: config
                 .peers
                 .iter()
@@ -674,6 +700,7 @@ impl Worker {
             free,
             returns: (0..count).map(|_| Vec::with_capacity(BUFFERS)).collect(),
             pending: VecDeque::with_capacity(count * BUFFERS),
+            received: VecDeque::with_capacity(count * BUFFERS),
             ready: VecDeque::with_capacity(batch_count),
             notifications: 0,
             counters: Snapshot::default(),
@@ -707,6 +734,7 @@ impl Worker {
         }
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 128];
         let mut immediate = true;
+        let mut event_start = 0;
         while !self.control.quitting() {
             let now = monotonic_now()?;
             let mut more = self.drain_queues(now)?;
@@ -717,6 +745,7 @@ impl Worker {
             self.addresses(now)?;
             self.progress_barriers(now)?;
             self.timers(now)?;
+            more |= self.drain_packets(now)?;
             self.flush_frames(now)?;
             self.flush_taps(now)?;
             self.flush_notifications()?;
@@ -753,10 +782,18 @@ impl Worker {
             };
             immediate = false;
             let now = monotonic_now()?;
-            for event in &events[..count] {
+            let start = event_start.min(count);
+            event_start = if start + 1 < count { start + 1 } else { 0 };
+            for event in events[start..count].iter().chain(&events[..start]) {
                 let token = event.u64;
                 match token >> 32 {
-                    1 => self.read_tap(token as u32 as usize, now)?,
+                    1 => {
+                        let session = token as u32 as usize;
+                        if event.events & libc::EPOLLOUT as u32 != 0 {
+                            self.sessions[session].tap_blocked = false;
+                        }
+                        self.read_tap(session, now)?;
+                    }
                     2 => {
                         let peer = ((token as u32) >> 7) as usize;
                         let path = ((token as u32) >> 6 & 1) as usize;
@@ -871,6 +908,10 @@ impl Worker {
     fn release(&mut self, mut buffer: Box<Buffer>) {
         let origin = buffer.origin;
         if origin == self.id {
+            if buffer.rx_reserved {
+                self.rx_retained -= 1;
+                buffer.rx_reserved = false;
+            }
             if buffer.tx_reserved {
                 self.sessions[buffer.session].tx_retained -= 1;
                 buffer.tx_reserved = false;
@@ -1131,6 +1172,7 @@ impl Worker {
                     .add(tap.as_fd(), TAP_TOKEN | index as u64, libc::EPOLLIN as u32)?;
                 session.tap_registered = true;
                 session.tap_writable = false;
+                session.tap_blocked = false;
             }
         }
         Ok(())
@@ -1144,7 +1186,7 @@ impl Worker {
                 let Some(event) = event else { break };
                 more |= index + 1 == BATCH_SIZE;
                 match event {
-                    Event::Packet(buffer) => self.packet(buffer, now)?,
+                    Event::Packet(buffer) => self.received.push_back(buffer),
                     Event::Frame(buffer) => self.frame(buffer, now)?,
                     Event::Free(buffer) => self.release(buffer),
                     Event::Register { mut buffer, lane } => {
@@ -1159,11 +1201,11 @@ impl Worker {
                             self.sessions[session].rx_index[usize::from(id)] = slot as u8 + 1;
                             self.sessions[session].rx[slot] = Some(lane);
                             self.install_rx_counters(session, slot);
-                            self.packet(buffer, now)?;
+                            self.received.push_back(buffer);
                         } else {
                             self.return_lane(session, lane);
                             if buffer.advance() {
-                                self.packet(buffer, now)?;
+                                self.received.push_back(buffer);
                             } else {
                                 self.release(buffer);
                             }
@@ -1228,13 +1270,21 @@ impl Worker {
     }
 
     fn read_socket(&mut self, endpoint: usize, now: Duration) -> io::Result<()> {
-        let mut buffers: [Option<Box<Buffer>>; BATCH_SIZE] =
-            std::array::from_fn(|_| self.free.pop());
+        let available = (RECEIVE_BUFFERS - self.rx_retained).min(self.free.len());
+        let mut buffers: [Option<Box<Buffer>>; RECEIVE_BUFFERS] = std::array::from_fn(|index| {
+            if index >= available {
+                return None;
+            }
+            let mut buffer = self.free.pop().unwrap();
+            buffer.rx_reserved = true;
+            self.rx_retained += 1;
+            Some(buffer)
+        });
         let available = buffers.iter().take_while(|b| b.is_some()).count();
         if available == 0 {
             return Ok(());
         }
-        let mut received: [ReceiveDatagram<'_>; BATCH_SIZE] =
+        let mut received: [ReceiveDatagram<'_>; RECEIVE_BUFFERS] =
             std::array::from_fn(|_| ReceiveDatagram::new(&mut []));
         for (output, buffer) in received.iter_mut().zip(&mut buffers).take(available) {
             output.buffer = &mut buffer.as_mut().unwrap().bytes;
@@ -1243,9 +1293,11 @@ impl Worker {
             .as_ref()
             .unwrap()
             .recv_batch(&mut received[..available]);
-        let lengths: [usize; BATCH_SIZE] = std::array::from_fn(|i| received[i].length);
-        let truncated: [bool; BATCH_SIZE] = std::array::from_fn(|i| received[i].truncated);
-        let segments: [usize; BATCH_SIZE] = std::array::from_fn(|i| received[i].segment_size);
+        let lengths: [usize; RECEIVE_BUFFERS] = std::array::from_fn(|i| received[i].length);
+        let truncated: [bool; RECEIVE_BUFFERS] = std::array::from_fn(|i| received[i].truncated);
+        let segments: [usize; RECEIVE_BUFFERS] = std::array::from_fn(|i| received[i].segment_size);
+        let overflows: [Option<u32>; RECEIVE_BUFFERS] =
+            std::array::from_fn(|i| received[i].overflow);
         let count = match result {
             Ok(count) => count,
             Err(error) => {
@@ -1257,6 +1309,14 @@ impl Worker {
         };
         for (index, buffer) in buffers.iter_mut().enumerate().take(available) {
             let mut buffer = buffer.take().unwrap();
+            if index < count
+                && let Some(total) = overflows[index]
+            {
+                self.counters.socket_overflow = self.counters.socket_overflow.wrapping_add(
+                    u64::from(total.wrapping_sub(self.receive_overflow[endpoint])),
+                );
+                self.receive_overflow[endpoint] = total;
+            }
             if index < count && !truncated[index] {
                 buffer.length = lengths[index];
                 buffer.rx_counted = false;
@@ -1272,7 +1332,7 @@ impl Worker {
                     .counters
                     .rx_outer_bytes
                     .wrapping_add((buffer.length + 48 * packets) as u64);
-                self.packet(buffer, now)?;
+                self.received.push_back(buffer);
             } else {
                 if index < count {
                     self.counters.malformed_packets =
@@ -1284,23 +1344,28 @@ impl Worker {
         Ok(())
     }
 
-    fn packet(&mut self, mut buffer: Box<Buffer>, now: Duration) -> io::Result<()> {
-        loop {
-            let Some(mut next) = self.packet_one(buffer, now)? else {
-                return Ok(());
+    fn drain_packets(&mut self, now: Duration) -> io::Result<bool> {
+        let mut budget = ReceiveBudget::default();
+        while !budget.exhausted() {
+            let Some(buffer) = self.received.pop_front() else {
+                break;
             };
-            if !next.advance() {
-                self.release(next);
-                return Ok(());
+            if let Some(mut buffer) = self.packet_one(buffer, now, &mut budget)? {
+                if buffer.advance() {
+                    self.received.push_front(buffer);
+                } else {
+                    self.release(buffer);
+                }
             }
-            buffer = next;
         }
+        Ok(!self.received.is_empty())
     }
 
     fn packet_one(
         &mut self,
         mut buffer: Box<Buffer>,
         now: Duration,
+        budget: &mut ReceiveBudget,
     ) -> io::Result<Option<Box<Buffer>>> {
         let end = if buffer.segment_size == 0 {
             buffer.length
@@ -1308,14 +1373,18 @@ impl Worker {
             (buffer.offset + buffer.segment_size).min(buffer.length)
         };
         let length = end - buffer.offset;
+        budget.datagrams += 1;
+        budget.bytes += length;
         if length > crate::socket::MAX_UDP_PAYLOAD {
             self.counters.malformed_packets = self.counters.malformed_packets.wrapping_add(1);
             return Ok(Some(buffer));
         }
         let Ok(datagram) = Datagram::decode(&buffer.bytes[buffer.offset..end]) else {
+            budget.records += wire::MAX_RECORDS;
             self.counters.malformed_packets = self.counters.malformed_packets.wrapping_add(1);
             return Ok(Some(buffer));
         };
+        budget.records += datagram.record_count;
         let header = datagram.header();
         let Some(session) = self.shared.config.session_for_cookie(header.cookie) else {
             self.counters.unknown_cookie_packets =
@@ -1433,7 +1502,23 @@ impl Worker {
             .rx_outer_bytes
             .wrapping_add((length + 48) as u64);
         local.rx_dirty |= 1_u64 << slot;
-        match local.rx[slot].as_mut().unwrap().admit(&datagram, now) {
+        let mut admission = local.rx[slot].as_mut().unwrap().admit(&datagram, now);
+        if admission == Admission::Pressure {
+            let retained = local.rx[slot].as_ref().unwrap().retained_frames();
+            self.flush_rx(session, slot, now);
+            if self.sessions[session].rx[slot]
+                .as_ref()
+                .unwrap()
+                .retained_frames()
+                < retained
+            {
+                admission = self.sessions[session].rx[slot]
+                    .as_mut()
+                    .unwrap()
+                    .admit(&datagram, now);
+            }
+        }
+        match admission {
             Admission::Fresh => {
                 for record in datagram.records() {
                     match record {
@@ -1509,12 +1594,14 @@ impl Worker {
                     .wrapping_add(1);
             }
             Admission::Pressure => {
-                self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
-                self.sessions[session].totals.queue_drops =
-                    self.sessions[session].totals.queue_drops.wrapping_add(1);
-                self.sessions[session].rx_totals[slot].queue_drops = self.sessions[session]
+                self.counters.admission_pressure = self.counters.admission_pressure.wrapping_add(1);
+                self.sessions[session].totals.admission_pressure = self.sessions[session]
+                    .totals
+                    .admission_pressure
+                    .wrapping_add(1);
+                self.sessions[session].rx_totals[slot].admission_pressure = self.sessions[session]
                     .rx_totals[slot]
-                    .queue_drops
+                    .admission_pressure
                     .wrapping_add(1);
             }
             Admission::Invalid => {
@@ -1529,12 +1616,23 @@ impl Worker {
                     .wrapping_add(1);
             }
         }
+        if self.sessions[session].rx[slot]
+            .as_ref()
+            .unwrap()
+            .ready_count()
+            >= 16
+        {
+            self.flush_rx(session, slot, now);
+        }
         self.refresh_rx_counters(session, slot);
         Ok(Some(buffer))
     }
 
     fn read_tap(&mut self, session: usize, now: Duration) -> io::Result<()> {
         for _ in 0..BATCH_SIZE {
+            if self.free.len() <= RECEIVE_BUFFERS - self.rx_retained {
+                break;
+            }
             let Some(mut buffer) = self.free.pop() else {
                 break;
             };
@@ -1844,39 +1942,8 @@ impl Worker {
                     continue;
                 }
                 lane.expire(now);
-                if let Some(tap) = &mut local.tap {
-                    for _ in 0..BATCH_SIZE {
-                        let Some(frame) = lane.front(now) else { break };
-                        let length = frame.bytes.len();
-                        match tap.write_frame(frame.bytes) {
-                            Ok(()) => {
-                                self.counters.delivered_frame_bytes = self
-                                    .counters
-                                    .delivered_frame_bytes
-                                    .wrapping_add(length as u64);
-                                local.totals.delivered_frame_bytes = local
-                                    .totals
-                                    .delivered_frame_bytes
-                                    .wrapping_add(length as u64);
-                                local.rx_totals[slot].delivered_frame_bytes = local.rx_totals[slot]
-                                    .delivered_frame_bytes
-                                    .wrapping_add(length as u64);
-                                local.rx_dirty |= 1_u64 << slot;
-                            }
-                            Err(error) if transient(&error) => {
-                                writable = true;
-                                break;
-                            }
-                            Err(_) => {
-                                self.counters.tap_errors = self.counters.tap_errors.wrapping_add(1);
-                                local.totals.tap_errors = local.totals.tap_errors.wrapping_add(1);
-                                local.rx_totals[slot].tap_errors =
-                                    local.rx_totals[slot].tap_errors.wrapping_add(1);
-                                local.rx_dirty |= 1_u64 << slot;
-                            }
-                        }
-                        lane.finish_front();
-                    }
+                if lane.ready_count() != 0 {
+                    writable |= self.flush_rx(session, slot, now);
                 }
                 self.refresh_rx_counters(session, slot);
             }
@@ -1885,6 +1952,9 @@ impl Worker {
                 local.rx_totals.iter().map(|s| s.reassembly_frames).sum();
             local.totals.reassembly_bytes =
                 local.rx_totals.iter().map(|s| s.reassembly_bytes).sum();
+            if !writable {
+                local.tap_blocked = false;
+            }
             if local.tap_registered && local.tap_writable != writable {
                 self.reactor.modify(
                     local.tap.as_ref().unwrap().as_fd(),
@@ -1895,6 +1965,51 @@ impl Worker {
             }
         }
         Ok(())
+    }
+
+    fn flush_rx(&mut self, session: usize, slot: usize, now: Duration) -> bool {
+        let local = &mut self.sessions[session];
+        if local.tap_blocked {
+            return true;
+        }
+        let lane = local.rx[slot].as_mut().unwrap();
+        let mut writable = false;
+        if let Some(tap) = &mut local.tap {
+            for _ in 0..BATCH_SIZE {
+                let Some(frame) = lane.front(now) else { break };
+                let length = frame.bytes.len();
+                match tap.write_frame(frame.bytes) {
+                    Ok(()) => {
+                        self.counters.delivered_frame_bytes = self
+                            .counters
+                            .delivered_frame_bytes
+                            .wrapping_add(length as u64);
+                        local.totals.delivered_frame_bytes = local
+                            .totals
+                            .delivered_frame_bytes
+                            .wrapping_add(length as u64);
+                        local.rx_totals[slot].delivered_frame_bytes = local.rx_totals[slot]
+                            .delivered_frame_bytes
+                            .wrapping_add(length as u64);
+                        local.rx_dirty |= 1_u64 << slot;
+                    }
+                    Err(error) if transient(&error) => {
+                        local.tap_blocked = true;
+                        writable = true;
+                        break;
+                    }
+                    Err(_) => {
+                        self.counters.tap_errors = self.counters.tap_errors.wrapping_add(1);
+                        local.totals.tap_errors = local.totals.tap_errors.wrapping_add(1);
+                        local.rx_totals[slot].tap_errors =
+                            local.rx_totals[slot].tap_errors.wrapping_add(1);
+                        local.rx_dirty |= 1_u64 << slot;
+                    }
+                }
+                lane.finish_front();
+            }
+        }
+        writable
     }
 
     fn feedback(&mut self, session: usize, packet: u64, length: u16, now: Duration) {
@@ -2286,6 +2401,300 @@ fn transient(error: &io::Error) -> bool {
 mod tests {
     use super::*;
 
+    // Datagram sockets give deterministic full-write/WouldBlock behavior without
+    // depending on the kernel's TAP ingress drop policy.
+    fn receive_worker() -> (Worker, std::os::unix::net::UnixDatagram) {
+        let (shared, [mut worker, _]) = test_workers();
+        let params = wire::Params {
+            port: 40000,
+            max_frame_len: 9022,
+            mandatory_features: 0,
+            optional_features: 0,
+        };
+        let connection = Connection {
+            role: handshake::Role::Initiator,
+            initiator: Tag::new(1).unwrap(),
+            responder: Tag::new(2).unwrap(),
+            local: params,
+            peer: wire::Params {
+                port: 40001,
+                ..params
+            },
+            max_frame_len: 9022,
+        };
+        worker.command(
+            0,
+            Command {
+                generation: 1,
+                phase: Phase::Install,
+                connection: Some(connection),
+            },
+            0,
+        );
+        let mut lane = worker.sessions[0].free.pop().unwrap();
+        lane.reset(7, 9022).unwrap();
+        worker.sessions[0].rx[0] = Some(lane);
+        worker.sessions[0].rx_index[7] = 1;
+        shared.owners[0][7].store(1, Ordering::Release);
+        worker.install_rx_counters(0, 0);
+        let (tx, rx) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        tx.set_nonblocking(true).unwrap();
+        rx.set_nonblocking(true).unwrap();
+        worker.attach_tap(0, TapQueue::test_fd(tx.into())).unwrap();
+        (worker, rx)
+    }
+
+    fn receive_bytes(number: u64, records: &[Record<'_>], output: &mut [u8]) -> usize {
+        wire::encode_datagram(
+            Header {
+                cookie: crate::UnquicUuid::from_bytes([1; 16]),
+                receive_tag: 1,
+                lane: 7,
+                record_area_len: 0,
+                packet_number: number,
+            },
+            records,
+            output,
+        )
+        .unwrap()
+    }
+
+    fn receive_piece(sequence: u64, offset: u32, bytes: &[u8]) -> Record<'_> {
+        Record::Data {
+            frame_id: (7 << 48) | sequence,
+            total_len: 60,
+            offset,
+            bytes,
+        }
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn receive_and_transmit_cannot_exhaust_each_others_buffers() {
+        let (mut worker, tap) = receive_worker();
+        worker.sessions[0].tx.truncate(1);
+        let socket = ReceiveSocket::bind("[::1]:40002".parse().unwrap(), None).unwrap();
+        let sender = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        for number in 1..=32 {
+            let length = receive_bytes(number, &[receive_piece(number, 0, &[9; 60])], &mut bytes);
+            sender
+                .send_to(&bytes[..length], socket.local_addr())
+                .unwrap();
+        }
+        worker.receive[0] = Some(socket);
+        worker.read_socket(0, Duration::ZERO).unwrap();
+        assert_eq!(worker.rx_retained, RECEIVE_BUFFERS);
+        worker.read_socket(0, Duration::ZERO).unwrap();
+        assert_eq!(worker.received.len(), RECEIVE_BUFFERS);
+
+        for _ in 0..BUFFERS {
+            tap.send(&[0; 60]).unwrap();
+        }
+        for _ in 0..3 {
+            worker.read_tap(0, Duration::ZERO).unwrap();
+        }
+        assert_eq!(worker.pending.len(), BUFFERS - RECEIVE_BUFFERS);
+        assert!(worker.free.is_empty());
+
+        worker.drain_packets(Duration::ZERO).unwrap();
+        assert_eq!(worker.rx_retained, 0);
+        assert_eq!(worker.free.len(), RECEIVE_BUFFERS);
+        worker.read_tap(0, Duration::ZERO).unwrap();
+        assert_eq!(worker.free.len(), RECEIVE_BUFFERS);
+        for _ in 0..3 {
+            worker.read_socket(0, Duration::ZERO).unwrap();
+            assert_eq!(worker.rx_retained, RECEIVE_BUFFERS);
+            worker.drain_packets(Duration::ZERO).unwrap();
+        }
+        assert_eq!(worker.rx_retained, 0);
+        while let Some(buffer) = worker.pending.pop_front() {
+            worker.release(buffer);
+        }
+        assert_eq!(worker.free.len(), BUFFERS);
+        assert_eq!(worker.counters.admission_pressure, 0);
+        assert_eq!(worker.counters.expired_frames, 0);
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn receive_bursts_budget_expanded_datagrams_records_and_bytes() {
+        // Exercise ordinary bursts, GRO bursts and record-heavy packed datagrams.
+        for (segments, records) in [(1, 1), (100, 1), (20, 16)] {
+            let (mut worker, rx) = receive_worker();
+            let mut number = 1;
+            for _ in 0..if segments == 1 { 100 } else { 2 } {
+                let mut buffer = worker.free.pop().unwrap();
+                for _ in 0..segments {
+                    let data: Vec<_> = (0..records)
+                        .map(|r| receive_piece((number - 1) * records + r + 1, 0, &[5; 60]))
+                        .collect();
+                    let length = receive_bytes(number, &data, &mut buffer.bytes[buffer.length..]);
+                    if segments != 1 {
+                        buffer.segment_size = length;
+                    }
+                    buffer.length += length;
+                    number += 1;
+                }
+                worker.received.push_back(buffer);
+            }
+            assert!(worker.drain_packets(Duration::ZERO).unwrap());
+            let first_bytes = worker.counters.delivered_frame_bytes;
+            assert_eq!(first_bytes, if records == 1 { 64 * 60 } else { 128 * 60 });
+            // Remaining work must yield to the caller, even inside one aggregate.
+            assert!(!worker.received.is_empty());
+            let mut delivered = 0;
+            loop {
+                let mut bytes = [0; 60];
+                while let Ok(n) = rx.recv(&mut bytes) {
+                    assert_eq!(n, 60);
+                    assert_eq!(bytes, [5; 60]);
+                    delivered += 1;
+                }
+                if !worker.drain_packets(Duration::ZERO).unwrap() {
+                    worker.flush_taps(Duration::ZERO).unwrap();
+                    while rx.recv(&mut bytes).is_ok() {
+                        delivered += 1;
+                    }
+                    break;
+                }
+            }
+            assert_eq!(delivered, (number - 1) * records);
+            assert_eq!(worker.counters.admission_pressure, 0);
+            assert_eq!(worker.counters.expired_frames, 0);
+            assert_eq!(worker.free.len(), BUFFERS);
+        }
+
+        // The byte budget must yield before the datagram or record budgets.
+        let (mut worker, _) = receive_worker();
+        let mut number = 1;
+        for _ in 0..2 {
+            let mut buffer = worker.free.pop().unwrap();
+            for _ in 0..30 {
+                let length = receive_bytes(
+                    number,
+                    &[Record::Data {
+                        frame_id: (7 << 48) | number,
+                        total_len: 1514,
+                        offset: 0,
+                        bytes: &[3; 1164],
+                    }],
+                    &mut buffer.bytes[buffer.length..],
+                );
+                assert_eq!(length, 1232);
+                buffer.segment_size = length;
+                buffer.length += length;
+                number += 1;
+            }
+            worker.received.push_back(buffer);
+        }
+        assert!(worker.drain_packets(Duration::ZERO).unwrap());
+        assert_eq!(
+            worker.sessions[0].rx[0].as_ref().unwrap().retained_frames(),
+            54
+        );
+        assert_eq!(worker.received.front().unwrap().offset, 24 * 1232);
+        assert!(!worker.drain_packets(Duration::ZERO).unwrap());
+        assert_eq!(worker.counters.admission_pressure, 0);
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn blocked_tap_keeps_tails_but_never_acks_an_unretained_head() {
+        use wire::{AckRange, MAX_ACK_RANGES};
+        for blocked in [false, true] {
+            let (mut worker, rx) = receive_worker();
+            let now = Duration::ZERO;
+            let mut bytes = [0; 256];
+            for number in 1..=64 {
+                let length =
+                    receive_bytes(number, &[receive_piece(number, 0, &[7; 30])], &mut bytes);
+                assert_eq!(
+                    worker.sessions[0].rx[0]
+                        .as_mut()
+                        .unwrap()
+                        .admit(&Datagram::decode(&bytes[..length]).unwrap(), now),
+                    Admission::Fresh
+                );
+            }
+            // Fill the simulated TAP's send queue before the completing piece arrives.
+            let tap = worker.sessions[0].tap.as_mut().unwrap();
+            if blocked {
+                while tap.write_frame(&[0; 60]).is_ok() {}
+            }
+            let records = [
+                receive_piece(1, 30, &[7; 30]),
+                receive_piece(65, 0, &[9; 30]),
+            ];
+            for _ in 0..2 {
+                let mut buffer = worker.free.pop().unwrap();
+                buffer.length = receive_bytes(65, &records, &mut buffer.bytes);
+                worker.received.push_back(buffer);
+                worker.drain_packets(now).unwrap();
+            }
+            assert_eq!(
+                worker.counters.admission_pressure,
+                if blocked { 2 } else { 0 }
+            );
+            let lane = worker.sessions[0].rx[0].as_mut().unwrap();
+            assert_eq!(lane.retained_frames(), 64);
+            if blocked {
+                assert_eq!(lane.front(now).unwrap().bytes, &[7; 60]);
+            }
+            let mut ranges = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
+            let Some(Record::Ack {
+                ranges: accepted, ..
+            }) = lane.take_ack(now, &mut ranges)
+            else {
+                panic!()
+            };
+            assert_eq!(
+                accepted.iter().collect::<Vec<_>>(),
+                [AckRange {
+                    start: 1,
+                    end: if blocked { 64 } else { 65 }
+                }]
+            );
+            if blocked {
+                while rx.recv(&mut bytes).is_ok() {}
+            }
+            worker.sessions[0].tap_blocked = false; // Simulate EPOLLOUT after draining.
+            worker.flush_taps(now).unwrap();
+            assert_eq!(rx.recv(&mut bytes).unwrap(), 60);
+            assert_eq!(&bytes[..60], &[7; 60]);
+            // Retry identical bytes and packet number: only the new head is retained.
+            let mut buffer = worker.free.pop().unwrap();
+            buffer.length = receive_bytes(65, &records, &mut buffer.bytes);
+            worker.received.push_back(buffer);
+            worker.drain_packets(now).unwrap();
+            let mut buffer = worker.free.pop().unwrap();
+            buffer.length =
+                receive_bytes(66, &[receive_piece(65, 30, &[9; 30])], &mut buffer.bytes);
+            worker.received.push_back(buffer);
+            worker.drain_packets(now).unwrap();
+            worker.flush_taps(now).unwrap();
+            assert_eq!(rx.recv(&mut bytes).unwrap(), 60);
+            assert_eq!(&bytes[..60], &[9; 60]);
+            assert_eq!(
+                rx.recv(&mut bytes).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(worker.counters.delivered_frame_bytes, 120);
+            assert_eq!(worker.free.len(), BUFFERS);
+            let lane = worker.sessions[0].rx[0].as_mut().unwrap();
+            let Some(Record::Ack {
+                ranges: accepted, ..
+            }) = lane.take_ack(Duration::from_millis(1), &mut ranges)
+            else {
+                panic!()
+            };
+            assert_eq!(
+                accepted.iter().collect::<Vec<_>>(),
+                [AckRange { start: 1, end: 66 }]
+            );
+        }
+    }
+
     #[test]
     fn origin_reservations_bound_every_session_direction() {
         for workers in 1..=64 {
@@ -2352,7 +2761,8 @@ mod tests {
         batch
             .prepare(workers[0].sessions[0].tx[0].as_mut().unwrap())
             .unwrap();
-        assert_eq!(batch.plan.len(), 64);
+        assert!(batch.plan.len() > 1);
+        let mut last_packet = batch.plan.packet(batch.plan.len() - 1).unwrap().number;
         let next = batch.plan.packet(1).unwrap();
         // Feed a successful one-packet prefix, then hold the socket unwritable.
         workers[0].submitted_batch(0, 0, &mut batch, 1);
@@ -2375,7 +2785,6 @@ mod tests {
         let mut reassembly = reassembly::Lane::new(1, 9022).unwrap();
         let mut delivered = 0;
         let mut physical_bytes = 0;
-        let mut last_packet = 64;
         for _ in 0..32 {
             workers[0].flush_frames(Duration::from_millis(10)).unwrap();
             loop {
@@ -2669,6 +3078,7 @@ mod tests {
             let now = Duration::from_millis(tick);
             for worker in &mut workers {
                 worker.drain_queues(now).unwrap();
+                worker.drain_packets(now).unwrap();
                 worker.flush_returns();
                 worker.progress_barriers(now).unwrap();
                 worker.flush_frames(now).unwrap();
@@ -2742,7 +3152,8 @@ mod tests {
                 &mut buffer.bytes,
             )
             .unwrap();
-            worker.packet(buffer, Duration::ZERO).unwrap();
+            worker.received.push_back(buffer);
+            worker.drain_packets(Duration::ZERO).unwrap();
             worker.flush_taps(Duration::ZERO).unwrap();
             worker.publish_counters();
             let lane = shared
@@ -2879,10 +3290,12 @@ mod tests {
         }
         let pointer = (&*buffer as *const Buffer) as usize;
         let original = buffer.bytes[..buffer.length].to_vec();
-        workers[0].packet(buffer, Duration::ZERO).unwrap();
+        workers[0].received.push_back(buffer);
+        workers[0].drain_packets(Duration::ZERO).unwrap();
         for _ in 0..8 {
             for worker in &mut workers {
                 worker.drain_queues(Duration::ZERO).unwrap();
+                worker.drain_packets(Duration::ZERO).unwrap();
                 worker.flush_taps(Duration::ZERO).unwrap();
                 worker.flush_returns();
             }

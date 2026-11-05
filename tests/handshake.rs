@@ -774,6 +774,55 @@ fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
         lane.retire();
         lane.reset(1, 9022).unwrap();
     }
+    for sequence in 1..=64 {
+        let record = Record::Data {
+            frame_id: (1 << 48) | sequence,
+            bytes: &[3; 30],
+            total_len: 60,
+            offset: 0,
+        };
+        let len = encode_datagram(
+            Header {
+                packet_number: sequence,
+                ..header
+            },
+            &[record],
+            &mut packet,
+        )
+        .unwrap();
+        assert_eq!(
+            lane.admit(&Datagram::decode(&packet[..len]).unwrap(), Duration::ZERO),
+            Admission::Fresh
+        );
+    }
+    let records = [
+        Record::Data {
+            frame_id: (1 << 48) | 1,
+            total_len: 60,
+            offset: 30,
+            bytes: &[3; 30],
+        },
+        Record::Data {
+            frame_id: (1 << 48) | 65,
+            total_len: 60,
+            offset: 0,
+            bytes: &[3; 30],
+        },
+    ];
+    let len = encode_datagram(
+        Header {
+            packet_number: 65,
+            ..header
+        },
+        &records,
+        &mut packet,
+    )
+    .unwrap();
+    let datagram = Datagram::decode(&packet[..len]).unwrap();
+    assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Pressure);
+    assert_eq!(lane.front(Duration::ZERO).unwrap().bytes, &[3; 60]);
+    lane.finish_front();
+    assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Fresh);
     let allocations = ALLOCATION_COUNT.replace(None);
     assert_eq!(allocations, Some(0));
 }

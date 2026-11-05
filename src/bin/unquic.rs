@@ -15,6 +15,12 @@ use unquic::{
     runtime::{self, Control},
 };
 
+static REPORT: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn report(_: libc::c_int) {
+    REPORT.store(true, Ordering::Relaxed);
+}
+
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn stop(_: libc::c_int) {
@@ -33,6 +39,11 @@ fn signals() -> io::Result<()> {
         {
             return Err(io::Error::last_os_error());
         }
+    }
+    action.sa_sigaction = report as *const () as usize;
+    // SAFETY: initialized handler and mask remain alive for this call.
+    if unsafe { libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) } < 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -101,6 +112,13 @@ fn serve(loaded: config::Loaded) -> io::Result<()> {
     let mut lookups = Some(loaded.lookups);
     let mut helper_error = None;
     while !transport.is_finished() {
+        if REPORT.swap(false, Ordering::Relaxed) {
+            let mut worker = 0;
+            while let Some(snapshot) = control.worker_counters(worker) {
+                eprintln!("unquic: worker {worker} {snapshot:?}");
+                worker += 1;
+            }
+        }
         if STOP.load(Ordering::Relaxed) {
             control.shutdown();
             break;

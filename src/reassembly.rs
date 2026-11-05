@@ -30,7 +30,8 @@ pub enum Admission {
     Fresh,
     /// Packet number already seen or permanently below the acceptance bound.
     Duplicate,
-    /// Insufficient storage; no records or packet/window advancement were applied.
+    /// Insufficient storage; existing DATA may progress, but no packet ACK,
+    /// window advancement, new reservation or control record is applied.
     Pressure,
     /// Wrong/retired lane, oversized frame or inconsistent frame length.
     Invalid,
@@ -270,6 +271,10 @@ impl Lane {
         FRAME_CAPACITY - self.free.len()
     }
 
+    pub(crate) fn ready_count(&self) -> usize {
+        self.ready.len()
+    }
+
     /// Sum of complete frame lengths reserved by retained slots.
     pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
@@ -356,12 +361,12 @@ impl Lane {
         self.retained_bytes = 0;
     }
 
-    /// Reserves a whole validated datagram before applying any record.
+    /// Validates all records before retaining DATA and making a packet ACK-eligible.
     ///
-    /// Due expirations happen independently before reservation. Pressure never
-    /// acknowledges the packet or advances either bound. Non-DATA records for
-    /// other owners are left to the caller after a Fresh result. Origin-zero
-    /// abandonment on this lane is applied here.
+    /// On pressure, only pieces for existing frames are retained. The caller can
+    /// deliver completed frames and retry the same datagram. Until all its DATA
+    /// fits, neither packet history, window bounds nor control records advance.
+    /// Due expirations remain independent. Other owners apply controls only on Fresh.
     pub fn admit(&mut self, datagram: &Datagram<'_>, now: Duration) -> Admission {
         let header = datagram.header();
         if self.retired || header.lane != self.id || header.receive_tag == 0 {
@@ -419,10 +424,10 @@ impl Lane {
                 _ => {}
             }
         }
-        if count > self.free.len() {
-            return Admission::Pressure;
+        let pressure = count > self.free.len();
+        if !pressure {
+            self.advance_frames(highest);
         }
-        self.advance_frames(highest);
         for record in datagram.records() {
             match record {
                 Record::Data {
@@ -438,6 +443,7 @@ impl Lane {
                     }
                     let slot = match self.find(sequence) {
                         Some(slot) => slot,
+                        None if pressure => continue,
                         None => {
                             let slot = usize::from(self.free.pop().expect("preflight reservation"));
                             self.frames[slot].start(sequence, total_len as u16, now);
@@ -465,11 +471,14 @@ impl Lane {
                     origin: 0,
                     frame_id,
                     ..
-                } => {
+                } if !pressure => {
                     self.abandon(frame_id);
                 }
                 _ => {}
             }
+        }
+        if pressure {
+            return Admission::Pressure;
         }
         self.packets.mark(header.packet_number);
         self.ack.accepted(header.packet_number, eliciting, now);

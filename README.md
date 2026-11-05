@@ -235,7 +235,11 @@ as owned buffers. Full data queues drop without ACK; buffer returns, barrier
 messages and pending lane retirements remain bounded and retry.
 
 Startup reserves 128 packet/frame buffers per worker, each with 64 KiB of
-payload storage for GRO, and 64 receive-lane tables per session. Each lane has
+payload storage for GRO, and 64 receive-lane tables per session. Eight pool
+entries are reserved for socket receive work; receive work cannot borrow the
+other 120 entries, and TAP reads cannot consume the receive reserve. Reservations
+stay charged until a buffer returns to its originating worker. This prevents
+receive backlog from starving transmit batches. Each lane has
 64 frame slots. The memory check includes these stores, handoff rings, indices,
 configuration capacities, thread stacks and an allocator allowance. This is a
 reservation check, not a process RSS limit or a limit on kernel socket buffers.
@@ -255,15 +259,34 @@ Only successful submissions advance frame offsets and release completed buffers.
 If a frame reaches its 100 ms deadline, it is removed; remaining frames keep their
 IDs and submitted offsets and are repacked with fresh packet numbers. Connection
 retirement discards every queued batch before the worker acknowledges quiescence.
-Receive reassembly copies pieces into fixed frame slots and retains complete
-frames through TAP backpressure until delivery or expiry. Workers batch socket
+Receive reassembly copies pieces into 64 fixed frame slots per lane and retains
+complete frames through TAP backpressure until delivery or the original 100 ms
+expiry. Receive work yields after 64 logical datagrams, 128 records or 64 KiB of
+UDP payload, counting GRO-expanded segments and handoffs. A final datagram is
+indivisible and may exceed the record/byte target; malformed record areas are
+charged the maximum 64 records. Unprocessed GRO bytes stay in their original
+pooled buffer. The bounded pending queue stores only buffer ownership and counts
+toward the memory ceiling. Workers drain a lane after 16 completions, on admission
+pressure, and at the end of each turn. TX, timers, control queues and readiness
+polling run between receive turns. Ready-event service rotates so busy endpoints
+share the receive reserve. TAP WouldBlock retains frames and waits for
+EPOLLOUT before another write attempt.
+
+On pressure, fully validated pieces for existing frames may complete them.
+After TAP delivery frees slots, admission retries once. New DATA storage, packet
+history and controls commit only when the whole datagram fits; a rejected
+packet is never ACK-eligible. Retried tails cannot redeliver a terminal frame.
+Unrelated incomplete frames are not evicted to make room. Workers batch socket
 I/O and notifications, update epoll write interests only when needed, and arm
 absolute monotonic timers. No worker waits for another worker's queue.
 
 Each owned transmit lane reserves metadata for 64 frames and 64 datagrams.
 A bounded round-robin queue serves ready session/lane batches. One batch may
 contain several frames; a long queue continues across batches without resetting
-frame identities. Batch storage and scheduling entries count toward startup's
+frame identities. Planning stops before starting a frame that would cross the
+GSO aggregate's byte limit. The final UDP datagram may be short. Thus local
+aggregate drops do not leave orphan pieces in adjacent batches. Individual
+on-wire datagram losses still require the planned bounded selective repair. Batch storage and scheduling entries count toward startup's
 memory reservation. TAP I/O still requires one read or write per frame. No
 throughput target follows from allocation checks alone. Small-frame acceptance must
 report delivered frames per second, CPU and drops separately from large-frame
@@ -356,15 +379,28 @@ RX lane totals start after current-tag and lane-owner checks. Handshake traffic
 belongs to session/peer totals; it has no established lane.
 
 `duplicate_packets` counts packet-history rejection. `duplicate_pieces`
-counts whole DATA pieces already covered or terminal in fresh packets; partial
+counts whole DATA pieces already covered or terminal, including admission retries; partial
 overlap that adds bytes is not a duplicate piece. `expired_frames` counts sender
 and receiver deadlines, not connection retirement. `reassembly_bytes` is the
 sum of reserved full frame lengths, including incomplete frames, rather than the
 number of piece bytes received so far. `reassembly_frames` includes complete
 frames waiting for TAP.
 
-Queue pressure is attributed where detected. Drops before lane admission appear
-only in worker/session totals. Malformed and unknown-cookie input that cannot
+Pressure is attributed where detected. `admission_pressure` counts datagrams
+still not fully admitted after the drain/retry attempt; useful existing pieces
+may have been retained, but that packet is not ACK-eligible. `queue_drops`
+counts bounded handoff/retention queue failures separately. Drops before lane
+admission appear only in worker/session totals. `socket_overflow` counts
+SO_RXQ_OVFL increments per receive socket, in kernel skb units, at worker scope.
+GRO means these are not necessarily logical datagrams. The kernel reports a
+cumulative 32-bit count on subsequent receives; wrap is handled, but a final
+drop burst without a later receive may not yet appear. Use namespace UDP
+receive-buffer error counters alongside it.
+
+Send SIGUSR1 to the foreground daemon to print independently sampled worker
+counters to stderr. Formatting runs in the daemon's supervisory thread, outside
+the workers and signal handler. The benchmark script captures these before and
+after traffic. Malformed and unknown-cookie input that cannot
 be attributed to a session, receive-bind failures and affinity failures remain
 worker-only. Peer socket-setup failures appear in worker and peer totals; they
 are not duplicated into every session. These scopes overlap: do not add worker,

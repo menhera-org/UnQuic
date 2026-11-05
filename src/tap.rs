@@ -142,6 +142,14 @@ pub struct TapQueue {
 }
 
 impl TapQueue {
+    #[cfg(test)]
+    pub(crate) fn test_fd(fd: OwnedFd) -> Self {
+        Self {
+            fd,
+            frame_limit: MAX_FRAME_LEN,
+        }
+    }
+
     /// Changes carrier for the whole device without removing the TAP or
     /// its upper devices. Any queue of the device may be used.
     pub fn set_carrier(&self, up: bool) -> io::Result<()> {

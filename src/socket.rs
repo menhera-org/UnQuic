@@ -22,7 +22,7 @@ pub const BATCH_SIZE: usize = 64;
 /// UDP payload ceiling under the configured 1500-byte outer IPv6 MTU.
 pub const MAX_UDP_PAYLOAD: usize = 1500 - 40 - 8;
 const MAX_VECTORS: usize = 1024;
-const GSO_MAX_BYTES: usize = 65_535 - 40 - 8;
+pub(crate) const GSO_MAX_BYTES: usize = 65_535 - 40 - 8;
 
 #[repr(C)]
 struct Ancillary {
@@ -47,6 +47,8 @@ pub struct ReceiveDatagram<'a> {
     pub truncated: bool,
     /// GRO segment size, or zero for an ordinary datagram.
     pub segment_size: usize,
+    /// Cumulative socket drops in kernel skb units, when supplied by SO_RXQ_OVFL.
+    pub overflow: Option<u32>,
 }
 
 impl<'a> ReceiveDatagram<'a> {
@@ -57,6 +59,7 @@ impl<'a> ReceiveDatagram<'a> {
             length: 0,
             truncated: false,
             segment_size: 0,
+            overflow: None,
         }
     }
 
@@ -104,6 +107,7 @@ impl ReceiveSocket {
         validate_address(address)?;
         let socket = configured_socket(device)?;
         set_int(&socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
+        set_int(&socket, libc::SOL_SOCKET, libc::SO_RXQ_OVFL, 1)?;
         bind(&socket, address)?;
         let address = local_address(&socket)?;
         Ok(Self {
@@ -426,7 +430,7 @@ fn recv_batch(fd: BorrowedFd<'_>, datagrams: &mut [ReceiveDatagram<'_>]) -> io::
     // SAFETY: zeroed headers request no source addresses.
     let mut messages: [libc::mmsghdr; BATCH_SIZE] = unsafe { zeroed() };
     // SAFETY: all-zero cmsghdr and bytes are valid writable storage.
-    let mut controls: [Ancillary; BATCH_SIZE] = unsafe { zeroed() };
+    let mut controls: [[Ancillary; 2]; BATCH_SIZE] = unsafe { zeroed() };
     for (i, datagram) in datagrams.iter_mut().enumerate() {
         vectors[i] = libc::iovec {
             iov_base: datagram.buffer.as_mut_ptr().cast(),
@@ -434,8 +438,8 @@ fn recv_batch(fd: BorrowedFd<'_>, datagrams: &mut [ReceiveDatagram<'_>]) -> io::
         };
         messages[i].msg_hdr.msg_iov = &mut vectors[i];
         messages[i].msg_hdr.msg_iovlen = 1;
-        messages[i].msg_hdr.msg_control = (&mut controls[i] as *mut Ancillary).cast();
-        messages[i].msg_hdr.msg_controllen = size_of::<Ancillary>() as _;
+        messages[i].msg_hdr.msg_control = controls[i].as_mut_ptr().cast();
+        messages[i].msg_hdr.msg_controllen = size_of::<[Ancillary; 2]>() as _;
     }
     // SAFETY: every header names one exclusive writable slice. MSG_DONTWAIT
     // makes timeout unnecessary; MSG_TRUNC reports the whole datagram length.
@@ -450,31 +454,44 @@ fn recv_batch(fd: BorrowedFd<'_>, datagrams: &mut [ReceiveDatagram<'_>]) -> io::
     })? as usize;
     for ((message, control), datagram) in messages[..count].iter().zip(&controls).zip(datagrams) {
         datagram.length = message.msg_len as usize;
-        let segment = gro_segment(&message.msg_hdr, control);
-        datagram.segment_size = segment.unwrap_or(0);
+        let metadata = receive_control(&message.msg_hdr, control);
+        let (segment, overflow) = metadata.unwrap_or((0, None));
+        datagram.segment_size = segment;
+        datagram.overflow = overflow;
         datagram.truncated = message.msg_hdr.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
             || datagram.length > datagram.buffer.len()
-            || segment.is_none();
+            || metadata.is_none();
     }
     Ok(count)
 }
 
-fn gro_segment(message: &libc::msghdr, control: &Ancillary) -> Option<usize> {
-    if message.msg_controllen == 0 {
-        return Some(0);
+fn receive_control(message: &libc::msghdr, controls: &[Ancillary]) -> Option<(usize, Option<u32>)> {
+    let mut remaining = message.msg_controllen as usize;
+    if remaining > std::mem::size_of_val(controls) {
+        return None;
     }
     // SAFETY: only computes the platform control-message length.
     let expected = unsafe { libc::CMSG_LEN(4) } as usize;
-    if (message.msg_controllen as usize) < expected
-        || (message.msg_controllen as usize) > size_of::<Ancillary>()
-        || control.header.cmsg_len as usize != expected
-        || control.header.cmsg_level != libc::IPPROTO_UDP
-        || control.header.cmsg_type != libc::UDP_GRO
-    {
-        return None;
+    let mut segment = 0;
+    let mut overflow = None;
+    for control in controls {
+        if remaining == 0 {
+            break;
+        }
+        if remaining < expected || control.header.cmsg_len as usize != expected {
+            return None;
+        }
+        let value = u32::from_ne_bytes(control.data[..4].try_into().unwrap());
+        match (control.header.cmsg_level, control.header.cmsg_type) {
+            (libc::IPPROTO_UDP, libc::UDP_GRO) if segment == 0 && (1..=65535).contains(&value) => {
+                segment = value as usize;
+            }
+            (libc::SOL_SOCKET, libc::SO_RXQ_OVFL) if overflow.is_none() => overflow = Some(value),
+            _ => return None,
+        }
+        remaining = remaining.saturating_sub(size_of::<Ancillary>());
     }
-    let size = i32::from_ne_bytes(control.data[..4].try_into().unwrap());
-    (size > 0 && size <= u16::MAX as i32).then_some(size as usize)
+    Some((segment, overflow))
 }
 
 fn validate_address(address: SocketAddrV6) -> io::Result<()> {
@@ -743,7 +760,10 @@ mod tests {
             std::mem::offset_of!(Ancillary, data),
             unsafe { libc::CMSG_LEN(0) } as usize
         );
-        assert_eq!(gro_segment(&message, &control), Some(0));
+        assert_eq!(
+            receive_control(&message, std::slice::from_ref(&control)).map(|v| v.0),
+            Some(0)
+        );
         message.msg_controllen = space as _;
         control.header.cmsg_len = length as _;
         control.header.cmsg_level = libc::IPPROTO_UDP;
@@ -751,21 +771,59 @@ mod tests {
         for size in [-1_i32, 0, 1, 1232, 65535, 65536] {
             control.data[..4].copy_from_slice(&size.to_ne_bytes());
             assert_eq!(
-                gro_segment(&message, &control),
+                receive_control(&message, std::slice::from_ref(&control)).map(|v| v.0),
                 (1..=65535).contains(&size).then_some(size as usize)
             );
         }
         message.msg_controllen = (length - 1) as _;
-        assert_eq!(gro_segment(&message, &control), None);
+        assert_eq!(
+            receive_control(&message, std::slice::from_ref(&control)).map(|v| v.0),
+            None
+        );
         message.msg_controllen = space as _;
         control.header.cmsg_len = (length - 1) as _;
-        assert_eq!(gro_segment(&message, &control), None);
+        assert_eq!(
+            receive_control(&message, std::slice::from_ref(&control)).map(|v| v.0),
+            None
+        );
         let mut empty = [];
         let received = ReceiveDatagram::new(&mut empty);
         assert_eq!(
             received.segments().unwrap().collect::<Vec<_>>(),
             vec![&[] as &[u8]]
         );
+    }
+
+    #[test]
+    fn gro_and_socket_overflow_metadata_coexist_in_either_order() {
+        // SAFETY: zeroed ancillary headers are valid storage.
+        let mut controls: [Ancillary; 2] = unsafe { zeroed() };
+        let mut message: libc::msghdr = unsafe { zeroed() };
+        message.msg_controllen = size_of::<[Ancillary; 2]>() as _;
+        for control in &mut controls {
+            // SAFETY: only calculates the ABI length.
+            control.header.cmsg_len = unsafe { libc::CMSG_LEN(4) } as _;
+        }
+        controls[0].header.cmsg_level = libc::IPPROTO_UDP;
+        controls[0].header.cmsg_type = libc::UDP_GRO;
+        controls[0].data[..4].copy_from_slice(&1232_u32.to_ne_bytes());
+        controls[1].header.cmsg_level = libc::SOL_SOCKET;
+        controls[1].header.cmsg_type = libc::SO_RXQ_OVFL;
+        controls[1].data[..4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert_eq!(
+            receive_control(&message, &controls),
+            Some((1232, Some(u32::MAX)))
+        );
+        controls.swap(0, 1);
+        assert_eq!(
+            receive_control(&message, &controls),
+            Some((1232, Some(u32::MAX)))
+        );
+        controls[1].header.cmsg_level = libc::SOL_SOCKET;
+        controls[1].header.cmsg_type = libc::SO_RXQ_OVFL;
+        assert_eq!(receive_control(&message, &controls), None);
+        message.msg_controllen -= 1;
+        assert_eq!(receive_control(&message, &controls), None);
     }
 
     #[test]
