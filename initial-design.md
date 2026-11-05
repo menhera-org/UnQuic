@@ -455,10 +455,12 @@ If a comparison already reaches the available underlay ceiling, report that fact
 **Current status:** stage 1 is in progress. Implemented foundations are
 `UnquicUuid` parsing/provisioning, duplicate-checked cookie indexing,
 `MacAddress` validation, IPv6 sockets with separate receive/transmit APIs, and
-nonpersistent multiqueue TAP creation and frame I/O. TAP creation accepts an
+nonpersistent multiqueue TAP creation and frame I/O. The version-1 wire codec
+validates complete datagrams before dispatch and has fixed byte vectors for all
+eleven record types in tests/vectors/wire-v1. TAP creation accepts an
 optional MAC and leaves administrative state unchanged. Tests cover the public
 types, loopback socket invariants and live TAP behavior in an isolated network
-namespace; see README.md for commands and coverage limits. Session dispatch,
+namespace; see README.md for commands and coverage limits. Handshake state and session dispatch,
 counters and the owned worker runtime are not yet implemented. The crate does
 not yet provide end-to-end Ethernet transport, and no performance acceptance
 claim has been made.

@@ -1,6 +1,7 @@
 //! Linux foundations for UnQuic's unencrypted Ethernet transport.
 //!
-//! This crate currently provides UUIDs, IPv6 UDP sockets and TAP ownership.
+//! This crate currently provides identity types, the v1 wire codec, IPv6 UDP
+//! sockets and TAP ownership.
 //! It does not yet establish sessions or forward Ethernet frames.
 //! Callers supply configuration explicitly; the library reads no configuration
 //! files or environment variables and writes no diagnostic output.
@@ -15,6 +16,7 @@ pub mod socket;
 mod sys;
 pub mod tap;
 pub mod uuid;
+pub mod wire;
 
 pub use mac::MacAddress;
 pub use uuid::UnquicUuid;

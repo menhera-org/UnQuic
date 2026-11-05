@@ -75,7 +75,11 @@ UDP, with the real handshake, the real wire format and worker ownership, but
 without repair, packing or congestion control. Datagrams stay at the 1232-byte
 baseline.
 
-### 1a Wire codec (`src/wire.rs`)
+### 1a Wire codec (`src/wire.rs`) — complete
+
+Implemented in `src/wire.rs`, with fixed datagram vectors in
+`tests/vectors/wire-v1` and rejection/round-trip tests in `tests/wire.rs`.
+Musl tests, Clippy, formatting and the isolated foundation kernel test pass.
 
 Implement section 6 exactly.
 

@@ -55,8 +55,15 @@ fn create_tap() -> Result<Tap, Box<dyn std::error::Error>> {
 // The caller retains the TAP and delegates administrative setup to its network manager.
 ```
 
+The v1 wire codec covers the 48-byte header and all eleven record types. It
+validates each complete datagram before exposing records, borrows DATA payloads
+and ACK ranges, and encodes into caller-owned buffers without allocation.
+[Fixed byte vectors](tests/vectors/wire-v1/README.md) cover every record type;
+tests exercise malformed lengths, reserved fields, lane identities, ACK ranges,
+and handshake isolation.
+
 The crate does not yet establish sessions or forward frames between peers.
-Protocol parsing, worker ownership, counters, batching/offloads, path-MTU
+Handshake state, worker ownership, counters, batching/offloads, path-MTU
 probing, recovery, BBRv3, DNS, the daemon and descriptor adoption remain to be
 implemented. There is no throughput claim for this foundation.
 
