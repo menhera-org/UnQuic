@@ -317,8 +317,9 @@ full return queues. The ten-second bidirectional TAP storm verifies integrity,
 duplicate suppression, observed packing and zero allocations/deallocations while
 reporting frame drops. The release baseline in BENCH.md now records single- and
 multiple-flow small-frame and MTU-1500 traffic, per-direction delivery/loss, process
-CPU and per-core CPU/softirq. Unlimited offered load causes severe loss; the final
-throughput gate remains open. Partial completion, GSO/GRO boundaries, MTU errors
+CPU and per-core CPU/softirq. The original admission-pressure collapse is fixed;
+remaining multi-flow declines under excess load are still under investigation.
+The final throughput gate remains open. Partial completion, GSO/GRO boundaries, MTU errors
 and allocation checks pass. The five frame-model regression cases
 now run against the real implementation in tests/reassembly.rs.
 

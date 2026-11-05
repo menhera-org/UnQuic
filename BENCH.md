@@ -1,115 +1,199 @@
-# Transport benchmark baseline
+# Release transport overload investigation
 
-The local throughput gate has **not passed**. At inner MTU 1500, the stage-2
-transport delivers far less than the required 20 Gbit/s in each direction
-simultaneously under unlimited offered load. Recovery, congestion control,
-pacing and path-MTU discovery are not implemented in this baseline. The real
-5 Gbit/s access-line target is also untested.
+The original throughput collapse is reproduced and its receive-admission
+failure is fixed. The strict overload plateau requirement remains **open**:
+some multi-flow directions still deliver less at unlimited load than at a
+paced saturation point. Neither the local **20 Gbit/s in each direction**
+gate nor the real **5 Gbit/s under loss** gate has passed.
 
-## Measurement profile
+This report separates that remaining decline from the earlier near-total
+collapse. Recovery, congestion control and PMTU discovery remain unfinished;
+their absence does not explain away a scheduling or admission failure.
+
+## Profile and method
 
 | Field | Value |
 | --- | --- |
-| Date / revision | 2026-11-05 / `74adc30` |
-| Build | Rust 1.99.1, x86_64-unknown-linux-musl, all features, release |
-| Release settings | opt-level 3, full LTO, strip, one codegen unit |
-| Kernel | Linux 6.8.0-147-generic, x86_64 |
-| CPU | Intel Xeon Gold 6138, nominal 2.00 GHz |
-| Transport | Two daemon processes; one peer/session each; four workers, four TAP queues and four TX lanes per endpoint |
-| Outer path | IPv6 UDP over loopback in a fresh container network namespace; 1232-byte UDP ceiling; GSO/GRO enabled when supported |
-| Inner path | Separate left/right network namespaces; IPv4 UDP through the two TAPs; MTU 1500; fixed neighbors; no direct inner route between namespaces |
-| Generator | iperf3 3.20, UDP, bidirectional, 1 or 16 flows per direction |
-| Duration | One 10-second sample per row, both directions active together; no warmup |
-| CPU budget | UnQuic left 0–3, right 4–7; generator left 8–11, right 12–15 |
-| Placement | These 16 logical CPUs are distinct physical cores on one socket; shared machine, no exclusive CPU reservation |
-| Impairment | No injected delay or loss; overload can still drop packets |
+| Date | 2026-11-05 |
+| Before | `a27d8e9` plus counter/snapshot observability; original receive/packing behavior |
+| After | `a69f88d`, including `a4c6a7d` and `9db630c` |
+| Build | Rust 1.99.1, all features, x86_64-unknown-linux-musl, release: opt-level 3, full LTO, strip, one codegen unit |
+| Kernel / CPU | Linux 6.8.0-147-generic; Intel Xeon Gold 6138, nominal 2.00 GHz |
+| Transport | Two daemons, one session each; four workers, four TAP queues and four TX lanes per daemon |
+| Outer path | IPv6 UDP loopback inside a disposable container namespace; 1232-byte UDP ceiling; GSO/GRO |
+| Inner path | IPv4 UDP through two TAPs in separate namespaces, MTU 1500, DF, fixed neighbors; no direct inner path |
+| Traffic | iperf3 3.20; two simultaneous unidirectional client/server pairs; 1 or 16 flows each way |
+| Sampling | Ten seconds per point, no warmup; both daemons stay running throughout each rate sweep |
+| CPU placement | Daemons: left 0–3, right 4–7. Senders: left 8–11, right 16–19. Receivers: left 12–15, right 20–23 |
+| Topology | CPUs 0–19 are on socket 0; receiver CPUs 20–23 are on socket 1. Shared local machine; no exclusive CPU reservation |
+| Impairment | No injected delay or loss; overload still drops traffic |
 
-The generator's UDP payload length is frame length minus 42 bytes
-(Ethernet + IPv4 + UDP). Frame sizes exclude FCS, preamble and inter-frame gap.
-DF is enabled on inner IPv4 packets. The outer namespace's IPv6 fragment creation
-and reassembly counters stayed at zero in every run.
+Each sweep retains its source ports and daemons, so a later unlimited point
+cannot hide poisoned reassembly state by restarting the transport. Source
+ports start at 51000 and increment per stream. Independent sweeps create new
+outer sockets: reuseport placement can differ. They are not paired trials
+with identical kernel hash placement.
 
-Goodput below counts **received UDP payload bytes**, excluding every header.
-Frames/s is received payload bytes divided by payload length and receiver
-duration. Missing percentage is `100 * (sent - received) / sent`; it includes
-missing tails, which iperf's sequence-gap percentage may omit. A sample ending
-with traffic still in flight counts that traffic as missing. This is not a
-zero-loss forwarding-capacity measurement.
+Goodput is received **UDP payload**, excluding all headers. Frame sizes exclude
+FCS; payload length is frame length minus 42 bytes. Offered rate uses actual
+sender packet counts and durations, rather than assuming iperf reached its
+requested rate. Missing percentage is `100 * (1 - received / sent)`, including
+missing tails. The receiver duration determines goodput. CPU snapshots also
+include connection setup/teardown, which can extend the interval after overload.
 
-L→R means left generator to right generator; R→L is the simultaneous reverse
-direction. The 100 Mbit/s row is a separate paced diagnostic; other rows use
-`-b 0` (unlimited).
+The old `--bidir` generator shared sending and receiving CPU sets. Diagnostics
+found hundreds of thousands of inner UDP receive-buffer errors under unlimited
+load. The current four-process setup uses separate CPU sets and records those
+errors. It does not assume that every remaining loss belongs to the transport.
 
-## Delivered traffic
+## Verified causes and changes
 
-| Frame bytes | Flows/direction | Offered rate/flow | L→R frames/s | R→L frames/s | L→R Gbit/s | R→L Gbit/s | L→R missing % | R→L missing % |
-| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 60 | 1 | unlimited | 192591 | 27955 | 0.0277 | 0.0040 | 43.259 | 91.603 |
-| 60 | 16 | unlimited | 20915 | 21915 | 0.0030 | 0.0032 | 98.162 | 97.989 |
-| 64 | 1 | unlimited | 187958 | 152864 | 0.0331 | 0.0269 | 44.364 | 49.890 |
-| 64 | 16 | unlimited | 249628 | 295895 | 0.0439 | 0.0521 | 73.766 | 67.818 |
-| 128 | 1 | unlimited | 191970 | 228259 | 0.1321 | 0.1570 | 43.892 | 30.054 |
-| 128 | 16 | unlimited | 285007 | 254891 | 0.1961 | 0.1754 | 72.403 | 72.245 |
-| 1514 | 1 | unlimited | 344 | 329 | 0.0041 | 0.0039 | 99.891 | 99.888 |
-| 1514 | 16 | unlimited | 22079 | 21163 | 0.2600 | 0.2492 | 97.852 | 97.881 |
-| 1514 | 1 | 100 Mbit/s | 8491 | 8490 | 0.1000 | 0.1000 | 0.000 | 0.020 |
+- The 64 receive slots were shared by incomplete and completed frames. A large
+  GRO batch could fill them before TAP delivery. Receive work now yields after
+  64 expanded datagrams, 64 records or 64 KiB, with TAP delivery interleaved.
+  The last datagram is indivisible and may exceed the record/byte target.
+- Whole-datagram reservation rejected useful tails when a new head could not
+  obtain a slot. Fully validated tails now progress in existing slots. The
+  packet remains unacknowledged until all nonterminal DATA is retained; a
+  drain that frees slots permits one retry.
+- A GSO aggregate could end in the middle of a frame. Dropping that aggregate
+  left incomplete frames occupying slots until expiry. Packing now ends a
+  planned GSO batch at a frame boundary. The regression drops alternate
+  aggregates and verifies that retained batches leave no orphan frames.
+  Individual on-wire packet loss still requires bounded repair.
+- Receive backlog could consume the shared buffer pool and starve transmit
+  batching. Eight of the existing 128 buffers per worker are reserved for RX;
+  RX cannot consume the TX share. No pool or reassembly limit was enlarged.
+- A 128-record receive allowance competed with a 64-frame TAP-read allowance.
+  Small-frame reverse delivery fell under load. The 64-record allowance removes
+  that particular imbalance.
+- Reuseport collisions could register several receive lanes on one worker.
+  Lane ownership now distributes consecutive lane IDs independently of the
+  socket that first receives them. The collision regression checks handoff,
+  installation and complete buffer return.
+- An idle worker could repeatedly poll a readable socket while all its RX
+  buffers were held by other workers. Read interest is now suppressed in that
+  state and restored after buffer return. Existing handoff notifications wake
+  the worker; a regression checks that readiness resumes.
 
-These runs demonstrate severe overload loss, not the intended throughput.
-Kernel UDP receive-buffer errors occurred in all unlimited runs. The paced
-100 Mbit/s run had none. Other losses are not attributed by this measurement;
-profiling and transport counters are needed before choosing an optimization.
-Flow hashing, receive-socket distribution and shared-machine scheduling vary
-between runs, so one sample is insufficient to rank small differences.
+The 64-slot limit and 100 ms frame lifetime are unchanged. Tests cover
+over-capacity bursts, expanded GRO budgets, packed tail/head pressure, TAP
+backpressure, duplicate suppression and ACK exclusion. The release container
+storm checks integrity and zero allocations/deallocations during forwarding.
+The full release suite, container worker/runtime cases, Clippy and formatting
+pass for the current fixes.
 
-The existing ten-second frame-storm test separately checks corruption,
-duplicates and allocations/deallocations. iperf measures delivery here; it does
-not replace that correctness test.
+## MTU-1500 rate sweeps
 
-## CPU accounting
+All pairs are L→R / R→L except process CPU, which is left / right.
+Requested rate is **per flow**, so 125M with 16 flows requests 2 Gbit/s each way.
+CPU uses one core as 100%; each daemon can use four cores.
 
-Each process percentage uses one core as 100%; a four-core process can reach
-400%. UnQuic percentages come from process user+system tick deltas over the
-snapshot interval (100 ticks/s here). Generator percentages come from iperf.
-The snapshot interval includes the short control-connection setup/teardown.
-Each endpoint handles both directions, so its CPU cannot be assigned entirely
-to one traffic direction.
+| Revision | Flows | Requested/flow | Actual offered Gbit/s | Delivered Gbit/s | Missing % | Daemon CPU % |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| before | 1 | 100M | 0.10 / 0.10 | 0.100 / 0.100 | 0.00 / 0.00 | 40.4 / 24.9 |
+| after | 1 | 100M | 0.10 / 0.10 | 0.100 / 0.100 | 0.00 / 0.00 | 41.3 / 39.9 |
+| before | 1 | 1G | 1.00 / 1.00 | 0.986 / 0.803 | 1.34 / 19.67 | 97.7 / 90.9 |
+| after | 1 | 1G | 1.00 / 1.00 | 0.992 / 0.986 | 0.77 / 1.36 | 102.5 / 112.3 |
+| before | 1 | 2G | 2.00 / 2.00 | 0.007 / 0.009 | 99.66 / 99.55 | 116.4 / 79.6 |
+| after | 1 | 2G | 2.00 / 2.00 | 1.207 / 1.377 | 39.64 / 31.15 | 100.0 / 103.9 |
+| before | 1 | 3G | 3.00 / 3.00 | 0.004 / 0.005 | 99.88 / 99.84 | 133.4 / 92.9 |
+| after | 1 | 3G | 3.00 / 3.00 | 1.191 / 1.388 | 59.50 / 53.72 | 96.6 / 102.0 |
+| before | 1 | unlimited | 4.12 / 3.74 | 0.005 / 0.012 | 99.88 / 99.67 | 134.6 / 96.5 |
+| after | 1 | unlimited | 3.93 / 3.96 | 1.249 / 1.315 | 68.18 / 66.09 | 96.1 / 102.3 |
+| before | 16 | 125M | 2.00 / 2.00 | 1.234 / 1.985 | 37.03 / 0.74 | 309.0 / 297.4 |
+| after | 16 | 125M | 2.00 / 2.00 | 1.958 / 1.906 | 2.07 / 4.71 | 322.5 / 341.6 |
+| before | 16 | 250M | 4.00 / 4.00 | 1.008 / 1.889 | 74.79 / 52.78 | 330.4 / 301.9 |
+| after | 16 | 250M | 4.00 / 4.00 | 2.197 / 3.209 | 43.95 / 19.77 | 344.8 / 333.4 |
+| before | 16 | 500M | 8.00 / 8.00 | 0.805 / 0.071 | 89.73 / 99.09 | 348.6 / 319.6 |
+| after | 16 | 500M | 8.00 / 8.00 | 2.398 / 3.383 | 69.41 / 57.70 | 359.4 / 349.2 |
+| before | 16 | unlimited | 12.68 / 12.72 | 0.143 / 0.117 | 98.85 / 99.06 | 319.7 / 294.2 |
+| after | 16 | unlimited | 13.21 / 12.90 | 2.569 / 3.081 | 80.55 / 76.10 | 286.1 / 289.3 |
 
-| Frame/flows | UnQuic left % | UnQuic right % | Generator left % | Generator right % |
-| --- | ---: | ---: | ---: | ---: |
-| 60/1 | 196.8 | 163.7 | 105.8 | 148.0 |
-| 60/16 | 292.6 | 304.8 | 393.5 | 394.9 |
-| 64/1 | 111.6 | 135.0 | 135.7 | 146.2 |
-| 64/16 | 346.6 | 333.1 | 390.5 | 397.4 |
-| 128/1 | 195.9 | 217.1 | 154.0 | 150.5 |
-| 128/16 | 315.5 | 347.6 | 395.2 | 394.0 |
-| 1514/1 | 200.9 | 160.2 | 100.0 | 99.8 |
-| 1514/16 | 311.6 | 322.8 | 394.8 | 393.3 |
-| 1514/1 (100M) | 35.3 | 40.3 | 12.3 | 11.9 |
+Repeated unlimited points after another paced overload point delivered
+1.260 / 1.434 Gbit/s for one flow and 2.441 / 3.000 Gbit/s for 16 flows.
+The 16-flow paced 500M points delivered 2.398 / 3.383 and 2.512 / 3.441 Gbit/s.
+The reverse-direction decline is still material; these results do not establish
+the theoretical CPU maximum or a load-independent plateau.
 
-Each entry below is **busy%/softirq%** for the listed CPUs, in order. Busy
-includes user, nice, system, IRQ and softirq time; the denominator also includes
-idle, iowait and steal time. These are per-CPU `/proc/stat` deltas, including
-unrelated work on the shared machine. They must not be added to process CPU
-percentages: some work is already represented there.
+## Small frames
 
-| Frame/flows | CPUs 0,1,2,3 | CPUs 4,5,6,7 | CPUs 8,9,10,11 | CPUs 12,13,14,15 |
-| --- | --- | --- | --- | --- |
-| 60/1 | 36.0/0.0, 91.1/8.0, 14.4/0.2, 68.4/0.4 | 65.5/0.3, 1.2/0.0, 1.1/0.1, 99.6/1.0 | 1.7/0.0, 99.1/0.5, 4.3/0.0, 4.9/0.0 | 57.2/0.0, 28.4/0.0, 15.8/0.0, 60.1/0.0 |
-| 60/16 | 91.1/1.6, 25.3/1.3, 97.4/1.5, 82.1/2.2 | 85.7/1.7, 55.9/1.5, 94.4/2.3, 72.9/2.4 | 97.3/0.2, 97.2/0.2, 95.3/0.0, 96.6/0.0 | 97.6/0.0, 99.1/0.0, 99.3/0.0, 99.2/0.0 |
-| 64/1 | 14.7/0.7, 0.3/0.0, 97.3/0.4, 0.1/0.0 | 96.1/0.3, 0.6/0.0, 39.0/1.8, 0.3/0.0 | 0.2/0.0, 97.3/0.3, 18.0/0.0, 19.2/0.0 | 97.1/0.0, 14.9/0.0, 29.1/0.0, 10.7/0.0 |
-| 64/16 | 93.2/1.3, 93.9/0.9, 98.8/1.1, 63.1/1.5 | 47.6/2.1, 97.3/1.7, 92.5/1.3, 99.0/1.0 | 99.0/0.5, 99.3/0.7, 99.1/0.0, 95.2/0.0 | 99.2/0.0, 99.5/0.0, 99.3/0.0, 99.3/0.0 |
-| 128/1 | 0.3/0.0, 0.6/0.1, 98.9/0.5, 97.7/1.8 | 0.5/0.0, 62.6/5.7, 60.1/0.2, 97.0/0.3 | 28.6/0.1, 33.6/0.2, 55.8/0.0, 41.4/0.0 | 30.9/0.0, 65.5/0.0, 28.2/0.0, 40.1/0.0 |
-| 128/16 | 62.1/2.0, 93.6/1.4, 65.6/1.5, 97.4/0.9 | 88.7/1.7, 66.9/1.3, 97.0/0.9, 97.7/1.6 | 99.5/0.3, 99.5/0.6, 96.9/0.0, 99.1/0.0 | 99.1/0.0, 98.3/0.0, 99.2/0.0, 99.0/0.0 |
-| 1514/1 | 62.3/0.0, 63.9/0.4, 0.3/0.0, 81.5/10.6 | 85.6/6.3, 1.6/0.1, 83.2/0.3, 0.5/0.0 | 0.4/0.0, 97.7/0.4, 5.1/0.0, 3.0/0.0 | 97.6/0.0, 4.3/0.0, 5.2/0.0, 1.6/0.0 |
-| 1514/16 | 93.4/2.2, 52.8/0.8, 72.4/2.0, 96.4/2.2 | 62.9/1.8, 97.4/2.4, 88.9/2.4, 75.2/1.6 | 95.6/0.3, 95.5/0.5, 94.2/0.0, 95.1/0.0 | 97.4/0.0, 94.2/0.0, 97.3/0.0, 97.4/0.0 |
-| 1514/1 (100M) | 26.6/1.8, 8.5/0.3, 3.7/0.0, 3.3/0.0 | 1.2/0.1, 26.5/0.5, 0.4/0.0, 13.2/1.9 | 4.7/0.1, 5.0/0.3, 4.2/0.0, 4.4/0.0 | 7.7/0.0, 6.3/0.0, 5.4/0.0, 4.4/0.0 |
+These are unlimited-load points from the current revision. The data file also
+contains the preceding paced points and repeated 60-byte overload points.
 
-Exact counts, durations, process ticks, per-core ticks and outer UDP/fragment
-counter deltas are in [tap_transport-baseline.json](benches/tap_transport-baseline.json).
-The ordered arrays and tick-field names are defined at the top of that file.
-It preserves inputs to these calculations rather than rounded table values.
+| Frame bytes | Flows | Delivered frames/s | Delivered Gbit/s | Missing % | Daemon CPU % |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 60 | 1 | 176101 / 176240 | 0.0254 / 0.0254 | 50.77 / 51.06 | 93.3 / 102.3 |
+| 60 | 16 | 321847 / 511860 | 0.0463 / 0.0737 | 73.47 / 57.46 | 369.0 / 346.9 |
+| 64 | 1 | 168814 / 169334 | 0.0297 / 0.0298 | 57.27 / 54.44 | 93.4 / 102.6 |
+| 64 | 16 | 297062 / 390617 | 0.0523 / 0.0687 | 74.87 / 66.02 | 357.6 / 348.8 |
+| 128 | 1 | 166793 / 167195 | 0.1148 / 0.1150 | 50.88 / 56.77 | 97.1 / 102.6 |
+| 128 | 16 | 339887 / 301506 | 0.2338 / 0.2074 | 72.19 / 75.17 | 347.5 / 354.3 |
 
-## Reproduce
+Single-flow runs plateau near 160–178 thousand frames/s. With 60-byte frames
+and 16 flows, paced and unlimited saturation points stay around 313–327 thousand
+frames/s forward and 508–515 thousand reverse. With 64-byte frames, reverse
+delivery falls from 448,939 frames/s at 10M per flow to 390,617 unlimited.
+Inner UDP receive-buffer drops are too few to explain that decline. Further
+worker/kernel profiling is required.
+
+## Drop attribution
+
+The following unlimited MTU-1500 points use **left / right endpoint** order.
+Admission pressure, queue drops, expiry and socket overflow are separate
+counters. TAP TX drops occur before the daemon reads the inner frame; inner UDP
+receive errors occur after TAP delivery.
+
+| Revision / flows | Admission pressure | Worker queue drops | Expired frames | Socket overflow SKBs | TAP TX drops | Inner UDP receive-buffer errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| before / 1 | 3763223 / 4342629 | 0 / 0 | 6359 / 6389 | 25258 / 17635 | 60911 / 1282 | 0 / 0 |
+| after / 1 | 0 / 0 | 0 / 0 | 0 / 0 | 10641 / 13982 | 1708952 / 1796171 | 82 / 2434 |
+| before / 16 | 5010166 / 5246750 | 0 / 0 | 24328 / 23546 | 177214 / 250215 | 2348042 / 4458183 | 0 / 29 |
+| after / 16 | 0 / 0 | 0 / 0 | 0 / 1 | 146074 / 139986 | 6266662 / 6044300 | 671 / 1640 |
+
+Socket overflow counts kernel SKBs, which may contain several GSO/GRO datagrams.
+It cannot be added to frame expiry or queue counts to obtain missing inner
+frames. Expiry combines sender and receiver events. TAP/link counters include
+control traffic as well as the measured UDP streams. Counter snapshots can lag
+the final overflow until the next successful receive.
+
+The admission-pressure cascade disappears in these after runs. Remaining losses
+are visible at TAP ingress and the outer receive sockets, with smaller losses
+at the inner receiver. That locates drops; it does not yet explain the remaining
+goodput decline. Outer IPv6 fragment creation and reassembly deltas are zero
+throughout all 54 recorded points.
+
+## CPU and profiling
+
+The data preserves each core's eight tick deltas. Below, CPU-set entries are
+mean **busy%/softirq%**; busy includes user, nice, system, IRQ and softirq.
+Per-core data includes unrelated activity and must not be added to process
+CPU percentages. Generator CPU is the sum of the local sender and receiver.
+
+| Frame / flows | Generator left/right % | CPUs 0–3 | 4–7 | 8–11 | 12–15 | 16–19 | 20–23 |
+| --- | ---: | --- | --- | --- | --- | --- | --- |
+| 1514 / 1 | 126.7 / 140.0 | 27.0/0.5 | 26.0/0.4 | 25.0/0.0 | 7.3/0.0 | 25.5/0.0 | 9.8/0.0 |
+| 1514 / 16 | 482.0 / 485.5 | 74.3/1.1 | 72.8/1.3 | 77.4/0.2 | 16.8/0.1 | 80.8/0.0 | 16.2/0.0 |
+| 60 / 16 | 545.7 / 506.1 | 94.9/1.2 | 87.4/1.6 | 98.1/0.2 | 39.6/0.1 | 98.1/0.0 | 27.0/0.0 |
+| 64 / 16 | 502.7 / 498.2 | 92.0/1.3 | 88.2/1.5 | 97.0/0.3 | 29.4/0.1 | 97.3/0.0 | 26.2/0.0 |
+| 128 / 16 | 484.0 / 515.5 | 90.7/1.6 | 89.3/1.4 | 97.8/0.3 | 23.5/0.1 | 97.7/0.0 | 30.2/0.0 |
+
+A separate 20-second, 1514-byte, 16-flow profile sampled thread CPU time every
+256 worker turns on `9db630c`. TAP reads consumed about 24% of sampled CPU;
+TAP writes about 22%; transmit flush about 14%; epoll about 7%. Receive processing
+and final TAP flush together accounted for 37%, including those TAP writes.
+The profile exposed the idle receive polling fixed in `a69f88d`. Its timings
+include startup and sampling overhead and are excluded from throughput tables.
+The data retains per-worker samples and turn counts; they are directional
+evidence for further profiling, not a cycle-accurate cost model.
+
+The next comparisons must control CPU/socket placement and repeat the remaining
+64-byte and MTU-1500 declines. Neither NUMA placement nor absent recovery is a
+verified explanation for those declines. Bounded repair remains necessary to
+prevent independent outer losses from multiplying inner-frame loss by the split
+count. Frame-aligned local GSO batches do not satisfy that requirement.
+
+## Reproduce and inspect
 
 Build the release daemon:
 
@@ -117,34 +201,31 @@ Build the release daemon:
 cargo build --release --all-features --target x86_64-unknown-linux-musl
 ```
 
-Copy that static binary and [tap_transport.sh](benches/tap_transport.sh) into
-a disposable container with no external network. It needs `/dev/net/tun`,
-CAP_SYS_ADMIN, CAP_NET_ADMIN, CAP_NET_RAW, iproute2, iperf3 with `--bidir`,
-taskset, unshare, nsenter and POSIX shell utilities. CPUs 0–15 must be available;
-the script uses the fixed budget above. Delete the container after collecting
-results, including on failure.
-
-Inside the container, with the daemon at `/root/unquic`:
+Copy it and [tap_transport.sh](benches/tap_transport.sh) into a disposable
+container with no external network, tun, CAP_SYS_ADMIN, CAP_NET_ADMIN,
+CAP_NET_RAW, iproute2, iperf3 3.20, taskset, unshare, nsenter and POSIX utilities.
+The default CPU sets require CPUs 0–23. Generator/receiver CPU sets can be
+overridden with the four environment variables used by the script.
 
 ```sh
-for frame in 60 64 128 1514; do
-    for flows in 1 16; do
-        sh /root/tap_transport.sh /root/unquic "$frame" "$flows" 10 \
-            "/root/result-$frame-$flows"
-    done
-done
-BITRATE=100M sh /root/tap_transport.sh /root/unquic 1514 1 10 /root/result-paced
+BITRATE='100M 1G 2G 3G 0 3G 0' \
+    sh /root/tap_transport.sh /root/unquic 1514 1 10 /root/one-flow
+BITRATE='125M 250M 500M 0 500M 0' \
+    sh /root/tap_transport.sh /root/unquic 1514 16 10 /root/many-flows
+BITRATE='3M 10M 0' \
+    sh /root/tap_transport.sh /root/unquic 64 16 10 /root/small-frames
 ```
 
-Each output directory must be new. The script creates private mount/network
-namespaces, starts both daemons on disjoint CPU sets, moves their TAPs into the
-two inner namespaces, and waits for carrier before starting traffic. It saves
-iperf JSON, process/thread CPU snapshots, per-core counters, link counters,
-kernel/CPU descriptions and daemon logs, then stops the processes and removes
-the inner namespaces. The setup uses existing tools; no new traffic generator
-or runtime dependency is needed.
+Each output directory must be new. Numbered subdirectories are consecutive
+points in one sweep. The script records both client/server JSON pairs, process
+and thread ticks, per-core ticks, inner/outer network counters, TAP counters
+and SIGUSR1 worker snapshots. It removes its namespaces and processes on exit.
+Collect results and delete the disposable container when testing is finished,
+including on failure.
 
-Repeat the matrix after stage 3 adds recovery, pacing, congestion control and
-confirmed larger path MTUs. Keep both acceptance gates open until repeatable
-complete-transport measurements pass. No access-line or netem loss-sweep result
-is claimed by this loopback baseline.
+[tap_transport-overload.json](benches/tap_transport-overload.json) contains
+exact counts, durations, CPU ticks, counter deltas, revision/binary identities
+and profile samples for this investigation.
+[tap_transport-baseline.json](benches/tap_transport-baseline.json) preserves
+the earlier `74adc30` unlimited-load baseline, which used the older
+`--bidir` generator profile and is not directly comparable to these sweeps.

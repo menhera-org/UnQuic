@@ -21,8 +21,11 @@ out=$(cd "$5" && pwd)
 left=
 right=
 server=
+reverse_server=
+client=
+reverse_client=
 cleanup() {
-    for pid in "$server" "$left" "$right"; do
+    for pid in "$client" "$reverse_client" "$server" "$reverse_server" "$left" "$right"; do
         [ -z "$pid" ] || kill "$pid" 2>/dev/null || :
     done
     wait || :
@@ -91,11 +94,18 @@ for side in left right; do
     done
 done
 snapshot() {
+    kill -USR1 "$left" "$right"
+    sleep 0.1
+    cp "$base/left.log" "$out/$1.left-log"
+    cp "$base/right.log" "$out/$1.right-log"
     cat /proc/uptime > "$out/$1.uptime"
     cat /proc/stat > "$out/$1.cpu"
     cat /proc/"$left"/stat /proc/"$right"/stat > "$out/$1.process"
     cat /proc/"$left"/task/*/stat /proc/"$right"/task/*/stat > "$out/$1.threads"
     cat /proc/net/snmp6 > "$out/$1.outer"
+    for side in left right; do
+        nsenter --net="/run/netns/uq-$side" cat /proc/net/snmp > "$out/$1.$side-ipv4"
+    done
     netip uq-left -s link show uq-left > "$out/$1.left-link"
     netip uq-right -s link show uq-right > "$out/$1.right-link"
 }
@@ -103,14 +113,39 @@ uname -srvm > "$out/kernel"
 sed -n '/model name/p' /proc/cpuinfo | head -n 1 > "$out/cpu-model"
 getconf CLK_TCK > "$out/clock-ticks"
 iperf3 --version > "$out/iperf-version"
-nsenter --net=/run/netns/uq-right taskset -c 12-15 iperf3 -s -1 -J > "$out/server.json" &
-server=$!
-sleep 0.2
-snapshot before
-nsenter --net=/run/netns/uq-left taskset -c 8-11 iperf3 -c 10.77.0.2 -u -b "${BITRATE:-0}" --dont-fragment \
-    -l "$((frame - 42))" -P "$flows" --bidir -t "$seconds" -J \
-    --connect-timeout 3000 > "$out/client.json"
-wait "$server"
-server=
-snapshot after
+printf '%s\n' "${GENERATOR_LEFT_CPUS:-8-11}" "${RECEIVER_LEFT_CPUS:-12-15}" \
+    "${GENERATOR_RIGHT_CPUS:-16-19}" "${RECEIVER_RIGHT_CPUS:-20-23}" > "$out/generator-cpus"
+base=$out
+index=0
+for rate in ${BITRATE:-0}; do
+    case "$rate" in *[!0-9.KMG]*|'') echo "invalid BITRATE: $rate" >&2; exit 2;; esac
+    case "${BITRATE:-0}" in
+        *[[:space:]]*) out=$base/$index; mkdir "$out";;
+    esac
+    echo "$rate" > "$out/bitrate"
+    nsenter --net=/run/netns/uq-right taskset -c "${RECEIVER_RIGHT_CPUS:-20-23}" iperf3 -s -1 -J > "$out/server.json" &
+    server=$!
+    nsenter --net=/run/netns/uq-left taskset -c "${RECEIVER_LEFT_CPUS:-12-15}" iperf3 -s -1 -J > "$out/reverse-server.json" &
+    reverse_server=$!
+    sleep 0.2
+    snapshot before
+    nsenter --net=/run/netns/uq-left taskset -c "${GENERATOR_LEFT_CPUS:-8-11}" iperf3 -c 10.77.0.2 -u -b "$rate" --dont-fragment \
+        -l "$((frame - 42))" -P "$flows" --cport 51000 -t "$seconds" -J \
+        --connect-timeout 3000 > "$out/client.json" &
+    client=$!
+    nsenter --net=/run/netns/uq-right taskset -c "${GENERATOR_RIGHT_CPUS:-16-19}" iperf3 -c 10.77.0.1 -u -b "$rate" --dont-fragment \
+        -l "$((frame - 42))" -P "$flows" --cport 51000 -t "$seconds" -J \
+        --connect-timeout 3000 > "$out/reverse-client.json" &
+    reverse_client=$!
+    wait "$client"
+    client=
+    wait "$reverse_client"
+    reverse_client=
+    wait "$server"
+    server=
+    wait "$reverse_server"
+    reverse_server=
+    snapshot after
+    index=$((index + 1))
+done
 BENCH
