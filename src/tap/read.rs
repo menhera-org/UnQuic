@@ -134,6 +134,7 @@ unsafe impl Send for Reader {}
 
 pub(crate) struct Batch {
     pub(crate) results: [io::Result<usize>; CAPACITY],
+    pub(crate) segments: [Option<super::Segments>; CAPACITY],
     pub(crate) calls: u64,
     pub(crate) requests: u64,
 }
@@ -256,6 +257,7 @@ impl Reader {
         );
         let mut batch = Batch {
             results: std::array::from_fn(|_| Err(io::ErrorKind::WouldBlock.into())),
+            segments: [None; CAPACITY],
             calls: 0,
             requests: 0,
         };
@@ -346,7 +348,11 @@ impl Reader {
                         Err(io::Error::from_raw_os_error(-c.result))
                     }
                 } else {
-                    tap.finish_read(&headers[i], c.result as usize, buffers[i])
+                    tap.finish_input(&headers[i], c.result as usize, buffers[i])
+                        .map(|(length, segments)| {
+                            batch.segments[i] = segments;
+                            length
+                        })
                 };
             }
             self.cq.atomic(self.params.cq.head).store(cq_tail, Release);
@@ -549,7 +555,7 @@ mod tests {
         // An io_uring READV on an epoll descriptor is rejected without consuming input.
         let n = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         assert!(n >= 0);
-        let mut tap = TapQueue::test_fd(unsafe { OwnedFd::from_raw_fd(n) });
+        let mut tap = TapQueue::test_fd(unsafe { OwnedFd::from_raw_fd(n) }, false);
         let mut bytes = [0u8; crate::MAX_FRAME_LEN + 1];
         let batch = ring.read(&mut tap, &mut [&mut bytes]);
         assert!(!ring.enabled);

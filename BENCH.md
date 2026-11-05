@@ -1,15 +1,12 @@
 # Release transport overload investigation
 
 The original receive-admission collapse and a later TAP readiness busy loop
-are fixed. Local TAP USO coalescing and batched reads improve delivery.
-The iperf3 read-ring repeats reach 4.94–5.28 / 6.23–6.48 Gbit/s under unlimited
-load; their five unlimited points exceed their paced predecessors.
-The newer segmented-send/GRO-receive workload still shows declines,
-including a four-worker direction falling from 6.27 to 5.31 Gbit/s as actual
-offered load rises. After optimizing checksum completion, eight workers reach
-9.74–9.75 / 9.29–9.45 Gbit/s unlimited; a four-worker reverse direction still
-falls 4.8% as actual input increases.
-Overload stability remains unresolved.
+are fixed. Bounded UDP super-frame input now reaches 14.44–14.77 / 11.00–11.05
+Gbit/s under unlimited load with eight workers, measured between receiver
+snapshots rather than including the drain. Matched checksum-only controls
+deliver 9.45 / 8.81 Gbit/s. Some paced/unlimited pairs still decline by
+1.8–2.6%; four workers also lose reverse delivery as input rises from 8 to
+21 Gbit/s. Overload stability remains unresolved.
 
 These short sweeps do not establish a plateau for every workload or the
 theoretical CPU ceiling. Neither the local **20 Gbit/s in each direction**
@@ -24,7 +21,7 @@ their absence does not explain away a scheduling or admission failure.
 ## Current performance gaps
 
 Status after the TAP readiness fix, per-peer payload limit, local TAP USO
-bounded read rings and partial-checksum completion.
+bounded read rings, partial-checksum completion and UDP super-frame input.
 The split-pool, deadline-cache and lane-association experiments below are not
 in the runtime.
 The latest segmented-send results use 12 physical cores with four workers per
@@ -33,16 +30,16 @@ L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Native-checksum segmented-send repeats deliver 9.74–9.75 / 9.29–9.45 Gbit/s with eight workers; ordinary iperf3 reaches 5.26–5.31 / 6.41 Gbit/s with four | Still about 2.1× short. Actual offered load is only about 10.5–12.5 Gbit/s with kernel segmentation before TAP reads. Full super-frame input remains unfinished. |
-| Goodput must plateau under excess traffic | Five MTU-1500 and three 64-byte corrected read-ring unlimited points exceed their paced predecessors in both directions; earlier baselines and a fixed-batch trial declined | The segmented-send/GRO workload fails the comparison: a four-worker direction drops 15.2% initially; after checksum optimization the reverse direction drops 4.8% with increased input. Longer runs, mixed traffic, more flows/sessions and the acceptance gate remain unverified. |
-| Small-frame overload must remain efficient | Native-checksum segmented sends deliver 1.22M / 1.06M frames/s with four workers and 1.55M / 1.58M with eight, using 64-byte frames | Both short sweeps hold up under overload. Eight-worker missing rates are 0.13% / 0.87%; mixed and non-coalescible traffic still need coverage. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Bounded UDP input delivers 14.44–14.77 / 11.00–11.05 Gbit/s unlimited with eight workers, from 24.29–25.25 / 30.12–30.43 Gbit/s actually offered | Still about 1.35× / 1.81× short. TCP super-frame input remains unfinished. |
+| Goodput must plateau under excess traffic | Earlier read-ring sweeps improved under overload; sampled UDP-input sweeps still decline | Eight-worker paced/unlimited pairs lose up to 2.6%. Four-worker reverse delivery falls 6.8% between requested 8 and 21 Gbit/s. Longer runs, mixed traffic, more flows/sessions and the acceptance gate remain unverified. |
+| Small-frame overload must remain efficient | UDP input delivers 1.75M / 2.13M frames/s with four workers and 3.60–3.62M / 3.06–3.08M with eight, using 64-byte frames | Unlimited delivery exceeds paced delivery in these short sweeps, with high overload loss. Mixed and non-coalescible traffic still need coverage. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
 | Use larger confirmed path MTUs | The runtime accepts a per-peer 1232–1452-byte payload assertion; a controlled 1452-byte sweep shows only a modest change | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. Configured capacity is not confirmed PMTU. |
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
 
-Loss under unlimited load is still high: the native-checksum eight-worker
-MTU-1500 points miss 7.3–7.4% / 15.8–16.9% of offered frames despite zero
+Loss under unlimited load is still high: the UDP-input eight-worker
+MTU-1500 points miss 37.3–37.9% / 59.9–60.4% of offered frames despite zero
 admission pressure and worker queue drops. TAP ingress drops, outer socket overflows
 and inner UDP receive-buffer errors are recorded. Their different units prevent
 an exact frame-loss decomposition.
@@ -842,8 +839,12 @@ associations reduced left-side crossings but nearly every right-side frame
 still crossed workers. They do not establish stable TAP placement; the
 unchanged tuple can outlive the queue on which its first frame arrived.
 The bounded table would also fall back permanently after saturation.
-The trial is reverted. A1 remains open; changing lanes after migration would
-weaken the agreed pinning rule, so the runtime keeps deterministic hashing.
+The trial is reverted; the runtime retains deterministic hashing and handoffs.
+The user's latest November 5 decision permits relaxing flow pinning where
+measurements establish that it harms performance, and retaining it otherwise.
+That permits a separate worker-local trial; it does not make this rejected
+association table useful. eBPF is excluded from both implementation and future
+performance assumptions.
 
 ## Direct TAP cost probes (audit B0)
 
@@ -1400,3 +1401,166 @@ or deallocations. All 16 kernel tests, the full release suite, Clippy and
 Rust 1.89 checks pass. These checks establish the checksum prerequisite;
 full TAP super-frame input, overload stability and both performance gates
 remain unfinished.
+
+## Bounded UDP super-frame input (audit B3, UDP portion)
+
+The runtime now enables UDP L4 TAP input offloads. It retains a super-frame
+in the existing pool and expands ordinary Ethernet frames before packing.
+Expansion stops after 64 frames or 64 KiB in a worker turn, with one final
+frame allowed to cross the byte target. Sessions rotate; input order within
+each session stays intact. One spare output buffer and byte credit prevent
+a queue of inputs from exhausting the resources needed for expansion.
+Raw input and produced frames both count against transmit limits. Expiry
+counts remaining logical frames and preserves the original 100 ms deadline.
+TCP input remains segmented by the kernel.
+
+The kernel comparison reproduces every output byte for IPv4/IPv6 USO inputs,
+including short tails and IPv4 ID wrap. Additional tests cover VLANs, options,
+IPv6 extensions, length/metadata rejection, flow pinning, maximum kernel UDP
+sends, pool pressure, turn budgets, expiry and quiesce. The release runtime
+test exercises actual super-frame reads and verifies zero steady-state
+allocations/deallocations, corruption or duplicate delivery.
+
+### Measurement correction: queued traffic and drain delivery
+
+[All experiments are retained](benches/tap-uso-input.json), including the
+initial shared-tunnel sweep. That sweep reached 36–42 Gbit/s actual offered
+load but later points contained invalid records. A diagnostic repeat
+classified all 75,550 invalid records as well-formed payloads carrying the
+previous run's ID. There were no other invalid payloads in that repeat.
+The original records lack this classification, so their exact causes cannot
+be recovered retrospectively.
+
+USO changes the unit held by the kernel TAP queue: one queued SKB can now
+carry dozens of frames. The earlier two-second drain did not empty every
+queue before the next run. Each rate point now starts fresh daemons and
+private namespaces. The initial failed points remain excluded from acceptance.
+
+Receiver SIGUSR1 snapshots at the before/sent boundaries now measure
+unique delivery within a defined interval. Final counts still include the
+drain and determine observed missing packets for that receiver lifetime.
+Several overloaded four-worker points deliver another 1.1–1.3 million
+frames during the drain. Dividing final delivery by sender duration, as
+the historical tables do, overstates the forwarding rate in these cases.
+New tables use the receiver sample interval and report drain-inclusive
+delivery separately in JSON.
+
+TAP TX drop counters now count super-frame SKBs where applicable; transport
+socket overflow also counts SKBs. Neither can be added directly to logical
+inner-frame loss. The 100 ms userspace deadline starts when the worker reads
+a TAP input, and does not measure time already spent in the kernel TAP queue.
+
+### Isolated, sampled release sweeps
+
+The daemon hash is
+`e228a51486c4eab44f3a5936dca84cd68721ebd996e2c2ccf5bcf8e80e7427fa`.
+Four-worker runs use the same 12 physical cores as the preceding segmented
+sweep; eight-worker runs use 20. Each point sends for 20 seconds, with
+16 flows each way and 44 UDP segments per send. The receiver interval is
+about 20.12 seconds. All points below have zero invalid records, duplicate
+sequences, admission pressure, worker queue drops and outer IPv6 fragmentation.
+
+| Workers | Requested Gbit/s each way | Actual offered Gbit/s | In-window delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 8 | 7.979 / 7.982 | 6.872 / 7.573 | 13.34 / 2.32 | 287.7 / 276.6 |
+| 4 | 21 | 20.807 / 20.971 | 7.734 / 7.059 | 59.51 / 62.87 | 348.9 / 349.2 |
+| 4 | unlimited | 36.092 / 43.012 | 7.824 / 7.377 | 76.39 / 81.22 | 359.8 / 347.0 |
+| 4 | 21 | 20.696 / 20.893 | 7.735 / 7.212 | 59.25 / 61.64 | 344.0 / 344.0 |
+| 4 | unlimited | 36.026 / 42.392 | 7.813 / 7.273 | 76.39 / 81.16 | 357.5 / 343.4 |
+| 8 | 8 | 7.971 / 7.963 | 7.907 / 7.875 | 0.21 / 0.51 | 301.0 / 294.1 |
+| 8 | 21 | 20.531 / 20.640 | 14.708 / 11.297 | 25.52 / 40.06 | 576.2 / 569.6 |
+| 8 | unlimited | 24.293 / 30.118 | 14.443 / 11.002 | 37.27 / 59.92 | 592.8 / 598.8 |
+| 8 | 21 | 20.647 / 20.702 | 14.762 / 11.264 | 25.62 / 40.54 | 579.6 / 571.6 |
+| 8 | unlimited | 25.248 / 30.428 | 14.773 / 11.048 | 37.92 / 60.41 | 604.4 / 601.4 |
+
+The last four-worker unlimited point has 34 packets outside the duplicate
+window, so its missing percentage is not an exact loss claim. All other
+isolated points above have zero out-of-window packets. Four-worker expiry
+counts are 0 / 1 at the first unlimited point and 2 / 0 at the second;
+the eight-worker points have no expiry.
+
+The eight-worker first paced/unlimited pair falls from 14.708 / 11.297
+to 14.443 / 11.002 Gbit/s as actual input increases. Its second pair holds
+L→R delivery but R→L falls from 11.264 to 11.048 Gbit/s. Four workers also
+lose reverse delivery between requested 8 and 21 Gbit/s. These are measured
+declines; the 20 Gbit/s gate and a stable overload plateau remain unmet.
+
+### Matched controls, small frames and CPU attribution
+
+Checksum-only controls use the same fresh-namespace harness, receiver samples,
+16 flows and 20-second intervals. Their actual offered rate remains lower
+because the kernel segments each send before the TAP read. These are matched
+requests and placement, not equal actual offered traffic.
+
+| Workers | Requested Gbit/s each way | Actual offered Gbit/s | In-window delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 8 | 7.862 / 7.925 | 7.721 / 7.808 | 1.21 / 0.89 | 386.5 / 385.8 |
+| 8 | 21 | 10.326 / 11.488 | 9.448 / 8.881 | 7.96 / 22.04 | 491.5 / 509.0 |
+| 8 | unlimited | 10.339 / 11.244 | 9.450 / 8.810 | 8.06 / 21.03 | 496.5 / 514.6 |
+| 4 | 21 | 10.456 / 11.928 | 5.319 / 6.098 | 48.67 / 48.49 | 292.7 / 329.6 |
+| 4 | unlimited | 9.532 / 11.814 | 6.574 / 5.438 | 30.46 / 53.62 | 329.6 / 352.3 |
+
+At the eight-worker 8 Gbit/s request, UDP input uses about 22–24% less daemon
+CPU. At unlimited load it delivers about 53–56% more L→R and 25% more R→L
+than the sampled checksum-only control, with about 20% more daemon CPU and
+higher offered traffic. Four-worker control variability prevents an equally
+clean speedup attribution.
+
+The 64-byte runs use 22-byte UDP payloads and 64 segments per send. Goodput
+below counts frames only within the receiver sample interval; missing rates
+use final delivery after drain.
+
+| Workers | Requested per-flow Mbit/s | Offered Mframes/s | Delivered Mframes/s | Missing after drain % | Daemon CPU % |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 10 | 0.909 / 0.909 | 0.903 / 0.903 | 0.00 / 0.02 | 148.9 / 146.1 |
+| 4 | unlimited | 19.004 / 18.735 | 1.749 / 2.126 | 90.23 / 87.91 | 364.4 / 351.3 |
+| 8 | 10 | 0.906 / 0.906 | 0.901 / 0.901 | 0.00 / 0.00 | 170.2 / 166.8 |
+| 8 | unlimited | 16.877 / 17.999 | 3.621 / 3.083 | 77.46 / 81.76 | 686.9 / 681.6 |
+| 8 | 40 | 3.601 / 3.609 | 3.228 / 2.567 | 8.06 / 24.92 | 556.8 / 544.1 |
+| 8 | unlimited | 16.712 / 17.992 | 3.602 / 3.058 | 77.30 / 81.87 | 693.2 / 679.8 |
+
+These small-frame points have no invalid, duplicate or out-of-window records,
+worker queue drops, admission pressure, expiry or outer fragmentation.
+Unlimited delivery exceeds the preceding paced point in both directions,
+including the 40 Mbit/s-per-flow saturation comparison.
+
+The unchanged iperf3 workload was also tested with fresh namespaces. With
+the original wider generator placement, four workers deliver 3.958 / 5.527
+Gbit/s at the 8 Gbit/s request and 4.778 / 5.914 Gbit/s unlimited, missing
+50.37% / 30.79% and 61.11% / 53.35%, respectively. Daemon CPU is
+338.5% / 346.8% and 320.4% / 319.6%. A separate single-core-per-generator
+smoke test delivers 3.289 / 3.303 and 3.430 / 3.500 Gbit/s; its lower offered
+rate cannot test the transport ceiling. Both placements have zero pressure
+and worker queue drops. The wider unlimited point expires three left-side
+frames. These ordinary-send runs do not establish an improvement over the
+earlier checksum-only iperf3 results.
+
+[The eight-worker CPU profile](benches/worker-uso-input-profile.json) samples
+one turn in 256 with thread CPU time and subtracts measured clock overhead.
+Complete one-second bins attribute roughly 24–29% of CPU to transmit flush,
+22–26% to receive processing including interleaved TAP delivery, 10–12% to
+final TAP delivery, 8–12% to TAP reads, and 8–11% to super-frame expansion.
+UDP receive calls account for another 7–11%. No TAP handler ran without
+available transmit capacity. Estimated total CPU is within about 3% of
+the process snapshots; small negative dispatch residuals show sampling noise.
+
+Worker load remains uneven: in the last uninstrumented eight-worker unlimited
+point, some worker CPUs spend about half the interval idle while others
+are almost fully busy. Both receiver process cores are busy for roughly
+94–97% of the sampled interval. This supports further placement and receiver
+profiling; it does not prove either is the remaining ceiling. The instrumented
+pair itself improves under unlimited load, so it does not explain the
+uninstrumented 1.8–2.6% declines.
+
+| Sampled run | TAP TX drops (SKBs) | Transport socket overflow (SKBs) | Inner UDP errors | Expired logical frames |
+| --- | ---: | ---: | ---: | ---: |
+| rx-uso-isolated-4-1452-1514-16/4 | 908138 / 1260708 | 184517 / 383997 | 3159 / 96 | 2 / 0 |
+| rx-uso-isolated-8-1452-1514-16/2 | 201073 / 565211 | 351179 / 406451 | 21142 / 11428 | 0 / 0 |
+| rx-uso-isolated-8-1452-1514-16/4 | 232701 / 576463 | 358531 / 361391 | 17666 / 11633 | 0 / 0 |
+| rx-uso-small-saturation-8-1452-64-16/1 | 3585681 / 4309183 | 589451 / 925899 | 13029 / 2002 | 0 / 0 |
+
+The final release suite, all 18 kernel library tests, both load-tool kernel
+tests, foundation and reconnect tests, Clippy and Rust 1.89 checks pass.
+The reconnect test includes byte-checked UDP super-frame delivery and checks
+for steady-state allocations and deallocations. TCP input, the overload
+plateau and both throughput gates remain unfinished.

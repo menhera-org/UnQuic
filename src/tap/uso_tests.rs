@@ -139,6 +139,35 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
                         );
                     }
                 }
+                // Compare our expansion with Linux segmentation of the identical metadata.
+                let payload: Vec<_> = payloads.iter().flatten().copied().collect();
+                let mut input = frame(v6, 65520, &payload);
+                let mut header = common::udp::partial(&mut input, v6);
+                header[1] = 5;
+                header[4..6].copy_from_slice(&(size as u16).to_ne_bytes());
+                let mut segments =
+                    super::Segments::parse(&header, &input, crate::MAX_FRAME_LEN).unwrap();
+                let iov = [
+                    libc::iovec {
+                        iov_base: header.as_ptr().cast_mut().cast(),
+                        iov_len: header.len(),
+                    },
+                    libc::iovec {
+                        iov_base: input.as_ptr().cast_mut().cast(),
+                        iov_len: input.len(),
+                    },
+                ];
+                // SAFETY: writev borrows both initialized buffers for this call.
+                assert_eq!(
+                    unsafe { libc::writev(tap.fd.as_raw_fd(), iov.as_ptr(), 2) },
+                    (input.len() + 10) as isize
+                );
+                let mut output = [0u8; crate::MAX_FRAME_LEN];
+                for _ in 0..count {
+                    let n = segments.write(&input, &mut output);
+                    assert_eq!(receive(&capture), &output[..n]);
+                }
+                assert!(segments.done(input.len()));
                 println!("v6={v6} count={count} short={short} byte_exact=true");
             }
         }

@@ -7,11 +7,13 @@
 
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
-mod test_common;
+pub(crate) mod test_common;
 
 mod read;
 pub(crate) use read::Reader;
+mod segment;
 mod uso;
+pub(crate) use segment::Segments;
 #[cfg(test)]
 #[path = "tap/uso_tests.rs"]
 mod uso_tests;
@@ -131,16 +133,23 @@ impl Tap {
         Ok(tap)
     }
 
-    pub(crate) fn enable_checksums(&self) -> io::Result<()> {
-        // SAFETY: TUNSETOFFLOAD takes an integer bitmask; every queue belongs to this TAP.
-        cvt(unsafe {
-            libc::ioctl(
-                self.queues[0].fd.as_raw_fd(),
-                libc::TUNSETOFFLOAD,
-                libc::TUN_F_CSUM as libc::c_ulong,
-            )
-        })?;
-        Ok(())
+    pub(crate) fn enable_input_offloads(&self) -> io::Result<()> {
+        let fd = self.queues[0].fd.as_raw_fd();
+        // Linux requires both TUN_F_USO4 (0x20) and TUN_F_USO6 (0x40).
+        let flags = libc::TUN_F_CSUM as libc::c_ulong | 0x60;
+        // SAFETY: TUNSETOFFLOAD takes an integer bitmask for this TAP.
+        let result = cvt(unsafe { libc::ioctl(fd, libc::TUNSETOFFLOAD, flags) });
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) => {
+                // Older kernels still segment in software before checksum-only TAP reads.
+                cvt(unsafe {
+                    libc::ioctl(fd, libc::TUNSETOFFLOAD, libc::TUN_F_CSUM as libc::c_ulong)
+                })?;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Returns the exact requested device name.
@@ -177,11 +186,11 @@ pub struct TapQueue {
 
 impl TapQueue {
     #[cfg(test)]
-    pub(crate) fn test_fd(fd: OwnedFd) -> Self {
+    pub(crate) fn test_fd(fd: OwnedFd, vnet: bool) -> Self {
         Self {
             fd,
             frame_limit: MAX_FRAME_LEN,
-            vnet: false,
+            vnet,
             uso: false,
             completed_checksums: 0,
         }
@@ -202,6 +211,17 @@ impl TapQueue {
     /// be mistaken for complete frames. Invalid frames are consumed and return
     /// InvalidData. WouldBlock and Interrupted leave retry policy to the worker.
     pub fn read_frame(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let (length, segments) = self.read_input(buffer)?;
+        if segments.is_some() {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(length)
+    }
+
+    pub(crate) fn read_input(
+        &mut self,
+        buffer: &mut [u8],
+    ) -> io::Result<(usize, Option<Segments>)> {
         if buffer.len() <= MAX_FRAME_LEN {
             return Err(io::ErrorKind::InvalidInput.into());
         }
@@ -231,7 +251,28 @@ impl TapQueue {
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
-        self.finish_read(&header, n as usize, buffer)
+        self.finish_input(&header, n as usize, buffer)
+    }
+
+    fn finish_input(
+        &mut self,
+        header: &[u8; 10],
+        n: usize,
+        buffer: &mut [u8],
+    ) -> io::Result<(usize, Option<Segments>)> {
+        if self.vnet && header[1] != 0 {
+            let length = n
+                .checked_sub(header.len())
+                .ok_or(io::ErrorKind::InvalidData)?;
+            if length >= buffer.len() {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            let segments = Segments::parse(header, &buffer[..length], self.frame_limit)
+                .ok_or(io::ErrorKind::InvalidData)?;
+            return Ok((length, Some(segments)));
+        }
+        self.finish_read(header, n, buffer)
+            .map(|length| (length, None))
     }
 
     fn finish_read(

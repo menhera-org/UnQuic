@@ -19,6 +19,8 @@ section 15 of the design and the "Implementation status" section of
   resolver's facilities as documented in config-model.md.
 - No async runtime, no wall-clock values on the wire, no host-specific facts in
   the repository.
+- Do not use eBPF; production deployment cannot depend on permission to load it.
+  Classic socket BPF receive steering keeps its ordinary-hashing fallback.
 - No locks or allocations on hot paths. Protocol transitions take supplied
   monotonic time and make no syscalls. Batch socket I/O, queue notifications
   and timer updates; measure before claiming a performance improvement.
@@ -318,9 +320,9 @@ duplicate suppression, observed packing and zero allocations/deallocations while
 reporting frame drops. The release baseline in BENCH.md now records single- and
 multiple-flow small-frame and MTU-1500 traffic, per-direction delivery/loss, process
 CPU and per-core CPU/softirq. The original admission-pressure collapse is fixed;
-local TAP USO improves both MTU-1500 and small-frame delivery, and the latest
-20-second sweeps hold up under excess load. Broader plateau checks and the
-measured CPU ceiling remain open.
+local TAP USO improves both MTU-1500 and small-frame delivery. The sampled
+UDP-input sweeps still show small overload declines with eight workers.
+Plateau checks and the measured CPU ceiling remain open.
 The final throughput gate remains open. Partial completion, GSO/GRO boundaries, MTU errors
 and allocation checks pass. The five frame-model regression cases
 now run against the real implementation in tests/reassembly.rs.
@@ -343,14 +345,15 @@ now run against the real implementation in tests/reassembly.rs.
   but no packet is ACK-eligible until all its nonterminal DATA is retained.
 - TAP reads retain the 64-frame budget and strip internal `IFF_VNET_HDR`
   metadata. The runtime enables checksum offload and completes partial checksums
-  in place; GSO read offloads remain disabled. Compatible complete
+  in place. UDP super-frame input uses bounded userspace segmentation from
+  the existing pool; TCP read offloads remain disabled. Compatible complete
   UDP frames can share a lossless USO TAP write, preserving per-flow order,
   backpressure and the existing receive deadline. Other frames use single writes.
   Workers use bounded nonblocking io_uring read batches when available,
   draining completions before releasing buffers and falling back to plain reads
-  on unsupported kernels. Corrected read-ring sweeps deliver about 5.0 / 6.3
-  Gbit/s and hold up under overload; the 20 Gbit/s gate and super-frame input
-  remain unfinished.
+  on unsupported kernels. UDP super-frame sweeps improve delivery but still
+  miss the 20 Gbit/s gate and show overload declines. TCP super-frame input
+  remains unfinished.
 - Preallocated buffer pools and descriptor rings in the worker; no allocation
   on the data path after startup. Verify by a test that counts allocations
   with a global allocator wrapper in the test binary.
@@ -362,9 +365,9 @@ now run against the real implementation in tests/reassembly.rs.
 - The Rust UDP_SEGMENT/GRO load tool uses concurrent sockets, per-flow pacing,
   byte validation and duplicate tracking; it reports generator CPU separately.
   Direct veth probes exceed 20 Gbit/s each way. Four-/eight-worker harness
-  smoke tests pass with plain UDP. Segmented senders now work through the runtime's checksum completion path;
-  the kernel still segments before TAP reads. B3 super-frame input remains
-  unfinished, and the direct probes do not pass the tunnel gate.
+  smoke tests pass with plain UDP. B3 UDP super-frame input is implemented;
+  TCP input remains segmented by the kernel. Direct harness probes do not
+  pass the tunnel gate; see BENCH.md for measured transport limits.
 - Measure: record frames per second and CPU per core on the container
   loopback in a `BENCH.md` table with kernel version and CPU model. These
   numbers are a baseline until a complete-transport run demonstrates at least

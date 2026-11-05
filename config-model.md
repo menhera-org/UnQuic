@@ -82,7 +82,10 @@ storage accounting is a separate startup check before TAP creation.
 
 The worker count is the largest session `queue_count`, or one for no sessions.
 TAP queue index selects its worker; TX lane index modulo worker count selects
-its owner. Queue and lane counts need not match. `path_group` is validated and
+its owner. Queue and lane counts need not match. A flow keeps its hashed lane
+when Linux moves it to another TAP queue; workers hand frames to the lane owner.
+This is the current baseline. Flow pinning may be relaxed where measured
+handoff costs justify it; otherwise retain it. eBPF is not an implementation option. `path_group` is validated and
 retained, but congestion grouping has no runtime effect until stage 3.
 
 The daemon's `host` field uses iphost's `IpHost`/`FQDN` types. The

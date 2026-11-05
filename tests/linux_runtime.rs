@@ -219,6 +219,64 @@ fn uso_delivery_allocates_nothing(net: &UdpSocket) {
     assert!(coalesced, "the allocation check must exercise USO delivery");
     assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
     assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
+    // AF_PACKET's virtio metadata makes the host TAP receive actual USO inputs.
+    let batches: Vec<_> = frames
+        .chunks(32)
+        .map(|batch| {
+            let payload: Vec<_> = batch.iter().flat_map(|f| f[42..].iter().copied()).collect();
+            let id = u16::from_be_bytes([batch[0][18], batch[0][19]]);
+            let mut input = common::udp::frame(false, id, &payload);
+            input[..12].copy_from_slice(&batch[0][..12]);
+            let mut header = common::udp::partial(&mut input, false);
+            header[1] = 5;
+            header[4..6].copy_from_slice(&1472u16.to_ne_bytes());
+            [header.as_slice(), input.as_slice()].concat()
+        })
+        .collect();
+    let vnet = 1i32;
+    // SAFETY: PACKET_VNET_HDR reads one initialized integer.
+    check(unsafe {
+        libc::setsockopt(
+            source.as_raw_fd(),
+            libc::SOL_PACKET,
+            libc::PACKET_VNET_HDR,
+            (&vnet as *const i32).cast(),
+            size_of_val(&vnet) as _,
+        )
+    });
+    seen.fill(false);
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    DEALLOCATIONS.store(0, Ordering::Relaxed);
+    COUNTING.store(true, Ordering::SeqCst);
+    for batch in &batches {
+        // SAFETY: use the bound IPv4 protocol; the first ten bytes are metadata.
+        assert_eq!(
+            unsafe { libc::send(source.as_raw_fd(), batch.as_ptr().cast(), batch.len(), 0) },
+            batch.len() as isize
+        );
+        let mut received = 0;
+        until(Duration::from_secs(2), || match receiver.recv(&mut input) {
+            Ok(n) => {
+                assert_eq!(n % 1472, 0);
+                for payload in input[..n].chunks(1472) {
+                    let sequence = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+                    assert!(sequence < seen.len() && !seen[sequence]);
+                    assert_eq!(payload, &frames[sequence][42..]);
+                    seen[sequence] = true;
+                    received += 1;
+                }
+                received == 32
+            }
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+                false
+            }
+        });
+    }
+    COUNTING.store(false, Ordering::SeqCst);
+    assert!(seen.iter().all(|&v| v));
+    assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
 }
 
 fn frame_storm() {
@@ -382,6 +440,12 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
         })
     });
     uso_delivery_allocates_nothing(&net);
+    until(Duration::from_secs(2), || {
+        (0..2)
+            .map(|worker| left.control.worker_counters(worker).unwrap().tap_gso_frames)
+            .sum::<u64>()
+            >= 512
+    });
     let a = raw_socket(c"uq-left", libc::ETH_P_ALL as u16);
     let b = raw_socket(c"uq-right", libc::ETH_P_ALL as u16);
     for fd in [&a, &b] {

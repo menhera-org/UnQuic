@@ -3,8 +3,14 @@ use std::{
     io,
     net::{IpAddr, SocketAddr, UdpSocket},
     os::fd::AsRawFd,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
+
+static SNAPSHOT: AtomicBool = AtomicBool::new(false);
+extern "C" fn snapshot(_: libc::c_int) {
+    SNAPSHOT.store(true, Ordering::Relaxed);
+}
 
 const MAGIC: [u8; 4] = *b"UQL1";
 const WORDS: usize = 128;
@@ -159,6 +165,8 @@ struct Flow {
     gro: u64,
     blocked: u64,
     invalid: u64,
+    wrong_run: u64,
+    first_wrong_run: u32,
     overflow: u64,
     overflow_last: u32,
     receive_bytes: i32,
@@ -231,6 +239,8 @@ fn flows(c: &Config) -> io::Result<Vec<Flow>> {
                 gro: 0,
                 blocked: 0,
                 invalid: 0,
+                wrong_run: 0,
+                first_wrong_run: 0,
                 overflow: 0,
                 overflow_last: 0,
                 receive_bytes,
@@ -254,10 +264,18 @@ fn consume(flow: &mut Flow, bytes: &[u8], segment: usize, size: usize, run: u32)
     for p in bytes.chunks(segment) {
         if p.len() != size
             || p[..4] != MAGIC
-            || p[4..8] != run.to_be_bytes()
             || p[16..].iter().fold(0, |bad, &v| bad | (v ^ 0xa5)) != 0
         {
             flow.invalid += 1;
+            continue;
+        }
+        let observed_run = u32::from_be_bytes(p[4..8].try_into().unwrap());
+        if observed_run != run {
+            flow.invalid += 1;
+            flow.wrong_run += 1;
+            if flow.first_wrong_run == 0 {
+                flow.first_wrong_run = observed_run;
+            }
             continue;
         }
         let seq = u64::from_be_bytes(p[8..16].try_into().unwrap());
@@ -380,12 +398,35 @@ fn run(c: &Config) -> io::Result<()> {
             revents: 0,
         })
         .collect();
+    if !c.send {
+        // SAFETY: sigaction contains a plain function handler and an initialized empty mask.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = snapshot as *const () as usize;
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    let mut samples = [(0.0f64, 0u64); 2];
+    let mut sample_count = 0;
     let start_cpu = cpu_ns()?;
     let start = Instant::now();
     let end = Duration::from_secs(c.seconds);
     let length = c.count() * c.payload;
     while start.elapsed() < end {
         let now = start.elapsed().as_nanos() as u64;
+        if SNAPSHOT.load(Ordering::Relaxed)
+            && SNAPSHOT.swap(false, Ordering::Relaxed)
+            && sample_count < samples.len()
+        {
+            samples[sample_count] = (
+                now as f64 / 1e9,
+                flows.iter().map(|f| f.window.unique).sum(),
+            );
+            sample_count += 1;
+        }
         let mut progress = false;
         let mut delay = 1_000_000;
         for f in &mut flows {
@@ -448,7 +489,7 @@ fn run(c: &Config) -> io::Result<()> {
     for (i, f) in flows.iter().enumerate() {
         let w = &f.window;
         println!(
-            "{}{{\"port\":{},\"sent\":{},\"unique\":{},\"next_sequence\":{},\"prefix_missing\":{},\"duplicates\":{},\"reordered\":{},\"too_old\":{},\"invalid\":{},\"calls\":{},\"gro_messages\":{},\"blocked\":{},\"socket_overflow\":{},\"receive_buffer_bytes\":{}}}",
+            "{}{{\"port\":{},\"sent\":{},\"unique\":{},\"next_sequence\":{},\"prefix_missing\":{},\"duplicates\":{},\"reordered\":{},\"too_old\":{},\"invalid\":{},\"wrong_run\":{},\"first_wrong_run\":{},\"calls\":{},\"gro_messages\":{},\"blocked\":{},\"socket_overflow\":{},\"receive_buffer_bytes\":{}}}",
             if i == 0 { "" } else { "," },
             c.port + i as u16,
             f.sequence,
@@ -459,11 +500,20 @@ fn run(c: &Config) -> io::Result<()> {
             w.reordered,
             w.too_old,
             f.invalid,
+            f.wrong_run,
+            f.first_wrong_run,
             f.calls,
             f.gro,
             f.blocked,
             f.overflow,
             f.receive_bytes
+        );
+    }
+    print!("],\"samples\":[");
+    for (i, (seconds, unique)) in samples[..sample_count].iter().enumerate() {
+        print!(
+            "{}{{\"seconds\":{seconds:.9},\"unique\":{unique}}}",
+            if i == 0 { "" } else { "," }
         );
     }
     println!("]}}");
@@ -643,11 +693,14 @@ mod tests {
                             assert_eq!(receiver.invalid, (payload - 16) as u64);
                             receiver.invalid = 0;
                         }
+                        consume(receiver, &bytes[..payload], payload, payload, c.run + 1);
+                        assert_eq!(receiver.wrong_run, 1);
+                        assert_eq!(receiver.first_wrong_run, c.run);
                         bytes[0] ^= 1;
                         consume(receiver, &bytes[..payload], payload, payload, c.run);
                         consume(receiver, &bytes[..payload - 1], payload - 1, payload, c.run);
                         consume(receiver, &[], 0, payload, c.run);
-                        assert_eq!(receiver.invalid, 3);
+                        assert_eq!(receiver.invalid, 4);
                     }
                 }
             }

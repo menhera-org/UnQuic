@@ -13,6 +13,17 @@ case "${OUTER_PAYLOAD_LIMIT:-1232}" in ''|*[!0-9]*) exit 2;; esac
 [ "${OUTER_PAYLOAD_LIMIT:-1232}" -ge 1232 ] && [ "${OUTER_PAYLOAD_LIMIT:-1232}" -le 1452 ] || exit 2
 case "${WORKERS:-4}" in 4|8) ;; *) echo "WORKERS must be 4 or 8" >&2; exit 2;; esac
 case "${UDP_LOAD:-}" in ''|/*) ;; *) echo "UDP_LOAD must be an absolute path" >&2; exit 2;; esac
+case "${BITRATE:-0}" in
+    *[[:space:]]*)
+        mkdir "$5"
+        index=0
+        for rate in ${BITRATE:-0}; do
+            BITRATE=$rate sh "$0" "$1" "$2" "$3" "$4" "$5/$index"
+            index=$((index + 1))
+        done
+        exit 0
+        ;;
+esac
 mkdir "$5"
 # A private mount namespace keeps ip-netns bind mounts out of the caller.
 exec unshare -m -n --propagation private sh -s -- "$@" <<'BENCH'
@@ -116,6 +127,9 @@ for side in left right; do
 done
 snapshot() {
     kill -USR1 "$left" "$right"
+    if [ -n "${UDP_LOAD:-}" ] && [ "$1" != after ]; then
+        kill -USR1 "$server" "$reverse_server"
+    fi
     sleep 0.1
     cp "$base/left.log" "$out/$1.left-log"
     cp "$base/right.log" "$out/$1.right-log"

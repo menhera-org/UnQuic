@@ -259,9 +259,10 @@ These conservative reservations can reject large configurations before startup.
 
 Fixed receive storage permits at most 4096 frames and 36,954,112 reserved frame
 bytes per session, below the 8192-frame/64-MiB directional ceilings. Transmit
-reservations divide the 64-MiB budget among the session's TAP queue owners,
-rounded down using the maximum frame length, and also respect their 128-buffer
-pools. A reservation lasts until the frame buffer returns to its origin,
+reservations divide the frame and 64-MiB byte budgets among the session's TAP
+queue owners and also respect their 128-buffer pools. Byte accounting includes
+retained super-frames and their expanded children; reads reserve worst-case
+space and leave one output buffer available for expansion. A reservation lasts until the frame buffer returns to its origin,
 including handoff and return-queue delays. Compile-time bounds and quota tests
 check these limits; no shared reservation lock or atomic is needed.
 
@@ -323,7 +324,11 @@ does not move when duplicates arrive.
 Completed frames are delivered as they become available, without a per-flow
 reorder queue. A flow hashes to one transmit lane; increasing `tx_lanes` spreads
 multiple flows but does not stripe a single flow. Queue counts and lane counts
-are independent, and peers need not use identical values.
+are independent, and peers need not use identical values. If Linux moves a flow
+to another TAP queue, its lane stays fixed and the reading worker hands frames
+to the lane owner. This remains the baseline; flow pinning may be relaxed only
+where measurements show a performance benefit. A frame and its repairs must
+stay on one lane. eBPF is excluded from deployment.
 
 Liveness currently sends a 52-byte UDP PROBE on local lane 1 every second,
 including during data traffic. Only the first reply matching the outstanding
@@ -358,16 +363,31 @@ Worker/session counters expose read syscalls (`tap_read_calls`), submitted
 read requests (`tap_read_requests`), ring batches (`tap_read_batches`),
 valid ring frames (`tap_ring_frames`) and fallback events
 (`tap_read_fallbacks`). Startup fallback counts belong to workers.
-`tap_checksums` counts partial checksums completed before transmit admission.
+`tap_checksums` counts completed partial checksums, including segmented outputs.
+`tap_gso_reads` counts retained UDP super-frames and `tap_gso_frames` counts
+the ordinary frames expanded from them.
 
 ## TAP write coalescing
 
 TAP queues use an internal 10-byte virtio header. The runtime enables checksum
 offload and completes partial Internet checksums in place after validating the
-metadata bounds. GSO read offloads remain disabled, so the kernel segments
-host super-frames before TAP reads. Wire DATA still carries ordinary Ethernet
-frames. Unknown metadata flags and unexpected GSO input are rejected.
-Standalone `Tap::create` keeps read offloads disabled until runtime setup.
+metadata bounds. UDP L4 read offloads let the runtime accept host super-frames
+up to 65,535 bytes. It segments these into ordinary Ethernet frames before
+packing; TCP read offloads remain disabled. Older kernels that reject USO
+use checksum-only reads and kernel segmentation. Standalone `Tap::create`
+keeps read offloads disabled until runtime setup.
+
+UDP expansion accepts IPv4 options, VLAN tags, and IPv6 hop-by-hop, routing
+and destination headers. It validates protocol, lengths and checksum offsets,
+adjusts the supplied pseudo-header checksum seed, and advances IPv4 IDs.
+Unknown flags, unsupported GSO types, and fragmented GSO inputs are rejected.
+Pending input retains its original connection tag and 100 ms deadline.
+Expansion yields after 64 frames or 64 KiB per worker turn; the last frame
+may cross the byte target. Sessions take turns, and each session preserves
+input order. The existing pool supplies both raw input and output buffers,
+with one output buffer reserved for progress. Both copies count toward the
+session's transmit byte limit until released. Wire DATA remains ordinary
+Ethernet frames, with unchanged flow pinning and packet-admission rules.
 
 A receive flush may combine already-complete UDP frames into one USO
 `writev`, borrowing their payloads directly from reassembly slots. Supported
