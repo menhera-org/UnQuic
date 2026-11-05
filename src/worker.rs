@@ -268,11 +268,27 @@ use std::{collections::VecDeque, net::SocketAddrV6, sync::atomic::Ordering};
 const TAP_TOKEN: u64 = 1 << 32;
 const TX_TOKEN: u64 = 2 << 32;
 const RETRY: Duration = Duration::from_millis(1);
+const RECEIVE_BYTES: usize = 65_536;
+// Receive quotas follow from fixed lane/slot counts, without shared reservations.
+const _: () = assert!(LANES * reassembly::FRAME_CAPACITY <= 8192);
+const _: () = assert!(LANES * reassembly::FRAME_CAPACITY * MAX_FRAME_LEN <= 64 * 1024 * 1024);
+
+const fn frame_quota(workers: usize) -> usize {
+    let bytes_limited = 64 * 1024 * 1024 / workers / MAX_FRAME_LEN;
+    if bytes_limited < BUFFERS {
+        bytes_limited
+    } else {
+        BUFFERS
+    }
+}
 
 /// Pool entries move through queues by ownership, including on rejection.
 pub(crate) struct Buffer {
     origin: usize,
     rx_counted: bool,
+    tx_reserved: bool,
+    offset: usize,
+    segment_size: usize,
     session: usize,
     tag: u128,
     lane: usize,
@@ -282,7 +298,19 @@ pub(crate) struct Buffer {
     lengths: [u16; 8],
     first: usize,
     count: usize,
-    bytes: [u8; MAX_FRAME_LEN + 1],
+    bytes: [u8; RECEIVE_BYTES],
+}
+
+impl Buffer {
+    fn advance(&mut self) -> bool {
+        self.offset = if self.segment_size == 0 {
+            self.length
+        } else {
+            (self.offset + self.segment_size).min(self.length)
+        };
+        self.rx_counted = false;
+        self.offset < self.length
+    }
 }
 
 pub(crate) enum Event {
@@ -346,6 +374,7 @@ struct Session {
     acknowledged: Option<Command>,
     installed: Option<Command>,
     totals: Snapshot,
+    tx_retained: usize,
     rx_totals: Vec<Snapshot>,
     tx_totals: Vec<Snapshot>,
     rx_dirty: u64,
@@ -522,6 +551,7 @@ impl Worker {
                 acknowledged: None,
                 installed: None,
                 totals: Snapshot::default(),
+                tx_retained: 0,
                 rx_totals: vec![Snapshot::default(); LANES],
                 tx_totals: vec![Snapshot::default(); config.peers[peer].tx_lanes],
                 rx_dirty: 0,
@@ -533,6 +563,9 @@ impl Worker {
                 Box::new(Buffer {
                     origin: id,
                     rx_counted: false,
+                    tx_reserved: false,
+                    offset: 0,
+                    segment_size: 0,
                     session: 0,
                     tag: 0,
                     lane: 0,
@@ -542,7 +575,7 @@ impl Worker {
                     lengths: [0; 8],
                     first: 0,
                     count: 0,
-                    bytes: [0; MAX_FRAME_LEN + 1],
+                    bytes: [0; RECEIVE_BYTES],
                 })
             })
             .collect();
@@ -768,9 +801,16 @@ impl Worker {
             })
     }
 
-    fn release(&mut self, buffer: Box<Buffer>) {
+    fn release(&mut self, mut buffer: Box<Buffer>) {
         let origin = buffer.origin;
         if origin == self.id {
+            if buffer.tx_reserved {
+                self.sessions[buffer.session].tx_retained -= 1;
+                buffer.tx_reserved = false;
+            }
+            buffer.offset = 0;
+            buffer.segment_size = 0;
+            buffer.rx_counted = false;
             self.free.push(buffer);
         } else if let Err(Event::Free(buffer)) = self.push(origin, Event::Free(buffer)) {
             debug_assert!(self.returns[origin].len() < BUFFERS);
@@ -948,7 +988,11 @@ impl Worker {
         for (index, endpoint) in config.endpoints.iter().enumerate() {
             if self.receive[index].is_none() {
                 match ReceiveSocket::bind(endpoint.socket_addr(), endpoint.bind_device.as_deref()) {
-                    Ok(socket) => {
+                    Ok(mut socket) => {
+                        if socket.enable_gro().is_err() {
+                            self.counters.socket_errors =
+                                self.counters.socket_errors.wrapping_add(1);
+                        }
                         self.reactor
                             .add(socket.as_fd(), index as u64 + 2, libc::EPOLLIN as u32)?;
                         self.receive[index] = Some(socket);
@@ -1035,8 +1079,8 @@ impl Worker {
                 match event {
                     Event::Packet(buffer) => self.packet(buffer, now)?,
                     Event::Frame(buffer) => self.frame(buffer, now)?,
-                    Event::Free(buffer) => self.free.push(buffer),
-                    Event::Register { buffer, lane } => {
+                    Event::Free(buffer) => self.release(buffer),
+                    Event::Register { mut buffer, lane } => {
                         let session = buffer.session;
                         if self.matches(session, buffer.tag) {
                             let id = lane.id();
@@ -1051,7 +1095,11 @@ impl Worker {
                             self.packet(buffer, now)?;
                         } else {
                             self.return_lane(session, lane);
-                            self.release(buffer);
+                            if buffer.advance() {
+                                self.packet(buffer, now)?;
+                            } else {
+                                self.release(buffer);
+                            }
                         }
                     }
                     Event::LaneFree { session, lane } => self.sessions[session].free.push(lane),
@@ -1122,7 +1170,7 @@ impl Worker {
         let mut received: [ReceiveDatagram<'_>; BATCH_SIZE] =
             std::array::from_fn(|_| ReceiveDatagram::new(&mut []));
         for (output, buffer) in received.iter_mut().zip(&mut buffers).take(available) {
-            output.buffer = &mut buffer.as_mut().unwrap().bytes[..BASE_UDP_PAYLOAD];
+            output.buffer = &mut buffer.as_mut().unwrap().bytes;
         }
         let result = self.receive[endpoint]
             .as_ref()
@@ -1130,6 +1178,7 @@ impl Worker {
             .recv_batch(&mut received[..available]);
         let lengths: [usize; BATCH_SIZE] = std::array::from_fn(|i| received[i].length);
         let truncated: [bool; BATCH_SIZE] = std::array::from_fn(|i| received[i].truncated);
+        let segments: [usize; BATCH_SIZE] = std::array::from_fn(|i| received[i].segment_size);
         let count = match result {
             Ok(count) => count,
             Err(error) => {
@@ -1144,11 +1193,18 @@ impl Worker {
             if index < count && !truncated[index] {
                 buffer.length = lengths[index];
                 buffer.rx_counted = false;
+                buffer.offset = 0;
+                buffer.segment_size = segments[index];
                 buffer.deadline = now;
+                let packets = if buffer.segment_size == 0 {
+                    1
+                } else {
+                    buffer.length.div_ceil(buffer.segment_size).max(1)
+                };
                 self.counters.rx_outer_bytes = self
                     .counters
                     .rx_outer_bytes
-                    .wrapping_add((buffer.length + 48) as u64);
+                    .wrapping_add((buffer.length + 48 * packets) as u64);
                 self.packet(buffer, now)?;
             } else {
                 if index < count {
@@ -1162,22 +1218,47 @@ impl Worker {
     }
 
     fn packet(&mut self, mut buffer: Box<Buffer>, now: Duration) -> io::Result<()> {
-        let Ok(datagram) = Datagram::decode(&buffer.bytes[..buffer.length]) else {
+        loop {
+            let Some(mut next) = self.packet_one(buffer, now)? else {
+                return Ok(());
+            };
+            if !next.advance() {
+                self.release(next);
+                return Ok(());
+            }
+            buffer = next;
+        }
+    }
+
+    fn packet_one(
+        &mut self,
+        mut buffer: Box<Buffer>,
+        now: Duration,
+    ) -> io::Result<Option<Box<Buffer>>> {
+        let end = if buffer.segment_size == 0 {
+            buffer.length
+        } else {
+            (buffer.offset + buffer.segment_size).min(buffer.length)
+        };
+        let length = end - buffer.offset;
+        if length > crate::socket::MAX_UDP_PAYLOAD {
             self.counters.malformed_packets = self.counters.malformed_packets.wrapping_add(1);
-            self.release(buffer);
-            return Ok(());
+            return Ok(Some(buffer));
+        }
+        let Ok(datagram) = Datagram::decode(&buffer.bytes[buffer.offset..end]) else {
+            self.counters.malformed_packets = self.counters.malformed_packets.wrapping_add(1);
+            return Ok(Some(buffer));
         };
         let header = datagram.header();
         let Some(session) = self.shared.config.session_for_cookie(header.cookie) else {
             self.counters.unknown_cookie_packets =
                 self.counters.unknown_cookie_packets.wrapping_add(1);
-            self.release(buffer);
-            return Ok(());
+            return Ok(Some(buffer));
         };
         buffer.session = session;
         if !buffer.rx_counted {
             let total = &mut self.sessions[session].totals.rx_outer_bytes;
-            *total = total.wrapping_add((buffer.length + 48) as u64);
+            *total = total.wrapping_add((length + 48) as u64);
             buffer.rx_counted = true;
         }
         buffer.tag = header.receive_tag;
@@ -1187,9 +1268,9 @@ impl Worker {
                     self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
                     self.sessions[session].totals.queue_drops =
                         self.sessions[session].totals.queue_drops.wrapping_add(1);
-                    self.release(buffer);
+                    return Ok(Some(buffer));
                 }
-                return Ok(());
+                return Ok(None);
             }
             let peer = self.shared.config.peer_for_session(session).unwrap();
             if !self.controls[session].barrier.is_active() && self.shared.peer_bound(peer) {
@@ -1197,8 +1278,7 @@ impl Worker {
                 if self.peer_controls[peer].change.is_some()
                     && !active_flight(self.sessions[session].connection, record)
                 {
-                    self.release(buffer);
-                    return Ok(());
+                    return Ok(Some(buffer));
                 }
                 if let Ok(mut effects) = self.controls[session].state.on_record(record, now, None) {
                     if effects.needs_tag {
@@ -1210,18 +1290,15 @@ impl Worker {
                     self.effects(session, effects, now)?;
                 }
             }
-            self.release(buffer);
-            return Ok(());
+            return Ok(Some(buffer));
         }
         if !self.matches(session, header.receive_tag) {
-            self.release(buffer);
-            return Ok(());
+            return Ok(Some(buffer));
         }
         let lane_id = usize::from(header.lane);
         let owner = self.shared.owners[session][lane_id].load(Ordering::Acquire);
         if owner == 255 {
-            self.release(buffer);
-            return Ok(());
+            return Ok(Some(buffer));
         }
         if owner == 0 {
             if self.id != 0 {
@@ -1229,16 +1306,15 @@ impl Worker {
                     self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
                     self.sessions[session].totals.queue_drops =
                         self.sessions[session].totals.queue_drops.wrapping_add(1);
-                    self.release(buffer);
+                    return Ok(Some(buffer));
                 }
-                return Ok(());
+                return Ok(None);
             }
             let Some(mut lane) = self.sessions[session].free.pop() else {
                 self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
                 self.sessions[session].totals.queue_drops =
                     self.sessions[session].totals.queue_drops.wrapping_add(1);
-                self.release(buffer);
-                return Ok(());
+                return Ok(Some(buffer));
             };
             lane.reset(
                 header.lane,
@@ -1257,9 +1333,9 @@ impl Worker {
                     self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
                     self.sessions[session].totals.queue_drops =
                         self.sessions[session].totals.queue_drops.wrapping_add(1);
-                    self.release(buffer);
+                    return Ok(Some(buffer));
                 }
-                return Ok(());
+                return Ok(None);
             }
             let slot = self.sessions[session]
                 .rx
@@ -1276,20 +1352,19 @@ impl Worker {
                 self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
                 self.sessions[session].totals.queue_drops =
                     self.sessions[session].totals.queue_drops.wrapping_add(1);
-                self.release(buffer);
+                return Ok(Some(buffer));
             }
-            return Ok(());
+            return Ok(None);
         }
         let slot = self.sessions[session].rx_index[lane_id];
         if slot == 0 {
-            self.release(buffer);
-            return Ok(());
+            return Ok(Some(buffer));
         }
         let slot = usize::from(slot - 1);
         let local = &mut self.sessions[session];
         local.rx_totals[slot].rx_outer_bytes = local.rx_totals[slot]
             .rx_outer_bytes
-            .wrapping_add((buffer.length + 48) as u64);
+            .wrapping_add((length + 48) as u64);
         local.rx_dirty |= 1_u64 << slot;
         match local.rx[slot].as_mut().unwrap().admit(&datagram, now) {
             Admission::Fresh => {
@@ -1301,7 +1376,7 @@ impl Worker {
                                 tag: header.receive_tag,
                                 lane: header.lane,
                                 packet: header.packet_number,
-                                length: buffer.length as u16,
+                                length: length as u16,
                             };
                             if self.id == 0 {
                                 self.send_record(
@@ -1309,7 +1384,7 @@ impl Worker {
                                     Record::ProbeReply {
                                         lane: header.lane,
                                         packet_number: header.packet_number,
-                                        payload_len: buffer.length as u16,
+                                        payload_len: length as u16,
                                     },
                                 )?;
                             } else {
@@ -1388,8 +1463,7 @@ impl Worker {
             }
         }
         self.refresh_rx_counters(session, slot);
-        self.release(buffer);
-        Ok(())
+        Ok(Some(buffer))
     }
 
     fn read_tap(&mut self, session: usize, now: Duration) -> io::Result<()> {
@@ -1401,7 +1475,7 @@ impl Worker {
                 .tap
                 .as_mut()
                 .unwrap()
-                .read_frame(&mut buffer.bytes);
+                .read_frame(&mut buffer.bytes[..MAX_FRAME_LEN + 1]);
             match result {
                 Ok(length) => {
                     buffer.length = length;
@@ -1410,6 +1484,17 @@ impl Worker {
                         self.release(buffer);
                         continue;
                     };
+                    let local = &mut self.sessions[session];
+                    if local.tx_retained
+                        >= frame_quota(self.shared.config.config().sessions[session].queue_count)
+                    {
+                        self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
+                        local.totals.queue_drops = local.totals.queue_drops.wrapping_add(1);
+                        self.release(buffer);
+                        continue;
+                    }
+                    local.tx_retained += 1;
+                    buffer.tx_reserved = true;
                     buffer.tag = connection.local_tag().get();
                     buffer.lane = pack::flow_hash(&buffer.bytes[..length]) as usize
                         % self.sessions[session].tx.len();
@@ -2045,6 +2130,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn origin_reservations_bound_every_session_direction() {
+        for workers in 1..=64 {
+            assert!(frame_quota(workers) * workers <= 8192);
+            assert!(frame_quota(workers) * workers * MAX_FRAME_LEN <= 64 * 1024 * 1024);
+            assert!(frame_quota(workers) <= BUFFERS);
+        }
+        assert_eq!(frame_quota(1), BUFFERS);
+        assert_eq!(frame_quota(64), 116);
+    }
+
+    #[test]
     #[ignore = "kernel descriptor test; run in a disposable container"]
     fn full_handoff_rings_return_buffers_and_finish_connection_barriers() {
         use crate::config::{Config, Daemon, Endpoint, Peer, Session as ConfigSession};
@@ -2052,7 +2148,7 @@ mod tests {
             net::Ipv6Addr,
             sync::atomic::{AtomicU8, AtomicU64},
         };
-        let config = Config {
+        let mut config = Config {
             daemon: Daemon::default(),
             endpoints: vec![Endpoint {
                 name: "rx".into(),
@@ -2079,26 +2175,33 @@ mod tests {
                 mac: None,
                 queue_count: 2,
             }],
-        }
-        .validate()
-        .unwrap();
+        };
+        let mut second = config.sessions[0].clone();
+        second.name = "other".into();
+        second.cookie = crate::UnquicUuid::from_bytes([2; 16]);
+        config.sessions.push(second);
+        let config = config.validate().unwrap();
         let shared = Arc::new(Shared {
             config,
             wakes: (0..2).map(|_| Arc::new(Wake::new().unwrap())).collect(),
-            owners: vec![(0..65_536).map(|_| AtomicU8::new(0)).collect()],
-            status: vec![AtomicU8::new(0)],
-            generations: vec![AtomicU64::new(0)],
+            owners: (0..2)
+                .map(|_| (0..65_536).map(|_| AtomicU8::new(0)).collect())
+                .collect(),
+            status: (0..2).map(|_| AtomicU8::new(0)).collect(),
+            generations: (0..2).map(|_| AtomicU64::new(0)).collect(),
             counters: (0..2).map(|_| crate::counters::Counters::new()).collect(),
-            session_counters: (0..2).map(|_| crate::counters::Counters::new()).collect(),
+            session_counters: (0..4).map(|_| crate::counters::Counters::new()).collect(),
             peer_counters: (0..2).map(|_| crate::counters::Counters::new()).collect(),
-            receive_counters: (0..2 * LANES)
+            receive_counters: (0..4 * LANES)
                 .map(|_| crate::counters::LaneCounters::new())
                 .collect(),
-            transmit_counters: vec![
-                (0..2)
-                    .map(|_| crate::counters::LaneCounters::new())
-                    .collect(),
-            ],
+            transmit_counters: (0..2)
+                .map(|_| {
+                    (0..2)
+                        .map(|_| crate::counters::LaneCounters::new())
+                        .collect()
+                })
+                .collect(),
             bound: vec![AtomicU64::new(0)],
             requests: std::sync::Mutex::new(crate::spsc::channel().0),
             address_pending: vec![std::sync::atomic::AtomicBool::new(false)],
@@ -2128,7 +2231,9 @@ mod tests {
             }
         }
         for _ in 0..BUFFERS {
-            let buffer = workers[0].free.pop().unwrap();
+            let mut buffer = workers[0].free.pop().unwrap();
+            buffer.tx_reserved = true;
+            workers[0].sessions[0].tx_retained += 1;
             workers[1].release(buffer);
         }
         assert!(workers[0].free.is_empty());
@@ -2190,6 +2295,7 @@ mod tests {
         }
         assert!(!workers[0].controls[0].barrier.is_active());
         assert_eq!(workers[0].free.len(), BUFFERS);
+        assert_eq!(workers[0].sessions[0].tx_retained, 0);
         assert_eq!(workers[0].sessions[0].free.len(), LANES);
         assert_eq!(shared.owners[0][7].load(Ordering::Acquire), 0);
         for worker in &mut workers {
@@ -2306,6 +2412,147 @@ mod tests {
                 .all(|c| c.snapshot().is_none())
         );
         assert_eq!(shared.session_counters[0].snapshot().expired_frames, 1);
+        // One GRO aggregate crosses cookies and owners; invalid siblings cannot hide valid DATA.
+        let connections = [
+            replacement,
+            Connection {
+                initiator: Tag::new(11).unwrap(),
+                ..replacement
+            },
+        ];
+        for worker in &mut workers {
+            for (session, connection) in connections.iter().enumerate() {
+                worker.command(
+                    session,
+                    Command {
+                        generation: generation + 2,
+                        phase: Phase::Install,
+                        connection: Some(*connection),
+                    },
+                    0,
+                );
+                worker.sessions[session].acknowledged = None;
+            }
+        }
+        for (session, id, owner, slot) in [(0, 7, 0, 0), (0, 8, 1, 0), (1, 7, 1, 0)] {
+            let mut lane = workers[0].sessions[session].free.pop().unwrap();
+            lane.reset(id, 9022).unwrap();
+            workers[owner].sessions[session].rx[slot] = Some(lane);
+            workers[owner].sessions[session].rx_index[usize::from(id)] = slot as u8 + 1;
+            shared.owners[session][usize::from(id)].store(owner as u8 + 1, Ordering::Release);
+            workers[owner].install_rx_counters(session, slot);
+        }
+        let before: [u64; 2] = std::array::from_fn(|session| {
+            workers
+                .iter()
+                .map(|w| w.sessions[session].totals.rx_outer_bytes)
+                .sum()
+        });
+        let mut buffer = workers[0].free.pop().unwrap();
+        buffer.length = 0;
+        buffer.segment_size = 98;
+        for (index, (cookie, lane, tag, packet)) in [
+            (1, 7, 3, 1),
+            (2, 7, 11, 1),
+            (1, 7, 3, 2),
+            (9, 7, 3, 1),
+            (1, 8, 3, 1),
+            (2, 7, 999, 2),
+            (1, 7, 3, 2),
+            (2, 7, 11, 2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let short = index == 7;
+            let start = buffer.length;
+            let length = wire::encode_datagram(
+                Header {
+                    cookie: crate::UnquicUuid::from_bytes([cookie; 16]),
+                    receive_tag: tag,
+                    lane,
+                    packet_number: packet,
+                    record_area_len: 0,
+                },
+                &[Record::Data {
+                    frame_id: (u64::from(lane) << 48) | if short { 2 } else { 1 },
+                    total_len: if short { 14 } else { 60 },
+                    offset: 0,
+                    bytes: if short { &[5; 14] } else { &[5; 30] },
+                }],
+                &mut buffer.bytes[start..],
+            )
+            .unwrap();
+            assert_eq!(length, if short { 82 } else { 98 });
+            if index == 2 {
+                buffer.bytes[start] ^= 1;
+            }
+            buffer.length += length;
+        }
+        let pointer = (&*buffer as *const Buffer) as usize;
+        let original = buffer.bytes[..buffer.length].to_vec();
+        workers[0].packet(buffer, Duration::ZERO).unwrap();
+        for _ in 0..8 {
+            for worker in &mut workers {
+                worker.drain_queues(Duration::ZERO).unwrap();
+                worker.flush_taps(Duration::ZERO).unwrap();
+                worker.flush_returns();
+            }
+        }
+        let returned = workers[0]
+            .free
+            .iter()
+            .find(|b| (&***b as *const Buffer) as usize == pointer)
+            .unwrap();
+        assert_eq!(&returned.bytes[..original.len()], &original);
+        assert_eq!(workers[0].free.len(), BUFFERS);
+        let after: [u64; 2] = std::array::from_fn(|session| {
+            workers
+                .iter()
+                .map(|w| w.sessions[session].totals.rx_outer_bytes)
+                .sum()
+        });
+        assert_eq!(after[0] - before[0], 3 * 146);
+        assert_eq!(after[1] - before[1], 2 * 146 + 130);
+        assert_eq!(
+            workers
+                .iter()
+                .map(|w| w.counters.malformed_packets)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            workers
+                .iter()
+                .map(|w| w.counters.unknown_cookie_packets)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            workers[0].sessions[0].rx[0]
+                .as_ref()
+                .unwrap()
+                .retained_frames(),
+            1
+        );
+        assert_eq!(
+            workers[1].sessions[0].rx[0]
+                .as_ref()
+                .unwrap()
+                .retained_frames(),
+            1
+        );
+        assert_eq!(
+            workers[1].sessions[1].rx[0]
+                .as_ref()
+                .unwrap()
+                .retained_frames(),
+            2
+        );
+        assert_eq!(
+            workers[1].sessions[1].rx_totals[0].rx_outer_bytes,
+            146 + 130
+        );
     }
 
     #[test]

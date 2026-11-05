@@ -163,8 +163,7 @@ through a VLAN upper device, exercising kernel tag materialization. Allocation
 instrumentation observes no allocations or deallocations during these forwarding
 checks. This is correctness coverage, not a throughput measurement.
 
-Aggregate receive reservations, multi-record packing, worker GRO integration,
-recovery, BBRv3,
+Multi-record packing, recovery, BBRv3,
 descriptor adoption and daemon process integration remain unfinished. No throughput
 target has been demonstrated.
 
@@ -221,12 +220,20 @@ their owners. Datagrams that arrive on another worker move through SPSC queues
 as owned buffers. Full data queues drop without ACK; buffer returns, barrier
 messages and pending lane retirements remain bounded and retry.
 
-Startup reserves 128 packet/frame buffers per worker and 64 receive-lane tables
-per session. Each lane has 64 frame slots. The memory check includes these
-stores, handoff rings, indices, configuration capacities, thread stacks and an
-allocator allowance. This is a reservation check, not a process RSS limit or a
-limit on kernel socket buffers. These conservative reservations can reject large
-configurations before startup; shared aggregate receive quotas are still pending.
+Startup reserves 128 packet/frame buffers per worker, each with 64 KiB of
+payload storage for GRO, and 64 receive-lane tables per session. Each lane has
+64 frame slots. The memory check includes these stores, handoff rings, indices,
+configuration capacities, thread stacks and an allocator allowance. This is a
+reservation check, not a process RSS limit or a limit on kernel socket buffers.
+These conservative reservations can reject large configurations before startup.
+
+Fixed receive storage permits at most 4096 frames and 36,954,112 reserved frame
+bytes per session, below the 8192-frame/64-MiB directional ceilings. Transmit
+reservations divide the 64-MiB budget among the session's TAP queue owners,
+rounded down using the maximum frame length, and also respect their 128-buffer
+pools. A reservation lasts until the frame buffer returns to its origin,
+including handoff and return-queue delays. Compile-time bounds and quota tests
+check these limits; no shared reservation lock or atomic is needed.
 
 Transmit DATA uses scatter/gather slices of the original frame buffer.
 Partial sends retain the unsent suffix with its original packet numbers until
@@ -259,8 +266,11 @@ invalid GRO metadata reject that buffer. Each segment still needs independent
 wire, cookie and connection validation. The single-datagram recv API refuses a
 GRO-enabled socket because it cannot represent the aggregate.
 
-Worker sends use GSO now; worker receives have not enabled GRO yet. The socket
-tests cover GSO and ordinary sends, empty datagrams, short final segments,
+Workers enable GRO where supported and otherwise retain ordinary receives.
+An aggregate moves between owners with a segment cursor; its payload is never
+copied merely to split or hand it off. Every segment gets separate cookie, tag,
+lane and record validation. A malformed, stale or unknown-cookie sibling does
+not hide valid later segments. The socket tests cover GSO and ordinary sends, empty datagrams, short final segments,
 large-batch splitting, malformed metadata, truncation and real checksum-offload
 failure with fallback. Allocation checks include offload and fallback paths.
 These APIs follow the Linux [UDP socket options](https://man7.org/linux/man-pages/man7/udp.7.html);
@@ -365,7 +375,10 @@ migration and migration back, unchanged-address updates, multiple peers/sessions
 shutdown cleanup, forwarding allocation checks, and
 TAP readiness with an unavailable receive address and unresolved peer. A worker
 ownership test fills both handoff rings and checks buffer returns, lane returns,
-commit completion and duplicate-install packet-number preservation. Counter tests
+commit completion and duplicate-install packet-number preservation. It also
+routes one unchanged GRO buffer across two sessions and two workers with bad
+siblings, verifies byte accounting and returns frame reservations through full
+queues. Counter tests
 cover lane reuse, duplicate/expiry accounting, reservation gauges, connection
 generations and peer aggregation after shutdown.
 The daemon test delays DNS answers until both TAPs exist, refreshes an AAAA

@@ -504,8 +504,11 @@ per-peer and per-lane counters in batches; lane snapshots include the local
 connection generation. README.md defines byte accounting, lifetime, aggregation
 and currently unsupported gauges. Socket APIs now support caller-supplied payload
 limits, scatter/gather UDP GSO with fallback, and validated UDP GRO splitting.
-Worker GSO sends pass the forwarding tests; worker receive offload, aggregate
-receive quotas, multi-record packing, recovery and congestion control remain
+Worker sends and receives now use these offloads with ordinary-I/O fallback.
+An unchanged GRO buffer can cross session and lane owners; each segment is
+validated independently. Fixed receive pools and per-origin frame reservations
+keep each session below the directional frame/byte limits without shared hot
+reservations. Multi-record packing, recovery and congestion control remain
 unfinished. Current liveness
 probes do not discover MTU: the UDP limit remains 1232 bytes until stage 3.
 The foreground daemon now parses the documented TOML, provisions cookies through

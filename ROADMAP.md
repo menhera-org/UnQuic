@@ -293,10 +293,12 @@ whole-datagram reservation, permanent packet/frame windows, terminal bits,
 reservation checks and batch integration now exist. Socket sends now accept
 caller-supplied lane limits and group scatter/gather datagrams through UDP_SEGMENT,
 with a tested ordinary-send fallback. Receive sockets can enable UDP_GRO and
-borrow each logical segment after ancillary/truncation checks. Worker GSO sends
-pass the container forwarding/restart test; worker GRO integration remains.
-Aggregate receive quotas, multi-record packing and the frame storm/throughput
-tests remain. Partial completion, GSO/GRO boundaries, MTU errors and allocation
+borrow each logical segment after ancillary/truncation checks. Worker GSO/GRO paths
+pass the container forwarding/restart test and allocation checks. A mixed-cookie,
+mixed-owner aggregate test verifies independent rejection and unchanged payload
+storage. Fixed receive pools remain below the directional frame/byte ceilings;
+per-origin transmit reservations enforce the same bounds through delayed returns.
+Multi-record packing and the frame storm/throughput tests remain. Partial completion, GSO/GRO boundaries, MTU errors and allocation
 checks pass. The five frame-model regression cases
 now run against the real implementation in tests/reassembly.rs.
 
