@@ -183,6 +183,9 @@ pub struct Lane {
     free: Vec<u8>,
     ready: VecDeque<u8>,
     deadline: Option<Duration>,
+    retained_bytes: usize,
+    expired_frames: u64,
+    duplicate_pieces: u64,
 }
 
 impl Lane {
@@ -200,6 +203,9 @@ impl Lane {
             free: (0..FRAME_CAPACITY as u8).collect(),
             ready: VecDeque::with_capacity(FRAME_CAPACITY),
             deadline: None,
+            retained_bytes: 0,
+            expired_frames: 0,
+            duplicate_pieces: 0,
         })
     }
 
@@ -221,6 +227,21 @@ impl Lane {
         FRAME_CAPACITY - self.free.len()
     }
 
+    /// Sum of complete frame lengths reserved by retained slots.
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    /// Frames released at their deadline since the last reset.
+    pub const fn expired_frames(&self) -> u64 {
+        self.expired_frames
+    }
+
+    /// Entire DATA pieces already terminal or fully covered since the last reset.
+    pub const fn duplicate_pieces(&self) -> u64 {
+        self.duplicate_pieces
+    }
+
     /// Permanent lower bounds for packet numbers and frame sequences.
     pub const fn lower_bounds(&self) -> (u64, u64) {
         (self.packets.lower, self.terminal.lower)
@@ -240,6 +261,8 @@ impl Lane {
         self.id = id;
         self.frame_limit = frame_limit;
         self.retired = false;
+        self.expired_frames = 0;
+        self.duplicate_pieces = 0;
         self.packets.reset();
         self.terminal.reset();
         self.clear_frames();
@@ -261,6 +284,7 @@ impl Lane {
         self.free.extend(0..FRAME_CAPACITY as u8);
         self.ready.clear();
         self.deadline = None;
+        self.retained_bytes = 0;
     }
 
     /// Reserves a whole validated datagram before applying any record.
@@ -335,6 +359,7 @@ impl Lane {
                 } => {
                     let sequence = frame_id & SEQUENCE_MASK;
                     if self.terminal.old(sequence) {
+                        self.duplicate_pieces = self.duplicate_pieces.wrapping_add(1);
                         continue;
                     }
                     let slot = match self.find(sequence) {
@@ -342,6 +367,7 @@ impl Lane {
                         None => {
                             let slot = usize::from(self.free.pop().expect("preflight reservation"));
                             self.frames[slot].start(sequence, total_len as u16, now);
+                            self.retained_bytes += total_len as usize;
                             self.insert(slot);
                             let deadline = self.frames[slot].deadline;
                             self.deadline =
@@ -350,11 +376,15 @@ impl Lane {
                         }
                     };
                     let frame = &mut self.frames[slot];
-                    if frame.remaining != 0 {
+                    let remaining = frame.remaining;
+                    if remaining != 0 {
                         frame.piece(offset as usize, bytes);
                         if frame.remaining == 0 {
                             self.ready.push_back(slot as u8);
                         }
+                    }
+                    if remaining == frame.remaining {
+                        self.duplicate_pieces = self.duplicate_pieces.wrapping_add(1);
                     }
                 }
                 Record::FrameAbandon {
@@ -409,6 +439,7 @@ impl Lane {
                 self.deadline = Some(self.deadline.map_or(deadline, |old| old.min(deadline)));
             }
         }
+        self.expired_frames = self.expired_frames.wrapping_add(expired as u64);
         expired
     }
 
@@ -498,6 +529,7 @@ impl Lane {
         } else {
             self.ready.retain(|&queued| usize::from(queued) != slot);
         }
+        self.retained_bytes -= usize::from(self.frames[slot].length);
         self.frames[slot].sequence = 0;
         self.free.push(slot as u8);
     }

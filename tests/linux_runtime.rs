@@ -240,6 +240,43 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
             raw_read(&source, &mut capture).is_some_and(|n| capture[..n] == frame)
         });
     }
+    until(Duration::from_secs(2), || {
+        [&left.control, &right.control].iter().all(|control| {
+            (0..3).all(|session| {
+                control
+                    .session_counters(session)
+                    .unwrap()
+                    .delivered_frame_bytes
+                    >= 60
+            })
+        })
+    });
+    for control in [&left.control, &right.control] {
+        for session in 0..3 {
+            let totals = control.session_counters(session).unwrap();
+            assert!(totals.tx_outer_bytes > 60);
+            assert!(totals.rx_outer_bytes > 60);
+            assert_eq!(totals.path_mtu_bytes, 1280);
+            let lanes = if session == 2 { 2 } else { 4 };
+            assert!((1..=lanes).any(|lane| {
+                control
+                    .receive_lane_counters(session, lane)
+                    .is_some_and(|s| s.counters.delivered_frame_bytes >= 60)
+            }));
+            for lane in 1..=lanes {
+                let snapshot = control.transmit_lane_counters(session, lane).unwrap();
+                assert_eq!(
+                    snapshot.generation,
+                    control.session(session).unwrap().generation
+                );
+                assert_eq!(snapshot.counters.path_mtu_bytes, 1280);
+            }
+        }
+        assert!(control.session_counters(3).is_none());
+        assert!(control.peer_counters(2).is_none());
+        assert!(control.transmit_lane_counters(0, 0).is_none());
+        assert!(control.receive_lane_counters(0, 0).is_none());
+    }
     let old_generation = left.control.session(0).unwrap().generation;
     left.control
         .supply_peer_address(0, "fd99::1".parse().unwrap(), 0)
@@ -272,6 +309,15 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
         capture_frame(&b, &mut capture).is_some_and(|n| capture[..n] == frame)
     });
     let migrated = left.control.session(0).unwrap().generation;
+    for lane in 1..=4 {
+        assert_eq!(
+            left.control
+                .transmit_lane_counters(0, lane)
+                .unwrap()
+                .generation,
+            migrated
+        );
+    }
     left.control
         .supply_peer_address(0, Ipv6Addr::LOCALHOST, 0)
         .unwrap();
@@ -296,6 +342,17 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
     });
     replacement.stop();
     left.stop();
+    for control in [&left.control, &right.control] {
+        for (peer, sessions) in [(0, &[0, 1][..]), (1, &[2][..])] {
+            let totals = control.peer_counters(peer).unwrap();
+            let delivered: u64 = sessions
+                .iter()
+                .map(|&s| control.session_counters(s).unwrap().delivered_frame_bytes)
+                .sum();
+            assert_eq!(totals.delivered_frame_bytes, delivered);
+            assert!(delivered >= 60);
+        }
+    }
 
     let mut unavailable = config("uq-wait", 40110, 40111);
     unavailable.endpoints[0].listen_address = "fd00::1".parse().unwrap();

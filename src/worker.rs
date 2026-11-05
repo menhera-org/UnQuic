@@ -272,6 +272,7 @@ const RETRY: Duration = Duration::from_millis(1);
 /// Pool entries move through queues by ownership, including on rejection.
 pub(crate) struct Buffer {
     origin: usize,
+    rx_counted: bool,
     session: usize,
     tag: u128,
     lane: usize,
@@ -344,6 +345,11 @@ struct Session {
     command: Option<Command>,
     acknowledged: Option<Command>,
     installed: Option<Command>,
+    totals: Snapshot,
+    rx_totals: Vec<Snapshot>,
+    tx_totals: Vec<Snapshot>,
+    rx_dirty: u64,
+    tx_dirty: u64,
 }
 
 struct SessionControl {
@@ -379,6 +385,7 @@ struct PeerPaths {
     paths: [Path; 2],
     generation: u64,
     preparing: Option<AddressChange>,
+    totals: Snapshot,
 }
 
 #[derive(Default)]
@@ -445,9 +452,12 @@ impl Worker {
         for session in &config.sessions {
             let peer = config.peers.iter().find(|p| p.name == session.peer)?;
             per_worker = per_worker
-                .checked_add(size_of::<Session>() + 65_536 + 8192)?
+                .checked_add(size_of::<Session>() + 65_536 + 8192 + LANES * size_of::<Snapshot>())?
                 .checked_add(LANES.checked_mul(size_of::<Option<Box<reassembly::Lane>>>())?)?
-                .checked_add(peer.tx_lanes.checked_mul(size_of::<Option<pack::Lane>>())?)?;
+                .checked_add(
+                    peer.tx_lanes
+                        .checked_mul(size_of::<Option<pack::Lane>>() + size_of::<Snapshot>())?,
+                )?;
         }
         per_worker
             .checked_mul(workers)?
@@ -511,12 +521,18 @@ impl Worker {
                 command: None,
                 acknowledged: None,
                 installed: None,
+                totals: Snapshot::default(),
+                rx_totals: vec![Snapshot::default(); LANES],
+                tx_totals: vec![Snapshot::default(); config.peers[peer].tx_lanes],
+                rx_dirty: 0,
+                tx_dirty: 0,
             });
         }
         let free = (0..BUFFERS)
             .map(|_| {
                 Box::new(Buffer {
                     origin: id,
+                    rx_counted: false,
                     session: 0,
                     tag: 0,
                     lane: 0,
@@ -552,6 +568,7 @@ impl Worker {
                     }),
                     generation: 0,
                     preparing: None,
+                    totals: Snapshot::default(),
                 })
                 .collect(),
             requests: None,
@@ -591,7 +608,7 @@ impl Worker {
         }
         let _stop = Stop(self.control.clone());
         if pin_to_allowed(self.id).is_err() {
-            self.counters.affinity_failures += 1;
+            self.counters.affinity_failures = self.counters.affinity_failures.wrapping_add(1);
         }
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 128];
         let mut immediate = true;
@@ -614,7 +631,7 @@ impl Worker {
                     .lanes[b.lane]
                     .blocked
             });
-            self.shared.counters[self.id].publish(&self.counters);
+            self.publish_counters();
             let mut deadline = self.deadline(now);
             if self.has_backpressure() {
                 let due = self.retry_due.get_or_insert(now + RETRY);
@@ -655,7 +672,89 @@ impl Worker {
                 }
             }
         }
+        self.publish_counters();
         Ok(())
+    }
+
+    fn publish_counters(&mut self) {
+        self.counters.reassembly_frames = self
+            .sessions
+            .iter()
+            .map(|s| s.totals.reassembly_frames)
+            .sum();
+        self.counters.reassembly_bytes = self
+            .sessions
+            .iter()
+            .map(|s| s.totals.reassembly_bytes)
+            .sum();
+        self.shared.counters[self.id].publish(&self.counters);
+        for (peer, paths) in self.transmit.iter().enumerate() {
+            self.shared.peer_counters[peer * self.shared.workers() + self.id]
+                .publish(&paths.totals);
+        }
+        for (session, local) in self.sessions.iter_mut().enumerate() {
+            self.shared.session_counters[session * self.shared.workers() + self.id]
+                .publish(&local.totals);
+            let mut dirty = local.rx_dirty;
+            let base = (session * self.shared.workers() + self.id) * LANES;
+            while dirty != 0 {
+                let slot = dirty.trailing_zeros() as usize;
+                dirty &= dirty - 1;
+                self.shared.receive_counters[base + slot]
+                    .counters
+                    .publish(&local.rx_totals[slot]);
+            }
+            dirty = local.tx_dirty;
+            while dirty != 0 {
+                let slot = dirty.trailing_zeros() as usize;
+                dirty &= dirty - 1;
+                self.shared.transmit_counters[session][slot]
+                    .counters
+                    .publish(&local.tx_totals[slot]);
+            }
+            local.rx_dirty = 0;
+            local.tx_dirty = 0;
+        }
+    }
+
+    fn install_rx_counters(&mut self, session: usize, slot: usize) {
+        let local = &mut self.sessions[session];
+        let lane = local.rx[slot].as_ref().unwrap().id();
+        local.rx_totals[slot] = Snapshot::default();
+        local.rx_dirty &= !(1_u64 << slot);
+        let index = (session * self.shared.workers() + self.id) * LANES + slot;
+        self.shared.receive_counters[index].replace(
+            lane,
+            local.installed.unwrap().generation,
+            &local.rx_totals[slot],
+        );
+    }
+
+    fn refresh_rx_counters(&mut self, session: usize, slot: usize) {
+        let local = &mut self.sessions[session];
+        let lane = local.rx[slot].as_ref().unwrap();
+        let totals = &mut local.rx_totals[slot];
+        let expired = lane.expired_frames().wrapping_sub(totals.expired_frames);
+        let duplicates = lane
+            .duplicate_pieces()
+            .wrapping_sub(totals.duplicate_pieces);
+        self.counters.expired_frames = self.counters.expired_frames.wrapping_add(expired);
+        self.counters.duplicate_pieces = self.counters.duplicate_pieces.wrapping_add(duplicates);
+        local.totals.expired_frames = local.totals.expired_frames.wrapping_add(expired);
+        local.totals.duplicate_pieces = local.totals.duplicate_pieces.wrapping_add(duplicates);
+        totals.expired_frames = lane.expired_frames();
+        totals.duplicate_pieces = lane.duplicate_pieces();
+        let frames = lane.retained_frames() as u64;
+        let bytes = lane.retained_bytes() as u64;
+        if expired != 0
+            || duplicates != 0
+            || totals.reassembly_frames != frames
+            || totals.reassembly_bytes != bytes
+        {
+            totals.reassembly_frames = frames;
+            totals.reassembly_bytes = bytes;
+            local.rx_dirty |= 1_u64 << slot;
+        }
     }
 
     fn push(&mut self, worker: usize, event: Event) -> Result<(), Event> {
@@ -885,7 +984,10 @@ impl Worker {
                                 break;
                             }
                             Err(_) => {
-                                self.counters.socket_errors += 1;
+                                self.counters.socket_errors =
+                                    self.counters.socket_errors.wrapping_add(1);
+                                paths.totals.socket_errors =
+                                    paths.totals.socket_errors.wrapping_add(1);
                                 break;
                             }
                         }
@@ -945,6 +1047,7 @@ impl Worker {
                                 .unwrap();
                             self.sessions[session].rx_index[usize::from(id)] = slot as u8 + 1;
                             self.sessions[session].rx[slot] = Some(lane);
+                            self.install_rx_counters(session, slot);
                             self.packet(buffer, now)?;
                         } else {
                             self.return_lane(session, lane);
@@ -1031,7 +1134,7 @@ impl Worker {
             Ok(count) => count,
             Err(error) => {
                 if !transient(&error) {
-                    self.counters.socket_errors += 1;
+                    self.counters.socket_errors = self.counters.socket_errors.wrapping_add(1);
                 }
                 0
             }
@@ -1040,12 +1143,17 @@ impl Worker {
             let mut buffer = buffer.take().unwrap();
             if index < count && !truncated[index] {
                 buffer.length = lengths[index];
+                buffer.rx_counted = false;
                 buffer.deadline = now;
-                self.counters.rx_outer_bytes += (buffer.length + 48) as u64;
+                self.counters.rx_outer_bytes = self
+                    .counters
+                    .rx_outer_bytes
+                    .wrapping_add((buffer.length + 48) as u64);
                 self.packet(buffer, now)?;
             } else {
                 if index < count {
-                    self.counters.malformed_packets += 1;
+                    self.counters.malformed_packets =
+                        self.counters.malformed_packets.wrapping_add(1);
                 }
                 self.release(buffer);
             }
@@ -1055,21 +1163,30 @@ impl Worker {
 
     fn packet(&mut self, mut buffer: Box<Buffer>, now: Duration) -> io::Result<()> {
         let Ok(datagram) = Datagram::decode(&buffer.bytes[..buffer.length]) else {
-            self.counters.malformed_packets += 1;
+            self.counters.malformed_packets = self.counters.malformed_packets.wrapping_add(1);
             self.release(buffer);
             return Ok(());
         };
         let header = datagram.header();
         let Some(session) = self.shared.config.session_for_cookie(header.cookie) else {
-            self.counters.unknown_cookie_packets += 1;
+            self.counters.unknown_cookie_packets =
+                self.counters.unknown_cookie_packets.wrapping_add(1);
             self.release(buffer);
             return Ok(());
         };
         buffer.session = session;
+        if !buffer.rx_counted {
+            let total = &mut self.sessions[session].totals.rx_outer_bytes;
+            *total = total.wrapping_add((buffer.length + 48) as u64);
+            buffer.rx_counted = true;
+        }
         buffer.tag = header.receive_tag;
         if header.lane == 0 {
             if self.id != 0 {
                 if let Err(Event::Packet(buffer)) = self.push(0, Event::Packet(buffer)) {
+                    self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
+                    self.sessions[session].totals.queue_drops =
+                        self.sessions[session].totals.queue_drops.wrapping_add(1);
                     self.release(buffer);
                 }
                 return Ok(());
@@ -1109,12 +1226,17 @@ impl Worker {
         if owner == 0 {
             if self.id != 0 {
                 if let Err(Event::Packet(buffer)) = self.push(0, Event::Packet(buffer)) {
+                    self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
+                    self.sessions[session].totals.queue_drops =
+                        self.sessions[session].totals.queue_drops.wrapping_add(1);
                     self.release(buffer);
                 }
                 return Ok(());
             }
             let Some(mut lane) = self.sessions[session].free.pop() else {
-                self.counters.queue_drops += 1;
+                self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
+                self.sessions[session].totals.queue_drops =
+                    self.sessions[session].totals.queue_drops.wrapping_add(1);
                 self.release(buffer);
                 return Ok(());
             };
@@ -1132,7 +1254,9 @@ impl Worker {
                 {
                     self.shared.owners[session][lane_id].store(0, Ordering::Release);
                     self.sessions[session].free.push(lane);
-                    self.counters.queue_drops += 1;
+                    self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
+                    self.sessions[session].totals.queue_drops =
+                        self.sessions[session].totals.queue_drops.wrapping_add(1);
                     self.release(buffer);
                 }
                 return Ok(());
@@ -1144,11 +1268,14 @@ impl Worker {
                 .unwrap();
             self.sessions[session].rx_index[lane_id] = slot as u8 + 1;
             self.sessions[session].rx[slot] = Some(lane);
+            self.install_rx_counters(session, slot);
         } else if usize::from(owner - 1) != self.id {
             if let Err(Event::Packet(buffer)) =
                 self.push(usize::from(owner - 1), Event::Packet(buffer))
             {
-                self.counters.queue_drops += 1;
+                self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
+                self.sessions[session].totals.queue_drops =
+                    self.sessions[session].totals.queue_drops.wrapping_add(1);
                 self.release(buffer);
             }
             return Ok(());
@@ -1158,10 +1285,13 @@ impl Worker {
             self.release(buffer);
             return Ok(());
         }
-        let lane = self.sessions[session].rx[usize::from(slot - 1)]
-            .as_mut()
-            .unwrap();
-        match lane.admit(&datagram, now) {
+        let slot = usize::from(slot - 1);
+        let local = &mut self.sessions[session];
+        local.rx_totals[slot].rx_outer_bytes = local.rx_totals[slot]
+            .rx_outer_bytes
+            .wrapping_add((buffer.length + 48) as u64);
+        local.rx_dirty |= 1_u64 << slot;
+        match local.rx[slot].as_mut().unwrap().admit(&datagram, now) {
             Admission::Fresh => {
                 for record in datagram.records() {
                     match record {
@@ -1225,10 +1355,39 @@ impl Worker {
                     }
                 }
             }
-            Admission::Duplicate => self.counters.duplicate_packets += 1,
-            Admission::Pressure => self.counters.queue_drops += 1,
-            Admission::Invalid => self.counters.malformed_packets += 1,
+            Admission::Duplicate => {
+                self.counters.duplicate_packets = self.counters.duplicate_packets.wrapping_add(1);
+                self.sessions[session].totals.duplicate_packets = self.sessions[session]
+                    .totals
+                    .duplicate_packets
+                    .wrapping_add(1);
+                self.sessions[session].rx_totals[slot].duplicate_packets = self.sessions[session]
+                    .rx_totals[slot]
+                    .duplicate_packets
+                    .wrapping_add(1);
+            }
+            Admission::Pressure => {
+                self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
+                self.sessions[session].totals.queue_drops =
+                    self.sessions[session].totals.queue_drops.wrapping_add(1);
+                self.sessions[session].rx_totals[slot].queue_drops = self.sessions[session]
+                    .rx_totals[slot]
+                    .queue_drops
+                    .wrapping_add(1);
+            }
+            Admission::Invalid => {
+                self.counters.malformed_packets = self.counters.malformed_packets.wrapping_add(1);
+                self.sessions[session].totals.malformed_packets = self.sessions[session]
+                    .totals
+                    .malformed_packets
+                    .wrapping_add(1);
+                self.sessions[session].rx_totals[slot].malformed_packets = self.sessions[session]
+                    .rx_totals[slot]
+                    .malformed_packets
+                    .wrapping_add(1);
+            }
         }
+        self.refresh_rx_counters(session, slot);
         self.release(buffer);
         Ok(())
     }
@@ -1260,14 +1419,18 @@ impl Worker {
                         self.frame(buffer, now)?;
                     } else if let Err(Event::Frame(buffer)) = self.push(owner, Event::Frame(buffer))
                     {
-                        self.counters.queue_drops += 1;
+                        self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
+                        self.sessions[session].totals.queue_drops =
+                            self.sessions[session].totals.queue_drops.wrapping_add(1);
                         self.release(buffer);
                     }
                 }
                 Err(error) => {
                     self.release(buffer);
                     if !transient(&error) {
-                        self.counters.tap_errors += 1;
+                        self.counters.tap_errors = self.counters.tap_errors.wrapping_add(1);
+                        self.sessions[session].totals.tap_errors =
+                            self.sessions[session].totals.tap_errors.wrapping_add(1);
                         let local = &mut self.sessions[session];
                         self.reactor.remove(local.tap.as_ref().unwrap().as_fd())?;
                         local.tap_registered = false;
@@ -1281,7 +1444,17 @@ impl Worker {
     }
 
     fn frame(&mut self, mut buffer: Box<Buffer>, now: Duration) -> io::Result<()> {
-        if !self.matches(buffer.session, buffer.tag) || now >= buffer.deadline {
+        if !self.matches(buffer.session, buffer.tag) {
+            self.release(buffer);
+            return Ok(());
+        }
+        if now >= buffer.deadline {
+            self.counters.expired_frames = self.counters.expired_frames.wrapping_add(1);
+            let local = &mut self.sessions[buffer.session];
+            local.totals.expired_frames = local.totals.expired_frames.wrapping_add(1);
+            local.tx_totals[buffer.lane].expired_frames =
+                local.tx_totals[buffer.lane].expired_frames.wrapping_add(1);
+            local.tx_dirty |= 1_u64 << buffer.lane;
             self.release(buffer);
             return Ok(());
         }
@@ -1315,8 +1488,17 @@ impl Worker {
     fn flush_frames(&mut self, now: Duration) -> io::Result<()> {
         for _ in 0..self.pending.len().min(BATCH_SIZE) {
             let mut buffer = self.pending.pop_front().unwrap();
-            if !self.matches(buffer.session, buffer.tag) || now >= buffer.deadline {
-                self.counters.expired_frames += 1;
+            if !self.matches(buffer.session, buffer.tag) {
+                self.release(buffer);
+                continue;
+            }
+            if now >= buffer.deadline {
+                self.counters.expired_frames = self.counters.expired_frames.wrapping_add(1);
+                let local = &mut self.sessions[buffer.session];
+                local.totals.expired_frames = local.totals.expired_frames.wrapping_add(1);
+                local.tx_totals[buffer.lane].expired_frames =
+                    local.tx_totals[buffer.lane].expired_frames.wrapping_add(1);
+                local.tx_dirty |= 1_u64 << buffer.lane;
                 self.release(buffer);
                 continue;
             }
@@ -1346,10 +1528,17 @@ impl Worker {
             }
             match socket.send_batch(&parts[buffer.first..buffer.count]) {
                 Ok(sent) => {
-                    for part in &parts[buffer.first..buffer.first + sent] {
-                        self.counters.tx_outer_bytes +=
-                            (part.prefix.len() + part.payload.len() + 48) as u64;
-                    }
+                    let bytes = parts[buffer.first..buffer.first + sent]
+                        .iter()
+                        .map(|part| (part.prefix.len() + part.payload.len() + 48) as u64)
+                        .sum::<u64>();
+                    self.counters.tx_outer_bytes = self.counters.tx_outer_bytes.wrapping_add(bytes);
+                    let local = &mut self.sessions[buffer.session];
+                    local.totals.tx_outer_bytes = local.totals.tx_outer_bytes.wrapping_add(bytes);
+                    local.tx_totals[buffer.lane].tx_outer_bytes = local.tx_totals[buffer.lane]
+                        .tx_outer_bytes
+                        .wrapping_add(bytes);
+                    local.tx_dirty |= 1_u64 << buffer.lane;
                     buffer.first += sent;
                     if buffer.first == buffer.count {
                         self.release(buffer);
@@ -1369,7 +1558,12 @@ impl Worker {
                     self.pending.push_back(buffer)
                 }
                 Err(_) => {
-                    self.counters.socket_errors += 1;
+                    self.counters.socket_errors = self.counters.socket_errors.wrapping_add(1);
+                    let local = &mut self.sessions[buffer.session];
+                    local.totals.socket_errors = local.totals.socket_errors.wrapping_add(1);
+                    local.tx_totals[buffer.lane].socket_errors =
+                        local.tx_totals[buffer.lane].socket_errors.wrapping_add(1);
+                    local.tx_dirty |= 1_u64 << buffer.lane;
                     self.release(buffer);
                 }
             }
@@ -1407,26 +1601,55 @@ impl Worker {
                     let lane = local.rx[slot].take().unwrap();
                     local.rx_index[usize::from(lane.id())] = 0;
                     local.returning &= !(1_u64 << slot);
+                    local.rx_totals[slot] = Snapshot::default();
+                    local.rx_dirty &= !(1_u64 << slot);
+                    let index = (session * self.shared.workers() + self.id) * LANES + slot;
+                    self.shared.receive_counters[index].replace(0, 0, &Snapshot::default());
                     self.return_lane(session, lane);
                     continue;
                 }
-                self.counters.expired_frames += lane.expire(now) as u64;
-                let Some(tap) = &mut local.tap else { continue };
-                for _ in 0..BATCH_SIZE {
-                    let Some(frame) = lane.front(now) else { break };
-                    let length = frame.bytes.len();
-                    match tap.write_frame(frame.bytes) {
-                        Ok(()) => self.counters.delivered_frame_bytes += length as u64,
-                        Err(error) if transient(&error) => {
-                            writable = true;
-                            break;
+                lane.expire(now);
+                if let Some(tap) = &mut local.tap {
+                    for _ in 0..BATCH_SIZE {
+                        let Some(frame) = lane.front(now) else { break };
+                        let length = frame.bytes.len();
+                        match tap.write_frame(frame.bytes) {
+                            Ok(()) => {
+                                self.counters.delivered_frame_bytes = self
+                                    .counters
+                                    .delivered_frame_bytes
+                                    .wrapping_add(length as u64);
+                                local.totals.delivered_frame_bytes = local
+                                    .totals
+                                    .delivered_frame_bytes
+                                    .wrapping_add(length as u64);
+                                local.rx_totals[slot].delivered_frame_bytes = local.rx_totals[slot]
+                                    .delivered_frame_bytes
+                                    .wrapping_add(length as u64);
+                                local.rx_dirty |= 1_u64 << slot;
+                            }
+                            Err(error) if transient(&error) => {
+                                writable = true;
+                                break;
+                            }
+                            Err(_) => {
+                                self.counters.tap_errors = self.counters.tap_errors.wrapping_add(1);
+                                local.totals.tap_errors = local.totals.tap_errors.wrapping_add(1);
+                                local.rx_totals[slot].tap_errors =
+                                    local.rx_totals[slot].tap_errors.wrapping_add(1);
+                                local.rx_dirty |= 1_u64 << slot;
+                            }
                         }
-                        Err(_) => self.counters.tap_errors += 1,
+                        lane.finish_front();
                     }
-                    lane.finish_front();
                 }
+                self.refresh_rx_counters(session, slot);
             }
             let local = &mut self.sessions[session];
+            local.totals.reassembly_frames =
+                local.rx_totals.iter().map(|s| s.reassembly_frames).sum();
+            local.totals.reassembly_bytes =
+                local.rx_totals.iter().map(|s| s.reassembly_bytes).sum();
             if local.tap_registered && local.tap_writable != writable {
                 self.reactor.modify(
                     local.tap.as_ref().unwrap().as_fd(),
@@ -1487,12 +1710,33 @@ impl Worker {
         };
         match socket.send(&bytes[..packet.length]) {
             Ok(()) => {
-                self.counters.tx_outer_bytes += (packet.length + 48) as u64;
+                self.counters.tx_outer_bytes = self
+                    .counters
+                    .tx_outer_bytes
+                    .wrapping_add((packet.length + 48) as u64);
+                let local = &mut self.sessions[session];
+                local.totals.tx_outer_bytes = local
+                    .totals
+                    .tx_outer_bytes
+                    .wrapping_add((packet.length + 48) as u64);
+                if !record.is_handshake() {
+                    local.tx_totals[0].tx_outer_bytes = local.tx_totals[0]
+                        .tx_outer_bytes
+                        .wrapping_add((packet.length + 48) as u64);
+                    local.tx_dirty |= 1;
+                }
                 Ok(Some((packet.number, packet.length as u16)))
             }
             Err(error) => {
                 if !transient(&error) {
-                    self.counters.socket_errors += 1;
+                    self.counters.socket_errors = self.counters.socket_errors.wrapping_add(1);
+                    let local = &mut self.sessions[session];
+                    local.totals.socket_errors = local.totals.socket_errors.wrapping_add(1);
+                    if !record.is_handshake() {
+                        local.tx_totals[0].socket_errors =
+                            local.tx_totals[0].socket_errors.wrapping_add(1);
+                        local.tx_dirty |= 1;
+                    }
                 }
                 Ok(None)
             }
@@ -1565,7 +1809,26 @@ impl Worker {
                         .connection
                         .filter(|_| index % self.shared.workers() == self.id)
                         .map(|c| pack::Lane::new(cookie, c, index as u16 + 1).unwrap());
+                    if index % self.shared.workers() == self.id {
+                        local.tx_totals[index] = Snapshot {
+                            path_mtu_bytes: if lane.is_some() { 1280 } else { 0 },
+                            path_mtu_state: u64::from(lane.is_some()),
+                            ..Snapshot::default()
+                        };
+                        self.shared.transmit_counters[session][index].replace(
+                            if lane.is_some() { index as u16 + 1 } else { 0 },
+                            command.generation,
+                            &local.tx_totals[index],
+                        );
+                    }
                 }
+                local.tx_dirty = 0;
+                local.totals.path_mtu_bytes = if command.connection.is_some() {
+                    1280
+                } else {
+                    0
+                };
+                local.totals.path_mtu_state = u64::from(command.connection.is_some());
                 local.installed = Some(command);
                 local.acknowledged = Some(command);
             }
@@ -1826,6 +2089,16 @@ mod tests {
             status: vec![AtomicU8::new(0)],
             generations: vec![AtomicU64::new(0)],
             counters: (0..2).map(|_| crate::counters::Counters::new()).collect(),
+            session_counters: (0..2).map(|_| crate::counters::Counters::new()).collect(),
+            peer_counters: (0..2).map(|_| crate::counters::Counters::new()).collect(),
+            receive_counters: (0..2 * LANES)
+                .map(|_| crate::counters::LaneCounters::new())
+                .collect(),
+            transmit_counters: vec![
+                (0..2)
+                    .map(|_| crate::counters::LaneCounters::new())
+                    .collect(),
+            ],
             bound: vec![AtomicU64::new(0)],
             requests: std::sync::Mutex::new(crate::spsc::channel().0),
             address_pending: vec![std::sync::atomic::AtomicBool::new(false)],
@@ -1953,6 +2226,86 @@ mod tests {
                 2
             );
         }
+        let worker = &mut workers[0];
+        let generation = worker.sessions[0].installed.unwrap().generation;
+        for (number, admission_count) in [(1, 1), (1, 2), (2, 3)] {
+            let mut buffer = worker.free.pop().unwrap();
+            buffer.rx_counted = false;
+            buffer.length = wire::encode_datagram(
+                Header {
+                    cookie: crate::UnquicUuid::from_bytes([1; 16]),
+                    receive_tag: replacement.local_tag().get(),
+                    lane: 7,
+                    record_area_len: 0,
+                    packet_number: number,
+                },
+                &[Record::Data {
+                    frame_id: (7_u64 << 48) | 1,
+                    total_len: 60,
+                    offset: 0,
+                    bytes: &[5; 30],
+                }],
+                &mut buffer.bytes,
+            )
+            .unwrap();
+            worker.packet(buffer, Duration::ZERO).unwrap();
+            worker.flush_taps(Duration::ZERO).unwrap();
+            worker.publish_counters();
+            let lane = shared
+                .receive_counters
+                .iter()
+                .filter_map(|c| c.snapshot())
+                .find(|c| c.lane == 7)
+                .unwrap();
+            assert_eq!(lane.generation, generation);
+            assert_eq!(
+                lane.counters.rx_outer_bytes,
+                admission_count * (68 + 30 + 48)
+            );
+            assert_eq!(lane.counters.reassembly_frames, 1);
+            assert_eq!(lane.counters.reassembly_bytes, 60);
+        }
+        worker.flush_taps(reassembly::FRAME_LIFETIME).unwrap();
+        worker.publish_counters();
+        let lane = shared
+            .receive_counters
+            .iter()
+            .filter_map(|c| c.snapshot())
+            .find(|c| c.lane == 7)
+            .unwrap();
+        let totals = shared.session_counters[0].snapshot();
+        assert_eq!(totals.rx_outer_bytes, lane.counters.rx_outer_bytes);
+        assert_eq!(totals.duplicate_packets, 1);
+        assert_eq!(totals.duplicate_pieces, 1);
+        assert_eq!(totals.expired_frames, 1);
+        assert_eq!(totals.reassembly_frames, 0);
+        assert_eq!(totals.reassembly_bytes, 0);
+        assert_eq!(lane.counters.expired_frames, 1);
+        assert_eq!(
+            shared.transmit_counters[0][0]
+                .snapshot()
+                .unwrap()
+                .generation,
+            generation
+        );
+        worker.command(
+            0,
+            Command {
+                generation: generation + 1,
+                phase: Phase::Quiesce,
+                connection: None,
+            },
+            0,
+        );
+        worker.flush_taps(reassembly::FRAME_LIFETIME).unwrap();
+        worker.publish_counters();
+        assert!(
+            shared
+                .receive_counters
+                .iter()
+                .all(|c| c.snapshot().is_none())
+        );
+        assert_eq!(shared.session_counters[0].snapshot().expired_frames, 1);
     }
 
     #[test]

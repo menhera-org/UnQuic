@@ -19,6 +19,14 @@
 - TAP configuration: creation accepts `Option<MacAddress>`. The in-tree `MacAddress` type accepts nonzero unicast addresses, whether globally or locally administered. `None` derives a stable address in Menhera's `60:a4:34:4x:xx:xx` MAC-M range from the current UTS hostname and interface name using SHA-256. UnQuic sets the configured MTU and optional MAC but leaves administrative state, addressing and bridge membership to the caller or network manager (for example, systemd-networkd or ifupdown). Transport state controls carrier, independently of administrative state.
 - Design: see [initial-design.md](initial-design.md). Implementation order and per-step acceptance: see [ROADMAP.md](ROADMAP.md).
 
+## Build and feature availability
+
+The crate requires Linux and declares Rust 1.89 or later. Use a
+`*-unknown-linux-musl` target for builds. The default build depends only on
+`libc`; enabling `dns` adds exactly `iphost 0.4.4` with RA and DHCPv6 support,
+without its default features. `bin`, `uuid-compat` and the CLI commands described
+in the design are not implemented yet. There is currently no executable to run.
+
 ## Implementation status
 
 The first foundation provides `UnquicUuid` parsing and UUIDv4 provisioning,
@@ -94,12 +102,10 @@ table above that. Allocation-counting tests cover lookup and handshake paths.
 Reproduce the lookup comparison with
 `cargo bench --target x86_64-unknown-linux-musl --bench cookie_lookup`.
 
-`counters::Counters` provides atomic totals and gauges for session, peer and
-lane owners. Updates use Relaxed ordering; snapshots read with Acquire ordering.
-Fields have explicit units, and a snapshot samples fields independently rather
-than promising a coherent transport-state transaction. Workers will publish
-batch totals; snapshots perform no allocation or locking. The runtime currently
-publishes worker totals. Separate session, peer and lane publication remains open.
+Workers publish local counter totals once per loop batch. Control reads worker,
+session, peer and lane snapshots without locks or allocation. Session and peer
+totals survive reconnection; lane snapshots identify their connection generation.
+See the accounting rules below.
 
 The worker handoff foundation is a fixed 1024-entry SPSC ring with exclusive
 producer/consumer handles and cached cursors. Push/pop use no locks, allocations
@@ -136,8 +142,7 @@ through a VLAN upper device, exercising kernel tag materialization. Allocation
 instrumentation observes no allocations or deallocations during these forwarding
 checks. This is correctness coverage, not a throughput measurement.
 
-Separate session/peer/lane counter publication, aggregate
-receive reservations, multi-record packing, GSO/GRO, recovery, BBRv3, scheduled
+Aggregate receive reservations, multi-record packing, GSO/GRO, recovery, BBRv3, scheduled
 DNS refresh, the daemon and descriptor adoption remain unfinished. No throughput
 target has been demonstrated.
 
@@ -146,10 +151,20 @@ target has been demonstrated.
 `runtime::run(config, control)` validates configuration and checks reserved
 transport storage against `daemon.memory_limit` before creating TAPs. It blocks
 until shutdown or a fatal worker error. Clone `runtime::Control` before calling
-run on a thread; use `ready()`, `session(index)`, `worker_counters(index)` and
+run on a thread; use `ready()`, `session(index)`, counter snapshots and
 `shutdown()` from the caller. Indices follow configuration order. A control
 handle is single-use. Shutdown wakes workers, joins them and closes their TAP
-queues before run returns; `stopped()` then becomes true.
+queues before run returns; `stopped()` then becomes true. A startup error also
+sets `stopped()`; inspect the run result to distinguish failure from shutdown.
+Calling `shutdown()` before run requests immediate exit, but does not bypass
+configuration validation or device setup. Keep and join the run thread to collect
+errors. The library emits no logs.
+
+An idle control handle does not own TAP queues. Keeping it after run returns
+retains configuration, counter storage and wake descriptors, allowing final
+statistics to be read. Drop all handle clones to release that storage. The current
+runtime creates nonpersistent TAPs; descriptor adoption and daemon re-exec
+handover are not implemented.
 
 Readiness means every configured TAP exists. Administrative state remains the
 network manager's responsibility. Receive bindings and missing transmit sockets
@@ -187,7 +202,8 @@ messages and pending lane retirements remain bounded and retry.
 Startup reserves 128 packet/frame buffers per worker and 64 receive-lane tables
 per session. Each lane has 64 frame slots. The memory check includes these
 stores, handoff rings, indices, configuration capacities, thread stacks and an
-allocator allowance. These conservative reservations can reject large
+allocator allowance. This is a reservation check, not a process RSS limit or a
+limit on kernel socket buffers. These conservative reservations can reject large
 configurations before startup; shared aggregate receive quotas are still pending.
 
 Transmit DATA uses scatter/gather slices of the original frame buffer.
@@ -197,6 +213,62 @@ Receive reassembly copies pieces into fixed frame slots and retains complete
 frames through TAP backpressure until delivery or expiry. Workers batch socket
 I/O and notifications, update epoll write interests only when needed, and arm
 absolute monotonic timers. No worker waits for another worker's queue.
+
+Current sends batch the pieces of one frame; packing multiple frames together
+and UDP GSO/GRO remain pending. TAP I/O still requires one read or write per
+frame. No throughput target follows from the allocation checks alone.
+
+## Statistics and accounting
+
+All control indices follow the original configuration order. TX lane IDs start
+at one; RX lane IDs are the remote peer's wire IDs. These APIs return None before
+runtime state is published or for an unknown index:
+
+| Control method | Scope and lifetime |
+| --- | --- |
+| `worker_counters(worker)` | Physical ingress, sends, drops and errors owned by that worker |
+| `session_counters(session)` | Sum of a session's worker totals across connection replacements |
+| `peer_counters(peer)` | Its sessions plus transmit-socket setup errors shared by the peer |
+| `transmit_lane_counters(session, lane)` | Current local lane, with its local commit generation |
+| `receive_lane_counters(session, lane)` | Currently registered remote lane, with its local commit generation |
+
+Lane totals reset on installation and disappear on retirement. A lane read can
+return None while its identity changes; retry on the next sampling interval.
+An installing lane can report a generation newer than `session().generation`,
+which advances only after every worker completes the barrier. Fields are sampled
+independently, and aggregation can span batches. Snapshots are observations, not
+synchronization for transport state.
+
+`delivered_frame_bytes` counts complete Ethernet frames successfully written
+to TAP, excluding FCS. Outer byte counters include the 40-byte IPv6 and 8-byte
+UDP headers. TX counts successful kernel submissions, not proof of remote
+delivery. Worker RX totals count nontruncated datagrams, including malformed and
+unknown-cookie input. Session RX totals count fully decoded datagrams with that
+session's cookie, including stale tags, once even if handed to another worker.
+RX lane totals start after current-tag and lane-owner checks. Handshake traffic
+belongs to session/peer totals; it has no established lane.
+
+`duplicate_packets` counts packet-history rejection. `duplicate_pieces`
+counts whole DATA pieces already covered or terminal in fresh packets; partial
+overlap that adds bytes is not a duplicate piece. `expired_frames` counts sender
+and receiver deadlines, not connection retirement. `reassembly_bytes` is the
+sum of reserved full frame lengths, including incomplete frames, rather than the
+number of piece bytes received so far. `reassembly_frames` includes complete
+frames waiting for TAP.
+
+Queue pressure is attributed where detected. Drops before lane admission appear
+only in worker/session totals. Malformed and unknown-cookie input that cannot
+be attributed to a session, receive-bind failures and affinity failures remain
+worker-only. Peer socket-setup failures appear in worker and peer totals; they
+are not duplicated into every session. These scopes overlap: do not add worker,
+session, peer and lane totals together.
+
+Counts and occupancy gauges sum across owners. RTT and feedback delay use the
+maximum; path MTU uses the smallest nonzero value. Aggregate MTU state prefers
+failed, probing, baseline, confirmed, then unknown. The current active TX lanes
+report outer MTU 1280 and baseline state. RTT, feedback delay, repairs, pacing
+and bytes-in-flight remain zero until recovery and congestion control are
+implemented. Cumulative counts wrap modulo 2^64.
 
 ## Path MTU status
 
@@ -245,7 +317,9 @@ migration and migration back, unchanged-address updates, multiple peers/sessions
 shutdown cleanup, forwarding allocation checks, and
 TAP readiness with an unavailable receive address and unresolved peer. A worker
 ownership test fills both handoff rings and checks buffer returns, lane returns,
-commit completion and duplicate-install packet-number preservation.
+commit completion and duplicate-install packet-number preservation. Counter tests
+cover lane reuse, duplicate/expiry accounting, reservation gauges, connection
+generations and peer aggregation after shutdown.
 Bridge/OVS/VRF matrices, offloads, Linux 5.0 qualification and performance
 acceptance remain open.
 

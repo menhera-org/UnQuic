@@ -184,7 +184,7 @@ One struct of `AtomicU64` per session, per peer and per lane, with the names
 section 12 lists. Workers increment with `Relaxed`; the control handle reads
 with `Acquire`. No locks, no strings in the hot path.
 
-### 1e Worker runtime (`src/spsc.rs`, `src/worker.rs`, `src/runtime.rs`) — in progress
+### 1e Worker runtime (`src/spsc.rs`, `src/worker.rs`, `src/runtime.rs`) — complete
 
 The 1024-entry SPSC queue is implemented with cached cursors and fixed storage.
 Tests cover full-ring ownership, cursor wraparound, endpoint destruction and
@@ -208,8 +208,11 @@ addresses now pass through a bounded control queue and prepare a second socket
 set before new handshakes. Tests cover initial supply, an unreachable candidate,
 migration and migration back, unchanged-address updates, and two peers/three
 sessions per endpoint. Receive readiness is independent per endpoint.
-Separate session/peer/lane counters and broader ownership/pressure tests remain
-before 1e can be called complete.
+Workers publish session, peer and lane counters in batches. Lane identities are
+generation-qualified; tests cover reuse, expiry, duplicate pieces, receive
+reservations and post-shutdown aggregation. The full-ring ownership test verifies
+buffer/lane returns and barrier completion. Step 1e's container acceptance now
+passes; broader pressure and overload coverage remains in stages 2 and 4.
 
 Implement the ownership rules of section 10 under "Worker ownership and
 routing (v1)".

@@ -5,7 +5,7 @@
 
 use crate::{
     config::{Config, Validated},
-    counters::{Counters, Snapshot},
+    counters::{Counters, LaneCounters, LaneSnapshot, Snapshot},
     handshake::State,
     reassembly, spsc,
     tap::Tap,
@@ -63,6 +63,10 @@ pub(crate) struct Shared {
     pub status: Vec<AtomicU8>,
     pub generations: Vec<AtomicU64>,
     pub counters: Vec<Counters>,
+    pub session_counters: Vec<Counters>,
+    pub peer_counters: Vec<Counters>,
+    pub receive_counters: Vec<LaneCounters>,
+    pub transmit_counters: Vec<Vec<LaneCounters>>,
     pub bound: Vec<AtomicU64>,
     pub requests: Mutex<spsc::Producer<AddressRequest>>,
     pub address_pending: Vec<AtomicBool>,
@@ -174,6 +178,67 @@ impl Control {
         })
     }
 
+    /// Aggregates a session's worker totals across all its connections.
+    ///
+    /// Counts and occupancies sum; RTT/delay use the maximum and MTU the
+    /// smallest nonzero value. MTU state prefers failed, probing, baseline,
+    /// confirmed, then unknown. Unsupported stage-3 gauges remain zero.
+    pub fn session_counters(&self, session: usize) -> Option<Snapshot> {
+        let shared = self.0.shared.get()?;
+        shared.config.config().sessions.get(session)?;
+        let start = session * shared.workers();
+        let mut result = Snapshot::default();
+        for counters in &shared.session_counters[start..start + shared.workers()] {
+            result.merge(counters.snapshot());
+        }
+        Some(result)
+    }
+
+    /// Aggregates this peer's sessions plus peer-owned socket setup errors.
+    pub fn peer_counters(&self, peer: usize) -> Option<Snapshot> {
+        let shared = self.0.shared.get()?;
+        shared.config.config().peers.get(peer)?;
+        let mut result = Snapshot::default();
+        for session in 0..shared.config.config().sessions.len() {
+            if shared.config.peer_for_session(session) == Some(peer) {
+                result.merge(self.session_counters(session)?);
+            }
+        }
+        let start = peer * shared.workers();
+        for counters in &shared.peer_counters[start..start + shared.workers()] {
+            result.merge(counters.snapshot());
+        }
+        Some(result)
+    }
+
+    /// Samples a current local transmit lane, numbered from one.
+    pub fn transmit_lane_counters(&self, session: usize, lane: u16) -> Option<LaneSnapshot> {
+        self.0
+            .shared
+            .get()?
+            .transmit_counters
+            .get(session)?
+            .get(usize::from(lane.checked_sub(1)?))?
+            .snapshot()
+    }
+
+    /// Samples a registered remote receive lane from its current worker owner.
+    ///
+    /// None means unregistered, retired or changing identity during this read.
+    /// Drops before owner admission appear in worker/session totals.
+    pub fn receive_lane_counters(&self, session: usize, lane: u16) -> Option<LaneSnapshot> {
+        let shared = self.0.shared.get()?;
+        let owner = shared.owners.get(session)?[usize::from(lane)].load(Ordering::Acquire);
+        if owner == 0 || owner == 255 {
+            return None;
+        }
+        let start = (session * shared.workers() + usize::from(owner - 1)) * LANES;
+        shared.receive_counters[start..start + LANES]
+            .iter()
+            .filter_map(LaneCounters::snapshot)
+            .find(|snapshot| snapshot.lane == lane)
+    }
+
     /// Samples one worker's cumulative totals; fields are sampled independently.
     pub fn worker_counters(&self, worker: usize) -> Option<Snapshot> {
         Some(self.0.shared.get()?.counters.get(worker)?.snapshot())
@@ -249,6 +314,14 @@ pub fn run(config: Config, control: Control) -> io::Result<()> {
     let wakes = (0..count)
         .map(|_| Wake::new().map(Arc::new))
         .collect::<io::Result<Vec<_>>>()?;
+    let transmit_counters = (0..sessions)
+        .map(|session| {
+            let peer = config.peer_for_session(session).unwrap();
+            (0..config.config().peers[peer].tx_lanes)
+                .map(|_| LaneCounters::new())
+                .collect()
+        })
+        .collect();
     let shared = Arc::new(Shared {
         config,
         wakes,
@@ -258,6 +331,12 @@ pub fn run(config: Config, control: Control) -> io::Result<()> {
         status: (0..sessions).map(|_| AtomicU8::new(0)).collect(),
         generations: (0..sessions).map(|_| AtomicU64::new(0)).collect(),
         counters: (0..count).map(|_| Counters::new()).collect(),
+        session_counters: (0..sessions * count).map(|_| Counters::new()).collect(),
+        peer_counters: (0..peers * count).map(|_| Counters::new()).collect(),
+        receive_counters: (0..sessions * count * LANES)
+            .map(|_| LaneCounters::new())
+            .collect(),
+        transmit_counters,
         bound: (0..endpoints).map(|_| AtomicU64::new(0)).collect(),
         requests: Mutex::new(request_tx),
         address_pending: (0..peers).map(|_| AtomicBool::new(false)).collect(),
@@ -325,6 +404,22 @@ fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
     let reassembly = sessions
         .checked_mul(LANES)?
         .checked_mul(reassembly::Lane::storage_bytes())?;
+    let lane_counters = sessions
+        .checked_mul(workers)?
+        .checked_mul(LANES)?
+        .checked_mul(size_of::<LaneCounters>())?;
+    let totals = sessions
+        .checked_add(raw.peers.len())?
+        .checked_mul(workers)?
+        .checked_mul(size_of::<Counters>())?;
+    let transmit = (0..sessions).try_fold(0_usize, |total, session| {
+        let peer = config.peer_for_session(session)?;
+        total.checked_add(
+            raw.peers[peer]
+                .tx_lanes
+                .checked_mul(size_of::<LaneCounters>())?,
+        )
+    })?;
     let shared = sessions
         .checked_mul(65_536 + size_of::<Box<[AtomicU8]>>() + 1 + size_of::<AtomicU64>())?
         .checked_add(workers.checked_mul(STACK_BYTES + size_of::<Counters>() + 256)?)?;
@@ -372,6 +467,9 @@ fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
     [
         Worker::storage_bytes(raw, workers)?,
         commands,
+        lane_counters,
+        totals,
+        transmit,
         raw.endpoints.len().checked_mul(size_of::<AtomicU64>())?,
         raw.peers
             .len()

@@ -398,3 +398,52 @@ fn full_ready_queue_rejects_new_frames_but_accepts_duplicates_without_reenqueuei
         Admission::Fresh
     );
 }
+
+#[test]
+fn accounting_tracks_reservations_duplicates_expiry_and_reset() {
+    let mut lane = Lane::new(1, 9022).unwrap();
+    let now = Duration::ZERO;
+    assert_eq!(
+        admit(&mut lane, 1, &[piece(1, 0, &[1; 30])], now),
+        Admission::Fresh
+    );
+    assert_eq!(lane.retained_bytes(), 60);
+    assert_eq!(
+        admit(&mut lane, 2, &[piece(1, 0, &[1; 30])], now),
+        Admission::Fresh
+    );
+    assert_eq!(lane.duplicate_pieces(), 1);
+    assert_eq!(
+        admit(&mut lane, 2, &[piece(1, 0, &[1; 30])], now),
+        Admission::Duplicate
+    );
+    assert_eq!(lane.duplicate_pieces(), 1);
+    assert_eq!(
+        admit(&mut lane, 3, &[piece(1, 15, &[1; 30])], now),
+        Admission::Fresh
+    );
+    assert_eq!(lane.duplicate_pieces(), 1); // Partial overlap adds bytes.
+    // Admission itself expires older frames, even when its packet is a duplicate.
+    assert_eq!(
+        admit(&mut lane, 3, &[piece(1, 15, &[1; 30])], FRAME_LIFETIME),
+        Admission::Duplicate
+    );
+    assert_eq!(lane.expired_frames(), 1);
+    assert_eq!(lane.retained_bytes(), 0);
+    assert_eq!(lane.expire(FRAME_LIFETIME), 0);
+    assert_eq!(
+        admit(&mut lane, 4, &[piece(1, 0, &[1; 60])], FRAME_LIFETIME),
+        Admission::Fresh
+    );
+    assert_eq!(lane.duplicate_pieces(), 2);
+    assert_eq!(
+        admit(&mut lane, 5, &[piece(2, 0, &[2; 60])], FRAME_LIFETIME),
+        Admission::Fresh
+    );
+    assert_eq!(lane.retained_bytes(), 60);
+    assert!(lane.finish_front());
+    assert_eq!(lane.retained_bytes(), 0);
+    lane.reset(1, 9022).unwrap();
+    assert_eq!(lane.expired_frames(), 0);
+    assert_eq!(lane.duplicate_pieces(), 0);
+}

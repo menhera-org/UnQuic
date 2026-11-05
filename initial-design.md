@@ -499,9 +499,11 @@ allocations or deallocations. Readiness, buffer ownership, memory reservations
 and remaining runtime gaps are documented in README.md. Candidate-address
 updates preserve active paths through fresh handshakes and worker barriers.
 Tests cover failed candidates, migration back, unchanged destinations, multiple
-peers/sessions and independent endpoint readiness. Per-session/peer/lane counter
-publication, aggregate receive quotas,
-offloads, recovery and congestion control remain unfinished. Current liveness
+peers/sessions and independent endpoint readiness. Workers publish per-session,
+per-peer and per-lane counters in batches; lane snapshots include the local
+connection generation. README.md defines byte accounting, lifetime, aggregation
+and currently unsupported gauges. Aggregate receive quotas, offloads, recovery
+and congestion control remain unfinished. Current liveness
 probes do not discover MTU: the UDP limit remains 1232 bytes until stage 3.
 No performance acceptance claim has been made.
 
