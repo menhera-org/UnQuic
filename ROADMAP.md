@@ -358,9 +358,16 @@ pending; README.md documents the baseline send-error behavior.
 - Repair: selective byte-range repair with the two-repair limit, sender
   deadline `clamp(4 * srtt, 20 ms, 100 ms)`, FRAME_ABANDON origin 0 and 1
   with 100 ms lifetime and two retries, LANE_RETIRE with tombstone bits.
-- `pmtu.rs`: RFC 8899 per lane from 1232 upward to 1452 using padded PROBE
-  and PROBE_REPLY, `EMSGSIZE` and `IPV6_RECVERR` Packet Too Big as "shrink
-  now, re-probe later". Keep `IPV6_PMTUDISC_DO`.
+- `pmtu.rs`: RFC 8899 per lane from the 1232-byte UDP baseline, using larger
+  confirmed path MTUs including above 1500 outer bytes. Expand the current
+  1452-byte socket API and receive-validation ceilings together, within wire
+  and reserved-buffer bounds; keep the hot path allocation-free. Use padded
+  PROBE and matching PROBE_REPLY, with `EMSGSIZE` and validated `IPV6_RECVERR`
+  Packet Too Big as "shrink now, re-probe later". Local interface MTU alone
+  never confirms a path. Reset discovery for new paths and keep TAP MTU
+  independent. Keep `IPV6_PMTUDISC_DO`. Test 1280-, 1500- and 9000-byte paths,
+  independent lane limits, lost probes, forged/stale replies, MTU reduction
+  and recovery in disposable network namespaces; never emit outer fragments.
 - `bbr.rs`: BBRv3 as draft-ietf-ccwg-bbr-07 specifies, one owner per sending
   direction and path group, charging outer IP bytes, initial window ten
   datagrams. Pin deterministic vectors derived from the draft's pseudocode

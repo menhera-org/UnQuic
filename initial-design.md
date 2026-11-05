@@ -2,7 +2,7 @@
 
 **Draft 0.1 • 4 November 2026 • Human-life Information Platforms Institute Menhera®**
 
-Build a Linux userspace Ethernet transport for closed-area NTT NGN networks. The transport must carry inner MTUs of at least 1500 over an IPv6-only UDP underlay whose IP MTU is fixed at 1500, without emitting outer IP fragments. It must use loss-tolerant congestion control and target sustained delivered throughput of at least 5 Gbit/s on modest 2–4-core hosts over routed IPv6 10G-EPON access lines with 4.5–7.5 ms RTT and nonzero packet loss.
+Build a Linux userspace Ethernet transport for closed-area NTT NGN networks. The transport must carry inner MTUs of at least 1500 over an IPv6-only UDP underlay, without emitting outer IP fragments. The target access line has IP MTU 1500; the final transport must also use larger path MTUs where discovery confirms them. It must use loss-tolerant congestion control and target sustained delivered throughput of at least 5 Gbit/s on modest 2–4-core hosts over routed IPv6 10G-EPON access lines with 4.5–7.5 ms RTT and nonzero packet loss.
 
 Encryption is deliberately absent. A session UUID is the sole session admission cookie. The project must turn that deployment choice into materially lower processing cost and substantially higher throughput than WireGuard, SoftEther VPN, and comparable solutions under equivalent conditions.
 
@@ -26,7 +26,7 @@ The following are operator-provided deployment observations, not provider guaran
 | - | - |
 | Access | Shared 10G-EPON NTT NGN |
 | Underlay | IPv6-only UDP |
-| Underlay IP MTU | Fixed at 1500 bytes |
+| Underlay IP MTU | 1500 bytes on the target access line; larger confirmed MTUs used on other paths |
 | RTT | Approximately 4.5–7.5 ms |
 | Idle jitter | Less than approximately 1.5 ms |
 | Loss | Nonzero; rate and burst distribution remain to be measured |
@@ -205,7 +205,7 @@ With a 1500-byte outer IP ceiling and no extension headers, the UDP payload ceil
 
 # 7 Packing and segmentation
 
-The transport must segment inner frames itself. Linux must never silently perform outer IPv6 fragmentation. Set `IPV6_DONTFRAG` on every transmit socket, handle `EMSGSIZE` and validated Packet Too Big feedback, and retain a per-path payload limit. Treat 1500 as the configured ceiling. Start each lane at the IPv6 1280-byte baseline (1232-byte UDP payload) and use RFC 8899 DPLPMTUD to validate larger sizes up to 1500. Keep per-lane state because source-port paths can differ; ACK of ordinary traffic alone cannot validate an unsent larger size. Only a matching padded PROBE_REPLY confirms its size. A validated smaller limit reduces segmentation immediately; an unusable path below the baseline fails clearly. Probe loss never licenses fragmentation. [S8]
+The transport must segment inner frames itself. Linux must never silently perform outer IPv6 fragmentation. Set `IPV6_DONTFRAG` on every transmit socket, handle `EMSGSIZE` and validated Packet Too Big feedback, and retain a per-path payload limit. Treat 1500 as the target access-line MTU, not a transport-wide ceiling. Start each lane at the IPv6 1280-byte baseline (1232-byte UDP payload) and use RFC 8899 DPLPMTUD to validate larger sizes, including above 1500 where available. Bound probes and data by the wire format and reserved buffer capacities; never allocate a larger packet buffer on the hot path. A local interface or route MTU can bound the search but cannot confirm end-to-end delivery. New paths restart at the baseline. The inner TAP MTU stays independently configured. Keep per-lane state because source-port paths can differ; ACK of ordinary traffic alone cannot validate an unsent larger size. Only a matching padded PROBE_REPLY confirms its size. A validated smaller limit reduces segmentation immediately; an unusable path below the baseline fails clearly. Probe loss never licenses fragmentation. [S8]
 
 Allow one datagram to contain several records, including a frame tail followed by a piece of another frame. Each record contains enough information to recover its frame independently. No frame boundary may depend on successfully parsing a preceding datagram.
 
@@ -398,7 +398,7 @@ For illustration, 5 Gbit/s of inner IP traffic requires the following rates when
 | 1500 | 416667 | 833333 |
 | 2400 | 260417 | 520833 |
 
-Assuming packing delivers an average of 1350 inner IP bytes per outer packet, the outer rate would be about 463000 packets/s. This average is a planning assumption below the v1 format's 1384-byte frame-data ceiling; actual efficiency depends on Ethernet overhead, frame sizes, record boundaries, and partial batches.
+Assuming packing delivers an average of 1350 inner IP bytes per outer packet, the outer rate would be about 463000 packets/s. This average is a planning assumption below the 1384-byte frame-data ceiling for a 1500-byte outer path; actual efficiency depends on Ethernet overhead, frame sizes, record boundaries, and partial batches.
 
 At 5 Gbit/s and RTT 4.5–7.5 ms, the bandwidth-delay product is approximately 2.81–4.69 MB per direction. Retaining 20 ms of payload for recovery would require about 12.5 MB per direction before metadata and copies. Bounds should scale with the configured memory ceiling and measured path, not with arbitrary tiny packet counts.
 
@@ -538,6 +538,7 @@ Maintain a clear distinction between a throughput experiment and an interoperabl
 | Numeric competitive margin | Define before acceptance; evaluate 1.5-fold as a proposal |
 | Local throughput | Required: ≥20 Gbit/s each direction simultaneously at inner MTU 1500; report CPU; freeze hardware, core budget and flow count |
 | Real-access throughput | Required target: ≥5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms and nonzero loss; freeze flow count, direction, CPU model and loss profile |
+| Outer path MTU | Discover per lane from 1280; use confirmed larger sizes, including above 1500, within wire and reserved-buffer bounds |
 | Maximum inner MTU and tag depth | Fixed: MTU 9000 with two VLAN tags, 9022-byte frame ceiling (section 3) |
 | Controller implementation | Decided: in-tree BBRv3 draft 07, one owner/budget per direction and path group (section 9) |
 | Retry and frame deadlines | Initial two-repair limit and bounded RTT-based sender / 100 ms receiver deadlines (section 8); tune by measurement |

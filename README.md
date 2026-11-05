@@ -358,7 +358,7 @@ payload limit. Transmit sockets set `IPV6_DONTFRAG` and `IPV6_PMTUDISC_DO`;
 GSO segments remain subject to that limit. Inner TAP MTU stays configured, and
 the transport splits Ethernet frames into DATA pieces.
 
-| Size, without outer extension headers | Current baseline | Planned confirmed ceiling |
+| Size, without outer extension headers | Current baseline | Confirmed 1500-byte path |
 | --- | ---: | ---: |
 | Outer IPv6 packet | 1280 bytes | 1500 bytes |
 | UDP payload | 1232 bytes | 1452 bytes |
@@ -377,11 +377,18 @@ It neither lowers the limit nor resizes the TAP. Other nontransient send errors
 follow the same path; WouldBlock and interrupted sends retain the remainder
 until its deadline.
 
-The planned per-lane discovery follows RFC 8899: padded PROBE packets test
-larger sizes, and a reply matching a live probe confirms its exact size.
+The final transport must use larger path MTUs when available, including values
+above 1500. That size describes the target access line, not a permanent transport
+ceiling. The planned RFC 8899 discovery starts each lane at the baseline and uses
+padded PROBE packets to confirm larger sizes within wire and reserved-buffer
+bounds. A reply must match a live probe and its exact size before DATA uses it;
+a local interface MTU alone is insufficient. The current 1452-byte socket API
+ceiling must expand with that implementation. TAP MTU remains separately configured.
+
 EMSGSIZE and validated ICMPv6 Packet Too Big feedback will lower the limit and
-schedule re-probing. A path below the 1280-byte baseline must fail explicitly.
-The current small liveness probes do not establish that a full DATA packet fits.
+schedule re-probing. New paths start discovery again. A path below the 1280-byte
+baseline must fail explicitly. The current small liveness probes do not establish
+that a full DATA packet fits.
 
 ## Operational checks
 
