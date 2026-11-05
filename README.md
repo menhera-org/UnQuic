@@ -269,7 +269,10 @@ matches the 64-frame TAP-read batch so small-frame receive bursts cannot take
 twice the work allowance of the reverse direction. A final datagram is
 indivisible and may exceed the record/byte target; malformed record areas are
 charged the maximum 64 records. Unprocessed GRO bytes stay in their original
-pooled buffer. The bounded pending queue stores only buffer ownership and counts
+pooled buffer. An idle worker waiting for buffers held by other workers suppresses
+socket read readiness until a buffer returns; the existing handoff notification
+wakes it. This avoids polling a readable socket with no receive storage.
+The bounded pending queue stores only buffer ownership and counts
 toward the memory ceiling. Workers drain a lane after 16 completions, on admission
 pressure, and at the end of each turn. TX, timers, control queues and readiness
 polling run between receive turns. Ready-event service rotates so busy endpoints

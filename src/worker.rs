@@ -502,6 +502,7 @@ pub(crate) struct Worker {
     controls: Vec<SessionControl>,
     receive: Vec<Option<ReceiveSocket>>,
     receive_overflow: Vec<u32>,
+    receive_enabled: bool,
     rx_retained: usize,
     transmit: Vec<PeerPaths>,
     pub requests: Option<Consumer<AddressRequest>>,
@@ -672,6 +673,7 @@ impl Worker {
             incoming: (0..count).map(|_| None).collect(),
             receive: (0..config.endpoints.len()).map(|_| None).collect(),
             receive_overflow: vec![0; config.endpoints.len()],
+            receive_enabled: true,
             rx_retained: 0,
             transmit: config
                 .peers
@@ -760,6 +762,7 @@ impl Worker {
                         .lanes[lane]
                         .blocked
                 });
+            self.receive_interest(more)?;
             self.publish_counters();
             let mut deadline = self.deadline(now);
             if self.has_backpressure() {
@@ -1101,8 +1104,15 @@ impl Worker {
                             self.counters.socket_errors =
                                 self.counters.socket_errors.wrapping_add(1);
                         }
-                        self.reactor
-                            .add(socket.as_fd(), index as u64 + 2, libc::EPOLLIN as u32)?;
+                        self.reactor.add(
+                            socket.as_fd(),
+                            index as u64 + 2,
+                            if self.receive_enabled {
+                                libc::EPOLLIN as u32
+                            } else {
+                                0
+                            },
+                        )?;
                         self.receive[index] = Some(socket);
                         self.shared.bound[index].fetch_or(1_u64 << self.id, Ordering::Release);
                     }
@@ -1267,6 +1277,25 @@ impl Worker {
         self.sessions[session]
             .connection
             .is_some_and(|c| c.local_tag().get() == tag)
+    }
+
+    fn receive_interest(&mut self, more: bool) -> io::Result<()> {
+        let enabled = self.rx_retained < RECEIVE_BUFFERS && !self.free.is_empty();
+        // Only suppress readiness when waiting for foreign buffers; local work already yields.
+        if enabled == self.receive_enabled || (!enabled && more) {
+            return Ok(());
+        }
+        for (index, socket) in self.receive.iter().enumerate() {
+            if let Some(socket) = socket {
+                self.reactor.modify(
+                    socket.as_fd(),
+                    index as u64 + 2,
+                    if enabled { libc::EPOLLIN as u32 } else { 0 },
+                )?;
+            }
+        }
+        self.receive_enabled = enabled;
+        Ok(())
     }
 
     fn read_socket(&mut self, endpoint: usize, now: Duration) -> io::Result<()> {
@@ -2551,11 +2580,24 @@ mod tests {
                 .send_to(&bytes[..length], socket.local_addr())
                 .unwrap();
         }
+        worker
+            .reactor
+            .add(socket.as_fd(), 2, libc::EPOLLIN as u32)
+            .unwrap();
         worker.receive[0] = Some(socket);
         worker.read_socket(0, Duration::ZERO).unwrap();
         assert_eq!(worker.rx_retained, RECEIVE_BUFFERS);
         worker.read_socket(0, Duration::ZERO).unwrap();
         assert_eq!(worker.received.len(), RECEIVE_BUFFERS);
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+        worker.receive_interest(true).unwrap();
+        assert_eq!(worker.reactor.wait(&mut events, 0).unwrap(), 1);
+        worker.receive_interest(false).unwrap();
+        assert_eq!(worker.reactor.wait(&mut events, 0).unwrap(), 0);
+        worker.shared.wakes[0].notify().unwrap();
+        assert_eq!(worker.reactor.wait(&mut events, 0).unwrap(), 1);
+        assert_eq!({ events[0].u64 }, WAKE_TOKEN);
+        worker.reactor.drain(WAKE_TOKEN).unwrap();
 
         for _ in 0..BUFFERS {
             tap.send(&[0; 60]).unwrap();
@@ -2568,6 +2610,9 @@ mod tests {
 
         worker.drain_packets(Duration::ZERO).unwrap();
         assert_eq!(worker.rx_retained, 0);
+        worker.receive_interest(true).unwrap();
+        let count = worker.reactor.wait(&mut events, 0).unwrap();
+        assert!(events[..count].iter().any(|event| event.u64 == 2));
         assert_eq!(worker.free.len(), RECEIVE_BUFFERS);
         worker.read_tap(0, Duration::ZERO).unwrap();
         assert_eq!(worker.free.len(), RECEIVE_BUFFERS);
