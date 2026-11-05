@@ -2,7 +2,7 @@
 
 **Draft 0.1 • 4 November 2026 • Human-life Information Platforms Institute Menhera®**
 
-Build a Linux userspace Ethernet transport for closed-area NTT NGN networks. The transport must carry inner MTUs of at least 1500 over an IPv6-only UDP underlay whose IP MTU is fixed at 1500, without emitting outer IP fragments. It must use loss-tolerant congestion control and target sustained delivered throughput above 3 Gbit/s on modest 2–4-core hosts.
+Build a Linux userspace Ethernet transport for closed-area NTT NGN networks. The transport must carry inner MTUs of at least 1500 over an IPv6-only UDP underlay whose IP MTU is fixed at 1500, without emitting outer IP fragments. It must use loss-tolerant congestion control and target sustained delivered throughput of at least 5 Gbit/s on modest 2–4-core hosts over routed IPv6 10G-EPON access lines with 4.5–7.5 ms RTT and nonzero packet loss.
 
 Encryption is deliberately absent. A session UUID is the sole session admission cookie. The project must turn that deployment choice into materially lower processing cost and substantially higher throughput than WireGuard, SoftEther VPN, and comparable solutions under equivalent conditions.
 
@@ -65,7 +65,7 @@ The requirement identifiers below describe commitments established for this proj
 
 ## 2.3 Performance and congestion
 
-- **R11 Throughput.** Target sustained delivered inner goodput above 3 Gbit/s on the specified 2–4-core deployments when the contemporaneous underlay capacity can support it.
+- **R11 Throughput.** Target sustained delivered inner goodput of at least 5 Gbit/s on the specified 2–4-core deployments over routed IPv6 10G-EPON with 4.5–7.5 ms RTT and nonzero packet loss, when contemporaneous underlay capacity supports the encapsulation and repair overhead. Local container tests must also sustain at least 20 Gbit/s in each direction simultaneously at inner MTU 1500, with CPU use reported.
 
 - **R12 Competitive margin.** Substantially outperform WireGuard, SoftEther VPN, and comparable solutions under equivalent host, underlay, MTU, and service conditions. The numerical margin remains an acceptance decision.
 
@@ -391,22 +391,22 @@ The future optional systemd integration consumes this same parent-exit readiness
 
 Use delivered inner bytes per second as the headline result and report the precise measurement layer. Record outer IP bytes and repair/control bytes separately. Do not compare TCP payload throughput with Ethernet or outer-wire throughput without conversion.
 
-For illustration, 3 Gbit/s of inner IP traffic requires the following rates when packets are full-sized. MTU 2400 is an example larger-MTU test point, not an operator-specified requirement:
+For illustration, 5 Gbit/s of inner IP traffic requires the following rates when packets are full-sized. MTU 2400 is an example larger-MTU test point, not an operator-specified requirement:
 
 | Inner MTU | Inner frames per second | Outer packets per second with two per frame |
 | - | -: | -: |
-| 1500 | 250000 | 500000 |
-| 2400 | 156250 | 312500 |
+| 1500 | 416667 | 833333 |
+| 2400 | 260417 | 520833 |
 
-Assuming packing delivers an average of 1350 inner IP bytes per outer packet, the outer rate would be about 278000 packets/s. This average is a planning assumption below the v1 format's 1384-byte frame-data ceiling; actual efficiency depends on Ethernet overhead, frame sizes, record boundaries, and partial batches.
+Assuming packing delivers an average of 1350 inner IP bytes per outer packet, the outer rate would be about 463000 packets/s. This average is a planning assumption below the v1 format's 1384-byte frame-data ceiling; actual efficiency depends on Ethernet overhead, frame sizes, record boundaries, and partial batches.
 
-At 3 Gbit/s and RTT 4.5–7.5 ms, the bandwidth-delay product is approximately 1.69–2.81 MB per direction. Retaining 20 ms of payload for recovery would require about 7.5 MB per direction before metadata and copies. Bounds should scale with the configured memory ceiling and measured path, not with arbitrary tiny packet counts.
+At 5 Gbit/s and RTT 4.5–7.5 ms, the bandwidth-delay product is approximately 2.81–4.69 MB per direction. Retaining 20 ms of payload for recovery would require about 12.5 MB per direction before metadata and copies. Bounds should scale with the configured memory ceiling and measured path, not with arbitrary tiny packet counts.
 
-Two 2 GHz cores provide approximately 14400 aggregate CPU cycles per outer packet at 278000 packets/s. That budget includes their kernel and userspace processing and is not evenly available if a queue concentrates work on one core. Full-duplex 3 Gbit/s in each direction roughly doubles packet work.
+Two 2 GHz cores provide approximately 8640 aggregate CPU cycles per outer packet at 463000 packets/s. That budget includes their kernel and userspace processing and is not evenly available if a queue concentrates work on one core. Full-duplex 5 Gbit/s in each direction roughly doubles packet work.
 
-At an assumed 90 percent effective encapsulation efficiency, delivering 3 Gbit/s needs about 3.33 Gbit/s of outer traffic. Adding repair traffic equal to 10 percent of original transmissions raises this illustrative demand to about 3.67 Gbit/s. These are arithmetic budgets, not measured results.
+At an assumed 90 percent effective encapsulation efficiency, delivering 5 Gbit/s needs about 5.56 Gbit/s of outer traffic. Adding repair traffic equal to 10 percent of original transmissions raises this illustrative demand to about 6.11 Gbit/s. These are arithmetic budgets, not measured results.
 
-A proposed development milestone is at least 4 Gbit/s of clean-path inner goodput on the actual CPU budget, providing headroom for the above-3-Gbit/s deployment target. Neither that milestone nor a competitive margin is established by removing encryption alone. Existing WireGuard implementations already use substantial batching and offload optimization. [S18]
+The local container acceptance requirement is at least 20 Gbit/s of delivered inner goodput in each direction simultaneously at inner MTU 1500, with CPU use reported. This requirement provides processing headroom for the 5 Gbit/s real-access target. Both require measurements through the complete transport; codec or socket microbenchmarks cannot establish either result. Existing WireGuard implementations already use substantial batching and offload optimization. [S18]
 
 # 14 Validation and acceptance
 
@@ -456,7 +456,9 @@ Measure on a controlled link with approximately the observed RTT and reproducibl
 
 Report goodput, total endpoint CPU including softirq, per-core load, p50/p95/p99 latency under load, frame loss/expiry, repair overhead, memory, and queue drops. A throughput gain accompanied by excessive queueing must remain visible.
 
-**Pass criteria still to freeze:** the numerical definition of a large competitive margin; which profiles must exceed 3 Gbit/s; whether that target is single-flow, aggregate, one-way, or simultaneous bidirectional; maximum acceptable loaded latency; and a representative loss profile. A tentative 1.5-fold throughput advantage can be evaluated as a proposal, not treated as an agreed requirement.
+**Required throughput:** local container tests must sustain at least 20 Gbit/s in each direction simultaneously at inner MTU 1500 and report CPU use. The real-access target is at least 5 Gbit/s over routed IPv6 10G-EPON with 4.5–7.5 ms RTT and nonzero packet loss. Record the achieved rate for each direction separately; an aggregate local result of 20 Gbit/s does not pass. Measure delivered inner goodput, excluding duplicates and repair/control bytes, and state the measurement layer. Local results do not establish real-access performance.
+
+**Pass criteria still to freeze:** local test hardware, core budget and flow count; real-access flow count and direction; maximum acceptable loaded latency; and representative random and burst loss profiles. “Nonzero loss” must become a reproducible rate and distribution before acceptance. The numerical definition of a large competitive margin also remains open; a tentative 1.5-fold throughput advantage is a proposal.
 
 If a comparison already reaches the available underlay ceiling, report that fact and CPU cost at equal goodput. Do not claim a large throughput margin that the measured path cannot demonstrate.
 
@@ -512,7 +514,8 @@ Maintain a clear distinction between a throughput experiment and an interoperabl
 | Decision | Initial direction |
 | - | - |
 | Numeric competitive margin | Define before acceptance; evaluate 1.5-fold as a proposal |
-| Scope of the above-3-Gbit/s target | Freeze flow count, direction, topology, CPU model, and loss profile |
+| Local throughput | Required: ≥20 Gbit/s each direction simultaneously at inner MTU 1500; report CPU; freeze hardware, core budget and flow count |
+| Real-access throughput | Required target: ≥5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms and nonzero loss; freeze flow count, direction, CPU model and loss profile |
 | Maximum inner MTU and tag depth | Fixed: MTU 9000 with two VLAN tags, 9022-byte frame ceiling (section 3) |
 | Controller implementation | Decided: in-tree BBRv3 draft 07, one owner/budget per direction and path group (section 9) |
 | Retry and frame deadlines | Initial two-repair limit and bounded RTT-based sender / 100 ms receiver deadlines (section 8); tune by measurement |

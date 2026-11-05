@@ -260,7 +260,9 @@ worker's queue.
 
 ## Stage 2: batched transport
 
-Goal: the packet rate and CPU baseline of section 13 can be measured.
+Goal: the packet rate and CPU baseline of section 13 can be measured. Final
+local acceptance requires at least 20 Gbit/s in each direction simultaneously
+at inner MTU 1500, with CPU use reported.
 
 The receive foundation is implemented early for step 1e: fixed frame storage,
 whole-datagram reservation, permanent packet/frame windows, terminal bits,
@@ -298,7 +300,11 @@ now run against the real implementation in tests/reassembly.rs.
   duplicated or corrupted.
 - Measure: record frames per second and CPU per core on the container
   loopback in a `BENCH.md` table with kernel version and CPU model. These
-  numbers are a baseline, not an acceptance claim.
+  numbers are a baseline until a complete-transport run demonstrates at least
+  20 Gbit/s of delivered inner goodput in each direction simultaneously at
+  inner MTU 1500. Report each direction separately, with loss, CPU including
+  softirq, core budget, flow count and the precise measurement layer. Keep
+  this requirement open until a repeatable run passes.
 
 ## Stage 3: recovery and congestion control
 
@@ -329,7 +335,10 @@ Goal: a production candidate under loss.
 - Tests: the BBR and feedback cases under "Protocol and ownership regression
   cases" in section 14.1; a container test with `tc netem` loss and reorder
   inside the namespace proving no duplicate delivery and bounded memory; a
-  loss sweep (0, 0.1, 1, 5 percent) recorded in `BENCH.md`.
+  loss sweep (0, 0.1, 1, 5 percent) recorded in `BENCH.md`. Include RTTs of
+  4.5 and 7.5 ms to exercise the real-access target: at least 5 Gbit/s over
+  routed IPv6 10G-EPON with nonzero packet loss. Record independent and burst
+  loss separately; simulated results still require validation on real access lines.
 
 ## Stage 4: composition and robustness
 
