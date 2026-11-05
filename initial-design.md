@@ -83,7 +83,9 @@ An inner frame is the Ethernet frame presented by TAP, excluding FCS and excludi
 
 This is a custom UDP transport inspired by QUIC's packet acknowledgment, loss detection, and pacing mechanisms. It does not claim QUIC wire compatibility or reuse QUIC stream semantics.
 
-Minimum supported kernel and maximum supported inner MTU remain open.
+The minimum supported kernel remains open. The maximum inner frame is fixed at 9022 bytes: MTU 9000 plus a 14-byte Ethernet header plus two VLAN tags, excluding FCS and TAP metadata. Buffer pools, reassembly slots, and TAP reads are sized from this constant; lowering it later is free.
+
+**Library shape:** the library owns its pinned worker threads. It exposes a blocking run function that takes parsed configuration and returns on shutdown, and a control handle for counters, carrier state, and configuration reload. The daemon is the only known caller and is a thin wrapper over this API.
 
 # 4 Socket and peer model
 
@@ -116,7 +118,16 @@ The cookie checks possession of a shared bearer value. It provides neither confi
 
 **Proposed restart handling:** preserve the configured session UUID while establishing a fresh sender epoch on restart. Packet numbers and frame IDs are 64-bit and cannot be exhausted in practice, so an epoch changes only when the process restarts. Take the epoch from the wall clock at startup so it is monotonic across restarts without persistent state; a peer accepts a new epoch only through a HELLO exchange and only if it is greater than the one currently active. Scope packet numbers by session, sender epoch, and lane. Scope frame IDs by session and sender epoch. A restart exchange must establish the active generation before accepting new DATA; an arbitrary delayed packet with a different epoch must not reset an established session.
 
-Use a small lifecycle: configured, establishing, active, degraded, and inactive. HELLO messages advertise compatible protocol features, MTU limits, and the configured fixed receive endpoint. They do not exchange cryptographic keys. Reject incompatible mandatory features explicitly. Exact restart, stale-generation rejection, and recovery transitions must be specified before interoperable implementations are attempted.
+Use a small lifecycle: configured, establishing, active, degraded, and inactive. HELLO messages advertise compatible protocol features, MTU limits, and the configured fixed receive endpoint. They do not exchange cryptographic keys. Reject incompatible mandatory features explicitly.
+
+**Frozen handshake (v0).** Each side keeps its own epoch (from the common header of everything it sends) and the peer's active epoch. The lifecycle is symmetric:
+
+- *Establishing:* send HELLO once per second from any lane until a HELLO_ACK naming the local epoch arrives. A side is *active* once its own epoch is acknowledged and a peer epoch is known.
+- *On HELLO received:* if its epoch is greater than the known peer epoch, adopt it, discard all per-peer packet, frame, and ACK state, and reply HELLO_ACK. If equal, reply HELLO_ACK again. If smaller, drop it silently.
+- *On DATA, ACK, PROBE, or FRAME_ABANDON received:* drop unless the header epoch equals the known peer epoch.
+- *Degraded:* no feedback of any kind for 3 seconds while active. Keep sending data and resume periodic HELLO. Return to active on any valid feedback; drop to *inactive* after 30 seconds and lower TAP carrier.
+
+HELLO record body, after the 4-byte record header: fixed receive port (2 bytes), maximum inner frame size (2 bytes), mandatory feature bits (4 bytes), optional feature bits (4 bytes); 12 bytes. All feature bits are zero in v0; any set mandatory bit the receiver does not understand is a hard reject. HELLO_ACK carries the same 12 bytes echoing the receiver's own values, followed by the acknowledged peer epoch (8 bytes); 20 bytes.
 
 After a lane failure, retire its packet state and establish a replacement lane without changing the session identity. Keep the TAP device through peer reconnection; use carrier state to reflect session availability with suitable hysteresis.
 
@@ -124,7 +135,7 @@ After a lane failure, retire its packet state and establish a replacement lane w
 
 Use a versioned fixed common header followed by bounded records. Every on-wire UDP datagram is independently parseable and contains the cookie. Encoding uses explicit byte order and fixed-width integers; it must not serialize native Rust, C, or virtio structures directly.
 
-The following is a candidate header for prototyping, not a frozen wire specification:
+The following header is frozen as wire version 0. Version 0 may still change before the protocol freeze in stage 6, but every change bumps the version byte so mismatched builds reject each other instead of misparsing. The magic is `0x5551` (ASCII `UQ`), all integers are big-endian, and no flag bits are defined: the Flags byte must be zero on send and is ignored on receive.
 
 | Field | Bytes | Purpose |
 | - | -: | - |
@@ -138,11 +149,11 @@ The following is a candidate header for prototyping, not a frozen wire specifica
 | Packet number | 8 | Unique transmission identity |
 | Total | 40 | Common header |
 
-A candidate DATA record has a 4-byte type, flags, and length prefix; an 8-byte frame ID; a 4-byte total frame length; a 4-byte byte offset; and the piece's bytes. This costs 20 bytes before frame data. Frame IDs must be unique within a sender epoch; workers can allocate disjoint ID ranges to avoid a shared counter on every frame.
+Every record starts with the same 4-byte prefix: type (1 byte), record flags (1 byte, zero in v0), and record length including the prefix (2 bytes). The v0 DATA record follows it with an 8-byte frame ID, a 4-byte total frame length, a 4-byte byte offset, and the piece's bytes. This costs 20 bytes before frame data. Frame IDs must be unique within a sender epoch; workers can allocate disjoint ID ranges to avoid a shared counter on every frame.
 
 With no IPv6 extension headers, the UDP payload budget is `1500 - 40 - 8 = 1452` bytes. Under the candidate format, a datagram carrying one DATA record can hold `1452 - 40 - 20 = 1392` frame bytes. Additional records consume additional record headers. Wire-efficiency calculations must use the final layout rather than earlier illustrative header sizes.
 
-Proposed record types are DATA, ACK, HELLO, HELLO_ACK, PROBE, PROBE_REPLY, FRAME_ABANDON, and optional padding for probes. ACKs name the acknowledged sender epoch and lane and carry bounded packet ranges and feedback delay. Exact record layouts, extension rules, and ACK limits remain open.
+Record types in v0 are DATA (1), ACK (2), HELLO (3), HELLO_ACK (4), PROBE (5), PROBE_REPLY (6), FRAME_ABANDON (7), and PADDING (0). ACKs name the acknowledged sender epoch and lane and carry bounded packet ranges and feedback delay. The HELLO and HELLO_ACK layouts are frozen in section 5; the ACK, PROBE, and FRAME_ABANDON layouts and ACK range limits are stage 3 decisions.
 
 Every physical transmission gets a new packet number. A repair retains the original frame ID and byte offsets but uses a new transmission number. The receiver deduplicates both transmissions and frame content; a late original packet and a successful repair must never inject the frame twice.
 
@@ -211,6 +222,8 @@ On UDP GRO receive, split the buffer into its logical datagrams using the return
 Keep frame buffers and reassembly slots owned by one worker. Retain references for repair and use scatter/gather I/O where it avoids extra payload copies. Measure whether packing into contiguous buffers or gathering slices is faster on target machines. Ordinary TAP and socket I/O still involves kernel copies.
 
 Start with a small worker count and several stable transmit lanes. Measure NIC queue counters, reuseport distribution, softirq CPU, and cross-worker traffic. Optional reuseport steering can align session/lane ownership with receive workers, but must not route all traffic for a session to one core merely because the cookie is shared. [S3, S4]
+
+**Feedback routing (decided).** Each worker owns a set of transmit lanes and their packet-accounting state. Inbound data needs no handoff: a lane is one remote source port, so all its datagrams hash to the same reuseport socket, and the worker holding that socket owns the lane's reassembly state. Feedback does need one: an ACK for lane i arrives on whichever receive socket the kernel picks, which is usually not lane i's owner. The receiving worker validates the datagram, looks up the owner, and pushes the ACK into that worker's single-producer single-consumer queue; the owner drains the queue on its next loop iteration. Lane state is never shared or locked. Reuseport steering with BPF is a later optimization that can only shorten this path, not change it.
 
 There is no encryption or per-packet cryptographic authentication pass. The implementation should not introduce transformation buffers or worker handoffs that exist only to support such a stage. Preserve ordinary UDP checksums and use hardware/kernel checksum support.
 
@@ -302,6 +315,8 @@ A proposed development milestone is at least 4 Gbit/s of clean-path inner goodpu
 
 Freeze a repeatable acceptance profile before declaring the performance requirements met. It must name the endpoint hardware and core budget, inner MTU, frame mix, flow count, traffic direction, attachment topology, loss profile, and contemporaneous direct-underlay capacity.
 
+Functional tests need only what any Linux host or container can provide: a kernel at or above the supported minimum, `/dev/net/tun`, and `CAP_NET_ADMIN` in the test's network namespace. There is no reference environment; tests must create every interface, namespace, and route they use and remove them afterwards, so they run the same on any contributor's machine.
+
 ## 14.1 Functional gates
 
 - **V01 Transport invariants:** capture outside the sending host's offload boundary and verify IPv6 UDP only, packet sizes within the limit, no Fragment headers, all destinations at fixed receive ports, and no protocol transmission from a fixed receive port.
@@ -356,13 +371,16 @@ Maintain a clear distinction between a throughput experiment and an interoperabl
 | - | - |
 | Numeric competitive margin | Define before acceptance; evaluate 1.5-fold as a proposal |
 | Scope of the above-3-Gbit/s target | Freeze flow count, direction, topology, CPU model, and loss profile |
-| Maximum inner MTU and tag depth | Require at least 1500; evaluate 2400, 9000, and at least two VLAN tags |
+| Maximum inner MTU and tag depth | Fixed: MTU 9000 with two VLAN tags, 9022-byte frame ceiling (section 3) |
 | Controller implementation | Evaluate BBRv3 and its aggregate-lane integration |
 | Retry and frame deadlines | Select from loaded-path measurements |
 | Reordering policy | Bounded per-flow policy with a non-IP fallback |
-| Restart and abandonment protocol | Specify exact transitions and stale-state handling |
-| Final wire layout | Candidate 40-byte common header; ACK and control encodings open |
+| Restart protocol | Frozen in section 5 as v0 |
+| Abandonment protocol | FRAME_ABANDON semantics and receiver acceptance point open until stage 3 |
+| Final wire layout | 40-byte common header, record prefix, DATA, HELLO, and HELLO_ACK frozen as v0; ACK, PROBE, and FRAME_ABANDON bodies open |
 | Worker and lane counts | Start small; determine from queue and CPU measurements |
+| Feedback routing | Decided: per-worker SPSC queues to the lane owner (section 10) |
+| Library API | Decided: library owns worker threads, blocking run plus control handle (section 3) |
 | DNS refresh and address migration | Explicit policy with stable active-path behavior |
 | Inner offload representation | Experimental, negotiated extension |
 | ECN and DSCP policy | Define before enabling outer ECN capability |
