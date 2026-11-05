@@ -2,7 +2,7 @@
 name = "unquic"
 version = "0.1.0"
 edition = "2024"
-publish = ["menhera-cooldown"]
+rust-version = "1.89"
 
 [dependencies]
 libc = "0.2.191"
