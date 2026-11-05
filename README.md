@@ -5,6 +5,7 @@
 - Development language: pure Rust.
 - Dependencies: none except `libc`. Everything else (UUID types, congestion control) is written in-tree. Write C-like Rust, optimized for performance.
 - Dependencies exceptions: feature-gate all the other deps: `dns` pulls `iphost v0.4.4` - otherwise the endpoints are configured manually. `uuid-compat` pulls in `uuid` crate, and the conversions from/into the in-tree UUID types. `bin` pulls in `serde` and `toml`, and enables `dns`. Obtain random bytes through Linux's `getrandom(2)` via `libc::getrandom()`, without an additional crate. The `unquic gen-uuid` subcommand generates session cookies; the daemon never generates a session cookie at runtime.
+- Protocol baseline: explicit initiator/responder roles, random connection receive tags from `libc::getrandom()`, bounded selective repair, and one in-tree BBRv3 controller per direction and path group. No wall-clock epochs or persistent restart counters.
 - Crate shape: library only. The daemon binary exists only when the `bin` feature is enabled.
 - Use `libc` for syscalls and socket options where appropriate; use `const fn` wherever a function can be one.
 - No async runtime: plain pinned threads with batched syscalls. `tokio` gives one syscall per packet, no GSO/GRO, cross-core task migration, and 1 ms timers, all wrong for a few always-busy sockets. See section 10 of the design.

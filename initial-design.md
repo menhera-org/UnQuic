@@ -41,7 +41,7 @@ The requirement identifiers below describe commitments established for this proj
 
 ## 2.1 Transport and addressing
 
-- **R01 Ethernet service.** Expose Linux TAP interfaces and preserve Ethernet service across the underlay. Support a configurable inner MTU of at least 1500. Larger values must be carried by transport segmentation without outer IP fragmentation; the maximum remains to be selected.
+- **R01 Ethernet service.** Expose Linux TAP interfaces and preserve Ethernet service across the underlay. Support a configurable inner MTU of at least 1500. Larger values must be carried by transport segmentation without outer IP fragmentation; the maximum is 9000 with up to two VLAN tags (9022 frame bytes).
 
 - **R02 Outer transport.** Send UDP over IPv6 only. Every emitted outer IPv6 packet must fit the applicable path MTU and must not contain an IPv6 Fragment header.
 
@@ -87,7 +87,7 @@ An inner frame is the Ethernet frame presented by TAP, excluding FCS and excludi
 
 This is a custom UDP transport inspired by QUIC's packet acknowledgment, loss detection, and pacing mechanisms. It does not claim QUIC wire compatibility or reuse QUIC stream semantics.
 
-The minimum supported kernel remains open. The maximum inner frame is fixed at 9022 bytes: MTU 9000 plus a 14-byte Ethernet header plus two VLAN tags, excluding FCS and TAP metadata. Buffer pools, reassembly slots, and TAP reads are sized from this constant; lowering it later is free.
+The initial minimum kernel target is Linux 5.0, with offload fallbacks; qualify it with live-kernel tests before declaring release support. The maximum inner frame is fixed at 9022 bytes: MTU 9000 plus a 14-byte Ethernet header plus two VLAN tags, excluding FCS and TAP metadata. Buffer pools, reassembly slots, and TAP reads are sized from this constant; lowering it later is free.
 
 **Library shape:** the library owns its pinned worker threads. It exposes a blocking run function that takes parsed configuration and returns on shutdown, and a control handle for counters, carrier state, and configuration reload. The daemon is the only known caller and is a thin wrapper over this API.
 
@@ -114,64 +114,100 @@ Resolve FQDNs to IPv6 addresses outside the packet-processing loop. Select and v
 
 # 5 Session cookie and lifecycle
 
-Carry the session UUID as 16 binary bytes in every protocol datagram, including feedback and control. All lanes for the session use the same configured cookie. Reject duplicate local session-cookie configurations and reject unknown cookies before allocating per-packet state or sending a response.
+Carry the configured session UUID as 16 binary bytes in every datagram. Reject duplicate local cookies and unknown cookies before allocating packet state or replying. The `unquic gen-uuid` subcommand generates UUIDv4 cookies using `libc::getrandom()` with flags zero; handle interruptions and short reads, and fail rather than substitute weaker randomness. Provision the cookie out of band and use a public session label in diagnostics. The daemon never generates or replaces the configured session cookie. [S6]
 
-**Proposed generation rule:** require UUIDv4 generated from a cryptographically secure random source. The `unquic gen-uuid` subcommand obtains random bytes through `libc::getrandom()` with flags set to zero, handling interrupted calls and short reads and reporting other failures without a weaker fallback. The daemon never generates a session cookie at runtime. UUIDv4 has 122 random bits in a 128-bit field; arbitrary UUID versions do not provide the same unpredictability. Provision the cookie out of band and use a public session label for logs and metrics. The full cookie must not appear in routine diagnostics. [S6]
+The cookie is a bearer value, without confidentiality or cryptographic payload integrity. An observer who learns it can forge data and feedback. The following handshake prevents accidental stale-state adoption; it does not change that accepted security boundary. [S7]
 
-The cookie checks possession of a shared bearer value. It provides neither confidentiality nor cryptographic payload integrity. An observer who learns it can forge traffic or feedback. This is the deliberately accepted deployment boundary, analogous to the blind-injection protection of an L2TPv3 cookie. [S7]
+## 5.1 Connection identity and roles
 
-**Proposed restart handling:** preserve the configured session UUID while establishing a fresh sender epoch on restart. Packet numbers and frame IDs are 64-bit and cannot be exhausted in practice, so an epoch changes only when the process restarts. Take the epoch from the wall clock at startup so it is monotonic across restarts without persistent state; a peer accepts a new epoch only through a HELLO exchange and only if it is greater than the one currently active. Scope packet numbers by session, sender epoch, and lane. Scope frame IDs by session and sender epoch. A restart exchange must establish the active generation before accepting new DATA; an arbitrary delayed packet with a different epoch must not reset an established session.
+Each session configures `role = "initiator"` at one endpoint and `role = "responder"` at the other. The roles control establishment only; Ethernet traffic is bidirectional. Reject missing or invalid local roles. Two initiators or two responders cannot establish; report a role mismatch when observable, without changing TAP readiness.
 
-Use a small lifecycle: configured, establishing, active, degraded, and inactive. HELLO messages advertise compatible protocol features, MTU limits, and the configured fixed receive endpoint. They do not exchange cryptographic keys. Reject incompatible mandatory features explicitly.
+Use independent, nonzero 128-bit random receive tags, I chosen by the initiator and R by the responder. Reject R equal to I. Established initiator-to-responder packets carry R; responder-to-initiator packets carry I. A connection is the confirmed pair (I, R), scoped by the configured cookie. Tags have no order and are never derived from a clock or persisted. A new connection resets packet/frame accounting only after confirmation. Data and feedback must match the current local receive tag and validated peer address/binding scope; they never establish or replace a connection. Different tags in each direction also reject reflected packets.
 
-**Frozen handshake (v0).** Each side keeps its own epoch (from the common header of everything it sends) and the peer's active epoch. The lifecycle is symmetric:
+Generate tags with `libc::getrandom()` using `GRND_NONBLOCK`, handling short reads and interruptions. If entropy is not ready, retry establishment later; report other errors and keep carrier down without a weak fallback. Randomness is needed only for establishment, not per packet. TAP creation/readiness proceeds independently. All durations below use monotonic time; no wall-clock value goes on the wire.
 
-- *Establishing:* send HELLO once per second from any lane until a HELLO_ACK naming the local epoch arrives. A side is *active* once its own epoch is acknowledged and a peer epoch is known.
-- *On HELLO received:* if its epoch is greater than the known peer epoch, adopt it, discard all per-peer packet, frame, and ACK state, and reply HELLO_ACK. If equal, reply HELLO_ACK again. If smaller, drop it silently.
-- *On DATA, ACK, PROBE, or FRAME_ABANDON received:* drop unless the header epoch equals the known peer epoch.
-- *Degraded:* no feedback of any kind for 3 seconds while active. Keep sending data and resume periodic HELLO. Return to active on any valid feedback; drop to *inactive* after 30 seconds and lower TAP carrier.
+## 5.2 Four-message handshake (wire version 1)
 
-HELLO record body, after the 4-byte record header: fixed receive port (2 bytes), maximum inner frame size (2 bytes), mandatory feature bits (4 bytes), optional feature bits (4 bytes); 12 bytes. All feature bits are zero in v0; any set mandatory bit the receiver does not understand is a hard reject. HELLO_ACK carries the same 12 bytes echoing the receiver's own values, followed by the acknowledged peer epoch (8 bytes); 20 bytes.
+Handshake packets contain exactly one handshake record, a zero receive tag, lane zero, and packet number zero. They are not packet-ACKed. Both endpoints send from dynamic ports to the configured fixed port. Validate the cookie, version, record, configured peer address and binding scope before handling it. The advertised fixed port must match configuration; a packet cannot redirect replies to an arbitrary endpoint.
 
-After a lane failure, retire its packet state and establish a replacement lane without changing the session identity. Keep the TAP device through peer reconnection; use carrier state to reflect session availability with suitable hysteresis.
+1. The initiator creates fresh I and sends HELLO(I, initiator parameters).
+2. The responder records a pending candidate, creates fresh R, and sends CHALLENGE(I, R, responder parameters). It preserves any active connection.
+3. The initiator accepts CHALLENGE only for its pending I, fixes R and the peer parameters, and sends CONFIRM(I, R). A different R or changed parameters for that attempt is ignored.
+4. The responder accepts CONFIRM only for its exact pending pair, installs that connection, and sends READY(I, R). The initiator installs it only on READY matching its exact pending pair. DATA arriving before local installation is dropped and can be repaired normally after establishment.
 
-# 6 Proposed packet and record format
+Parameters are fixed receive port (2 bytes), maximum inner frame size (2), mandatory features (4), and optional features (4). All integers are big-endian. Mandatory feature bits are zero in v1; reject unsupported mandatory bits. Optional bits are zero on send and ignored if unknown. The negotiated frame ceiling is the smaller advertised size, which must be between 1514 and 9022 bytes. If the local configured MTU/tag depth requires frames exceeding that ceiling, reject the candidate, report the mismatch, and keep carrier down if no compatible connection is already active. This does not remove TAPs or retract daemon readiness.
 
-Use a versioned fixed common header followed by bounded records. Every on-wire UDP datagram is independently parseable and contains the cookie. Encoding uses explicit byte order and fixed-width integers; it must not serialize native Rust, C, or virtio structures directly.
+There is at most one active connection and one pending handshake per session. A pending attempt lasts 10 seconds without extension by duplicates. The initiator retransmits HELLO every second until it has a challenge, then CONFIRM every second until READY; after expiry it starts again with fresh I. For the same pending I and identical parameters, the responder resends its existing challenge, not a new R. While a candidate is pending, other HELLOs are ignored until it expires or commits. A changed HELLO body with the same I is invalid. Send the first reply for each new handshake phase immediately. Limit repeated replies and retransmissions of a phase to once per second, and cap all handshake traffic at four datagrams per second per session with a burst of four; suppress excess duplicates.
 
-The following header is frozen as wire version 0. Version 0 may still change before the protocol freeze in stage 6, but every change bumps the version byte so mismatched builds reject each other instead of misparsing. The magic is `0x5551` (ASCII `UQ`), all integers are big-endian, and no flag bits are defined: the Flags byte must be zero on send and is ignored on receive.
+Remember the active pair and its negotiated parameters. Duplicate CONFIRM for that pair resends READY without resetting packet, frame, or congestion state; duplicate READY is a no-op. HELLO for the active I can only repeat its existing challenge. A different HELLO can create a pending candidate but cannot clear active state. After a process restart, lost candidate state is never reconstructed from CONFIRM or READY: a new HELLO must obtain a fresh challenge. Thus an old HELLO plus old CONFIRM cannot install a connection after a restart. Delayed messages for an older pair cannot overwrite a later connection. Loss of READY is handled by repeated CONFIRM. Explicit roles make simultaneous startup and simultaneous restart follow this same exchange without election.
+
+A new connection commit discards the old connection's packet, frame, pending-write, and lane state through a worker barrier. Events and queued transmissions carry their connection tags and are rechecked before use; stale events cannot affect the replacement. Cancel outstanding grants, reconcile all successful sends, and report any remaining unacknowledged old transmissions as lost exactly once before releasing their congestion charges; replacing a connection must not manufacture free inflight credit. A commit must not reset counters under a retained tag. Re-exec without a versioned transport-state handover starts a fresh handshake even if TAP descriptors survive.
+
+## 5.3 Liveness, path changes, and lanes
+
+States are configured, establishing, active, degraded, and inactive. TAP existence determines daemon readiness independently of these states. A confirmed connection becomes active and raises carrier. On an idle connection, send an ACK-eliciting PROBE once per second in each direction. Only an ACK newly covering an outstanding ACK-eliciting packet, or the first matching PROBE_REPLY for an unanswered probe, demonstrates feedback for that direction; repeated old packets do not refresh it. After 3 seconds without such feedback, enter degraded, keep congestion-limited traffic and probes running, and let the initiator start a replacement handshake. After 30 seconds, enter inactive and lower carrier; discard the active connection using the same worker barrier and congestion-accounting settlement as replacement. The initiator continues attempts; a responder waits for HELLO. Valid fresh feedback can restore a degraded connection before replacement or inactivity.
+
+Resolve addresses outside workers. Keep the active address stable while it works; a DNS failure keeps it. For a changed address, allow one candidate address alongside the active address and require a new handshake before using it for data. The initiator attempts the candidate; a responder accepts HELLO only from an explicitly configured/resolved candidate. Retire the old address on commit. Do not learn a new destination from an arbitrary packet. Reset path measurements for an address or binding change; a session-only reconnect on an unchanged path must not grant an independent congestion budget.
+
+Lane IDs are 16-bit, nonzero, allocated monotonically per sending direction within a connection, with at most 64 active lanes. Zero is reserved for handshake packets. Never reuse an ID or reset its packet counter within that connection. Start a new handshake before exhausting IDs. Each lane uses one fixed source-address/source-port/destination/binding tuple. A tuple change retires the lane; it is not an implicit migration. Freeze receive reuseport membership while connections are active; changing worker/socket membership requires fresh connections, while keeping TAPs.
+
+On lane retirement, stop sending on it and abandon all its outstanding frames. Retain compact transmit accounting for late ACKs or loss declaration until its congestion charges are settled; retirement does not release inflight credit by itself. Never repair an old frame on a replacement lane. The replacement gets a new lane ID and only new frames. Send LANE_RETIRE naming the old lane through a surviving or replacement lane, with bounded control retries. Reject a retirement record naming its own carrying lane. The receiver marks that lane retired, drops its reassembly and pending TAP writes, and rejects later packets for it. Retired lane bits remain until the connection ends (8192 bytes cover the entire ID space). A lost retirement message cannot cause cross-lane duplicates: old frames are never resent elsewhere, and their own windows and deadlines still apply. If retirement cannot free receiver lane capacity, reconnect rather than reuse an ID.
+
+# 6 Packet and record format
+
+The initial implementation uses wire version 1, replacing the unimplemented epoch-based version 0. Any incompatible future format change increments the version. Do not accept version 0. All integers are big-endian; encode explicitly rather than serializing native structures. Unknown versions, nonzero reserved flags, unknown record types, and malformed lengths are rejected without changing state.
 
 | Field | Bytes | Purpose |
 | - | -: | - |
-| Magic | 2 | Basic protocol recognition |
-| Version | 1 | Wire-format version |
-| Flags | 1 | Packet properties |
-| Session cookie | 16 | Session lookup and admission |
-| Sender epoch | 8 | Restart generation |
-| Transmit lane ID | 2 | Packet-accounting lane |
-| Record area length | 2 | Bounds checking |
-| Packet number | 8 | Unique transmission identity |
-| Total | 40 | Common header |
+| Magic | 2 | `0x5551` (ASCII `UQ`) |
+| Version | 1 | `1` |
+| Flags | 1 | Zero |
+| Session cookie | 16 | Configured admission cookie |
+| Receive tag | 16 | Destination's confirmed tag; zero for handshake |
+| Transmit lane ID | 2 | Sender's lane; zero for handshake |
+| Record area length | 2 | Exact bytes following the common header |
+| Packet number | 8 | Per-lane transmission number; zero for handshake |
+| Total | 48 | Common header |
 
-Every record starts with the same 4-byte prefix: type (1 byte), record flags (1 byte, zero in v0), and record length including the prefix (2 bytes). The v0 DATA record follows it with an 8-byte frame ID, a 4-byte total frame length, a 4-byte byte offset, and the piece's bytes. This costs 20 bytes before frame data. Frame IDs must be unique within a sender epoch; workers can allocate disjoint ID ranges to avoid a shared counter on every frame.
+Every record starts with type (1 byte), flags (1, zero), and record length including this prefix (2). The record area must exactly fill the UDP payload after the header, contain at least one record, and have at most 64 records. Validate the entire datagram before dispatch or state changes; a bad trailing record cannot leave a partially applied packet.
 
-With no IPv6 extension headers, the UDP payload budget is `1500 - 40 - 8 = 1452` bytes. Under the candidate format, a datagram carrying one DATA record can hold `1452 - 40 - 20 = 1392` frame bytes. Additional records consume additional record headers. Wire-efficiency calculations must use the final layout rather than earlier illustrative header sizes.
+The fixed v1 record bodies are below. Sizes exclude the 4-byte record prefix.
 
-Record types in v0 are DATA (1), ACK (2), HELLO (3), HELLO_ACK (4), PROBE (5), PROBE_REPLY (6), FRAME_ABANDON (7), and PADDING (0). ACKs name the acknowledged sender epoch and lane and carry bounded packet ranges and feedback delay. The HELLO and HELLO_ACK layouts are frozen in section 5; the ACK, PROBE, and FRAME_ABANDON layouts and ACK range limits are stage 3 decisions.
+| Type | Name | Body |
+| - | - | - |
+| 0 | PADDING | Zero bytes, any body length; no effect |
+| 1 | DATA | Frame ID (8), total frame length (4), byte offset (4), nonempty piece bytes |
+| 2 | ACK | Acknowledged lane (2), range count (1), reserved zero (1), ACK delay in microseconds (4), then inclusive packet-number pairs (8-byte start, 8-byte end) |
+| 3 | HELLO | I (16), initiator parameters (12); 28 bytes |
+| 4 | CHALLENGE | I (16), R (16), responder parameters (12); 44 bytes |
+| 5 | PROBE | Empty body; packet number identifies the probe |
+| 6 | PROBE_REPLY | Probed lane (2), reserved zero (2), probed packet number (8), received UDP payload length (2), reserved zero (2); 16 bytes |
+| 7 | FRAME_ABANDON | Frame's lane (2), origin (1), reason (1), frame ID (8); 12 bytes |
+| 8 | CONFIRM | I (16), R (16); 32 bytes |
+| 9 | READY | I (16), R (16); 32 bytes |
+| 10 | LANE_RETIRE | Retired sender lane (2), reserved zero (2); 4 bytes |
 
-Every physical transmission gets a new packet number. A repair retains the original frame ID and byte offsets but uses a new transmission number. The receiver deduplicates both transmissions and frame content; a late original packet and a successful repair must never inject the frame twice.
+Established packets may mix records except handshake records, which are always isolated. DATA's frame ID is `(lane_id << 48) | frame_sequence`; the low 48 bits start at 1 and increase for each new frame on that lane. Its high bits must match the datagram's lane. Frame sequences never wrap or reset under that connection tag; retire the lane before exhaustion. A frame's total length is 14 through the negotiated frame ceiling. Offsets and lengths must fit that total without integer overflow. Reject inconsistent totals and conflicting overlaps for an incomplete frame. Identical overlaps are duplicates. Every repair preserves the frame ID and offsets.
 
-Validate complete record boundaries, lengths, offsets, supported flags, and size limits before changing protocol state. Reject inconsistent total lengths and conflicting overlaps. Bound ACK processing to ranges that could correspond to packets actually sent. Pure ACK packets must not trigger ACK-of-ACK loops.
+Every established physical transmission, including control and ACK-only packets, gets a new packet number starting at 1 on its lane. Retries use new numbers. Never reuse a number after a failed or partially successful batched send; track which allocated numbers actually reached a successful send syscall. Records refer only to the current connection; neither an ACK nor an abandonment record can reach a retired connection through an old tag.
 
-An ACK acknowledges transport reception, not successful consumption by the bridge, OVS, or an application. Define the exact receiver acceptance point and FRAME_ABANDON behavior before freezing the protocol so memory-pressure drops cannot be mistaken for reliable frame delivery.
+ACK ranges have a count from 1 to 32 and are strictly descending, disjoint, nonadjacent, inclusive ranges with nonzero endpoints. The delay applies to the highest acknowledged packet, measured from reception to ACK construction and capped at 1000 microseconds. Reject future numbers and known unsent holes; ignore portions older than bounded sender history. Process ranges against retained sent entries, never by iterating an attacker-supplied integer span. Account each physical transmission at most once, even if several ACKs or repairs cover it.
+
+A datagram containing DATA, PROBE, FRAME_ABANDON, or LANE_RETIRE elicits an ACK. ACK, PROBE_REPLY, and PADDING alone do not. Schedule feedback after 16 accepted ACK-eliciting packets on a lane or after 1 ms, whichever comes first; a newly detected gap schedules it immediately. Emit at most the newest 32 ranges from the receive window. Duplicate ACK-eliciting packets may trigger repeated feedback, limited to once per millisecond per lane. Missing older ranges can cause a bounded repair, never unbounded ACK history. ACKs may travel through any local transmit lane and name the original sender's lane explicitly.
+
+A PROBE_REPLY echoes the received probe's lane, packet number and actual UDP payload length. Accept it only against a live matching sent-probe entry; do not treat its claims as an ACK for arbitrary data. It validates liveness/size but packet-ACK accounting still occurs through ACK. A PMTU probe contains PROBE plus PADDING and no DATA. Probe records and replies do not create ping-pong loops.
+
+FRAME_ABANDON origin 0 means the frame sender stopped sending; origin 1 means the receiver discarded the frame. Reasons are deadline (1), resource limit (2), lane retirement (3), or TAP failure (4). Its frame ID must name its body lane. Origin 0 must travel on that same sender lane; if the lane has failed, use LANE_RETIRE instead. Origin 1 may travel through any local lane. Route origin 0 to the remote lane's reassembly owner and origin 1 to the local lane's transmit owner. A frame already written to TAP is never undone. Retire pending state and stop repairs. For origin 0, mark the frame sequence terminal even if its first piece has not arrived, advancing the receive frame window if necessary without allocating payload storage. This prevents reordered data from recreating a cancelled frame. For origin 1, unknown or already retired transmit frames are a no-op. Duplicates and sequences below the window floor never reopen state. Control retries use at most two retransmissions and a 100 ms lifetime. Abandonment is advisory: loss of this record does not prevent local expiry or release of buffers.
+
+With a 1500-byte outer IP ceiling and no extension headers, the UDP payload ceiling is `1500 - 40 - 8 = 1452`. One DATA record holds `1452 - 48 - 20 = 1384` frame bytes. A 1514-byte Ethernet frame splits into 1384 and 130 bytes before packing. At the 1280-byte IPv6 baseline, the equivalent frame-piece ceiling is 1164 bytes.
 
 # 7 Packing and segmentation
 
-The transport must segment inner frames itself. Linux must never silently perform outer IPv6 fragmentation. Set `IPV6_DONTFRAG` on every transmit socket, handle `EMSGSIZE` and validated Packet Too Big feedback, and retain a per-path payload limit. Treat 1500 as the configured ceiling; a smaller effective path must cause smaller datagrams or a clear path failure. DPLPMTUD is the proposed robustness mechanism. [S8]
+The transport must segment inner frames itself. Linux must never silently perform outer IPv6 fragmentation. Set `IPV6_DONTFRAG` on every transmit socket, handle `EMSGSIZE` and validated Packet Too Big feedback, and retain a per-path payload limit. Treat 1500 as the configured ceiling. Start each lane at the IPv6 1280-byte baseline (1232-byte UDP payload) and use RFC 8899 DPLPMTUD to validate larger sizes up to 1500. Keep per-lane state because source-port paths can differ; ACK of ordinary traffic alone cannot validate an unsent larger size. Only a matching padded PROBE_REPLY confirms its size. A validated smaller limit reduces segmentation immediately; an unusable path below the baseline fails clearly. Probe loss never licenses fragmentation. [S8]
 
 Allow one datagram to contain several records, including a frame tail followed by a piece of another frame. Each record contains enough information to recover its frame independently. No frame boundary may depend on successfully parsing a preceding datagram.
 
-For a 1500-byte inner IP packet, the ordinary Ethernet frame is 1514 bytes. With the candidate record layout, sending it alone produces pieces of 1392 and 122 bytes. Packing the short tail with already queued data reduces packet count. The same approach applies to larger inner MTUs.
+For a 1500-byte inner IP packet, the ordinary Ethernet frame is 1514 bytes. With the v1 record layout, sending it alone produces pieces of 1384 and 130 bytes. Packing the short tail with already queued data reduces packet count. The same approach applies to larger inner MTUs.
 
 Packing should use data already available to the worker. Flush promptly when the queue empties; do not wait indefinitely for enough traffic to fill a datagram. Balance batch size against pacing burst size and latency.
 
@@ -181,43 +217,55 @@ A missing datagram may contain pieces of several frames. Recover its still-neede
 
 # 8 Loss recovery and ordering
 
-**Proposed baseline:** selective retransmission with bounded persistence. Keep transmitted payload buffers briefly; ACK ranges identify received transmissions, and packet/time thresholds identify likely loss while allowing reordering. Repair missing frame ranges rather than retransmitting an entire oversized frame. This follows the independently receivable and repairable message-piece model described in RFC 8085. [S1]
+Use selective repair of missing byte ranges with bounded persistence. Keep original payloads until every range is acknowledged, abandoned, or expired; an ACK means transport acceptance, not successful TAP or application delivery. Repairs retain frame identity but get new packet numbers. At most two repair transmissions may cover any byte range, and do not repair while another known outstanding copy already covers it. Whole-frame delivery is best effort; unrelated frames never wait for it. [S1]
 
-Use RTT and variance estimators, a bounded feedback delay, and a tail-loss probe mechanism. QUIC loss detection is a reference for these mechanisms, not a requirement to implement QUIC or its cryptography. A probe timeout must not automatically declare every outstanding packet lost. [S9]
+## 8.1 Acceptance, delivery, and pressure
 
-Frames expire by deadline and resource limits. Stop repairing expired or already delivered frames. Carry abandonment information when needed to release receiver state. Keep recent completion and expiry information long enough to prevent delayed pieces from recreating retired frames.
+After full wire validation, reserve all storage needed by a datagram before applying any of it. For new nonterminal DATA, ACK eligibility starts only after its bytes are retained by the reassembly owner. A full handoff queue, unavailable reassembly slot, or failed payload reservation drops the whole datagram without ACKing or marking its packet number received. Do not evict an unrelated accepted frame just to accept the new packet. This makes receiver overload visible as loss to the sender's congestion controller.
 
-No frame may wait behind an unrelated incomplete frame merely because its global sequence number is later. For an inner flow undergoing repair, a short bounded reorder window can prevent later packets from provoking premature inner TCP loss recovery. This trades latency for loss concealment and must be evaluated. [S10]
+DATA for a frame already delivered, abandoned, expired, or below the frame window is terminal: discard it without allocating or writing to TAP again. Such duplicates can be packet-ACKed; when the frame was discarded rather than delivered, schedule a bounded FRAME_ABANDON if still useful. Packet ACKs never promise reliable frame delivery. A receiver may later abandon previously ACKed pieces at the frame deadline or on a TAP error and reports this when possible; it never retracts packet ACKs.
 
-Proposed first mapping: keep an inner flow on one transmit lane and keep all pieces of a frame under one reassembly owner. Define an Ethernet-based fallback for traffic whose IP or transport headers cannot be parsed. Flow keys must include relevant VLAN context and must handle inner fragmentation consistently.
+A complete frame enters a bounded TAP-write queue once. While queued it remains ineligible for a second enqueue. A successful full-frame write marks it delivered; `EAGAIN` retains that same entry until writable or expired. Other write failures, including an unexpected short write, discard it and mark it terminal; never retry a partial frame as another Ethernet frame. Expiry or abandonment of an incomplete/queued frame also marks it terminal before releasing buffers.
 
-This mapping may limit a single inner flow to one worker. If single-flow throughput requires striping, evaluate distributing complete frames across lanes with a separate bounded per-flow reorder mechanism. Do not introduce cross-worker assembly of every frame by default.
+## 8.2 Bounded duplicate history
 
-Retry count, frame deadline, reorder limits, and receiver abandonment semantics remain open. Compare bounded one-retry and two-retry profiles using measured loss traces and loaded RTT. FEC is a later experiment: it may reduce repair delay, but all redundant bytes consume bandwidth and congestion budget.
+Each active receive lane has a 65536-packet sliding window and a separate 65536-frame-sequence window. Each window has a monotonically increasing lower acceptance bound. Advance it when a validated, admitted higher number would exceed the window; numbers below the lower bound are permanently old until this connection ends. Discard incomplete or queued frames displaced by the frame bound and report abandonment when possible. Keep terminal bits for delivered/expired/abandoned frames inside the window. Old packets are never made new by a timer expiring or a ring slot being reused. A delayed repair with a new packet number still fails its old frame's terminal/window check.
+
+Do not deduplicate using only a time-limited completion cache. Window advancement may discard unusually reordered traffic; this is bounded loss, never duplicate Ethernet delivery. Only the owning worker changes these windows. Retired-lane bits reject the whole lane before frame lookup, so its windows can be freed safely. For still-active lanes, preserve the lower bounds even through long idle periods.
+
+Initial resource limits are 8192 retained transmit frames and 8192 receive frames (incomplete plus queued complete) per session, with 64 MiB of payload storage per direction and at most 64 active lanes per direction. The daemon's default total transport-memory ceiling is 256 MiB, including metadata, histories, and queues; caller-provided ceilings may raise or lower it. Refuse reservations beyond either limit. The sender also keeps at most 65536 sent-packet entries per lane; if advancing would overwrite an unresolved entry, apply backpressure rather than forget its inflight charge. On startup validate fixed allocations against the ceiling. Unknown cookies allocate nothing; pending handshakes, lane tables and worker queues are bounded separately. These are initial implementation limits, not performance claims.
+
+## 8.3 Timers and initial ordering policy
+
+Use RFC 9002 sections 5 and 6 for RTT estimation, per-lane packet/time loss detection, and probe timeouts, with these transport parameters: initial RTT 333 ms, maximum ACK delay 1 ms, timer granularity 1 ms for loss detection, packet threshold 3, and time threshold 9/8. Pacing has its own finer schedule. ACK delay cannot reduce a sample below observed minimum RTT. Apply packet thresholds only within one lane, never across unrelated packet-number spaces. [S9]
+
+At frame admission, set its sender deadline to `now + clamp(4 * smoothed_rtt, 20 ms, 100 ms)`. The receiver deadline is 100 ms after the first retained piece and is not extended by repairs or duplicates. The two-repair limit and the deadline both apply. Deliver completed frames immediately in v1; do not add a per-flow reorder queue before measurements justify one. Pin each inner flow to a lane, with a fallback key of MAC addresses, VLAN stack, and EtherType for non-IP or unparseable traffic. Fragmented IP traffic uses a consistent address/protocol key without transport ports for all fragments. A lane change sends only new frames.
+
+An individual PTO sends at most two probe datagrams per path group, with exponential backoff; one PTO does not declare all outstanding traffic lost. Retiring a frame does not erase the congestion charge for its outstanding packets. Free payloads at their deadlines but retain packet accounting until ACK or loss. If feedback is absent for three consecutive PTO periods, treat remaining outstanding transmissions as lost once and tell BBR; continue only backed-off probes until feedback resumes. Reset the PTO backoff on newly acknowledged ACK-eliciting traffic. The aggregate controller, not each lane independently, grants probe allowance. These at-most-two probes may exceed the congestion window when it is full, as in RFC 9002, but are still charged to inflight bytes and paced; no other packet bypasses the window this way.
+
+LANE_RETIRE and FRAME_ABANDON retries consume ordinary transmission credit and stop at their own limits. Neither controls the correctness of local duplicate suppression. FEC and intentional per-flow reordering remain later measured experiments.
 
 # 9 Congestion control and pacing
 
-Congestion control is a required production behavior. Support arbitrary Ethernet traffic and account for the extra traffic created by repair. Do not rely solely on inner TCP to control the tunnel.
+Implement BBRv3 directly in-tree for the first production controller, pinned to draft-ietf-ccwg-bbr-07. Use that revision's state machine, estimator updates, gains and loss responses; do not substitute a simpler loss controller or silently follow a newer draft. The reference remains experimental, so performance and coexistence still require measurement. [S11]
 
-**Proposed controller candidate:** BBRv3, as an in-tree implementation of its delivery-rate and inflight model; the library core allows no crate beyond `libc`, so an external controller cannot be reused. Because that is a large piece of work, stage 3 may start with a simpler in-tree loss-and-delay controller and replace it once BBRv3 is validated. BBRv3 remains an experimental specification. Selection depends on throughput, coexistence, queueing delay, and CPU results; the algorithm is not yet a confirmed requirement. [S11]
+Use one controller owner per sending direction and path group, shared by every session and lane in that group. A peer names its configured path group; default to one group per binding scope so adding peers or ports does not multiply the access-link budget. Separate groups require explicit configuration for separate bottlenecks. Lane/session replacement within an unchanged group does not reset or duplicate its controller. Address/binding changes discard stale path measurements through that owner.
 
-Maintain one congestion budget per sending direction and path group. Several source ports to the same peer are not independent entitlements to bandwidth. Share pacing and inflight limits across those lanes while retaining per-lane measurements. RFC 8085 explicitly discusses aggregate control across multiple sockets. [S1]
+Charge outer IP bytes, including IPv6 and UDP headers, for each successful physical transmission of data, repair, probes, abandonment, and lane retirement. Set the controller's maximum segment size from the effective outer IP ceiling and its initial window to ten such datagrams. Use BBRv3's UDP/QUIC-style offload budget and its delivery-rate sampling rules, with shared delivered-byte counters and per-transmission send metadata. ACK duplicate suppression must precede sampling. A repair and its late original are distinct delivered transmissions for bandwidth accounting, while their frame bytes are delivered only once. Keep application-limited and host-queue-limited observations distinguishable. [S11]
 
-Count new data, retransmissions, FEC, and relevant probes in the offered-load budget. Keep ACK-only feedback promptly deliverable and separately bounded so waiting for data-window credit cannot deadlock feedback. Piggyback ACKs where useful without requiring reverse application traffic.
+The controller owner serializes send/ACK/loss reports from lane owners and issues byte grants covering both pacing and inflight limits. Reserve inflight credit before granting it. Grants expire for future sends after 100 microseconds, but reserved credit is not reusable until the worker reports sent and unused bytes; expiry alone must not double-spend it. Failed/partially successful `sendmmsg` submissions return only unsent credit, and each successful GSO segment is a separate transmission. Bounded report queues must retain accounting events: a full queue stops further grants/sends until reports drain, rather than dropping inflight updates.
 
-Workers should receive short-lived byte budgets or scheduled send opportunities; avoid a shared controller lock for every packet. Record send timing close enough to actual transmission that application queues and GSO bursts do not corrupt delivery-rate estimates. Handle application-limited samples and lost feedback.
+Initially pace in userspace using monotonic deadlines and `timerfd`, without requiring an `fq` qdisc or host networking changes. Workers send only with current grants. Cap the combined outstanding burst allowance at the smaller of BBR's send quantum and 16 maximum-size datagrams, spread across workers; GSO aggregates obey that limit too. Timestamp at successful nonblocking socket submission and bound queued socket work. This is a testable baseline; kernel pacing remains a measured optimization. [S11]
 
-Use bounded transmit queues with age limits. Drop whole unsent frames before segmentation where possible. Reserve sufficient service for control traffic and avoid letting bulk repair starve fresh traffic.
+ACK-only and PROBE_REPLY traffic can proceed without data-window credit to avoid feedback deadlock, but share a separate 4 MiB/s ceiling per path group with a 16-datagram burst. Coalesce pending ACKs and discard stale feedback when bounded queues fill; do not invent delivery progress. Handshake messages use the per-session one-per-second retry/reply limits and this same control ceiling. This is a ceiling, not a fixed send rate. All these bytes remain visible in counters. Worker/controller scheduling must give bounded service to feedback, fresh frames, and repairs; sender queue expiry drops whole unsent frames where possible.
 
-Do not assume that every loss is random or that every RTT increase is congestion. Measure receiver socket drops, queue delays, and CPU pressure alongside network feedback. An overloaded receiver also needs the sender to reduce its load.
-
-ECN behavior is an open design item. Do not mark outer packets ECN-capable until a defined feedback and congestion response is implemented. Preserve inner packet fields unless an explicit tunnel ECN policy requires changing them. Fixed-rate and controller-disabled modes may exist for isolated experiments, but are not substitutes for the required production controller.
+BBRv3 receives receiver-pressure losses as well as network losses; no static 5 Gbit/s pacing rate is inferred from deployment measurements. Keep outer ECN disabled and outer DSCP zero in v1, preserving inner fields. ECN needs an explicit wire feedback extension before enabling it. Controller-disabled modes are confined to isolated experiments and cannot pass production acceptance. The real-NGN throughput and latency profile, including random and burst loss and competing traffic, remains a release gate.
 
 # 10 Linux dataplane
 
 Create Ethernet TAP devices using `IFF_TAP`, `IFF_NO_PI`, and multiqueue support. Use `IFF_VNET_HDR` only with correctly implemented and negotiated checksum/GSO handling. Configure offloads explicitly and record their effective state. [S2]
 
-**No async runtime.** The dataplane is plain threads over `std` and `libc`, not `tokio` or another async runtime. The workload is a handful of always-busy sockets and one TAP fd, not many idle connections, so readiness notification and task scheduling are pure overhead. Tokio's UDP API issues one syscall per packet and has no `recvmmsg`, `sendmmsg`, UDP GSO, or UDP GRO support; using those means dropping to `AsyncFd` plus `libc`, leaving the runtime as nothing but an event loop. Its work-stealing scheduler moves tasks between cores and defeats the one-worker-owns-its-buffers model below, and its 1 ms timer granularity is too coarse for pacing at hundreds of thousands of packets per second. Tailscale's WireGuard work and quinn's UDP layer both ended up on raw batched sockets for the same reasons. [S18] Workers are pinned threads that block in `epoll_wait()` or batched receive calls; pacing uses `timerfd` or kernel pacing (`fq` qdisc with `SO_MAX_PACING_RATE` or `SO_TXTIME`), to be chosen by measurement.
+**No async runtime.** The dataplane is plain threads over `std` and `libc`, not `tokio` or another async runtime. The workload is a handful of always-busy sockets and one TAP fd, not many idle connections, so readiness notification and task scheduling are pure overhead. Tokio's UDP API issues one syscall per packet and has no `recvmmsg`, `sendmmsg`, UDP GSO, or UDP GRO support; using those means dropping to `AsyncFd` plus `libc`, leaving the runtime as nothing but an event loop. Its work-stealing scheduler moves tasks between cores and defeats the one-worker-owns-its-buffers model below, and its 1 ms timer granularity is too coarse for pacing at hundreds of thousands of packets per second. Tailscale's WireGuard work and quinn's UDP layer both ended up on raw batched sockets for the same reasons. [S18] Workers are pinned threads that wait in `epoll_wait()` on sockets, TAP queues, `eventfd`, and `timerfd`; receive calls are nonblocking and batched. Section 9 fixes userspace pacing as the baseline.
 
 The baseline fast path should use preallocated buffer pools, bounded descriptor rings, nonblocking I/O, `sendmmsg()`, `recvmmsg()`, UDP GSO, and UDP GRO where supported. Use fewer system calls and fewer full stack traversals per byte. GSO and GRO fallbacks must preserve correctness when an interface, driver, or binding scope cannot support them. [S12]
 
@@ -227,7 +275,9 @@ Keep frame buffers and reassembly slots owned by one worker. Retain references f
 
 Start with a small worker count and several stable transmit lanes. Measure NIC queue counters, reuseport distribution, softirq CPU, and cross-worker traffic. Optional reuseport steering can align session/lane ownership with receive workers, but must not route all traffic for a session to one core merely because the cookie is shared. [S3, S4]
 
-**Feedback routing (decided).** Each worker owns a set of transmit lanes and their packet-accounting state. Inbound data needs no handoff: a lane is one remote source port, so all its datagrams hash to the same reuseport socket, and the worker holding that socket owns the lane's reassembly state. Feedback does need one: an ACK for lane i arrives on whichever receive socket the kernel picks, which is usually not lane i's owner. The receiving worker validates the datagram, looks up the owner, and pushes the ACK into that worker's single-producer single-consumer queue; the owner drains the queue on its next loop iteration. Lane state is never shared or locked. Reuseport steering with BPF is a later optimization that can only shorten this path, not change it.
+**Worker ownership and routing (v1).** A worker owns each transmit lane's packet state and each receive lane's reassembly, frame windows, and TAP-write queue. Keep an explicit connection-tag/lane-to-owner table; reuseport hashing is a delivery optimization, not the source of protocol identity. First reception registers a remote lane with the session control owner before admitting its data; bound pending registration buffers and drop excess without ACK. Validate and bind its source tuple, and reject later tuple changes under the same lane ID. Check retirement before allocation. Established DATA normally remains on its registered receive worker. If a packet arrives elsewhere, forward the complete datagram to that owner rather than creating another reassembly table. ACK and origin-1 abandonment go to the named local transmit owner; origin-0 abandonment and retirement go to the remote receive owner. Validate all records before dispatch, and apply datagram acceptance on the receive owner.
+
+Use one bounded SPSC queue per ordered producer/consumer worker pair, initially 1024 entries each. The local-owner case needs no queue. Batch handoffs and signal the destination's nonblocking `eventfd` after publishing each batch; `EAGAIN` means a wakeup is already pending. The destination drains its eventfd and all incoming queues before sleeping, so enqueueing work cannot rely on unrelated socket traffic to wake it. A full DATA queue drops the datagram without ACK; a full ACK queue may drop feedback and let bounded recovery handle it. Control commits/retirements and congestion-accounting reports must be retried with backpressure, never silently dropped. Workers keep draining inbound queues while retrying; they must not block waiting for space in each other's queues. Tag every queued event with its connection identity and discard stale events after a commit barrier. Queue ownership remains single-producer even with four workers; no queue accepts writes from two producers.
 
 There is no encryption or per-packet cryptographic authentication pass. The implementation should not introduce transformation buffers or worker handoffs that exist only to support such a stage. Preserve ordinary UDP checksums and use hardware/kernel checksum support.
 
@@ -241,7 +291,7 @@ Preserve source/destination MAC addresses, EtherType or length fields, payload, 
 
 Support 802.1Q and 802.1ad tags, including stacked tags and PCP/DEI bits. The Linux TAP path can materialize a VLAN tag from skb metadata into the bytes returned to userspace; tests must exercise this path rather than assuming all tags were already in-line. [S14]
 
-Distinguish inner interface MTU, ordinary Ethernet-frame size, and an offloaded GSO object. MTU 2400 corresponds to 2414 bytes without VLAN tags and 2422 bytes with two tags, excluding FCS. Account separately for TAP metadata. Negotiate and enforce frame and aggregate limits; the maximum supported tag depth and inner MTU remain explicit design decisions.
+Distinguish inner interface MTU, ordinary Ethernet-frame size, and an offloaded GSO object. MTU 2400 corresponds to 2414 bytes without VLAN tags and 2422 bytes with two tags, excluding FCS. Account separately for TAP metadata. Negotiate and enforce frame and aggregate limits; v1 supports MTU up to 9000 and up to two VLAN tags within its 9022-byte frame ceiling.
 
 The daemon must allow Linux bridge or OVS to own forwarding policy. It need not implement an FDB, STP, or VLAN access/trunk policy. Reserved link-local traffic is transported if delivered to the daemon; bridge/OVS policy may consume or filter it before that point. [S15, S16]
 
@@ -282,6 +332,7 @@ tx_lanes = 4
 name = "ngn-a"
 peer = "peer-a"
 cookie = "<uuid-v4>"
+role = "initiator" # configure the other endpoint as responder
 tap_name = "tap-ngn-a"
 inner_mtu = 2400
 ```
@@ -317,7 +368,7 @@ For illustration, 3 Gbit/s of inner IP traffic requires the following rates when
 | 1500 | 250000 | 500000 |
 | 2400 | 156250 | 312500 |
 
-Assuming packing delivers an average of 1350 inner IP bytes per outer packet, the outer rate would be about 278000 packets/s. This average is a planning assumption below the candidate's 1392-byte frame-data ceiling; actual efficiency depends on Ethernet overhead, frame sizes, record boundaries, and partial batches.
+Assuming packing delivers an average of 1350 inner IP bytes per outer packet, the outer rate would be about 278000 packets/s. This average is a planning assumption below the v1 format's 1384-byte frame-data ceiling; actual efficiency depends on Ethernet overhead, frame sizes, record boundaries, and partial batches.
 
 At 3 Gbit/s and RTT 4.5–7.5 ms, the bandwidth-delay product is approximately 1.69–2.81 MB per direction. Retaining 20 ms of payload for recovery would require about 7.5 MB per direction before metadata and copies. Bounds should scale with the configured memory ceiling and measured path, not with arbitrary tiny packet counts.
 
@@ -339,13 +390,24 @@ Functional tests need only what any Linux host or container can provide: a kerne
 
 - **V02 Session correctness:** test valid/unknown cookies, duplicate configuration, malformed records, bad ACK ranges, duplicate and reordered datagrams, late originals after repairs, and no duplicate Ethernet delivery.
 
-- **V03 Lifecycle:** test restart epochs, delayed old packets, lane replacement, loss of all feedback, peer reboot, DNS address changes, and persistent TAP reattachment. Without systemd, verify that the original parent waits while any configured TAP is missing, exits successfully once all exist despite unavailable DNS, underlay bindings, routes, or peers, and reports failure if startup fails or the daemon dies before readiness. For optional systemd integration, verify that the enabled embedded/packaged unit makes both `network.target` and `network-online.target` require and wait for readiness, including startup through `network.target` alone, without reverse dependencies or wait-online dependencies.
+- **V03 Lifecycle:** test random-tag establishment, delayed old packets, lane replacement, loss of all feedback, peer reboot, DNS address changes, and persistent TAP reattachment. Without systemd, verify that the original parent waits while any configured TAP is missing, exits successfully once all exist despite unavailable DNS, underlay bindings, routes, or peers, and reports failure if startup fails or the daemon dies before readiness. For optional systemd integration, verify that the enabled embedded/packaged unit makes both `network.target` and `network-online.target` require and wait for readiness, including startup through `network.target` alone, without reverse dependencies or wait-online dependencies.
 
 - **V04 Ethernet composition:** test Linux bridge, OVS system ports, VLAN/QinQ, macvlan, multiple MACs, multicast, broadcast, and non-IP/LLC traffic. Verify frame contents and MTU handling.
 
 - **V05 Binding and offloads:** test ordinary interface and VRF binding, lower effective PMTU, software fallbacks, GSO/GRO boundaries, VLAN metadata, partial checksums, and receive truncation.
 
 - **V06 Resource behavior:** stress reassembly limits, loss bursts, ACK-history limits, queue backpressure, and sustained receiver overload. Verify bounded memory and recovery without corrupting unrelated sessions.
+
+### Protocol and ownership regression cases
+
+The implementation must exercise these cases with deterministic loss, reordering, clock-independent randomness fixtures, and bounded queues. A test-only executable model in `tests/design_model.rs` checks the handshake and frame-window invariants before the transport exists; it is not a substitute for socket/TAP tests.
+
+- Lose each handshake message, duplicate every message, start both roles together, restart either or both endpoints, replay old HELLO/CONFIRM/READY after a newer connection, and change the wall clock. Only the current pending exchange may commit; duplicate confirmation never resets active counters. A pending attempt must not evict working data state.
+- Confirm the responder, lose READY, and resend CONFIRM. The responder repeats READY without reinstalling state; the initiator eventually commits. If a responder restarts between challenge and confirmation, the old confirmation is rejected and a fresh attempt succeeds.
+- Deliver FRAME_ABANDON before a frame's first piece and verify that reordered data cannot recreate it. Deliver a frame, lose its ACK, retire its lane, then deliver old pieces and attempted repairs on another lane. The frame reaches TAP once. After the frame window advances or a lane retires, even a repair carrying a new packet number cannot recreate it.
+- Fill reassembly, TAP-write, and handoff queues. Unreserved datagrams are not ACKed; accepted frames either complete once or become terminal. Expired completion bits never reopen sequence numbers below a window floor. Exercise memory ceilings with many sessions and lanes.
+- Route feedback from three workers to one owner, wake an otherwise idle owner, fill queues, and commit a new connection with old events still queued. Verify the per-pair producer contract, no lost wakeups, and no stale state mutation.
+- Feed BBR duplicate ACKs, ACK loss, reordered ranges, late originals after repairs, sender stalls, receiver drops, and partial GSO/sendmmsg completion. Assert that reservations plus actual inflight bytes respect the shared budget and that no session/lane replacement multiplies it. Pin deterministic controller vectors to draft 07 before optimizing.
 
 ## 14.2 Performance comparisons
 
@@ -371,7 +433,7 @@ If a comparison already reaches the available underlay ceiling, report that fact
 
 2. **Batched transport.** Implement frame records, packing, bounded reassembly, UDP GSO/GRO, and TAP offload handling. Establish CPU and packet-rate baselines against L2TPv3.
 
-3. **Recovery and congestion.** Add bounded selective repair, ACK accounting, adaptive timing, aggregate pacing, and congestion control. Evaluate loss and latency together; this stage is required for a production candidate.
+3. **Recovery and congestion.** Implement the v1 selective-repair/ACK rules and BBRv3 aggregate pacing and congestion control. Evaluate loss and latency together; this stage is required for a production candidate.
 
 4. **Composition and robustness.** Complete the bridge/OVS/VLAN/macvlan matrix, resource stress, restart and path-change behavior, and sustained bidirectional tests.
 
@@ -381,27 +443,27 @@ If a comparison already reaches the available underlay ceiling, report that fact
 
 Maintain a clear distinction between a throughput experiment and an interoperable production protocol. Promote mechanisms only after correctness and the supported topologies have been exercised.
 
-# 16 Open decisions
+# 16 Decisions and remaining acceptance work
 
 | Decision | Initial direction |
 | - | - |
 | Numeric competitive margin | Define before acceptance; evaluate 1.5-fold as a proposal |
 | Scope of the above-3-Gbit/s target | Freeze flow count, direction, topology, CPU model, and loss profile |
 | Maximum inner MTU and tag depth | Fixed: MTU 9000 with two VLAN tags, 9022-byte frame ceiling (section 3) |
-| Controller implementation | Evaluate BBRv3 and its aggregate-lane integration |
-| Retry and frame deadlines | Select from loaded-path measurements |
-| Reordering policy | Bounded per-flow policy with a non-IP fallback |
-| Restart protocol | Frozen in section 5 as v0 |
-| Abandonment protocol | FRAME_ABANDON semantics and receiver acceptance point open until stage 3 |
-| Final wire layout | 40-byte common header, record prefix, DATA, HELLO, and HELLO_ACK frozen as v0; ACK, PROBE, and FRAME_ABANDON bodies open |
+| Controller implementation | Decided: in-tree BBRv3 draft 07, one owner/budget per direction and path group (section 9) |
+| Retry and frame deadlines | Initial two-repair limit and bounded RTT-based sender / 100 ms receiver deadlines (section 8); tune by measurement |
+| Reordering policy | Decided: flow-to-lane pinning, immediate completed-frame delivery; extra reorder buffering deferred |
+| Restart protocol | Decided: explicit roles, random directional receive tags, HELLO/CHALLENGE/CONFIRM/READY (section 5) |
+| Abandonment protocol | Decided: transport-acceptance ACKs, bounded advisory abandonment, permanent window floors and lane tombstones (sections 6 and 8) |
+| Wire layout | v1: 48-byte common header and exact record bodies (section 6); interoperability vectors required before release |
 | Worker and lane counts | Start small; determine from queue and CPU measurements |
-| Feedback routing | Decided: per-worker SPSC queues to the lane owner (section 10) |
+| Feedback routing | Decided: per-worker-pair bounded SPSC queues, eventfd wakeups, explicit lane owners (section 10) |
 | Library API | Decided: library owns worker threads, blocking run plus control handle (section 3) |
-| DNS refresh and address migration | Explicit policy with stable active-path behavior |
+| DNS refresh and address migration | Keep a working address; one candidate and a new handshake for change (section 5) |
 | Inner offload representation | Experimental, negotiated extension |
-| ECN and DSCP policy | Define before enabling outer ECN capability |
+| ECN and DSCP policy | Decided: outer Not-ECT and DSCP zero; preserve inner fields; ECN feedback deferred |
 | FEC | Optional experiment after selective repair is measured |
-| Minimum kernel and service packaging | At least 5.0, since UDP GRO requires it (UDP GSO needs 4.18); confirm after validating the other APIs |
+| Minimum kernel and service packaging | Kernel target 5.0; qualify APIs/fallbacks before release. Optional service integration and packages do not raise core runtime requirements |
 
 These decisions do not weaken the confirmed constraints: encryption remains absent, the fixed port remains receive-only, all outgoing protocol traffic uses dynamic per-destination ports, native outer fragmentation remains prohibited, and the library core depends on nothing beyond `libc`.
 
