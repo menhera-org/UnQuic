@@ -38,6 +38,10 @@ harness = false
 name = "tap_cost"
 harness = false
 
+[[example]]
+name = "udp_load"
+test = true
+
 [profile.release]
 opt-level = 3
 lto = true

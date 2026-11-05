@@ -28,7 +28,7 @@ L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | The read-ring repeats deliver 4.94–5.28 / 6.23–6.48 Gbit/s of inner UDP payload under unlimited load | Even the better points need about 3.8× / 3.1× more delivered goodput. The generator still offers only about 13 Gbit/s each way. |
+| At least 20 Gbit/s each way at inner MTU 1500 | The read-ring repeats deliver 4.94–5.28 / 6.23–6.48 Gbit/s of inner UDP payload under unlimited load | Even the better points need about 3.8× / 3.1× more delivered goodput. iperf3 still offers only about 13 Gbit/s each way. The new UDP_SEGMENT/GRO tool exceeds 20 Gbit/s over veth, but needs production TAP super-frame input for segmented tunnel tests. |
 | Goodput must plateau under excess traffic | Five MTU-1500 and three 64-byte corrected read-ring unlimited points exceed their paced predecessors in both directions; earlier baselines and a fixed-batch trial declined | The current 20-second samples pass that comparison. Longer runs, mixed traffic, more flows/sessions and the acceptance gate remain unverified. |
 | Small-frame overload must remain efficient | Read rings deliver 847–899k / 844–868k frames/s in three 64-byte unlimited points, compared with 729–737k / 714–734k with USO alone | The final 10M-per-flow sweep holds up under overload. Receiver errors are now substantial; mixed and non-coalescible traffic still need coverage. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
@@ -1163,3 +1163,66 @@ unrelated bridge multicast reports by source MAC; fixture frames and duplicate
 checks remain byte-exact. A real thread-local seccomp filter denies ring setup;
 the worker then reads through the ordinary path and counts the fallback.
 Older kernels remain untested.
+
+## Concurrent UDP generator and GRO receiver (C2/C3)
+
+The [Rust load tool](benches/udp_load.md) runs concurrent connected sockets
+on one thread per process. It supports fixed ports, per-flow integer pacing,
+UDP segmentation and GRO, with byte validation and bounded duplicate tracking.
+No new dependency is required. Its measured send/receive loop allocates and
+deallocates nothing in the kernel regression.
+
+These capacity probes connect two disposable namespaces directly by veth,
+with MTU 1500, 16 flows each way and 1472-byte UDP payloads. Four distinct
+physical cores on one socket host the two senders and two receivers.
+Each sender runs for 10 seconds; receivers include a two-second drain window.
+No daemon participates. These figures do not count toward the tunnel gate.
+
+[Raw per-flow results](benches/udp-load.json) retain all six points.
+CPU below is process CPU time divided by the corresponding sender duration;
+receiver values include drain work. No own builds or other tests ran alongside
+the measurements.
+
+| Build | Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing % | Sender CPU % | Receiver CPU % |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Scalar validation trial | 21 | 20.969 / 20.969 | 12.679 / 12.621 | 39.54 / 39.81 | 51.8 / 51.2 | 100.4 / 100.7 |
+| Scalar validation trial | unlimited | 51.255 / 51.554 | 12.798 / 12.704 | 75.03 / 75.36 | 99.7 / 98.9 | 100.7 / 100.3 |
+| Vectorizable validation | 21 | 20.972 / 20.967 | 20.972 / 20.962 | 0.0010 / 0.0240 | 65.9 / 64.7 | 71.4 / 70.0 |
+| Vectorizable validation | unlimited | 35.698 / 36.256 | 35.691 / 35.822 | 0.0194 / 1.1976 | 99.7 / 99.8 | 100.6 / 99.8 |
+| Final example target | 21 | 20.926 / 20.940 | 20.924 / 20.939 | 0.0092 / 0.0022 | 64.9 / 64.2 | 69.8 / 70.3 |
+| Final example target | unlimited | 37.820 / 36.900 | 37.820 / 36.897 | 0.0004 / 0.0080 | 99.7 / 99.3 | 100.5 / 100.5 |
+
+The first receiver's early-exit byte comparison limited delivery to about
+13 Gbit/s. Replacing that expression with a vectorizable bitwise reduction,
+while still checking every byte, removed this measured bottleneck.
+The final executable's SHA-256 is
+`da57a37ab95c5db52287d577e95c81439d9c16c7ebf89097b7e6a2035f53ec3d`.
+
+Every probe reports zero corruption, duplicates and packets outside the
+duplicate window. In the final paced point, receive-socket overflow was
+37 / 9 SKBs; unlimited overflow was 3 / 57 SKBs. Each held 44 datagrams,
+and those counts account exactly for the final points' missing datagrams.
+Actual paced offers were slightly below the requested 21 Gbit/s; report the
+measured rates, not the request.
+
+The first segmented TAP smoke test failed with EIO before producing a
+throughput result. A focused kernel test reproduces the failure with
+TUNSETOFFLOAD=0, then verifies successful sends with TUN_F_CSUM and a single
+USO super-frame when both USO flags are enabled. Linux 6.8's
+[UDP send path](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/udp.c#L854-L873)
+requires partial-checksum support for segmented sends, and its
+[TUN setup](https://github.com/torvalds/linux/blob/v6.8/drivers/net/tun.c#L2752-L2755)
+requires both USO flags together.
+
+Production TAP read offloads remain disabled. B3 must validate, checksum
+and segment their input before this generator can exercise segmented
+TAP-to-TAP traffic. Plain-UDP smoke tests pass with both four and eight
+workers, and the existing iperf3 mode remains available. Neither those
+two-second checks nor the direct veth probes establish tunnel performance.
+The full four-/eight-worker sweeps and five-run acceptance gate remain open.
+
+Four ordinary unit tests and two ignored container tests cover pacing,
+sequence windows, argument bounds, ancillary validation, IPv4/IPv6,
+four concurrent sockets, 18/1472/8972-byte payloads and batches up to 64
+datagrams. Corrupting every byte of the checked payload body is detected. The send/receive
+test counts zero allocations and deallocations. Clippy and Rust 1.89 checks pass.

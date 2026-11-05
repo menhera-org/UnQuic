@@ -1,5 +1,5 @@
 #!/bin/sh
-# Run only inside a disposable container with tun, iproute2, iperf3 and taskset.
+# Run only inside a disposable container with tun, iproute2, taskset and a generator.
 # Usage: sh benches/tap_transport.sh /absolute/unquic FRAME_BYTES FLOWS SECONDS OUT
 set -eu
 [ "$#" -eq 5 ] || { echo "usage: $0 DAEMON FRAME_BYTES FLOWS SECONDS OUT" >&2; exit 2; }
@@ -11,6 +11,8 @@ for number in "$3" "$4"; do
 done
 case "${OUTER_PAYLOAD_LIMIT:-1232}" in ''|*[!0-9]*) exit 2;; esac
 [ "${OUTER_PAYLOAD_LIMIT:-1232}" -ge 1232 ] && [ "${OUTER_PAYLOAD_LIMIT:-1232}" -le 1452 ] || exit 2
+case "${WORKERS:-4}" in 4|8) ;; *) echo "WORKERS must be 4 or 8" >&2; exit 2;; esac
+case "${UDP_LOAD:-}" in ''|/*) ;; *) echo "UDP_LOAD must be an absolute path" >&2; exit 2;; esac
 mkdir "$5"
 # A private mount namespace keeps ip-netns bind mounts out of the caller.
 exec unshare -m -n --propagation private sh -s -- "$@" <<'BENCH'
@@ -20,6 +22,21 @@ frame=$2
 flows=$3
 seconds=$4
 out=$(cd "$5" && pwd)
+workers=${WORKERS:-4}
+case "$workers" in
+    4)
+        GENERATOR_LEFT_CPUS=${GENERATOR_LEFT_CPUS:-8-11}
+        RECEIVER_LEFT_CPUS=${RECEIVER_LEFT_CPUS:-12-13}
+        GENERATOR_RIGHT_CPUS=${GENERATOR_RIGHT_CPUS:-14-17}
+        RECEIVER_RIGHT_CPUS=${RECEIVER_RIGHT_CPUS:-18-19}
+        ;;
+    8)
+        GENERATOR_LEFT_CPUS=${GENERATOR_LEFT_CPUS:-16}
+        RECEIVER_LEFT_CPUS=${RECEIVER_LEFT_CPUS:-17}
+        GENERATOR_RIGHT_CPUS=${GENERATOR_RIGHT_CPUS:-18}
+        RECEIVER_RIGHT_CPUS=${RECEIVER_RIGHT_CPUS:-19}
+        ;;
+esac
 left=
 right=
 server=
@@ -56,7 +73,7 @@ name = "peer"
 endpoint = "rx"
 host = "::1"
 peer_port = $remote
-tx_lanes = 4
+tx_lanes = $workers
 outer_payload_limit = ${OUTER_PAYLOAD_LIMIT:-1232}
 [[sessions]]
 name = "uq-$side"
@@ -64,12 +81,12 @@ peer = "peer"
 cookie = "00112233-4455-4677-8899-aabbccddeeff"
 inner_mtu = 1500
 mac = "02:00:00:00:00:$mac"
-queue_count = 4
+queue_count = $workers
 CONFIG
 done
-taskset -c 0-3 "$daemon" run "$out/left.toml" > "$out/left.log" 2>&1 &
+taskset -c "${DAEMON_LEFT_CPUS:-0-$((workers - 1))}" "$daemon" run "$out/left.toml" > "$out/left.log" 2>&1 &
 left=$!
-taskset -c 4-7 "$daemon" run "$out/right.toml" > "$out/right.log" 2>&1 &
+taskset -c "${DAEMON_RIGHT_CPUS:-$workers-$((workers * 2 - 1))}" "$daemon" run "$out/right.toml" > "$out/right.log" 2>&1 &
 right=$!
 for side in left right; do
     attempts=0
@@ -116,9 +133,15 @@ snapshot() {
 uname -srvm > "$out/kernel"
 sed -n '/model name/p' /proc/cpuinfo | head -n 1 > "$out/cpu-model"
 getconf CLK_TCK > "$out/clock-ticks"
-iperf3 --version > "$out/iperf-version"
-printf '%s\n' "${GENERATOR_LEFT_CPUS:-8-11}" "${RECEIVER_LEFT_CPUS:-12-15}" \
-    "${GENERATOR_RIGHT_CPUS:-16-19}" "${RECEIVER_RIGHT_CPUS:-20-23}" > "$out/generator-cpus"
+if [ -n "${UDP_LOAD:-}" ]; then
+    sha256sum "$UDP_LOAD" > "$out/generator-sha256"
+    printf '%s\n' "udp_load segments=${SEGMENTS:-64}" > "$out/generator"
+else
+    iperf3 --version > "$out/iperf-version"
+fi
+printf '%s\n' "${DAEMON_LEFT_CPUS:-0-$((workers - 1))}" "${DAEMON_RIGHT_CPUS:-$workers-$((workers * 2 - 1))}" > "$out/daemon-cpus"
+printf '%s\n' "$GENERATOR_LEFT_CPUS" "$RECEIVER_LEFT_CPUS" \
+    "$GENERATOR_RIGHT_CPUS" "$RECEIVER_RIGHT_CPUS" > "$out/generator-cpus"
 base=$out
 index=0
 for rate in ${BITRATE:-0}; do
@@ -127,24 +150,45 @@ for rate in ${BITRATE:-0}; do
         *[[:space:]]*) out=$base/$index; mkdir "$out";;
     esac
     echo "$rate" > "$out/bitrate"
-    nsenter --net=/run/netns/uq-right taskset -c "${RECEIVER_RIGHT_CPUS:-20-23}" iperf3 -s -1 -J > "$out/server.json" &
-    server=$!
-    nsenter --net=/run/netns/uq-left taskset -c "${RECEIVER_LEFT_CPUS:-12-15}" iperf3 -s -1 -J > "$out/reverse-server.json" &
-    reverse_server=$!
-    sleep 0.2
-    snapshot before
-    nsenter --net=/run/netns/uq-left taskset -c "${GENERATOR_LEFT_CPUS:-8-11}" iperf3 -c 10.77.0.2 -u -b "$rate" --dont-fragment \
-        -l "$((frame - 42))" -P "$flows" --cport 51000 -t "$seconds" -J \
-        --connect-timeout 3000 > "$out/client.json" &
-    client=$!
-    nsenter --net=/run/netns/uq-right taskset -c "${GENERATOR_RIGHT_CPUS:-16-19}" iperf3 -c 10.77.0.1 -u -b "$rate" --dont-fragment \
-        -l "$((frame - 42))" -P "$flows" --cport 51000 -t "$seconds" -J \
-        --connect-timeout 3000 > "$out/reverse-client.json" &
-    reverse_client=$!
+    if [ -n "${UDP_LOAD:-}" ]; then
+        case "$rate" in *[!0-9]*) echo "UDP_LOAD rates must be integer bits/s per flow" >&2; exit 2;; esac
+        run=$((index + 1))
+        nsenter --net=/run/netns/uq-right taskset -c "$RECEIVER_RIGHT_CPUS" "$UDP_LOAD" recv \
+            10.77.0.2 10.77.0.1 52000 51000 "$flows" "$((frame - 42))" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/server.json" &
+        server=$!
+        nsenter --net=/run/netns/uq-left taskset -c "$RECEIVER_LEFT_CPUS" "$UDP_LOAD" recv \
+            10.77.0.1 10.77.0.2 52000 51000 "$flows" "$((frame - 42))" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/reverse-server.json" &
+        reverse_server=$!
+        sleep 0.2
+        kill -0 "$server" && kill -0 "$reverse_server" || exit 1
+        snapshot before
+        nsenter --net=/run/netns/uq-left taskset -c "$GENERATOR_LEFT_CPUS" "$UDP_LOAD" send \
+            10.77.0.1 10.77.0.2 51000 52000 "$flows" "$((frame - 42))" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/client.json" &
+        client=$!
+        nsenter --net=/run/netns/uq-right taskset -c "$GENERATOR_RIGHT_CPUS" "$UDP_LOAD" send \
+            10.77.0.2 10.77.0.1 51000 52000 "$flows" "$((frame - 42))" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/reverse-client.json" &
+        reverse_client=$!
+    else
+        nsenter --net=/run/netns/uq-right taskset -c "$RECEIVER_RIGHT_CPUS" iperf3 -s -1 -J > "$out/server.json" &
+        server=$!
+        nsenter --net=/run/netns/uq-left taskset -c "$RECEIVER_LEFT_CPUS" iperf3 -s -1 -J > "$out/reverse-server.json" &
+        reverse_server=$!
+        sleep 0.2
+        snapshot before
+        nsenter --net=/run/netns/uq-left taskset -c "$GENERATOR_LEFT_CPUS" iperf3 -c 10.77.0.2 -u -b "$rate" --dont-fragment \
+            -l "$((frame - 42))" -P "$flows" --cport 51000 -t "$seconds" -J \
+            --connect-timeout 3000 > "$out/client.json" &
+        client=$!
+        nsenter --net=/run/netns/uq-right taskset -c "$GENERATOR_RIGHT_CPUS" iperf3 -c 10.77.0.1 -u -b "$rate" --dont-fragment \
+            -l "$((frame - 42))" -P "$flows" --cport 51000 -t "$seconds" -J \
+            --connect-timeout 3000 > "$out/reverse-client.json" &
+        reverse_client=$!
+    fi
     wait "$client"
     client=
     wait "$reverse_client"
     reverse_client=
+    if [ -n "${UDP_LOAD:-}" ]; then snapshot sent; fi
     wait "$server"
     server=
     wait "$reverse_server"

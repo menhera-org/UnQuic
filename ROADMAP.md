@@ -358,9 +358,11 @@ now run against the real implementation in tests/reassembly.rs.
   `sendmmsg` completion returns the unsent entries, container test extended
   with a 10 s bidirectional frame storm and a check that no frame is
   duplicated or corrupted.
-- If existing generators cannot exercise concurrent sockets and the complete
-  TAP-to-TAP path, write a small Rust traffic generator for those measurements.
-  Keep generator implementation out of the runtime and report its CPU separately.
+- The Rust UDP_SEGMENT/GRO load tool uses concurrent sockets, per-flow pacing,
+  byte validation and duplicate tracking; it reports generator CPU separately.
+  Direct veth probes exceed 20 Gbit/s each way. Four-/eight-worker harness
+  smoke tests pass with plain UDP. Segmented TAP-to-TAP tests require B3
+  checksum/super-frame input support; these probes do not pass the tunnel gate.
 - Measure: record frames per second and CPU per core on the container
   loopback in a `BENCH.md` table with kernel version and CPU model. These
   numbers are a baseline until a complete-transport run demonstrates at least
