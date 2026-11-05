@@ -8,7 +8,7 @@ Encryption is deliberately absent. A session UUID is the sole session admission 
 
 This initial design distinguishes **confirmed requirements**, **proposed implementation choices**, and **open decisions**. It is a basis for prototyping and review; the byte-level protocol and performance acceptance profile are not yet frozen.
 
-The project is named UnQuic and is written in pure Rust with `libc` as the only dependency, built for `*-unknown-linux-musl` targets (see README.md). Every mechanism below, including the congestion controller, configuration parser, and UUID generation, must therefore be implemented in-tree over raw system calls.
+The project is named UnQuic and is written in pure Rust, built for `*-unknown-linux-musl` targets (see README.md). The library core depends only on `libc`; the transport, congestion controller, and UUID types are implemented in-tree, calling the kernel through `libc` wherever a syscall or socket option is needed. The crate is a library; the daemon binary is built only with the `bin` feature. Optional Cargo features pull in further crates: `dns` for FQDN resolution, `uuid-compat` for conversions to the `uuid` crate, and `bin` for the daemon's config parsing and random cookie generation. `bin` enables `dns`, so the daemon always accepts FQDN hosts. Functions that can be `const fn` should be.
 
 # 1 Deployment and motivation
 
@@ -110,7 +110,7 @@ Resolve FQDNs to IPv6 addresses outside the packet-processing loop. Select and v
 
 Carry the session UUID as 16 binary bytes in every protocol datagram, including feedback and control. All lanes for the session use the same configured cookie. Reject duplicate local session-cookie configurations and reject unknown cookies before allocating per-packet state or sending a response.
 
-**Proposed generation rule:** require UUIDv4 generated from `getrandom(2)`. UUIDv4 has 122 random bits in a 128-bit field; arbitrary UUID versions do not provide the same unpredictability. Provision the cookie out of band and use a public session label for logs and metrics. The full cookie must not appear in routine diagnostics. [S6]
+**Proposed generation rule:** require UUIDv4 generated from a cryptographically secure random source. The `unquic gen-uuid` subcommand does this with the `getrandom` crate and is its only user; the daemon never generates a UUID at runtime. UUIDv4 has 122 random bits in a 128-bit field; arbitrary UUID versions do not provide the same unpredictability. Provision the cookie out of band and use a public session label for logs and metrics. The full cookie must not appear in routine diagnostics. [S6]
 
 The cookie checks possession of a shared bearer value. It provides neither confidentiality nor cryptographic payload integrity. An observer who learns it can forge traffic or feedback. This is the deliberately accepted deployment boundary, analogous to the blind-injection protection of an L2TPv3 cookie. [S7]
 
@@ -184,7 +184,7 @@ Retry count, frame deadline, reorder limits, and receiver abandonment semantics 
 
 Congestion control is a required production behavior. Support arbitrary Ethernet traffic and account for the extra traffic created by repair. Do not rely solely on inner TCP to control the tunnel.
 
-**Proposed controller candidate:** BBRv3, as an in-tree implementation of its delivery-rate and inflight model; the no-dependency rule rules out reusing an external crate. Because that is a large piece of work, stage 3 may start with a simpler in-tree loss-and-delay controller and replace it once BBRv3 is validated. BBRv3 remains an experimental specification. Selection depends on throughput, coexistence, queueing delay, and CPU results; the algorithm is not yet a confirmed requirement. [S11]
+**Proposed controller candidate:** BBRv3, as an in-tree implementation of its delivery-rate and inflight model; the library core allows no crate beyond `libc`, so an external controller cannot be reused. Because that is a large piece of work, stage 3 may start with a simpler in-tree loss-and-delay controller and replace it once BBRv3 is validated. BBRv3 remains an experimental specification. Selection depends on throughput, coexistence, queueing delay, and CPU results; the algorithm is not yet a confirmed requirement. [S11]
 
 Maintain one congestion budget per sending direction and path group. Several source ports to the same peer are not independent entitlements to bandwidth. Share pacing and inflight limits across those lanes while retaining per-lane measurements. RFC 8085 explicitly discusses aggregate control across multiple sockets. [S1]
 
@@ -243,7 +243,7 @@ Keep TAP names, MAC configuration, and device identity stable across ordinary pe
 
 Separate daemon-wide receive configuration, peer transport configuration, and per-session Ethernet configuration. One peer may carry multiple sessions; shared lanes or separate lane pools must still observe the appropriate aggregate congestion budget.
 
-An illustrative configuration shape follows. Names and default values are proposed, and the cookie is a placeholder. The file is a flat TOML-like subset (tables, array tables, and scalar `key = value` lines) parsed by a small in-tree parser; it is not full TOML, because no TOML crate is allowed.
+An illustrative configuration shape follows. Names and default values are proposed, and the cookie is a placeholder. The file is TOML, parsed with `serde` and `toml` under the `bin` feature; the library core takes already-parsed values and never touches the file.
 
 ```toml
 [daemon]
@@ -265,7 +265,7 @@ tap_name = "tap-ngn-a"
 inner_mtu = 2400
 ```
 
-Support both FQDN and IPv6-literal hosts, resolved with `getaddrinfo(3)` on a helper thread so the packet loop never blocks. `bind_device` is per peer because peers may live in different VRFs; the daemon creates one receive socket per distinct device on the single configured port, as section 4 requires. Define scope identifiers for link-local literals if those addresses are supported. Cookie changes are explicit administrative operations; do not silently replace a configured cookie during reconnect.
+Support IPv6-literal hosts always, and FQDN hosts when the `dns` feature is enabled, which the daemon always has; resolution runs on a helper thread so the packet loop never blocks. A library user without `dns` configures endpoints as literals only. `bind_device` is per peer because peers may live in different VRFs; the daemon creates one receive socket per distinct device on the single configured port, as section 4 requires. Define scope identifiers for link-local literals if those addresses are supported. Cookie changes are explicit administrative operations; do not silently replace a configured cookie during reconnect.
 
 Expose per-session, per-peer, and per-lane counters for delivered frame bytes, outer bytes, repairs, duplicates, expired frames, queue drops, reassembly occupancy, RTT, feedback delay, pacing rate, bytes in flight, and path-MTU state. Distinguish malformed/unknown-cookie packets from operational loss without logging secrets.
 
@@ -367,7 +367,7 @@ Maintain a clear distinction between a throughput experiment and an interoperabl
 | FEC | Optional experiment after selective repair is measured |
 | Minimum kernel and service packaging | At least 5.0, since UDP GRO requires it (UDP GSO needs 4.18); confirm after validating the other APIs |
 
-These decisions do not weaken the confirmed constraints: encryption remains absent, the fixed port remains receive-only, all outgoing protocol traffic uses dynamic per-destination ports, native outer fragmentation remains prohibited, and `libc` remains the only dependency.
+These decisions do not weaken the confirmed constraints: encryption remains absent, the fixed port remains receive-only, all outgoing protocol traffic uses dynamic per-destination ports, native outer fragmentation remains prohibited, and the library core depends on nothing beyond `libc`.
 
 # 17 Technical references
 
