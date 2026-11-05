@@ -10,6 +10,33 @@ This report separates that remaining decline from the earlier near-total
 collapse. Recovery, congestion control and PMTU discovery remain unfinished;
 their absence does not explain away a scheduling or admission failure.
 
+## Current performance gaps
+
+Status at `a69f88d`; the numbers below use the recorded 24-CPU local profile.
+L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
+
+| Requirement | Current evidence | Remaining gap |
+| --- | --- | --- |
+| At least 20 Gbit/s each way at inner MTU 1500 | Repeated 16-flow unlimited points deliver 2.44–2.57 / 3.00–3.08 Gbit/s of inner UDP payload | Roughly 8× / 6.5× more delivered goodput is needed even relative to the better unlimited point. The gate is not close to passing. |
+| Goodput must plateau under excess traffic | MTU-1500 reverse goodput falls from 3.38–3.44 Gbit/s at paced saturation to 3.00–3.08 Gbit/s unlimited | A roughly 9–13% decline remains. Removing the earlier admission cascade does not satisfy the plateau requirement. |
+| Small-frame overload must remain efficient | With 64-byte frames and 16 flows, reverse delivery falls from 448,939 to 390,617 frames/s | The 13% decline remains unresolved. The 60-byte multi-flow and small-frame single-flow cases are substantially steadier; they do not prove the 64-byte case fixed. |
+| Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
+| Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
+| Use larger confirmed path MTUs | The runtime still sends at the 1232-byte UDP baseline | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. No performance gain from larger outer packets has been demonstrated. |
+| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
+
+Loss under unlimited load is still high: the recorded MTU-1500 16-flow point
+misses about 81% / 76% of offered frames despite zero admission-pressure
+rejections and zero worker queue drops. TAP ingress drops and outer socket
+overflows account for visible loss locations; their different units prevent
+an exact frame-loss decomposition. Inner UDP receive-buffer errors are recorded
+and are too small to explain the observed 64-byte goodput decline.
+
+The next investigation is a repeated single-socket CPU-placement comparison,
+followed by worker/kernel profiling of any decline that persists. No remaining
+decline is attributed solely to missing congestion control, recovery or PMTU.
+The absence of those features is a separate production-performance gap.
+
 ## Profile and method
 
 | Field | Value |
