@@ -1078,3 +1078,26 @@ fn cancelling_an_old_path_preserves_active_state_and_rejects_its_pending_flights
     assert_ne!(encoded(hello), encoded(new_hello));
     assert_eq!(a.connection(), Some(active));
 }
+
+#[test]
+fn repair_coverage_allocates_nothing() {
+    use unquic::{MAX_FRAME_LEN, loss::FrameRecovery};
+    let mut frame = FrameRecovery::new(MAX_FRAME_LEN).unwrap();
+    ALLOCATION_COUNT.set(Some(0));
+    for _ in 0..100 {
+        assert!(frame.reset(MAX_FRAME_LEN));
+        assert!(frame.submitted(0..MAX_FRAME_LEN, 0));
+        for attempt in 0..=2 {
+            assert!(frame.lost(0..MAX_FRAME_LEN, attempt));
+            if attempt < 2 {
+                while let Some((range, next)) = frame.next_repair(1232) {
+                    assert_eq!(next, attempt + 1);
+                    assert!(frame.submitted(range, next));
+                }
+            }
+        }
+        assert_eq!(frame.next_repair(MAX_FRAME_LEN), None);
+        assert_eq!(frame.acknowledge(0..MAX_FRAME_LEN, 0), Some(MAX_FRAME_LEN));
+    }
+    assert_eq!(ALLOCATION_COUNT.replace(None), Some(0));
+}

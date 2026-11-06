@@ -625,8 +625,10 @@ ACKs against actual submissions, preserves unresolved charges and rejects known
 unsent holes. Each entry uses 16 bytes plus four bitmap bits, preserving full
 monotonic timestamp range and precision. Worker history integration and ACK routing are not yet connected.
 Pure RTT, loss-deadline, PTO-period and frame
-lifetime calculations are implemented; worker loss recovery and congestion
-control remain unfinished. Per-lane MTU discovery now starts DATA at 1232 bytes
+lifetime calculations and per-frame byte coverage are implemented. Coverage
+tracks at most two repairs per byte and rejects stale loss against a newer
+outstanding copy; packet charges remain separate. Payload retention, packet
+mappings, worker loss recovery and congestion control remain unfinished. Per-lane MTU discovery now starts DATA at 1232 bytes
 and probes up to the configured ceiling, defaulting to 8952 bytes. Limits and
 gauges reflect confirmation rather than operator assertions. Release routed
 tests verify 9000/1500/1280-byte outer paths with returned and filtered PTB and

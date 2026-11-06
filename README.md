@@ -236,6 +236,15 @@ bounds, backward time, numeric limits and exact estimator values. These
 calculations are not yet connected to worker ACK processing or the shared
 PTO probe budget; they do not provide recovery on their own.
 
+The pure `loss::FrameRecovery` tracks acknowledged and outstanding byte ranges
+and permits at most two repairs per byte. It excludes unsent bytes, ignores
+obsolete loss notifications and accepts a late original ACK while a repair is
+outstanding. Its 3392-byte fixed state can be reused without allocation; reset
+clears only words needed by the new frame length. Old frame-ID mappings must
+be rejected after reuse, while their packet charges remain in `History`.
+A byte-by-byte reference model and boundary tests verify transitions. Workers
+still need payload retention, packet-to-frame mappings and repair submission.
+
 Recovery, BBRv3,
 descriptor adoption and daemon process integration remain unfinished. No throughput
 target has been demonstrated. [BENCH.md](BENCH.md) records the release

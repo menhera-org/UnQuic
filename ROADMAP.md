@@ -447,6 +447,12 @@ lifetime now live in `loss.rs`, with exact-value and boundary tests. ACK-driven
 updates, history integration, timer ownership and the shared two-probe/three-PTO policy
 still need integration; this does not complete the loss-detection step.
 
+Pure per-frame byte coverage now lives in `loss::FrameRecovery`, with two-repair
+limits, outstanding-generation checks, late ACK handling and bounded slot reuse.
+Word masks are checked against a byte model and allocation instrumentation.
+Allocate this state against actual frame quotas when wiring packet mappings,
+payload retention and worker repair sends; none of those is connected yet.
+
 - `ack.rs`: ACK scheduling (16 packets or 1 ms, immediate on gap), at most
   32 newest ranges, delay capped at 1000 µs, per-lane once-per-millisecond
   duplicate limit, and processing against retained sent entries only.

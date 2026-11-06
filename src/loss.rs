@@ -4,6 +4,9 @@
 //! Packet thresholds apply within one lane. PTO backoff and probe credit belong
 //! to the shared path-group owner, not to individual lanes.
 
+mod repair;
+pub use repair::FrameRecovery;
+
 use std::time::Duration;
 
 const INITIAL: Duration = Duration::from_millis(333);
