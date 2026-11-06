@@ -589,7 +589,8 @@ suppression and zero allocations/deallocations, while reporting drops. BENCH.md
 records the release throughput/CPU baseline; overload loss is severe and the
 throughput gate has not passed. Receive-side ACK scheduling/range construction
 is implemented over the existing bitmap; sender-history validation and runtime
-ACK routing are not yet connected. Worker loss recovery and congestion
+ACK routing are not yet connected. Pure RTT, loss-deadline, PTO-period and frame
+lifetime calculations are implemented; worker loss recovery and congestion
 control remain unfinished. Per-lane MTU discovery now starts DATA at 1232 bytes
 and probes up to the configured ceiling, defaulting to 8952 bytes. Limits and
 gauges reflect confirmation rather than operator assertions. Release routed

@@ -196,6 +196,14 @@ Tests cover pressure rejection, reordering, window wrap, delay calculation and
 allocation-free construction. Workers do not yet transmit or process these
 ACKs; retained sender history and bounded feedback routing remain stage-3 work.
 
+`loss::Rtt` implements the pure RFC 9002 timing calculations: RTT sampling,
+packet/time loss thresholds, exponential PTO periods and sender frame lifetime.
+It applies [verified erratum 7539](https://www.rfc-editor.org/errata/eid7539),
+which computes deviation before updating the smoothed RTT. Tests cover delay
+bounds, backward time, numeric limits and exact estimator values. These
+calculations are not yet connected to worker ACK processing or the shared
+PTO probe budget; they do not provide recovery on their own.
+
 Recovery, BBRv3,
 descriptor adoption and daemon process integration remain unfinished. No throughput
 target has been demonstrated. [BENCH.md](BENCH.md) records the release

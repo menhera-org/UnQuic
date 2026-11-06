@@ -19,6 +19,7 @@ pub mod counters;
 #[cfg(feature = "dns")]
 pub mod dns;
 pub mod handshake;
+pub mod loss;
 pub mod mac;
 pub mod pack;
 pub mod pmtu;

@@ -420,6 +420,11 @@ worker feedback routing remain pending, so the runtime still emits no packet
 ACKs. Per-lane MTU probing is connected to the workers. Recovery and congestion
 control remain pending; README.md documents probe feedback and send-error handling.
 
+The pure RTT estimator, loss-deadline calculation, PTO-period backoff and frame
+lifetime now live in `loss.rs`, with exact-value and boundary tests. ACK-driven
+updates, sent history, timer ownership and the shared two-probe/three-PTO policy
+still need integration; this does not complete the loss-detection step.
+
 - `ack.rs`: ACK scheduling (16 packets or 1 ms, immediate on gap), at most
   32 newest ranges, delay capped at 1000 µs, per-lane once-per-millisecond
   duplicate limit, and processing against retained sent entries only.
