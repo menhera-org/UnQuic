@@ -495,8 +495,17 @@ The pure `bbr::Delivery` sampler now follows draft-07's delivery-rate rules,
 with fixed vectors under `tests/vectors/bbr-07`. It counts newly acknowledged
 physical transmissions, including late originals and repairs, and preserves
 one ACK sample across bounded processing turns. It distinguishes application
-bubbles from host-queue limitation. The BBR state machine, bounded grant-batch
-scheduler and runtime recovery remain unfinished.
+bubbles from host-queue limitation. The pure BBRv3 controller implements draft-07's
+model and state machine; worker integration and runtime recovery remain unfinished.
+
+`pacing::Sender` combines the grant ledger with a shared bounded sampling slab
+and ordered completion processing. One reusable flight buffer per worker carries
+requests, permissions and successful prefixes. The coordinator waits for every
+issued grant report before committing sends in timestamp order, then accepts
+generation-qualified ACK, loss and retirement reports. Tests cover delayed and
+reversed completions, partial sends, metadata pressure and allocation-free reuse.
+This coordinator is not yet connected to worker I/O; it does not enable runtime
+congestion control or repair.
 
 ## TAP read batching
 

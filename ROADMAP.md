@@ -503,17 +503,22 @@ cover canceled holes, lost and feedback-only packets, ring wrap, maximum
 identities, and sampler reuse before a late ACK. Sampling handles now fit inside
 the existing 16-byte history entries: ACK and retirement take ownership, loss
 only copies it. A live-handle count prevents silent eviction/reset; the final
-packet number can retire without wrapping. Metadata slab allocation, identity
-validation and ordered report routing remain pending. Keep that slab in the
-concrete epoch coordinator, capped at 65,535 slots across the daemon; separate
-reserved send reports from feedback so frozen ACK work cannot deadlock sends. Keep PTO progress
-independent of free sampler slots.
-Shared sampling needs bounded grant batches: freeze shared ACK/loss application
-until all issued grants report, cap cumulative issued bytes as well as outstanding
-reservations, and close issuance when feedback waits. Commit successful sends in
-timestamp order before applying feedback, using a fresh owner timestamp for
-delivery accounting and original receive time for RTT. The runtime does not
-yet enforce these rules; batching latency and throughput need measurement.
+packet number can retire without wrapping. The shared sampling slab and ordered grant epochs now live in
+`pacing::Sender`. Startup allocates at most 65,535 slots across the daemon and
+one movable flight buffer per worker. Every slot checks group, session,
+generation, lane and packet number. The first completion closes issuance,
+including an unused grant; all reports must return before successful runs
+commit in timestamp/grant/ordinal order. Commit work has a packet budget and
+preserves each transmission's prefix inflight count. Empty groups can enter
+feedback for pressure retirement without first reserving a slot. Tests cover
+reversed reports, all 64 workers, partial sends, stale identities, bounded ACK
+transactions, full-pool PTO/loss/retirement progress and counter exhaustion before
+permission to send. Allocation instrumentation covers sorting and 66,000
+history/slot reuse cycles; reserved-memory estimates match actual allocations.
+Controller ownership, worker routing and runtime activation remain pending.
+Keep send-report storage separate from feedback buffers, preserve original
+receive time for RTT and use fresh owner time for delivery accounting. The
+one-flight-per-worker bound and epoch latency still need throughput measurement.
 
 The pure RTT estimator, loss-deadline calculation, PTO-period backoff and frame
 lifetime now live in `loss.rs`, with exact-value and boundary tests. ACK-driven

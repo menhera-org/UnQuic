@@ -33,7 +33,7 @@ impl Limits {
 /// group; the worker must reserve report capacity before using it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Grant {
-    id: u64,
+    pub(super) id: u64,
     worker: usize,
     bytes: u32,
     issued: Duration,

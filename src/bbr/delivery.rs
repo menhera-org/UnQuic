@@ -142,6 +142,17 @@ impl Delivery {
         }
     }
 
+    /// Remaining representable successful transmission identities.
+    /// Reserve capacity for every outstanding grant before permitting socket I/O.
+    pub const fn remaining_packets(&self) -> u64 {
+        u64::MAX - self.next_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn limit_packets_for_test(&mut self, remaining: u64) {
+        self.next_id = u64::MAX - remaining;
+    }
+
     /// Total newly acknowledged outer bytes, including acknowledged repairs.
     pub const fn delivered(&self) -> u64 {
         self.delivered
@@ -367,6 +378,7 @@ mod tests {
     fn exhausted_identity_delivery_and_loss_counters_do_not_wrap() {
         let mut delivery = Delivery::new();
         delivery.next_id = u64::MAX;
+        assert_eq!(delivery.remaining_packets(), 0);
         assert_eq!(
             delivery.sent(Duration::ZERO, 100, 0, false).unwrap_err(),
             DeliveryError::Exhausted

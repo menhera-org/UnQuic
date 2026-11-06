@@ -1,10 +1,13 @@
 //! Owner-local byte grants and the separate control-traffic ceiling.
 //!
 //! The runtime currently uses only control service. Data grants are a pure
-//! accounting component; BBR and worker report routing remain to be connected.
+//! accounting component with bounded ordered completion processing. BBR and
+//! worker report routing remain to be connected.
 
 mod grants;
+mod sender;
 pub use grants::{Grant, GrantError, Grants, Limits};
+pub use sender::{Flight, PacketId, Planned, Sender};
 use std::{io, time::Duration};
 
 const RATE: u64 = 4 * 1024 * 1024;
