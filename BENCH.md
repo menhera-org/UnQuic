@@ -34,7 +34,7 @@ L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 | At least 20 Gbit/s each way at inner MTU 1500 | The UDP-only local-lane build delivers 16.50 / 16.45 Gbit/s unlimited over 60 seconds with eight workers and 500-entry test TAP queues, from 28.39 / 27.71 Gbit/s offered; a prior 20-second pair reached 17.95 / 17.07 | Still about 1.21× / 1.22× short in the longer pair. TCP super-frame input remains unfinished. |
 | Goodput must plateau under excess traffic | The 60-second UDP-only pair declines 0.45% L→R under unlimited load | Shorter test queues reduce the long tail but do not establish a plateau: earlier left-side repeats lose 2–3%. With 10,000-entry queues, one pair loses 8.3%. Repeated longer runs, tagged/mixed traffic and more flows/sessions remain unverified. |
 | Small-frame overload must remain efficient | The UDP-only local-lane build delivers 6.05M / 6.08M 64-byte frames/s with eight workers | The local-lane paced/unlimited sweep improves under overload, with high loss. Mixed and non-coalescible traffic still need coverage. |
-| VLAN-heavy deployment | Checked output coalescing now handles one or two tags. Single-tag delivery reaches 16.00 / 15.53 Gbit/s paced; QinQ reaches 6.19 / 6.03 | Single-tag overload still declines. QinQ concentrates TAP input on one worker per daemon; lane distribution needs a controlled comparison. These short runs do not pass the throughput gate. |
+| VLAN-heavy deployment | Checked output coalescing now handles one or two tags. Single-tag delivery reaches 16.00 / 15.53 Gbit/s paced; QinQ reaches 10.49 / 9.91 with strict lane hashing | Tagged overload still declines. QinQ input concentrates on one reader; full-lane hashing helps but does not remove that bottleneck. These short runs do not pass the throughput gate. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
 | Use larger confirmed path MTUs | The runtime accepts a per-peer 1232–1452-byte payload assertion; a controlled 1452-byte sweep shows only a modest change | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. Configured capacity is not confirmed PMTU. |
@@ -1813,6 +1813,53 @@ into an exact logical-frame loss attribution.
 The release suite, all 18 serial kernel library tests, foundation,
 reconnect/allocation, CLI and both load-tool kernel tests pass, as do
 Clippy, formatting and Rust 1.89 checks. The first parallel kernel run
-failed two process-wide descriptor-count assertions; the serial run passed.
+failed two process-wide thread-count assertions; the serial run passed.
 The tagged coalescing test passed in both runs. No instrumentation remains
 in the production binary.
+
+### Keep strict hashing for stacked VLANs
+
+The full-lane hashing comparison improves QinQ paced delivery from
+6.193 / 6.030 to 10.491 / 9.914 Gbit/s, with CPU rising from roughly
+196% per daemon to 369% / 360%. Unlimited delivery rises from
+6.173 / 6.276 to 10.405 / 9.974. Outer socket drops fall from
+141481 / 108227 to 8487 / 2941 in the paced pair. This is evidence that
+concentrating all transmit work on the TAP reader wasted available capacity.
+
+The runtime therefore retains strict hashing for stacked VLANs. Untagged
+and single-tag unfragmented UDP keep reader-local selection when all workers
+have TAP queues; the prior TCP and fragment rules remain. The policy reuses
+the existing parsed Ethernet header length and adds no table or allocation.
+Regression tests cover tag types, both IP versions and every worker/lane
+count through 64. A frame and its repairs still retain one original lane.
+
+The final executable is byte-identical to the trial:
+`3a695dd915ff8749bed4ed0efaa1847b2ae88fe7607f6cd1c0d5fb8e8b13afb7`.
+A fresh four-rate sweep gives:
+
+| Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| 8 | 7.987 / 7.966 | 7.834 / 7.842 | 0.89 / 0.58 | 277.5 / 270.4 |
+| 16 | 15.950 / 15.890 | 10.283 / 9.634 | 34.80 / 38.68 | 372.2 / 368.4 |
+| 21 | 20.809 / 20.831 | 10.218 / 9.587 | 50.39 / 53.49 | 366.2 / 361.3 |
+| unlimited | 48.646 / 47.126 | 9.900 / 10.135 | 79.44 / 78.28 | 359.9 / 359.7 |
+
+At 8 Gbit/s requested, missing frames stay below 1% in each direction.
+The unlimited L→R result still declines 3.72% from its 16 Gbit/s point;
+R→L improves. The one-reader bottleneck and overload stability remain open.
+Full worker and CPU counters are in the same JSON artifact.
+
+| Run | TAP TX drops (SKBs) | Transport socket overflow (SKBs) | Inner UDP errors | Expired frames |
+| --- | ---: | ---: | ---: | ---: |
+| rx-vlan2-strict/0 | 397184 / 411172 | 8487 / 2941 | 8403 / 334 | 0 / 0 |
+| rx-vlan2-strict/1 | 1354398 / 1398194 | 9364 / 2578 | 657 / 0 | 0 / 0 |
+| rx-vlan2-final-sweep/0 | 2397 / 0 | 3488 / 719 | 0 / 0 | 0 / 0 |
+| rx-vlan2-final-sweep/1 | 213222 / 233085 | 7310 / 2014 | 774 / 3 | 0 / 0 |
+| rx-vlan2-final-sweep/2 | 402870 / 426310 | 7018 / 3043 | 452 / 823 | 0 / 0 |
+| rx-vlan2-final-sweep/3 | 1490571 / 1414188 | 18138 / 1342 | 273 / 1453 | 0 / 0 |
+
+All six additional points have zero admission pressure, worker queue drops
+and expiry, with no invalid, duplicate, out-of-window or wrong-run receiver
+records and no outer fragmentation. The final policy passes the release
+suite, all 18 serial kernel library tests, Clippy and Rust 1.89 checks.
+These gains do not establish the 20 Gbit/s gate or replace active MTU probing.

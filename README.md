@@ -322,14 +322,15 @@ frame from reaching TAP. Receive expiry starts at the first retained piece and
 does not move when duplicates arrive.
 
 Completed frames are delivered as they become available, without a per-flow
-reorder queue. For unfragmented UDP in sessions with a TAP queue on every worker,
-each reader hashes among its own transmit lanes. This removes measured handoff costs. The hash
-stays stable while TAP queue placement stays stable; Linux queue migration may
+reorder queue. For unfragmented UDP with at most one VLAN tag, in sessions
+with a TAP queue on every worker, each reader hashes among its own transmit
+lanes. This removes measured handoff costs. The hash stays stable while TAP queue placement stays stable; Linux queue migration may
 put later frames of the same flow on another lane and cause reordering.
 A frame's pieces and any future repairs stay on its original lane.
 
-TCP, fragmented IP and other traffic retain strict flow hashing. Sessions
-with fewer TAP queues than global workers also retain strict flow hashing
+Stacked VLANs, TCP, fragmented IP and other traffic retain strict flow hashing.
+Stacked VLAN traffic can concentrate on one TAP queue; hashing it across all
+lanes avoids stranding the other transmit workers. Sessions with fewer TAP queues than global workers also retain strict flow hashing
 across all transmit lanes, so those workers still provide transmit capacity.
 A reader owning no transmit lane also retains hashing and handoffs. Queue and
 lane counts remain independent; peers need not use identical values. eBPF is

@@ -304,7 +304,7 @@ const fn frame_quota(workers: usize) -> usize {
 
 fn tap_lane(frame: &[u8], worker: usize, workers: usize, queues: usize, lanes: usize) -> usize {
     // A session with fewer TAP queues still needs its other transmit workers.
-    if queues < workers || worker >= lanes || !pack::is_udp_flow(frame) {
+    if queues < workers || worker >= lanes || !pack::prefer_local_lane(frame) {
         return pack::flow_hash(frame) as usize % lanes;
     }
     let count = (lanes - 1 - worker) / workers + 1;
@@ -3137,9 +3137,23 @@ mod tests {
             crate::tap::test_common::udp::frame(false, 1, &[7; 22]),
             crate::tap::test_common::udp::frame(true, 1, &[9; 22]),
         ];
+        let stacked: Vec<_> = frames
+            .iter()
+            .map(|frame| {
+                let mut tagged = frame.clone();
+                tagged.splice(12..12, [0x88, 0xa8, 0, 42, 0x81, 0, 0, 7]);
+                tagged
+            })
+            .collect();
         for workers in 1..=64 {
             for lanes in 1..=64 {
                 for worker in 0..workers {
+                    for frame in &stacked {
+                        assert_eq!(
+                            tap_lane(frame, worker, workers, workers, lanes),
+                            pack::flow_hash(frame) as usize % lanes
+                        );
+                    }
                     for frame in &frames {
                         let lane = tap_lane(frame, worker, workers, workers, lanes);
                         assert!(lane < lanes);

@@ -490,8 +490,10 @@ pub fn flow_hash(frame: &[u8]) -> u64 {
     hash.finish()
 }
 
-pub(crate) fn is_udp_flow(frame: &[u8]) -> bool {
-    matches!(flow_key(frame).1, Some((_, 17, ports)) if ports.len() == 4)
+pub(crate) fn prefer_local_lane(frame: &[u8]) -> bool {
+    // Stacked VLAN traffic can enter one TAP queue; spread it across all lanes.
+    let (link, ip) = flow_key(frame);
+    link.len() <= 18 && matches!(ip, Some((_, 17, ports)) if ports.len() == 4)
 }
 
 type IpKey<'a> = (&'a [u8], u8, &'a [u8]);
@@ -585,19 +587,27 @@ mod tests {
     use crate::handshake::{Params, Role, Tag};
 
     #[test]
-    fn only_parseable_unfragmented_udp_flows_use_local_lanes() {
+    fn local_lanes_require_unfragmented_udp_and_at_most_one_tag() {
         for v6 in [false, true] {
             let frame = crate::tap::test_common::udp::frame(v6, 1, &[7; 22]);
-            assert!(is_udp_flow(&frame));
+            assert!(prefer_local_lane(&frame));
             for end in 0..frame.len() {
-                assert!(!is_udp_flow(&frame[..end]));
+                assert!(!prefer_local_lane(&frame[..end]));
             }
             let mut tagged = frame.clone();
             tagged.splice(12..12, [0x81, 0, 0, 7]);
-            assert!(is_udp_flow(&tagged));
+            assert!(prefer_local_lane(&tagged));
+            for outer in [0x8100u16, 0x88a8, 0x9100] {
+                let mut stacked = tagged.clone();
+                stacked.splice(
+                    12..12,
+                    [outer.to_be_bytes()[0], outer.to_be_bytes()[1], 0, 42],
+                );
+                assert!(!prefer_local_lane(&stacked));
+            }
             let mut tcp = frame.clone();
             tcp[if v6 { 20 } else { 23 }] = 6;
-            assert!(!is_udp_flow(&tcp));
+            assert!(!prefer_local_lane(&tcp));
             let mut fragment = frame;
             if v6 {
                 fragment[20] = 44;
@@ -607,7 +617,7 @@ mod tests {
             } else {
                 fragment[20] = 0x20;
             }
-            assert!(!is_udp_flow(&fragment));
+            assert!(!prefer_local_lane(&fragment));
         }
     }
 

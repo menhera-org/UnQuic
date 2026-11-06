@@ -329,10 +329,13 @@ The post-locality profile in BENCH.md records no empty-buffer TAP reads;
 receive/TAP delivery and transmit flushing need finer attribution before
 another optimization. Its improving instrumented pair does not explain the
 remaining declines in uninstrumented repeats.
-Unfragmented UDP now uses the TAP reader's owned lanes when a session has a
-queue on every worker; measured handoff savings justify relaxing pinning there.
-TCP, fragments, other protocols and sessions with fewer queues retain strict
-hashing. TAP queue migration may reorder UDP frames; a frame and its repairs
+Unfragmented UDP with at most one VLAN tag uses the TAP reader's owned lanes
+when a session has a queue on every worker; measured handoff savings justify
+relaxing pinning there.
+Stacked VLANs, TCP, fragments, other protocols and sessions with fewer queues
+retain strict hashing. QinQ measurements show that full-lane hashing improves
+throughput when TAP input concentrates on one queue. TAP queue migration may
+reorder UDP frames; a frame and its repairs
 keep one lane. The expanded benchmark history measures this reordering without
 changing transport storage or admission. See BENCH.md for UDP/TCP comparisons.
 The final throughput gate remains open. Partial completion, GSO/GRO boundaries, MTU errors
