@@ -238,6 +238,9 @@ The pure piece journal reserves mappings before I/O and keeps packet charges
 separate from payload lifetime. It retains mappings after loss for late ACKs;
 ACKs and bounded frame cleanup unlink mappings without scanning other histories.
 It is not yet connected to worker sends or recovery.
+A pure path-group PTO state now provides shared backoff and the three-PTO
+stop/settlement transition. Worker timer ownership, aggregate probe grants and
+loss dispatch remain unconnected.
 
 ACK, handshake and PROBE_REPLY sends share a 4 MiB/s outer-byte ceiling per
 path group, with a burst of sixteen datagrams. Worker zero owns each fixed

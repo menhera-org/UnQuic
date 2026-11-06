@@ -147,6 +147,116 @@ impl Rtt {
     }
 }
 
+/// One path group's PTO expiry, independent of packet/frame retirement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbeTimeoutExpired {
+    /// Aggregate probe allowance across every session and lane in the group.
+    pub probe_limit: u8,
+    /// Start one bounded pass declaring outstanding transmissions lost.
+    pub declare_lost: bool,
+}
+
+/// Shared established-traffic PTO backoff for one sending path group.
+///
+/// RFC 9002 supplies timing/backoff; the three-PTO stop/settlement rule follows
+/// this transport's initial-design.md section 8.3.
+///
+/// The owner serializes this with ACK/loss reports and ordinary byte grants.
+/// A timeout grants at most two probes in total, including liveness/PMTU probes;
+/// workers must not each turn this event into their own allowance. Those probes
+/// remain paced and charged to inflight bytes, even when exceeding the window.
+///
+/// After three expiries without fresh directional feedback, stop ordinary grants
+/// and declare remaining outstanding transmissions lost once. A first matching
+/// PROBE_REPLY clears that silence count; a new ACK of eliciting traffic also
+/// resets the backoff. Duplicate/feedback-only ACKs and payload expiry do neither.
+/// Packet charges remain independent of this timer state.
+#[derive(Debug, Default)]
+pub struct ProbeTimeout {
+    backoff: u32,
+    unanswered: u8,
+    expired_at: Option<Duration>,
+}
+
+impl ProbeTimeout {
+    /// Starts an idle path group with no PTO backoff.
+    pub const fn new() -> Self {
+        Self {
+            backoff: 0,
+            unanswered: 0,
+            expired_at: None,
+        }
+    }
+
+    /// Ordinary transmissions must stop until fresh directional feedback.
+    pub const fn stalled(&self) -> bool {
+        self.unanswered == 3
+    }
+
+    /// Next PTO deadline, or None when idle or the timestamp cannot be represented.
+    ///
+    /// last_sent is the earliest of each outstanding lane's most recent eliciting
+    /// send times. Pass None when no eliciting charge remains. Stalled groups keep
+    /// probing even after their old charges have all been settled.
+    ///
+    /// A failed/deferred probe must not trigger repeated immediate expiry: wait
+    /// one backed-off period after the last expiry before issuing another allowance.
+    pub fn deadline(&self, rtt: &Rtt, last_sent: Option<Duration>) -> Option<Duration> {
+        let sent = match last_sent {
+            Some(sent) => sent,
+            None if self.stalled() => self.expired_at?,
+            None => return None,
+        };
+        sent.max(self.expired_at.unwrap_or(sent))
+            .checked_add(rtt.pto_period(self.backoff))
+    }
+
+    /// Consumes a due PTO once; early/backward polls change nothing.
+    ///
+    /// Time-threshold loss detection takes precedence: service its timer and
+    /// pending bounded loss work before polling PTO. Replace any unissued allowance
+    /// from the previous expiry; allowances must not accumulate. Retain the one-time
+    /// loss instruction until the owner has scheduled its bounded settlement pass.
+    /// This method itself neither sends packets nor releases congestion credit.
+    pub fn expire(
+        &mut self,
+        now: Duration,
+        rtt: &Rtt,
+        last_sent: Option<Duration>,
+    ) -> Option<ProbeTimeoutExpired> {
+        if now < self.deadline(rtt, last_sent)? {
+            return None;
+        }
+        let declare_lost = self.unanswered == 2;
+        self.unanswered = (self.unanswered + 1).min(3);
+        self.backoff = self.backoff.saturating_add(1);
+        self.expired_at = Some(now);
+        Some(ProbeTimeoutExpired {
+            probe_limit: 2,
+            declare_lost,
+        })
+    }
+
+    /// Ends silence on the first validated matching reply to an unanswered probe.
+    ///
+    /// The caller validates connection, lane, packet and size and rejects replay.
+    /// This neither resets PTO backoff nor settles any packet charge.
+    pub fn probe_replied(&mut self) {
+        self.unanswered = 0;
+    }
+
+    /// Resets only on validated, newly acknowledged ACK-eliciting traffic.
+    ///
+    /// A late ACK after loss qualifies even when it releases no remaining charge.
+    /// Cancel unissued probe allowances from prior expiries; already reserved
+    /// grants still require sent/unused reports before their credit can be reused.
+    pub fn acknowledged(&mut self, newly_acked_eliciting: bool) {
+        if newly_acked_eliciting {
+            *self = Self::new();
+        }
+    }
+}
+
 fn weighted(old: Duration, sample: Duration, weight: u128) -> Duration {
     // Duration::MAX * 7 fits u128; averaging before conversion avoids saturation bias.
     from_nanos((old.as_nanos() * weight + sample.as_nanos()) / (weight + 1))

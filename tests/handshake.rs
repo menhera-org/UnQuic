@@ -1178,3 +1178,36 @@ fn bounded_outstanding_scans_allocate_nothing() {
     let count = ALLOCATION_COUNT.replace(None);
     assert_eq!(count, Some(0));
 }
+
+#[test]
+fn shared_probe_timeout_transitions_allocate_nothing() {
+    use unquic::loss::{ProbeTimeout, Rtt};
+    let rtt = Rtt::new();
+    let mut pto = ProbeTimeout::new();
+    ALLOCATION_COUNT.set(Some(0));
+    for _ in 0..10_000 {
+        for second in [1, 3, 7, 15] {
+            let at = Duration::from_secs(second);
+            assert_eq!(
+                pto.expire(at, &rtt, Some(Duration::ZERO))
+                    .unwrap()
+                    .probe_limit,
+                2
+            );
+            assert_eq!(pto.expire(at, &rtt, Some(Duration::ZERO)), None);
+        }
+        assert!(pto.stalled());
+        pto.acknowledged(false);
+        assert!(pto.stalled());
+        pto.probe_replied();
+        assert!(!pto.stalled());
+        assert_eq!(
+            pto.deadline(&rtt, Some(Duration::ZERO)),
+            Some(Duration::from_secs(31))
+        );
+        pto.acknowledged(true);
+        assert_eq!(pto.deadline(&rtt, None), None);
+    }
+    let count = ALLOCATION_COUNT.replace(None);
+    assert_eq!(count, Some(0));
+}

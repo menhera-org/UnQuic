@@ -120,3 +120,207 @@ fn weighted_estimates_preserve_fractional_nanoseconds_without_early_rounding() {
     assert_eq!(rtt.smoothed(), ns(8));
     assert_eq!(rtt.variance(), ns(4));
 }
+
+#[test]
+fn shared_pto_backs_off_caps_each_allowance_and_declares_loss_once() {
+    use unquic::loss::{ProbeTimeout, ProbeTimeoutExpired};
+    let rtt = Rtt::new();
+    let mut pto = ProbeTimeout::new();
+    let sec = Duration::from_secs;
+    assert_eq!(pto.deadline(&rtt, None), None);
+    assert_eq!(pto.expire(Duration::MAX, &rtt, None), None);
+    let mut outstanding = Some(sec(0));
+    for (count, at) in [1, 3, 7, 15, 31].into_iter().enumerate() {
+        assert_eq!(pto.deadline(&rtt, outstanding), Some(sec(at)));
+        assert_eq!(pto.expire(sec(at) - us(1), &rtt, outstanding), None);
+        assert_eq!(
+            pto.expire(sec(at), &rtt, outstanding),
+            Some(ProbeTimeoutExpired {
+                probe_limit: 2,
+                declare_lost: count == 2
+            })
+        );
+        assert_eq!(pto.expire(sec(at), &rtt, outstanding), None);
+        assert_eq!(pto.expire(sec(0), &rtt, outstanding), None);
+        assert_eq!(pto.stalled(), count >= 2);
+        if count == 2 {
+            // Packet settlement may finish over several turns, without new sends.
+            outstanding = None;
+        }
+    }
+    assert!(pto.stalled());
+    pto.acknowledged(false);
+    assert_eq!(pto.deadline(&rtt, None), Some(sec(63)));
+    assert!(pto.stalled());
+    pto.acknowledged(true);
+    assert!(!pto.stalled());
+    assert_eq!(pto.deadline(&rtt, None), None);
+    assert_eq!(pto.deadline(&rtt, Some(sec(40))), Some(sec(41)));
+}
+
+#[test]
+fn hot_lanes_do_not_hide_the_earliest_outstanding_lane_or_multiply_pto() {
+    use unquic::loss::ProbeTimeout;
+    let rtt = Rtt::new();
+    let mut pto = ProbeTimeout::new();
+    let sec = Duration::from_secs;
+    let mut lanes = [Some(sec(0)), Some(sec(1)), None, Some(sec(2))];
+    let earliest = |lanes: &[Option<Duration>]| lanes.iter().flatten().copied().min();
+    assert_eq!(pto.deadline(&rtt, earliest(&lanes)), Some(sec(1)));
+    lanes[3] = Some(sec(10));
+    assert_eq!(pto.deadline(&rtt, earliest(&lanes)), Some(sec(1)));
+    let mut allowance = 0;
+    for _ in 0..lanes.len() {
+        allowance += pto
+            .expire(sec(1), &rtt, earliest(&lanes))
+            .map_or(0, |e| e.probe_limit);
+    }
+    assert_eq!(allowance, 2);
+    lanes[0] = Some(sec(1));
+    assert_eq!(pto.deadline(&rtt, earliest(&lanes)), Some(sec(3)));
+    // Acknowledged/lost lanes stop contributing, but replacement does not reset the group.
+    lanes[0] = None;
+    lanes[1] = None;
+    assert_eq!(pto.deadline(&rtt, earliest(&lanes)), Some(sec(12)));
+    lanes[2] = Some(sec(2));
+    assert_eq!(pto.deadline(&rtt, earliest(&lanes)), Some(sec(4)));
+}
+
+#[test]
+fn stalled_pto_recovery_uses_new_acks_even_when_their_charge_was_lost() {
+    use unquic::{
+        ack::History,
+        loss::ProbeTimeout,
+        wire::{AckRange, AckRanges},
+    };
+    let mut history = History::new().unwrap();
+    history.reserve(1, 1500, true, true).unwrap();
+    assert!(history.submit(1, Duration::ZERO));
+    let rtt = Rtt::new();
+    let mut pto = ProbeTimeout::new();
+    for at in [1, 3, 7] {
+        let event = pto
+            .expire(Duration::from_secs(at), &rtt, Some(Duration::ZERO))
+            .unwrap();
+        if event.declare_lost {
+            assert_eq!(history.lose(1).unwrap().outer_bytes, 1500);
+        }
+    }
+    assert!(pto.stalled());
+    assert_eq!(history.inflight_bytes(), 0);
+    // Feedback-only delivery cannot reopen ordinary sends.
+    history.reserve(2, 100, false, false).unwrap();
+    assert!(history.submit(2, Duration::from_secs(8)));
+    let ranges = [AckRange { start: 2, end: 2 }];
+    let ack = history
+        .acknowledge(AckRanges::new(&ranges).unwrap(), |_| {})
+        .unwrap();
+    pto.acknowledged(ack.eliciting);
+    assert!(pto.stalled());
+    let ranges = [AckRange { start: 1, end: 2 }];
+    let ack = history
+        .acknowledge(AckRanges::new(&ranges).unwrap(), |_| {})
+        .unwrap();
+    assert_eq!(ack.packets, 1);
+    assert_eq!(ack.released_bytes, 0);
+    pto.acknowledged(ack.eliciting);
+    assert!(!pto.stalled());
+    assert_eq!(pto.deadline(&rtt, None), None);
+    // A duplicate cannot reset an independently started later PTO sequence.
+    pto.expire(Duration::from_secs(10), &rtt, Some(Duration::from_secs(9)))
+        .unwrap();
+    let ack = history
+        .acknowledge(AckRanges::new(&ranges).unwrap(), |_| {})
+        .unwrap();
+    pto.acknowledged(ack.eliciting);
+    assert_eq!(
+        pto.deadline(&rtt, Some(Duration::from_secs(9))),
+        Some(Duration::from_secs(12))
+    );
+}
+
+#[test]
+fn pto_uses_current_rtt_and_does_not_catch_up_expiries_after_a_long_stall() {
+    use unquic::loss::ProbeTimeout;
+    let mut rtt = Rtt::new();
+    let mut pto = ProbeTimeout::new();
+    let sec = Duration::from_secs;
+    // One late timer service produces one allowance, never an accumulated burst.
+    let event = pto.expire(sec(100), &rtt, Some(Duration::ZERO)).unwrap();
+    assert!(!event.declare_lost);
+    assert_eq!(event.probe_limit, 2);
+    assert_eq!(pto.deadline(&rtt, Some(Duration::ZERO)), Some(sec(102)));
+    assert!(rtt.sample(sec(100), sec(100) + us(4500), 0));
+    pto.acknowledged(true);
+    assert_eq!(
+        pto.deadline(&rtt, Some(sec(100))),
+        Some(sec(100) + us(14_500))
+    );
+    assert_eq!(pto.expire(sec(100), &rtt, Some(sec(100))), None);
+    assert!(
+        pto.expire(sec(100) + us(14_500), &rtt, Some(sec(100)))
+            .is_some()
+    );
+    // Successful probes shift the next deadline; failed ones leave the expiry floor.
+    assert_eq!(
+        pto.deadline(&rtt, Some(sec(100) + us(15_000))),
+        Some(sec(100) + us(44_000))
+    );
+    assert_eq!(
+        pto.deadline(&rtt, Some(sec(100))),
+        Some(sec(100) + us(43_500))
+    );
+    assert_eq!(pto.deadline(&rtt, None), None);
+}
+
+#[test]
+fn pto_deadline_overflow_is_disarmed_and_backoff_never_wraps() {
+    use unquic::loss::ProbeTimeout;
+    let rtt = Rtt::new();
+    let mut pto = ProbeTimeout::new();
+    assert_eq!(pto.deadline(&rtt, Some(Duration::MAX)), None);
+    assert_eq!(pto.expire(Duration::MAX, &rtt, Some(Duration::MAX)), None);
+    let mut now = Duration::ZERO;
+    let mut count = 0;
+    while let Some(deadline) = pto.deadline(&rtt, Some(now)) {
+        assert!(deadline > now);
+        let event = pto.expire(deadline, &rtt, Some(now)).unwrap();
+        count += 1;
+        assert!(count <= 64);
+        assert_eq!(event.declare_lost, count == 3);
+        now = deadline;
+    }
+    assert!(pto.stalled());
+    assert_eq!(pto.expire(Duration::MAX, &rtt, Some(now)), None);
+}
+
+#[test]
+fn fresh_probe_replies_clear_silence_without_resetting_backoff() {
+    use unquic::loss::ProbeTimeout;
+    let rtt = Rtt::new();
+    let mut pto = ProbeTimeout::new();
+    let sec = Duration::from_secs;
+    let last_sent = Some(Duration::ZERO);
+    for at in [1, 3, 7, 15] {
+        let event = pto.expire(sec(at), &rtt, last_sent).unwrap();
+        assert!(!event.declare_lost);
+        let before = pto.deadline(&rtt, last_sent);
+        pto.probe_replied();
+        assert!(!pto.stalled());
+        assert_eq!(pto.deadline(&rtt, last_sent), before);
+    }
+    for (count, at) in [31, 63, 127].into_iter().enumerate() {
+        let event = pto.expire(sec(at), &rtt, last_sent).unwrap();
+        assert_eq!(event.declare_lost, count == 2);
+    }
+    assert!(pto.stalled());
+    assert_eq!(pto.deadline(&rtt, None), Some(sec(255)));
+    pto.probe_replied();
+    assert!(!pto.stalled());
+    assert_eq!(pto.deadline(&rtt, last_sent), Some(sec(255)));
+    assert_eq!(pto.deadline(&rtt, None), None);
+    // Ordinary traffic may resume, with its new sends retaining the existing backoff.
+    assert_eq!(pto.deadline(&rtt, Some(sec(128))), Some(sec(256)));
+    pto.acknowledged(true);
+    assert_eq!(pto.deadline(&rtt, Some(sec(128))), Some(sec(129)));
+}

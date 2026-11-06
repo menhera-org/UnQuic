@@ -468,8 +468,17 @@ control remain pending; README.md documents probe feedback and send-error handli
 
 The pure RTT estimator, loss-deadline calculation, PTO-period backoff and frame
 lifetime now live in `loss.rs`, with exact-value and boundary tests. ACK-driven
-updates, history integration, timer ownership and the shared two-probe/three-PTO policy
-still need integration; this does not complete the loss-detection step.
+updates, history integration and timer ownership still need integration.
+The pure shared PTO state now limits each expiry to two aggregate probe
+permissions, backs off across lanes and requests one loss-declaration pass on
+the third unanswered expiry. It then stops ordinary grants and keeps backed-off
+probes running until fresh directional feedback. A first matching probe reply
+clears the silence count; only a new ACK of eliciting traffic resets backoff.
+Tests cover multiple lanes, deferred probes, fresh probe replies,
+late/duplicate/feedback-only ACKs, long pauses,
+overflow and allocation-free transitions. Runtime grant/allowance enforcement,
+loss-pass dispatch and liveness/PMTU probe gating remain unfinished; this does
+not complete the loss-detection step.
 
 Pure per-frame byte coverage now lives in `loss::FrameRecovery`, with two-repair
 limits, outstanding-generation checks, late ACK handling and bounded slot reuse.
