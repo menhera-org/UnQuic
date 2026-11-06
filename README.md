@@ -355,9 +355,10 @@ These conservative reservations can reject large configurations before startup.
 Fixed receive storage permits at most 4096 frames and 36,954,112 reserved frame
 bytes per session, below the 8192-frame/64-MiB directional ceilings. Transmit
 reservations divide the frame and 64-MiB byte budgets among the union of the
-session's TAP readers and transmit owners. Each worker preallocates 8192 frame
-views shared across its sessions and source metadata for its 128 pool
-buffers. A view holds a rewritten header of at most 128 bytes and a range in
+session's TAP readers and transmit owners. Each worker preallocates the sum
+of its participating sessions' frame quotas, capped at 8192 shared views,
+plus source metadata for its 128 pool buffers. Workers outside a session's
+TAP/transmit ownership set reserve no views for that session. A view holds a rewritten header of at most 128 bytes and a range in
 a retained source. Larger headers use the ordinary-frame copy path. Sources
 and views both consume frame credits; headers and queue links are included in
 the startup memory reservation.

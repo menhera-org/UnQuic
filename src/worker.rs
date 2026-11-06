@@ -300,6 +300,23 @@ const fn frame_quota(workers: usize) -> usize {
     frames::CAPACITY / workers
 }
 
+// A worker can retain frames only for sessions where it reads TAP or owns TX lanes.
+fn frame_capacity(config: &crate::config::Config, workers: usize, id: usize) -> Option<usize> {
+    if workers == 0 || id >= workers {
+        return None;
+    }
+    config.sessions.iter().try_fold(0_usize, |slots, session| {
+        let peer = config.peers.iter().find(|peer| peer.name == session.peer)?;
+        let owners = session.queue_count.max(peer.tx_lanes.min(workers));
+        let quota = frames::CAPACITY.checked_div(owners)?;
+        Some(if id < owners {
+            slots.saturating_add(quota).min(frames::CAPACITY)
+        } else {
+            slots
+        })
+    })
+}
+
 fn tap_lane(frame: &[u8], worker: usize, workers: usize, queues: usize, lanes: usize) -> usize {
     // A session with fewer TAP queues still needs its other transmit workers.
     if queues < workers || worker >= lanes || !pack::prefer_local_lane(frame) {
@@ -575,7 +592,6 @@ impl Worker {
     pub fn storage_bytes(config: &crate::config::Config, workers: usize) -> Option<usize> {
         let mut per_worker = size_of::<Self>()
             .checked_add(crate::tap::Reader::storage_bytes()?)?
-            .checked_add(frames::Store::storage_bytes())?
             .checked_add(
                 feedback::BUFFERS
                     * (size_of::<feedback::Feedback>() + size_of::<Box<feedback::Feedback>>()),
@@ -631,8 +647,14 @@ impl Worker {
                         + size_of::<Snapshot>(),
                 )?)?;
         }
+        let frame_storage = (0..workers).try_fold(0_usize, |bytes, id| {
+            bytes.checked_add(frames::Store::storage_bytes(frame_capacity(
+                config, workers, id,
+            )?))
+        })?;
         per_worker
             .checked_mul(workers)?
+            .checked_add(frame_storage)?
             .checked_add(batches)?
             .checked_add(
                 config
@@ -852,7 +874,9 @@ impl Worker {
             feedback_retry: Duration::ZERO,
             free,
             returns: (0..count).map(|_| Vec::with_capacity(BUFFERS)).collect(),
-            frames: frames::Store::new(),
+            frames: frames::Store::new(
+                frame_capacity(config, count, id).ok_or(io::ErrorKind::InvalidInput)?,
+            )?,
             received: VecDeque::with_capacity(count * BUFFERS),
             ready: VecDeque::with_capacity(batch_count),
             notifications: 0,
@@ -4922,6 +4946,64 @@ mod tests {
                 [AckRange { start: 1, end: 66 }]
             );
         }
+    }
+
+    #[test]
+    fn frame_storage_follows_each_sessions_actual_owners() {
+        use crate::config::{Config, Peer, Session};
+        let mut config = Config::default();
+        assert_eq!(frame_capacity(&config, 8, 0), Some(0));
+        assert_eq!(frame_capacity(&config, 0, 0), None);
+        assert_eq!(frame_capacity(&config, 8, 8), None);
+        config.peers.push(Peer {
+            name: "peer".into(),
+            endpoint: "ep".into(),
+            address: None,
+            peer_port: 40000,
+            scope_id: 0,
+            tx_lanes: 1,
+            outer_payload_limit: 8952,
+            path_group: None,
+        });
+        config.sessions.push(Session {
+            name: "tap".into(),
+            peer: "peer".into(),
+            cookie: crate::UnquicUuid::from_bytes([1; 16]),
+            tap_name: None,
+            inner_mtu: 1500,
+            mac: None,
+            queue_count: 1,
+        });
+        for workers in [1, 2, 8, 64] {
+            for queues in [1, workers] {
+                for lanes in [1, 3, 64] {
+                    config.peers[0].tx_lanes = lanes;
+                    config.sessions[0].queue_count = queues;
+                    let owners = queues.max(lanes.min(workers));
+                    let expected = frames::CAPACITY / owners;
+                    for id in 0..workers {
+                        assert_eq!(
+                            frame_capacity(&config, workers, id),
+                            Some(if id < owners { expected } else { 0 })
+                        );
+                    }
+                    // Another session contributes only its own quota, up to the pool cap.
+                    let mut second = config.sessions[0].clone();
+                    second.queue_count = workers;
+                    config.sessions.push(second);
+                    for id in 0..workers {
+                        let first = if id < owners { expected } else { 0 };
+                        assert_eq!(
+                            frame_capacity(&config, workers, id),
+                            Some((first + frames::CAPACITY / workers).min(frames::CAPACITY))
+                        );
+                    }
+                    config.sessions.pop();
+                }
+            }
+        }
+        config.peers.clear();
+        assert_eq!(frame_capacity(&config, 8, 0), None);
     }
 
     #[test]

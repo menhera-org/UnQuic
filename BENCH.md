@@ -25,6 +25,9 @@ The rate sweeps below precede runtime packet-ACK emission and the shared
 control queue. The ACK-enabled release passes forwarding/restart and allocation
 checks, plus control-pressure and stale-feedback regression tests. Its rate
 sweeps, CPU overhead and overload behavior have not yet been measured.
+Frame-view allocations now follow actual per-worker quotas instead of reserving
+8192 slots on every worker. This reduces reserved metadata; it does not establish
+a goodput gain or change the session retention limits.
 
 The latest storage/batching results below use eight workers per daemon,
 16 flows per direction, 500-entry TAP queues, and a 1452-byte outer UDP cap.

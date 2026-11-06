@@ -472,7 +472,10 @@ Word masks are checked against a byte model and allocation instrumentation.
 The packer can select exact missing ranges while retaining original frame lengths
 and identities. Tests cover header/payload boundaries, partial submissions and
 completion after an original piece and its first repair are both lost.
-Allocate this state against actual frame quotas when wiring packet mappings,
+Frame-view storage now follows each worker's actual session quotas, capped at
+8192 shared slots; startup accounting uses the same calculation. Tests cover
+unequal queue/lane counts, multiple sessions, empty stores and slot recycling.
+Allocate recovery state against those slots when wiring packet mappings,
 payload retention and worker repair sends; none of those is connected yet.
 
 - `ack.rs`: ACK scheduling (16 packets or 1 ms, immediate on gap), at most

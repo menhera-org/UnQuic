@@ -119,20 +119,23 @@ pub(super) struct Store {
 }
 
 impl Store {
-    pub const fn storage_bytes() -> usize {
+    pub const fn storage_bytes(capacity: usize) -> usize {
         BUFFERS * (size_of::<Option<Source>>() + size_of::<usize>())
-            + CAPACITY * (size_of::<Option<Frame>>() + 2 * size_of::<usize>())
+            + capacity * (size_of::<Option<Frame>>() + 2 * size_of::<usize>())
     }
 
-    pub fn new() -> Self {
+    pub fn new(capacity: usize) -> io::Result<Self> {
+        if capacity > CAPACITY {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
         let sources = BUFFERS;
-        Self {
+        Ok(Self {
             sources: std::iter::repeat_with(|| None).take(sources).collect(),
             free_sources: (0..sources).rev().collect(),
-            frames: std::iter::repeat_with(|| None).take(CAPACITY).collect(),
-            free_frames: (0..CAPACITY).rev().collect(),
-            links: vec![UNQUEUED; CAPACITY],
-        }
+            frames: std::iter::repeat_with(|| None).take(capacity).collect(),
+            free_frames: (0..capacity).rev().collect(),
+            links: vec![UNQUEUED; capacity],
+        })
     }
 
     pub fn available(&self) -> usize {
@@ -307,8 +310,20 @@ mod tests {
     }
 
     #[test]
+    fn empty_store_and_oversized_reservation_do_not_create_frame_slots() {
+        assert!(Store::new(CAPACITY + 1).is_err());
+        let mut store = Store::new(0).unwrap();
+        let source = store.insert_source(buffer(60)).ok().unwrap();
+        assert_eq!(store.available(), 0);
+        assert!(store.insert_frame(frame(source, 0..60, 1)).is_none());
+        assert!(store.unpin(source).is_some());
+        assert!(store.frames.is_empty());
+        assert!(store.links.is_empty());
+    }
+
+    #[test]
     fn interleaved_queues_preserve_order_and_recycled_indices() {
-        let mut store = Store::new();
+        let mut store = Store::new(CAPACITY).unwrap();
         let source = store.insert_source(buffer(60)).ok().unwrap();
         let mut a = Queue::default();
         let mut b = Queue::default();
@@ -353,7 +368,7 @@ mod tests {
 
     #[test]
     fn queue_capacity_operations_change_only_head_and_tail_links() {
-        let mut store = Store::new();
+        let mut store = Store::new(CAPACITY).unwrap();
         let source = store.insert_source(buffer(60)).ok().unwrap();
         let mut queue = Queue::default();
         for id in 1..CAPACITY {
@@ -399,12 +414,15 @@ mod tests {
 
     #[test]
     fn source_pins_and_frame_references_bound_capacity_and_recycle_once() {
-        for close_first in [false, true] {
-            let mut store = Store::new();
+        for (capacity, close_first) in [1, 17, CAPACITY]
+            .into_iter()
+            .flat_map(|capacity| [false, true].map(|close_first| (capacity, close_first)))
+        {
+            let mut store = Store::new(capacity).unwrap();
             let source = store.insert_source(buffer(60)).ok().unwrap();
             let pointer = store.source(source).unwrap().bytes.as_ptr();
             let mut ids = Vec::new();
-            for id in 1..=CAPACITY {
+            for id in 1..=capacity {
                 ids.push(store.insert_frame(frame(source, 0..60, id as u64)).unwrap());
             }
             assert_eq!(store.available(), 0);
@@ -412,11 +430,11 @@ mod tests {
             if close_first {
                 assert!(store.unpin(source).is_none());
             }
-            for index in ids[..CAPACITY - 1].iter().rev() {
+            for index in ids[..capacity - 1].iter().rev() {
                 assert!(store.release(*index).is_none());
                 assert!(store.release(*index).is_none());
             }
-            let last = ids[CAPACITY - 1];
+            let last = ids[capacity - 1];
             assert_eq!(store.input(last).unwrap().bytes.as_ptr(), pointer);
             let released = store.release(last);
             let released = if close_first {
@@ -427,7 +445,7 @@ mod tests {
             }
             .unwrap();
             assert_eq!(released.bytes.as_ptr(), pointer);
-            assert_eq!(store.available(), CAPACITY);
+            assert_eq!(store.available(), capacity);
             assert_eq!(store.free_sources.len(), BUFFERS);
             assert!(store.unpin(source).is_none());
         }
@@ -435,7 +453,7 @@ mod tests {
 
     #[test]
     fn slabs_preserve_each_deadline_and_charge_dead_ranges_until_recycling() {
-        let mut store = Store::new();
+        let mut store = Store::new(CAPACITY).unwrap();
         let input = store.insert_source(buffer(MAX_FRAME_LEN)).ok().unwrap();
         let slab = store.insert_source(buffer(0)).ok().unwrap();
         let mut ids = Vec::new();

@@ -625,6 +625,8 @@ reservations. Workers now pack multiple frames per datagram and retain batches
 through partial sends. Metadata uses frame indices/ranges without payload copies
 or self-references; expiry preserves live frames and quiescence drains batches.
 The socket API gathers original slices within a fixed descriptor budget.
+Each worker's frame-view allocation follows its participating session quotas,
+with the existing 8192-view ceiling shared across sessions.
 Generated sequences, small-frame bursts and partial batches have regression tests.
 A ten-second bidirectional TAP storm checks observed packing, integrity, duplicate
 suppression and zero allocations/deallocations, while reporting drops. BENCH.md
