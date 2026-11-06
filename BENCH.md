@@ -2,13 +2,13 @@
 
 The original receive-admission collapse and a later TAP readiness busy loop
 are fixed. Bounded UDP super-frame input and conditional worker-local lanes
-now deliver 17.69 / 16.25 Gbit/s paced and 17.95 / 17.07 unlimited in the
-latest eight-worker pair, using 500-entry test TAP queues. Strict-pinning
-controls deliver about 15.2 / 11.5–11.7 Gbit/s with the same queue size.
-Earlier local-lane repeats still decline by 2–3% in one direction; 10,000-entry
-queues produce larger declines. Overload stability remains unresolved.
+deliver 16.57 / 15.60 Gbit/s paced and 16.50 / 16.45 unlimited in the latest
+60-second eight-worker pair, using 500-entry test TAP queues. A preceding
+20-second pair reached 17.95 / 17.07 unlimited. The longer run still declines
+0.45% in one direction; earlier short repeats declined 2–3%, and 10,000-entry
+queues produced larger declines. Overload stability remains unresolved.
 
-These short sweeps do not establish a plateau for every workload or the
+These sweeps do not establish a plateau for every workload or the
 theoretical CPU ceiling. Neither the local **20 Gbit/s in each direction**
 gate nor the real **5 Gbit/s under loss** gate has passed.
 Split-pool, deadline-cache and first-reader lane-association trials were rejected
@@ -31,8 +31,8 @@ L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | The UDP-only local-lane build delivers 17.95 / 17.07 Gbit/s unlimited with eight workers and 500-entry test TAP queues, from 32.05 / 31.69 Gbit/s offered | Still about 1.11× / 1.17× short in this pair. TCP super-frame input remains unfinished. |
-| Goodput must plateau under excess traffic | The latest UDP-only pair improves in both directions, but preceding local-lane repeats still decline | Shorter test queues reduce the long tail but do not establish a plateau: earlier left-side repeats lose 2–3%. With 10,000-entry queues, one pair loses 8.3%. Longer runs, mixed traffic and more flows/sessions remain unverified. |
+| At least 20 Gbit/s each way at inner MTU 1500 | The UDP-only local-lane build delivers 16.50 / 16.45 Gbit/s unlimited over 60 seconds with eight workers and 500-entry test TAP queues, from 28.39 / 27.71 Gbit/s offered; a prior 20-second pair reached 17.95 / 17.07 | Still about 1.21× / 1.22× short in the longer pair. TCP super-frame input remains unfinished. |
+| Goodput must plateau under excess traffic | The 60-second UDP-only pair declines 0.45% L→R under unlimited load | Shorter test queues reduce the long tail but do not establish a plateau: earlier left-side repeats lose 2–3%. With 10,000-entry queues, one pair loses 8.3%. Repeated longer runs, tagged/mixed traffic and more flows/sessions remain unverified. |
 | Small-frame overload must remain efficient | The UDP-only local-lane build delivers 6.05M / 6.08M 64-byte frames/s with eight workers | The local-lane paced/unlimited sweep improves under overload, with high loss. Mixed and non-coalescible traffic still need coverage. |
 | VLAN-heavy deployment | Current throughput sweeps use untagged IP frames. Input UDP segmentation and lane selection parse VLAN tags, but TAP output UDP coalescing currently accepts only untagged IPv4/IPv6 | Tagged frames take the ordinary output path. Benchmark 802.1Q and QinQ as primary workloads and extend checked coalescing before claiming representative throughput. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
@@ -41,7 +41,7 @@ L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
 
 Loss under unlimited load is still high: the latest UDP-only eight-worker
-MTU-1500 point misses 43.44% / 45.62% of offered frames despite zero
+60-second MTU-1500 point misses 41.71% / 40.45% of offered frames despite zero
 admission pressure and worker queue drops. TAP ingress drops, outer socket overflows
 and inner UDP receive-buffer errors are recorded. Their different units prevent
 an exact frame-loss decomposition.
@@ -1714,3 +1714,30 @@ Receive/TAP delivery and transmit flushing warrant finer profiling; their
 combined stage times do not identify an individual function or establish a
 CPU ceiling. No speculative optimization or timing instrumentation is retained
 in production.
+
+### Sixty-second production follow-up
+
+The tested production binary, without profiling instrumentation, ran one
+60-second paced/unlimited pair with the same eight-worker placement,
+16 flows each way and 500-entry test TAP queues.
+[Full counters and receiver samples](benches/tap-local-lanes-60s.json)
+retain both points. These frames are untagged; VLAN performance is still unmeasured.
+
+| Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 21 | 20.858 / 20.760 | 16.573 / 15.597 | 20.34 / 24.66 | 553.4 / 551.9 |
+| unlimited | 28.388 / 27.707 | 16.497 / 16.453 | 41.71 / 40.45 | 722.5 / 715.2 |
+
+L→R declines 0.45% while R→L improves 5.48%. This single pair does not
+establish whether the small decline is repeatable or measurement variation.
+It also does not establish the required plateau or throughput gate.
+
+| Request | TAP TX drops (SKBs) | Transport socket overflow (SKBs) | Inner UDP errors | Expired frames |
+| --- | ---: | ---: | ---: | ---: |
+| 21 Gbit/s | 234894 / 173263 | 1135346 / 726146 | 35946 / 20926 | 65 / 2 |
+| unlimited | 717894 / 600380 | 1998071 / 1751411 | 175616 / 451379 | 11 / 36 |
+
+Admission pressure and worker queue drops remain zero. Invalid, duplicate,
+out-of-window and wrong-run receiver records and outer fragmentation counters
+are zero. Higher CPU and socket/TAP drops accompany overload; the counters
+do not prove which cost causes the remaining decline.
