@@ -9,12 +9,14 @@ use crate::{
     sys::{cvt, invalid, udp_socket},
 };
 use std::{
+    cell::Cell,
     ffi::{CStr, CString},
     io,
     mem::{MaybeUninit, size_of, zeroed},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket},
     os::fd::{AsFd, AsRawFd, BorrowedFd},
     sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
 
 /// Maximum number of logical datagrams in one batched syscall.
@@ -475,11 +477,34 @@ impl TransmitSocket {
     /// Each call submits at most 1024 slices, possibly shortening the batch.
     /// A single datagram with more slices is rejected before any submission.
     pub fn send_batch(&self, datagrams: &[SendDatagram<'_>], limit: usize) -> io::Result<usize> {
+        self.send_batch_checked(datagrams, limit, || Ok(Duration::ZERO))
+            .map(|(sent, _)| sent)
+    }
+
+    /// Checks permission and captures time immediately before each nonblocking syscall.
+    ///
+    /// The callback runs after validation and message construction, including on
+    /// an ordinary-send retry after GSO failure. Return an error to prevent that
+    /// attempt. Callback errors never change the learned GSO capability.
+    /// The returned timestamp belongs only to the successful packet prefix.
+    /// Use it for sent history; a post-syscall timestamp can be later than an ACK.
+    pub fn send_batch_checked(
+        &self,
+        datagrams: &[SendDatagram<'_>],
+        limit: usize,
+        mut before: impl FnMut() -> io::Result<Duration>,
+    ) -> io::Result<(usize, Duration)> {
         let gso = self.gso_enabled();
-        match send_batch(self.socket.as_fd(), datagrams, limit, gso) {
-            Err(error) if gso && offload_unavailable(&error) => {
+        let attempted = Cell::new(false);
+        let mut check = || {
+            let at = before()?;
+            attempted.set(true);
+            Ok(at)
+        };
+        match send_batch(self.socket.as_fd(), datagrams, limit, gso, &mut check) {
+            Err(error) if attempted.get() && gso && offload_unavailable(&error) => {
                 self.gso.store(false, Ordering::Relaxed);
-                send_batch(self.socket.as_fd(), datagrams, limit, false)
+                send_batch(self.socket.as_fd(), datagrams, limit, false, &mut check)
             }
             result => result,
         }
@@ -531,7 +556,8 @@ fn send_batch(
     datagrams: &[SendDatagram<'_>],
     limit: usize,
     gso: bool,
-) -> io::Result<usize> {
+    mut before: impl FnMut() -> io::Result<Duration>,
+) -> io::Result<(usize, Duration)> {
     if datagrams.is_empty()
         || datagrams.len() > BATCH_SIZE
         || !(BASE_UDP_PAYLOAD..=MAX_UDP_PAYLOAD).contains(&limit)
@@ -610,6 +636,7 @@ fn send_batch(
         count += 1;
         first = end;
     }
+    let at = before()?;
     // SAFETY: each header borrows live datagram slices and aligned ancillary
     // storage. All referenced iovecs were initialized above; unused slots are
     // outside msg_iovlen. The kernel reads payloads and writes only message lengths.
@@ -621,7 +648,7 @@ fn send_batch(
             (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as _,
         )
     })? as usize;
-    Ok(if sent == 0 { 0 } else { ends[sent - 1] })
+    Ok((if sent == 0 { 0 } else { ends[sent - 1] }, at))
 }
 
 /// Receives up to BATCH_SIZE entries from a borrowed UDP socket without blocking.
@@ -964,6 +991,121 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
+    }
+
+    #[test]
+    fn checked_batch_returns_successful_attempt_time_including_gso_fallback() {
+        for fallback in [false, true] {
+            let rx = receiver();
+            let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
+            if fallback {
+                set_int(&tx.socket, libc::IPPROTO_UDP, libc::UDP_NO_CHECK6_TX, 1).unwrap();
+                set_int(&rx.socket, libc::IPPROTO_UDP, libc::UDP_NO_CHECK6_RX, 1).unwrap();
+            }
+            let outgoing = [SendDatagram {
+                parts: &[&[7; BASE_UDP_PAYLOAD]],
+            }; 2];
+            let mut calls = 0;
+            let (sent, at) = tx
+                .send_batch_checked(&outgoing, BASE_UDP_PAYLOAD, || {
+                    calls += 1;
+                    Ok(Duration::from_micros(calls))
+                })
+                .unwrap();
+            assert_eq!(sent, 2);
+            assert_eq!(calls, if fallback { 2 } else { 1 });
+            assert_eq!(at, Duration::from_micros(calls));
+            assert_eq!(tx.gso_enabled(), !fallback);
+            for _ in 0..2 {
+                let mut bytes = [0; BASE_UDP_PAYLOAD];
+                assert_eq!(rx.recv(&mut bytes).unwrap().0, BASE_UDP_PAYLOAD);
+                assert!(bytes.iter().all(|byte| *byte == 7));
+            }
+        }
+    }
+
+    #[test]
+    fn checked_batch_does_not_submit_or_disable_gso_on_callback_failure() {
+        let rx = receiver();
+        let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
+        let outgoing = [SendDatagram {
+            parts: &[b"payload"],
+        }; 2];
+        for errno in [libc::EINVAL, libc::EIO, libc::EAGAIN] {
+            let mut calls = 0;
+            let error = tx
+                .send_batch_checked(&outgoing, BASE_UDP_PAYLOAD, || {
+                    calls += 1;
+                    Err(io::Error::from_raw_os_error(errno))
+                })
+                .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+            assert_eq!(calls, 1);
+            assert!(tx.gso_enabled());
+        }
+        assert!(
+            tx.send_batch_checked(&[], BASE_UDP_PAYLOAD, || panic!(
+                "invalid input must not reach the callback"
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            rx.recv(&mut [0; 32]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn grant_expiring_between_gso_failure_and_plain_retry_prevents_submission() {
+        use crate::pacing::{Grants, Limits};
+        let rx = receiver();
+        let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
+        set_int(&tx.socket, libc::IPPROTO_UDP, libc::UDP_NO_CHECK6_TX, 1).unwrap();
+        set_int(&rx.socket, libc::IPPROTO_UDP, libc::UDP_NO_CHECK6_RX, 1).unwrap();
+        let mut grants = Grants::new(1).unwrap();
+        let grant = grants
+            .reserve(
+                0,
+                2560,
+                false,
+                Limits {
+                    window: 12800,
+                    rate: 1_000_000,
+                    quantum: 2560,
+                    max_datagram: 1280,
+                },
+                Duration::ZERO,
+            )
+            .unwrap();
+        let outgoing = [SendDatagram {
+            parts: &[&[7; BASE_UDP_PAYLOAD]],
+        }; 2];
+        let mut calls = 0;
+        let error = tx
+            .send_batch_checked(&outgoing, BASE_UDP_PAYLOAD, || {
+                let at = if calls == 0 {
+                    Duration::ZERO
+                } else {
+                    grant.expires()
+                };
+                calls += 1;
+                if grant.valid_at(at) {
+                    Ok(at)
+                } else {
+                    Err(io::ErrorKind::WouldBlock.into())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(calls, 2);
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(!tx.gso_enabled()); // A real capability failure preceded the rejected retry.
+        assert_eq!(
+            rx.recv(&mut [0; BASE_UDP_PAYLOAD]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(grants.reserved(), 2560);
+        grants.reported(grant, 0, None).unwrap();
+        assert_eq!((grants.reserved(), grants.in_flight()), (0, 0));
     }
 
     #[test]
@@ -1350,7 +1492,16 @@ mod tests {
         let mut sent = 0;
         let mut calls = 0;
         while sent < BATCH_SIZE {
-            let count = send_batch(tx.as_fd(), &outgoing[sent..], BASE_UDP_PAYLOAD, false).unwrap();
+            let expected_time = Duration::from_micros(calls + 1);
+            let (count, at) = send_batch(
+                tx.as_fd(),
+                &outgoing[sent..],
+                BASE_UDP_PAYLOAD,
+                false,
+                || Ok(expected_time),
+            )
+            .unwrap();
+            assert_eq!(at, expected_time);
             assert!(count > 0 && count < BATCH_SIZE);
             let mut input = [0; 1016];
             for expected in sent..sent + count {

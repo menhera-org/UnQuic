@@ -961,8 +961,11 @@ fn batched_socket_io_and_rejection_paths_allocate_nothing() {
     ALLOCATION_COUNT.set(Some(0));
     for _ in 0..100 {
         assert_eq!(
-            tx.send_batch(&outgoing, unquic::BASE_UDP_PAYLOAD).unwrap(),
-            4
+            tx.send_batch_checked(&outgoing, unquic::BASE_UDP_PAYLOAD, || Ok(
+                Duration::from_micros(7)
+            ))
+            .unwrap(),
+            (4, Duration::from_micros(7))
         );
         assert_eq!(rx.recv_batch(&mut incoming).unwrap(), 4);
         for packet in &incoming {
@@ -979,6 +982,14 @@ fn batched_socket_io_and_rejection_paths_allocate_nothing() {
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            tx.send_batch_checked(&outgoing, unquic::BASE_UDP_PAYLOAD, || Err(
+                std::io::ErrorKind::WouldBlock.into()
+            ))
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::WouldBlock
         );
         tx.send(b"too long", unquic::BASE_UDP_PAYLOAD).unwrap();
         assert_eq!(
