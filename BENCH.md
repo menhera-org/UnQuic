@@ -31,7 +31,7 @@ earlier tables retain their original builds and test conditions.
 | --- | --- | --- |
 | At least 20 Gbit/s each way at inner MTU 1500 | QinQ: 16.68 / 14.43 Gbit/s paced, 20.63 / 13.47 unlimited. Single tag: 17.10 / 15.27 paced, 18.26 / 16.49 unlimited | Neither workload passes both directions. Paced missing fractions remain 18–31%, far above the under-1% gate. Five successful repeats are absent. |
 | Goodput must plateau under excess traffic | Persistent QinQ reverse delivery falls 6.7%; returning to 16G restores earlier delivery without restarting transport | The severe prototype collapse is fixed, but the remaining decline is unresolved. Bounded foreign-source batching and larger receive groups reduce syscalls; reader/receive scheduling still needs attribution. |
-| Small-frame overload must remain efficient | An earlier local-lane build delivered 6.05M / 6.08M 64-byte frames/s | The compact-storage build needs the same small-frame matrix, mixed traffic and non-coalescible frames. |
+| Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Current QinQ reports zero reordering; single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | Frame-aligned GSO, receive pressure drain/retry and compact borrowed payload storage have regression coverage | Runtime bounded selective repair is not implemented. Split frames can still be lost after one outer-packet loss. |
@@ -140,6 +140,16 @@ Unchanged shared-session probes retain their history. The global probe
 budget still applies; reconnect does not guarantee immediate confirmation
 of every lane.
 
+A later Linux 7.0 reconnect repeat caught a separate test precondition error:
+carrier was active while the transmit PMTU was still failed. One frame
+expired; no queue, admission or socket-overflow drop occurred. PMTU recovered
+on a later probe. The log does not identify why the first probe went unanswered.
+The device-lifecycle test now waits for usable PMTU in the current generation
+on all four transmit lanes before injecting its single frame. A deterministic
+test loses the first reconnect probe and checks continued DATA blocking until
+the scheduled retry succeeds. Carrier alone does not promise lossless DATA
+during baseline recovery.
+
 Correctness checks pass on Linux 6.8.0-147-generic and Ubuntu 26.04.1 /
 Linux 7.0.0-43-generic: kernel unit tests, runtime forwarding/reconnect,
 external TAP renames and namespace moves. Storm checks observe no hot-path
@@ -151,6 +161,12 @@ drops. Release/default tests, Clippy with warnings denied, Rust 1.89 checks
 and formatting pass. A short-write regression now tests the common result validator directly;
 the prior eventfd fixture returned a different error on Linux 7.0.
 No kernel or distribution is treated as the sole platform contract.
+The range-packer build repeats the full routed sequence on both kernels
+(650.59 / 650.41 seconds). After the PMTU readiness correction, both runtime
+tests pass on each kernel and the external-move/reconnect test passes three
+additional Linux 7.0 repeats. Cross-compilation also passes for aarch64,
+riscv64gc and powerpc64le Linux musl; these are compile checks, not runtime
+compatibility evidence.
 
 ### Bounded source batches and persistent overload
 
@@ -247,6 +263,87 @@ Final TAP delivery and readability updates remain after transmit processing:
 transmission can release credits after an earlier update disabled TAP reads.
 Moving that update before transmit could leave readable input disabled while
 the worker sleeps.
+
+### Per-worker evidence in the retained build
+
+In the persistent 32-completion QinQ sweep, the right TAP reader (worker 5)
+is already at 98% CPU under paced load. Unlimited load increases its receive
+work while its source intake falls:
+
+| Right reader, 60 seconds | 21G requested | Unlimited |
+| --- | ---: | ---: |
+| Total CPU % | 98.01 | 98.19 |
+| User / system CPU % | 25.19 / 72.82 | 26.76 / 71.43 |
+| GSO sources read | 2,178,214 | 1,957,130 |
+| TAP read calls | 722,755 | 640,356 |
+| Outer receive GB | 11.06 | 16.18 |
+| TAP write calls | 302,459 | 445,019 |
+
+The left reader receives almost no DATA and grows from 2,410,112 to
+3,543,328 sources. This is a measured imbalance within the same running
+processes. It supports the shared reader/receive CPU bottleneck hypothesis;
+it does not isolate every kernel cost or prove that this alone accounts for
+the 6.7% reverse-goodput decline.
+
+The busiest left receive worker reaches 97% CPU, while another worker uses
+20%. Left workers 2 and 3 record 536,455 and 541,448 queue drops under
+unlimited load; their socket-overflow counts are 273,367 and 920,559.
+Total daemon CPU remains 575% / 577% despite individual saturated cores.
+Aggregate idle CPU therefore does not establish forwarding headroom.
+Stage 5 must revisit work placement and shared-reader service with per-worker
+measurements, alongside kernel I/O cost. Counter deltas include the drain
+interval; CPU samples cover offered load.
+
+### Tagged small-frame follow-up
+
+These ten release observations use the same baseline and retained storage
+binaries as the larger-frame comparison. Each run starts fresh processes
+and sockets, then keeps them for a paced and unlimited point, 60 seconds
+each. Eight workers per daemon, 16 flows per direction, 44 segments per
+source, 500-entry TAP queues and a 1452-byte outer UDP ceiling are fixed.
+The paced request is eight million frames/s per direction. A 64-byte frame
+has one VLAN and 18 UDP payload bytes; a 128-byte frame has QinQ and
+78 payload bytes. Gbit/s below counts UDP payload, not Ethernet overhead.
+Full counters, per-flow counts, CPU samples and binary hashes are in
+[tap-small-frame-storage.json](benches/tap-small-frame-storage.json).
+
+| Observation | Actual offered Gbit/s | Delivered Gbit/s | Million frames/s | Missing % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| small-base-tag-0 | 1.134 / 1.114 | 0.683 / 0.737 | 4.75 / 5.12 | 39.49 / 33.58 | 721.5 / 717.1 |
+| small-base-tag-1 | 1.583 / 1.644 | 0.762 / 0.726 | 5.29 / 5.04 | 51.71 / 55.66 | 728.9 / 720.6 |
+| small-storage-tag-0 | 1.141 / 1.143 | 0.381 / 0.513 | 2.65 / 3.56 | 65.99 / 54.34 | 466.9 / 467.8 |
+| small-storage-tag-1 | 1.769 / 1.651 | 0.437 / 0.531 | 3.03 / 3.69 | 75.20 / 67.72 | 499.4 / 498.9 |
+| small-storage-tag-repeat-0 | 1.132 / 1.137 | 0.683 / 0.738 | 4.74 / 5.12 | 39.46 / 34.86 | 710.0 / 707.0 |
+| small-storage-tag-repeat-1 | 1.584 / 1.617 | 0.731 / 0.760 | 5.07 / 5.28 | 53.72 / 52.83 | 756.5 / 745.0 |
+| small-base-qinq-0 | 4.954 / 4.961 | 2.112 / 0.630 | 3.38 / 1.01 | 57.21 / 87.26 | 350.8 / 385.1 |
+| small-base-qinq-1 | 7.274 / 7.482 | 2.050 / 0.687 | 3.29 / 1.10 | 71.72 / 90.79 | 355.2 / 384.7 |
+| small-storage-qinq-0 | 4.931 / 4.943 | 2.188 / 1.550 | 3.51 / 2.48 | 55.45 / 68.53 | 452.1 / 476.6 |
+| small-storage-qinq-1 | 7.245 / 7.524 | 2.181 / 1.365 | 3.50 / 2.19 | 69.79 / 81.80 | 441.2 / 458.0 |
+
+The first retained 64-byte run is much slower than the baseline. Four
+workers per daemon approach saturation while the other four use only
+27–31% CPU. A fresh run of the same binary restores roughly baseline
+delivery and spreads work across all eight workers. This demonstrates
+placement sensitivity; it does not isolate compact storage as the cause
+of the first regression. Single-tag traffic still reorders: the repeated
+unlimited run reports 25.1% / 25.5%.
+
+The retained QinQ run improves reverse delivery over this baseline
+placement, but its reverse rate falls 11.9% from paced to unlimited load.
+This is another unresolved overload decline. Neither these single
+comparisons nor the fresh-placement repeat establish a CPU ceiling.
+
+| Retained unlimited run | TAP TX drops | Worker queue drops | Socket overflow | Inner UDP receive errors |
+| --- | ---: | ---: | ---: | ---: |
+| small-storage-tag-1 | 12539491 / 10265753 | 0 / 0 | 667951 / 112470 | 1066 / 0 |
+| small-storage-tag-repeat-1 | 7783246 / 7754017 | 0 / 0 | 607422 / 554973 | 298 / 10095 |
+| small-storage-qinq-1 | 10676868 / 13283654 | 252950 / 3561 | 144095 / 93945 | 0 / 165 |
+
+Admission pressure and expired frames are zero in all ten observations.
+All report zero corrupted, duplicate, too-old and wrong-run application
+packets, and zero outer IPv6 fragment creations. Source/SKB drop counters
+can each represent many frames and cannot be summed into frame loss.
+Mixed traffic and non-coalescible small frames still need validation.
 
 ## Local acceptance gate
 
@@ -1418,6 +1515,11 @@ USO super-frame when both USO flags are enabled. Linux 6.8's
 requires partial-checksum support for segmented sends, and its
 [TUN setup](https://github.com/torvalds/linux/blob/v6.8/drivers/net/tun.c#L2752-L2755)
 requires both USO flags together.
+A later Linux 7.0 check accepts the initial no-offload send and delivers two
+complete frames. The portability test now checks either that software delivery
+or Linux 6.8's EIO with no output, then verifies byte-exact segmented and USO
+delivery with offloads enabled. Both kernel versions pass. The earlier EIO
+observation is specific to that kernel, not a universal prerequisite.
 
 Production TAP read offloads remain disabled. B3 must validate, checksum
 and segment their input before this generator can exercise segmented
