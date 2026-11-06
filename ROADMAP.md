@@ -348,8 +348,10 @@ The November 6 cookie controls reduce reordering with aligned placement but do
 not establish a throughput gain. A separate full-batch queue rotation bug is
 fixed: newer frames cannot overtake a lane's oldest deferred frame. Tests cover
 expiry, other-session progress and connection replacement without expanding
-the scan budget. Encapsulated IPv4/IPv6/Ethernet flow hashing still needs a
-bounded inner-header key and measured tagged/SRv6 coverage. BENCH.md separates
+the scan budget. Encapsulated IPv4/IPv6/Ethernet flow hashing now includes one
+inner header while retaining outer identity and strict pinning. Tagged SRv6
+release measurements verify that this spreads work and improves goodput;
+remaining losses and the throughput gates are still open. BENCH.md separates
 these findings from the remaining performance hypotheses.
 The final throughput gate remains open. Partial completion, GSO/GRO boundaries, MTU errors
 and allocation checks pass. The five frame-model regression cases

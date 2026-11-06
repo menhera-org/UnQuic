@@ -504,15 +504,35 @@ impl Batch {
 /// addresses, protocol and TCP/UDP-style ports when available. All fragments
 /// omit ports; IPv6 stops at the fragment header so later fragments agree even
 /// when fragmentable extension headers precede the transport header. Malformed
-/// IP uses only the Ethernet key. The hash is local, never a wire value.
+/// IP uses only the Ethernet key. One unfragmented IPv4/IPv6/Ethernet
+/// encapsulation adds its inner flow while retaining the outer key.
+/// The hash is local, never a wire value.
 pub fn flow_hash(frame: &[u8]) -> u64 {
     let (link, ip) = flow_key(frame);
     let mut hash = DefaultHasher::new();
     hash.write(link);
-    if let Some((addresses, protocol, ports)) = ip {
-        hash.write(addresses);
-        hash.write_u8(protocol);
-        hash.write(ports);
+    if let Some(key) = ip {
+        hash_ip(&mut hash, key);
+        let inner = match key.1 {
+            4 => ipv4(key.2),
+            41 => ipv6(key.2),
+            143 if key.2.len() >= 14 => {
+                let (link, inner) = flow_key(key.2);
+                let protocol = u16::from_be_bytes([link[link.len() - 2], link[link.len() - 1]]);
+                if inner.is_some()
+                    || !matches!(protocol, 0x0800 | 0x86dd | 0x8100 | 0x88a8 | 0x9100)
+                {
+                    hash.write(link);
+                    inner
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(key) = inner {
+            hash_ip(&mut hash, key);
+        }
     }
     hash.finish()
 }
@@ -524,6 +544,14 @@ pub(crate) fn prefer_local_lane(frame: &[u8]) -> bool {
 }
 
 type IpKey<'a> = (&'a [u8], u8, &'a [u8]);
+
+fn hash_ip(hash: &mut DefaultHasher, (addresses, protocol, tail): IpKey<'_>) {
+    hash.write(addresses);
+    hash.write_u8(protocol);
+    if !matches!(protocol, 4 | 41 | 143) {
+        hash.write(tail);
+    }
+}
 
 fn flow_key(frame: &[u8]) -> (&[u8], Option<IpKey<'_>>) {
     if frame.len() < 14 {
@@ -547,9 +575,11 @@ fn flow_key(frame: &[u8]) -> (&[u8], Option<IpKey<'_>>) {
     (&frame[..offset], key)
 }
 
-fn ports(protocol: u8, payload: &[u8]) -> Option<&[u8]> {
+fn flow_tail(protocol: u8, payload: &[u8]) -> Option<&[u8]> {
     if matches!(protocol, 6 | 17 | 33 | 132 | 136) {
         payload.get(..4)
+    } else if matches!(protocol, 4 | 41 | 143) {
+        Some(payload)
     } else {
         Some(&[])
     }
@@ -565,12 +595,12 @@ fn ipv4(ip: &[u8]) -> Option<IpKey<'_>> {
         return None;
     }
     let fragmented = u16::from_be_bytes([ip[6], ip[7]]) & 0x3fff != 0;
-    let ports = if fragmented {
+    let tail = if fragmented {
         &[][..]
     } else {
-        ports(ip[9], &ip[header..length])?
+        flow_tail(ip[9], &ip[header..length])?
     };
-    Some((&ip[12..20], ip[9], ports))
+    Some((&ip[12..20], ip[9], tail))
 }
 
 fn ipv6(ip: &[u8]) -> Option<IpKey<'_>> {
@@ -598,7 +628,7 @@ fn ipv6(ip: &[u8]) -> Option<IpKey<'_>> {
                 let fragment = payload.get(..8)?;
                 return Some((&ip[8..40], fragment[0], &[]));
             }
-            _ => return Some((&ip[8..40], next, ports(next, payload)?)),
+            _ => return Some((&ip[8..40], next, flow_tail(next, payload)?)),
         };
         if size > payload.len() {
             return None;
@@ -635,6 +665,25 @@ mod tests {
             let mut tcp = frame.clone();
             tcp[if v6 { 20 } else { 23 }] = 6;
             assert!(!prefer_local_lane(&tcp));
+            for (protocol, inner) in [
+                (
+                    4,
+                    crate::tap::test_common::udp::frame(false, 1, &[7; 22])[14..].to_vec(),
+                ),
+                (
+                    41,
+                    crate::tap::test_common::udp::frame(true, 1, &[7; 22])[14..].to_vec(),
+                ),
+                (143, frame.clone()),
+            ] {
+                let mut outer = frame[..if v6 { 54 } else { 34 }].to_vec();
+                outer[if v6 { 20 } else { 23 }] = protocol;
+                outer.extend_from_slice(&inner);
+                let length = (outer.len() - if v6 { 54 } else { 14 }) as u16;
+                let at = if v6 { 18 } else { 16 };
+                outer[at..at + 2].copy_from_slice(&length.to_be_bytes());
+                assert!(!prefer_local_lane(&outer));
+            }
             let mut fragment = frame;
             if v6 {
                 fragment[20] = 44;

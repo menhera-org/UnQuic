@@ -2184,3 +2184,86 @@ goodput remains variable and below target, and receiver CPU still exceeds
 Release tests cover multiple valid messages around an invalid sibling in one
 receive call, IPv4/IPv6, GRO, truncation and allocation-free processing.
 Clippy and Rust 1.89 checks pass.
+
+## Encapsulated-flow hashing and tagged SRv6 (2026-11-06)
+
+The flow key now looks through one IPv4, IPv6 or Ethernet encapsulation,
+retaining the outer identity. It skips supported IPv6 extension headers,
+stops at fragments and one inner level, and falls back to the outer key for
+truncated inner headers. Encapsulated traffic retains strict pinning. No
+allocation, queue growth, deadline change or wire change is involved.
+
+[Seventeen release observations](benches/tap-srv6-inner-flow.json) compare the
+FIFO-fixed baseline with this change. Both use the revised load receiver,
+eight workers, 16 flows per direction unless noted, 60 seconds, a single VLAN,
+500-entry TAP queues and a 1452-byte outer UDP ceiling. Every point starts
+fresh processes and namespaces; builds and tests do not overlap load.
+
+The new harness mode uses real kernel IPv6-in-IPv6 SRv6 encapsulation with a
+one-segment routing header and End.DT6 decapsulation. The tagged frames are
+1518 bytes and carry 1388 bytes of UDP payload. SRv6 traffic reaches TAP as
+individual frames in these runs, even with 44-segment generator sends.
+A low-rate smoke test delivered every frame both ways and reported zero
+decapsulation errors. The JSON includes endpoint IPv6 and SRv6 route counters.
+
+| Key / requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| Outer only / 1 | 1.000 / 1.000 | 0.820 / 0.690 | 17.676 / 30.751 | 60.0 / 65.5 |
+| Inner flow / 1 | 1.000 / 1.000 | 0.997 / 0.997 | 0.0008 / 0 | 96.1 / 89.7 |
+| Outer only / 5 | 4.993 / 4.993 | 1.265 / 1.199 | 74.569 / 75.899 | 115.0 / 122.4 |
+| Inner flow / 5 | 4.979 / 4.974 | 4.634 / 4.864 | 6.454 / 1.704 | 429.4 / 393.9 |
+| Outer only / 21 | 8.027 / 7.896 | 1.271 / 1.263 | 84.093 / 83.937 | 116.3 / 127.6 |
+| Inner flow / 21 | 7.184 / 7.149 | 5.622 / 5.882 | 21.473 / 17.437 | 539.9 / 489.5 |
+| Outer only / unlimited | 7.893 / 7.607 | 1.229 / 1.181 | 84.369 / 84.415 | 118.5 / 124.4 |
+| Inner flow / unlimited | 7.122 / 7.093 | 5.558 / 5.816 | 21.689 / 17.733 | 529.7 / 486.3 |
+
+The baseline puts each direction on one transmit lane and one receive worker.
+At higher rates those receive workers reach 91–99% CPU. The new key spreads
+the inner flows and raises the unlimited result by about 4.5–4.9 times.
+This verifies the report's encapsulation bottleneck. It does not establish
+the 20 Gbit/s gate or the lossy real-path target.
+
+The generators saturate near 8 Gbit/s with the baseline and 7 Gbit/s with the
+busier candidate. Thus the 21 Gbit/s request is not a 21 Gbit/s offered load.
+Candidate receivers reach about 90% CPU, and its busiest workers reach
+94–97%. Receiver CPU includes its two-second drain; daemon CPU covers the
+load interval. The unlimited SRv6 result is about 1.1% below its requested-21 result,
+with a slightly lower offered rate. Repeated plateau validation remains open.
+
+Drop attribution at the 5 Gbit/s request, left/right:
+
+| Key | TAP TX drops (SKBs) | Socket overflow (SKBs) | Inner UDPv6 receive errors | Expired frames |
+| --- | ---: | ---: | ---: | ---: |
+| Outer only | 13635728 / 13494796 | 372366 / 340476 | 0 / 0 | 1190 / 2380 |
+| Inner flow | 190128 / 255995 | 21644 / 215375 | 8942 / 23935 | 0 / 0 |
+
+At 1 Gbit/s, the baseline's large bursts already overflow TAP and socket
+queues despite low average CPU. With one-segment sends, baseline delivery
+rises to 0.990 / 0.982 Gbit/s with 0.412 / 1.320% missing. Its sustained
+ceiling still stays near 1.3 Gbit/s. The inner-flow one-segment unlimited
+control delivers 1.889 / 1.948 Gbit/s, with 0.398 / 0.385% missing and
+560.3 / 505.4% daemon CPU. Its generators offer only 1.903 / 1.962 Gbit/s;
+smaller sends cost much more CPU. These controls separate burst pressure
+from the verified single-lane ceiling.
+
+A single-flow SRv6 unlimited control with the new key delivers only
+1.208 / 1.169 Gbit/s at 113.5 / 127.1% daemon CPU. Hashing cannot divide one
+flow. Its 84.98 / 84.63% missing and per-frame cost remain deployment gaps.
+
+Ordinary single-tag UDP retains its existing key and reader-local lane
+policy. Its new paced control delivers 16.394 / 14.456 Gbit/s, with
+20.67 / 30.15% missing at 622.3 / 620.4% CPU. Unlimited load falls to
+12.421 / 12.975 Gbit/s, with 67.09 / 65.64% missing at 530.6 / 534.5% CPU.
+The latter concentrates load on alternating workers: roughly 78–92% CPU on
+the busy halves and 40–51% on the others. This repeats the earlier imbalance
+pattern; its exact cause and the remaining overload decline are unresolved.
+
+All seventeen observations have zero admission-pressure and worker-queue
+drops, invalid/duplicate/out-of-window/wrong-run receiver records, and outer
+fragmentation. The JSON retains every run's drop counters, per-worker CPU
+and reordering. The parser tests cover both outer IP versions, inner IP and
+tagged Ethernet, SRH, fragments, depth limits, truncation and non-IP fallback.
+
+Default and release suites, Clippy and Rust 1.89 checks pass. All 22 library
+kernel tests, the socket/TAP foundation test and both runtime tests pass,
+including allocation checks, reconnect, foreign rename and namespace move.

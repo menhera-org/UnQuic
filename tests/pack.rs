@@ -211,6 +211,135 @@ fn malformed_ip_and_non_ip_use_ethernet_fallback_without_payload_hashing() {
     }
 }
 
+fn encapsulate(v6_outer: bool, protocol: u8, payload: &[u8]) -> Vec<u8> {
+    let ip = if v6_outer {
+        v6(protocol, payload)
+    } else {
+        let mut ip = v4();
+        ip.truncate(20);
+        ip[9] = protocol;
+        ip.extend_from_slice(payload);
+        let length = ip.len() as u16;
+        ip[2..4].copy_from_slice(&length.to_be_bytes());
+        ip
+    };
+    ethernet(if v6_outer { 0x86dd } else { 0x0800 }, &ip)
+}
+
+#[test]
+fn encapsulated_flows_include_inner_ports_and_keep_outer_identity() {
+    for outer in [false, true] {
+        for (protocol, mut inner, port) in [
+            (4, v4(), 20),
+            (41, v6(17, &[1, 2, 3, 4, 0, 8, 0, 0]), 40),
+            (143, ethernet(0x0800, &v4()), 34),
+        ] {
+            if protocol == 143 {
+                inner.splice(12..12, [0x88, 0xa8, 0, 7, 0x81, 0, 0, 42]);
+            }
+            let port = port + if protocol == 143 { 8 } else { 0 };
+            let base = flow_hash(&encapsulate(outer, protocol, &inner));
+            *inner.last_mut().unwrap() ^= 1;
+            assert_eq!(flow_hash(&encapsulate(outer, protocol, &inner)), base);
+            inner[port] ^= 1;
+            assert_ne!(flow_hash(&encapsulate(outer, protocol, &inner)), base);
+            inner[port] ^= 1;
+            let mut frame = encapsulate(outer, protocol, &inner);
+            frame[14 + if outer { 8 } else { 12 }] ^= 1;
+            assert_ne!(flow_hash(&frame), base);
+            if protocol == 143 {
+                inner[15] ^= 1;
+                assert_ne!(flow_hash(&encapsulate(outer, protocol, &inner)), base);
+            }
+            if outer {
+                let mut srh = vec![protocol, 2, 4, 0, 0, 0, 0, 0];
+                srh.extend_from_slice(&[3; 16]);
+                srh.extend_from_slice(&inner);
+                assert_eq!(
+                    flow_hash(&ethernet(0x86dd, &v6(43, &srh))),
+                    flow_hash(&encapsulate(true, protocol, &inner))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn encapsulation_stops_at_fragments_and_one_inner_level() {
+    for outer in [false, true] {
+        let mut inner = v4();
+        inner[6] = 0x20;
+        let first = flow_hash(&encapsulate(outer, 4, &inner));
+        inner[6..8].copy_from_slice(&1u16.to_be_bytes());
+        inner[20..].fill(255);
+        assert_eq!(flow_hash(&encapsulate(outer, 4, &inner)), first);
+        let mut fragment = vec![17, 0, 0, 1, 1, 2, 3, 4, 1, 2, 3, 4];
+        let first = flow_hash(&encapsulate(outer, 41, &v6(44, &fragment)));
+        fragment[2..4].copy_from_slice(&8u16.to_be_bytes());
+        fragment[8..].fill(255);
+        assert_eq!(
+            flow_hash(&encapsulate(outer, 41, &v6(44, &fragment))),
+            first
+        );
+
+        let mut nested = v6(4, &v4());
+        let first = flow_hash(&encapsulate(outer, 41, &nested));
+        nested[60] ^= 1;
+        assert_eq!(flow_hash(&encapsulate(outer, 41, &nested)), first);
+        nested[8] ^= 1;
+        assert_ne!(flow_hash(&encapsulate(outer, 41, &nested)), first);
+
+        let mut frame = encapsulate(outer, 4, &v4());
+        if outer {
+            frame[20] = 44;
+            frame.splice(54..54, [4, 0, 0, 1, 1, 2, 3, 4]);
+            frame[18..20].copy_from_slice(&48u16.to_be_bytes());
+        } else {
+            frame[20] = 0x20;
+        }
+        let first = flow_hash(&frame);
+        *frame.last_mut().unwrap() ^= 1;
+        let port = if outer { 82 } else { 54 };
+        frame[port] ^= 1;
+        assert_eq!(flow_hash(&frame), first);
+    }
+}
+
+#[test]
+fn truncated_inner_headers_fall_back_without_reading_payload() {
+    for outer in [false, true] {
+        for (protocol, inner, required) in [
+            (4, v4(), 40),
+            (41, v6(17, &[1, 2, 3, 4]), 44),
+            (143, ethernet(0x0800, &v4()), 54),
+        ] {
+            let fallback = flow_hash(&encapsulate(outer, protocol, &[]));
+            for end in 0..required {
+                assert_eq!(
+                    flow_hash(&encapsulate(outer, protocol, &inner[..end])),
+                    fallback
+                );
+            }
+        }
+        let mut incomplete_tag = ethernet(0x8100, &[0, 42, 0x81, 0]);
+        incomplete_tag.extend_from_slice(&[0, 7]);
+        assert_eq!(
+            flow_hash(&encapsulate(outer, 143, &incomplete_tag)),
+            flow_hash(&encapsulate(outer, 143, &[]))
+        );
+    }
+}
+
+#[test]
+fn encapsulated_non_ip_ethernet_uses_only_its_link_key() {
+    let mut inner = ethernet(0x0806, &[0; 28]);
+    let base = flow_hash(&encapsulate(true, 143, &inner));
+    inner[14..].fill(255);
+    assert_eq!(flow_hash(&encapsulate(true, 143, &inner)), base);
+    inner[0] ^= 1;
+    assert_ne!(flow_hash(&encapsulate(true, 143, &inner)), base);
+}
+
 #[test]
 fn scatter_gather_pieces_borrow_original_frame_and_match_contiguous_encoding() {
     use unquic::wire::{DATA_PREFIX_LEN, encode_data_prefix, encode_datagram};

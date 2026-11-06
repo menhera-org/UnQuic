@@ -74,6 +74,16 @@ signal the receivers. A multi-rate invocation creates fresh daemons and
 private namespaces for each point, preventing queued packets from leaking
 into later runs. A failed child fails the run.
 
+`VLAN_DEPTH=0|1|2` selects untagged, 802.1Q or QinQ traffic. Frame sizes
+include those tags. `SRV6=1` adds IPv6-in-IPv6 encapsulation with a one-segment
+routing header and End.DT6 decapsulation inside the private endpoint
+namespaces; it requires `UDP_LOAD` and kernel SRv6 support. A 1518-byte
+single-tag frame then carries 1388 bytes of UDP payload. The harness records
+IPv6 counters and SRv6 route counters alongside the existing snapshots.
+Check actual offered rates: kernel encapsulation can saturate a generator
+before it reaches the requested rate. Compare `SEGMENTS=1` with aggregates
+to distinguish burst losses from sustained capacity.
+
 `SESSION_COOKIE` overrides the session UUID for queue-placement controls;
 record it when comparing runs because it affects receive-worker assignment.
 

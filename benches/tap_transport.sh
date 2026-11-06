@@ -14,11 +14,13 @@ case "${OUTER_PAYLOAD_LIMIT:-1232}" in ''|*[!0-9]*) exit 2;; esac
 case "${TAP_TXQUEUELEN:-10000}" in ''|*[!0-9]*) exit 2;; esac
 [ "${TAP_TXQUEUELEN:-10000}" -ge 1 ] && [ "${TAP_TXQUEUELEN:-10000}" -le 10000 ] || exit 2
 case "${VLAN_DEPTH:-0}" in 0|1|2) ;; *) echo "VLAN_DEPTH must be 0, 1 or 2" >&2; exit 2;; esac
+case "${SRV6:-0}" in 0|1) ;; *) echo "SRV6 must be 0 or 1" >&2; exit 2;; esac
+[ "${SRV6:-0}" = 0 ] || [ -n "${UDP_LOAD:-}" ] || { echo "SRV6 requires UDP_LOAD" >&2; exit 2; }
 [ "$2" -le "$((1514 + 4 * ${VLAN_DEPTH:-0}))" ] || exit 2
 case "${WORKERS:-4}" in 4|8) ;; *) echo "WORKERS must be 4 or 8" >&2; exit 2;; esac
 case "${UDP_LOAD:-}" in ''|/*) ;; *) echo "UDP_LOAD must be an absolute path" >&2; exit 2;; esac
 if [ -n "${UDP_LOAD:-}" ]; then
-    [ "$2" -ge "$((58 + 4 * ${VLAN_DEPTH:-0}))" ] || { echo "UDP_LOAD needs 16 payload bytes after tags" >&2; exit 2; }
+    [ "$2" -ge "$((58 + 4 * ${VLAN_DEPTH:-0} + 84 * ${SRV6:-0}))" ] || { echo "UDP_LOAD needs 16 payload bytes after headers" >&2; exit 2; }
 fi
 case "${BITRATE:-0}" in
     *[[:space:]]*)
@@ -37,7 +39,13 @@ exec unshare -m -n --propagation private sh -s -- "$@" <<'BENCH'
 set -eu
 daemon=$1
 frame=$2
-payload=$((frame - 42 - 4 * ${VLAN_DEPTH:-0}))
+payload=$((frame - 42 - 4 * ${VLAN_DEPTH:-0} - 84 * ${SRV6:-0}))
+left_address=10.77.0.1
+right_address=10.77.0.2
+if [ "${SRV6:-0}" = 1 ]; then
+    left_address=fd77:1::1
+    right_address=fd77:1::2
+fi
 flows=$3
 seconds=$4
 out=$(cd "$5" && pwd)
@@ -133,6 +141,15 @@ for side in left right; do
     if [ "$side" = left ]; then local=1; remote=2; else local=2; remote=1; fi
     netip "uq-$side" addr add "10.77.0.$local/24" dev "$data"
     netip "uq-$side" neigh add "10.77.0.$remote" lladdr "02:00:00:00:00:0$remote" nud permanent dev "$data"
+    if [ "${SRV6:-0}" = 1 ]; then
+        netip "uq-$side" -6 addr add "fd77:3::$local/64" dev "$data" nodad
+        netip "uq-$side" -6 addr add "fd77:1::$local/128" dev lo nodad
+        netip "uq-$side" -6 neigh add "fd77:3::$remote" lladdr "02:00:00:00:00:0$remote" nud permanent dev "$data"
+        nsenter --net="/run/netns/uq-$side" sysctl -qw net.ipv6.conf.all.seg6_enabled=1 net.ipv6.conf.all.forwarding=1
+        netip "uq-$side" -6 route add "fd77:2::$local/128" encap seg6local action End.DT6 table 255 count dev "$data"
+        netip "uq-$side" -6 route add "fd77:2::$remote/128" via "fd77:3::$remote" dev "$data"
+        netip "uq-$side" -6 route add "fd77:1::$remote/128" encap seg6 mode encap segs "fd77:2::$remote" via "fd77:3::$remote" dev "$data"
+    fi
 done
 for side in left right; do
     attempts=0
@@ -158,6 +175,8 @@ snapshot() {
     cat /proc/net/snmp6 > "$out/$1.outer"
     for side in left right; do
         nsenter --net="/run/netns/uq-$side" cat /proc/net/snmp > "$out/$1.$side-ipv4"
+        nsenter --net="/run/netns/uq-$side" cat /proc/net/snmp6 > "$out/$1.$side-ipv6"
+        netip "uq-$side" -s -6 route show > "$out/$1.$side-routes"
     done
     netip uq-left -s link show uq-left > "$out/$1.left-link"
     netip uq-right -s link show uq-right > "$out/$1.right-link"
@@ -175,6 +194,7 @@ printf '%s\n' "${DAEMON_LEFT_CPUS:-0-$((workers - 1))}" "${DAEMON_RIGHT_CPUS:-$w
 printf '%s\n' "$GENERATOR_LEFT_CPUS" "$RECEIVER_LEFT_CPUS" \
     "$GENERATOR_RIGHT_CPUS" "$RECEIVER_RIGHT_CPUS" > "$out/generator-cpus"
 printf '%s\n' "${VLAN_DEPTH:-0}" > "$out/vlan-depth"
+printf '%s\n' "${SRV6:-0}" > "$out/srv6"
 printf '%s\n' "$frame" > "$out/frame-bytes"
 base=$out
 index=0
@@ -188,19 +208,19 @@ for rate in ${BITRATE:-0}; do
         case "$rate" in *[!0-9]*) echo "UDP_LOAD rates must be integer bits/s per flow" >&2; exit 2;; esac
         run=$((index + 1))
         nsenter --net=/run/netns/uq-right taskset -c "$RECEIVER_RIGHT_CPUS" "$UDP_LOAD" recv \
-            10.77.0.2 10.77.0.1 52000 51000 "$flows" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/server.json" &
+            "$right_address" "$left_address" 52000 51000 "$flows" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/server.json" &
         server=$!
         nsenter --net=/run/netns/uq-left taskset -c "$RECEIVER_LEFT_CPUS" "$UDP_LOAD" recv \
-            10.77.0.1 10.77.0.2 52000 51000 "$flows" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/reverse-server.json" &
+            "$left_address" "$right_address" 52000 51000 "$flows" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/reverse-server.json" &
         reverse_server=$!
         sleep 0.2
         kill -0 "$server" && kill -0 "$reverse_server" || exit 1
         snapshot before
         nsenter --net=/run/netns/uq-left taskset -c "$GENERATOR_LEFT_CPUS" "$UDP_LOAD" send \
-            10.77.0.1 10.77.0.2 51000 52000 "$flows" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/client.json" &
+            "$left_address" "$right_address" 51000 52000 "$flows" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/client.json" &
         client=$!
         nsenter --net=/run/netns/uq-right taskset -c "$GENERATOR_RIGHT_CPUS" "$UDP_LOAD" send \
-            10.77.0.2 10.77.0.1 51000 52000 "$flows" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/reverse-client.json" &
+            "$right_address" "$left_address" 51000 52000 "$flows" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/reverse-client.json" &
         reverse_client=$!
     else
         nsenter --net=/run/netns/uq-right taskset -c "$RECEIVER_RIGHT_CPUS" iperf3 -s -1 -J > "$out/server.json" &

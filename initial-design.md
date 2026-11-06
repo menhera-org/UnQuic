@@ -266,6 +266,14 @@ applies only to new frames: a frame's pieces and repairs stay on its original la
 Any such change must document possible cross-lane reordering and verify overload
 behavior. eBPF is excluded because production hosts may prohibit loading programs.
 
+The flow key includes one unfragmented IPv4, IPv6 or Ethernet encapsulation
+(IP protocol numbers 4, 41 and 143). Retain the outer key and add the inner
+addresses, protocol and available transport ports, plus inner MAC addresses
+and VLAN stack for Ethernet. Skip supported IPv6 extension headers, including
+segment routing headers. Stop at fragments and after one inner level;
+malformed inner headers fall back to the outer key. Encapsulated traffic
+retains strict pinning. This key is local and never transmitted.
+
 An individual PTO sends at most two probe datagrams per path group, with exponential backoff; one PTO does not declare all outstanding traffic lost. Retiring a frame does not erase the congestion charge for its outstanding packets. Free payloads at their deadlines but retain packet accounting until ACK or loss. If feedback is absent for three consecutive PTO periods, treat remaining outstanding transmissions as lost once and tell BBR; continue only backed-off probes until feedback resumes. Reset the PTO backoff on newly acknowledged ACK-eliciting traffic. The aggregate controller, not each lane independently, grants probe allowance. These at-most-two probes may exceed the congestion window when it is full, as in RFC 9002, but are still charged to inflight bytes and paced; no other packet bypasses the window this way.
 
 LANE_RETIRE and FRAME_ABANDON retries consume ordinary transmission credit and stop at their own limits. Neither controls the correctness of local duplicate suppression. FEC and intentional per-flow reordering remain later measured experiments.

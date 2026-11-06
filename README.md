@@ -379,6 +379,13 @@ A reader owning no transmit lane also retains hashing and handoffs. Queue and
 lane counts remain independent; peers need not use identical values. eBPF is
 excluded from deployment.
 
+Flow hashing looks through one unfragmented IPv4, IPv6 or Ethernet
+encapsulation, including an IPv6 segment routing header before the inner
+packet. It retains the outer key and adds the inner addresses, protocol and
+available ports; inner Ethernet also retains its MAC addresses and VLAN stack.
+Fragments omit ports and stop descent. Truncated inner headers retain only
+the outer key. Encapsulated flows use strict lane pinning.
+
 Liveness currently sends a 52-byte UDP PROBE on local lane 1 every second,
 including during data traffic. Only the first reply matching the outstanding
 probe's packet number and payload length refreshes feedback; ordinary DATA and
