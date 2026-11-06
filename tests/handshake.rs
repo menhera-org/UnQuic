@@ -1211,3 +1211,34 @@ fn shared_probe_timeout_transitions_allocate_nothing() {
     let count = ALLOCATION_COUNT.replace(None);
     assert_eq!(count, Some(0));
 }
+
+#[test]
+fn shared_transmission_grants_allocate_nothing_after_startup() {
+    use unquic::pacing::{Grants, Limits};
+    let mut grants = Grants::new(64).unwrap();
+    let limits = Limits {
+        window: 12800,
+        rate: 128_000_000,
+        quantum: 20480,
+        max_datagram: 1280,
+    };
+    ALLOCATION_COUNT.set(Some(0));
+    for step in 0..10000 {
+        let now = Duration::from_millis(step);
+        grants.probe_allowance(2).unwrap();
+        let grant = grants
+            .reserve(step as usize % 64, 1280, true, limits, now)
+            .unwrap();
+        grants.reported(grant, 0, None).unwrap();
+        let now = now + Duration::from_micros(10);
+        let grant = grants
+            .reserve(step as usize % 64, 1280, false, limits, now)
+            .unwrap();
+        grants.reported(grant, 100, Some(now)).unwrap();
+        grants.settled(100).unwrap();
+        grants.probe_allowance(0).unwrap();
+    }
+    let count = ALLOCATION_COUNT.replace(None);
+    assert_eq!(count, Some(0));
+    assert_eq!((grants.reserved(), grants.in_flight()), (0, 0));
+}

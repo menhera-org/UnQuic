@@ -1,4 +1,10 @@
-//! Owner-local control traffic service; data grants and BBR pacing are separate.
+//! Owner-local byte grants and the separate control-traffic ceiling.
+//!
+//! The runtime currently uses only control service. Data grants are a pure
+//! accounting component; BBR and worker report routing remain to be connected.
+
+mod grants;
+pub use grants::{Grant, GrantError, Grants, Limits};
 use std::{io, time::Duration};
 
 const RATE: u64 = 4 * 1024 * 1024;

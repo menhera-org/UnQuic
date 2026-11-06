@@ -440,7 +440,18 @@ through the existing handoff rings. A shared control queue rotates blocked
 groups and returns, with at most 64 construction visits and 64 service visits
 per turn. Tests cover rejected packed tails/heads, full handoff and return
 queues, stale identities, control-class fairness and actual-send duplicate
-spacing. Incoming ACK application, congestion grants and data pacing remain pending.
+spacing. Incoming ACK application and runtime congestion grants/data pacing remain pending.
+The pure shared grant ledger now reserves credit before handoff, keeps it through
+100-microsecond expiry, and consumes each sent/unused report once. Partial
+submissions convert only successful outer bytes to inflight charges. Workers
+share the send quantum and sixteen-maximum-datagram byte cap; PTO rounds share
+at most two one-datagram grants, with epoch checks on unused reports.
+Exact pacing deadlines, delayed completion, duplicate reports, limit reductions,
+late ACK/loss settlement and allocation-free transitions have regression coverage.
+BBR output, reliable report routing, startup accounting and worker enforcement
+still need integration. PMTU candidates must fit the current grant quantum;
+limit the candidate size without treating an unconfirmed probe as the effective
+MSS. Neither this ledger nor its tests enable runtime pacing.
 Receive-side ACK scheduling and range construction now use the existing
 reassembly bitmap, with no second history or hot-path allocations. Tests cover
 thresholds, gaps, duplicate rate limits, pressure rejection, word/window wrap,

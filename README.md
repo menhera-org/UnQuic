@@ -483,6 +483,14 @@ degraded and attempts replacement while retaining its active connection. After
 30 seconds it retires that connection and lowers carrier through the worker
 barrier. Recovery and per-lane path monitoring remain stage 3 work.
 
+The pure `pacing::Grants` ledger reserves shared path-group credit before
+handoff and retains it until a worker reports successful and unused bytes.
+A grant permits syscall starts for 100 microseconds; a call that returns later
+still reports its successful bytes. Expiry alone frees no credit. Probe grants
+share a two-datagram PTO allowance and may exceed the confirmed MTU for
+discovery, while obeying the aggregate burst cap. The ledger is not yet wired
+to workers or BBR; the current runtime remains unpaced for DATA.
+
 ## TAP read batching
 
 Each worker attempts to create one 64-entry io_uring for its TAP queues.
