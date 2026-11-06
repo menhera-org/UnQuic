@@ -74,6 +74,14 @@ port, device binding and scope. It rejects multicast and IPv4-mapped addresses;
 link-local addresses require a nonzero numeric scope ID. A peer's unspecified
 address is invalid: use None to wait for address supply.
 
+`tap_name` (or the session name when omitted) is a creation name. Once created,
+the TAP's device identity and queue descriptors bind it to the session. External
+renames must be respected during operation and descriptor-preserving restart;
+configuration must not rename it back or create a replacement at the old name.
+Renaming does not recompute its MAC. Published TAP removal requires an explicit
+instruction, independently of peer state or UDP socket lifetime. Descriptor
+handover and full lifetime enforcement remain Stage 4 work.
+
 `validate()` consumes the input and returns immutable numeric references or
 the first `ConfigError`. That error identifies a field, optional zero-based
 entry index and fixed reason; it does not include a cookie or user-provided

@@ -363,9 +363,39 @@ control and is independent of administrative state. Queues can move out of the
 `Tap` into their owning workers; any queue can set carrier for the device. The
 interface MAC does not replace source or destination MACs in transported frames.
 
-Keep TAP names, MAC configuration, and device identity stable across ordinary peer reconnects. Session failure changes carrier according to a defined policy; it does not delete the interface or its VLAN/macvlan children.
+**TAP lifetime and identity:** once published, a TAP must remain present for the
+daemon's lifetime. Peer failure, socket errors, worker recovery, configuration
+updates and transport reconnects must not delete or recreate it. Removal requires
+an explicit instruction to remove that interface; shutdown or restart alone is
+not such an instruction. Preserve device identity, MAC, bridge/OVS membership and
+VLAN/macvlan children. Session failure may change carrier, never device lifetime.
 
-**Future restart support:** retain and hand over TAP queue file descriptors across daemon re-exec so the TAPs and their existing attachments survive. Follow rs-l2tpd's descriptor-preservation approach: it preserves L2TP tunnel sockets, while UnQuic would preserve TAP descriptors. Optional systemd descriptor storage may also retain descriptors across a crash for the next process to adopt. The daemon handles descriptor announcements, environment variables, and re-exec; the library receives explicitly supplied, validated descriptors. Define and version the handover format before implementing adoption. Preserving TAPs does not itself preserve userspace transport state or guarantee uninterrupted forwarding.
+External interface renames are supported and authoritative. Treat the configured
+TAP name as its creation name, not its identity. Keep using the existing queue
+descriptors and device identity after a rename; never rename it back, recreate
+the old name or attach to another device that later acquires that name. Renames
+must not change the MAC, session association or forwarding behavior, including
+across descriptor handover.
+
+**Required restart support:** retain and hand over TAP queue file descriptors
+across daemon re-exec without a last-descriptor-close gap. TAPs and their existing
+attachments must survive; UDP sockets may close and be recreated. Follow
+rs-l2tpd's descriptor-preservation approach: it preserves L2TP tunnel sockets,
+while UnQuic preserves TAP descriptors. Optional systemd descriptor storage may
+also retain descriptors across a crash for the next process to adopt. The daemon
+handles descriptor announcements, environment variables and re-exec; the library
+receives explicitly supplied, validated descriptors. Define and version the
+handover format before implementing adoption, and retain the original descriptors
+if preparation or exec fails. Preserving TAPs does not itself preserve userspace
+transport state or guarantee uninterrupted forwarding.
+
+**No production panics:** production library and daemon code must not panic.
+Validate fallible inputs and operations, propagate or handle errors, and preserve
+TAP ownership while recovering from transport or worker failures. This includes
+implicit panics from indexing, arithmetic and unchecked `unwrap`/`expect` calls;
+invariants must be proven or checked without panic. Aborting on panic or catching
+an unwind is not a substitute. Test assertions are allowed. Audit existing code
+and inject failure cases before claiming this requirement is met.
 
 # 12 Configuration and operations
 

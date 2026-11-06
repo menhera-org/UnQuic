@@ -56,6 +56,15 @@ cookie lookup allocate no memory. The default build depends only on `libc`;
 `dns` enables exactly `iphost v0.4.4`, without its default Tokio, tracing or serde
 features. Its direct, RA and DHCPv6 resolver modes are available.
 
+Required device lifetime is stronger than the current implementation: published
+TAPs must survive daemon operation and descriptor-preserving restarts, and may
+be removed only on explicit instruction. UDP sockets may be recreated. External
+TAP renames must be respected without renaming back, recreating the old name or
+changing session identity. Production code must not panic. The current runtime
+still closes nonpersistent TAPs on shutdown, has no descriptor adoption/re-exec
+handover, and has not completed the panic-path audit or rename regression tests.
+These are tracked in Stage 4 of [ROADMAP.md](ROADMAP.md).
+
 Receive sockets use fixed nonzero ports and expose no send method. Transmit
 sockets inherit their receiver's binding scope, use stable dynamic ports, and
 disable IPv6 fragmentation. Send APIs take a lane payload limit from 1232 through

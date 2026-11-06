@@ -26,6 +26,12 @@ section 15 of the design and the "Implementation status" section of
 - No locks or allocations on hot paths. Protocol transitions take supplied
   monotonic time and make no syscalls. Batch socket I/O, queue notifications
   and timer updates; measure before claiming a performance improvement.
+- Production code must not panic, including through unchecked indexing,
+  arithmetic or `unwrap`/`expect`. Handle failures without losing published TAPs.
+  Test assertions are allowed; panic-abort and catch-unwind are not substitutes.
+- Published TAPs survive transport failures and descriptor-preserving restarts;
+  removal requires an explicit instruction. External renames are authoritative:
+  use device identity, never restore the configured creation name.
 - Receive admission checks cookies, wire validity and protocol state on the
   bound socket, regardless of sender address or port. Transmit destinations
   come only from configuration or the optional resolution layer.
@@ -473,6 +479,17 @@ control remain pending; README.md documents probe feedback and send-error handli
 
 ## Stage 4: composition and robustness
 
+- Implement section 11's TAP lifetime contract. Keep published devices alive
+  through worker/socket failures and shutdown unless removal was explicitly
+  requested. Define versioned descriptor adoption and re-exec handover with no
+  last-close gap; retain descriptors on failed exec. UDP sockets may be recreated.
+  This remains unfinished: current nonpersistent TAPs disappear on last close.
+- Support foreign TAP renames during operation and across handover. Test unchanged
+  ifindex, MAC, upper devices, bridge membership and forwarding, including reuse
+  of the old name by an unrelated device. Never rename back or recreate by name.
+- Audit production panic paths, including implicit bounds/overflow failures and
+  thread startup/join errors. Add malformed-input and fault-injection tests that
+  verify error handling preserves published TAPs; keep assertions in tests only.
 - Container tests for Linux bridge, OVS system port where OVS is available,
   VLAN and QinQ uppers, macvlan, multiple MACs, multicast, broadcast and LLC
   frames, as section 14.1 V04 lists. Each test creates and deletes its own
