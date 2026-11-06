@@ -624,7 +624,12 @@ fn send_batch(
     Ok(if sent == 0 { 0 } else { ends[sent - 1] })
 }
 
-fn recv_batch(fd: BorrowedFd<'_>, datagrams: &mut [ReceiveDatagram<'_>]) -> io::Result<usize> {
+/// Receives up to BATCH_SIZE entries from a borrowed UDP socket without blocking.
+///
+/// Supports IPv4 and IPv6, including connected sockets. The caller enables
+/// UDP_GRO and SO_RXQ_OVFL when wanted; source addresses are not requested.
+/// Each entry reports truncation independently, preserving valid siblings.
+pub fn recv_batch(fd: BorrowedFd<'_>, datagrams: &mut [ReceiveDatagram<'_>]) -> io::Result<usize> {
     if datagrams.is_empty() || datagrams.len() > BATCH_SIZE {
         return Err(io::ErrorKind::InvalidInput.into());
     }
@@ -1114,6 +1119,9 @@ mod tests {
             receive_control(&message, &controls),
             Some((1232, Some(u32::MAX)))
         );
+        message.msg_controllen += 1;
+        assert_eq!(receive_control(&message, &controls), None);
+        message.msg_controllen -= 1;
         controls.swap(0, 1);
         assert_eq!(
             receive_control(&message, &controls),

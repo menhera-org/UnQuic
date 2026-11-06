@@ -2,7 +2,7 @@
 use std::{
     io,
     net::{IpAddr, SocketAddr, UdpSocket},
-    os::fd::AsRawFd,
+    os::fd::{AsFd, AsRawFd},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -288,92 +288,48 @@ fn consume(flow: &mut Flow, bytes: &[u8], segment: usize, size: usize, run: u32)
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Ancillary {
-    header: libc::cmsghdr,
-    data: [u8; size_of::<usize>()],
-}
-fn metadata(message: &libc::msghdr, controls: &[Ancillary; 2]) -> Option<(usize, Option<u32>)> {
-    let mut remaining = message.msg_controllen as usize;
-    if remaining > size_of_val(controls)
-        || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
-    {
-        return None;
-    }
-    let mut segment = 0;
-    let mut overflow = None;
-    // SAFETY: CMSG_LEN only computes an ABI size.
-    let expected = unsafe { libc::CMSG_LEN(4) } as usize;
-    for c in controls {
-        if remaining == 0 {
-            break;
-        }
-        if remaining < expected || c.header.cmsg_len as usize != expected {
-            return None;
-        }
-        let value = u32::from_ne_bytes(c.data[..4].try_into().unwrap());
-        match (c.header.cmsg_level, c.header.cmsg_type) {
-            (libc::IPPROTO_UDP, libc::UDP_GRO) if segment == 0 && value != 0 && value <= 65535 => {
-                segment = value as usize
-            }
-            (libc::SOL_SOCKET, libc::SO_RXQ_OVFL) if overflow.is_none() => overflow = Some(value),
-            _ => return None,
-        }
-        remaining = remaining.saturating_sub(size_of::<Ancillary>());
-    }
-    Some((segment, overflow))
-}
 fn receive(flow: &mut Flow, bytes: &mut [u8], c: &Config) -> io::Result<bool> {
-    // SAFETY: these ABI structs allow all-zero initialization.
-    let mut controls: [Ancillary; 2] = unsafe { std::mem::zeroed() };
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    let mut iov = libc::iovec {
-        iov_base: bytes.as_mut_ptr().cast(),
-        iov_len: bytes.len(),
-    };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = controls.as_mut_ptr().cast();
-    msg.msg_controllen = size_of_val(&controls) as _;
+    let count = bytes.len().div_ceil(MAX_BYTES).min(16);
+    let mut chunks = bytes.chunks_mut(MAX_BYTES);
+    let mut packets: [unquic::socket::ReceiveDatagram<'_>; 16] = std::array::from_fn(|_| {
+        unquic::socket::ReceiveDatagram::new(chunks.next().unwrap_or(&mut []))
+    });
     flow.calls += 1;
-    // SAFETY: msg points to live writable payload, iovec and ancillary storage.
-    let n = unsafe {
-        libc::recvmsg(
-            flow.socket.as_raw_fd(),
-            &mut msg,
-            libc::MSG_DONTWAIT | libc::MSG_TRUNC,
-        )
-    };
-    if n < 0 {
-        let e = io::Error::last_os_error();
-        if matches!(
-            e.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ) {
+    let received = match unquic::socket::recv_batch(flow.socket.as_fd(), &mut packets[..count]) {
+        Ok(n) => n,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) =>
+        {
             return Ok(false);
         }
-        return Err(e);
-    }
-    if let Some((segment, overflow)) =
-        metadata(&msg, &controls).filter(|_| n as usize <= bytes.len())
-    {
-        if let Some(value) = overflow {
+        Err(e) => return Err(e),
+    };
+    for packet in &packets[..received] {
+        if packet.truncated {
+            flow.invalid += 1;
+            continue;
+        }
+        if let Some(value) = packet.overflow {
             flow.overflow += u64::from(value.wrapping_sub(flow.overflow_last));
             flow.overflow_last = value;
         }
-        flow.gro += u64::from(segment != 0);
+        flow.gro += u64::from(packet.segment_size != 0);
         consume(
             flow,
-            &bytes[..n as usize],
-            if segment == 0 { n as usize } else { segment },
+            &packet.buffer[..packet.length],
+            if packet.segment_size == 0 {
+                packet.length
+            } else {
+                packet.segment_size
+            },
             c.payload,
             c.run,
         );
-    } else {
-        flow.invalid += 1;
     }
-    Ok(true)
+    Ok(received != 0)
 }
 
 fn cpu_ns() -> io::Result<u64> {
@@ -390,7 +346,7 @@ fn cpu_ns() -> io::Result<u64> {
 fn run(c: &Config) -> io::Result<()> {
     c.validate()?;
     let mut flows = flows(c)?;
-    let mut bytes = vec![0xa5; MAX_BYTES];
+    let mut bytes = vec![0xa5; MAX_BYTES * if c.send { 1 } else { 16 }];
     let mut polls: Vec<_> = flows
         .iter()
         .map(|f| libc::pollfd {
@@ -412,6 +368,7 @@ fn run(c: &Config) -> io::Result<()> {
     }
     let mut samples = [(0.0f64, 0u64); 2];
     let mut sample_count = 0;
+    let mut poll_calls = 0u64;
     let start_cpu = cpu_ns()?;
     let start = Instant::now();
     let end = Duration::from_secs(c.seconds);
@@ -430,7 +387,19 @@ fn run(c: &Config) -> io::Result<()> {
         }
         let mut progress = false;
         let mut delay = 1_000_000;
-        for f in &mut flows {
+        if !c.send {
+            poll_calls += 1;
+            // SAFETY: polls contains initialized live descriptors and writable revents.
+            let n = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as _, 1) };
+            if n < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+        for (index, f) in flows.iter_mut().enumerate() {
             if c.send {
                 let wait = f.bucket.wait(now, c.rate);
                 if wait != 0 {
@@ -456,31 +425,18 @@ fn run(c: &Config) -> io::Result<()> {
                     }
                     Err(e) => return Err(e),
                 }
-            } else {
-                for _ in 0..16 {
-                    if !receive(f, &mut bytes, c)? {
-                        break;
-                    }
-                    progress = true;
-                }
+            } else if polls[index].revents != 0 {
+                receive(f, &mut bytes, c)?;
             }
         }
-        if !progress {
-            if c.send {
-                std::thread::sleep(Duration::from_nanos(delay));
-            } else {
-                // SAFETY: polls contains initialized live descriptors and writable revents.
-                let n = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as _, 1) };
-                if n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                    return Err(io::Error::last_os_error());
-                }
-            }
+        if c.send && !progress {
+            std::thread::sleep(Duration::from_nanos(delay));
         }
     }
     let elapsed = start.elapsed().as_secs_f64();
     let cpu = (cpu_ns()? - start_cpu) as f64 / 1e9;
     println!(
-        "{{\"mode\":\"{}\",\"payload_bytes\":{},\"segments_per_send\":{},\"requested_bps_per_flow\":{},\"run_id\":{},\"seconds\":{elapsed:.9},\"cpu_seconds\":{cpu:.9},\"flows\":[",
+        "{{\"mode\":\"{}\",\"payload_bytes\":{},\"segments_per_send\":{},\"requested_bps_per_flow\":{},\"run_id\":{},\"seconds\":{elapsed:.9},\"cpu_seconds\":{cpu:.9},\"poll_calls\":{poll_calls},\"flows\":[",
         if c.send { "send" } else { "recv" },
         c.payload,
         c.count(),
@@ -718,36 +674,25 @@ mod tests {
                         consume(receiver, &bytes[..payload - 1], payload - 1, payload, c.run);
                         consume(receiver, &[], 0, payload, c.run);
                         assert_eq!(receiver.invalid, 4);
+                        if payload == 1472 && segments == 1 {
+                            storage.resize(MAX_BYTES * 16, 0);
+                            let calls = receiver.calls;
+                            without_allocations(|| {
+                                for i in 0..3 {
+                                    fill(&mut bytes, payload, c.run, count as u64 + i);
+                                    let length = payload - usize::from(i == 1);
+                                    sender.socket.send(&bytes[..length]).unwrap();
+                                }
+                                assert!(receive(receiver, &mut storage, &c).unwrap());
+                            });
+                            assert_eq!(receiver.calls, calls + 1);
+                            assert_eq!(receiver.window.unique, count as u64 + 2);
+                            assert_eq!(receiver.invalid, 5);
+                        }
                     }
                 }
             }
         }
-    }
-    #[test]
-    fn ancillary_validation_rejects_truncation_and_duplicate_gro() {
-        // SAFETY: zero is a valid initialization for these kernel ABI structures.
-        let mut controls: [Ancillary; 2] = unsafe { std::mem::zeroed() };
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        assert_eq!(metadata(&msg, &controls), Some((0, None)));
-        msg.msg_controllen = size_of_val(&controls) as _;
-        for c in &mut controls {
-            c.header.cmsg_len = unsafe { libc::CMSG_LEN(4) } as _;
-            c.header.cmsg_level = libc::IPPROTO_UDP;
-            c.header.cmsg_type = libc::UDP_GRO;
-            c.data[..4].copy_from_slice(&1472u32.to_ne_bytes());
-        }
-        assert_eq!(metadata(&msg, &controls), None);
-        controls[1].header.cmsg_level = libc::SOL_SOCKET;
-        controls[1].header.cmsg_type = libc::SO_RXQ_OVFL;
-        controls[1].data[..4].copy_from_slice(&42u32.to_ne_bytes());
-        assert_eq!(metadata(&msg, &controls), Some((1472, Some(42))));
-        for flag in [libc::MSG_TRUNC, libc::MSG_CTRUNC] {
-            msg.msg_flags = flag;
-            assert_eq!(metadata(&msg, &controls), None);
-        }
-        msg.msg_flags = 0;
-        msg.msg_controllen -= 5;
-        assert_eq!(metadata(&msg, &controls), None);
     }
 
     #[test]

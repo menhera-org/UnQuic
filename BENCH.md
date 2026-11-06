@@ -2144,3 +2144,43 @@ drops, invalid/duplicate/out-of-window/wrong-run receiver records, and outer
 fragmentation. Full drop counters, reordering and per-worker CPU are in the
 JSON. Most receiver processes remain above 89% CPU, so the next harness
 check batches their UDP receives while keeping the daemon unchanged.
+
+## Load receiver syscall reduction (2026-11-06)
+
+The load tool now reuses the library's checked `recvmmsg` implementation and
+services only sockets reported ready by `poll`. Each socket still receives
+at most 16 kernel messages per turn. Payload, sequence, duplicate, GRO and
+overflow validation remain unchanged; about 1 MiB of payload storage is
+allocated before timing. The duplicate ancillary parser is removed.
+
+[Release observations](benches/udp-load-receive-batch.json) use the unchanged
+`58e70fb` daemon, threshold 16, and the single-tag settings above. These
+measure the harness, not a daemon optimization.
+
+| Receiver / request Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % | Receiver CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| Original / 21 | 16.506 / 14.962 | 20.23 / 27.73 | 612.4 / 611.7 | 93.3 / 92.6 |
+| Batch only / 21 | 17.208 / 15.395 | 17.24 / 25.95 | 625.1 / 619.8 | 95.9 / 95.6 |
+| Batch only / unlimited | 16.813 / 15.305 | 51.30 / 50.50 | 669.4 / 679.5 | 95.9 / 95.7 |
+| Ready sockets / 21 | 16.047 / 14.761 | 21.79 / 28.24 | 615.4 / 611.2 | 85.4 / 81.0 |
+| Ready sockets / unlimited | 16.085 / 14.745 | 44.55 / 48.89 | 689.9 / 681.9 | 86.2 / 83.5 |
+| Final, including poll counter / 21 | 15.985 / 14.679 | 22.36 / 29.16 | 622.1 / 634.6 | 87.9 / 83.2 |
+
+The original paced receivers made 23.46 / 25.04 million receive calls. The
+final receivers make 5.63 / 5.53 million receive calls plus 2.52 / 2.86
+million readiness polls. The combined count is about two thirds lower.
+Batching alone reduced receive calls but kept probing empty sockets and
+did not reduce CPU use.
+
+The final paced row has left/right TAP drops 242842 / 128832 SKBs, socket
+overflow 2702282 / 1423571 SKBs, inner UDP errors 39892 / 40106, and expired
+frames 7 / 1321. All five new observations have zero admission-pressure and
+worker-queue drops, invalid/duplicate/out-of-window/wrong-run receiver records,
+and outer fragmentation; the JSON retains every row's drop attribution.
+
+The syscall reduction is verified. A transport throughput improvement is not:
+goodput remains variable and below target, and receiver CPU still exceeds
+80% at these rates. More receiver capacity may be needed for the final gate.
+Release tests cover multiple valid messages around an invalid sibling in one
+receive call, IPv4/IPv6, GRO, truncation and allocation-free processing.
+Clippy and Rust 1.89 checks pass.

@@ -26,7 +26,10 @@ flow, paced with a token bucket capped at two aggregates. Successful sends
 consume credits and sequence numbers; failed sends consume neither. The
 actual offered rate can be below the request and must be reported.
 
-Receivers expand GRO messages before validating each datagram's run ID,
+Receivers use the library's checked `recvmmsg` path to read up to 16 messages
+per ready socket per turn, with about 1 MiB of reusable payload storage per
+process. A readiness poll avoids repeatedly reading empty sockets.
+They expand GRO messages before validating each datagram's run ID,
 sequence number, length and entire payload. Each flow tracks 262,144 blocks of
 64 sequence numbers (16,777,216 positions), using 4 MiB of startup-allocated
 tag and bitmap storage. The maximum 64-flow configuration reserves 256 MiB for
@@ -43,6 +46,7 @@ must be zero for an acceptance run.
 
 The JSON output includes process CPU time, syscall counts, blocked sends,
 GRO messages, observed socket overflow and the actual receive-buffer limit.
+Per-flow `calls` counts send/receive syscalls; `poll_calls` counts readiness polls.
 Overflow is in kernel SKB units, not datagrams, and its final cumulative value
 is available only when the kernel attaches it to a received message.
 
