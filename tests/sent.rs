@@ -536,3 +536,123 @@ fn bounded_ack_keeps_rtt_candidate_until_later_eliciting_range() {
     assert!(progress.eliciting);
     assert_eq!(progress.rtt_sent_at, Some(Duration::from_micros(3)));
 }
+
+#[test]
+fn sparse_outstanding_scan_budgets_empty_words_and_stops_at_its_original_end() {
+    let mut history = History::new().unwrap();
+    let last = SENT_CAPACITY as u64;
+    sent(&mut history, last, true);
+    let mut scan = history.outstanding_scan();
+    let mut budget = 0;
+    assert_eq!(scan.advance(&history, &mut budget), None);
+    assert!(!scan.is_complete());
+    for _ in 0..16 {
+        let mut budget = 64;
+        assert_eq!(scan.advance(&history, &mut budget), None);
+        assert_eq!(budget, 0);
+        assert!(!scan.is_complete());
+    }
+    // Appending after a pass starts must not extend that pass indefinitely.
+    sent(&mut history, last + 1, true);
+    let mut budget = 64;
+    assert_eq!(scan.advance(&history, &mut budget).unwrap().number, last);
+    assert_eq!(budget, 63);
+    assert!(scan.is_complete());
+    assert_eq!(scan.advance(&history, &mut budget), None);
+    assert_eq!(budget, 63);
+    assert_eq!(history.outstanding().count(), 2);
+}
+
+#[test]
+fn outstanding_scan_rechecks_ack_loss_and_eviction_between_steps() {
+    let mut history = History::new().unwrap();
+    for number in 1..=4 {
+        sent(&mut history, number, true);
+    }
+    let mut scan = history.outstanding_scan();
+    assert_eq!(scan.advance(&history, &mut 1).unwrap().number, 1);
+    history.lose(1).unwrap();
+    history.lose(2).unwrap();
+    history
+        .acknowledge(ranges(&[AckRange { start: 3, end: 3 }]), |_| {})
+        .unwrap();
+    assert_eq!(scan.advance(&history, &mut 1).unwrap().number, 4);
+    assert!(scan.is_complete());
+    history.lose(4).unwrap();
+    let next = SENT_CAPACITY as u64 + 4;
+    sent(&mut history, next, true);
+    // A cursor whose remaining span was evicted cannot visit recycled ring slots.
+    let mut scan = history.outstanding_scan();
+    assert!(!scan.is_complete());
+    history.lose(next).unwrap();
+    sent(&mut history, next + SENT_CAPACITY as u64, true);
+    let mut budget = 64;
+    assert_eq!(scan.advance(&history, &mut budget), None);
+    assert_eq!(budget, 64);
+    assert!(scan.is_complete());
+}
+
+#[test]
+fn outstanding_scan_skips_holes_feedback_and_preserves_pending_ack_protection() {
+    let mut history = History::new().unwrap();
+    sent(&mut history, 1, false);
+    history.reserve(2, 1500, true, true).unwrap();
+    sent(&mut history, 3, true);
+    sent(&mut history, 4, true);
+    history.reserve(5, 1500, true, true).unwrap();
+    history.cancel(5);
+    let mut scan = history.outstanding_scan();
+    history
+        .begin_ack(ranges(&[AckRange { start: 3, end: 3 }]))
+        .unwrap();
+    let mut budget = 1;
+    assert_eq!(scan.advance(&history, &mut budget).unwrap().number, 3);
+    assert_eq!(budget, 0);
+    assert_eq!(history.lose(3), None, "validated ACK wins over a loss scan");
+    assert_eq!(scan.advance(&history, &mut 1).unwrap().number, 4);
+    assert!(history.lose(4).is_some());
+    // Only packet 3 remains; packet 5 was never successfully submitted.
+    assert_eq!(scan.advance(&history, &mut 1), None);
+    assert!(scan.is_complete());
+    assert_eq!(history.inflight_bytes(), 1500);
+}
+
+#[test]
+fn outstanding_scan_handles_empty_full_and_maximum_number_windows() {
+    let mut history = History::new().unwrap();
+    let mut scan = history.outstanding_scan();
+    assert!(scan.is_complete());
+    let mut budget = 64;
+    assert_eq!(scan.advance(&history, &mut budget), None);
+    assert_eq!(budget, 64);
+    for number in 1..=SENT_CAPACITY as u64 {
+        sent(&mut history, number, true);
+    }
+    let mut scan = history.outstanding_scan();
+    for turn in 0..SENT_CAPACITY / 64 {
+        let mut budget = 64;
+        for offset in 1..=64 {
+            let packet = scan.advance(&history, &mut budget).unwrap();
+            assert_eq!(packet.number, (turn * 64 + offset) as u64);
+            assert_eq!(budget, 64 - offset);
+            assert_eq!(history.lose(packet.number), Some(packet));
+        }
+        assert_eq!(scan.advance(&history, &mut budget), None);
+    }
+    assert!(scan.is_complete());
+    assert_eq!(history.inflight_bytes(), 0);
+    sent(&mut history, u64::MAX - 1, true);
+    sent(&mut history, u64::MAX, true);
+    let mut scan = history.outstanding_scan();
+    let mut numbers = Vec::new();
+    let mut turns = 0;
+    while !scan.is_complete() {
+        let mut budget = 64;
+        while let Some(packet) = scan.advance(&history, &mut budget) {
+            numbers.push(packet.number);
+        }
+        turns += 1;
+        assert!(turns <= 17);
+    }
+    assert_eq!(numbers, [u64::MAX - 1, u64::MAX]);
+}

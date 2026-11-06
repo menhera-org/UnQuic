@@ -453,6 +453,11 @@ budget of bitmap scans, range transitions and callbacks. Whole-record validation
 precedes application; pending ACKs pin their history window and protect covered
 packets from interleaved loss. Tests cover a full-window ACK, duplicate-only
 scans, floor pressure, competing ACKs, late loss and RTT sampling across yields.
+Outstanding-charge scans now yield on a bitmap-read budget, including empty
+words. Each pass has a fixed upper packet number and rechecks state after ACK,
+loss and eviction; new sends cannot extend a pass. Empty, sparse, full-window,
+maximum-number and allocation-free regressions pass. These scans remain pure
+components until the worker loss loop is connected.
 Worker integration must retain the ACK's arrival time and reserve report space
 before advancing it. Sender entries now use 16 bytes each, retaining full
 `Duration` range and nanosecond precision; 64 histories save 32 MiB compared with

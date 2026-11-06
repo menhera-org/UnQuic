@@ -94,6 +94,57 @@ struct PendingAck {
     progress: AckProgress,
 }
 
+/// Resumable visit of one lane's outstanding charges, bounded by bitmap work.
+///
+/// The upper packet number is fixed at creation, so continuous transmission
+/// cannot extend the pass. ACK/loss and history eviction may run between steps.
+/// A reservation submitted after its number was passed needs a later scan.
+/// Discard this cursor before resetting or replacing its history/connection.
+pub struct OutstandingScan {
+    next: Option<u64>,
+    end: u64,
+}
+
+impl OutstandingScan {
+    /// Whether this pass has finished, including an empty history.
+    pub const fn is_complete(&self) -> bool {
+        self.next.is_none()
+    }
+
+    /// Returns one still-outstanding packet, spending one unit per bitmap read.
+    ///
+    /// None means either exhaustion of the budget or completion; check
+    /// is_complete. Zero budget leaves the cursor unchanged. Call History::lose
+    /// before reporting a loss: a pending validated ACK may protect this packet.
+    pub fn advance(&mut self, history: &History, budget: &mut usize) -> Option<SentPacket> {
+        while *budget != 0 {
+            let start = self.next?.max(history.floor);
+            if start > self.end || history.inflight_bytes == 0 {
+                self.next = None;
+                return None;
+            }
+            *budget -= 1;
+            let end = self.end.min(start | 63);
+            let mask = (u64::MAX << (start % 64)) & (u64::MAX >> (63 - end % 64));
+            let bits = history.inflight[(start >> 6) as usize & (WORDS - 1)] & mask;
+            let number = if bits == 0 {
+                end
+            } else {
+                (start & !63) | u64::from(bits.trailing_zeros())
+            };
+            self.next = if number == self.end {
+                None
+            } else {
+                number.checked_add(1)
+            };
+            if bits != 0 {
+                return Some(history.metadata(number));
+            }
+        }
+        None
+    }
+}
+
 /// Bounded sender history with allocation-free reservation, ACK and loss operations.
 ///
 /// Each packet uses 16 bytes of metadata plus four bitmap bits, preserving the
@@ -402,24 +453,28 @@ impl History {
         Some(packet)
     }
 
-    /// Visits outstanding charged packets in number order without allocation.
+    /// Starts a bounded outstanding-charge pass through the current allocated number.
+    ///
+    /// Newer packets need a later pass. Loss policy and per-turn piece/report budgets
+    /// belong to the caller; this cursor bounds scanning even across empty words.
+    pub const fn outstanding_scan(&self) -> OutstandingScan {
+        OutstandingScan {
+            next: if self.inflight_bytes == 0 {
+                None
+            } else {
+                Some(self.floor)
+            },
+            end: self.allocated,
+        }
+    }
+
+    /// Visits outstanding charged packets synchronously in number order.
+    ///
+    /// Worker turns should use outstanding_scan to bound visits of empty words too.
     pub fn outstanding(&self) -> impl Iterator<Item = SentPacket> + '_ {
-        let end = if self.inflight_bytes == 0 {
-            0
-        } else {
-            self.allocated
-        };
-        words(self.floor, end).flat_map(move |(word, mask)| {
-            let mut bits = self.inflight[word as usize & (WORDS - 1)] & mask;
-            std::iter::from_fn(move || {
-                if bits == 0 {
-                    return None;
-                }
-                let bit = bits.trailing_zeros();
-                bits &= bits - 1;
-                Some(self.metadata((word << 6) | u64::from(bit)))
-            })
-        })
+        let mut scan = self.outstanding_scan();
+        let mut budget = usize::MAX;
+        std::iter::from_fn(move || scan.advance(self, &mut budget))
     }
 
     /// Reuses storage only after every charge and reservation has been settled.

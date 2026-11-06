@@ -1152,3 +1152,29 @@ fn piece_journal_reservation_feedback_and_expiry_allocate_nothing() {
     let count = ALLOCATION_COUNT.replace(None);
     assert_eq!(count, Some(0));
 }
+
+#[test]
+fn bounded_outstanding_scans_allocate_nothing() {
+    use unquic::ack::{History, SENT_CAPACITY};
+    let mut history = History::new().unwrap();
+    let mut number = 0;
+    ALLOCATION_COUNT.set(Some(0));
+    for _ in 0..100 {
+        number += SENT_CAPACITY as u64;
+        assert!(history.reserve(number, 1500, true, true).is_ok());
+        assert!(history.submit(number, Duration::ZERO));
+        let mut scan = history.outstanding_scan();
+        let mut seen = 0;
+        while !scan.is_complete() {
+            let mut budget = 64;
+            while let Some(packet) = scan.advance(&history, &mut budget) {
+                assert_eq!(packet.number, number);
+                assert!(history.lose(packet.number).is_some());
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 1);
+    }
+    let count = ALLOCATION_COUNT.replace(None);
+    assert_eq!(count, Some(0));
+}
