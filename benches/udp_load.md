@@ -70,6 +70,9 @@ signal the receivers. A multi-rate invocation creates fresh daemons and
 private namespaces for each point, preventing queued packets from leaking
 into later runs. A failed child fails the run.
 
+`SESSION_COOKIE` overrides the session UUID for queue-placement controls;
+record it when comparing runs because it affects receive-worker assignment.
+
 `WORKERS=4` is the default; `WORKERS=8` also changes the lane and queue
 counts. `DAEMON_LEFT_CPUS` and `DAEMON_RIGHT_CPUS` override daemon placement.
 The existing `GENERATOR_*_CPUS` and `RECEIVER_*_CPUS` variables select the

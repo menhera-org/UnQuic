@@ -442,6 +442,7 @@ struct TxBatch {
     plan: pack::Batch,
     frames: [Option<Box<Buffer>>; pack::BATCH_CAPACITY],
     len: usize,
+    deferred: u64,
 }
 
 impl TxBatch {
@@ -450,6 +451,7 @@ impl TxBatch {
             plan: pack::Batch::new(),
             frames: std::array::from_fn(|_| None),
             len: 0,
+            deferred: 0,
         }
     }
 
@@ -2156,6 +2158,11 @@ impl Worker {
         for _ in 0..self.pending.len().min(BATCH_SIZE) {
             let buffer = self.pending.pop_front().unwrap();
             if !self.matches(buffer.session, buffer.tag) || self.expired(&buffer, now) {
+                if let Some(batch) = &mut self.sessions[buffer.session].batches[buffer.lane]
+                    && batch.deferred == buffer.frame_id
+                {
+                    batch.deferred = 0;
+                }
                 self.release(buffer);
                 continue;
             }
@@ -2163,10 +2170,17 @@ impl Worker {
             let lane = buffer.lane;
             let local = &mut self.sessions[session];
             let batch = local.batches[lane].as_mut().unwrap();
-            if !batch.plan.is_empty() || batch.len == pack::BATCH_CAPACITY {
+            // Queue rotation must not let a newer frame overtake a deferred one.
+            if batch.deferred != 0 && batch.deferred != buffer.frame_id {
                 self.pending.push_back(buffer);
                 continue;
             }
+            if !batch.plan.is_empty() || batch.len == pack::BATCH_CAPACITY {
+                batch.deferred = buffer.frame_id;
+                self.pending.push_back(buffer);
+                continue;
+            }
+            batch.deferred = 0;
             batch.frames[batch.len] = Some(buffer);
             batch.len += 1;
             if local.tx_ready & (1_u64 << lane) == 0 {
@@ -2872,6 +2886,9 @@ impl Worker {
             }
             Phase::Install => {
                 local.rx_index.fill(0);
+                for batch in local.batches.iter_mut().flatten() {
+                    batch.deferred = 0;
+                }
                 local.connection = command.connection;
                 local.path = path;
                 let config = self.shared.config.config();
@@ -4225,6 +4242,123 @@ mod tests {
         assert_eq!(delivered, 9022);
         assert!(worker.ready.is_empty());
         assert_eq!(worker.free.len(), BUFFERS);
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn transmit_pending_keeps_fifo_across_full_batches() {
+        for expired in [0, 65, 66] {
+            let (_, mut workers) = test_workers();
+            let mut other = workers[1].free.pop().unwrap();
+            let worker = &mut workers[0];
+            let (tx, _rx) = crate::spsc::channel();
+            worker.outgoing[1] = Some(tx);
+            let params = wire::Params {
+                port: 40000,
+                max_frame_len: 1514,
+                mandatory_features: 0,
+                optional_features: 0,
+            };
+            for session in 0..2 {
+                worker.command(
+                    session,
+                    Command {
+                        generation: 0,
+                        phase: Phase::Install,
+                        connection: Some(Connection {
+                            role: handshake::Role::Initiator,
+                            initiator: Tag::new(1).unwrap(),
+                            responder: Tag::new(2).unwrap(),
+                            local: params,
+                            peer: params,
+                            max_frame_len: 1514,
+                        }),
+                    },
+                    0,
+                );
+            }
+            let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
+            worker.transmit[0].paths[0].lanes[0].socket =
+                Some(TransmitSocket::connect(&rx, rx.local_addr()).unwrap());
+            worker.transmit[0].paths[0].lanes[0].blocked = true;
+            for _ in 0..128 {
+                let mut buffer = worker.free.pop().unwrap();
+                buffer.tag = 1;
+                buffer.length = 60;
+                buffer.deadline = Duration::from_secs(1);
+                worker.frame(buffer, Duration::ZERO).unwrap();
+            }
+            // Leave one batch slot and one pending frame beyond this turn's budget.
+            let batch = worker.sessions[0].batches[0].as_mut().unwrap();
+            for frame in &mut batch.frames[..63] {
+                *frame = worker.pending.pop_front();
+            }
+            batch.len = 63;
+            worker.sessions[0].tx_ready = 1;
+            worker.ready.push_back((0, 0));
+            other.session = 1;
+            other.tag = 1;
+            other.length = 60;
+            other.deadline = Duration::from_secs(1);
+            worker.frame(other, Duration::ZERO).unwrap();
+            worker.flush_frames(Duration::ZERO).unwrap();
+            let now = Duration::from_millis(10);
+            if expired != 0 {
+                worker
+                    .pending
+                    .iter_mut()
+                    .find(|b| b.session == 0 && b.frame_id == (1 << 48) | expired)
+                    .unwrap()
+                    .deadline = now;
+            }
+            for _ in 0..3 {
+                worker.flush_frames(now).unwrap();
+                assert_eq!(worker.sessions[0].batches[0].as_ref().unwrap().len, 64);
+                assert_eq!(worker.pending.len(), 64 - usize::from(expired != 0));
+                assert_eq!(worker.sessions[1].batches[0].as_ref().unwrap().len, 1);
+            }
+            worker.transmit[0].paths[0].lanes[0].blocked = false;
+            let mut received = Vec::new();
+            let mut bytes = [0; BASE_UDP_PAYLOAD];
+            for _ in 0..4 {
+                worker.flush_frames(now).unwrap();
+                while let Ok((length, _)) = rx.recv(&mut bytes) {
+                    let datagram = Datagram::decode(&bytes[..length]).unwrap();
+                    if datagram.header().cookie != crate::UnquicUuid::from_bytes([1; 16]) {
+                        continue;
+                    }
+                    for record in datagram.records() {
+                        if let Record::Data {
+                            frame_id,
+                            offset: 0,
+                            ..
+                        } = record
+                        {
+                            received.push(frame_id);
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                received,
+                (1..=128)
+                    .filter(|id| *id != expired)
+                    .map(|id| (1 << 48) | id)
+                    .collect::<Vec<_>>()
+            );
+            assert!(worker.pending.is_empty());
+            let command = worker.sessions[0].installed.unwrap();
+            worker.sessions[0].batches[0].as_mut().unwrap().deferred = 1;
+            worker.command(
+                0,
+                Command {
+                    generation: command.generation + 1,
+                    ..command
+                },
+                0,
+            );
+            assert_eq!(worker.sessions[0].batches[0].as_ref().unwrap().deferred, 0);
+        }
     }
 
     #[test]

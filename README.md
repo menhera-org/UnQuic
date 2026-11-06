@@ -178,6 +178,10 @@ buffers by frame index and byte range, without self-references or payload copies
 Generated sequences, reversed arrival, duplicate packets, identity exhaustion
 and small-frame bursts have tests. Two 1514-byte frames pack into three baseline
 datagrams. Workers now use this encoder and retain partial batches.
+Each lane remembers its oldest deferred frame, so bounded pending-queue
+rotation cannot admit newer frames ahead of it when a batch fills. Other lanes
+can still progress within the same 64-entry scan budget; expiry and connection
+replacement clear the marker.
 
 The runtime now forwards frames between TAPs with configured or supplied IPv6 peers.
 The isolated test exercises two workers, two peers and three sessions per endpoint,

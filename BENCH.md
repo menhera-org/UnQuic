@@ -1991,3 +1991,99 @@ it does not inject probe replies or advance a simulated clock.
 This verifies routed discovery with delivered and silently dropped errors,
 including recovery to a larger MTU. It does not measure goodput, loss under
 load or CPU usage. The local and real-access performance gates remain open.
+
+## Cookie placement and transmit FIFO investigation (2026-11-06)
+
+The November 6 performance review proposed a feedback loop between reader-local
+lane selection and Linux TAP's learned reverse-flow queue. Linux's
+[tun flow updates](https://github.com/torvalds/linux/blob/v6.8/drivers/net/tun.c)
+and [symmetric flow hashing](https://github.com/torvalds/linux/blob/master/net/core/flow_dissector.c)
+support the mechanism: writing a reverse flow can change its next TAP reader.
+With eight readers/lanes, the current receiver mapping shifts each direction
+by the cookie's low word modulo eight. A low word ending in `ff` therefore
+does not provide a stable reader; `f8` and `f4` provide fixed points for the
+round trip. This predicts placement behavior, not throughput.
+
+[Controlled release observations](benches/tap-cookie-placement.json) retain
+the per-flow results, per-worker counters, thread CPU, socket overflow, TAP
+drops and inner UDP errors. Each point runs for 60 seconds with 16 flows each
+way, 44-segment sends, eight workers per daemon, 500-entry TAP queues and an
+outer payload ceiling of 1452. The original CPU placement is unchanged.
+These are untagged controls. Each point starts fresh processes and namespaces.
+Use `SESSION_COOKIE` with `benches/tap_transport.sh` to reproduce the variants.
+
+At `dce9054`, changing only the cookie gives:
+
+| Cookie suffix / request Gbit/s each way | Delivered Gbit/s | Missing after drain % | Reordered / received % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| ff / 21 | 15.711 / 14.602 | 23.06 / 29.22 | 50.60 / 42.55 | 596.6 / 602.0 |
+| ff / unlimited | 15.351 / 13.250 | 40.02 / 50.70 | 54.22 / 50.19 | 594.6 / 598.4 |
+| f8 / 21 | 13.585 / 13.845 | 33.26 / 32.64 | 16.39 / 15.59 | 542.1 / 543.8 |
+| f8 / unlimited | 16.873 / 14.535 | 41.48 / 51.40 | 18.25 / 17.05 | 626.2 / 634.3 |
+| f4 / 21 | 15.136 / 13.142 | 26.86 / 36.62 | 16.02 / 13.90 | 548.8 / 547.6 |
+| f4 / unlimited | 15.418 / 14.537 | 34.05 / 41.37 | 22.14 / 22.34 | 629.3 / 631.1 |
+
+Alignment reduces reordering, but does not produce the predicted near-zero
+reordering or a paced-throughput improvement. The busiest aligned workers
+reach about 98% CPU while others remain below 50%. Original-cookie worker
+loads are more even. These observations support a placement effect but do
+not establish migration as the sole cause of overload decline. Receiver
+processes exceed 90% CPU in these baseline points, further limiting attribution.
+No production lane-number permutation is justified by these throughput results
+alone.
+
+A separate, reproduced bug explains some within-lane reordering. When a
+transmit batch filled during a bounded pending-queue scan, deferred frames
+rotated behind the unexamined tail. A release kernel regression sent frame
+128 before frames 65–127 on the same lane. Each batch now remembers its
+oldest deferred frame; newer frames wait for that frame to be admitted or
+discarded. The scan still examines at most 64 entries, and other lanes can
+progress. The marker adds eight bytes per batch and no allocation or syscall.
+It is cleared on expiry and connection replacement.
+
+The review's encapsulation concern is also present in the code: IPv6 next
+headers 4, 41 and 143 stop flow-key parsing before the encapsulated flow.
+Its throughput impact has not yet been measured. The proposed sender-retention
+layout still needs implementation with recovery. At 5 Gbit/s and 7.5 ms RTT,
+one RTT holds about 4.7 MB; retaining every frame for the full 30 ms deadline
+would hold about 18.8 MB. The latter is a stress bound, not evidence that
+normally acknowledged frames must remain buffered for that whole deadline.
+No payload buffers or socket buffers were enlarged for this investigation.
+
+The FIFO fix alone, with the same settings, gives:
+
+| Cookie suffix / request Gbit/s each way | Delivered Gbit/s | Missing after drain % | Reordered / received % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| ff / 21 | 15.496 / 14.224 | 23.86 / 30.53 | 46.81 / 39.05 | 576.5 / 582.9 |
+| ff / unlimited | 15.618 / 14.177 | 32.16 / 39.75 | 47.65 / 41.80 | 602.8 / 607.8 |
+| f8 / 21 | 13.506 / 13.529 | 34.12 / 34.16 | 2.29 / 1.89 | 519.7 / 523.8 |
+| f8 / unlimited | 15.052 / 14.804 | 41.22 / 46.00 | 2.99 / 3.32 | 584.4 / 588.5 |
+
+This fixes demonstrated queue overtaking and substantially reduces reordering
+with aligned placement. It does not establish a throughput improvement:
+paced goodput falls slightly in both controls, and unlimited changes differ
+by direction and cookie. These are single pairs, not repeatability results.
+The original-cookie run still has substantial reordering after the FIFO fix.
+
+Drop attribution for the FIFO build, ordered by left/right daemon or interface:
+
+| Cookie / request | TAP TX drops (SKBs) | Socket overflow (SKBs) | Inner UDP receive errors | Expired frames |
+| --- | ---: | ---: | ---: | ---: |
+| ff / 21 | 274826 / 109908 | 1216633 / 718455 | 127251 / 91805 | 2 / 1 |
+| ff / unlimited | 537374 / 427794 | 1321658 / 772703 | 98206 / 72331 | 9 / 3955 |
+| f8 / 21 | 488762 / 331449 | 679112 / 433292 | 62907 / 51252 | 12971 / 6623 |
+| f8 / unlimited | 842500 / 973359 | 828527 / 543429 | 103692 / 62891 | 11785 / 26189 |
+
+All ten points have zero admission-pressure and worker-queue drops, zero
+receiver invalid/duplicate/out-of-window/wrong-run records, and zero outer
+fragmentation. Socket and TAP counters count SKBs, which can contain multiple
+datagrams or frames. The JSON retains the baseline drop counters as well.
+The 20 Gbit/s gate, repeatable overload plateau and real-path recovery target
+remain open.
+
+Validation includes the release FIFO regression, the full release test suite,
+Clippy and the minimum supported Rust version. One runtime test timed out on
+a single frame after address migration; four diagnostic reruns passed. The
+fixture now waits for both peers' generations before sending that frame,
+because local installation alone does not establish peer readiness. The
+initial timeout's cause was not captured and remains unattributed.

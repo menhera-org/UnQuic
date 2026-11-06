@@ -344,6 +344,13 @@ throughput when TAP input concentrates on one queue. TAP queue migration may
 reorder UDP frames; a frame and its repairs
 keep one lane. The expanded benchmark history measures this reordering without
 changing transport storage or admission. See BENCH.md for UDP/TCP comparisons.
+The November 6 cookie controls reduce reordering with aligned placement but do
+not establish a throughput gain. A separate full-batch queue rotation bug is
+fixed: newer frames cannot overtake a lane's oldest deferred frame. Tests cover
+expiry, other-session progress and connection replacement without expanding
+the scan budget. Encapsulated IPv4/IPv6/Ethernet flow hashing still needs a
+bounded inner-header key and measured tagged/SRv6 coverage. BENCH.md separates
+these findings from the remaining performance hypotheses.
 The final throughput gate remains open. Partial completion, GSO/GRO boundaries, MTU errors
 and allocation checks pass. The five frame-model regression cases
 now run against the real implementation in tests/reassembly.rs.

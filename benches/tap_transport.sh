@@ -97,7 +97,7 @@ outer_payload_limit = ${OUTER_PAYLOAD_LIMIT:-1232}
 [[sessions]]
 name = "uq-$side"
 peer = "peer"
-cookie = "00112233-4455-4677-8899-aabbccddeeff"
+cookie = "${SESSION_COOKIE:-00112233-4455-4677-8899-aabbccddeeff}"
 inner_mtu = 1500
 mac = "02:00:00:00:00:$mac"
 queue_count = $workers
