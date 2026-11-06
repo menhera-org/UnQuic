@@ -2087,3 +2087,60 @@ a single frame after address migration; four diagnostic reruns passed. The
 fixture now waits for both peers' generations before sending that frame,
 because local installation alone does not establish peer readiness. The
 initial timeout's cause was not captured and remains unattributed.
+
+## Completed-frame drain threshold experiment (2026-11-06)
+
+At `58e70fb`, changing only the completed-frame drain threshold from 16 to
+32 retains the same 64-datagram, 64-record and 64-KiB receive-turn budgets,
+64 reassembly slots, deadlines and pressure-triggered drain/retry. All 22
+release kernel tests pass, including bursts, GRO expansion, blocked TAP and
+tail-plus-new-head admission.
+
+[Full observations](benches/tap-drain-threshold.json) use the preceding
+60-second, 16-flow, eight-worker setup and the original load tool. Each row
+starts fresh processes and namespaces. Untagged frames contain 1514 bytes;
+single-tag frames contain 1518. Both carry 1472-byte UDP payloads at inner
+MTU 1500. The outer payload ceiling remains 1452.
+
+| Traffic / cookie / threshold / request Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| Untagged / ff / 32 / 21 | 12.452 / 12.117 | 39.42 / 41.26 | 456.3 / 460.5 |
+| Untagged / ff / 32 / unlimited | 18.171 / 15.005 | 45.32 / 55.98 | 642.7 / 661.6 |
+| Untagged / f8 / 32 / 21 | 15.892 / 14.705 | 23.53 / 29.26 | 526.0 / 522.3 |
+| Untagged / f8 / 32 / unlimited | 18.318 / 17.075 | 45.49 / 50.66 | 639.7 / 642.8 |
+| Untagged repeat / ff / 16 / 21 | 16.810 / 15.542 | 18.41 / 24.62 | 569.7 / 583.7 |
+| Untagged repeat / ff / 32 / 21 | 17.170 / 15.842 | 16.43 / 23.09 | 557.3 / 573.5 |
+| Untagged repeat / f8 / 16 / 21 | 14.525 / 14.151 | 29.41 / 31.07 | 524.1 / 520.1 |
+| Untagged repeat / f8 / 32 / 21 | 15.600 / 14.668 | 24.77 / 29.31 | 528.6 / 529.1 |
+| Single tag / ff / 16 / 21 | 16.506 / 14.962 | 20.23 / 27.73 | 612.4 / 611.7 |
+| Single tag / ff / 16 / unlimited | 15.851 / 12.372 | 54.08 / 66.82 | 607.7 / 603.7 |
+| Single tag / ff / 32 / 21 | 16.449 / 15.551 | 20.12 / 24.54 | 613.9 / 618.4 |
+| Single tag / ff / 32 / unlimited | 15.252 / 14.913 | 53.27 / 53.03 | 637.4 / 631.1 |
+
+The larger threshold raises mean USO groups from roughly 10–11 to 14–17
+frames. Aligned untagged placement improves in both paced comparisons.
+However, the first original-cookie paced run concentrates work on four queues
+per daemon: those workers reach 81–97% CPU while the others stay near 21–24%.
+Its cause was not isolated. The repeat spreads work more evenly and performs
+much better, demonstrating substantial run-to-run variation.
+
+Tagged results also fail to establish an improvement in both directions.
+At unlimited load, threshold 32 delivers less left-to-right traffic than
+threshold 16, and both still fall below their paced goodput. **The experiment
+is rejected; production retains threshold 16.** Larger write groups alone
+have not solved worker imbalance or overload decline.
+
+Tagged drop attribution, left/right:
+
+| Threshold / request | TAP TX drops (SKBs) | Socket overflow (SKBs) | Inner UDP receive errors | Expired frames |
+| --- | ---: | ---: | ---: | ---: |
+| 16 / 21 | 256017 / 155314 | 2070095 / 1256899 | 52417 / 70299 | 5 / 2659 |
+| 16 / unlimited | 1772759 / 2276780 | 1962955 / 1411254 | 84600 / 165296 | 3736 / 37537 |
+| 32 / 21 | 208158 / 87520 | 2325207 / 1413031 | 55233 / 46887 | 4 / 1341 |
+| 32 / unlimited | 1527179 / 1249358 | 1812179 / 1554049 | 79624 / 101215 | 18155 / 13032 |
+
+All twelve new observations have zero admission-pressure and worker-queue
+drops, invalid/duplicate/out-of-window/wrong-run receiver records, and outer
+fragmentation. Full drop counters, reordering and per-worker CPU are in the
+JSON. Most receiver processes remain above 89% CPU, so the next harness
+check batches their UDP receives while keeping the daemon unchanged.
