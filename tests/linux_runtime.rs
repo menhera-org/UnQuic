@@ -1,17 +1,15 @@
 //! End-to-end worker tests; never change the host network namespace.
 mod common;
+use common::runtime::Running;
 use common::*;
 use std::{
     io,
     net::{Ipv6Addr, UdpSocket},
     os::fd::AsRawFd,
-    thread::{self, JoinHandle},
+    thread,
     time::{Duration, Instant},
 };
-use unquic::{
-    config::{Config, Daemon, Endpoint, Peer, Session},
-    runtime::{self, Control},
-};
+use unquic::config::{Config, Daemon, Endpoint, Peer, Session};
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -93,33 +91,6 @@ fn config(name: &str, port: u16, remote: u16) -> Config {
     config.peers.push(peer2);
     config.sessions.extend([second, third]);
     config
-}
-
-struct Running {
-    control: Control,
-    thread: Option<JoinHandle<io::Result<()>>>,
-}
-impl Running {
-    fn start(config: Config) -> Self {
-        let control = Control::new();
-        let worker_control = control.clone();
-        let thread = Some(thread::spawn(move || runtime::run(config, worker_control)));
-        Self { control, thread }
-    }
-    fn stop(&mut self) {
-        self.control.shutdown();
-        self.thread.take().unwrap().join().unwrap().unwrap();
-        assert!(self.control.stopped());
-        assert!(!self.control.ready());
-    }
-}
-impl Drop for Running {
-    fn drop(&mut self) {
-        self.control.shutdown();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
 }
 
 #[track_caller]

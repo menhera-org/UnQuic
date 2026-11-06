@@ -651,6 +651,19 @@ if a Rust toolchain and the source are available:
 cargo test --target x86_64-unknown-linux-musl --test linux_foundation -- --ignored
 ```
 
+`linux_pmtu` also requires `ip` and `tc`. Its routed discovery test takes about
+11 minutes because it waits through the real 600-second upward retry. Two
+runtimes communicate through a third, private router namespace: the path starts
+at 9000 outer bytes, drops to 1500 with returned ICMPv6 Packet Too Big, drops to
+1280 with those errors filtered, then recovers to 9000. Each phase checks every
+lane and bidirectional QinQ frames up to 9022 bytes. Packet captures check for
+outer Fragment headers and capture drops; filter counters prove the silent-error
+case was exercised. Run its release binary with:
+
+```sh
+./linux_pmtu --ignored --test-threads=1 --nocapture
+```
+
 The kernel test checks actual IPv6 UDP headers and port use, explicit device
 binding, TAP flags/MTU/MAC, deterministic MAC recreation, administrative state,
 multiqueue frame I/O,

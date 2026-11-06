@@ -1,5 +1,6 @@
 //! Shared helpers for disposable network-namespace tests.
 #![allow(dead_code)]
+pub mod runtime;
 pub mod udp;
 use std::{
     ffi::CStr,

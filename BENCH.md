@@ -1971,3 +1971,23 @@ test and the full runtime test. The latter confirms 9000/1500-byte outer limits
 in opposite directions, forwards tagged and jumbo frames, handles restart,
 and counts zero allocations/deallocations during forwarding and periodic MTU
 confirmation. Rust 1.89 all-target checking and Clippy with warnings denied pass.
+
+## Routed MTU reduction and recovery, November 6
+
+The release `linux_pmtu` integration test passed in 650.45 seconds. Two runtimes
+with two transmit lanes each communicated through a router in a third disposable
+network namespace. Endpoint link MTUs stayed at 9000; router route limits supplied
+the bottleneck. Every lane confirmed 9000 outer bytes, reduced to 1500 with real
+router-generated ICMPv6 Packet Too Big, then reduced to 1280 while `tc` filtered
+those errors. Filter counters showed drops in both directions and endpoint
+captures saw no PTB during that phase. After restoring the route limits, every
+lane reconfirmed 9000 through the normal 600-second upward retry.
+
+Each phase delivered byte-exact 60-, 1518- and 9022-byte QinQ frames in both
+directions. Outer captures contained no IPv6 Fragment headers and reported no
+capture drops. The test uses the real worker runtime and real elapsed time;
+it does not inject probe replies or advance a simulated clock.
+
+This verifies routed discovery with delivered and silently dropped errors,
+including recovery to a larger MTU. It does not measure goodput, loss under
+load or CPU usage. The local and real-access performance gates remain open.

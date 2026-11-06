@@ -456,10 +456,12 @@ control remain pending; README.md documents probe feedback and send-error handli
   actual PTB quotes, cached-MTU bypass, local reductions and recovery, and GSO
   retention after EMSGSIZE. Worker tests cover actual PTB errors, forged quotes,
   silent size filters, reduction/recovery, shared sessions and repacking unsent
-  byte ranges. DATA-quoted PTB validation awaits sent history. Extend real routed
-  namespace tests across 1280-, 1500- and 9000-byte paths,
-  independent lane limits, lost probes, forged/stale replies, MTU reduction
-  and recovery in disposable network namespaces; never emit outer fragments.
+  byte ranges. A release test now connects two real runtimes through a private
+  router: every lane confirms 9000, reduces to 1500 with returned PTB, reduces
+  to 1280 with PTB filtered, then recovers to 9000 after the real 600-second
+  retry interval. It checks bidirectional QinQ frames and captures without outer
+  fragmentation or capture drops. DATA-quoted PTB validation awaits sent history;
+  retain independent-lane, lost-probe and forged/stale-feedback regression coverage.
 - `bbr.rs`: BBRv3 as draft-ietf-ccwg-bbr-07 specifies, one owner per sending
   direction and path group, charging outer IP bytes, initial window ten
   datagrams. Pin deterministic vectors derived from the draft's pseudocode
