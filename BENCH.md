@@ -1669,3 +1669,47 @@ load-tool kernel tests, reconnect/allocation test, Clippy and Rust 1.89
 checks pass. The final UDP-only binary SHA-256 is
 `83f262aa576b3f7ddf8ec5a324a9a490e4b58f8e238a7e84691ad27cbe932885`.
 The local 20 Gbit/s gate, stable overload plateau and real-path gate remain open.
+
+### Profile after UDP lane locality
+
+A follow-up profile of `640adda` uses eight workers per daemon, 16 UDP flows
+each way, 1514-byte frames, a 1452-byte outer payload ceiling and 500-entry
+test TAP queues. These are two 20-second release runs with temporary timing
+instrumentation, not acceptance runs. The
+[stage measurements and counters](benches/worker-udp-local-profile.json)
+retain the complete observations.
+
+| Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| 21 | 20.915 / 20.588 | 17.771 / 16.262 | 14.37 / 20.41 | 582.4 / 589.3 |
+| unlimited | 34.137 / 33.579 | 17.856 / 16.959 | 47.18 / 49.02 | 645.0 / 651.1 |
+
+Timing samples one turn in 256 with thread CPU time, subtracts a calibrated
+clock-read baseline and includes only complete one-second bins: 19 seconds
+per point. The estimated total CPU is within 2.3% of the process snapshots.
+Small negative setup/dispatch residuals are retained; those stages are below
+the calibration resolution.
+
+Across the four daemon observations, receive processing including interleaved
+TAP delivery takes 29.6–30.5% of sampled CPU, transmit flushing 23.5–25.3%,
+final TAP delivery 12.7–13.7%, TAP reads and frame dispatch 11.6–13.1%,
+UDP receive calls 10.5–10.8%, and super-frame expansion 8.1–8.3%.
+No TAP-read handler ran without an available transmit buffer. The earlier
+readiness busy loop has not returned in these observations.
+
+| Request | TAP TX drops (SKBs) | Transport socket overflow (SKBs) | Inner UDP errors | Expired frames |
+| --- | ---: | ---: | ---: | ---: |
+| 21 Gbit/s | 34790 / 6652 | 428237 / 224821 | 5384 / 12221 | 2 / 0 |
+| unlimited | 494771 / 454061 | 559087 / 409723 | 7189 / 3715 | 0 / 4 |
+
+Worker admission pressure and queue drops remain zero. Receivers report no
+invalid, duplicate, out-of-window or wrong-run records; outer fragmentation
+counters remain zero. These counters separate where drops occur, but cannot
+convert dropped GRO/GSO SKBs into exact logical-frame losses.
+
+This instrumented pair improves under excess load. It neither reproduces nor
+explains the earlier small declines, and remains below the 20 Gbit/s gate.
+Receive/TAP delivery and transmit flushing warrant finer profiling; their
+combined stage times do not identify an individual function or establish a
+CPU ceiling. No speculative optimization or timing instrumentation is retained
+in production.

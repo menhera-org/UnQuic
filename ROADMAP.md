@@ -325,6 +325,10 @@ CPU and per-core CPU/softirq. The original admission-pressure collapse is fixed;
 local TAP USO improves both MTU-1500 and small-frame delivery. The sampled
 UDP-input sweeps still show small overload declines with eight workers.
 Plateau checks and the measured CPU ceiling remain open.
+The post-locality profile in BENCH.md records no empty-buffer TAP reads;
+receive/TAP delivery and transmit flushing need finer attribution before
+another optimization. Its improving instrumented pair does not explain the
+remaining declines in uninstrumented repeats.
 Unfragmented UDP now uses the TAP reader's owned lanes when a session has a
 queue on every worker; measured handoff savings justify relaxing pinning there.
 TCP, fragments, other protocols and sessions with fewer queues retain strict
