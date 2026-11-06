@@ -546,6 +546,8 @@ struct PeerControl {
 }
 
 pub(crate) struct Worker {
+    #[cfg(test)]
+    io_time: Option<fn(Duration) -> io::Result<Duration>>,
     tap_reader: Option<crate::tap::Reader>,
     tap_start: usize,
     id: usize,
@@ -804,6 +806,8 @@ impl Worker {
             }
         }
         Ok(Self {
+            #[cfg(test)]
+            io_time: None,
             tap_reader,
             tap_start: 0,
             id,
@@ -897,6 +901,20 @@ impl Worker {
         self.sessions[session].tap_registered = true;
         self.sessions[session].tap_readable = true;
         Ok(())
+    }
+
+    // Production reads the clock at the I/O boundary; fixtures may use supplied time.
+    fn io_clock(&self, now: Duration) -> impl FnMut() -> io::Result<Duration> + use<> {
+        #[cfg(test)]
+        let override_time = self.io_time;
+        move || {
+            #[cfg(test)]
+            if let Some(clock) = override_time {
+                return clock(now);
+            }
+            let _ = now;
+            monotonic_now()
+        }
     }
 
     pub fn run(mut self) -> io::Result<()> {
@@ -1563,6 +1581,7 @@ impl Worker {
     }
 
     fn read_socket(&mut self, endpoint: usize, now: Duration) -> io::Result<()> {
+        let mut clock = self.io_clock(now);
         let available = (RECEIVE_BUFFERS - self.rx_retained).min(self.free.len());
         let mut buffers: [Option<Box<Buffer>>; RECEIVE_BUFFERS] = std::array::from_fn(|index| {
             if index >= available {
@@ -1586,6 +1605,11 @@ impl Worker {
             .as_ref()
             .unwrap()
             .recv_batch(&mut received[..available]);
+        let received_at = if result.as_ref().is_ok_and(|&count| count != 0) {
+            clock()?
+        } else {
+            now
+        };
         let lengths: [usize; RECEIVE_BUFFERS] = std::array::from_fn(|i| received[i].length);
         let truncated: [bool; RECEIVE_BUFFERS] = std::array::from_fn(|i| received[i].truncated);
         let segments: [usize; RECEIVE_BUFFERS] = std::array::from_fn(|i| received[i].segment_size);
@@ -1614,7 +1638,7 @@ impl Worker {
                 buffer.rx_counted = false;
                 buffer.offset = 0;
                 buffer.segment_size = segments[index];
-                buffer.deadline = now;
+                buffer.deadline = received_at;
                 let packets = if buffer.segment_size == 0 {
                     1
                 } else {
@@ -2568,13 +2592,20 @@ impl Worker {
             return Ok(());
         }
         // Cleanup belongs to the bounded expiry pass; never submit a stale plan.
-        if batch.frames[..batch.len].iter().flatten().any(|&index| {
-            self.frames
-                .frame(index)
-                .is_none_or(|frame| frame.deadline <= now)
-        }) {
+        let deadline =
+            batch.frames[..batch.len]
+                .iter()
+                .flatten()
+                .try_fold(Duration::MAX, |due, &index| {
+                    self.frames
+                        .frame(index)
+                        .map(|frame| due.min(frame.deadline))
+                });
+        let Some(deadline) = deadline.filter(|&due| due > now) else {
             return Ok(());
-        }
+        };
+        let mut clock = self.io_clock(now);
+        let mut expired = false;
         if batch.len == 0 {
             return Ok(());
         }
@@ -2636,10 +2667,20 @@ impl Worker {
                 .socket
                 .as_ref()
                 .unwrap()
-                .send_batch(&packets[..count], limit)
+                .send_batch_checked(&packets[..count], limit, || {
+                    let at = clock()?;
+                    if at >= deadline {
+                        expired = true;
+                        return Err(io::ErrorKind::WouldBlock.into());
+                    }
+                    Ok(at)
+                })
         };
+        if expired {
+            return Ok(());
+        }
         match result {
-            Ok(sent) => self.submitted_batch(session, lane, batch, sent),
+            Ok((sent, _)) => self.submitted_batch(session, lane, batch, sent),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 let tx = &mut self.transmit[peer].paths[path].lanes[lane];
                 let token = TX_TOKEN | ((peer as u64) << 7) | ((path as u64) << 6) | lane as u64;
@@ -2907,6 +2948,7 @@ impl Worker {
         length: usize,
         now: Duration,
     ) -> io::Result<()> {
+        let clock = self.io_clock(now);
         let mut prefix = [0; wire::PROBE_PREFIX_LEN];
         let Ok(piece) = self.sessions[session].tx[lane]
             .as_mut()
@@ -2918,15 +2960,14 @@ impl Worker {
         };
         let parts = [&prefix[..], piece.bytes];
         let tx = &mut self.transmit[peer].paths[path].lanes[lane];
-        match tx
-            .socket
-            .as_ref()
-            .unwrap()
-            .send_batch(&[SendDatagram { parts: &parts }], length)
-        {
-            Ok(1) => {
+        match tx.socket.as_ref().unwrap().send_batch_checked(
+            &[SendDatagram { parts: &parts }],
+            length,
+            clock,
+        ) {
+            Ok((1, started)) => {
                 let local = &mut self.sessions[session];
-                assert!(tx.mtu.submitted(
+                if !tx.mtu.submitted(
                     pmtu::ProbeId {
                         session,
                         tag: local.connection.unwrap().local_tag().get(),
@@ -2934,8 +2975,10 @@ impl Worker {
                         packet: piece.packet.number,
                     },
                     length,
-                    now
-                ));
+                    started,
+                ) {
+                    tx.mtu.defer(started);
+                }
                 for totals in [
                     &mut self.counters,
                     &mut local.totals,
@@ -3120,7 +3163,9 @@ impl Worker {
         session: usize,
         record: Record<'_>,
         now: Duration,
-    ) -> io::Result<Option<(u64, u16)>> {
+    ) -> io::Result<Option<(u64, u16, Duration)>> {
+        let mut clock = self.io_clock(now);
+        let prepared = clock()?;
         let peer = self.shared.config.peer_for_session(session).unwrap();
         let path =
             if record.is_handshake() && !active_flight(self.sessions[session].connection, record) {
@@ -3153,8 +3198,38 @@ impl Worker {
         let Some(packet) = packet else {
             return Ok(None);
         };
+        let mut handshake = record
+            .is_handshake()
+            .then(|| &mut self.controls[session].state);
+        let mut send = || {
+            let at = clock()?;
+            if let Some(state) = handshake.as_mut()
+                && !state.prepare_send(record, at).map_err(io::Error::other)?
+            {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            if let Record::Ack {
+                lane,
+                delay_us,
+                ranges,
+            } = record
+            {
+                // Finalize queue delay using the same clock as successful-send bookkeeping.
+                Record::Ack {
+                    lane,
+                    ranges,
+                    delay_us: delay_us
+                        .saturating_add(at.saturating_sub(now).as_micros().min(1000) as u32)
+                        .min(1000),
+                }
+                .encode(&mut bytes[wire::HEADER_LEN..packet.length])
+                .map_err(io::Error::other)?;
+            }
+            socket.send(&bytes[..packet.length], limit)?;
+            Ok(at)
+        };
         let result = if record.ack_eliciting() {
-            socket.send(&bytes[..packet.length], limit)
+            send()
         } else {
             let group = self
                 .shared
@@ -3165,12 +3240,10 @@ impl Worker {
                 .control_budgets
                 .get_mut(group)
                 .ok_or_else(|| io::Error::other("control transmission on a non-owner worker"))?;
-            budget.send(packet.length + 48, now, || {
-                socket.send(&bytes[..packet.length], limit)
-            })
+            budget.send(packet.length + 48, prepared, send)
         };
         match result {
-            Ok(()) => {
+            Ok(started) => {
                 self.counters.tx_outer_bytes = self
                     .counters
                     .tx_outer_bytes
@@ -3186,7 +3259,7 @@ impl Worker {
                         .wrapping_add((packet.length + 48) as u64);
                     local.tx_dirty |= 1;
                 }
-                Ok(Some((packet.number, packet.length as u16)))
+                Ok(Some((packet.number, packet.length as u16, started)))
             }
             Err(error) => {
                 if !transient(&error) {
@@ -3450,11 +3523,11 @@ impl Worker {
             self.controls[session].pending_send = None;
             return Ok(());
         }
-        if self.send_record(session, record, now)?.is_some() {
+        if let Some((_, _, started)) = self.send_record(session, record, now)? {
             self.controls[session].pending_send = None;
             self.controls[session]
                 .state
-                .transmitted(record, now)
+                .transmitted(record, started)
                 .map_err(io::Error::other)?;
         } else {
             let peer = self.shared.config.peer_for_session(session).unwrap();
@@ -3500,7 +3573,13 @@ impl Worker {
                 && now >= self.controls[session].probe_due
             {
                 self.controls[session].probe_due = now + Duration::from_secs(1);
-                self.controls[session].probe = self.send_record(session, Record::Probe, now)?;
+                self.controls[session].probe = self.send_record(session, Record::Probe, now)?.map(
+                    |(number, length, started)| {
+                        self.controls[session].probe_due =
+                            started.saturating_add(Duration::from_secs(1));
+                        (number, length)
+                    },
+                );
             }
             self.shared.publish_state(
                 session,
@@ -4003,6 +4082,98 @@ mod tests {
 
     #[test]
     #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn io_boundary_time_rejects_expired_frames_and_dates_probe_proofs() {
+        let (mut worker, _tap) = receive_worker();
+        let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
+        worker.transmit[0].paths[0].lanes[0].socket =
+            Some(TransmitSocket::connect(&rx, rx.local_addr()).unwrap());
+        worker.io_time = Some(|_| Ok(Duration::from_millis(10)));
+        let mut frame = worker.free.pop().unwrap();
+        frame.session = 0;
+        frame.lane = 0;
+        frame.tag = 1;
+        frame.length = 60;
+        frame.deadline = Duration::from_millis(10);
+        frame.tx_reserved = true;
+        worker.sessions[0].tx_retained += 1;
+        worker.sessions[0].tx_bytes += frame.length;
+        worker.input_frame(frame, Duration::ZERO).unwrap();
+        worker.flush_frames(Duration::ZERO).unwrap();
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        assert_eq!(
+            rx.recv(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(!worker.transmit[0].paths[0].lanes[0].blocked);
+        assert_eq!(worker.counters.socket_errors, 0);
+        assert_eq!(worker.counters.tx_outer_bytes, 0);
+        worker.expire_frames(Duration::from_millis(10)).unwrap();
+        assert_eq!(worker.sessions[0].totals.expired_frames, 1);
+        assert_eq!(worker.sessions[0].tx_retained, 0);
+
+        let size = worker.transmit[0].paths[0].lanes[0]
+            .mtu
+            .poll(Duration::ZERO)
+            .unwrap();
+        worker
+            .send_mtu_probe(0, 0, 0, 0, size, Duration::ZERO)
+            .unwrap();
+        let length = rx.recv(&mut bytes).unwrap().0;
+        assert_eq!(length, size);
+        let mtu = &worker.transmit[0].paths[0].lanes[0].mtu;
+        assert_eq!(mtu.probes(Duration::ZERO).count(), 0);
+        assert_eq!(mtu.probes(Duration::from_millis(10)).count(), 1);
+        // An early duplicate probe cannot panic or create an invalid proof.
+        worker
+            .send_mtu_probe(0, 0, 0, 0, size, Duration::ZERO)
+            .unwrap();
+        assert_eq!(
+            worker.transmit[0].paths[0].lanes[0]
+                .mtu
+                .probes(Duration::from_millis(10))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn delayed_handshake_uses_submission_time_and_rechecks_expiry() {
+        let (_, [mut worker, _]) = test_workers();
+        let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
+        worker.transmit[0].paths[0].lanes[0].socket =
+            Some(TransmitSocket::connect(&rx, rx.local_addr()).unwrap());
+        worker.shared.bound[0].store(3, Ordering::Release);
+        let effects = worker.controls[0]
+            .state
+            .on_timer(Duration::ZERO, Tag::new(9))
+            .unwrap();
+        worker.effects(0, effects, Duration::ZERO).unwrap();
+        worker.io_time = Some(|_| Ok(Duration::from_millis(50)));
+        worker.flush_handshake(0, Duration::ZERO).unwrap();
+        assert_eq!(
+            worker.controls[0].state.deadline(),
+            Some(Duration::from_millis(1050))
+        );
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        rx.recv(&mut bytes).unwrap();
+        let effects = worker.controls[0]
+            .state
+            .on_timer(Duration::from_secs(2), None)
+            .unwrap();
+        worker.effects(0, effects, Duration::from_secs(2)).unwrap();
+        assert!(worker.controls[0].pending_send.is_some());
+        worker.io_time = Some(|_| Ok(Duration::from_secs(10)));
+        worker.flush_handshake(0, Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            rx.recv(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(worker.counters.socket_errors, 0);
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
     fn shared_control_budget_defers_handshakes_and_counts_only_successful_sends() {
         let (mut worker, _) = receive_worker();
         worker.command(1, worker.sessions[0].installed.unwrap(), 0);
@@ -4025,7 +4196,7 @@ mod tests {
         let mut charged = 0;
         let mut bytes = [0; BASE_UDP_PAYLOAD];
         for session in (0..16).map(|index| index % 2) {
-            let (_, length) = worker.send_record(session, reply, now).unwrap().unwrap();
+            let (_, length, _) = worker.send_record(session, reply, now).unwrap().unwrap();
             charged += u64::from(length) + 48;
             assert_eq!(rx.recv(&mut bytes).unwrap().0, usize::from(length));
         }
@@ -4196,6 +4367,7 @@ mod tests {
     fn colliding_receive_flows_register_on_distinct_owners() {
         let (first, _tap) = receive_worker();
         let mut second = Worker::new(1, Arc::clone(&first.shared), Control::new()).unwrap();
+        second.io_time = Some(Ok);
         second.command(
             0,
             Command {
@@ -4278,7 +4450,14 @@ mod tests {
             .add(socket.as_fd(), 2, libc::EPOLLIN as u32)
             .unwrap();
         worker.receive[0] = Some(socket);
+        worker.io_time = Some(|_| Ok(Duration::from_millis(2)));
         worker.read_socket(0, Duration::ZERO).unwrap();
+        assert!(
+            worker
+                .received
+                .iter()
+                .all(|buffer| buffer.deadline == Duration::from_millis(2))
+        );
         assert_eq!(worker.rx_retained, RECEIVE_BUFFERS);
         worker.read_socket(0, Duration::ZERO).unwrap();
         assert_eq!(worker.received.len(), RECEIVE_BUFFERS);
@@ -5167,7 +5346,8 @@ mod tests {
     #[ignore = "kernel descriptor test; run in a disposable container"]
     fn mtu_probes_route_to_lane_owners_and_survive_silent_size_filters() {
         let (first, _tap) = receive_worker();
-        let second = Worker::new(1, Arc::clone(&first.shared), Control::new()).unwrap();
+        let mut second = Worker::new(1, Arc::clone(&first.shared), Control::new()).unwrap();
+        second.io_time = Some(Ok);
         let mut workers = [first, second];
         let connection = workers[0].sessions[0].connection;
         let remote = ReceiveSocket::bind("[::1]:40101".parse().unwrap(), None).unwrap();
@@ -6100,8 +6280,11 @@ mod tests {
             address_pending: vec![std::sync::atomic::AtomicBool::new(false)],
             address_ready: (0..2).map(|_| AtomicU64::new(0)).collect(),
         });
-        let workers: [Worker; 2] =
-            std::array::from_fn(|id| Worker::new(id, Arc::clone(&shared), Control::new()).unwrap());
+        let workers: [Worker; 2] = std::array::from_fn(|id| {
+            let mut worker = Worker::new(id, Arc::clone(&shared), Control::new()).unwrap();
+            worker.io_time = Some(Ok);
+            worker
+        });
 
         (shared, workers)
     }
@@ -6355,6 +6538,7 @@ mod tests {
         });
         let mut buffer = workers[0].free.pop().unwrap();
         buffer.length = 0;
+        buffer.deadline = Duration::from_micros(13);
         buffer.segment_size = 98;
         for (index, (cookie, lane, tag, packet)) in [
             (1, 7, 3, 1),
@@ -6412,6 +6596,7 @@ mod tests {
             .find(|b| (&***b as *const Buffer) as usize == pointer)
             .unwrap();
         assert_eq!(&returned.bytes[..original.len()], &original);
+        assert_eq!(returned.deadline, Duration::from_micros(13));
         assert_eq!(workers[0].free.len(), BUFFERS);
         let after: [u64; 2] = std::array::from_fn(|session| {
             workers

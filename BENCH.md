@@ -27,7 +27,8 @@ The latest release passes forwarding/restart and allocation checks,
 plus control-pressure, stale-feedback and bounded transmit-expiry regressions.
 The new matched expiry comparison establishes no general throughput gain and
 still has a forward overload decline. Earlier storage/batching sweeps predate
-ACK emission.
+ACK emission. Subsequent sender-accounting and I/O-timestamp changes have
+correctness coverage only; no matched throughput sweep measures their cost yet.
 Frame-view allocations now follow actual per-worker quotas instead of reserving
 8192 slots on every worker. This reduces reserved metadata; it does not establish
 a goodput gain or change the session retention limits.

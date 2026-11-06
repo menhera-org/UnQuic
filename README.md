@@ -225,9 +225,17 @@ between ACKs, probe replies and handshakes. Construction visits at most 64 lane
 slots per turn; sending visits at most 64 queue entries. Blocked groups and
 buffer returns yield to other entries and wake at their next deadline.
 ACK delay includes queue residence, capped at 1 ms. Successful-send timestamps
-return to the receive owner to enforce duplicate spacing. Connection tags and
+return to the receive owner to enforce duplicate spacing. ACK delay is finalized
+using that send timestamp; control service starts no earlier than submission,
+so a delayed worker cannot accumulate a catch-up burst. Connection tags and
 lane identity are rechecked before sends and buffer returns. Incoming ACK
 application to sender history, loss detection and recovery remains Stage 3 work.
+UDP receive batches retain a timestamp taken after the receive call, including
+across GRO expansion and worker handoff. Data sends recheck frame deadlines
+immediately before each syscall and GSO fallback. Expired plans return to bounded
+cleanup without being mistaken for socket backpressure. Handshake retries,
+liveness probes and PMTU proofs use the successful attempt's pre-send time.
+
 The pure sender history supports bounded ACK application after whole-record
 validation. It preserves callback progress and RTT accounting across yields,
 pins retained metadata, and prevents covered packets from being declared lost

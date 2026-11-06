@@ -455,7 +455,15 @@ MSS. The socket batch API now supports a timestamp/permission callback immediate
 before each syscall, including a retry without GSO. Tests force that fallback,
 expire a grant before its retry, and verify no packets were sent. Callback
 errors leave GSO capability unchanged; partial prefixes retain the successful
-attempt's timestamp. Neither this API nor the ledger enables runtime pacing.
+attempt's timestamp. Workers now use this check to reject data plans whose
+frames expired during message preparation or before GSO fallback. Expiry keeps
+bounded cleanup ownership and does not mark the socket blocked. Handshake
+attempts revalidate expiry at submission; successful handshake/liveness timers
+and PMTU proofs use pre-send time. ACK delay and duplicate spacing share that
+timestamp, and the control service ceiling cannot bank a delayed send's elapsed
+time. Receive batches retain post-receive time across expansion and handoff.
+Regressions inject delayed clocks for these paths. Neither these changes nor
+the ledger enables runtime data pacing.
 Receive-side ACK scheduling and range construction now use the existing
 reassembly bitmap, with no second history or hot-path allocations. Tests cover
 thresholds, gaps, duplicate rate limits, pressure rejection, word/window wrap,

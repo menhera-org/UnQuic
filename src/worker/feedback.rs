@@ -195,6 +195,7 @@ impl Worker {
 
     pub(super) fn flush_control(&mut self, now: Duration) -> io::Result<()> {
         for _ in 0..self.pending_control.len().min(BATCH_SIZE) {
+            let now = self.io_clock(now)()?;
             let Some(job) = self.pending_control.pop_front() else {
                 break;
             };
@@ -271,19 +272,16 @@ impl Worker {
                             now.saturating_sub(feedback.created).as_micros().min(1000) as u32;
                         let ranges = AckRanges::new(&feedback.ranges[..feedback.count])
                             .map_err(io::Error::other)?;
-                        if self
-                            .send_record(
-                                feedback.session,
-                                Record::Ack {
-                                    lane: feedback.lane,
-                                    delay_us: (feedback.delay_us + queued).min(1000),
-                                    ranges,
-                                },
-                                now,
-                            )?
-                            .is_some()
-                        {
-                            feedback.sent = Some(now);
+                        if let Some((_, _, started)) = self.send_record(
+                            feedback.session,
+                            Record::Ack {
+                                lane: feedback.lane,
+                                delay_us: (feedback.delay_us + queued).min(1000),
+                                ranges,
+                            },
+                            now,
+                        )? {
+                            feedback.sent = Some(started);
                         }
                     }
                     self.return_feedback(feedback, now)?;
@@ -375,6 +373,43 @@ mod tests {
             rx.recv(&mut bytes).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn delayed_ack_includes_queue_time_and_spaces_duplicate_feedback_from_send() {
+        let (mut worker, _tap) = receive_worker();
+        let rx = socket(&mut worker);
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        let length = receive_bytes(2, &[receive_piece(1, 0, &[1; 60])], &mut bytes);
+        let packet = Datagram::decode(&bytes[..length]).unwrap();
+        let lane = worker.sessions[0].rx[0].as_mut().unwrap();
+        assert_eq!(lane.admit(&packet, Duration::ZERO), Admission::Fresh);
+        worker.collect_acks(Duration::ZERO).unwrap();
+        std::thread_local! {
+            static CLOCK_STEP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        CLOCK_STEP.set(0);
+        worker.io_time = Some(|_| {
+            let step = CLOCK_STEP.replace(CLOCK_STEP.get() + 1);
+            Ok(Duration::from_micros([200, 300, 700][step]))
+        });
+        worker.flush_control(Duration::from_micros(100)).unwrap();
+        let mut output = [0; BASE_UDP_PAYLOAD];
+        let length = rx.recv(&mut output).unwrap().0;
+        assert!(matches!(
+            Datagram::decode(&output[..length])
+                .unwrap()
+                .records()
+                .next(),
+            Some(Record::Ack { delay_us: 700, .. })
+        ));
+        let lane = worker.sessions[0].rx[0].as_mut().unwrap();
+        assert_eq!(
+            lane.admit(&packet, Duration::from_micros(800)),
+            Admission::Duplicate
+        );
+        assert!(lane.ack_deadline().unwrap() >= Duration::from_micros(1700));
     }
 
     #[test]

@@ -35,12 +35,13 @@ impl Control {
     }
 
     /// Runs one nonblocking send if budget permits; failures consume no service.
+    /// The closure returns pre-syscall time, so a delayed send cannot bank a burst.
     pub fn send(
         &mut self,
         outer_bytes: usize,
         now: Duration,
-        send: impl FnOnce() -> io::Result<()>,
-    ) -> io::Result<()> {
+        send: impl FnOnce() -> io::Result<Duration>,
+    ) -> io::Result<Duration> {
         if !(100..=1280).contains(&outer_bytes) {
             return Err(io::ErrorKind::InvalidInput.into());
         }
@@ -58,13 +59,13 @@ impl Control {
             self.finishes[(tail + BURST - 1) % BURST].max(now)
         };
         let service = Duration::from_nanos((outer_bytes as u64 * 1_000_000_000).div_ceil(RATE));
-        let finish = start
+        start
             .checked_add(service)
             .ok_or(io::ErrorKind::WouldBlock)?;
-        send()?;
-        self.finishes[tail] = finish;
+        let started = send()?;
+        self.finishes[tail] = start.max(started).saturating_add(service);
         self.len += 1;
-        Ok(())
+        Ok(started)
     }
 }
 
@@ -95,13 +96,13 @@ mod tests {
             } else {
                 now
             };
-            control.send(bytes, at, || Ok(())).unwrap();
+            control.send(bytes, at, || Ok(at)).unwrap();
             finish += Duration::from_nanos((bytes as u64 * 1_000_000_000).div_ceil(RATE));
             expected.push_back(finish);
         }
         let idle = finish + Duration::from_secs(1);
         for _ in 0..BURST {
-            control.send(100, idle, || Ok(())).unwrap();
+            control.send(100, idle, || Ok(idle)).unwrap();
         }
         assert_eq!(
             control.deadline(),
@@ -128,7 +129,7 @@ mod tests {
         ] {
             assert_eq!(
                 control
-                    .send(1280, Duration::ZERO, || Err::<(), _>(kind.into()))
+                    .send(1280, Duration::ZERO, || Err::<Duration, _>(kind.into()))
                     .unwrap_err()
                     .kind(),
                 kind
@@ -144,8 +145,40 @@ mod tests {
         );
         assert_eq!(control.len, 0);
         for _ in 0..BURST {
-            control.send(1280, Duration::ZERO, || Ok(())).unwrap();
+            control
+                .send(1280, Duration::ZERO, || Ok(Duration::ZERO))
+                .unwrap();
         }
         assert_eq!(control.deadline(), Some(Duration::from_nanos(305_176)));
+    }
+
+    #[test]
+    fn delayed_success_cannot_bank_service_or_wrap_its_deadline() {
+        let mut control = Control::new();
+        let at = Duration::from_secs(1);
+        assert_eq!(control.send(1280, Duration::ZERO, || Ok(at)).unwrap(), at);
+        for _ in 1..BURST {
+            control.send(1280, at, || Ok(at)).unwrap();
+        }
+        assert_eq!(control.deadline(), Some(at + Duration::from_nanos(305_176)));
+        assert_eq!(
+            control
+                .send(1280, at, || panic!("unbudgeted send"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let mut control = Control::new();
+        control
+            .send(1280, Duration::ZERO, || Ok(Duration::MAX))
+            .unwrap();
+        assert_eq!(control.finishes[0], Duration::MAX);
+        assert_eq!(
+            control
+                .send(1280, Duration::ZERO, || panic!("overflowing send"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 }

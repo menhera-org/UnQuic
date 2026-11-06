@@ -617,7 +617,12 @@ Deferred handshakes retain one flight, recheck identity/expiry and update retry
 clocks on successful submission. Four reserved feedback buffers per worker
 carry ACK snapshots through bounded handoffs; a rotating control queue gives
 blocked groups and buffer returns bounded service. ACK delay includes queue
-residence, and actual-send timestamps enforce duplicate spacing. Incoming
+residence finalized at submission, and the same pre-send timestamp enforces
+duplicate spacing. Data submissions recheck frame expiry before each socket
+attempt, including GSO fallback. Handshake/liveness timers and PMTU proofs
+use pre-send time; receive buffers retain post-receive time across GRO expansion
+and handoff. Delayed control sends start their service at submission rather
+than accumulating credit from an earlier worker turn. Incoming
 ACK application and runtime data grants remain unfinished. Pure shared grant
 accounting, draft-07 delivery sampling and the pure BBR controller are implemented.
 The shared accounting coordinator now reserves sampling handles before grants,
