@@ -370,20 +370,6 @@ fn batching_preserves_backpressure_and_disables_rejected_offloads() {
     assert_eq!(receiver.recv(&mut bytes).unwrap(), 10 + 42 + 240);
     assert_eq!(bytes[1], 5);
 
-    // eventfd consumes only eight bytes: a short write must name the entire attempted batch.
-    let fd = check(unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) });
-    // SAFETY: sole owner of the new descriptor.
-    let mut short = TapQueue {
-        fd: unsafe { OwnedFd::from_raw_fd(fd) },
-        frame_limit: crate::MAX_FRAME_LEN,
-        vnet: true,
-        uso: true,
-        completed_checksums: 0,
-    };
-    let (mask, result) = short.write_batch([a.as_slice(), b.as_slice()].into_iter());
-    assert_eq!(mask, 3);
-    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WriteZero);
-
     // An epoll descriptor rejects writes with EINVAL, exercising capability fallback.
     let fd = check(unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) });
     // SAFETY: sole owner of the new descriptor.
@@ -446,4 +432,19 @@ fn tap_metadata_is_removed_and_unsupported_partial_frames_are_rejected() {
         tap.read_frame(&mut bytes).unwrap_err().kind(),
         io::ErrorKind::InvalidData
     );
+}
+
+#[test]
+fn short_writes_never_complete_a_frame_or_batch() {
+    for expected in [60, 10 + 42 + 240, 65535] {
+        for written in [0, 8, expected - 1, expected + 1] {
+            assert_eq!(
+                super::complete_write(written as isize, expected)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::WriteZero
+            );
+        }
+        assert!(super::complete_write(expected as isize, expected).is_ok());
+    }
 }

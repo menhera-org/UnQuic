@@ -173,13 +173,8 @@ pub(super) fn write<'a>(
     };
     // SAFETY: header and every borrowed payload remain readable until writev returns.
     let n = unsafe { libc::writev(fd, iov.as_ptr(), (count + 2) as _) };
-    let result = if n < 0 {
-        Err(io::Error::last_os_error())
-    } else if n as usize != vnet.len() + header_len + payload {
-        Err(io::ErrorKind::WriteZero.into())
-    } else {
-        Ok(original_bytes)
-    };
+    let result =
+        super::complete_write(n, vnet.len() + header_len + payload).map(|()| original_bytes);
     Some((mask, result))
 }
 

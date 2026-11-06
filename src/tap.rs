@@ -332,13 +332,7 @@ impl TapQueue {
                 libc::write(self.fd.as_raw_fd(), frame.as_ptr().cast(), frame.len())
             }
         };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if n as usize != frame.len() + if self.vnet { header.len() } else { 0 } {
-            return Err(io::ErrorKind::WriteZero.into());
-        }
-        Ok(())
+        complete_write(n, frame.len() + if self.vnet { header.len() } else { 0 })
     }
 
     pub(crate) fn uso_enabled(&self) -> bool {
@@ -368,6 +362,16 @@ impl TapQueue {
             }
         }
         (1, self.write_frame(first).map(|()| first.len()))
+    }
+}
+
+fn complete_write(written: isize, expected: usize) -> io::Result<()> {
+    if written < 0 {
+        Err(io::Error::last_os_error())
+    } else if written as usize != expected {
+        Err(io::ErrorKind::WriteZero.into())
+    } else {
+        Ok(())
     }
 }
 
