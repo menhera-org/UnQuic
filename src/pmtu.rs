@@ -410,7 +410,19 @@ mod tests {
         let fresh = ProbeId { tag: 13, ..old };
         assert!(path.submitted(fresh, BASE_UDP_PAYLOAD, now));
         assert_eq!(path.payload_limit(), 0);
-        assert!(path.reply(fresh, BASE_UDP_PAYLOAD, now + RTT));
+        // Lose the first reconnect probe: DATA stays blocked through its retry interval.
+        let retry = path.deadline();
+        assert!(retry > now + Duration::from_millis(100));
+        assert_eq!(path.poll(now + Duration::from_millis(100)), None);
+        assert_eq!(path.payload_limit(), 0);
+        assert_eq!(path.poll(retry), Some(BASE_UDP_PAYLOAD));
+        let next = ProbeId {
+            packet: fresh.packet + 1,
+            ..fresh
+        };
+        assert!(path.submitted(next, BASE_UDP_PAYLOAD, retry));
+        assert_eq!(path.payload_limit(), 0);
+        assert!(path.reply(next, BASE_UDP_PAYLOAD, retry + RTT));
         assert_eq!(path.payload_limit(), BASE_UDP_PAYLOAD);
     }
 

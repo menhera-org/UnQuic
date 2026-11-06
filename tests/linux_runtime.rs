@@ -749,6 +749,27 @@ fn foreign_rename_and_namespace_move_preserve_running_transport() {
             flags(&moved_control, name) & running == running
                 && flags(&control, c"uq-stay") & running == running
         });
+        // Carrier confirms the handshake; failed PMTU still blocks DATA until a probe succeeds.
+        for control in [&left.control, peer] {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            for lane in 1..=4 {
+                loop {
+                    let snapshot = control.transmit_lane_counters(0, lane);
+                    if snapshot.is_some_and(|s| {
+                        s.generation == control.session(0).unwrap().generation
+                            && s.counters.path_mtu_bytes >= 1280
+                            && s.counters.path_mtu_state != 4
+                    }) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "{phase}, lane {lane}: {snapshot:?}"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
         let mut frame = [0x5a; 1514];
         frame[..14].copy_from_slice(&[2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2, 0x88, 0xb5]);
         let mut capture = [0; 2000];
