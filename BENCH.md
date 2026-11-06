@@ -6,11 +6,11 @@ slabs, with per-lane FIFOs and zero-copy ownership exchange. A rejected
 global-queue prototype exposed a separate severe QinQ collapse; the FIFO
 regression reproduces its frame-order inversion and verifies the fix.
 
-The latest 60-second persistent QinQ sweep delivers 16.68 / 14.43 Gbit/s
-at 21 Gbit/s requested each way, then 20.63 / 13.47 unlimited. Reverse
-goodput still falls 6.7% under excess load and recovers when the offered rate
-returns to 16 Gbit/s. Single-tag and SRv6 results differ; no workload proves
-a universal plateau or the theoretical CPU ceiling.
+The latest ACK-enabled 60-second QinQ sweep delivers 8.04 / 17.65 Gbit/s
+at 21 Gbit/s requested each way, then 7.83 / 16.89 unlimited: declines of
+2.6% and 4.3%. The matched pre-ACK build is also strongly asymmetric.
+Earlier pre-ACK sweeps reached higher rates with another kernel build and TAP queue placement.
+No workload proves a universal plateau or the theoretical CPU ceiling.
 
 Neither the local **20 Gbit/s in each direction** gate nor the real
 **5 Gbit/s under loss** gate has passed. Recovery and congestion control
@@ -21,15 +21,15 @@ scheduling and admission problems.
 
 ## Current performance gaps
 
-The rate sweeps below precede runtime packet-ACK emission and the shared
-control queue. The ACK-enabled release passes forwarding/restart and allocation
-checks, plus control-pressure and stale-feedback regression tests. Its rate
-sweeps, CPU overhead and overload behavior have not yet been measured.
+The ACK-enabled release passes forwarding/restart and allocation checks,
+plus control-pressure and stale-feedback regression tests. The new matched
+release comparison below measures higher CPU use and a remaining overload
+decline. Earlier storage/batching sweeps predate ACK emission.
 Frame-view allocations now follow actual per-worker quotas instead of reserving
 8192 slots on every worker. This reduces reserved metadata; it does not establish
 a goodput gain or change the session retention limits.
 
-The latest storage/batching results below use eight workers per daemon,
+The storage/batching results below use eight workers per daemon,
 16 flows per direction, 500-entry TAP queues, and a 1452-byte outer UDP cap.
 They keep active discovery enabled. L→R / R→L pairs are simultaneous.
 The JSON records actual offered load, CPU and counters for each observation;
@@ -37,8 +37,8 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | QinQ: 16.68 / 14.43 Gbit/s paced, 20.63 / 13.47 unlimited. Single tag: 17.10 / 15.27 paced, 18.26 / 16.49 unlimited | Neither workload passes both directions. Paced missing fractions remain 18–31%, far above the under-1% gate. Five successful repeats are absent. |
-| Goodput must plateau under excess traffic | Persistent QinQ reverse delivery falls 6.7%; returning to 16G restores earlier delivery without restarting transport | The severe prototype collapse is fixed, but the remaining decline is unresolved. Bounded foreign-source batching and larger receive groups reduce syscalls; reader/receive scheduling still needs attribution. |
+| At least 20 Gbit/s each way at inner MTU 1500 | ACK-enabled QinQ: 8.04 / 17.65 Gbit/s paced, 7.83 / 16.89 unlimited. Earlier pre-ACK QinQ: 16.68 / 14.43 paced, 20.63 / 13.47 unlimited | Neither build passes both directions. ACK-enabled paced missing fractions are 61.49 / 15.47%, far above the under-1% gate. Five successful repeats are absent. |
+| Goodput must plateau under excess traffic | ACK-enabled QinQ declines 2.6 / 4.3% from 21G to unlimited; the 16G return delivers 7.77 / 14.81 versus 8.16 / 14.84 initially | The severe prototype collapse is fixed, but the remaining decline is unresolved. Bounded foreign-source batching and larger receive groups reduce syscalls; reader/receive scheduling still needs attribution. |
 | Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Current QinQ reports zero reordering; single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
@@ -53,6 +53,73 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## ACK-enabled release comparison (November 6)
+
+[Eight observations](benches/tap-ack-control.json) compare `623beb5`, immediately
+before runtime ACK emission, with `8ac7608`. Both use musl release builds with
+full LTO, one codegen unit and identical dependencies. Each sweep keeps the same
+daemons, TAPs, sockets and private namespaces through four 60-second points;
+PID/start-time checks confirm persistence. No owned build or other test overlaps
+load.
+
+Both run on Linux 6.8.0-149-generic, Intel Xeon Gold 6138, with eight workers
+per daemon on CPUs 0–7 and 8–15. Separate generator/receiver CPUs are 16/17
+and 18/19. Sixteen flows each way carry 1472-byte UDP payloads in 1522-byte
+QinQ frames, using 44-segment sources, 500-entry TAP queues and active discovery
+capped at 1452 outer UDP bytes. Goodput excludes drain; missing fractions include
+it. A CPU value of 100% means one CPU.
+
+| Build / requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| Before ACK / 16G | 15.94 / 15.96 | 8.16 / 14.82 | 48.63 / 6.81 | 363.47 / 356.32 |
+| Before ACK / 21G | 20.87 / 20.86 | 8.67 / 17.07 | 58.28 / 17.85 | 408.39 / 428.52 |
+| Before ACK / unlimited | 50.76 / 39.94 | 8.55 / 17.74 | 83.09 / 55.43 | 408.28 / 428.99 |
+| Before ACK / 16G return | 15.97 / 15.97 | 8.15 / 15.06 | 48.77 / 5.43 | 366.25 / 355.56 |
+| ACK enabled / 16G | 15.95 / 15.95 | 8.16 / 14.84 | 48.64 / 6.67 | 442.52 / 420.40 |
+| ACK enabled / 21G | 20.95 / 20.95 | 8.04 / 17.65 | 61.49 / 15.47 | 468.42 / 474.64 |
+| ACK enabled / unlimited | 49.67 / 40.42 | 7.83 / 16.89 | 84.18 / 58.05 | 461.91 / 477.47 |
+| ACK enabled / 16G return | 15.93 / 15.93 | 7.77 / 14.81 | 51.06 / 6.75 | 450.64 / 429.14 |
+
+The first 16G point delivers similar goodput with 21.7 / 18.0% more daemon CPU
+in the ACK-enabled build. At unlimited load its CPU use is 13.1 / 11.3% higher,
+while goodput is lower than the matched baseline. This build also includes
+quota-sized frame stores; the comparison does not isolate every change.
+Neither build reaches the target. The new ACK-enabled decline and its CPU cost
+remain performance work, not an accepted tradeoff that closes the gate.
+
+Drop counts below use endpoint L/R order; the goodput table uses direction
+L→R / R→L. TAP and outer-socket drops count SKBs; worker queue-drop events may
+discard aggregates, while expiry counts frames. They cannot be summed into
+an exact frame-loss total.
+
+| Build / load | TAP TX drops | Outer socket overflow | Worker queue drops | Expired frames | Inner UDP receive-buffer errors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Before ACK / 21G | 1402494 / 134015 | 546743 / 7669 | 968 / 9914 | 5327 / 20523 | 95006 / 1311 |
+| Before ACK / unlimited | 4880618 / 2306319 | 512173 / 4638 | 0 / 2826 | 0 / 0 | 6011 / 205 |
+| ACK enabled / 21G | 1489314 / 66213 | 771023 / 4874 | 0 / 1619 | 0 / 0 | 1487 / 71 |
+| ACK enabled / unlimited | 4837971 / 2404384 | 1000758 / 7041 | 764 / 3552 | 2340 / 10341 | 1453 / 33 |
+
+All eight points have zero admission pressure, receiver corruption, duplicates,
+out-of-window records, wrong-run records, reordering and outer fragmentation.
+The JSON includes per-flow results, per-worker counters, thread CPU and per-core
+softirq CPU. At unlimited load, summed softirq use on the assigned twenty CPUs
+is 23.76% before ACKs and 30.88% with ACKs, separately from daemon CPU.
+
+All super-frame reads concentrate on worker 3 at both endpoints. In the
+ACK-enabled unlimited point, left worker 3 reads 914237 super-frames and receives
+25.26 GB of outer traffic; right worker 3 reads 2276048 and receives only control
+traffic. The left reader is near 99% CPU while worker 5 is nearly idle. These
+counters verify concentration and shared read/receive work. The older flush32
+sweep placed all left super-frame reads on worker 5, which received only control
+traffic. That placement difference is verified; its full throughput cost is not.
+These observations do not establish the CPU maximum. Scheduler
+profiling and controlled redistribution remain necessary; missing recovery is
+not sufficient attribution.
+
+One sweep per build does not satisfy the repeatability gate. The older higher
+rates used a different kernel build and TAP queue placement and are retained as
+historical observations, not a matched control for ACK overhead.
 
 ## Compact transmit storage and source ownership (November 6)
 
