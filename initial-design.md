@@ -600,8 +600,11 @@ carry ACK snapshots through bounded handoffs; a rotating control queue gives
 blocked groups and buffer returns bounded service. ACK delay includes queue
 residence, and actual-send timestamps enforce duplicate spacing. Incoming
 ACK application and runtime data grants remain unfinished. Pure shared grant
-accounting and draft-07 delivery sampling are implemented; the BBR controller,
-bounded grant batches and sender recovery still need runtime integration.
+accounting, draft-07 delivery sampling and the pure BBR controller are implemented.
+The controller has fixed cycle vectors, model/loss/recovery boundary tests and
+allocation checks; tests/vectors/bbr-07/README.md records draft interpretations.
+Bounded grant batches, shared controller ownership and sender recovery still
+need runtime integration.
 Configuration
 validation now freezes named endpoint/peer/session relationships into numeric
 indices. Cookie lookup uses short scans for small sets and randomized hashing

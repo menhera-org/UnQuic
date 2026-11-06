@@ -40,7 +40,10 @@ fn pinned_draft_07_delivery_vectors() {
                 ),
                 "M" => delivery.application_limited(n(1)).unwrap(),
                 "L" => assert_eq!(
-                    delivery.declared_lost(&mut packets[n(1) as usize]).unwrap(),
+                    delivery
+                        .declared_lost(&mut packets[n(1) as usize])
+                        .unwrap()
+                        .is_some(),
                     flag(2)
                 ),
                 "A" | "E" => {
@@ -208,7 +211,7 @@ fn history_validation_and_partial_submission_feed_only_successful_transmissions(
     );
     assert_eq!(delivery.delivered(), 0);
     assert!(history.lose(1).is_some());
-    assert!(delivery.declared_lost(&mut packets[0]).unwrap());
+    assert!(delivery.declared_lost(&mut packets[0]).unwrap().is_some());
     let ranges = [AckRange { start: 1, end: 3 }];
     for expected in [Some(2560), None] {
         history.begin_ack(AckRanges::new(&ranges).unwrap()).unwrap();
@@ -286,4 +289,90 @@ fn delayed_send_reports_do_not_move_delivery_snapshots_or_rtt_into_the_future() 
         assert!(sample.host_limited);
         assert!(!sample.app_limited);
     }
+}
+
+#[test]
+fn loss_snapshots_preserve_physical_bytes_and_send_time_counters() {
+    use unquic::bbr::LossSample;
+    let mut d = Delivery::new();
+    let mut a = d.sent(ns(0), 1280, 0, false).unwrap();
+    d.application_limited(1280).unwrap();
+    let mut b = d.sent(ns(1), 1500, 1280, false).unwrap();
+    assert_eq!(
+        d.declared_lost(&mut a).unwrap(),
+        Some(LossSample {
+            bytes: 1280,
+            total_lost: 1280,
+            lost: 1280,
+            tx_in_flight: 1280,
+            app_limited: false,
+        })
+    );
+    let mut repair = d.sent(ns(2), 9000, 1500, false).unwrap();
+    assert_eq!(
+        d.declared_lost(&mut b).unwrap(),
+        Some(LossSample {
+            bytes: 1500,
+            total_lost: 2780,
+            lost: 2780,
+            tx_in_flight: 2780,
+            app_limited: true,
+        })
+    );
+    assert_eq!(
+        d.declared_lost(&mut repair).unwrap(),
+        Some(LossSample {
+            bytes: 9000,
+            total_lost: 11780,
+            lost: 10500,
+            tx_in_flight: 10500,
+            app_limited: true,
+        })
+    );
+    assert_eq!(d.declared_lost(&mut a).unwrap(), None);
+}
+
+#[test]
+fn controller_limits_feed_shared_grants_after_partial_submission_and_late_ack() {
+    use unquic::bbr::Controller;
+    use unquic::pacing::Grants;
+    let mut c = Controller::new(1280, Some(Duration::from_millis(1)), ns(0), 1).unwrap();
+    let mut d = Delivery::new();
+    let mut g = Grants::new(2).unwrap();
+    let grant = g.reserve(0, 2560, false, c.limits(), ns(0)).unwrap();
+    // Only the first datagram is submitted; unsent bytes earn no sampler identity.
+    g.reported(grant, 1280, Some(ns(0))).unwrap();
+    let mut original = d.sent(ns(0), 1280, 0, false).unwrap();
+    assert_eq!(g.in_flight(), 1280);
+    c.enter_recovery(ns(1_000_000), g.in_flight(), false)
+        .unwrap();
+    c.on_loss(
+        d.declared_lost(&mut original).unwrap().unwrap(),
+        ns(1_000_000),
+    )
+    .unwrap();
+    g.settled(1280).unwrap();
+    let grant = g
+        .reserve(1, 1280, false, c.limits(), ns(1_000_000))
+        .unwrap();
+    g.reported(grant, 1280, Some(ns(1_000_000))).unwrap();
+    let mut repair = d.sent(ns(1_000_000), 1280, 0, false).unwrap();
+    d.begin_ack(ns(2_000_000), false).unwrap();
+    d.acknowledged(&mut original).unwrap();
+    d.acknowledged(&mut repair).unwrap();
+    let sample = d.finish_ack(ns(1_000_000)).unwrap().unwrap();
+    assert_eq!(sample.newly_acked, 2560);
+    g.settled(1280).unwrap(); // The lost original was settled once, at loss.
+    c.recovery_finished(ns(2_000_000), false).unwrap();
+    c.on_ack(
+        sample,
+        Some(ns(1_000_000)),
+        g.in_flight(),
+        false,
+        ns(2_000_000),
+    )
+    .unwrap();
+    assert_eq!(g.in_flight(), 0);
+    assert_eq!(c.limits().window, 15360);
+    assert_eq!(c.limits().rate, 35_456_000); // Startup pacing never decreases.
 }

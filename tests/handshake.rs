@@ -1244,16 +1244,24 @@ fn shared_transmission_grants_allocate_nothing_after_startup() {
 }
 
 #[test]
-fn delivery_sampling_allocates_nothing_including_chunked_acks_and_late_loss() {
-    use unquic::bbr::Delivery;
+fn delivery_and_controller_allocate_nothing_including_chunked_acks_and_late_loss() {
+    use unquic::bbr::{Controller, Delivery};
     let mut delivery = Delivery::new();
+    let mut controller =
+        Controller::new(1280, Some(Duration::from_millis(1)), Duration::ZERO, 1).unwrap();
     ALLOCATION_COUNT.set(Some(0));
     for step in 0..10000 {
         let now = Duration::from_millis(step * 10);
         delivery.application_limited(0).unwrap();
+        controller
+            .on_transmit(now, 0, delivery.is_app_limited())
+            .unwrap();
         let mut original = delivery.sent(now, 1280, 0, false).unwrap();
-        assert!(delivery.declared_lost(&mut original).unwrap());
-        assert!(!delivery.declared_lost(&mut original).unwrap());
+        controller.enter_recovery(now, 1280, false).unwrap();
+        controller
+            .on_loss(delivery.declared_lost(&mut original).unwrap().unwrap(), now)
+            .unwrap();
+        assert!(delivery.declared_lost(&mut original).unwrap().is_none());
         let mut repair = delivery
             .sent(now + Duration::from_millis(1), 1280, 0, true)
             .unwrap();
@@ -1269,6 +1277,14 @@ fn delivery_sampling_allocates_nothing_including_chunked_acks_and_late_loss() {
             .unwrap();
         assert_eq!(sample.newly_acked, 2560);
         assert!(sample.app_limited && sample.host_limited);
+        let at = now + Duration::from_millis(2);
+        controller.recovery_finished(at, true).unwrap();
+        if controller
+            .on_ack(sample, Some(Duration::from_millis(1)), 0, false, at)
+            .unwrap()
+        {
+            delivery.application_limited(0).unwrap();
+        }
     }
     let count = ALLOCATION_COUNT.replace(None);
     assert_eq!(count, Some(0));

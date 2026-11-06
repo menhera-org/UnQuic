@@ -14,8 +14,9 @@ Earlier pre-ACK sweeps reached higher rates with another kernel build and TAP qu
 No workload proves a universal plateau or the theoretical CPU ceiling.
 
 Neither the local **20 Gbit/s in each direction** gate nor the real
-**5 Gbit/s under loss** gate has passed. Recovery and congestion control
-remain unfinished. PMTU discovery is active in the latest rate sweeps and
+**5 Gbit/s under loss** gate has passed. Runtime recovery and congestion control
+remain unfinished. The pure draft-07 controller has deterministic model and
+allocation tests, but is not active in the daemon and establishes no throughput gain. PMTU discovery is active in the latest rate sweeps and
 passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
 Missing recovery or congestion control does not explain away the remaining
 scheduling and admission problems.

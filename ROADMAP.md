@@ -481,7 +481,15 @@ The pure draft-07 delivery sampler now has fixed vectors for ACK compression,
 idle restart, application bubbles, late ACKs after loss and duplicate suppression.
 It preserves a single sample across bounded ACK chunks and counts each physical
 transmission once. Allocation checks and sent-history integration tests pass.
-The BBR state machine, model filters, gains and runtime integration remain pending.
+The pure draft-07 controller now implements Startup, Drain, ProbeBW and ProbeRTT,
+fixed model filters, pacing/window gains, loss bounds and recovery undo. Fixed
+cycle vectors and boundary tests cover application limitation, filter expiry,
+MTU changes, loss thresholds, RTT probing and a tenfold capacity reduction.
+Sampler/controller/grant tests cover partial submissions and late originals.
+Steady-state sampling and model updates allocate nothing. Pseudocode/prose
+differences and integer rounding are recorded in tests/vectors/bbr-07/README.md.
+Runtime feedback ordering, controller ownership and worker enforcement remain
+pending; these pure components do not enable congestion control in the daemon.
 Reserve sampling metadata against the startup memory ceiling; a full sampling
 record in every lane's 65,536 history slots would exceed that ceiling. Use bounded
 shared storage and retire only resolved sender-history prefixes, preserving

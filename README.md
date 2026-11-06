@@ -864,5 +864,5 @@ Dual-licensed under either of
 
 at your option.
 
-The BBR delivery sampler includes code derived from the IETF draft under the
+The BBR sampler and controller include code derived from the IETF draft under the
 Revised BSD License; retain its notice in [LICENSE-BBR](LICENSE-BBR).

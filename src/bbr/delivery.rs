@@ -38,6 +38,21 @@ pub struct RateSample {
     pub last_packet: u64,
 }
 
+/// One newly declared physical loss, including the transmission's delivery snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LossSample {
+    /// Outer bytes in this physical datagram.
+    pub bytes: u16,
+    /// Shared cumulative lost bytes after this declaration.
+    pub total_lost: u64,
+    /// Shared lost bytes since this transmission was sent.
+    pub lost: u64,
+    /// Shared bytes in flight immediately after this transmission was sent.
+    pub tx_in_flight: u64,
+    /// Whether this transmission belonged to an application-limited bubble.
+    pub app_limited: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Snapshot {
     id: u64,
@@ -144,9 +159,10 @@ impl Delivery {
 
     /// Marks the draft's application-limited bubble at delivered + inflight.
     ///
-    /// Call only with no unsent data, no pending lower-layer transmissions,
+    /// For normal idle detection, require no unsent data or pending lower-layer transmissions,
     /// inflight below cwnd, and no unrepaired loss. Check before enqueueing new
     /// data and before ACK/timer processing; host backpressure alone is not enough.
+    /// ProbeRTT also calls this explicitly, even with unsent data, to exclude its low rates.
     pub fn application_limited(&mut self, in_flight: u64) -> Result<(), DeliveryError> {
         if self.pending.is_some() {
             return Err(DeliveryError::Busy);
@@ -301,12 +317,18 @@ impl Delivery {
 
     /// Declares one transmission lost once; already acknowledged packets do nothing.
     /// Retain its metadata for a possible late ACK. Payload expiry is not packet loss.
-    pub fn declared_lost(&mut self, packet: &mut DeliveryPacket) -> Result<bool, DeliveryError> {
+    pub fn declared_lost(
+        &mut self,
+        packet: &mut DeliveryPacket,
+    ) -> Result<Option<LossSample>, DeliveryError> {
         if self.pending.is_some() {
             return Err(DeliveryError::Busy);
         }
         if packet.declared_lost || packet.acknowledged {
-            return Ok(false);
+            return Ok(None);
+        }
+        if packet.snapshot.lost > self.lost || packet.snapshot.id >= self.next_id {
+            return Err(DeliveryError::Invalid);
         }
         let lost = self
             .lost
@@ -314,7 +336,13 @@ impl Delivery {
             .ok_or(DeliveryError::Exhausted)?;
         self.lost = lost;
         packet.declared_lost = true;
-        Ok(true)
+        Ok(Some(LossSample {
+            bytes: packet.bytes,
+            total_lost: lost,
+            lost: lost - packet.snapshot.lost,
+            tx_in_flight: packet.snapshot.in_flight,
+            app_limited: packet.snapshot.app_limited,
+        }))
     }
 }
 
