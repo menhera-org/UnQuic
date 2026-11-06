@@ -339,6 +339,11 @@ impl Lane {
         })
     }
 
+    /// Records successful ACK submission after queueing, preserving duplicate spacing.
+    pub fn ack_transmitted(&mut self, sent_at: Duration) {
+        self.ack.transmitted(sent_at);
+    }
+
     /// Recycles storage for a new connection or a never-used remote lane ID.
     ///
     /// Call only after the old owner's commit/retirement barrier and preserve

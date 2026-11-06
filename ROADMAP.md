@@ -428,15 +428,19 @@ Do not defer this performance coverage to the stage 4 composition matrix.
 Goal: a production candidate under loss.
 
 Session liveness already uses matching small probes on local lane 1.
-Handshake and PROBE_REPLY sends now share the path group's 4 MiB/s ceiling
-and sixteen-datagram burst. A fixed scheduler charges successful outer bytes;
+ACK, handshake and PROBE_REPLY sends now share the path group's 4 MiB/s
+ceiling and sixteen-datagram burst. A fixed scheduler charges successful outer bytes;
 throttled handshakes retain one current flight and use deadline-driven retries.
 Per-session clocks and tokens track successful submission after deferral.
 Configuration groups default binding scopes independently of endpoint names and
 ports, and shares explicit group names across endpoints. Tests cover burst
 wraparound, byte sizes, failed sends, deferred phases, cancellation, expiry
-and multiple sessions. This implements the control ceiling only; congestion
-grants, ACK routing and data pacing remain pending.
+and multiple sessions. Four reserved feedback buffers per worker carry ACKs
+through the existing handoff rings. A shared control queue rotates blocked
+groups and returns, with at most 64 construction visits and 64 service visits
+per turn. Tests cover rejected packed tails/heads, full handoff and return
+queues, stale identities, control-class fairness and actual-send duplicate
+spacing. Incoming ACK application, congestion grants and data pacing remain pending.
 Receive-side ACK scheduling and range construction now use the existing
 reassembly bitmap, with no second history or hot-path allocations. Tests cover
 thresholds, gaps, duplicate rate limits, pressure rejection, word/window wrap,
@@ -446,9 +450,9 @@ whole ACKs before mutation, and preserves unresolved charges under window pressu
 Tests cover late ACKs, feedback-only eviction, ring wrap, maximum identities and
 allocation-free transitions. Sender entries now use 16 bytes each, retaining full
 `Duration` range and nanosecond precision; 64 histories save 32 MiB compared with
-the previous 24-byte entries. Worker integration and feedback routing remain
-pending, so the runtime still emits no packet
-ACKs. Per-lane MTU probing is connected to the workers. Recovery and congestion
+the previous 24-byte entries. Worker submission accounting and incoming ACK
+application remain pending. Outgoing ACKs are now emitted through the shared
+control queue. Per-lane MTU probing is connected to the workers. Recovery and congestion
 control remain pending; README.md documents probe feedback and send-error handling.
 
 The pure RTT estimator, loss-deadline calculation, PTO-period backoff and frame

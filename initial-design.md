@@ -579,10 +579,15 @@ namespace; see README.md for commands and coverage limits. The pure handshake
 state machine implements automatic role election, bounded retries, negotiated
 parameters, replacement and liveness transitions using supplied monotonic times.
 The runtime now applies commit and carrier events through the worker barrier.
-Handshake and PROBE_REPLY transmissions share the path group's fixed 4 MiB/s
-control scheduler and sixteen-datagram burst, charging successful outer bytes.
+ACK, handshake and PROBE_REPLY transmissions share the path group's fixed
+4 MiB/s control scheduler and sixteen-datagram burst, charging successful
+outer bytes.
 Deferred handshakes retain one flight, recheck identity/expiry and update retry
-clocks on successful submission. Data grants and ACK routing remain unfinished.
+clocks on successful submission. Four reserved feedback buffers per worker
+carry ACK snapshots through bounded handoffs; a rotating control queue gives
+blocked groups and buffer returns bounded service. ACK delay includes queue
+residence, and actual-send timestamps enforce duplicate spacing. Incoming
+ACK application and data grants remain unfinished.
 Configuration
 validation now freezes named endpoint/peer/session relationships into numeric
 indices. Cookie lookup uses short scans for small sets and randomized hashing
@@ -628,7 +633,7 @@ throughput gate has not passed. Receive-side ACK scheduling/range construction
 is implemented over the existing bitmap. Pure sender history now validates whole
 ACKs against actual submissions, preserves unresolved charges and rejects known
 unsent holes. Each entry uses 16 bytes plus four bitmap bits, preserving full
-monotonic timestamp range and precision. Worker history integration and ACK routing are not yet connected.
+monotonic timestamp range and precision. Worker history integration and incoming ACK application are not yet connected.
 Pure RTT, loss-deadline, PTO-period and frame
 lifetime calculations and per-frame byte coverage are implemented. Coverage
 tracks at most two repairs per byte and rejects stale loss against a newer

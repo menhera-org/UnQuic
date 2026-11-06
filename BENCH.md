@@ -21,6 +21,11 @@ scheduling and admission problems.
 
 ## Current performance gaps
 
+The rate sweeps below precede runtime packet-ACK emission and the shared
+control queue. The ACK-enabled release passes forwarding/restart and allocation
+checks, plus control-pressure and stale-feedback regression tests. Its rate
+sweeps, CPU overhead and overload behavior have not yet been measured.
+
 The latest storage/batching results below use eight workers per daemon,
 16 flows per direction, 500-entry TAP queues, and a 1452-byte outer UDP cap.
 They keep active discovery enabled. L→R / R→L pairs are simultaneous.

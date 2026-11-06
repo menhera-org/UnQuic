@@ -1,5 +1,6 @@
 //! Worker-owned polling primitives and transport loop support.
 
+mod feedback;
 mod frames;
 
 use crate::sys::{cvt, invalid};
@@ -350,6 +351,7 @@ pub(crate) enum Event {
     Packet(Box<Buffer>),
     Frame(Box<Buffer>),
     Free(Box<Buffer>),
+    Feedback(Box<feedback::Feedback>),
     Register {
         buffer: Box<Buffer>,
         lane: Box<reassembly::Lane>,
@@ -421,6 +423,7 @@ struct Session {
     slab: Option<usize>,
     rx_totals: Vec<Snapshot>,
     tx_totals: Vec<Snapshot>,
+    ack_inflight: u64,
     rx_dirty: u64,
     tx_dirty: u64,
 }
@@ -437,6 +440,7 @@ struct SessionControl {
     install_path: usize,
     pending_send: Option<Record<'static>>,
     send_due: Duration,
+    queued: bool,
 }
 
 struct TxBatch {
@@ -550,6 +554,12 @@ pub(crate) struct Worker {
     probe_slot: Option<u128>,
     pub requests: Option<Consumer<AddressRequest>>,
     peer_controls: Vec<PeerControl>,
+    #[allow(clippy::vec_box)] // Move pool handles without enlarging every handoff-ring slot.
+    feedback_free: Vec<Box<feedback::Feedback>>,
+    pending_control: VecDeque<feedback::Pending>,
+    control_replies: usize,
+    feedback_cursor: usize,
+    feedback_retry: Duration,
     free: Vec<Box<Buffer>>,
     returns: Vec<Vec<Box<Buffer>>>,
     frames: frames::Store,
@@ -566,6 +576,10 @@ impl Worker {
         let mut per_worker = size_of::<Self>()
             .checked_add(crate::tap::Reader::storage_bytes()?)?
             .checked_add(frames::Store::storage_bytes())?
+            .checked_add(
+                feedback::BUFFERS
+                    * (size_of::<feedback::Feedback>() + size_of::<Box<feedback::Feedback>>()),
+            )?
             .checked_add(BUFFERS.checked_mul(size_of::<Buffer>() + size_of::<Box<Buffer>>())?)?
             .checked_add(workers.checked_mul(
                 size_of::<Option<Producer<Event>>>() + size_of::<Option<Consumer<Event>>>(),
@@ -622,6 +636,14 @@ impl Worker {
             .checked_add(batches)?
             .checked_add(
                 config
+                    .sessions
+                    .len()
+                    .checked_add(feedback::REPLIES)?
+                    .checked_add(feedback::BUFFERS.checked_mul(workers)?)?
+                    .checked_mul(size_of::<feedback::Pending>())?,
+            )?
+            .checked_add(
+                config
                     .endpoints
                     .len()
                     .checked_mul(workers)?
@@ -675,6 +697,7 @@ impl Worker {
                     install_path: 0,
                     pending_send: None,
                     send_due: Duration::ZERO,
+                    queued: false,
                 });
             }
             sessions.push(Session {
@@ -711,6 +734,7 @@ impl Worker {
                 slab: None,
                 rx_totals: vec![Snapshot::default(); LANES],
                 tx_totals: vec![Snapshot::default(); config.peers[peer].tx_lanes],
+                ack_inflight: 0,
                 rx_dirty: 0,
                 tx_dirty: 0,
             });
@@ -815,6 +839,17 @@ impl Worker {
                 .collect(),
             sessions,
             controls,
+            feedback_free: (0..feedback::BUFFERS)
+                .map(|_| Box::new(feedback::Feedback::new(id)))
+                .collect(),
+            pending_control: VecDeque::with_capacity(if id == 0 {
+                config.sessions.len() + feedback::REPLIES + feedback::BUFFERS * count
+            } else {
+                0
+            }),
+            control_replies: 0,
+            feedback_cursor: 0,
+            feedback_retry: Duration::ZERO,
             free,
             returns: (0..count).map(|_| Vec::with_capacity(BUFFERS)).collect(),
             frames: frames::Store::new(),
@@ -872,6 +907,8 @@ impl Worker {
             more |= self.drain_tap_inputs(now)?;
             self.flush_frames(now)?;
             self.flush_taps(now)?;
+            self.collect_acks(now)?;
+            self.flush_control(now)?;
             self.flush_notifications()?;
             more |= self.ready.iter().copied().any(|(session, lane)| {
                 let tx = &self.transmit[self.shared.config.peer_for_session(session).unwrap()]
@@ -1405,6 +1442,7 @@ impl Worker {
                     Event::Packet(buffer) => self.received.push_back(buffer),
                     Event::Frame(buffer) => self.input_frame(buffer, now)?,
                     Event::Free(buffer) => self.release(buffer),
+                    Event::Feedback(feedback) => self.receive_feedback(feedback)?,
                     Event::Register { mut buffer, lane } => {
                         let session = buffer.session;
                         if self.matches(session, buffer.tag) {
@@ -1458,15 +1496,7 @@ impl Worker {
                         length,
                     } => {
                         if self.matches(session, tag) {
-                            self.send_record(
-                                session,
-                                Record::ProbeReply {
-                                    lane,
-                                    packet_number: packet,
-                                    payload_len: length,
-                                },
-                                now,
-                            )?;
+                            self.queue_reply(session, tag, lane, packet, length, now);
                         }
                     }
                     Event::Retire { session, tag, lane } => {
@@ -1769,15 +1799,14 @@ impl Worker {
                                 length: length as u16,
                             };
                             if self.id == 0 {
-                                self.send_record(
+                                self.queue_reply(
                                     session,
-                                    Record::ProbeReply {
-                                        lane: header.lane,
-                                        packet_number: header.packet_number,
-                                        payload_len: length as u16,
-                                    },
+                                    header.receive_tag,
+                                    header.lane,
+                                    header.packet_number,
+                                    length as u16,
                                     now,
-                                )?;
+                                );
                             } else {
                                 let _ = self.push(0, event);
                             }
@@ -2636,6 +2665,7 @@ impl Worker {
                     let lane = local.rx[slot].take().unwrap();
                     local.rx_index[usize::from(lane.id())] = 0;
                     local.returning &= !(1_u64 << slot);
+                    local.ack_inflight &= !(1_u64 << slot);
                     local.rx_totals[slot] = Snapshot::default();
                     local.rx_dirty &= !(1_u64 << slot);
                     let index = (session * self.shared.workers() + self.id) * LANES + slot;
@@ -3132,7 +3162,7 @@ impl Worker {
         }
         if let Some(record) = effects.send {
             self.controls[session].pending_send = Some(record);
-            self.flush_handshake(session, now)?;
+            self.queue_handshake(session, now);
         }
         self.controls[session].retry = now + Duration::from_millis(100);
         self.shared.publish_state(
@@ -3175,6 +3205,7 @@ impl Worker {
             }
             Phase::Install => {
                 local.rx_index.fill(0);
+                local.ack_inflight = 0;
                 local.connection = command.connection;
                 local.path = path;
                 let config = self.shared.config.config();
@@ -3379,11 +3410,6 @@ impl Worker {
             {
                 continue;
             }
-            if self.controls[session].pending_send.is_some()
-                && now >= self.controls[session].send_due
-            {
-                self.flush_handshake(session, now)?;
-            }
             let due = self.controls[session]
                 .state
                 .deadline()
@@ -3419,6 +3445,9 @@ impl Worker {
 
     fn deadline(&self, now: Duration) -> Option<Duration> {
         let mut due = self.setup_due.min(self.mtu_due);
+        if let Some(feedback) = self.feedback_deadline() {
+            due = due.min(feedback);
+        }
         for (index, control) in self.controls.iter().enumerate() {
             let peer = self.shared.config.peer_for_session(index).unwrap();
             if self.shared.peer_bound(peer)
@@ -3444,7 +3473,19 @@ impl Worker {
             {
                 due = due.min(input.deadline);
             }
-            for lane in session.rx.iter().flatten() {
+            for (slot, lane) in session
+                .rx
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, lane)| lane.as_ref().map(|lane| (slot, lane)))
+            {
+                if !self.feedback_free.is_empty()
+                    && session.ack_inflight & (1 << slot) == 0
+                    && session.returning & (1 << slot) == 0
+                    && let Some(deadline) = lane.ack_deadline()
+                {
+                    due = due.min(deadline.max(self.feedback_retry));
+                }
                 if let Some(deadline) = lane.deadline() {
                     due = due.min(deadline);
                 }
@@ -3747,7 +3788,7 @@ mod tests {
 
     // Datagram sockets give deterministic full-write/WouldBlock behavior without
     // depending on the kernel's TAP ingress drop policy.
-    fn receive_worker() -> (Worker, std::os::unix::net::UnixDatagram) {
+    pub(super) fn receive_worker() -> (Worker, std::os::unix::net::UnixDatagram) {
         let (shared, [mut worker, _]) = test_workers();
         let params = wire::Params {
             port: 40000,
@@ -3828,13 +3869,16 @@ mod tests {
 
         let effects = worker.controls[0].state.on_timer(now, Tag::new(9)).unwrap();
         worker.effects(0, effects, now).unwrap();
+        worker.flush_control(now).unwrap();
         assert!(worker.controls[0].pending_send.is_some());
         let due = worker.control_budgets[0].deadline().unwrap();
         assert_eq!(worker.deadline(now), Some(due));
         worker.timers(due - Duration::from_nanos(1)).unwrap();
+        worker.flush_control(due - Duration::from_nanos(1)).unwrap();
         assert!(worker.controls[0].pending_send.is_some());
         assert_eq!(worker.counters.tx_outer_bytes, charged);
         worker.timers(due).unwrap();
+        worker.flush_control(due).unwrap();
         assert!(worker.controls[0].pending_send.is_none());
         let length = rx.recv(&mut bytes).unwrap().0;
         assert!(matches!(
@@ -3858,15 +3902,17 @@ mod tests {
     fn queued_handshakes_expire_and_socket_retry_preserves_the_flight() {
         let (_, [mut worker, other]) = test_workers();
         assert!(other.control_budgets.is_empty());
+        worker.shared.bound[0].store(3, Ordering::Release);
         let now = Duration::ZERO;
         let effects = worker.controls[0].state.on_timer(now, Tag::new(9)).unwrap();
         worker.effects(0, effects, now).unwrap();
+        worker.flush_control(now).unwrap();
         assert!(worker.controls[0].pending_send.is_some());
         assert_eq!(worker.controls[0].send_due, RETRY);
         let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
         worker.transmit[0].paths[0].lanes[0].socket =
             Some(TransmitSocket::connect(&rx, rx.local_addr()).unwrap());
-        worker.flush_handshake(0, Duration::from_secs(10)).unwrap();
+        worker.flush_control(Duration::from_secs(10)).unwrap();
         assert!(worker.controls[0].pending_send.is_none());
         let mut bytes = [0; BASE_UDP_PAYLOAD];
         assert_eq!(
@@ -3881,6 +3927,7 @@ mod tests {
             .on_timer(now, Tag::new(10))
             .unwrap();
         worker.effects(0, effects, now).unwrap();
+        worker.flush_control(now).unwrap();
         assert!(worker.controls[0].pending_send.is_none());
         let length = rx.recv(&mut bytes).unwrap().0;
         assert!(matches!(
@@ -3890,7 +3937,7 @@ mod tests {
         assert_eq!(worker.counters.tx_outer_bytes, length as u64 + 48);
     }
 
-    fn receive_bytes(number: u64, records: &[Record<'_>], output: &mut [u8]) -> usize {
+    pub(super) fn receive_bytes(number: u64, records: &[Record<'_>], output: &mut [u8]) -> usize {
         wire::encode_datagram(
             Header {
                 cookie: crate::UnquicUuid::from_bytes([1; 16]),
@@ -3905,7 +3952,7 @@ mod tests {
         .unwrap()
     }
 
-    fn receive_piece(sequence: u64, offset: u32, bytes: &[u8]) -> Record<'_> {
+    pub(super) fn receive_piece(sequence: u64, offset: u32, bytes: &[u8]) -> Record<'_> {
         Record::Data {
             frame_id: (7 << 48) | sequence,
             total_len: 60,
@@ -5755,7 +5802,7 @@ mod tests {
         assert_eq!(workers[0].free.len(), BUFFERS);
     }
 
-    fn test_workers() -> (Arc<Shared>, [Worker; 2]) {
+    pub(super) fn test_workers() -> (Arc<Shared>, [Worker; 2]) {
         use crate::config::{Config, Daemon, Endpoint, Peer, Session as ConfigSession};
         use std::{
             net::Ipv6Addr,

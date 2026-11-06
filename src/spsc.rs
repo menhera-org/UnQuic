@@ -88,14 +88,20 @@ pub fn channel<T: Send>() -> (Producer<T>, Consumer<T>) {
 }
 
 impl<T> Producer<T> {
+    /// Checks space before preparing an item; only this producer can consume it.
+    #[inline]
+    pub fn is_full(&mut self) -> bool {
+        if self.head.wrapping_sub(self.cached_tail) == CAPACITY {
+            self.cached_tail = self.shared.tail.0.load(Ordering::Acquire);
+        }
+        self.head.wrapping_sub(self.cached_tail) == CAPACITY
+    }
+
     /// Publishes an item, or returns it unchanged when the ring is full.
     #[inline]
     pub fn try_push(&mut self, value: T) -> Result<(), T> {
-        if self.head.wrapping_sub(self.cached_tail) == CAPACITY {
-            self.cached_tail = self.shared.tail.0.load(Ordering::Acquire);
-            if self.head.wrapping_sub(self.cached_tail) == CAPACITY {
-                return Err(value);
-            }
+        if self.is_full() {
+            return Err(value);
         }
         // SAFETY: this endpoint exclusively owns the free slot. An acquired tail
         // proves the consumer finished reading before this slot can be reused.
@@ -147,11 +153,13 @@ mod tests {
             for i in 0..CAPACITY {
                 assert_eq!(tx.try_push(round * CAPACITY + i), Ok(()));
             }
+            assert!(tx.is_full());
             assert_eq!(tx.try_push(usize::MAX), Err(usize::MAX));
             for i in 0..CAPACITY {
                 assert_eq!(rx.try_pop(), Some(round * CAPACITY + i));
             }
             assert_eq!(rx.try_pop(), None);
+            assert!(!tx.is_full());
         }
     }
 

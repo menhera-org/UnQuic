@@ -217,10 +217,19 @@ ACK-eliciting packets or one millisecond, immediate feedback on a new gap,
 and rate-limited duplicate feedback. Reassembly's `ack_deadline` and `take_ack`
 APIs construct at most the newest 32 ranges from the existing receive bitmap.
 Tests cover pressure rejection, reordering, window wrap, delay calculation and
-allocation-free construction. Workers do not yet transmit or process these
-ACKs; worker integration and bounded feedback routing remain stage-3 work.
+allocation-free construction. Workers now emit these ACKs from four reserved
+feedback buffers per worker. They reserve handoff space before consuming a
+schedule and retain at most one snapshot per receive lane; further accepted
+packets coalesce in that lane's bitmap. A rotating queue shares control slots
+between ACKs, probe replies and handshakes. Construction visits at most 64 lane
+slots per turn; sending visits at most 64 queue entries. Blocked groups and
+buffer returns yield to other entries and wake at their next deadline.
+ACK delay includes queue residence, capped at 1 ms. Successful-send timestamps
+return to the receive owner to enforce duplicate spacing. Connection tags and
+lane identity are rechecked before sends and buffer returns. Incoming ACK
+application to sender history, loss detection and recovery remains Stage 3 work.
 
-Handshake and PROBE_REPLY sends now share a 4 MiB/s outer-byte ceiling per
+ACK, handshake and PROBE_REPLY sends share a 4 MiB/s outer-byte ceiling per
 path group, with a burst of sixteen datagrams. Worker zero owns each fixed
 scheduler; successful sends alone consume its budget. A throttled handshake
 retains one flight per session and wakes at the next budget deadline.
@@ -418,8 +427,9 @@ frames per second, CPU and drops separately from large-frame Gbit/s.
 
 The current runtime sends each DATA piece once. It retains a frame only until
 all pieces have been submitted, the connection changes, or its 100 ms sender
-deadline expires. It does not yet generate data ACKs, retain sent data for repair,
-or apply congestion control. A lost piece can therefore prevent that entire
+deadline expires. It emits packet ACKs after full admission, but does not yet
+apply received ACKs, retain sent data for repair or apply congestion control.
+A lost piece can therefore prevent that entire
 frame from reaching TAP. Receive expiry starts at the first retained piece and
 does not move when duplicates arrive.
 

@@ -60,6 +60,16 @@ impl Schedule {
         self.deadline = Some(self.deadline.map_or(due, |old| old.min(due)));
     }
 
+    pub fn transmitted(&mut self, now: Duration) {
+        let sent = self.last_feedback.map_or(now, |old| old.max(now));
+        self.last_feedback = Some(sent);
+        if self.eliciting == 0 {
+            self.deadline = self
+                .deadline
+                .and_then(|due| sent.checked_add(DELAY).map(|next| due.max(next)));
+        }
+    }
+
     pub fn take(&mut self, now: Duration) -> Option<u32> {
         if self.deadline.is_none_or(|due| due > now) {
             return None;
@@ -131,6 +141,28 @@ mod tests {
         assert_eq!(ack.take(us(1200)), Some(0));
         ack.duplicate(us(1200));
         assert_eq!(ack.deadline, Some(us(2200)));
+    }
+
+    #[test]
+    fn deferred_submission_spaces_duplicates_but_preserves_fresh_feedback() {
+        for fresh in [false, true] {
+            let mut ack = Schedule::new();
+            ack.accepted(1, true, us(0));
+            assert_eq!(ack.take(us(1000)), Some(1000));
+            ack.duplicate(us(2000));
+            if fresh {
+                ack.accepted(3, true, us(2500));
+            }
+            ack.transmitted(us(3000));
+            assert_eq!(ack.deadline, Some(us(if fresh { 2000 } else { 4000 })));
+            if !fresh {
+                assert_eq!(ack.take(us(3999)), None);
+            }
+            assert!(ack.take(us(4000)).is_some());
+            ack.duplicate(Duration::MAX);
+            ack.transmitted(Duration::MAX);
+            assert_eq!(ack.deadline, None);
+        }
     }
 
     #[test]
