@@ -260,7 +260,7 @@ use crate::{
         self, Connection, Effects, Tag,
         barrier::{Barrier, Command, Phase, Progress},
     },
-    pack, pmtu,
+    pacing, pack, pmtu,
     reassembly::{self, Admission},
     runtime::{AddressRequest, BUFFERS, Control, LANES, Shared},
     socket::{BATCH_SIZE, ReceiveDatagram, ReceiveSocket, SendDatagram, TransmitSocket},
@@ -435,6 +435,8 @@ struct SessionControl {
     probe: Option<(u64, u16)>,
     handshake_path: usize,
     install_path: usize,
+    pending_send: Option<Record<'static>>,
+    send_due: Duration,
 }
 
 struct TxBatch {
@@ -533,6 +535,7 @@ pub(crate) struct Worker {
     pub incoming: Vec<Option<Consumer<Event>>>,
     sessions: Vec<Session>,
     controls: Vec<SessionControl>,
+    control_budgets: Vec<pacing::Control>,
     receive: Vec<Option<ReceiveSocket>>,
     receive_overflow: Vec<u32>,
     pending_receive: VecDeque<(usize, usize, ReceiveSocket)>,
@@ -624,7 +627,12 @@ impl Worker {
                     .checked_mul(workers)?
                     .checked_mul(size_of::<(usize, usize, ReceiveSocket)>())?,
             )?
-            .checked_add(config.peers.len().checked_mul(size_of::<PeerControl>())?)?
+            .checked_add(
+                config
+                    .peers
+                    .len()
+                    .checked_mul(size_of::<PeerControl>() + size_of::<pacing::Control>())?,
+            )?
             .checked_add(config.sessions.len().checked_mul(
                 size_of::<SessionControl>() + LANES * size_of::<Box<reassembly::Lane>>(),
             )?)
@@ -665,6 +673,8 @@ impl Worker {
                     probe: None,
                     handshake_path: 0,
                     install_path: 0,
+                    pending_send: None,
+                    send_due: Duration::ZERO,
                 });
             }
             sessions.push(Session {
@@ -795,6 +805,13 @@ impl Worker {
             requests: None,
             peer_controls: (0..if id == 0 { config.peers.len() } else { 0 })
                 .map(|_| PeerControl::default())
+                .collect(),
+            control_budgets: (0..if id == 0 {
+                shared.config.path_groups()
+            } else {
+                0
+            })
+                .map(|_| pacing::Control::new())
                 .collect(),
             sessions,
             controls,
@@ -1159,6 +1176,7 @@ impl Worker {
                 for session in 0..self.controls.len() {
                     if self.shared.config.peer_for_session(session) == Some(peer) {
                         self.controls[session].state.cancel_pending(now).unwrap();
+                        self.controls[session].pending_send = None;
                         self.controls[session].handshake_path = self.sessions[session].path;
                         self.controls[session].retry = now + Duration::from_millis(100);
                     }
@@ -1447,6 +1465,7 @@ impl Worker {
                                     packet_number: packet,
                                     payload_len: length,
                                 },
+                                now,
                             )?;
                         }
                     }
@@ -1757,6 +1776,7 @@ impl Worker {
                                         packet_number: header.packet_number,
                                         payload_len: length as u16,
                                     },
+                                    now,
                                 )?;
                             } else {
                                 let _ = self.push(0, event);
@@ -3000,7 +3020,8 @@ impl Worker {
     fn send_record(
         &mut self,
         session: usize,
-        record: Record<'static>,
+        record: Record<'_>,
+        now: Duration,
     ) -> io::Result<Option<(u64, u16)>> {
         let peer = self.shared.config.peer_for_session(session).unwrap();
         let path =
@@ -3034,7 +3055,23 @@ impl Worker {
         let Some(packet) = packet else {
             return Ok(None);
         };
-        match socket.send(&bytes[..packet.length], limit) {
+        let result = if record.ack_eliciting() {
+            socket.send(&bytes[..packet.length], limit)
+        } else {
+            let group = self
+                .shared
+                .config
+                .path_group_for_peer(peer)
+                .ok_or_else(|| io::Error::other("missing control path group"))?;
+            let budget = self
+                .control_budgets
+                .get_mut(group)
+                .ok_or_else(|| io::Error::other("control transmission on a non-owner worker"))?;
+            budget.send(packet.length + 48, now, || {
+                socket.send(&bytes[..packet.length], limit)
+            })
+        };
+        match result {
             Ok(()) => {
                 self.counters.tx_outer_bytes = self
                     .counters
@@ -3071,6 +3108,7 @@ impl Worker {
 
     fn effects(&mut self, session: usize, effects: Effects, now: Duration) -> io::Result<()> {
         if effects.commit.is_some() || effects.retire {
+            self.controls[session].pending_send = None;
             self.controls[session]
                 .barrier
                 .begin(effects.commit)
@@ -3093,7 +3131,8 @@ impl Worker {
             self.controls[session].carrier = carrier;
         }
         if let Some(record) = effects.send {
-            self.send_record(session, record)?;
+            self.controls[session].pending_send = Some(record);
+            self.flush_handshake(session, now)?;
         }
         self.controls[session].retry = now + Duration::from_millis(100);
         self.shared.publish_state(
@@ -3300,6 +3339,35 @@ impl Worker {
         Ok(())
     }
 
+    fn flush_handshake(&mut self, session: usize, now: Duration) -> io::Result<()> {
+        let Some(record) = self.controls[session].pending_send else {
+            return Ok(());
+        };
+        if !self.controls[session]
+            .state
+            .prepare_send(record, now)
+            .map_err(io::Error::other)?
+        {
+            self.controls[session].pending_send = None;
+            return Ok(());
+        }
+        if self.send_record(session, record, now)?.is_some() {
+            self.controls[session].pending_send = None;
+            self.controls[session]
+                .state
+                .transmitted(record, now)
+                .map_err(io::Error::other)?;
+        } else {
+            let peer = self.shared.config.peer_for_session(session).unwrap();
+            let group = self.shared.config.path_group_for_peer(peer).unwrap();
+            self.controls[session].send_due = self.control_budgets[group]
+                .deadline()
+                .filter(|&due| due > now)
+                .unwrap_or_else(|| now.saturating_add(RETRY));
+        }
+        Ok(())
+    }
+
     fn timers(&mut self, now: Duration) -> io::Result<()> {
         for session in 0..self.controls.len() {
             let peer = self.shared.config.peer_for_session(session).unwrap();
@@ -3310,6 +3378,11 @@ impl Worker {
                 || self.controls[session].barrier.is_active()
             {
                 continue;
+            }
+            if self.controls[session].pending_send.is_some()
+                && now >= self.controls[session].send_due
+            {
+                self.flush_handshake(session, now)?;
             }
             let due = self.controls[session]
                 .state
@@ -3333,7 +3406,7 @@ impl Worker {
                 && now >= self.controls[session].probe_due
             {
                 self.controls[session].probe_due = now + Duration::from_secs(1);
-                self.controls[session].probe = self.send_record(session, Record::Probe)?;
+                self.controls[session].probe = self.send_record(session, Record::Probe, now)?;
             }
             self.shared.publish_state(
                 session,
@@ -3354,6 +3427,9 @@ impl Worker {
                     .is_some()
                 && !control.barrier.is_active()
             {
+                if control.pending_send.is_some() {
+                    due = due.min(control.send_due);
+                }
                 if let Some(deadline) = control.state.deadline() {
                     due = due.min(deadline.max(control.retry));
                 }
@@ -3712,6 +3788,106 @@ mod tests {
             .attach_tap(0, TapQueue::test_fd(tx.into(), false))
             .unwrap();
         (worker, rx)
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn shared_control_budget_defers_handshakes_and_counts_only_successful_sends() {
+        let (mut worker, _) = receive_worker();
+        worker.command(1, worker.sessions[0].installed.unwrap(), 0);
+        let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
+        worker.transmit[0].paths[0].lanes[0].socket =
+            Some(TransmitSocket::connect(&rx, rx.local_addr()).unwrap());
+        worker.shared.bound[0].store(3, Ordering::Release);
+        worker.setup_due = Duration::MAX;
+        worker.mtu_due = Duration::MAX;
+        for control in &mut worker.controls {
+            control.retry = Duration::MAX;
+            control.probe_due = Duration::MAX;
+        }
+        let now = Duration::ZERO;
+        let reply = Record::ProbeReply {
+            lane: 7,
+            packet_number: 1,
+            payload_len: 52,
+        };
+        let mut charged = 0;
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        for session in (0..16).map(|index| index % 2) {
+            let (_, length) = worker.send_record(session, reply, now).unwrap().unwrap();
+            charged += u64::from(length) + 48;
+            assert_eq!(rx.recv(&mut bytes).unwrap().0, usize::from(length));
+        }
+        assert!(worker.send_record(1, reply, now).unwrap().is_none());
+        assert_eq!(worker.counters.tx_outer_bytes, charged);
+        assert_eq!(worker.counters.socket_errors, 0);
+        assert_eq!(
+            rx.recv(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        let effects = worker.controls[0].state.on_timer(now, Tag::new(9)).unwrap();
+        worker.effects(0, effects, now).unwrap();
+        assert!(worker.controls[0].pending_send.is_some());
+        let due = worker.control_budgets[0].deadline().unwrap();
+        assert_eq!(worker.deadline(now), Some(due));
+        worker.timers(due - Duration::from_nanos(1)).unwrap();
+        assert!(worker.controls[0].pending_send.is_some());
+        assert_eq!(worker.counters.tx_outer_bytes, charged);
+        worker.timers(due).unwrap();
+        assert!(worker.controls[0].pending_send.is_none());
+        let length = rx.recv(&mut bytes).unwrap().0;
+        assert!(matches!(
+            Datagram::decode(&bytes[..length]).unwrap().records().next(),
+            Some(Record::Hello { initiator: 9, .. })
+        ));
+        assert_eq!(worker.counters.tx_outer_bytes, charged + length as u64 + 48);
+        assert_eq!(
+            worker.controls[0].state.deadline(),
+            Some(due + Duration::from_secs(1))
+        );
+        assert_eq!(
+            rx.recv(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(worker.counters.socket_errors, 0);
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn queued_handshakes_expire_and_socket_retry_preserves_the_flight() {
+        let (_, [mut worker, other]) = test_workers();
+        assert!(other.control_budgets.is_empty());
+        let now = Duration::ZERO;
+        let effects = worker.controls[0].state.on_timer(now, Tag::new(9)).unwrap();
+        worker.effects(0, effects, now).unwrap();
+        assert!(worker.controls[0].pending_send.is_some());
+        assert_eq!(worker.controls[0].send_due, RETRY);
+        let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
+        worker.transmit[0].paths[0].lanes[0].socket =
+            Some(TransmitSocket::connect(&rx, rx.local_addr()).unwrap());
+        worker.flush_handshake(0, Duration::from_secs(10)).unwrap();
+        assert!(worker.controls[0].pending_send.is_none());
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        assert_eq!(
+            rx.recv(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(worker.counters.tx_outer_bytes, 0);
+
+        let now = Duration::from_secs(11);
+        let effects = worker.controls[0]
+            .state
+            .on_timer(now, Tag::new(10))
+            .unwrap();
+        worker.effects(0, effects, now).unwrap();
+        assert!(worker.controls[0].pending_send.is_none());
+        let length = rx.recv(&mut bytes).unwrap().0;
+        assert!(matches!(
+            Datagram::decode(&bytes[..length]).unwrap().records().next(),
+            Some(Record::Hello { initiator: 10, .. })
+        ));
+        assert_eq!(worker.counters.tx_outer_bytes, length as u64 + 48);
     }
 
     fn receive_bytes(number: u64, records: &[Record<'_>], output: &mut [u8]) -> usize {
@@ -5474,7 +5650,10 @@ mod tests {
         );
         assert_eq!(workers[0].sessions[0].totals.tx_outer_bytes, charged);
         // A control transmission may overtake the discarded packet-number suffix.
-        let control = workers[0].send_record(0, Record::Probe).unwrap().unwrap();
+        let control = workers[0]
+            .send_record(0, Record::Probe, Duration::ZERO)
+            .unwrap()
+            .unwrap();
         assert!(control.0 > unused);
         let mut bytes = [0; BASE_UDP_PAYLOAD];
         let length = rx.recv(&mut bytes).unwrap().0;

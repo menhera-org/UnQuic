@@ -207,3 +207,52 @@ fn outer_payload_limits_are_bounded_per_peer() {
         assert_eq!(error.field, "peers.outer_payload_limit");
     }
 }
+
+#[test]
+fn path_groups_share_binding_scopes_or_explicit_names_without_port_multiplication() {
+    let mut c = config();
+    let mut other = c.endpoints[0].clone();
+    other.name = "other-port".into();
+    other.listen_port += 1;
+    c.endpoints.push(other.clone());
+    let mut addressed = other.clone();
+    addressed.name = "addressed".into();
+    addressed.listen_port += 1;
+    addressed.listen_address = Ipv6Addr::LOCALHOST;
+    c.endpoints.push(addressed);
+    let mut device = other.clone();
+    device.name = "device".into();
+    device.bind_device = Some(c"vrf-a".into());
+    c.endpoints.push(device);
+    other.name = "scoped".into();
+    other.listen_address = "fe80::1".parse().unwrap();
+    other.scope_id = 2;
+    c.endpoints.push(other.clone());
+    other.name = "other-scope".into();
+    other.scope_id = 3;
+    c.endpoints.push(other);
+    for endpoint in ["other-port", "addressed", "device", "scoped", "other-scope"] {
+        let mut peer = c.peers[0].clone();
+        peer.name = endpoint.into();
+        peer.endpoint = endpoint.into();
+        c.peers.push(peer);
+    }
+    for (endpoint, name) in [
+        ("default", "shared"),
+        ("device", "shared"),
+        ("default", "separate"),
+    ] {
+        let mut peer = c.peers[0].clone();
+        peer.name = format!("{endpoint}-{name}");
+        peer.endpoint = endpoint.into();
+        peer.path_group = Some(name.into());
+        c.peers.push(peer);
+    }
+    let c = c.validate().unwrap();
+    let expected = [0, 0, 0, 1, 2, 3, 4, 5, 5, 6];
+    assert_eq!(c.path_groups(), 7);
+    for (peer, group) in expected.into_iter().enumerate() {
+        assert_eq!(c.path_group_for_peer(peer), Some(group));
+    }
+    assert_eq!(c.path_group_for_peer(expected.len()), None);
+}

@@ -286,6 +286,71 @@ impl Session {
         Ok(())
     }
 
+    /// Checks queued flights against the current phase, identity and expiry.
+    pub(crate) fn prepare_send(
+        &mut self,
+        record: Record<'_>,
+        now: Duration,
+    ) -> Result<bool, HandshakeError> {
+        self.advance(now)?;
+        Ok(self.send_clock(record).is_some())
+    }
+
+    /// Commits a successful submission; the owner retains at most one flight.
+    pub(crate) fn transmitted(
+        &mut self,
+        record: Record<'_>,
+        now: Duration,
+    ) -> Result<(), HandshakeError> {
+        self.advance(now)?;
+        if let Some(last) = self.send_clock(record) {
+            *last = Some(now);
+            // Deferral may refill the token reserved when this flight was generated.
+            self.budget = self.budget.min(SECOND - TOKEN);
+        }
+        Ok(())
+    }
+
+    fn send_clock(&mut self, record: Record<'_>) -> Option<&mut Option<Duration>> {
+        let (initiator, responder, role) = match record {
+            Record::Hello { initiator, .. } => (initiator, None, Role::Initiator),
+            Record::Confirm {
+                initiator,
+                responder,
+            } => (initiator, Some(responder), Role::Initiator),
+            Record::Challenge {
+                initiator,
+                responder,
+                ..
+            } => (initiator, Some(responder), Role::Responder),
+            Record::Ready {
+                initiator,
+                responder,
+            } => (initiator, Some(responder), Role::Responder),
+            _ => return None,
+        };
+        if !matches!(record, Record::Ready { .. })
+            && let Some(pending) = self.pending.as_mut().filter(|pending| {
+                pending.role == role
+                    && pending.initiator.get() == initiator
+                    && pending.responder.map(Tag::get) == responder
+            })
+        {
+            return Some(&mut pending.last_send);
+        }
+        let active = self.active.as_mut().filter(|active| {
+            active.connection.role == Role::Responder
+                && self.now - active.feedback < Duration::from_secs(30)
+                && active.connection.initiator.get() == initiator
+                && Some(active.connection.responder.get()) == responder
+        })?;
+        match record {
+            Record::Challenge { .. } => Some(&mut active.last_challenge),
+            Record::Ready { .. } => Some(&mut active.last_ready),
+            _ => None,
+        }
+    }
+
     /// Next time-based transition or initiator retransmission to service.
     ///
     /// The owner may wake sooner for received input. If entropy is unavailable,
@@ -640,4 +705,203 @@ impl Session {
 
 fn matches_pair(connection: Connection, initiator: u128, responder: u128) -> bool {
     connection.initiator.get() == initiator && connection.responder.get() == responder
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOCAL: Params = Params {
+        port: 40000,
+        max_frame_len: 9022,
+        mandatory_features: 0,
+        optional_features: 0,
+    };
+    const REMOTE: Params = Params {
+        port: 40001,
+        ..LOCAL
+    };
+
+    fn session() -> Session {
+        Session::new(LOCAL, REMOTE.port, 1514).unwrap()
+    }
+
+    #[test]
+    fn deferred_submission_moves_retry_clock_without_delaying_the_next_phase() {
+        let mut state = session();
+        let hello = state
+            .on_timer(Duration::ZERO, Tag::new(1))
+            .unwrap()
+            .send
+            .unwrap();
+        let sent = Duration::from_secs(2);
+        assert!(state.prepare_send(hello, sent).unwrap());
+        state.transmitted(hello, sent).unwrap();
+        assert_eq!(state.budget, Duration::from_millis(750));
+        assert_eq!(state.deadline(), Some(Duration::from_secs(3)));
+        assert!(state.on_timer(sent, None).unwrap().send.is_none());
+        let confirm = state
+            .on_record(
+                Record::Challenge {
+                    initiator: 1,
+                    responder: 2,
+                    params: REMOTE,
+                },
+                sent,
+                None,
+            )
+            .unwrap()
+            .send
+            .unwrap();
+        assert!(!state.prepare_send(hello, sent).unwrap());
+        assert!(state.prepare_send(confirm, sent).unwrap());
+        state.transmitted(confirm, sent).unwrap();
+        assert_eq!(state.budget, Duration::from_millis(500));
+        assert!(
+            state
+                .on_timer(Duration::from_millis(2999), None)
+                .unwrap()
+                .send
+                .is_none()
+        );
+        assert!(
+            state
+                .on_timer(Duration::from_secs(3), None)
+                .unwrap()
+                .send
+                .is_some()
+        );
+        assert!(!state.prepare_send(confirm, ATTEMPT).unwrap());
+        assert!(state.on_timer(ATTEMPT, None).unwrap().needs_tag);
+    }
+
+    #[test]
+    fn actual_burst_budget_survives_deferral_and_new_connection_phases() {
+        let mut state = session();
+        let challenge = state
+            .on_record(
+                Record::Hello {
+                    initiator: 1,
+                    params: REMOTE,
+                },
+                Duration::ZERO,
+                Tag::new(2),
+            )
+            .unwrap()
+            .send
+            .unwrap();
+        let now = SECOND;
+        state.transmitted(challenge, now).unwrap();
+        assert_eq!(state.budget, Duration::from_millis(750));
+        let mut old_ready = None;
+        for initiator in [1, 3] {
+            if initiator == 3 {
+                let next = state
+                    .on_record(
+                        Record::Hello {
+                            initiator,
+                            params: REMOTE,
+                        },
+                        now,
+                        Tag::new(4),
+                    )
+                    .unwrap()
+                    .send
+                    .unwrap();
+                assert!(state.prepare_send(next, now).unwrap());
+                state.transmitted(next, now).unwrap();
+            }
+            let ready = state
+                .on_record(
+                    Record::Confirm {
+                        initiator,
+                        responder: initiator + 1,
+                    },
+                    now,
+                    None,
+                )
+                .unwrap()
+                .send
+                .unwrap();
+            assert!(state.prepare_send(ready, now).unwrap());
+            state.transmitted(ready, now).unwrap();
+            if let Some(old) = old_ready {
+                assert!(!state.prepare_send(old, now).unwrap());
+            }
+            old_ready = Some(ready);
+        }
+        assert_eq!(state.budget, Duration::ZERO);
+        let hello = Record::Hello {
+            initiator: 5,
+            params: REMOTE,
+        };
+        assert!(
+            state
+                .on_record(hello, now, Tag::new(6))
+                .unwrap()
+                .send
+                .is_none()
+        );
+        let next = state
+            .on_record(hello, now + TOKEN, None)
+            .unwrap()
+            .send
+            .unwrap();
+        state.transmitted(next, now + TOKEN).unwrap();
+        assert_eq!(state.budget, Duration::ZERO);
+        state.cancel_pending(now + TOKEN).unwrap();
+        assert!(!state.prepare_send(next, now + TOKEN).unwrap());
+        assert!(
+            !state
+                .prepare_send(old_ready.unwrap(), Duration::from_secs(31))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn partial_refill_and_overwritten_flights_do_not_manufacture_tokens() {
+        let mut state = session();
+        let hello = state
+            .on_timer(Duration::ZERO, Tag::new(1))
+            .unwrap()
+            .send
+            .unwrap();
+        state.transmitted(hello, Duration::ZERO).unwrap();
+        let confirm = state
+            .on_record(
+                Record::Challenge {
+                    initiator: 1,
+                    responder: 2,
+                    params: REMOTE,
+                },
+                Duration::from_millis(100),
+                None,
+            )
+            .unwrap()
+            .send
+            .unwrap();
+        state
+            .transmitted(confirm, Duration::from_millis(200))
+            .unwrap();
+        assert_eq!(state.budget, Duration::from_millis(700));
+        for millis in [1200, 2200] {
+            assert!(
+                state
+                    .on_timer(Duration::from_millis(millis), None)
+                    .unwrap()
+                    .send
+                    .is_some()
+            );
+        }
+        state
+            .transmitted(confirm, Duration::from_millis(2300))
+            .unwrap();
+        assert_eq!(state.budget, Duration::from_millis(750));
+        assert_eq!(state.deadline(), Some(Duration::from_millis(3300)));
+        assert!(
+            state
+                .prepare_send(confirm, Duration::from_millis(2299))
+                .is_err()
+        );
+    }
 }

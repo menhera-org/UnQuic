@@ -289,7 +289,7 @@ LANE_RETIRE and FRAME_ABANDON retries consume ordinary transmission credit and s
 
 Implement BBRv3 directly in-tree for the first production controller, pinned to draft-ietf-ccwg-bbr-07. Use that revision's state machine, estimator updates, gains and loss responses; do not substitute a simpler loss controller or silently follow a newer draft. The reference remains experimental, so performance and coexistence still require measurement. [S11]
 
-Use one controller owner per sending direction and path group, shared by every session and lane in that group. A peer names its configured path group; default to one group per binding scope so adding peers or ports does not multiply the access-link budget. Separate groups require explicit configuration for separate bottlenecks. Lane/session replacement within an unchanged group does not reset or duplicate its controller. Address/binding changes discard stale path measurements through that owner.
+Use one controller owner per sending direction and path group, shared by every session and lane in that group. A peer names its configured path group; default to one group per binding scope so adding peers or ports does not multiply the access-link budget. The default binding scope is the endpoint's exact local IPv6 address, numeric scope ID and binding device; endpoint names and UDP ports do not split it. Explicit names share across endpoints. Configure the same name when distinct local bindings share a bottleneck. Separate groups require explicit configuration for separate bottlenecks. Lane/session replacement within an unchanged group does not reset or duplicate its controller. Address/binding changes discard stale path measurements through that owner.
 
 Charge outer IP bytes, including IPv6 and UDP headers, for each successful physical transmission of data, repair, probes, abandonment, and lane retirement. Set the controller's maximum segment size from the effective outer IP ceiling and its initial window to ten such datagrams. Use BBRv3's UDP/QUIC-style offload budget and its delivery-rate sampling rules, with shared delivered-byte counters and per-transmission send metadata. ACK duplicate suppression must precede sampling. A repair and its late original are distinct delivered transmissions for bandwidth accounting, while their frame bytes are delivered only once. Keep application-limited and host-queue-limited observations distinguishable. [S11]
 
@@ -578,7 +578,12 @@ types, loopback socket invariants and live TAP behavior in an isolated network
 namespace; see README.md for commands and coverage limits. The pure handshake
 state machine implements automatic role election, bounded retries, negotiated
 parameters, replacement and liveness transitions using supplied monotonic times.
-The runtime now applies commit and carrier events through the worker barrier. Configuration
+The runtime now applies commit and carrier events through the worker barrier.
+Handshake and PROBE_REPLY transmissions share the path group's fixed 4 MiB/s
+control scheduler and sixteen-datagram burst, charging successful outer bytes.
+Deferred handshakes retain one flight, recheck identity/expiry and update retry
+clocks on successful submission. Data grants and ACK routing remain unfinished.
+Configuration
 validation now freezes named endpoint/peer/session relationships into numeric
 indices. Cookie lookup uses short scans for small sets and randomized hashing
 for larger sets, with an allocation check and repeatable benchmark. The optional

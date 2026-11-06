@@ -428,6 +428,15 @@ Do not defer this performance coverage to the stage 4 composition matrix.
 Goal: a production candidate under loss.
 
 Session liveness already uses matching small probes on local lane 1.
+Handshake and PROBE_REPLY sends now share the path group's 4 MiB/s ceiling
+and sixteen-datagram burst. A fixed scheduler charges successful outer bytes;
+throttled handshakes retain one current flight and use deadline-driven retries.
+Per-session clocks and tokens track successful submission after deferral.
+Configuration groups default binding scopes independently of endpoint names and
+ports, and shares explicit group names across endpoints. Tests cover burst
+wraparound, byte sizes, failed sends, deferred phases, cancellation, expiry
+and multiple sessions. This implements the control ceiling only; congestion
+grants, ACK routing and data pacing remain pending.
 Receive-side ACK scheduling and range construction now use the existing
 reassembly bitmap, with no second history or hot-path allocations. Tests cover
 thresholds, gaps, duplicate rate limits, pressure rejection, word/window wrap,

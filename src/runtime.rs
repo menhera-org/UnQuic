@@ -474,7 +474,7 @@ fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
     }
     // Numeric references and a conservative bound for cookie hash buckets.
     configuration = configuration
-        .checked_add(raw.peers.len().checked_mul(size_of::<usize>())?)?
+        .checked_add(raw.peers.len().checked_mul(2 * size_of::<usize>())?)?
         .checked_add(sessions.checked_mul(128)?)?;
     [
         Worker::storage_bytes(raw, workers)?,

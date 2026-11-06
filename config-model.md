@@ -105,8 +105,13 @@ fewer TAP queues than global workers also retain strict hashing across
 all lanes to use the other transmit workers. Readers with no owned lane also
 retain hashing and handoffs. Multiples of the worker count give each reader the
 same number of lane choices, but are not required. eBPF is excluded.
-`path_group` is validated and retained, but congestion grouping has no runtime
-effect until stage 3.
+Named `path_group` values share one budget across all matching peers and
+endpoints. Without a name, peers share a group when the endpoint's
+`listen_address`, `scope_id` and `bind_device` match; names and UDP ports
+do not split it. Use the same explicit group for different local bindings
+that share a bottleneck. Validation freezes these groups into numeric indices.
+The runtime currently applies their shared control-traffic ceiling; congestion
+controllers and data grants remain Stage 3 work.
 
 The daemon's `host` field uses iphost's `IpHost`/`FQDN` types. The
 current `dns::resolve_ipv6` helper blocks and may allocate or lock, so call it

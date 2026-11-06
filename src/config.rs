@@ -164,6 +164,8 @@ pub struct Validated {
     config: Config,
     endpoint_for_peer: Vec<usize>,
     peer_for_session: Vec<usize>,
+    path_group_for_peer: Vec<usize>,
+    path_groups: usize,
     cookies: CookieIndex,
 }
 
@@ -177,6 +179,20 @@ impl Validated {
     #[inline]
     pub fn endpoint_for_peer(&self, peer: usize) -> Option<usize> {
         self.endpoint_for_peer.get(peer).copied()
+    }
+
+    /// Number of independent sending-direction path groups.
+    pub const fn path_groups(&self) -> usize {
+        self.path_groups
+    }
+
+    /// Resolves a peer to its stable path-group index without allocation.
+    ///
+    /// Named groups share across endpoints. Default groups share an exact local
+    /// address, scope ID and device binding, regardless of ports or peer names.
+    #[inline]
+    pub fn path_group_for_peer(&self, peer: usize) -> Option<usize> {
+        self.path_group_for_peer.get(peer).copied()
     }
 
     /// Resolves a session index to its peer index in constant time.
@@ -295,6 +311,31 @@ impl Config {
                 ));
             }
         }
+        #[derive(PartialEq, Eq, PartialOrd, Ord)]
+        enum Group<'a> {
+            Named(&'a str),
+            Binding(Ipv6Addr, u32, Option<&'a std::ffi::CStr>),
+        }
+        let mut groups = BTreeMap::new();
+        let path_group_for_peer = self
+            .peers
+            .iter()
+            .enumerate()
+            .map(|(index, peer)| {
+                let endpoint = &self.endpoints[endpoint_for_peer[index]];
+                let key = match peer.path_group.as_deref() {
+                    Some(name) => Group::Named(name),
+                    None => Group::Binding(
+                        endpoint.listen_address,
+                        endpoint.scope_id,
+                        endpoint.bind_device.as_deref(),
+                    ),
+                };
+                let next = groups.len();
+                *groups.entry(key).or_insert(next)
+            })
+            .collect();
+        let path_groups = groups.len();
         let mut peer_for_session = Vec::with_capacity(self.sessions.len());
         let mut taps = BTreeMap::new();
         for (index, session) in self.sessions.iter().enumerate() {
@@ -342,6 +383,8 @@ impl Config {
             config: self,
             endpoint_for_peer,
             peer_for_session,
+            path_group_for_peer,
+            path_groups,
             cookies,
         })
     }

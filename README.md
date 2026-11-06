@@ -220,6 +220,17 @@ Tests cover pressure rejection, reordering, window wrap, delay calculation and
 allocation-free construction. Workers do not yet transmit or process these
 ACKs; worker integration and bounded feedback routing remain stage-3 work.
 
+Handshake and PROBE_REPLY sends now share a 4 MiB/s outer-byte ceiling per
+path group, with a burst of sixteen datagrams. Worker zero owns each fixed
+scheduler; successful sends alone consume its budget. A throttled handshake
+retains one flight per session and wakes at the next budget deadline.
+Successful submission updates the handshake retry clock and token budget;
+canceled, expired and superseded flights are discarded before sending.
+Named groups share across endpoints. The default groups endpoints by local
+address, scope ID and binding device, ignoring names and UDP ports.
+Configure a shared group when different bindings use the same bottleneck.
+Data/probe congestion grants remain unfinished.
+
 `ack::History` separately tracks reservations and successful submissions in a
 fixed 65,536-number window. It validates every ACK range before applying any,
 rejects retained unsent holes and future numbers, and ignores older portions.
@@ -694,9 +705,9 @@ Small liveness probes remain separate and cannot confirm a DATA-sized path.
 Each timer pass visits at most 64 owned sockets before returning to ordinary
 work. Rotating scan order prevents a failing path from monopolising probes.
 Static worker slots allow nominally one padded probe per 3 ms across workers,
-at most 9000 bytes each. This is an interim probe budget, not the complete
-control-traffic pacer: shared grants and pacing of other control records remain
-Stage 3 work. All steady-state discovery storage and packet data are bounded
+at most 9000 bytes each. Padded probes still need the shared congestion grants
+from Stage 3; replies already use the separate path-group control ceiling.
+All steady-state discovery storage and packet data are bounded
 and allocated before workers start.
 
 ## Operational checks

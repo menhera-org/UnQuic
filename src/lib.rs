@@ -21,6 +21,7 @@ pub mod dns;
 pub mod handshake;
 pub mod loss;
 pub mod mac;
+mod pacing;
 pub mod pack;
 pub mod pmtu;
 pub mod reassembly;
