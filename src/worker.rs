@@ -465,6 +465,7 @@ impl TxBatch {
             header: &[],
             bytes: &[],
             offset: 0,
+            end: 0,
         }; pack::BATCH_CAPACITY];
         for (input, frame) in inputs.iter_mut().zip(&self.frames[..self.len]) {
             *input = frame
@@ -2492,6 +2493,7 @@ impl Worker {
                         header: &[],
                         bytes: &[],
                         offset: 0,
+                        end: 0,
                     })
             });
             let mut slices = [&[][..]; pack::BATCH_SLICES];

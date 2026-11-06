@@ -186,7 +186,10 @@ allocation checks. The multi-record encoder packs frame tails with following
 heads and flushes at queue exhaustion. Retained metadata addresses original
 buffers by frame index and byte range, without self-references or payload copies.
 `FrameInput` can also concatenate a rewritten header and borrowed payload;
-DATA pieces crossing that boundary remain one wire record. Segmentation can
+DATA pieces crossing that boundary remain one wire record. Callers set `end` to
+the complete frame length for fresh DATA; `offset..end` can select a repair
+without truncating the original length or changing its frame identity.
+Segmentation can
 generate just the header, preserving the supplied UDP pseudo-header seed.
 Workers use these spans for UDP segmentation. Ordinary frames share compact
 payload slabs; each frame retains its own identity, deadline and submitted range.
@@ -242,7 +245,9 @@ obsolete loss notifications and accepts a late original ACK while a repair is
 outstanding. Its 3392-byte fixed state can be reused without allocation; reset
 clears only words needed by the new frame length. Old frame-ID mappings must
 be rejected after reuse, while their packet charges remain in `History`.
-A byte-by-byte reference model and boundary tests verify transitions. Workers
+A byte-by-byte reference model and boundary tests verify transitions. Packer and
+reassembly tests lose every possible original piece and its first repair, then
+verify one complete delivery after the second repair. Workers
 still need payload retention, packet-to-frame mappings and repair submission.
 
 Recovery, BBRv3,

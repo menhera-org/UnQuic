@@ -436,6 +436,7 @@ fn pack_all(sender: &mut pack::Lane, frames: &[&[u8]], limit: usize) -> Vec<Vec<
             header: &[],
             bytes,
             offset: 0,
+            end: bytes.len(),
         })
         .collect();
     let mut output = Vec::new();
@@ -571,6 +572,7 @@ fn batch_input_validation_and_empty_queue_preserve_packet_numbers() {
         header: &[],
         bytes: &[0; 60],
         offset: 0,
+        end: 60,
     };
     let mut batch = pack::Batch::new();
     for bad in [
@@ -593,6 +595,13 @@ fn batch_input_validation_and_empty_queue_preserve_packet_numbers() {
         },
         pack::FrameInput {
             offset: 60,
+            ..input
+        },
+        pack::FrameInput { end: 0, ..input },
+        pack::FrameInput { end: 61, ..input },
+        pack::FrameInput {
+            offset: 32,
+            end: 31,
             ..input
         },
     ] {
@@ -691,6 +700,7 @@ fn packed_datagrams_send_original_slices_through_the_socket_batch() {
             header: &[],
             bytes,
             offset: 0,
+            end: bytes.len(),
         })
         .collect();
     let mut batch = pack::Batch::new();
@@ -752,6 +762,7 @@ fn dropping_alternate_gso_batches_leaves_no_orphan_frames() {
                         header: &[],
                         bytes,
                         offset: 0,
+                        end: bytes.len(),
                     })
                     .collect();
                 while !inputs.is_empty() {
@@ -826,6 +837,7 @@ fn scattered_headers_match_contiguous_frames_across_boundaries_and_retries() {
                             header: &bytes[..split],
                             bytes: &bytes[split..],
                             offset: i % size,
+                            end: size,
                         }
                     })
                     .collect();
@@ -880,6 +892,162 @@ fn scattered_headers_match_contiguous_frames_across_boundaries_and_retries() {
                 }
                 assert_eq!(assembled, frames);
             }
+        }
+    }
+}
+
+fn selected_packet(batch: &pack::Batch, packet: usize, inputs: &[pack::FrameInput<'_>]) -> Vec<u8> {
+    let mut slices = [&[][..]; pack::PACKED_SLICES];
+    batch
+        .slices(packet, inputs, &mut slices)
+        .unwrap()
+        .iter()
+        .flat_map(|bytes| bytes.iter().copied())
+        .collect()
+}
+
+#[test]
+fn selected_ranges_preserve_total_length_across_spans_and_partial_sends() {
+    for limit in [BASE_UDP_PAYLOAD, 1452, unquic::socket::MAX_UDP_PAYLOAD] {
+        let bytes: Vec<_> = (0..MAX_FRAME_LEN).map(|i| i as u8).collect();
+        for split in [0, 1, 13, 42, 128, 1164, MAX_FRAME_LEN] {
+            let mut sender = sender();
+            let ranges = [
+                split.saturating_sub(1)..(split + 1).min(MAX_FRAME_LEN),
+                123..1514,
+                8000..MAX_FRAME_LEN,
+            ];
+            let mut inputs: Vec<_> = ranges
+                .iter()
+                .map(|range| pack::FrameInput {
+                    id: sender.start_frame(bytes.len()).unwrap(),
+                    header: &bytes[..split],
+                    bytes: &bytes[split..],
+                    offset: range.start,
+                    end: range.end,
+                })
+                .collect();
+            let mut assembled = [Vec::new(), Vec::new(), Vec::new()];
+            let mut first = 0;
+            let mut last = 0;
+            while first < inputs.len() {
+                let mut batch = pack::Batch::new();
+                batch.prepare(&mut sender, &inputs[first..], limit).unwrap();
+                assert!(!batch.is_empty());
+                let packet = batch.packet(0).unwrap();
+                assert!(packet.number > last);
+                last = packet.number;
+                let encoded = selected_packet(&batch, 0, &inputs[first..]);
+                assert!(encoded.len() <= limit);
+                let datagram = Datagram::decode(&encoded).unwrap();
+                for ((index, range), record) in batch.pieces(0).unwrap().zip(datagram.records()) {
+                    let index = first + index;
+                    let Record::Data {
+                        frame_id,
+                        total_len,
+                        offset,
+                        bytes: payload,
+                    } = record
+                    else {
+                        panic!("unexpected record");
+                    };
+                    assert_eq!(frame_id, inputs[index].id);
+                    assert_eq!(total_len as usize, bytes.len());
+                    assert_eq!(offset as usize, range.start);
+                    assert_eq!(inputs[index].offset, range.start);
+                    assert!(range.end <= inputs[index].end);
+                    assert_eq!(payload, &bytes[range.clone()]);
+                    assembled[index].extend_from_slice(payload);
+                    inputs[index].offset = range.end;
+                }
+                // Only the successful prefix advances; every retry gets fresh numbers.
+                while first < inputs.len() && inputs[first].offset == inputs[first].end {
+                    first += 1;
+                }
+            }
+            for (actual, range) in assembled.iter().zip(ranges) {
+                assert_eq!(actual, &bytes[range]);
+            }
+        }
+    }
+}
+
+#[test]
+fn losing_each_original_piece_and_its_first_repair_still_delivers_once() {
+    use unquic::loss::FrameRecovery;
+    let bytes: Vec<_> = (0..MAX_FRAME_LEN).map(|i| i as u8).collect();
+    for limit in [BASE_UDP_PAYLOAD, 1452, unquic::socket::MAX_UDP_PAYLOAD] {
+        let pieces = MAX_FRAME_LEN.div_ceil(limit - unquic::wire::DATA_PREFIX_LEN);
+        for lost in 0..pieces {
+            let mut sender = sender();
+            let input = pack::FrameInput {
+                id: sender.start_frame(bytes.len()).unwrap(),
+                header: &bytes[..128],
+                bytes: &bytes[128..],
+                offset: 0,
+                end: bytes.len(),
+            };
+            let mut batch = pack::Batch::new();
+            batch.prepare(&mut sender, &[input], limit).unwrap();
+            assert_eq!(batch.len(), pieces);
+            let originals: Vec<_> = (0..batch.len())
+                .map(|p| selected_packet(&batch, p, &[input]))
+                .collect();
+            let mut receiver = ReceiveLane::new(1, MAX_FRAME_LEN as u16).unwrap();
+            let mut state = FrameRecovery::new(bytes.len()).unwrap();
+            let mut missing = None;
+            for (packet, encoded) in originals.iter().enumerate() {
+                let range = batch.pieces(packet).unwrap().next().unwrap().1;
+                assert!(state.submitted(range.clone(), 0));
+                if packet == lost {
+                    missing = Some(range);
+                } else {
+                    assert_eq!(
+                        receiver.admit(&Datagram::decode(encoded).unwrap(), Duration::ZERO),
+                        Admission::Fresh
+                    );
+                    assert_eq!(state.acknowledge(range.clone(), 0), Some(range.len()));
+                }
+            }
+            assert!(receiver.front(Duration::ZERO).is_none());
+            let missing = missing.unwrap();
+            assert!(state.lost(missing.clone(), 0));
+            for attempt in 1..=2 {
+                assert_eq!(
+                    state.next_repair(usize::MAX),
+                    Some((missing.clone(), attempt))
+                );
+                let repair = pack::FrameInput {
+                    offset: missing.start,
+                    end: missing.end,
+                    ..input
+                };
+                batch.prepare(&mut sender, &[repair], limit).unwrap();
+                assert_eq!(batch.len(), 1);
+                assert!(batch.packet(0).unwrap().number > originals.len() as u64);
+                let encoded = selected_packet(&batch, 0, &[repair]);
+                assert!(state.submitted(missing.clone(), attempt));
+                if attempt == 1 {
+                    assert!(state.lost(missing.clone(), attempt));
+                } else {
+                    assert_eq!(
+                        receiver.admit(&Datagram::decode(&encoded).unwrap(), Duration::ZERO),
+                        Admission::Fresh
+                    );
+                    assert_eq!(
+                        state.acknowledge(missing.clone(), attempt),
+                        Some(missing.len())
+                    );
+                }
+            }
+            assert_eq!(state.remaining(), 0);
+            assert_eq!(receiver.front(Duration::ZERO).unwrap().bytes, bytes);
+            assert!(receiver.finish_front());
+            let late = Datagram::decode(&originals[lost]).unwrap();
+            assert_eq!(receiver.admit(&late, Duration::ZERO), Admission::Fresh);
+            assert_eq!(receiver.admit(&late, Duration::ZERO), Admission::Duplicate);
+            assert_eq!(state.acknowledge(missing, 0), Some(0));
+            assert!(receiver.front(Duration::ZERO).is_none());
         }
     }
 }

@@ -196,6 +196,7 @@ impl Store {
             header: frame.header.get(..frame.header_len)?,
             bytes: source.bytes.get(frame.range.clone())?,
             offset: frame.offset,
+            end: frame.length(),
         })
     }
 

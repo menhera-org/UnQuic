@@ -889,28 +889,36 @@ fn segmentation_and_flow_selection_allocate_nothing() {
         assert_eq!(count, 8);
     }
     let frames = [&frame[..60]; pack::BATCH_CAPACITY];
-    let inputs = std::array::from_fn::<_, { pack::BATCH_CAPACITY }, _>(|index| pack::FrameInput {
-        id: lane.start_frame(frames[index].len()).unwrap(),
-        header: &frames[index][..42],
-        bytes: &frames[index][42..],
-        offset: 0,
-    });
+    let mut inputs =
+        std::array::from_fn::<_, { pack::BATCH_CAPACITY }, _>(|index| pack::FrameInput {
+            id: lane.start_frame(frames[index].len()).unwrap(),
+            header: &frames[index][..42],
+            bytes: &frames[index][42..],
+            offset: 0,
+            end: frames[index].len(),
+        });
     let mut batch = pack::Batch::new();
-    batch
-        .prepare(&mut lane, &inputs, unquic::BASE_UDP_PAYLOAD)
-        .unwrap();
-    assert!(batch.len() < 6);
-    for packet in 0..batch.len() {
-        let mut slices = [&[][..]; pack::PACKED_SLICES];
-        assert_eq!(
-            batch
-                .slices(packet, &inputs, &mut slices)
-                .unwrap()
-                .iter()
-                .map(|part| part.len())
-                .sum::<usize>(),
-            batch.packet(packet).unwrap().length
-        );
+    for (start, end) in [(0, 60), (40, 44)] {
+        for input in &mut inputs {
+            input.offset = start;
+            input.end = end;
+        }
+        batch
+            .prepare(&mut lane, &inputs, unquic::BASE_UDP_PAYLOAD)
+            .unwrap();
+        assert!(batch.len() < 6);
+        for packet in 0..batch.len() {
+            let mut slices = [&[][..]; pack::PACKED_SLICES];
+            assert_eq!(
+                batch
+                    .slices(packet, &inputs, &mut slices)
+                    .unwrap()
+                    .iter()
+                    .map(|part| part.len())
+                    .sum::<usize>(),
+                batch.packet(packet).unwrap().length
+            );
+        }
     }
     let allocations = ALLOCATION_COUNT.replace(None);
     assert_eq!(allocations, Some(0));

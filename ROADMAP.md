@@ -450,6 +450,9 @@ still need integration; this does not complete the loss-detection step.
 Pure per-frame byte coverage now lives in `loss::FrameRecovery`, with two-repair
 limits, outstanding-generation checks, late ACK handling and bounded slot reuse.
 Word masks are checked against a byte model and allocation instrumentation.
+The packer can select exact missing ranges while retaining original frame lengths
+and identities. Tests cover header/payload boundaries, partial submissions and
+completion after an original piece and its first repair are both lost.
 Allocate this state against actual frame quotas when wiring packet mappings,
 payload retention and worker repair sends; none of those is connected yet.
 

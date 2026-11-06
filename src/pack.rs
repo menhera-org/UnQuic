@@ -254,7 +254,7 @@ pub const PACKED_SLICES: usize = 1 + MAX_RECORDS * 3;
 /// Maximum borrowed slices across a complete batch.
 pub const BATCH_SLICES: usize = BATCH_CAPACITY * 6;
 
-/// A retained frame with its next unsent byte offset.
+/// A retained frame and selected byte range for fresh data or selective repair.
 #[derive(Clone, Copy)]
 pub struct FrameInput<'a> {
     /// Identity allocated by Lane::start_frame; unchanged across partial sends.
@@ -263,8 +263,11 @@ pub struct FrameInput<'a> {
     pub header: &'a [u8],
     /// Borrowed frame bytes following header; the complete frame when header is empty.
     pub bytes: &'a [u8],
-    /// First unsent byte in the concatenation of header and bytes.
+    /// First selected byte in the concatenation of header and bytes.
     pub offset: usize,
+    /// Exclusive selected end; use the complete frame length for fresh DATA.
+    /// Repairs keep the original source spans and restrict this range.
+    pub end: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -421,12 +424,14 @@ impl Batch {
         Ok(&output[..used])
     }
 
-    /// Prepares up to 64 packets from at most 64 frames, without copying payloads.
+    /// Prepares up to 64 packets from at most 64 frame ranges, without copying payloads.
     ///
     /// All inputs are validated before changing the lane or this batch. Packet
     /// exhaustion can produce a shorter batch; it errors when no packet can be
-    /// produced. Batches end on frame boundaries within one GSO byte budget,
-    /// except at packet-number exhaustion. Keep unplanned frames' IDs and advance
+    /// produced. Batches end on selected range boundaries within one GSO byte
+    /// budget, except at packet-number exhaustion. Fresh DATA selects the full
+    /// remaining frame; repairs retain its total length and identity on the wire.
+    /// Keep unplanned frames' IDs and advance
     /// offsets using pieces() only after submission.
     /// Only prepare again after submitting or discarding the previous batch.
     pub fn prepare(
@@ -442,7 +447,8 @@ impl Batch {
             || frames.iter().any(|frame| {
                 let length = frame.header.len().saturating_add(frame.bytes.len());
                 !(14..=usize::from(lane.frame_limit)).contains(&length)
-                    || frame.offset >= length
+                    || frame.offset >= frame.end
+                    || frame.end > length
                     || frame.id >> 48 != u64::from(lane.header.lane)
                     || frame.id & MAX_SEQUENCE == 0
                     || (lane.next_frame != 0 && frame.id & MAX_SEQUENCE >= lane.next_frame)
@@ -467,15 +473,15 @@ impl Batch {
             {
                 let input = &frames[frame];
                 let frame_len = input.header.len() + input.bytes.len();
-                // Keep complete frames within one GSO aggregate under socket overload.
+                // Keep selected ranges within one GSO aggregate under socket overload.
                 let available = limit - length - RECORD_PREFIX_LEN
                     + (packet_limit - self.count - 1) * (limit - DATA_PREFIX_LEN);
-                if frame_len - offset > available {
+                if input.end - offset > available {
                     break;
                 }
-                let end = frame_len.min(offset + limit - length - RECORD_PREFIX_LEN);
+                let end = input.end.min(offset + limit - length - RECORD_PREFIX_LEN);
                 let mut prefix = [0; DATA_PREFIX_LEN];
-                // Each piece ends a frame or a packet: 64 of each need at most 127 pieces.
+                // Each piece ends an input or a packet: 64 of each need at most 127 pieces.
                 debug_assert!(pieces < self.pieces.len());
                 encode_data_prefix_length(
                     lane.header,
@@ -495,7 +501,7 @@ impl Batch {
                 pieces += 1;
                 length += RECORD_PREFIX_LEN + end - offset;
                 offset = end;
-                if offset == frame_len {
+                if offset == input.end {
                     frame += 1;
                     offset = frames.get(frame).map_or(0, |frame| frame.offset);
                 }
@@ -752,6 +758,7 @@ mod tests {
             header: &[],
             bytes: &[1; 1514],
             offset: 0,
+            end: 1514,
         }];
         lane.header.packet_number = u64::MAX;
         let mut batch = Batch::new();
