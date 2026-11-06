@@ -767,10 +767,10 @@ fn foreign_rename_and_namespace_move_preserve_running_transport() {
     until(Duration::from_secs(35), || {
         !left.control.session(0).unwrap().carrier
     });
-    assert_eq!(
-        flags(&moved_control, c"uq-again") & libc::IFF_RUNNING as i16,
-        0
-    );
+    // IFF_RUNNING follows deferred linkwatch work after TUNSETCARRIER returns.
+    until(Duration::from_secs(3), || {
+        flags(&moved_control, c"uq-again") & libc::IFF_RUNNING as i16 == 0
+    });
     assert_eq!(mac_address(&moved_control, c"uq-again"), mac);
     enter(&original);
     assert_eq!(mac_address(&control, c"uq-move"), unrelated_mac);
