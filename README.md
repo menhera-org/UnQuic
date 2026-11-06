@@ -292,8 +292,11 @@ including handoff and return-queue delays. Compile-time bounds and quota tests
 check these limits; no shared reservation lock or atomic is needed.
 
 Transmit DATA uses scatter/gather slices of the original frame buffer.
-Partial sends retain the unsent suffix with its original packet numbers.
-Only successful submissions advance frame offsets and release completed buffers.
+Partial or failed sends retain the unsent frame ranges and rebuild packet
+headers with fresh numbers on retry. Only successful submissions advance frame
+offsets or charge transmitted bytes; an intervening control packet cannot leave
+the retry using older numbers.
+Fully submitted frames release their buffers; retaining them for repair remains unfinished.
 If a frame reaches its 100 ms deadline, it is removed; remaining frames keep their
 IDs and submitted offsets and are repacked with fresh packet numbers. Connection
 retirement discards every queued batch before the worker acknowledges quiescence.

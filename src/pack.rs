@@ -120,8 +120,8 @@ impl Lane {
 
     /// Encodes one established record at the 1232-byte baseline.
     ///
-    /// Errors leave the counter unchanged. After success retain the encoded
-    /// bytes on WouldBlock, or discard them; re-encoding consumes a new number.
+    /// Encoding errors leave the counter unchanged. After a failed send, retain
+    /// the record's content and re-encode with a fresh number before retrying.
     /// Handshake records cannot use this established-lane encoder.
     pub fn record(&mut self, record: Record<'_>, output: &mut [u8]) -> Result<Packet, PackError> {
         if self.header.packet_number == 0 {
@@ -348,7 +348,8 @@ impl Batch {
     /// Frame indices and byte ranges submitted by a particular packet.
     ///
     /// Advance frame offsets only after successful socket submission. A partial
-    /// socket batch consumes exactly the returned packet prefix.
+    /// socket batch consumes exactly the returned packet prefix. After each
+    /// attempted send, re-prepare the remaining ranges with fresh packet numbers.
     pub fn pieces(
         &self,
         packet: usize,

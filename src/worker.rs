@@ -442,7 +442,6 @@ struct TxBatch {
     plan: pack::Batch,
     frames: [Option<Box<Buffer>>; pack::BATCH_CAPACITY],
     len: usize,
-    first: usize,
 }
 
 impl TxBatch {
@@ -451,7 +450,6 @@ impl TxBatch {
             plan: pack::Batch::new(),
             frames: std::array::from_fn(|_| None),
             len: 0,
-            first: 0,
         }
     }
 
@@ -481,7 +479,6 @@ impl TxBatch {
             }
         }
         self.len = len;
-        self.first = 0;
         self.plan.clear();
     }
 }
@@ -2249,11 +2246,11 @@ impl Worker {
             });
             let mut slices = [&[][..]; pack::BATCH_SLICES];
             let mut starts = [0; BATCH_SIZE + 1];
-            let count = batch.plan.len() - batch.first;
+            let count = batch.plan.len();
             for index in 0..count {
                 let length = batch
                     .plan
-                    .slices(batch.first + index, &frames, &mut slices[starts[index]..])
+                    .slices(index, &frames, &mut slices[starts[index]..])
                     .unwrap()
                     .len();
                 starts[index + 1] = starts[index] + length;
@@ -2283,10 +2280,11 @@ impl Worker {
                     libc::EPOLLOUT as u32,
                 )?;
                 tx.blocked = true;
+                batch.compact();
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => batch.compact(),
             Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => {
-                let attempted = (batch.first..batch.plan.len())
+                let attempted = (0..batch.plan.len())
                     .map(|index| batch.plan.packet(index).unwrap().length)
                     .max()
                     .unwrap();
@@ -2308,7 +2306,7 @@ impl Worker {
 
     fn submitted_batch(&mut self, session: usize, lane: usize, batch: &mut TxBatch, sent: usize) {
         let mut bytes = 0;
-        for packet in batch.first..batch.first + sent {
+        for packet in 0..sent {
             bytes += (batch.plan.packet(packet).unwrap().length + 48) as u64;
             for (frame, range) in batch.plan.pieces(packet).unwrap() {
                 batch.frames[frame].as_mut().unwrap().offset = range.end;
@@ -2320,7 +2318,6 @@ impl Worker {
         local.tx_totals[lane].tx_outer_bytes =
             local.tx_totals[lane].tx_outer_bytes.wrapping_add(bytes);
         local.tx_dirty |= 1_u64 << lane;
-        batch.first += sent;
         for frame in &mut batch.frames[..batch.len] {
             if frame
                 .as_ref()
@@ -2329,9 +2326,8 @@ impl Worker {
                 self.release(frame.take().unwrap());
             }
         }
-        if batch.first == batch.plan.len() {
-            batch.compact();
-        }
+        // Every retry gets new packet numbers; retain only unsent frame byte ranges.
+        batch.compact();
     }
 
     fn return_lane(&mut self, session: usize, mut lane: Box<reassembly::Lane>) {
@@ -4292,15 +4288,13 @@ mod tests {
             .unwrap();
         assert!(batch.plan.len() > 1);
         let mut last_packet = batch.plan.packet(batch.plan.len() - 1).unwrap().number;
-        let next = batch.plan.packet(1).unwrap();
         // Feed a successful one-packet prefix, then hold the socket unwritable.
         workers[0].submitted_batch(0, 0, &mut batch, 1);
         assert_eq!(batch.frames[0].as_ref().unwrap().offset, 1164);
         workers[0]
             .flush_batch(0, 0, &mut batch, Duration::from_millis(1))
             .unwrap();
-        assert_eq!(batch.first, 1);
-        assert_eq!(batch.plan.packet(1), Some(next));
+        assert!(batch.plan.is_empty());
         workers[0]
             .flush_batch(0, 0, &mut batch, Duration::from_millis(10))
             .unwrap();
@@ -4375,16 +4369,40 @@ mod tests {
             .unwrap();
         let tail = batch.plan.packet(2).unwrap();
         workers[0].submitted_batch(0, 0, &mut batch, 2);
-        assert!(batch.frames[0].is_none());
-        assert_eq!(batch.frames[1].as_ref().unwrap().offset, 794);
-        assert_eq!(batch.plan.packet(2), Some(tail));
+        assert_eq!(batch.len, 1);
+        assert_eq!(batch.frames[0].as_ref().unwrap().offset, 794);
+        assert!(batch.plan.is_empty());
+        batch
+            .prepare(
+                workers[0].sessions[0].tx[0].as_mut().unwrap(),
+                BASE_UDP_PAYLOAD,
+            )
+            .unwrap();
+        let unused = batch.plan.packet(0).unwrap().number;
+        assert!(unused > tail.number);
+        let charged = workers[0].sessions[0].totals.tx_outer_bytes;
+        workers[0].submitted_batch(0, 0, &mut batch, 0);
+        assert!(batch.plan.is_empty());
+        assert_eq!(batch.frames[0].as_ref().unwrap().offset, 794);
+        assert_eq!(workers[0].sessions[0].totals.tx_outer_bytes, charged);
+        // A control transmission may overtake the discarded packet-number suffix.
+        let control = workers[0].send_record(0, Record::Probe).unwrap().unwrap();
+        assert!(control.0 > unused);
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        let length = rx.recv(&mut bytes).unwrap().0;
+        assert_eq!(
+            Datagram::decode(&bytes[..length])
+                .unwrap()
+                .header()
+                .packet_number,
+            control.0
+        );
         workers[0].sessions[0].batches[0] = Some(batch);
         workers[0].transmit[0].paths[0].lanes[0].blocked = false;
         workers[0].flush_frames(Duration::ZERO).unwrap();
-        let mut bytes = [0; BASE_UDP_PAYLOAD];
         let length = rx.recv(&mut bytes).unwrap().0;
         let datagram = Datagram::decode(&bytes[..length]).unwrap();
-        assert_eq!(datagram.header().packet_number, tail.number);
+        assert!(datagram.header().packet_number > control.0);
         assert!(matches!(datagram.records().next(), Some(Record::Data {
             offset: 794, bytes, ..
         }) if bytes == [1; 720]));
