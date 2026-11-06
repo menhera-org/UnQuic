@@ -491,6 +491,13 @@ share a two-datagram PTO allowance and may exceed the confirmed MTU for
 discovery, while obeying the aggregate burst cap. The ledger is not yet wired
 to workers or BBR; the current runtime remains unpaced for DATA.
 
+The pure `bbr::Delivery` sampler now follows draft-07's delivery-rate rules,
+with fixed vectors under `tests/vectors/bbr-07`. It counts newly acknowledged
+physical transmissions, including late originals and repairs, and preserves
+one ACK sample across bounded processing turns. It distinguishes application
+bubbles from host-queue limitation. The BBR state machine, bounded grant-batch
+scheduler and runtime recovery remain unfinished.
+
 ## TAP read batching
 
 Each worker attempts to create one 64-entry io_uring for its TAP queues.
@@ -856,3 +863,6 @@ Dual-licensed under either of
 - Mozilla Public License, Version 2.0 ([LICENSE-MPL](LICENSE-MPL))
 
 at your option.
+
+The BBR delivery sampler includes code derived from the IETF draft under the
+Revised BSD License; retain its notice in [LICENSE-BBR](LICENSE-BBR).

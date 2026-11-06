@@ -248,6 +248,16 @@ Do not deduplicate using only a time-limited completion cache. Window advancemen
 
 Initial resource limits are 8192 retained transmit frames and 8192 receive frames (incomplete plus queued complete) per session, with 64 MiB of payload storage per direction and at most 64 active lanes per direction. The daemon's default total transport-memory ceiling is 256 MiB, including metadata, histories, and queues; caller-provided ceilings may raise or lower it. Refuse reservations beyond either limit. The sender also keeps at most 65536 sent-packet entries per lane; if advancing would overwrite an unresolved entry, apply backpressure rather than forget its inflight charge. On startup validate fixed allocations against the ceiling. Unknown cookies allocate nothing; pending handshakes, lane tables and worker queues are bounded separately. These are initial implementation limits, not performance claims.
 
+Bound sampling metadata in a shared fixed pool. Keep complete sampling state for
+each retained, unacknowledged charged transmission, including declared losses.
+Under pressure, retire resolved sender-history prefixes with a bounded work
+budget. A reservation, unresolved charge or pending validated ACK blocks
+retirement. Advance the history floor monotonically and ignore later ACKs below
+it; do not retain ACK identities after discarding the sampling state they need.
+Retirement never declares loss, releases congestion credit or shortens a deadline.
+Apply earlier accounting reports before reusing any reclaimed metadata slot.
+PTO timers and third-PTO loss settlement must progress even when the pool is full.
+
 Successful ACK-only and PROBE_REPLY transmissions carry no ordinary congestion
 charge. Retain their submission identity and timestamp while inside sender
 history, but allow them to age out without an ACK; otherwise one-way feedback
@@ -293,7 +303,9 @@ Use one controller owner per sending direction and path group, shared by every s
 
 Charge outer IP bytes, including IPv6 and UDP headers, for each successful physical transmission of data, repair, probes, abandonment, and lane retirement. Set the controller's maximum segment size from the effective outer IP ceiling and its initial window to ten such datagrams. Use BBRv3's UDP/QUIC-style offload budget and its delivery-rate sampling rules, with shared delivered-byte counters and per-transmission send metadata. ACK duplicate suppression must precede sampling. A repair and its late original are distinct delivered transmissions for bandwidth accounting, while their frame bytes are delivered only once. Keep application-limited and host-queue-limited observations distinguishable. [S11]
 
-The controller owner serializes send/ACK/loss reports from lane owners and issues byte grants covering both pacing and inflight limits. Reserve inflight credit before granting it. Grants expire for future sends after 100 microseconds, but reserved credit is not reusable until the worker reports sent and unused bytes; expiry alone must not double-spend it. Check grant validity with a fresh timestamp immediately before each nonblocking syscall. A call that starts within its grant interval can return after expiry; still account for every successful physical transmission, using its actual submission timestamp for sent history and delivery sampling. Failed/partially successful `sendmmsg` submissions return only unsent credit, and each successful GSO segment is a separate transmission. Bounded report queues must retain accounting events: a full queue stops further grants/sends until reports drain, rather than dropping inflight updates.
+The controller owner serializes send/ACK/loss reports from lane owners and issues byte grants covering both pacing and inflight limits. Reserve inflight credit before granting it. Grants expire for future sends after 100 microseconds, but reserved credit is not reusable until the worker reports sent and unused bytes; expiry alone must not double-spend it. Check grant validity with a fresh timestamp immediately before each nonblocking syscall. A call that starts within its grant interval can return after expiry; still account for every successful physical transmission, retaining the pre-syscall timestamp for its successful prefix in sent history and delivery sampling. A timestamp taken after the call returns can be later than that packet's ACK if the sending thread was descheduled. Failed/partially successful `sendmmsg` submissions return only unsent credit, and each successful GSO segment is a separate transmission. Bounded report queues must retain accounting events: a full queue stops further grants/sends until reports drain, rather than dropping inflight updates.
+
+For the first shared-owner implementation, collect a bounded batch of grants before applying ACK/loss feedback. Close issuance when feedback waits or cumulative issued bytes reach the burst cap; replenishing reported grants must not extend a batch indefinitely. Await every issued grant's sent/unused report, even after expiry. Commit successful physical sends in order of pre-syscall timestamp, grant ID and datagram ordinal, assigning shared sampling IDs in that order. Start from the batch's opening inflight count and add each successful transmission; never use the final batch total for every packet. Shared delivered/lost counters remain frozen until those sends are committed. Then apply a bounded feedback pass before issuing another batch. Preserve each ACK's accumulator across processing turns. Use fresh owner-processing time when advancing the shared delivered counter, and retain original receive time separately for RTT estimation. Host/report-queue delay does not itself satisfy the draft's application-limited predicates. Bound all retained reports and stop grants when that storage fills. Measure this batching cost before accepting the performance gates.
 
 Initially pace in userspace using monotonic deadlines and `timerfd`, without requiring an `fq` qdisc or host networking changes. Workers send only with current grants. Cap the combined outstanding burst allowance at the smaller of BBR's send quantum and 16 maximum-size datagrams, spread across workers; GSO aggregates obey that limit too. Timestamp at successful nonblocking socket submission and bound queued socket work. This is a testable baseline; kernel pacing remains a measured optimization. [S11]
 
@@ -587,7 +599,9 @@ clocks on successful submission. Four reserved feedback buffers per worker
 carry ACK snapshots through bounded handoffs; a rotating control queue gives
 blocked groups and buffer returns bounded service. ACK delay includes queue
 residence, and actual-send timestamps enforce duplicate spacing. Incoming
-ACK application and data grants remain unfinished.
+ACK application and runtime data grants remain unfinished. Pure shared grant
+accounting and draft-07 delivery sampling are implemented; the BBR controller,
+bounded grant batches and sender recovery still need runtime integration.
 Configuration
 validation now freezes named endpoint/peer/session relationships into numeric
 indices. Cookie lookup uses short scans for small sets and randomized hashing

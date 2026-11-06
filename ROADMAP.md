@@ -477,6 +477,24 @@ application remain pending. Outgoing ACKs are now emitted through the shared
 control queue. Per-lane MTU probing is connected to the workers. Recovery and congestion
 control remain pending; README.md documents probe feedback and send-error handling.
 
+The pure draft-07 delivery sampler now has fixed vectors for ACK compression,
+idle restart, application bubbles, late ACKs after loss and duplicate suppression.
+It preserves a single sample across bounded ACK chunks and counts each physical
+transmission once. Allocation checks and sent-history integration tests pass.
+The BBR state machine, model filters, gains and runtime integration remain pending.
+Reserve sampling metadata against the startup memory ceiling; a full sampling
+record in every lane's 65,536 history slots would exceed that ceiling. Use bounded
+shared storage and retire only resolved sender-history prefixes, preserving
+complete sampling state above the new floor. Implement budgeted retirement and
+pool reuse ordered after earlier reports; reservations, charges and pending ACKs
+must pin history. Keep PTO progress independent of free sampler slots.
+Shared sampling needs bounded grant batches: freeze shared ACK/loss application
+until all issued grants report, cap cumulative issued bytes as well as outstanding
+reservations, and close issuance when feedback waits. Commit successful sends in
+timestamp order before applying feedback, using a fresh owner timestamp for
+delivery accounting and original receive time for RTT. The runtime does not
+yet enforce these rules; batching latency and throughput need measurement.
+
 The pure RTT estimator, loss-deadline calculation, PTO-period backoff and frame
 lifetime now live in `loss.rs`, with exact-value and boundary tests. ACK-driven
 updates, history integration and timer ownership still need integration.

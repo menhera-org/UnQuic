@@ -246,7 +246,7 @@ impl Grants {
     /// reports its successful prefix; report the remainder as unused by passing
     /// fewer bytes. Positive bytes require the last syscall's start timestamp
     /// within the grant interval; zero bytes require None. A call may return
-    /// after expiry; its actual submission timestamp belongs in packet history.
+    /// after expiry; retain its pre-syscall time for successful packets in history.
     /// A probe reports either zero or the full datagram. Stale reports do nothing.
     pub fn reported(
         &mut self,

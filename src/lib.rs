@@ -14,6 +14,7 @@ compile_error!("UnQuic requires the Linux kernel");
 extern crate self as unquic;
 
 pub mod ack;
+pub mod bbr;
 pub mod config;
 pub mod counters;
 #[cfg(feature = "dns")]

@@ -22,7 +22,7 @@ struct Entry {
 pub struct SentPacket {
     /// Packet number in this history's connection and lane.
     pub number: u64,
-    /// Actual successful socket-submission time.
+    /// Pre-syscall timestamp of a successfully submitted physical transmission.
     pub sent_at: Duration,
     /// IPv6 packet bytes, including the IPv6 and UDP headers.
     pub outer_bytes: u16,

@@ -1242,3 +1242,38 @@ fn shared_transmission_grants_allocate_nothing_after_startup() {
     assert_eq!(count, Some(0));
     assert_eq!((grants.reserved(), grants.in_flight()), (0, 0));
 }
+
+#[test]
+fn delivery_sampling_allocates_nothing_including_chunked_acks_and_late_loss() {
+    use unquic::bbr::Delivery;
+    let mut delivery = Delivery::new();
+    ALLOCATION_COUNT.set(Some(0));
+    for step in 0..10000 {
+        let now = Duration::from_millis(step * 10);
+        delivery.application_limited(0).unwrap();
+        let mut original = delivery.sent(now, 1280, 0, false).unwrap();
+        assert!(delivery.declared_lost(&mut original).unwrap());
+        assert!(!delivery.declared_lost(&mut original).unwrap());
+        let mut repair = delivery
+            .sent(now + Duration::from_millis(1), 1280, 0, true)
+            .unwrap();
+        delivery
+            .begin_ack(now + Duration::from_millis(2), false)
+            .unwrap();
+        assert!(delivery.acknowledged(&mut repair).unwrap());
+        assert!(delivery.acknowledged(&mut original).unwrap());
+        assert!(!delivery.acknowledged(&mut original).unwrap());
+        let sample = delivery
+            .finish_ack(Duration::from_millis(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(sample.newly_acked, 2560);
+        assert!(sample.app_limited && sample.host_limited);
+    }
+    let count = ALLOCATION_COUNT.replace(None);
+    assert_eq!(count, Some(0));
+    assert_eq!(
+        (delivery.delivered(), delivery.lost()),
+        (25_600_000, 12_800_000)
+    );
+}

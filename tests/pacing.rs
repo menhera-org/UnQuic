@@ -292,8 +292,8 @@ fn partial_submission_late_completion_and_history_dedup_settle_exact_bytes() {
     let completed = us(500);
     assert!(grant.valid_at(started));
     assert!(!grant.valid_at(completed));
-    assert!(history.submit(1, completed));
-    assert!(history.submit(2, completed));
+    assert!(history.submit(1, started));
+    assert!(history.submit(2, started));
     assert!(history.cancel(3));
     grants.reported(grant, 2560, Some(started)).unwrap();
     assert_eq!(grants.in_flight(), history.inflight_bytes());
