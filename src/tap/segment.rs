@@ -91,11 +91,36 @@ impl Segments {
 
     /// Writes one complete frame. The immutable input stays alive until exhausted.
     pub(crate) fn write(&mut self, input: &[u8], output: &mut [u8]) -> usize {
-        let header = self.transport + 8;
+        if output.len() < self.header_len() + self.size.min(input.len().saturating_sub(self.next)) {
+            return 0;
+        }
+        let Some(range) = self.write_header(input, output) else {
+            return 0;
+        };
+        let header = self.header_len();
+        output[header..header + range.len()].copy_from_slice(&input[range.clone()]);
+        header + range.len()
+    }
+
+    pub(crate) const fn header_len(&self) -> usize {
+        self.transport + 8
+    }
+
+    /// Rewrites only the header and returns a range in the unchanged source.
+    /// Insufficient header storage leaves both cursor and output unchanged.
+    pub(crate) fn write_header(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Option<std::ops::Range<usize>> {
+        let header = self.header_len();
+        if output.len() < header || input.len() <= self.next {
+            return None;
+        }
         let count = self.size.min(input.len() - self.next);
         let length = header + count;
+        let range = self.next..self.next + count;
         output[..header].copy_from_slice(&input[..header]);
-        output[header..length].copy_from_slice(&input[self.next..self.next + count]);
         self.next += count;
         let at = self.transport;
         let udp_length = (8 + count) as u16;
@@ -107,7 +132,8 @@ impl Segments {
         );
         output[at + 4..at + 6].copy_from_slice(&udp_length.to_be_bytes());
         output[at + 6..at + 8].copy_from_slice(&seed.to_be_bytes());
-        let checksum = !fold(sum(&output[at..length]));
+        // The eight-byte UDP header leaves payload word alignment unchanged.
+        let checksum = !fold(sum(&output[at..header]) + sum(&input[range.clone()]));
         output[at + 6..at + 8]
             .copy_from_slice(&if checksum == 0 { 65535u16 } else { checksum }.to_be_bytes());
         let ip = self.network;
@@ -121,7 +147,7 @@ impl Segments {
             let checksum = !fold(sum(&output[ip..at]));
             output[ip + 10..ip + 12].copy_from_slice(&checksum.to_be_bytes());
         }
-        length
+        Some(range)
     }
 
     pub(crate) fn remaining(&self, length: usize) -> usize {
@@ -160,6 +186,17 @@ mod tests {
                         let mut output = [0u8; crate::MAX_FRAME_LEN];
                         for (i, data) in input[payload..].chunks(size).enumerate() {
                             let expected = udp::frame(v6, 65534u16.wrapping_add(i as u16), data);
+                            let mut borrowed = segments;
+                            let mut prefix = [0xa5; 128];
+                            assert!(
+                                borrowed
+                                    .write_header(&input, &mut prefix[..payload - 1])
+                                    .is_none()
+                            );
+                            assert_eq!(prefix, [0xa5; 128]);
+                            let range = borrowed.write_header(&input, &mut prefix).unwrap();
+                            assert_eq!(&prefix[..payload], &expected[..payload]);
+                            assert_eq!(&input[range], &expected[payload..]);
                             let n = segments.write(&input, &mut output);
                             assert_eq!(&output[..n], expected);
                             assert_eq!(
@@ -169,6 +206,57 @@ mod tests {
                         }
                         assert!(segments.done(input.len()));
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn routing_seed_and_long_headers_survive_borrowed_segmentation() {
+        for extension in [0, 80] {
+            let (mut input, mut header) = packet(true, 3, 101, true);
+            let final_address = [9; 16];
+            let seed =
+                fold(sum(&input[22..38]) + sum(&final_address) + 17 + (input.len() - 54) as u32);
+            input[60..62].copy_from_slice(&seed.to_be_bytes());
+            let mut routing = [0; 24];
+            routing[0] = 17;
+            routing[1] = 2;
+            routing[2] = 4;
+            routing[8..].copy_from_slice(&final_address);
+            input.splice(54..54, routing);
+            input[20] = 43;
+            if extension != 0 {
+                let mut options = [0; 80];
+                options[0] = 43;
+                options[1] = 9;
+                input.splice(54..54, options);
+                input[20] = 60;
+            }
+            let at = 54 + 24 + extension;
+            let n = (input.len() - 54) as u16;
+            input[18..20].copy_from_slice(&n.to_be_bytes());
+            header[6..8].copy_from_slice(&(at as u16).to_ne_bytes());
+            let mut segments = Segments::parse(&header, &input, 1514).unwrap();
+            for i in 0..3 {
+                let mut borrowed = segments;
+                let mut prefix = [0xa5; 128];
+                let range = borrowed.write_header(&input, &mut prefix);
+                let mut output = [0; 1514];
+                let n = segments.write(&input, &mut output);
+                assert_eq!(n, at + 8 + if i == 2 { 100 } else { 101 });
+                assert_eq!(&output[54..at], &input[54..at]);
+                let pseudo = sum(&output[22..38]) + sum(&final_address) + 17 + (n - at) as u32;
+                assert_eq!(fold(pseudo + sum(&output[at..n])), 65535);
+                if let Some(range) = range {
+                    assert_eq!(&prefix[..at + 8], &output[..at + 8]);
+                    assert_eq!(&input[range], &output[at + 8..n]);
+                } else {
+                    assert!(at + 8 > prefix.len());
+                    assert_eq!(prefix, [0xa5; 128]);
+                    let mut fallback = [0; 1514];
+                    assert_eq!(borrowed.write(&input, &mut fallback), n);
+                    assert_eq!(&fallback[..n], &output[..n]);
                 }
             }
         }

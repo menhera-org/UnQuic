@@ -175,6 +175,11 @@ Batched socket calls, WouldBlock and invalid/truncated input paths also have
 allocation checks. The multi-record encoder packs frame tails with following
 heads and flushes at queue exhaustion. Retained metadata addresses original
 buffers by frame index and byte range, without self-references or payload copies.
+`FrameInput` can also concatenate a rewritten header and borrowed payload;
+DATA pieces crossing that boundary remain one wire record. Segmentation can
+generate just the header, preserving the supplied UDP pseudo-header seed.
+These primitives have boundary, retry and allocation tests; worker retention
+still uses complete frame buffers.
 Generated sequences, reversed arrival, duplicate packets, identity exhaustion
 and small-frame bursts have tests. Two 1514-byte frames pack into three baseline
 datagrams. Workers now use this encoder and retain partial batches.
@@ -302,8 +307,8 @@ bytes per session, below the 8192-frame/64-MiB directional ceilings. Transmit
 reservations divide the frame and 64-MiB byte budgets among the union of the
 session's TAP readers and transmit owners, and respect their 128-buffer pools.
 Byte accounting includes retained super-frames and their expanded children;
-reads reserve worst-case
-space and leave one output buffer available for expansion. A reservation lasts until the frame buffer returns to its origin,
+reads reserve worst-case space and leave one output buffer available for
+expansion. A reservation lasts until the frame buffer returns to its origin,
 including handoff and return-queue delays. Compile-time bounds and quota tests
 check these limits; no shared reservation lock or atomic is needed.
 

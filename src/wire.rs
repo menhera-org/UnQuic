@@ -426,17 +426,7 @@ impl Record<'_> {
                 total_len,
                 offset,
                 bytes,
-            } => {
-                if frame_id >> 48 == 0
-                    || frame_id & 0x0000_ffff_ffff_ffff == 0
-                    || !(14..=MAX_FRAME_LEN as u32).contains(&total_len)
-                    || bytes.is_empty()
-                    || offset > total_len
-                    || bytes.len() > (total_len - offset) as usize
-                {
-                    return Err(WireError::Data);
-                }
-            }
+            } => validate_data(frame_id, total_len, offset, bytes.len())?,
             Self::Ack {
                 lane,
                 delay_us,
@@ -625,7 +615,7 @@ pub fn encode_datagram(
 /// two buffers in the same datagram. Returns their combined length. Validation
 /// matches encode_datagram and finishes before modifying output.
 pub fn encode_data_prefix(
-    mut header: Header,
+    header: Header,
     data: Record<'_>,
     output: &mut [u8; DATA_PREFIX_LEN],
 ) -> Result<usize, WireError> {
@@ -638,14 +628,53 @@ pub fn encode_data_prefix(
     else {
         return Err(WireError::Data);
     };
-    data.validate()?;
-    data.validate_context(header, 1)?;
-    let length = data.encoded_len();
+    encode_data_prefix_length(header, frame_id, total_len, offset, bytes.len(), output)
+}
+
+fn validate_data(
+    frame_id: u64,
+    total_len: u32,
+    offset: u32,
+    length: usize,
+) -> Result<(), WireError> {
+    if length > u16::MAX as usize - 20 {
+        return Err(WireError::Length);
+    }
+    if frame_id >> 48 == 0
+        || frame_id & 0x0000_ffff_ffff_ffff == 0
+        || !(14..=MAX_FRAME_LEN as u32).contains(&total_len)
+        || length == 0
+        || offset > total_len
+        || length > (total_len - offset) as usize
+    {
+        return Err(WireError::Data);
+    }
+    Ok(())
+}
+
+/// Prefix for a DATA piece whose payload may span separate borrowed slices.
+pub(crate) fn encode_data_prefix_length(
+    mut header: Header,
+    frame_id: u64,
+    total_len: u32,
+    offset: u32,
+    piece_len: usize,
+    output: &mut [u8; DATA_PREFIX_LEN],
+) -> Result<usize, WireError> {
+    validate_data(frame_id, total_len, offset, piece_len)?;
+    Record::Data {
+        frame_id,
+        total_len,
+        offset,
+        bytes: &[],
+    }
+    .validate_context(header, 1)?;
+    let length = 20 + piece_len;
     header.record_area_len = length as u16;
     header.encode((&mut output[..HEADER_LEN]).try_into().unwrap());
     output[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&[1, 0, (length >> 8) as u8, length as u8]);
     encode_data_fields(frame_id, total_len, offset, &mut output[HEADER_LEN + 4..]);
-    Ok(DATA_PREFIX_LEN + bytes.len())
+    Ok(DATA_PREFIX_LEN + piece_len)
 }
 
 /// Encodes a PROBE and PADDING prefix for scatter/gather I/O.
@@ -836,3 +865,30 @@ impl fmt::Display for WireError {
     }
 }
 impl std::error::Error for WireError {}
+
+#[cfg(test)]
+#[test]
+fn scattered_data_prefix_rejects_invalid_lengths_before_writing() {
+    let header = Header {
+        cookie: UnquicUuid::from_bytes([1; 16]),
+        receive_tag: 1,
+        lane: 1,
+        packet_number: 1,
+        record_area_len: 0,
+    };
+    for (id, total, offset, length, expected) in [
+        ((1 << 48) | 1, 60, 0, usize::MAX, WireError::Length),
+        ((1 << 48) | 1, 60, 0, 0, WireError::Data),
+        ((1 << 48) | 1, 60, 61, 1, WireError::Data),
+        ((1 << 48) | 1, 60, 59, 2, WireError::Data),
+        (1 << 48, 60, 0, 1, WireError::Data),
+        ((2 << 48) | 1, 60, 0, 1, WireError::Lane),
+    ] {
+        let mut output = [0xa5; DATA_PREFIX_LEN];
+        assert_eq!(
+            encode_data_prefix_length(header, id, total, offset, length, &mut output),
+            Err(expected)
+        );
+        assert_eq!(output, [0xa5; DATA_PREFIX_LEN]);
+    }
+}

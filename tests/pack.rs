@@ -433,6 +433,7 @@ fn pack_all(sender: &mut pack::Lane, frames: &[&[u8]], limit: usize) -> Vec<Vec<
         .iter()
         .map(|bytes| pack::FrameInput {
             id: sender.start_frame(bytes.len()).unwrap(),
+            header: &[],
             bytes,
             offset: 0,
         })
@@ -450,7 +451,7 @@ fn pack_all(sender: &mut pack::Lane, frames: &[&[u8]], limit: usize) -> Vec<Vec<
                 let meta = batch.packet(packet).unwrap();
                 assert_eq!(meta.number, output.len() as u64 + 1);
                 let mut slices = [&[][..]; pack::PACKED_SLICES];
-                let parts = batch.slices(packet, &frames, &mut slices).unwrap();
+                let parts = batch.slices(packet, &pending, &mut slices).unwrap();
                 for payload in parts.iter().skip(2).step_by(2) {
                     assert!(frames.iter().any(|frame| {
                         let range = frame.as_ptr_range();
@@ -567,6 +568,7 @@ fn batch_input_validation_and_empty_queue_preserve_packet_numbers() {
     let id = sender.start_frame(60).unwrap();
     let input = pack::FrameInput {
         id,
+        header: &[],
         bytes: &[0; 60],
         offset: 0,
     };
@@ -621,9 +623,20 @@ fn batch_input_validation_and_empty_queue_preserve_packet_numbers() {
     assert_eq!(batch.packet(0).unwrap().number, 1);
     let mut slices = [&[][..]; pack::PACKED_SLICES];
     assert!(batch.slices(0, &[], &mut slices).is_err());
-    assert!(batch.slices(1, &[input.bytes], &mut slices).is_err());
-    assert!(batch.slices(0, &[input.bytes], &mut []).is_err());
-    assert!(batch.slices(0, &[&[0; 59]], &mut slices).is_err());
+    assert!(batch.slices(1, &[input], &mut slices).is_err());
+    assert!(batch.slices(0, &[input], &mut []).is_err());
+    assert!(
+        batch
+            .slices(
+                0,
+                &[pack::FrameInput {
+                    bytes: &[0; 59],
+                    ..input
+                }],
+                &mut slices
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -675,6 +688,7 @@ fn packed_datagrams_send_original_slices_through_the_socket_batch() {
         .iter()
         .map(|bytes| pack::FrameInput {
             id: sender.start_frame(bytes.len()).unwrap(),
+            header: &[],
             bytes,
             offset: 0,
         })
@@ -689,7 +703,7 @@ fn packed_datagrams_send_original_slices_through_the_socket_batch() {
         .iter_mut()
         .enumerate()
         .map(|(packet, slices)| SendDatagram {
-            parts: batch.slices(packet, &frames, slices).unwrap(),
+            parts: batch.slices(packet, &inputs, slices).unwrap(),
         })
         .collect();
     let mut first = 0;
@@ -735,6 +749,7 @@ fn dropping_alternate_gso_batches_leaves_no_orphan_frames() {
                     .iter()
                     .map(|bytes| pack::FrameInput {
                         id: sender.start_frame(bytes.len()).unwrap(),
+                        header: &[],
                         bytes,
                         offset: 0,
                     })
@@ -749,12 +764,11 @@ fn dropping_alternate_gso_batches_leaves_no_orphan_frames() {
                             .sum::<usize>()
                             <= 65_535 - 40 - 8
                     );
-                    let borrowed: Vec<_> = inputs.iter().map(|input| input.bytes).collect();
                     let mut offsets = vec![0; inputs.len()];
                     for packet in 0..batch.len() {
                         let mut slices = [&[][..]; pack::PACKED_SLICES];
                         let bytes: Vec<_> = batch
-                            .slices(packet, &borrowed, &mut slices)
+                            .slices(packet, &inputs, &mut slices)
                             .unwrap()
                             .iter()
                             .flat_map(|part| part.iter().copied())
@@ -788,6 +802,84 @@ fn dropping_alternate_gso_batches_leaves_no_orphan_frames() {
             }
             assert_eq!(delivered, expected);
             assert!(delivered > 0 && delivered < frames.len());
+        }
+    }
+}
+
+#[test]
+fn scattered_headers_match_contiguous_frames_across_boundaries_and_retries() {
+    for limit in [BASE_UDP_PAYLOAD, 1452, unquic::socket::MAX_UDP_PAYLOAD] {
+        for size in [14, 60, 1514, MAX_FRAME_LEN] {
+            let frames: Vec<Vec<u8>> = (0..pack::BATCH_CAPACITY)
+                .map(|i| (0..size).map(|j| (i * 17 + j) as u8).collect())
+                .collect();
+            for split in [0, 1, 13, 42, 128, 1164, 1384, size] {
+                let split = split.min(size);
+                let mut sender = sender();
+                let mut inputs: Vec<_> = frames
+                    .iter()
+                    .enumerate()
+                    .map(|(i, bytes)| {
+                        let split = if i % 3 == 0 { 0 } else { split };
+                        pack::FrameInput {
+                            id: sender.start_frame(size).unwrap(),
+                            header: &bytes[..split],
+                            bytes: &bytes[split..],
+                            offset: i % size,
+                        }
+                    })
+                    .collect();
+                let mut assembled: Vec<_> = inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| frames[i][..f.offset].to_vec())
+                    .collect();
+                let mut first = 0;
+                while first < inputs.len() {
+                    let mut batch = pack::Batch::new();
+                    batch.prepare(&mut sender, &inputs[first..], limit).unwrap();
+                    assert!(!batch.is_empty());
+                    let mut slices = [&[][..]; pack::BATCH_SLICES];
+                    let mut used = 0;
+                    for packet in 0..batch.len() {
+                        let parts = batch
+                            .slices(packet, &inputs[first..], &mut slices[used..])
+                            .unwrap();
+                        used += parts.len();
+                        let encoded: Vec<_> =
+                            parts.iter().flat_map(|b| b.iter().copied()).collect();
+                        assert_eq!(encoded.len(), batch.packet(packet).unwrap().length);
+                        let datagram = Datagram::decode(&encoded).unwrap();
+                        for record in datagram.records() {
+                            let Record::Data {
+                                frame_id,
+                                total_len,
+                                offset,
+                                bytes,
+                            } = record
+                            else {
+                                panic!("unexpected record")
+                            };
+                            let index = (frame_id & 0x0000_ffff_ffff_ffff) as usize - 1;
+                            assert_eq!(total_len as usize, size);
+                            assert_eq!(offset as usize, assembled[index].len());
+                            assembled[index].extend_from_slice(bytes);
+                        }
+                        for (i, range) in batch.pieces(packet).unwrap() {
+                            inputs[first + i].offset = range.end;
+                        }
+                        // Reprepare after a partial physical batch, including inside headers.
+                        if packet == batch.len() / 2 {
+                            break;
+                        }
+                    }
+                    assert!(used <= pack::BATCH_SLICES);
+                    while first < inputs.len() && inputs[first].offset == size {
+                        first += 1;
+                    }
+                }
+                assert_eq!(assembled, frames);
+            }
         }
     }
 }

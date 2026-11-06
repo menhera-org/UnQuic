@@ -891,7 +891,8 @@ fn segmentation_and_flow_selection_allocate_nothing() {
     let frames = [&frame[..60]; pack::BATCH_CAPACITY];
     let inputs = std::array::from_fn::<_, { pack::BATCH_CAPACITY }, _>(|index| pack::FrameInput {
         id: lane.start_frame(frames[index].len()).unwrap(),
-        bytes: frames[index],
+        header: &frames[index][..42],
+        bytes: &frames[index][42..],
         offset: 0,
     });
     let mut batch = pack::Batch::new();
@@ -903,7 +904,7 @@ fn segmentation_and_flow_selection_allocate_nothing() {
         let mut slices = [&[][..]; pack::PACKED_SLICES];
         assert_eq!(
             batch
-                .slices(packet, &frames, &mut slices)
+                .slices(packet, &inputs, &mut slices)
                 .unwrap()
                 .iter()
                 .map(|part| part.len())

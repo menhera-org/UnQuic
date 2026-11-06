@@ -11,7 +11,7 @@ use crate::{
     socket::{GSO_MAX_BYTES, MAX_UDP_PAYLOAD},
     wire::{
         DATA_PREFIX_LEN, HEADER_LEN, Header, MAX_RECORDS, PROBE_PREFIX_LEN, Record, WireError,
-        encode_data_prefix, encode_datagram, encode_probe_prefix,
+        encode_data_prefix, encode_data_prefix_length, encode_datagram, encode_probe_prefix,
     },
 };
 use std::{collections::hash_map::DefaultHasher, fmt, hash::Hasher};
@@ -249,19 +249,21 @@ impl<'a> Frame<'a> {
 
 /// Maximum queued frames or encoded packets in one retained batch.
 pub const BATCH_CAPACITY: usize = 64;
-/// Maximum scatter/gather slices for one header and 64 DATA records.
-pub const PACKED_SLICES: usize = 1 + MAX_RECORDS * 2;
+/// Maximum scatter/gather slices for one header and 64 two-span DATA records.
+pub const PACKED_SLICES: usize = 1 + MAX_RECORDS * 3;
 /// Maximum borrowed slices across a complete batch.
-pub const BATCH_SLICES: usize = BATCH_CAPACITY * 5;
+pub const BATCH_SLICES: usize = BATCH_CAPACITY * 6;
 
 /// A retained frame with its next unsent byte offset.
 #[derive(Clone, Copy)]
 pub struct FrameInput<'a> {
     /// Identity allocated by Lane::start_frame; unchanged across partial sends.
     pub id: u64,
-    /// Original complete Ethernet frame, never a copied fragment.
+    /// Optional rewritten Ethernet/IP/transport header preceding bytes.
+    pub header: &'a [u8],
+    /// Borrowed frame bytes following header; the complete frame when header is empty.
     pub bytes: &'a [u8],
-    /// First byte still needing submission; must be less than bytes.len().
+    /// First unsent byte in the concatenation of header and bytes.
     pub offset: usize,
 }
 
@@ -378,7 +380,7 @@ impl Batch {
     pub fn slices<'a, 'out>(
         &'a self,
         packet: usize,
-        frames: &[&'a [u8]],
+        frames: &[FrameInput<'a>],
         output: &'out mut [&'a [u8]],
     ) -> Result<&'out [&'a [u8]], PackError> {
         let plan = self
@@ -390,14 +392,33 @@ impl Batch {
             return Err(PackError::Wire(WireError::BufferTooSmall));
         }
         output[0] = &plan.header;
+        let mut used = 1;
         for (index, (frame, range)) in self.pieces(packet).unwrap().enumerate() {
-            output[1 + index * 2] = &self.prefixes[usize::from(plan.first) + index];
-            output[2 + index * 2] = frames
-                .get(frame)
-                .and_then(|frame| frame.get(range))
+            let frame = frames.get(frame).ok_or(PackError::Frame)?;
+            let split = frame.header.len();
+            let header = frame
+                .header
+                .get(range.start.min(split)..range.end.min(split))
                 .ok_or(PackError::Frame)?;
+            let bytes = frame
+                .bytes
+                .get(range.start.saturating_sub(split)..range.end.saturating_sub(split))
+                .ok_or(PackError::Frame)?;
+            let count = 1 + usize::from(!header.is_empty()) + usize::from(!bytes.is_empty());
+            let slots = output
+                .get_mut(used..used + count)
+                .ok_or(PackError::Wire(WireError::BufferTooSmall))?;
+            slots[0] = &self.prefixes[usize::from(plan.first) + index];
+            let mut part = 1;
+            for span in [header, bytes] {
+                if !span.is_empty() {
+                    slots[part] = span;
+                    part += 1;
+                }
+            }
+            used += count;
         }
-        Ok(&output[..1 + usize::from(plan.count) * 2])
+        Ok(&output[..used])
     }
 
     /// Prepares up to 64 packets from at most 64 frames, without copying payloads.
@@ -419,8 +440,9 @@ impl Batch {
         }
         if frames.len() > BATCH_CAPACITY
             || frames.iter().any(|frame| {
-                !(14..=usize::from(lane.frame_limit)).contains(&frame.bytes.len())
-                    || frame.offset >= frame.bytes.len()
+                let length = frame.header.len().saturating_add(frame.bytes.len());
+                !(14..=usize::from(lane.frame_limit)).contains(&length)
+                    || frame.offset >= length
                     || frame.id >> 48 != u64::from(lane.header.lane)
                     || frame.id & MAX_SEQUENCE == 0
                     || (lane.next_frame != 0 && frame.id & MAX_SEQUENCE >= lane.next_frame)
@@ -444,26 +466,26 @@ impl Batch {
                 && length + RECORD_PREFIX_LEN < limit
             {
                 let input = &frames[frame];
+                let frame_len = input.header.len() + input.bytes.len();
                 // Keep complete frames within one GSO aggregate under socket overload.
                 let available = limit - length - RECORD_PREFIX_LEN
                     + (packet_limit - self.count - 1) * (limit - DATA_PREFIX_LEN);
-                if input.bytes.len() - offset > available {
+                if frame_len - offset > available {
                     break;
                 }
-                let end = input
-                    .bytes
-                    .len()
-                    .min(offset + limit - length - RECORD_PREFIX_LEN);
-                let record = Record::Data {
-                    frame_id: input.id,
-                    total_len: input.bytes.len() as u32,
-                    offset: offset as u32,
-                    bytes: &input.bytes[offset..end],
-                };
+                let end = frame_len.min(offset + limit - length - RECORD_PREFIX_LEN);
                 let mut prefix = [0; DATA_PREFIX_LEN];
                 // Each piece ends a frame or a packet: 64 of each need at most 127 pieces.
                 debug_assert!(pieces < self.pieces.len());
-                encode_data_prefix(lane.header, record, &mut prefix).unwrap();
+                encode_data_prefix_length(
+                    lane.header,
+                    input.id,
+                    frame_len as u32,
+                    offset as u32,
+                    end - offset,
+                    &mut prefix,
+                )
+                .map_err(PackError::Wire)?;
                 self.prefixes[pieces].copy_from_slice(&prefix[HEADER_LEN..]);
                 self.pieces[pieces] = PieceRange {
                     frame: frame as u8,
@@ -473,7 +495,7 @@ impl Batch {
                 pieces += 1;
                 length += RECORD_PREFIX_LEN + end - offset;
                 offset = end;
-                if offset == input.bytes.len() {
+                if offset == frame_len {
                     frame += 1;
                     offset = frames.get(frame).map_or(0, |frame| frame.offset);
                 }
@@ -727,6 +749,7 @@ mod tests {
         assert!(matches!(lane.start_frame(14), Err(PackError::Exhausted)));
         let frames = [FrameInput {
             id,
+            header: &[],
             bytes: &[1; 1514],
             offset: 0,
         }];

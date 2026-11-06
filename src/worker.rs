@@ -460,6 +460,7 @@ impl TxBatch {
     fn prepare(&mut self, lane: &mut pack::Lane, limit: usize) -> Result<(), pack::PackError> {
         let mut inputs = [pack::FrameInput {
             id: 0,
+            header: &[],
             bytes: &[],
             offset: 0,
         }; pack::BATCH_CAPACITY];
@@ -467,6 +468,7 @@ impl TxBatch {
             let frame = frame.as_ref().unwrap();
             *input = pack::FrameInput {
                 id: frame.frame_id,
+                header: &[],
                 bytes: &frame.bytes[..frame.length],
                 offset: frame.offset,
             };
@@ -2272,11 +2274,15 @@ impl Worker {
             return Ok(());
         }
         let result = {
-            let frames: [&[u8]; pack::BATCH_CAPACITY] = std::array::from_fn(|index| {
-                batch.frames[index]
-                    .as_ref()
-                    .map_or(&[][..], |frame| &frame.bytes[..frame.length])
-            });
+            let frames =
+                std::array::from_fn::<_, { pack::BATCH_CAPACITY }, _>(|index| pack::FrameInput {
+                    id: 0,
+                    header: &[],
+                    bytes: batch.frames[index]
+                        .as_ref()
+                        .map_or(&[][..], |frame| &frame.bytes[..frame.length]),
+                    offset: 0,
+                });
             let mut slices = [&[][..]; pack::BATCH_SLICES];
             let mut starts = [0; BATCH_SIZE + 1];
             let count = batch.plan.len();
