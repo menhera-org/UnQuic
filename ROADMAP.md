@@ -433,8 +433,12 @@ README.md documents the baseline send-error behavior.
 - `pmtu.rs`: RFC 8899 per lane from the 1232-byte UDP baseline, using larger
   confirmed path MTUs up to 9000 outer bytes. Socket I/O, packing and receive
   validation now support 8952-byte UDP payloads. The padded-probe encoder
-  borrows shared zero padding for scatter/gather sends; scheduling and feedback
-  validation remain to be connected. Keep the hot path allocation-free. Use padded
+  borrows shared zero padding for scatter/gather sends. The pure state machine
+  now bounds proof history, checks full probe identity/length, narrows the search
+  after loss, handles reductions and baseline failure, and retries upward.
+  Deterministic tests cover every supported MTU, stale/forged replies, loss and
+  backpressure. Runtime scheduling and feedback remain to be connected.
+  Keep the hot path allocation-free. Use padded
   PROBE and matching PROBE_REPLY, with `EMSGSIZE` and validated `IPV6_RECVERR`
   Packet Too Big as "shrink now, re-probe later". Local interface MTU alone
   never confirms a path. Reset discovery for new paths and keep TAP MTU

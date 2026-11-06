@@ -1917,3 +1917,11 @@ The release/all-features suite, Rust 1.89 all-target check and Clippy pass.
 Workers still need the probe state machine, feedback validation and error-queue
 integration. No new throughput measurement or acceptance claim accompanies
 these socket changes.
+
+
+The pure per-lane discovery state machine is now implemented separately from
+worker I/O. Release tests cover every supported payload size, silent probe
+loss, bounded proof history, full identity/length checks, reductions, baseline
+failure and the 600-second upward retry. This adds no runtime throughput
+evidence: workers still use the configured payload assertion until discovery
+is connected.

@@ -21,6 +21,7 @@ pub mod dns;
 pub mod handshake;
 pub mod mac;
 pub mod pack;
+pub mod pmtu;
 pub mod reassembly;
 pub mod runtime;
 mod sha256;

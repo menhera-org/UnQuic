@@ -534,8 +534,8 @@ the transport splits Ethernet frames into DATA pieces.
 The NTT NGN production target has a 1500-byte outer IPv6 ceiling. Other paths
 may differ; active per-lane discovery remains required, capped at 9000 outer
 bytes. A padded-probe encoder now gathers a 56-byte prefix and shared zero
-padding without a packet-sized copy. Its runtime scheduling and reply validation
-are still pending.
+padding without a packet-sized copy. A pure per-lane discovery state machine
+validates live probe identities and sizes; worker integration is still pending.
 
 | Size, without outer extension headers | Default baseline | Asserted 1500-byte path |
 | --- | ---: | ---: |
@@ -572,6 +572,22 @@ rejecting packets above the local interface MTU. Each error read retains at most
 the quoted 48-byte protocol header and distinguishes local errors from remote
 PTB reports. Callers must validate remote quotes against successful sends and
 budget error processing. Workers do not use these APIs yet.
+
+The discovery state machine retains at most three submitted proofs, each scoped
+by session, connection tag, lane and packet number. Two unanswered larger probes
+trigger confirmation of the working size before a narrower binary search.
+Three consecutive failures restart the baseline; baseline failure suspends DATA
+until a matching baseline reply arrives. Validated size hints never confirm a
+larger DATA limit. Delayed replies cannot revive proofs invalidated by a reduction.
+
+The initial timeout is 16 seconds. After a verified probe, it becomes four times
+that probe's RTT, with a one-second floor. This deliberately uses a shorter
+timeout than RFC 8899's greater-than-15-second recommendation on measured low-RTT
+paths, to limit black-hole loss. Loss can make the selected size conservative;
+the state machine retries upward after 600 seconds. Current-size confirmations
+run no faster than the probe timeout. They support the current unacknowledged
+DATA path and must give way to transport loss feedback when ACK processing is
+connected. [RFC 8899](https://www.rfc-editor.org/rfc/rfc8899.html)
 
 EMSGSIZE and validated ICMPv6 Packet Too Big feedback will lower the limit and
 schedule re-probing. New paths start discovery again. A path below the 1280-byte
