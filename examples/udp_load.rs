@@ -696,8 +696,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TAP offload prerequisite probe; run in a disposable container"]
-    fn segmented_sends_require_tap_checksum_support() {
+    #[ignore = "TAP offload delivery probe; run in a disposable container"]
+    fn segmented_sends_follow_available_tap_offloads() {
         use std::os::fd::AsFd;
         // SAFETY: the test thread alone enters a disposable network namespace.
         assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
@@ -738,32 +738,44 @@ mod tests {
         .unwrap();
         option(&socket, libc::IPPROTO_UDP, libc::UDP_SEGMENT, 1472).unwrap();
         let bytes = [0xa5; 2944];
-        assert_eq!(
-            socket.send(&bytes).unwrap_err().raw_os_error(),
-            Some(libc::EIO)
-        );
         let fd = queues[0].as_fd().as_raw_fd();
+        let read_segments = || {
+            let mut frame = [0u8; 65536];
+            let mut count = 0;
+            loop {
+                // SAFETY: frame provides writable storage for the complete read.
+                let n = unsafe { libc::read(fd, frame.as_mut_ptr().cast(), frame.len()) };
+                if n < 0 {
+                    assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+                    break;
+                }
+                assert!(n >= 24);
+                if frame[22..24] == [8, 0] {
+                    assert_eq!(n, 1524);
+                    assert_eq!(&frame[52..1524], &bytes[..1472]);
+                    count += 1;
+                }
+            }
+            count
+        };
+        // Kernels may segment in software without TAP checksum offload.
+        match socket.send(&bytes) {
+            Ok(n) => {
+                assert_eq!(n, bytes.len());
+                assert_eq!(read_segments(), 2);
+            }
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EIO));
+                assert_eq!(read_segments(), 0);
+            }
+        }
         // SAFETY: TUNSETOFFLOAD takes an integer; only this test's TAP is changed.
         assert_eq!(
             unsafe { libc::ioctl(fd, libc::TUNSETOFFLOAD, libc::TUN_F_CSUM as libc::c_ulong) },
             0
         );
         assert_eq!(socket.send(&bytes).unwrap(), bytes.len());
-        let mut frame = [0u8; 65536];
-        let mut count = 0;
-        loop {
-            // SAFETY: frame provides writable storage for the complete read.
-            let n = unsafe { libc::read(fd, frame.as_mut_ptr().cast(), frame.len()) };
-            if n < 0 {
-                assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
-                break;
-            }
-            if frame[22..24] == [8, 0] {
-                assert_eq!(n, 1524);
-                count += 1;
-            }
-        }
-        assert_eq!(count, 2);
+        assert_eq!(read_segments(), 2);
         // Linux 6.8 requires both TUN_F_USO4 (0x20) and TUN_F_USO6 (0x40).
         assert_eq!(
             unsafe {
@@ -776,8 +788,10 @@ mod tests {
             0
         );
         assert_eq!(socket.send(&bytes).unwrap(), bytes.len());
+        let mut frame = [0u8; 65536];
         let n = unsafe { libc::read(fd, frame.as_mut_ptr().cast(), frame.len()) };
         assert_eq!(n, 10 + 42 + bytes.len() as isize);
         assert_eq!(frame[1], 5);
+        assert_eq!(&frame[52..n as usize], &bytes);
     }
 }
