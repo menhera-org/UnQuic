@@ -439,7 +439,10 @@ README.md documents the baseline send-error behavior.
   Packet Too Big as "shrink now, re-probe later". Local interface MTU alone
   never confirms a path. Reset discovery for new paths and keep TAP MTU
   independent. Preserve `IPV6_DONTFRAG`; probing must be able to exceed a
-  cached PMTU without fragmentation (RFC 8899 section 4.5). Test 1280-, 1500- and 9000-byte paths,
+  cached PMTU without fragmentation (RFC 8899 section 4.5). Socket discovery
+  setup and bounded error-queue reads are implemented; a kernel test verifies
+  actual PTB quotes, cached-MTU bypass, local reductions and recovery, and GSO
+  retention after EMSGSIZE. Worker integration is pending. Test 1280-, 1500- and 9000-byte paths,
   independent lane limits, lost probes, forged/stale replies, MTU reduction
   and recovery in disposable network namespaces; never emit outer fragments.
 - `bbr.rs`: BBRv3 as draft-ietf-ccwg-bbr-07 specifies, one owner per sending

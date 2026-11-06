@@ -425,10 +425,11 @@ Groups stay within 64 logical datagrams and a conservative 64 KiB outer-packet
 bound. SendDatagram now takes a borrowed list of slices, allowing multiple
 record prefixes and original frame pieces. A call uses at most 1024 descriptors
 and returns the complete datagram prefix it submitted when that budget fills;
-validation covers the entire input before any send. Callers retain the rest. Kernel capability/path errors disable GSO on that socket and retry through
-ordinary sendmmsg. Partial results count successful logical datagrams, so callers
-retain exactly the unsent suffix. An MTU error that also affects an ordinary
-datagram still returns EMSGSIZE.
+validation covers the entire input before any send. Callers retain the rest.
+Offload capability errors disable GSO on that socket and retry through ordinary
+sendmmsg. Partial results count successful logical datagrams, so callers retain
+exactly the unsent suffix. EMSGSIZE returns directly and preserves GSO support;
+an oversized probe must not disable offloads for subsequent DATA.
 
 ReceiveSocket::enable_gro attempts UDP_GRO during setup and reports whether it
 succeeded. recv_batch then reports the coalesced length and segment size in each
@@ -549,8 +550,8 @@ not outer IPv6 fragments.
 
 Both the runtime and socket API enforce the supplied limit. The runtime has
 no `IPV6_RECVERR` error-queue processing
-or Packet Too Big validation. If ordinary sending returns EMSGSIZE after any
-GSO fallback, it counts a socket error and drops the affected batch's unsent
+or Packet Too Big validation. If sending returns EMSGSIZE,
+it counts a socket error and drops the affected batch's unsent
 frames.
 It neither lowers the limit nor resizes the TAP. Other nontransient send errors
 follow the same path; WouldBlock and interrupted sends retain the remainder
@@ -561,8 +562,16 @@ above 1500. That size describes the target access line, not a permanent transpor
 ceiling. The planned RFC 8899 discovery starts each lane at the baseline and uses
 padded PROBE packets to confirm larger sizes within wire and reserved-buffer
 bounds. A reply must match a live probe and its exact size before DATA uses it;
-a local interface MTU alone is insufficient. The current 1452-byte socket API
-ceiling must expand with that implementation. TAP MTU remains separately configured.
+a local interface MTU alone is insufficient. The socket API already supports
+the product's 9000-byte outer ceiling. TAP MTU remains separately configured.
+
+The socket layer exposes explicit discovery setup and bounded error-queue reads.
+Setup enables `IPV6_PMTUDISC_PROBE` and `IPV6_RECVERR`, preserving
+`IPV6_DONTFRAG`. This permits probes above a learned kernel PMTU while still
+rejecting packets above the local interface MTU. Each error read retains at most
+the quoted 48-byte protocol header and distinguishes local errors from remote
+PTB reports. Callers must validate remote quotes against successful sends and
+budget error processing. Workers do not use these APIs yet.
 
 EMSGSIZE and validated ICMPv6 Packet Too Big feedback will lower the limit and
 schedule re-probing. New paths start discovery again. A path below the 1280-byte

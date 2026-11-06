@@ -32,6 +32,36 @@ struct Ancillary {
     data: [u8; size_of::<usize>()],
 }
 
+#[repr(C)]
+struct ErrorControl {
+    header: libc::cmsghdr,
+    error: libc::sock_extended_err,
+    offender: libc::sockaddr_in6,
+}
+
+/// A size error consumed from the transmit socket's IPv6 error queue.
+///
+/// Remote reports are untrusted. Match the destination and quoted protocol
+/// identity against retained successful sends before applying their size hint.
+pub struct MtuError {
+    /// Reported outer IPv6 MTU, including the IP header.
+    pub mtu: u32,
+    /// Whether the kernel generated this error locally instead of receiving ICMP.
+    pub local: bool,
+    /// Original outgoing destination, not the ICMP sender.
+    pub destination: SocketAddrV6,
+    quote: [u8; crate::wire::HEADER_LEN],
+    quote_len: usize,
+}
+
+impl MtuError {
+    /// Available prefix of the original UDP payload, at most one wire header.
+    /// Local errors can have an empty quote; short remote quotes cannot prove identity.
+    pub fn quoted_payload(&self) -> &[u8] {
+        &self.quote[..self.quote_len]
+    }
+}
+
 /// One outgoing datagram gathered from borrowed wire prefixes and frame pieces.
 #[derive(Clone, Copy)]
 pub struct SendDatagram<'a> {
@@ -341,6 +371,77 @@ impl TransmitSocket {
         local_address(&self.socket)
     }
 
+    /// Enables application MTU discovery while continuing to forbid fragmentation.
+    ///
+    /// Call during lane setup. PROBE bypasses cached path-MTU enforcement, so the
+    /// owner must restrict DATA to its confirmed size and track padded probes.
+    /// Drain size errors with recv_mtu_error when the socket reports EPOLLERR.
+    pub fn enable_mtu_discovery(&mut self) -> io::Result<()> {
+        set_int(&self.socket, libc::IPPROTO_IPV6, libc::IPV6_RECVERR, 1)?;
+        set_int(
+            &self.socket,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MTU_DISCOVER,
+            libc::IPV6_PMTUDISC_PROBE,
+        )
+    }
+
+    /// Consumes one error-queue entry without allocation, retaining its header quote.
+    ///
+    /// None means an unrelated or malformed entry was consumed. WouldBlock means
+    /// the queue is empty. Bound calls per worker turn even under an ICMP flood.
+    /// Payload truncation is intentional; truncated ancillary metadata is rejected.
+    pub fn recv_mtu_error(&self) -> io::Result<Option<MtuError>> {
+        let mut quote = [0; crate::wire::HEADER_LEN];
+        // SAFETY: all-zero headers and sockaddr_in6 are valid writable ABI storage.
+        let (mut source, mut control, mut message): (
+            libc::sockaddr_in6,
+            ErrorControl,
+            libc::msghdr,
+        ) = unsafe { zeroed() };
+        let mut vector = libc::iovec {
+            iov_base: quote.as_mut_ptr().cast(),
+            iov_len: quote.len(),
+        };
+        message.msg_name = (&mut source as *mut libc::sockaddr_in6).cast();
+        message.msg_namelen = size_of_val(&source) as _;
+        message.msg_iov = &mut vector;
+        message.msg_iovlen = 1;
+        message.msg_control = (&mut control as *mut ErrorControl).cast();
+        message.msg_controllen = size_of_val(&control) as _;
+        // SAFETY: the initialized message describes live, correctly sized output buffers.
+        let length = unsafe {
+            libc::recvmsg(
+                self.socket.as_raw_fd(),
+                &mut message,
+                libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+            )
+        };
+        if length < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let Some((mtu, local)) = mtu_error(&message, &control) else {
+            return Ok(None);
+        };
+        if message.msg_namelen as usize != size_of_val(&source)
+            || source.sin6_family != libc::AF_INET6 as libc::sa_family_t
+        {
+            return Ok(None);
+        }
+        Ok(Some(MtuError {
+            mtu,
+            local,
+            destination: SocketAddrV6::new(
+                Ipv6Addr::from(source.sin6_addr.s6_addr),
+                u16::from_be(source.sin6_port),
+                source.sin6_flowinfo,
+                source.sin6_scope_id,
+            ),
+            quote_len: (length as usize).min(quote.len()),
+            quote,
+        }))
+    }
+
     /// Whether GSO attempts remain enabled; support is learned on actual sends.
     pub fn gso_enabled(&self) -> bool {
         self.gso.load(Ordering::Relaxed)
@@ -368,7 +469,7 @@ impl TransmitSocket {
     ///
     /// All entries must fit the supplied 1232..=8952-byte lane limit. Adjacent
     /// equal-sized datagrams (with an optional shorter last one) share a GSO
-    /// message without payload copies. Capability/path errors disable GSO and
+    /// message without payload copies. Offload capability errors disable GSO and
     /// retry through ordinary sendmmsg. Partial results count logical datagrams,
     /// never GSO messages; retain the unsent suffix with its packet identities.
     /// Each call submits at most 1024 slices, possibly shortening the batch.
@@ -390,6 +491,28 @@ impl TransmitSocket {
     }
 }
 
+fn mtu_error(message: &libc::msghdr, control: &ErrorControl) -> Option<(u32, bool)> {
+    // SAFETY: only computes the minimum ABI length for the fixed error record.
+    let minimum = unsafe { libc::CMSG_LEN(size_of::<libc::sock_extended_err>() as _) } as usize;
+    let length = control.header.cmsg_len as usize;
+    if message.msg_flags & libc::MSG_CTRUNC != 0
+        || length < minimum
+        || length > message.msg_controllen as usize
+        || message.msg_controllen as usize > size_of::<ErrorControl>()
+        || control.header.cmsg_level != libc::IPPROTO_IPV6
+        || control.header.cmsg_type != libc::IPV6_RECVERR
+        || control.error.ee_errno != libc::EMSGSIZE as u32
+    {
+        return None;
+    }
+    let error = &control.error;
+    match (error.ee_origin, error.ee_type, error.ee_code) {
+        (libc::SO_EE_ORIGIN_LOCAL, 0, 0) => Some((error.ee_info, true)),
+        (libc::SO_EE_ORIGIN_ICMP6, 2, 0) => Some((error.ee_info, false)),
+        _ => None,
+    }
+}
+
 impl AsFd for TransmitSocket {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.socket.as_fd()
@@ -399,7 +522,7 @@ impl AsFd for TransmitSocket {
 fn offload_unavailable(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
-        Some(libc::ENOPROTOOPT | libc::EOPNOTSUPP | libc::EINVAL | libc::EIO | libc::EMSGSIZE)
+        Some(libc::ENOPROTOOPT | libc::EOPNOTSUPP | libc::EINVAL | libc::EIO)
     )
 }
 
@@ -818,6 +941,10 @@ mod tests {
                 .raw_os_error(),
             Some(libc::EMSGSIZE)
         );
+        assert!(
+            tx.gso_enabled(),
+            "an MTU error is not an offload capability failure"
+        );
         assert_eq!(
             rx.recv(&mut [0; 32]).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
@@ -832,6 +959,94 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
+    }
+
+    #[test]
+    fn discovery_preserves_dontfrag_and_reads_local_mtu_errors_without_payload() {
+        let rx = receiver();
+        let mut tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
+        tx.enable_mtu_discovery().unwrap();
+        assert_eq!(
+            option(tx.as_fd(), libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG),
+            1
+        );
+        assert_eq!(
+            option(tx.as_fd(), libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER),
+            libc::IPV6_PMTUDISC_PROBE
+        );
+        assert_eq!(
+            option(tx.as_fd(), libc::IPPROTO_IPV6, libc::IPV6_RECVERR),
+            1
+        );
+        set_int(&tx.socket, libc::IPPROTO_IPV6, libc::IPV6_MTU, 1280).unwrap();
+        assert_eq!(
+            tx.send(&[0; 1452], 1452).unwrap_err().raw_os_error(),
+            Some(libc::EMSGSIZE)
+        );
+        let error = tx
+            .recv_mtu_error()
+            .unwrap()
+            .expect("missing local size error");
+        assert!(error.local);
+        assert_eq!(error.mtu, 1280);
+        assert_eq!(error.destination, rx.local_addr());
+        assert!(error.quoted_payload().is_empty());
+        assert!(matches!(tx.recv_mtu_error(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+        tx.send(&[1; BASE_UDP_PAYLOAD], BASE_UDP_PAYLOAD).unwrap();
+        let mut bytes = [0; MAX_UDP_PAYLOAD];
+        assert_eq!(rx.recv(&mut bytes).unwrap().0, BASE_UDP_PAYLOAD);
+        assert_eq!(&bytes[..BASE_UDP_PAYLOAD], &[1; BASE_UDP_PAYLOAD]);
+    }
+
+    #[test]
+    fn mtu_error_metadata_rejects_truncation_wrong_kinds_and_short_records() {
+        // SAFETY: zeroed ancillary records and msghdr are valid initialized storage.
+        let (mut control, mut message): (ErrorControl, libc::msghdr) = unsafe { zeroed() };
+        let minimum = unsafe { libc::CMSG_LEN(size_of::<libc::sock_extended_err>() as _) } as usize;
+        assert_eq!(
+            std::mem::offset_of!(ErrorControl, error),
+            unsafe { libc::CMSG_LEN(0) } as usize
+        );
+        message.msg_controllen = size_of::<ErrorControl>() as _;
+        control.header.cmsg_len = minimum as _;
+        control.header.cmsg_level = libc::IPPROTO_IPV6;
+        control.header.cmsg_type = libc::IPV6_RECVERR;
+        control.error.ee_errno = libc::EMSGSIZE as u32;
+        control.error.ee_origin = libc::SO_EE_ORIGIN_ICMP6;
+        control.error.ee_type = 2;
+        control.error.ee_info = 1500;
+        assert_eq!(mtu_error(&message, &control), Some((1500, false)));
+        for length in 0..minimum {
+            control.header.cmsg_len = length as _;
+            assert_eq!(mtu_error(&message, &control), None);
+        }
+        control.header.cmsg_len = minimum as _;
+        for length in [0, minimum - 1, size_of::<ErrorControl>() + 1, usize::MAX] {
+            message.msg_controllen = length as _;
+            assert_eq!(mtu_error(&message, &control), None);
+        }
+        message.msg_controllen = size_of::<ErrorControl>() as _;
+        message.msg_flags = libc::MSG_CTRUNC;
+        assert_eq!(mtu_error(&message, &control), None);
+        message.msg_flags = libc::MSG_TRUNC;
+        assert_eq!(mtu_error(&message, &control), Some((1500, false)));
+        for (origin, kind, code) in [
+            (libc::SO_EE_ORIGIN_ICMP, 3, 4),
+            (libc::SO_EE_ORIGIN_ICMP6, 1, 0),
+            (libc::SO_EE_ORIGIN_ICMP6, 2, 1),
+            (libc::SO_EE_ORIGIN_LOCAL, 2, 0),
+        ] {
+            control.error.ee_origin = origin;
+            control.error.ee_type = kind;
+            control.error.ee_code = code;
+            assert_eq!(mtu_error(&message, &control), None);
+        }
+        control.error.ee_origin = libc::SO_EE_ORIGIN_LOCAL;
+        control.error.ee_type = 0;
+        control.error.ee_code = 0;
+        assert_eq!(mtu_error(&message, &control), Some((1500, true)));
+        control.error.ee_errno = libc::ECONNREFUSED as u32;
+        assert_eq!(mtu_error(&message, &control), None);
     }
 
     #[test]

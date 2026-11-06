@@ -1895,3 +1895,25 @@ enough datagrams to cross the GSO aggregate limit. That fixture correction
 does not establish an overload plateau. Larger production queues remain an
 option when controlled measurements demonstrate a gain within the memory
 budget; the performance gaps above remain open.
+
+
+## MTU socket errors and GSO retention, November 6
+
+EMSGSIZE previously disabled GSO for the socket before retrying the same
+datagrams. An oversized discovery probe would therefore disable offloads for
+later traffic. Size errors now return directly and preserve GSO; capability
+errors retain the ordinary-send fallback. This is a verified failure mode for
+MTU probing, not an attribution for the earlier throughput collapse.
+
+Explicit socket discovery setup now enables nonfragmenting probes above a
+learned PMTU and exposes bounded error-queue reads. A release-build kernel test
+injects an ICMPv6 Packet Too Big message quoting an actual 9000-byte packet,
+verifies the retained protocol header and 1500-byte cached PMTU, then sends
+9000-byte probes after enabling discovery. It also verifies local reduction to
+1400, recovery to 9000, retained GSO, and packet captures without Fragment
+headers. All changes occur in a disposable network namespace.
+
+The release/all-features suite, Rust 1.89 all-target check and Clippy pass.
+Workers still need the probe state machine, feedback validation and error-queue
+integration. No new throughput measurement or acceptance claim accompanies
+these socket changes.
