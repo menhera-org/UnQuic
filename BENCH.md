@@ -34,7 +34,7 @@ L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 | At least 20 Gbit/s each way at inner MTU 1500 | The UDP-only local-lane build delivers 16.50 / 16.45 Gbit/s unlimited over 60 seconds with eight workers and 500-entry test TAP queues, from 28.39 / 27.71 Gbit/s offered; a prior 20-second pair reached 17.95 / 17.07 | Still about 1.21× / 1.22× short in the longer pair. TCP super-frame input remains unfinished. |
 | Goodput must plateau under excess traffic | The 60-second UDP-only pair declines 0.45% L→R under unlimited load | Shorter test queues reduce the long tail but do not establish a plateau: earlier left-side repeats lose 2–3%. With 10,000-entry queues, one pair loses 8.3%. Repeated longer runs, tagged/mixed traffic and more flows/sessions remain unverified. |
 | Small-frame overload must remain efficient | The UDP-only local-lane build delivers 6.05M / 6.08M 64-byte frames/s with eight workers | The local-lane paced/unlimited sweep improves under overload, with high loss. Mixed and non-coalescible traffic still need coverage. |
-| VLAN-heavy deployment | Current throughput sweeps use untagged IP frames. Input UDP segmentation and lane selection parse VLAN tags, but TAP output UDP coalescing currently accepts only untagged IPv4/IPv6 | Tagged frames take the ordinary output path. Benchmark 802.1Q and QinQ as primary workloads and extend checked coalescing before claiming representative throughput. |
+| VLAN-heavy deployment | Checked output coalescing now handles one or two tags. Single-tag delivery reaches 16.00 / 15.53 Gbit/s paced; QinQ reaches 6.19 / 6.03 | Single-tag overload still declines. QinQ concentrates TAP input on one worker per daemon; lane distribution needs a controlled comparison. These short runs do not pass the throughput gate. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
 | Use larger confirmed path MTUs | The runtime accepts a per-peer 1232–1452-byte payload assertion; a controlled 1452-byte sweep shows only a modest change | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. Configured capacity is not confirmed PMTU. |
@@ -1741,3 +1741,78 @@ Admission pressure and worker queue drops remain zero. Invalid, duplicate,
 out-of-window and wrong-run receiver records and outer fragmentation counters
 are zero. Higher CPU and socket/TAP drops accompany overload; the counters
 do not prove which cost causes the remaining decline.
+
+## VLAN and QinQ output coalescing
+
+The runtime now coalesces compatible UDP frames behind up to two
+802.1Q/802.1ad tags. It checks IP/UDP offsets after the tag stack and preserves
+every tag byte, including PCP/DEI. The existing checksum checks, same-flow
+barriers, aggregate bounds and ordinary-write fallback remain. The change
+adds eight stack bytes for headers and no allocation, lock or syscall.
+
+The kernel test compares single writes and coalesced writes byte for byte
+across a veth for IPv4/IPv6, zero/one/two tags, 1/2/43/44 frames, short final
+segments and IPv4 ID wrap. Ancillary VLAN metadata is reconstructed during
+capture. It also compares input expansion against Linux segmentation.
+Pure tests reject every truncation, bad UDP checksums and excess tag depth.
+
+The harness accepts `VLAN_DEPTH=0|1|2` and creates actual VLAN uppers inside
+the test namespaces. Frame size includes tags: use 1518 or 1522 for a
+1500-byte inner IP packet. The Rust generator requires at least 16 payload
+bytes, so a 64-byte double-tagged test must use a larger frame or another
+generator. The original untagged default remains available for controls.
+
+### Controlled tagged release comparison
+
+[All eight observations](benches/tap-vlan-coalescing.json) use eight workers
+per daemon, 16 flows each way, 20 seconds per point, 44-segment sends,
+500-entry TAP queues and the same 20-core placement as the preceding runs.
+The 1452-byte outer payload is a controlled diagnostic setting, not evidence
+of PMTU. The final runtime must probe available sizes rather than assume
+that setting or a 1500-byte access path.
+
+| Tags / build | Request Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 / before | 21 | 20.709 / 20.512 | 5.260 / 5.100 | 74.15 / 74.71 | 697.0 / 705.1 |
+| 1 / before | unlimited | 29.979 / 31.594 | 5.036 / 4.962 | 82.92 / 84.05 | 766.2 / 774.7 |
+| 1 / after | 21 | 20.796 / 20.730 | 16.003 / 15.530 | 22.15 / 24.20 | 620.2 / 621.0 |
+| 1 / after | unlimited | 26.949 / 27.623 | 15.477 / 15.335 | 41.88 / 43.81 | 672.3 / 677.7 |
+| 2 / before | 21 | 20.787 / 20.929 | 2.714 / 2.815 | 86.79 / 86.40 | 197.9 / 196.7 |
+| 2 / before | unlimited | 51.875 / 52.143 | 2.684 / 2.641 | 94.77 / 94.88 | 197.8 / 197.3 |
+| 2 / after | 21 | 20.952 / 20.905 | 6.193 / 6.030 | 70.12 / 70.85 | 196.4 / 195.7 |
+| 2 / after | unlimited | 52.916 / 53.332 | 6.173 / 6.276 | 88.21 / 88.10 | 197.6 / 196.1 |
+
+Single-tag paced TAP writes fall from 18.65M / 19.54M to 2.91M / 3.09M
+over the observation windows. Delivery improves about threefold while
+daemon CPU falls. The new unlimited point still declines 3.28% / 1.25%
+from paced delivery; this is not a verified plateau.
+
+QinQ gains roughly 2.2–2.4 times in delivery, but uses only about two cores
+per daemon. Worker counters show virtually all TAP input on one queue, with
+the corresponding traffic on one transmit lane. The current worker-local
+selection therefore leaves most transmit workers unused in this workload.
+Compare strict hashing before changing that policy; the profile does not
+prove that it will remove the reader bottleneck.
+
+| Tags / build / request | TAP TX drops (SKBs) | Transport socket overflow (SKBs) | Inner UDP errors | Expired frames |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / before / 21 | 258039 / 238219 | 763077 / 574088 | 9834632 / 10446166 | 1 / 6 |
+| 1 / before / unlimited | 571544 / 612037 | 958237 / 773411 | 11034315 / 11384284 | 10 / 7 |
+| 1 / after / 21 | 66518 / 47819 | 823101 / 579611 | 18110 / 57234 | 0 / 0 |
+| 1 / after / unlimited | 307190 / 316058 | 858952 / 745180 | 27425 / 14276 | 0 / 5 |
+| 2 / before / 21 | 446475 / 434769 | 289525 / 274906 | 153 / 155 | 0 / 0 |
+| 2 / before / unlimited | 1646926 / 1645772 | 290259 / 275767 | 131 / 0 | 0 / 0 |
+| 2 / after / 21 | 468678 / 443076 | 141481 / 108227 | 0 / 70 | 0 / 0 |
+| 2 / after / unlimited | 1697604 / 1699383 | 125753 / 114495 | 69 / 14 | 0 / 0 |
+
+All eight points have zero worker admission pressure and queue drops, zero
+invalid/duplicate/out-of-window/wrong-run receiver records, and zero outer
+fragmentation. These drop counters use different units and cannot be summed
+into an exact logical-frame loss attribution.
+
+The release suite, all 18 serial kernel library tests, foundation,
+reconnect/allocation, CLI and both load-tool kernel tests pass, as do
+Clippy, formatting and Rust 1.89 checks. The first parallel kernel run
+failed two process-wide descriptor-count assertions; the serial run passed.
+The tagged coalescing test passed in both runs. No instrumentation remains
+in the production binary.

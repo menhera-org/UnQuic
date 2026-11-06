@@ -342,9 +342,9 @@ now run against the real implementation in tests/reassembly.rs.
 VLAN-tagged frames are the expected deployment workload; untagged IP is a
 control case. Prioritize 802.1Q/QinQ throughput and overload sweeps during
 stage 2, including tags materialized by Linux TAP. Input segmentation and
-lane selection already parse tags, but output UDP coalescing currently falls
-back for tagged frames. Extend that checked path and its kernel regressions;
-keep VID, PCP/DEI, stacked tags, frame limits and per-flow ordering intact.
+lane selection parse tags. Output UDP coalescing now preserves up to two
+802.1Q/802.1ad tags, with byte-exact kernel tests for both IP versions.
+Keep VID, PCP/DEI, stacked tags, frame limits and per-flow ordering intact.
 Do not defer this performance coverage to the stage 4 composition matrix.
 
 - `socket.rs`: `recv_batch` with `recvmmsg`, `send_batch` with `sendmmsg`,
@@ -421,6 +421,10 @@ README.md documents the baseline send-error behavior.
 - Repair: selective byte-range repair with the two-repair limit, sender
   deadline `clamp(4 * srtt, 20 ms, 100 ms)`, FRAME_ABANDON origin 0 and 1
   with 100 ms lifetime and two retries, LANE_RETIRE with tombstone bits.
+- Do not assume an access-line MTU from the audit or a local benchmark. Active
+  probing must confirm usable sizes and detect reductions; configured limits
+  are constraints, not discovery. This requirement supersedes audit A5's
+  fixed-size recommendation for the final runtime.
 - `pmtu.rs`: RFC 8899 per lane from the 1232-byte UDP baseline, using larger
   confirmed path MTUs including above 1500 outer bytes. Expand the current
   1452-byte socket API and receive-validation ceilings together, within wire

@@ -4,7 +4,7 @@
 set -eu
 [ "$#" -eq 5 ] || { echo "usage: $0 DAEMON FRAME_BYTES FLOWS SECONDS OUT" >&2; exit 2; }
 case "$1" in /*) ;; *) echo "DAEMON must be an absolute path" >&2; exit 2;; esac
-case "$2" in 60|64|128|1514) ;; *) echo "frame size must be 60, 64, 128 or 1514" >&2; exit 2;; esac
+case "$2" in 60|64|128|1514|1518|1522) ;; *) echo "frame size must be 60, 64, 128, 1514, 1518 or 1522" >&2; exit 2;; esac
 for number in "$3" "$4"; do
     case "$number" in ''|*[!0-9]*) exit 2;; esac
     [ "$number" -ge 1 ] && [ "$number" -le 60 ] || exit 2
@@ -13,8 +13,13 @@ case "${OUTER_PAYLOAD_LIMIT:-1232}" in ''|*[!0-9]*) exit 2;; esac
 [ "${OUTER_PAYLOAD_LIMIT:-1232}" -ge 1232 ] && [ "${OUTER_PAYLOAD_LIMIT:-1232}" -le 1452 ] || exit 2
 case "${TAP_TXQUEUELEN:-10000}" in ''|*[!0-9]*) exit 2;; esac
 [ "${TAP_TXQUEUELEN:-10000}" -ge 1 ] && [ "${TAP_TXQUEUELEN:-10000}" -le 10000 ] || exit 2
+case "${VLAN_DEPTH:-0}" in 0|1|2) ;; *) echo "VLAN_DEPTH must be 0, 1 or 2" >&2; exit 2;; esac
+[ "$2" -le "$((1514 + 4 * ${VLAN_DEPTH:-0}))" ] || exit 2
 case "${WORKERS:-4}" in 4|8) ;; *) echo "WORKERS must be 4 or 8" >&2; exit 2;; esac
 case "${UDP_LOAD:-}" in ''|/*) ;; *) echo "UDP_LOAD must be an absolute path" >&2; exit 2;; esac
+if [ -n "${UDP_LOAD:-}" ]; then
+    [ "$2" -ge "$((58 + 4 * ${VLAN_DEPTH:-0}))" ] || { echo "UDP_LOAD needs 16 payload bytes after tags" >&2; exit 2; }
+fi
 case "${BITRATE:-0}" in
     *[[:space:]]*)
         mkdir "$5"
@@ -32,6 +37,7 @@ exec unshare -m -n --propagation private sh -s -- "$@" <<'BENCH'
 set -eu
 daemon=$1
 frame=$2
+payload=$((frame - 42 - 4 * ${VLAN_DEPTH:-0}))
 flows=$3
 seconds=$4
 out=$(cd "$5" && pwd)
@@ -113,11 +119,21 @@ for side in left right; do
     netip "uq-$side" link set lo up
     netip "uq-$side" link set "uq-$side" txqueuelen "${TAP_TXQUEUELEN:-10000}"
     netip "uq-$side" link set "uq-$side" up
+    data="uq-$side"
+    if [ "${VLAN_DEPTH:-0}" = 2 ]; then
+        netip "uq-$side" link add link "$data" name uq-outer type vlan protocol 802.1ad id 42
+        netip "uq-$side" link set uq-outer up
+        data=uq-outer
+    fi
+    if [ "${VLAN_DEPTH:-0}" != 0 ]; then
+        netip "uq-$side" link add link "$data" name uq-data type vlan id 7
+        netip "uq-$side" link set uq-data mtu 1500 up
+        data=uq-data
+    fi
+    if [ "$side" = left ]; then local=1; remote=2; else local=2; remote=1; fi
+    netip "uq-$side" addr add "10.77.0.$local/24" dev "$data"
+    netip "uq-$side" neigh add "10.77.0.$remote" lladdr "02:00:00:00:00:0$remote" nud permanent dev "$data"
 done
-netip uq-left addr add 10.77.0.1/24 dev uq-left
-netip uq-right addr add 10.77.0.2/24 dev uq-right
-netip uq-left neigh add 10.77.0.2 lladdr 02:00:00:00:00:02 nud permanent dev uq-left
-netip uq-right neigh add 10.77.0.1 lladdr 02:00:00:00:00:01 nud permanent dev uq-right
 for side in left right; do
     attempts=0
     until netip "uq-$side" -o link show "uq-$side" | grep -q LOWER_UP; do
@@ -158,6 +174,8 @@ fi
 printf '%s\n' "${DAEMON_LEFT_CPUS:-0-$((workers - 1))}" "${DAEMON_RIGHT_CPUS:-$workers-$((workers * 2 - 1))}" > "$out/daemon-cpus"
 printf '%s\n' "$GENERATOR_LEFT_CPUS" "$RECEIVER_LEFT_CPUS" \
     "$GENERATOR_RIGHT_CPUS" "$RECEIVER_RIGHT_CPUS" > "$out/generator-cpus"
+printf '%s\n' "${VLAN_DEPTH:-0}" > "$out/vlan-depth"
+printf '%s\n' "$frame" > "$out/frame-bytes"
 base=$out
 index=0
 for rate in ${BITRATE:-0}; do
@@ -170,19 +188,19 @@ for rate in ${BITRATE:-0}; do
         case "$rate" in *[!0-9]*) echo "UDP_LOAD rates must be integer bits/s per flow" >&2; exit 2;; esac
         run=$((index + 1))
         nsenter --net=/run/netns/uq-right taskset -c "$RECEIVER_RIGHT_CPUS" "$UDP_LOAD" recv \
-            10.77.0.2 10.77.0.1 52000 51000 "$flows" "$((frame - 42))" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/server.json" &
+            10.77.0.2 10.77.0.1 52000 51000 "$flows" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/server.json" &
         server=$!
         nsenter --net=/run/netns/uq-left taskset -c "$RECEIVER_LEFT_CPUS" "$UDP_LOAD" recv \
-            10.77.0.1 10.77.0.2 52000 51000 "$flows" "$((frame - 42))" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/reverse-server.json" &
+            10.77.0.1 10.77.0.2 52000 51000 "$flows" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/reverse-server.json" &
         reverse_server=$!
         sleep 0.2
         kill -0 "$server" && kill -0 "$reverse_server" || exit 1
         snapshot before
         nsenter --net=/run/netns/uq-left taskset -c "$GENERATOR_LEFT_CPUS" "$UDP_LOAD" send \
-            10.77.0.1 10.77.0.2 51000 52000 "$flows" "$((frame - 42))" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/client.json" &
+            10.77.0.1 10.77.0.2 51000 52000 "$flows" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/client.json" &
         client=$!
         nsenter --net=/run/netns/uq-right taskset -c "$GENERATOR_RIGHT_CPUS" "$UDP_LOAD" send \
-            10.77.0.2 10.77.0.1 51000 52000 "$flows" "$((frame - 42))" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/reverse-client.json" &
+            10.77.0.2 10.77.0.1 51000 52000 "$flows" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/reverse-client.json" &
         reverse_client=$!
     else
         nsenter --net=/run/netns/uq-right taskset -c "$RECEIVER_RIGHT_CPUS" iperf3 -s -1 -J > "$out/server.json" &
@@ -192,11 +210,11 @@ for rate in ${BITRATE:-0}; do
         sleep 0.2
         snapshot before
         nsenter --net=/run/netns/uq-left taskset -c "$GENERATOR_LEFT_CPUS" iperf3 -c 10.77.0.2 -u -b "$rate" --dont-fragment \
-            -l "$((frame - 42))" -P "$flows" --cport 51000 -t "$seconds" -J \
+            -l "$payload" -P "$flows" --cport 51000 -t "$seconds" -J \
             --connect-timeout 3000 > "$out/client.json" &
         client=$!
         nsenter --net=/run/netns/uq-right taskset -c "$GENERATOR_RIGHT_CPUS" iperf3 -c 10.77.0.1 -u -b "$rate" --dont-fragment \
-            -l "$((frame - 42))" -P "$flows" --cport 51000 -t "$seconds" -J \
+            -l "$payload" -P "$flows" --cport 51000 -t "$seconds" -J \
             --connect-timeout 3000 > "$out/reverse-client.json" &
         reverse_client=$!
     fi

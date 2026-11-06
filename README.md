@@ -396,8 +396,9 @@ Ethernet frames on the input's selected lane, with unchanged packet-admission ru
 
 A receive flush may combine already-complete UDP frames into one USO
 `writev`, borrowing their payloads directly from reassembly slots. Supported
-frames are untagged IPv4 without options, with DF set, or plain IPv6 without
-extension headers. IP/UDP lengths and checksums must be valid; UDP checksums
+frames contain IPv4 without options, with DF set, or IPv6 without extension
+headers, optionally behind one or two 802.1Q/802.1ad tags. The complete VLAN
+stack, including VID and PCP/DEI, must match and is preserved. IP/UDP lengths and checksums must be valid; UDP checksums
 must be present. Headers must match apart from lengths, checksums and consecutive
 IPv4 IDs. The final payload may be shorter. Other frames use ordinary writes.
 

@@ -33,7 +33,7 @@ fn receive(capture: &OwnedFd) -> Vec<u8> {
     let mut bytes = vec![0; 65536];
     let mut length = 0;
     wait_for(|| {
-        let Some(n) = raw_read(capture, &mut bytes) else {
+        let Some(n) = capture_frame(capture, &mut bytes) else {
             return false;
         };
         // Ignore bridge multicast reports, which use a different source MAC.
@@ -92,83 +92,109 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
         completed_checksums: 0,
     };
     let capture = raw_socket(c"uq-v1", libc::ETH_P_ALL as u16);
-    for v6 in [false, true] {
-        let size = if v6 { 1432 } else { 1472 };
-        for count in [1, 2, 43, 44] {
-            for short in [false, true] {
-                let payloads: Vec<_> = (0..count)
-                    .map(|i| {
-                        let len = if short && i + 1 == count { 1 } else { size };
-                        (0..len).map(|b| (i * 13 + b * 7) as u8).collect::<Vec<_>>()
-                    })
-                    .collect();
-                let expected: Vec<_> = payloads
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| frame(v6, 65520u16.wrapping_add(i as u16), p))
-                    .collect();
-                for p in &expected {
-                    tap.write_frame(p).unwrap();
-                    assert_eq!(receive(&capture), *p, "single frame changed");
-                }
-                let frames: Vec<_> = expected.iter().map(Vec::as_slice).collect();
-                let (mask, result) = tap.write_batch(frames.iter().copied());
-                let expected_mask = (1_u64 << count) - 1;
-                assert_eq!(mask, expected_mask);
-                assert_eq!(
-                    result.unwrap(),
-                    expected.iter().map(Vec::len).sum::<usize>()
-                );
-                for (i, p) in expected.iter().enumerate() {
-                    let got = receive(&capture);
-                    assert_eq!(
-                        got.len(),
-                        p.len(),
-                        "v6={v6} count={count} short={short} segment={i}"
-                    );
-                    if got != *p {
-                        let changes: Vec<_> = got
-                            .iter()
-                            .zip(p)
-                            .enumerate()
-                            .filter(|(_, (a, b))| a != b)
-                            .map(|(n, (a, b))| (n, *a, *b))
-                            .collect();
-                        panic!(
-                            "v6={v6} count={count} short={short} segment={i} changed bytes {changes:?}"
-                        );
+    // SAFETY: the packet socket option borrows one initialized integer.
+    check(unsafe {
+        libc::setsockopt(
+            capture.as_raw_fd(),
+            libc::SOL_PACKET,
+            libc::PACKET_AUXDATA,
+            (&1i32 as *const i32).cast(),
+            std::mem::size_of::<i32>() as _,
+        )
+    });
+    for tags in [
+        &[][..],
+        &[0x81, 0, 0xb0, 7][..],
+        &[0x88, 0xa8, 0xd0, 11, 0x81, 0, 0x70, 7][..],
+    ] {
+        for v6 in [false, true] {
+            let size = if v6 { 1432 } else { 1472 };
+            for count in [1, 2, 43, 44] {
+                for short in [false, true] {
+                    let payloads: Vec<_> = (0..count)
+                        .map(|i| {
+                            let len = if short && i + 1 == count { 1 } else { size };
+                            (0..len).map(|b| (i * 13 + b * 7) as u8).collect::<Vec<_>>()
+                        })
+                        .collect();
+                    let expected: Vec<_> = payloads
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| {
+                            let mut bytes = frame(v6, 65520u16.wrapping_add(i as u16), p);
+                            bytes.splice(12..12, tags.iter().copied());
+                            bytes
+                        })
+                        .collect();
+                    for p in &expected {
+                        tap.write_frame(p).unwrap();
+                        assert_eq!(receive(&capture), *p, "single frame changed");
                     }
+                    let frames: Vec<_> = expected.iter().map(Vec::as_slice).collect();
+                    let (mask, result) = tap.write_batch(frames.iter().copied());
+                    let expected_mask = (1_u64 << count) - 1;
+                    assert_eq!(mask, expected_mask);
+                    assert_eq!(
+                        result.unwrap(),
+                        expected.iter().map(Vec::len).sum::<usize>()
+                    );
+                    for (i, p) in expected.iter().enumerate() {
+                        let got = receive(&capture);
+                        assert_eq!(
+                            got.len(),
+                            p.len(),
+                            "v6={v6} count={count} short={short} segment={i}"
+                        );
+                        if got != *p {
+                            let changes: Vec<_> = got
+                                .iter()
+                                .zip(p)
+                                .enumerate()
+                                .filter(|(_, (a, b))| a != b)
+                                .map(|(n, (a, b))| (n, *a, *b))
+                                .collect();
+                            panic!(
+                                "v6={v6} count={count} short={short} segment={i} changed bytes {changes:?}"
+                            );
+                        }
+                    }
+                    // Compare our expansion with Linux segmentation of the identical metadata.
+                    let payload: Vec<_> = payloads.iter().flatten().copied().collect();
+                    let mut input = frame(v6, 65520, &payload);
+                    let mut header = common::udp::partial(&mut input, v6);
+                    input.splice(12..12, tags.iter().copied());
+                    let at = u16::from_ne_bytes([header[6], header[7]]) + tags.len() as u16;
+                    header[6..8].copy_from_slice(&at.to_ne_bytes());
+                    header[1] = 5;
+                    header[4..6].copy_from_slice(&(size as u16).to_ne_bytes());
+                    let mut segments =
+                        super::Segments::parse(&header, &input, crate::MAX_FRAME_LEN).unwrap();
+                    let iov = [
+                        libc::iovec {
+                            iov_base: header.as_ptr().cast_mut().cast(),
+                            iov_len: header.len(),
+                        },
+                        libc::iovec {
+                            iov_base: input.as_ptr().cast_mut().cast(),
+                            iov_len: input.len(),
+                        },
+                    ];
+                    // SAFETY: writev borrows both initialized buffers for this call.
+                    assert_eq!(
+                        unsafe { libc::writev(tap.fd.as_raw_fd(), iov.as_ptr(), 2) },
+                        (input.len() + 10) as isize
+                    );
+                    let mut output = [0u8; crate::MAX_FRAME_LEN];
+                    for _ in 0..count {
+                        let n = segments.write(&input, &mut output);
+                        assert_eq!(receive(&capture), &output[..n]);
+                    }
+                    assert!(segments.done(input.len()));
+                    println!(
+                        "tags={} v6={v6} count={count} short={short} byte_exact=true",
+                        tags.len() / 4
+                    );
                 }
-                // Compare our expansion with Linux segmentation of the identical metadata.
-                let payload: Vec<_> = payloads.iter().flatten().copied().collect();
-                let mut input = frame(v6, 65520, &payload);
-                let mut header = common::udp::partial(&mut input, v6);
-                header[1] = 5;
-                header[4..6].copy_from_slice(&(size as u16).to_ne_bytes());
-                let mut segments =
-                    super::Segments::parse(&header, &input, crate::MAX_FRAME_LEN).unwrap();
-                let iov = [
-                    libc::iovec {
-                        iov_base: header.as_ptr().cast_mut().cast(),
-                        iov_len: header.len(),
-                    },
-                    libc::iovec {
-                        iov_base: input.as_ptr().cast_mut().cast(),
-                        iov_len: input.len(),
-                    },
-                ];
-                // SAFETY: writev borrows both initialized buffers for this call.
-                assert_eq!(
-                    unsafe { libc::writev(tap.fd.as_raw_fd(), iov.as_ptr(), 2) },
-                    (input.len() + 10) as isize
-                );
-                let mut output = [0u8; crate::MAX_FRAME_LEN];
-                for _ in 0..count {
-                    let n = segments.write(&input, &mut output);
-                    assert_eq!(receive(&capture), &output[..n]);
-                }
-                assert!(segments.done(input.len()));
-                println!("v6={v6} count={count} short={short} byte_exact=true");
             }
         }
     }
