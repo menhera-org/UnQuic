@@ -384,7 +384,8 @@ Do not defer this performance coverage to the stage 4 composition matrix.
 - TAP reads retain the 64-frame budget and strip internal `IFF_VNET_HDR`
   metadata. The runtime enables checksum offload and completes partial checksums
   in place. UDP super-frame input uses bounded userspace segmentation from
-  the existing pool; TCP read offloads remain disabled. Compatible complete
+  the existing pool after one whole-input handoff to the selected lane owner;
+  TCP read offloads remain disabled. Compatible complete
   UDP frames can share a lossless USO TAP write, preserving per-flow order,
   backpressure and the existing receive deadline. Other frames use single writes.
   Workers use bounded nonblocking io_uring read batches when available,

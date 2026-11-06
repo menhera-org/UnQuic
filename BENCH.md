@@ -2267,3 +2267,72 @@ tagged Ethernet, SRH, fragments, depth limits, truncation and non-IP fallback.
 Default and release suites, Clippy and Rust 1.89 checks pass. All 22 library
 kernel tests, the socket/TAP foundation test and both runtime tests pass,
 including allocation checks, reconnect, foreign rename and namespace move.
+
+## Whole-super-frame handoff (2026-11-06)
+
+The TAP reader now hands each retained super-frame to its selected transmit
+owner once. Expansion happens there, with the same 64-frame/64-KiB turn
+budget, original deadline and lane. This removes per-child handoffs and
+moves segmentation work off a busy reader. It still copies each child's
+payload. Input queues remain bounded to 128 entries; one reservation budget
+covers both readers and transmit owners.
+
+[Fourteen release observations](benches/tap-super-frame-handoff.json) compare
+`7895a64` with this change, using the previous section's load tool, CPU
+placement, outer ceiling and 60-second isolation. QinQ uses 1522-byte frames
+and strict hashing; single-tag controls use 1518-byte frames and the existing
+reader-local policy. Both carry 1472-byte UDP payloads.
+
+| Variant / requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| QinQ baseline / 8 | 7.978 / 7.984 | 7.890 / 7.865 | 0.260 / 0.646 | 291.2 / 278.9 |
+| QinQ handoff / 8 | 7.980 / 7.972 | 7.934 / 7.866 | 0.239 / 0.989 | 261.9 / 248.5 |
+| QinQ baseline / 16 | 15.891 / 15.901 | 9.686 / 9.967 | 38.731 / 36.994 | 363.1 / 358.3 |
+| QinQ handoff / 16 | 15.843 / 15.882 | 13.070 / 13.763 | 16.768 / 12.594 | 458.4 / 462.9 |
+| QinQ baseline / 21 | 20.914 / 20.907 | 8.368 / 10.202 | 59.835 / 51.020 | 350.2 / 337.8 |
+| QinQ handoff / 21 | 20.812 / 20.872 | 13.001 / 14.331 | 37.198 / 30.988 | 469.5 / 496.9 |
+| QinQ baseline / unlimited | 51.649 / 49.751 | 9.322 / 10.087 | 81.881 / 79.643 | 364.9 / 346.0 |
+| QinQ handoff / unlimited | 46.432 / 44.295 | 12.999 / 14.146 | 71.840 / 67.880 | 464.3 / 488.7 |
+| Single-tag baseline / 21 | 20.748 / 20.768 | 16.394 / 14.456 | 20.669 / 30.145 | 622.3 / 620.4 |
+| Single-tag handoff / 21 | 20.740 / 20.802 | 15.873 / 14.920 | 23.145 / 27.994 | 624.1 / 628.4 |
+| Single-tag baseline / unlimited | 37.905 / 37.923 | 12.421 / 12.975 | 67.089 / 65.642 | 530.6 / 534.5 |
+| Single-tag handoff / unlimited | 30.416 / 31.475 | 16.049 / 14.867 | 47.028 / 52.578 | 671.2 / 661.1 |
+
+QinQ repeats deliver 13.218 / 13.396 Gbit/s at the 16 Gbit/s request and
+13.546 / 14.000 unlimited, with 459.6 / 458.9% and 471.7 / 488.1% daemon CPU.
+Moving expansion verifies a throughput gain for this workload. At 8 Gbit/s,
+similar delivery uses about 10% less daemon CPU. At higher rates, more workers
+do useful work and total CPU rises. The single-tag unlimited result no longer
+collapses relative to its paced point in this sweep. Neither this sweep nor
+the two QinQ repeats establish the final five-run gate.
+
+Drop attribution at unlimited load, left/right:
+
+| Variant | TAP TX drops (SKBs) | Socket overflow (SKBs) | Inner UDP receive errors | Expired frames |
+| --- | ---: | ---: | ---: | ---: |
+| QinQ baseline | 4891638 / 4569473 | 36402 / 9969 | 1155 / 1324 | 0 / 0 |
+| QinQ handoff | 3835642 / 3162056 | 783383 / 33313 | 6385 / 17616 | 0 / 0 |
+| Single-tag baseline | 2551184 / 2349650 | 2023171 / 966511 | 35759 / 47666 | 14059 / 1348 |
+| Single-tag handoff | 1168292 / 1253968 | 1859603 / 1618021 | 65329 / 97988 | 5702 / 14222 |
+
+The additional QinQ unlimited repeat expires 97160 frames on the right.
+Pressure has shifted from TAP ingress toward socket delivery; loss remains
+far above target. Generator CPU reaches 94–98% in unlimited runs. Receiver
+CPU reaches 76–81% for QinQ and 84–88% for single-tag traffic.
+
+QinQ reordering rises from under 0.02% to roughly 9–10% in one direction
+under load; the other stays near 0.2%. The repeat confirms this increase.
+The targeted handoff test preserves source and frame-ID order, but the
+end-to-end cause remains unverified. Single-tag reordering was already high
+and remains about 48–52% under unlimited load. These are unresolved gaps,
+especially for TCP and QUIC; throughput alone does not close them.
+
+All fourteen observations have zero admission-pressure and worker-queue
+drops, invalid/duplicate/out-of-window/wrong-run receiver records, and outer
+fragmentation. The JSON includes per-flow counts, per-worker CPU and every
+drop counter.
+
+Release/default suites, Clippy, Rust 1.89 and formatting pass. All 23 library
+kernel tests and both runtime tests pass. The new handoff regression covers
+44 normal segments, 10000 one-byte segments, a following ordinary frame,
+bounded expansion, full input/return queues, quiesce and reservation return.

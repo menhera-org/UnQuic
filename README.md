@@ -299,9 +299,10 @@ These conservative reservations can reject large configurations before startup.
 
 Fixed receive storage permits at most 4096 frames and 36,954,112 reserved frame
 bytes per session, below the 8192-frame/64-MiB directional ceilings. Transmit
-reservations divide the frame and 64-MiB byte budgets among the session's TAP
-queue owners and also respect their 128-buffer pools. Byte accounting includes
-retained super-frames and their expanded children; reads reserve worst-case
+reservations divide the frame and 64-MiB byte budgets among the union of the
+session's TAP readers and transmit owners, and respect their 128-buffer pools.
+Byte accounting includes retained super-frames and their expanded children;
+reads reserve worst-case
 space and leave one output buffer available for expansion. A reservation lasts until the frame buffer returns to its origin,
 including handoff and return-queue delays. Compile-time bounds and quota tests
 check these limits; no shared reservation lock or atomic is needed.
@@ -420,16 +421,17 @@ read requests (`tap_read_requests`), ring batches (`tap_read_batches`),
 valid ring frames (`tap_ring_frames`) and fallback events
 (`tap_read_fallbacks`). Startup fallback counts belong to workers.
 `tap_checksums` counts completed partial checksums, including segmented outputs.
-`tap_gso_reads` counts retained UDP super-frames and `tap_gso_frames` counts
-the ordinary frames expanded from them.
+`tap_gso_reads` counts retained UDP super-frames on the reader;
+`tap_gso_frames` counts ordinary frames expanded on the transmit owner.
 
 ## TAP write coalescing
 
 TAP queues use an internal 10-byte virtio header. The runtime enables checksum
 offload and completes partial Internet checksums in place after validating the
 metadata bounds. UDP L4 read offloads let the runtime accept host super-frames
-up to 65,535 bytes. It segments these into ordinary Ethernet frames before
-packing; TCP read offloads remain disabled. Older kernels that reject USO
+up to 65,535 bytes. The reader selects the lane and hands the whole input to
+its transmit owner once. That owner segments it into ordinary Ethernet frames
+before packing; TCP read offloads remain disabled. Older kernels that reject USO
 use checksum-only reads and kernel segmentation. Standalone `Tap::create`
 keeps read offloads disabled until runtime setup.
 
