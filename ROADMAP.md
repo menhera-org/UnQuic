@@ -339,6 +339,14 @@ The final throughput gate remains open. Partial completion, GSO/GRO boundaries, 
 and allocation checks pass. The five frame-model regression cases
 now run against the real implementation in tests/reassembly.rs.
 
+VLAN-tagged frames are the expected deployment workload; untagged IP is a
+control case. Prioritize 802.1Q/QinQ throughput and overload sweeps during
+stage 2, including tags materialized by Linux TAP. Input segmentation and
+lane selection already parse tags, but output UDP coalescing currently falls
+back for tagged frames. Extend that checked path and its kernel regressions;
+keep VID, PCP/DEI, stacked tags, frame limits and per-flow ordering intact.
+Do not defer this performance coverage to the stage 4 composition matrix.
+
 - `socket.rs`: `recv_batch` with `recvmmsg`, `send_batch` with `sendmmsg`,
   UDP GSO via `UDP_SEGMENT` and GRO via `UDP_GRO` with runtime detection and
   a fallback path that stays correct. On GRO receive, split by the returned

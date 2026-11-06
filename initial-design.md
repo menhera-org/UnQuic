@@ -310,6 +310,11 @@ Avoid assuming every frame is host-generated TCP. Forwarded Ethernet frames, inn
 
 Preserve source/destination MAC addresses, EtherType or length fields, payload, VLAN tags, and frame boundaries. Do not rewrite MAC addresses to the TAP's own address. Support IEEE 802.3/LLC traffic such as IS-IS and normal multicast and broadcast behavior.
 
+VLAN-tagged frames are the normal deployment workload; untagged IP-containing
+frames are uncommon. Performance validation must use tagged traffic as a
+primary case, including single-tag and stacked-tag paths, rather than infer
+its throughput from untagged-IP results.
+
 Support 802.1Q and 802.1ad tags, including stacked tags and PCP/DEI bits. The Linux TAP path can materialize a VLAN tag from skb metadata into the bytes returned to userspace; tests must exercise this path rather than assuming all tags were already in-line. [S14]
 
 Distinguish inner interface MTU, ordinary Ethernet-frame size, and an offloaded GSO object. MTU 2400 corresponds to 2414 bytes without VLAN tags and 2422 bytes with two tags, excluding FCS. Account separately for TAP metadata. Negotiate and enforce frame and aggregate limits; v1 supports MTU up to 9000 and up to two VLAN tags within its 9022-byte frame ceiling.
