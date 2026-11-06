@@ -6,9 +6,10 @@ slabs, with per-lane FIFOs and zero-copy ownership exchange. A rejected
 global-queue prototype exposed a separate severe QinQ collapse; the FIFO
 regression reproduces its frame-order inversion and verifies the fix.
 
-The latest ACK-enabled 60-second QinQ sweep delivers 8.04 / 17.65 Gbit/s
-at 21 Gbit/s requested each way, then 7.83 / 16.89 unlimited: declines of
-2.6% and 4.3%. The matched pre-ACK build is also strongly asymmetric.
+The latest 60-second QinQ sweep with bounded transmit expiry delivers
+7.76 / 16.70 Gbit/s at 21 Gbit/s requested each way, then 7.55 / 17.21
+unlimited: a 2.7% forward decline and a 3.1% reverse increase.
+Matched builds remain strongly asymmetric.
 Earlier pre-ACK sweeps reached higher rates with another kernel build and TAP queue placement.
 No workload proves a universal plateau or the theoretical CPU ceiling.
 
@@ -21,10 +22,11 @@ scheduling and admission problems.
 
 ## Current performance gaps
 
-The ACK-enabled release passes forwarding/restart and allocation checks,
-plus control-pressure and stale-feedback regression tests. The new matched
-release comparison below measures higher CPU use and a remaining overload
-decline. Earlier storage/batching sweeps predate ACK emission.
+The latest release passes forwarding/restart and allocation checks,
+plus control-pressure, stale-feedback and bounded transmit-expiry regressions.
+The new matched expiry comparison establishes no general throughput gain and
+still has a forward overload decline. Earlier storage/batching sweeps predate
+ACK emission.
 Frame-view allocations now follow actual per-worker quotas instead of reserving
 8192 slots on every worker. This reduces reserved metadata; it does not establish
 a goodput gain or change the session retention limits.
@@ -37,8 +39,8 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | ACK-enabled QinQ: 8.04 / 17.65 Gbit/s paced, 7.83 / 16.89 unlimited. Earlier pre-ACK QinQ: 16.68 / 14.43 paced, 20.63 / 13.47 unlimited | Neither build passes both directions. ACK-enabled paced missing fractions are 61.49 / 15.47%, far above the under-1% gate. Five successful repeats are absent. |
-| Goodput must plateau under excess traffic | ACK-enabled QinQ declines 2.6 / 4.3% from 21G to unlimited; the 16G return delivers 7.77 / 14.81 versus 8.16 / 14.84 initially | The severe prototype collapse is fixed, but the remaining decline is unresolved. Bounded foreign-source batching and larger receive groups reduce syscalls; reader/receive scheduling still needs attribution. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Latest QinQ: 7.76 / 16.70 Gbit/s paced, 7.55 / 17.21 unlimited. Earlier pre-ACK QinQ: 16.68 / 14.43 paced, 20.63 / 13.47 unlimited | Neither build passes both directions. Latest paced missing fractions are 62.84 / 20.08%, far above the under-1% gate. Five successful repeats are absent. |
+| Goodput must plateau under excess traffic | Latest QinQ declines 2.7% forward and rises 3.1% reverse from 21G to unlimited; the 16G return delivers 7.63 / 14.71 versus 7.76 / 14.88 initially | The severe prototype collapse is fixed, but the remaining decline is unresolved. Bounded foreign-source batching and larger receive groups reduce syscalls; reader/receive scheduling still needs attribution. |
 | Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Current QinQ reports zero reordering; single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
@@ -53,6 +55,66 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## Bounded transmit expiry (November 6)
+
+[Twelve release observations](benches/tap-expiry.json) compare `edf2513`
+with `ad17f54` (indexed transmit expiry) and include an intermediate heap prototype.
+The final change bounds cleanup to 64 expired frame views per worker turn,
+including prepared batches, and defers remaining expired data without sending
+it. Exact deadlines replace repeated scans of all retained frames. Heap
+updates visit at most 13 levels; pending-queue removal is constant-time.
+The heap allocates only at startup. Its two compact indices and queue links
+use the same per-frame metadata bytes as the old links on 64-bit builds.
+
+All three builds use the same musl release profile, dependencies, generator,
+kernel and 60-second QinQ workload as the ACK comparison below. Each sweep
+retains its daemons and sockets across 16G, 21G, unlimited and 16G return.
+No owned builds or other tests overlap load. These are single sweeps, not
+the five successful repeats required for acceptance.
+
+| Build / requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| Before / 16G | 15.96 / 15.97 | 7.80 / 14.73 | 50.98 / 7.45 | 448.13 / 419.44 |
+| Before / 21G | 20.95 / 20.94 | 7.98 / 17.27 | 61.78 / 17.26 | 478.31 / 477.50 |
+| Before / unlimited | 52.75 / 39.98 | 7.54 / 16.71 | 85.66 / 58.07 | 470.56 / 472.70 |
+| Before / 16G return | 15.97 / 15.97 | 7.56 / 14.74 | 52.45 / 7.37 | 450.03 / 410.03 |
+| Indexed expiry / 16G | 15.97 / 15.97 | 7.76 / 14.88 | 51.25 / 6.56 | 455.72 / 424.20 |
+| Indexed expiry / 21G | 20.96 / 20.96 | 7.76 / 16.70 | 62.84 / 20.08 | 476.73 / 479.59 |
+| Indexed expiry / unlimited | 52.25 / 42.08 | 7.55 / 17.21 | 85.49 / 58.96 | 477.36 / 488.67 |
+| Indexed expiry / 16G return | 15.96 / 15.98 | 7.63 / 14.71 | 52.05 / 7.65 | 445.77 / 418.62 |
+
+The final unlimited point declines 2.7% forward and rises 3.1% reverse from
+21G. Compared with the matched baseline, its paced goodput is 2.7 / 3.3%
+lower, while unlimited goodput is 0.2 / 3.0% higher. These mixed results
+establish no general throughput gain. The cleanup bound is a correctness
+and scheduling improvement; the overload plateau and CPU ceiling remain open.
+
+The intermediate prototype ordered equal deadlines by frame slot. It delivered
+7.67 / 16.77 Gbit/s paced and 7.45 / 16.44 unlimited. The final heap compares
+only deadlines, avoiding unnecessary work on equal timestamps. All four
+prototype observations remain in the JSON; one reports 0.000054% reverse
+reordering. Baseline and final observations report no reordering.
+
+At unlimited load, drop attribution is:
+
+| Build | TAP ingress SKBs | Socket overflow SKBs | Worker queue-drop events | Expired frames | Inner UDP receive-buffer errors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Before | 5230614 / 2343107 | 720624 / 3252 | 10 / 1196 | 0 / 0 | 2743 / 0 |
+| Indexed expiry | 5170437 / 2520275 | 1383217 / 3143 | 0 / 2779 | 0 / 0 | 1976 / 124 |
+
+Admission pressure, invalid/duplicate/out-of-window/wrong-run payloads and
+outer fragmentation are zero in all twelve observations. TAP and socket
+counters count SKBs, queue events may discard aggregates, and expiry counts
+frames; they cannot be summed into an exact inner loss total. The final run's
+higher socket overflow remains unresolved. The JSON includes every point's
+counters, per-thread CPU, generator/receiver CPU and per-core softirq time.
+
+All three builds concentrate QinQ super-frame reads on worker 3 at both
+endpoints. That worker also receives substantial outer traffic on the left,
+while the right worker receives only control traffic. This placement remains
+a verified imbalance; the expiry change does not remove it. Neither missing
+recovery nor congestion control explains away the remaining decline.
 
 ## ACK-enabled release comparison (November 6)
 
