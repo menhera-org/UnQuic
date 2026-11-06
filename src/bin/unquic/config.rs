@@ -50,7 +50,7 @@ const fn one() -> usize {
     1
 }
 const fn outer_payload_limit() -> usize {
-    unquic::BASE_UDP_PAYLOAD
+    unquic::socket::MAX_UDP_PAYLOAD
 }
 const fn refresh() -> u64 {
     60
@@ -260,7 +260,10 @@ mod tests {
             ));
             assert_eq!(loaded.lookups[0].refresh, Duration::from_secs(60));
             assert_eq!(loaded.config.peers[0].address, None);
-            assert_eq!(loaded.config.peers[0].outer_payload_limit, 1232);
+            assert_eq!(
+                loaded.config.peers[0].outer_payload_limit,
+                unquic::socket::MAX_UDP_PAYLOAD
+            );
             assert_eq!(loaded.config.sessions[0].queue_count, 1);
             assert_eq!(loaded.config.daemon.memory_limit, 256 * 1024 * 1024);
             loaded.config.validate().unwrap();

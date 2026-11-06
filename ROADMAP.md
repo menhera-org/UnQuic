@@ -411,8 +411,8 @@ reassembly bitmap, with no second history or hot-path allocations. Tests cover
 thresholds, gaps, duplicate rate limits, pressure rejection, word/window wrap,
 maximum packet numbers, and reset/retirement. Sender-history validation and
 worker feedback routing remain pending, so the runtime still emits no packet
-ACKs. Per-lane MTU probing, recovery and congestion control are also pending;
-README.md documents the baseline send-error behavior.
+ACKs. Per-lane MTU probing is connected to the workers. Recovery and congestion
+control remain pending; README.md documents probe feedback and send-error handling.
 
 - `ack.rs`: ACK scheduling (16 packets or 1 ms, immediate on gap), at most
   32 newest ranges, delay capped at 1000 µs, per-lane once-per-millisecond
@@ -437,7 +437,9 @@ README.md documents the baseline send-error behavior.
   now bounds proof history, checks full probe identity/length, narrows the search
   after loss, handles reductions and baseline failure, and retries upward.
   Deterministic tests cover every supported MTU, stale/forged replies, loss and
-  backpressure. Runtime scheduling and feedback remain to be connected.
+  backpressure. Runtime scheduling now visits at most 64 owned sockets per pass,
+  routes feedback to lane owners and shares socket state across sessions.
+  Static probe slots are temporary until the shared control pacer is available.
   Keep the hot path allocation-free. Use padded
   PROBE and matching PROBE_REPLY, with `EMSGSIZE` and validated `IPV6_RECVERR`
   Packet Too Big as "shrink now, re-probe later". Local interface MTU alone
@@ -446,7 +448,10 @@ README.md documents the baseline send-error behavior.
   cached PMTU without fragmentation (RFC 8899 section 4.5). Socket discovery
   setup and bounded error-queue reads are implemented; a kernel test verifies
   actual PTB quotes, cached-MTU bypass, local reductions and recovery, and GSO
-  retention after EMSGSIZE. Worker integration is pending. Test 1280-, 1500- and 9000-byte paths,
+  retention after EMSGSIZE. Worker tests cover actual PTB errors, forged quotes,
+  silent size filters, reduction/recovery, shared sessions and repacking unsent
+  byte ranges. DATA-quoted PTB validation awaits sent history. Extend real routed
+  namespace tests across 1280-, 1500- and 9000-byte paths,
   independent lane limits, lost probes, forged/stale replies, MTU reduction
   and recovery in disposable network namespaces; never emit outer fragments.
 - `bbr.rs`: BBRv3 as draft-ietf-ccwg-bbr-07 specifies, one owner per sending
@@ -484,6 +489,13 @@ README.md documents the baseline send-error behavior.
   linkage.
 
 ## Stage 5: measured optimisation
+
+If evidence shows no further improvement is feasible at an earlier step,
+record the blocker and proceed with the remaining stages. Return here to the
+original targets: at least 20 Gbit/s each direction locally, stable goodput
+under overload, and 5 Gbit/s over the specified lossy access path. Moving on
+does not close those gates. Bounded queues and buffers may grow when controlled
+measurements show a benefit; report memory, latency and overload behavior too.
 
 Only with a profile showing the bottleneck. Candidates in the order the
 design names them: reuseport steering, inner GSO representation as a

@@ -258,7 +258,7 @@ use crate::{
         self, Connection, Effects, Tag,
         barrier::{Barrier, Command, Phase, Progress},
     },
-    pack,
+    pack, pmtu,
     reassembly::{self, Admission},
     runtime::{AddressRequest, BUFFERS, Control, LANES, Shared},
     socket::{BATCH_SIZE, ReceiveDatagram, ReceiveSocket, SendDatagram, TransmitSocket},
@@ -376,6 +376,7 @@ pub(crate) enum Event {
     ProbeFeedback {
         session: usize,
         tag: u128,
+        lane: u16,
         packet: u64,
         length: u16,
     },
@@ -488,6 +489,8 @@ impl TxBatch {
 struct Tx {
     socket: Option<TransmitSocket>,
     blocked: bool,
+    mtu: pmtu::Path,
+    failed_payload: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -499,6 +502,7 @@ pub(crate) struct AddressChange {
 
 struct Path {
     address: Option<SocketAddrV6>,
+    probe_session: Option<usize>,
     lanes: Vec<Tx>,
 }
 
@@ -533,6 +537,12 @@ pub(crate) struct Worker {
     receive_enabled: bool,
     rx_retained: usize,
     transmit: Vec<PeerPaths>,
+    mtu_jobs: Vec<(usize, usize, usize)>,
+    mtu_cursor: usize,
+    mtu_start: usize,
+    mtu_due: Duration,
+    mtu_next: Duration,
+    probe_slot: Option<u128>,
     pub requests: Option<Consumer<AddressRequest>>,
     peer_controls: Vec<PeerControl>,
     free: Vec<Box<Buffer>>,
@@ -579,7 +589,12 @@ impl Worker {
                 .checked_add(size_of::<PeerPaths>())?
                 .checked_add(peer.tx_lanes.checked_mul(2 * size_of::<Tx>())?)?;
         }
-        let mut batches = 0_usize;
+        let mut batches = config.peers.iter().try_fold(0_usize, |bytes, peer| {
+            bytes.checked_add(
+                peer.tx_lanes
+                    .checked_mul(2 * size_of::<(usize, usize, usize)>())?,
+            )
+        })?;
         for session in &config.sessions {
             let peer = config.peers.iter().find(|p| p.name == session.peer)?;
             batches = batches.checked_add(
@@ -712,6 +727,20 @@ impl Worker {
             tap_read_fallbacks: u64::from(tap_reader.is_none()),
             ..Snapshot::default()
         };
+        let mut mtu_jobs = Vec::with_capacity(
+            config
+                .peers
+                .iter()
+                .map(|peer| 2 * (id..peer.tx_lanes).step_by(count).count())
+                .sum(),
+        );
+        for (peer, config) in config.peers.iter().enumerate() {
+            for path in 0..2 {
+                for lane in (id..config.tx_lanes).step_by(count) {
+                    mtu_jobs.push((peer, path, lane));
+                }
+            }
+        }
         Ok(Self {
             tap_reader,
             tap_start: 0,
@@ -735,10 +764,14 @@ impl Worker {
                 .map(|peer| PeerPaths {
                     paths: std::array::from_fn(|slot| Path {
                         address: if slot == 0 { peer.socket_addr() } else { None },
+                        probe_session: None,
                         lanes: (0..peer.tx_lanes)
                             .map(|_| Tx {
                                 socket: None,
                                 blocked: false,
+                                mtu: pmtu::Path::new(peer.outer_payload_limit, Duration::ZERO)
+                                    .unwrap(),
+                                failed_payload: 0,
                             })
                             .collect(),
                     }),
@@ -747,6 +780,12 @@ impl Worker {
                     totals: Snapshot::default(),
                 })
                 .collect(),
+            mtu_jobs,
+            mtu_cursor: 0,
+            mtu_start: 0,
+            mtu_due: Duration::ZERO,
+            mtu_next: Duration::MAX,
+            probe_slot: None,
             requests: None,
             peer_controls: (0..if id == 0 { config.peers.len() } else { 0 })
                 .map(|_| PeerControl::default())
@@ -805,6 +844,7 @@ impl Worker {
             self.addresses(now)?;
             self.progress_barriers(now)?;
             self.timers(now)?;
+            more |= self.mtu_timers(now)?;
             more |= self.drain_packets(now)?;
             more |= self.drain_tap_inputs(now)?;
             self.flush_frames(now)?;
@@ -816,10 +856,10 @@ impl Worker {
                 .map(|b| (b.session, b.lane))
                 .chain(self.ready.iter().copied())
                 .any(|(session, lane)| {
-                    !self.transmit[self.shared.config.peer_for_session(session).unwrap()].paths
-                        [self.sessions[session].path]
-                        .lanes[lane]
-                        .blocked
+                    let tx = &self.transmit[self.shared.config.peer_for_session(session).unwrap()]
+                        .paths[self.sessions[session].path]
+                        .lanes[lane];
+                    !tx.blocked && tx.mtu.payload_limit() != 0
                 });
             self.receive_interest(more)?;
             publish_turns = publish_turns.wrapping_add(1);
@@ -868,9 +908,13 @@ impl Worker {
                         let path = ((token as u32) >> 6 & 1) as usize;
                         let lane = token as usize & 63;
                         let tx = &mut self.transmit[peer].paths[path].lanes[lane];
-                        if tx.blocked {
-                            self.reactor.remove(tx.socket.as_ref().unwrap().as_fd())?;
+                        if tx.blocked && event.events & libc::EPOLLOUT as u32 != 0 {
+                            self.reactor
+                                .modify(tx.socket.as_ref().unwrap().as_fd(), token, 0)?;
                             tx.blocked = false;
+                        }
+                        if event.events & libc::EPOLLERR as u32 != 0 {
+                            self.mtu_error(peer, path, lane, now)?;
                         }
                     }
                     _ if token >= 2 => self.read_socket(token as usize - 2, now)?,
@@ -1035,12 +1079,19 @@ impl Worker {
         }
         let path = &mut paths.paths[change.path];
         for tx in &mut path.lanes {
-            if tx.blocked {
-                self.reactor.remove(tx.socket.as_ref().unwrap().as_fd())?;
+            if let Some(socket) = &tx.socket {
+                self.reactor.remove(socket.as_fd())?;
             }
             tx.socket = None;
             tx.blocked = false;
+            tx.failed_payload = 0;
+            tx.mtu = pmtu::Path::new(
+                self.shared.config.config().peers[change.request.peer].outer_payload_limit,
+                Duration::ZERO,
+            )
+            .unwrap();
         }
+        path.probe_session = None;
         path.address = Some(change.request.address);
         paths.generation = change.generation;
         paths.preparing = Some(change);
@@ -1249,7 +1300,7 @@ impl Worker {
                 continue;
             };
             let paths = &mut self.transmit[index];
-            for path in &mut paths.paths {
+            for (path_index, path) in paths.paths.iter_mut().enumerate() {
                 let Some(address) = path.address else {
                     continue;
                 };
@@ -1260,12 +1311,20 @@ impl Worker {
                     // A dynamic port must differ from every configured fixed port.
                     for _ in 0..16 {
                         match TransmitSocket::connect(receiver, address) {
-                            Ok(socket) => {
+                            Ok(mut socket) => {
                                 let port = socket.local_addr()?.port();
                                 if config.endpoints.iter().any(|e| e.listen_port == port) {
                                     continue;
                                 }
+                                socket.enable_mtu_discovery()?;
+                                let token = TX_TOKEN
+                                    | ((index as u64) << 7)
+                                    | ((path_index as u64) << 6)
+                                    | lane as u64;
+                                self.reactor.add(socket.as_fd(), token, 0)?;
                                 tx.socket = Some(socket);
+                                self.mtu_due = Duration::ZERO;
+                                self.mtu_next = Duration::ZERO;
                                 break;
                             }
                             Err(_) => {
@@ -1364,11 +1423,12 @@ impl Worker {
                     Event::ProbeFeedback {
                         session,
                         tag,
+                        lane,
                         packet,
                         length,
                     } => {
                         if self.matches(session, tag) {
-                            self.feedback(session, packet, length, now);
+                            self.feedback(session, lane, packet, length, now);
                         }
                     }
                     Event::Reply {
@@ -1703,20 +1763,21 @@ impl Worker {
                             }
                         }
                         Record::ProbeReply {
-                            lane: 1,
+                            lane,
                             packet_number,
                             payload_len,
-                        } => {
-                            // Probe history belongs to the control owner, which also owns TX lane 1.
-                            if self.id == 0 {
-                                self.feedback(session, packet_number, payload_len, now);
+                        } if lane != 0 && usize::from(lane) <= self.sessions[session].tx.len() => {
+                            let owner = (usize::from(lane) - 1) % self.shared.workers();
+                            if self.id == owner {
+                                self.feedback(session, lane, packet_number, payload_len, now);
                             } else {
                                 // Carry the exact proof; arbitrary valid DATA cannot refresh liveness.
                                 let _ = self.push(
-                                    0,
+                                    owner,
                                     Event::ProbeFeedback {
                                         session,
                                         tag: header.receive_tag,
+                                        lane,
                                         packet: packet_number,
                                         length: payload_len,
                                     },
@@ -2162,14 +2223,14 @@ impl Worker {
             return Ok(());
         }
         let peer = self.shared.config.peer_for_session(session).unwrap();
-        let limit = self.shared.config.config().peers[peer].outer_payload_limit;
         let path = self.sessions[session].path;
         let tx = &self.transmit[peer].paths[path].lanes[lane];
+        let limit = tx.mtu.payload_limit();
         if tx.socket.is_none() {
             self.clear_batch(batch);
             return Ok(());
         }
-        if tx.blocked {
+        if tx.blocked || limit == 0 {
             return Ok(());
         }
         if batch.plan.is_empty()
@@ -2216,7 +2277,7 @@ impl Worker {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 let tx = &mut self.transmit[peer].paths[path].lanes[lane];
                 let token = TX_TOKEN | ((peer as u64) << 7) | ((path as u64) << 6) | lane as u64;
-                self.reactor.add(
+                self.reactor.modify(
                     tx.socket.as_ref().unwrap().as_fd(),
                     token,
                     libc::EPOLLOUT as u32,
@@ -2224,6 +2285,14 @@ impl Worker {
                 tx.blocked = true;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => {
+                let attempted = (batch.first..batch.plan.len())
+                    .map(|index| batch.plan.packet(index).unwrap().length)
+                    .max()
+                    .unwrap();
+                self.mtu_send_error(peer, path, lane, attempted, now)?;
+                batch.compact();
+            }
             Err(_) => {
                 self.counters.socket_errors = self.counters.socket_errors.wrapping_add(1);
                 let local = &mut self.sessions[session];
@@ -2403,8 +2472,271 @@ impl Worker {
         writable
     }
 
-    fn feedback(&mut self, session: usize, packet: u64, length: u16, now: Duration) {
-        if self.controls[session].probe == Some((packet, length)) {
+    // Nominally one 9000-byte probe per 3 ms globally, without a shared counter or lock.
+    // shortcut: static worker slots waste idle shares; replace with control grants in pacing.rs.
+    fn probe_time(&self, now: Duration) -> Duration {
+        let slot = now.as_millis() / 3;
+        let workers = self.shared.workers() as u128;
+        let owner = slot % workers;
+        let mut distance = (self.id as u128 + workers - owner) % workers;
+        if distance == 0 && self.probe_slot != Some(slot) {
+            return now;
+        }
+        if distance == 0 {
+            distance = workers;
+        }
+        Duration::from_millis(((slot + distance) * 3).min(u64::MAX as u128) as u64)
+    }
+
+    fn mtu_timers(&mut self, now: Duration) -> io::Result<bool> {
+        if now < self.mtu_due || self.mtu_jobs.is_empty() {
+            return Ok(false);
+        }
+        if self.mtu_cursor == 0 {
+            self.mtu_next = Duration::MAX;
+        }
+        let end = (self.mtu_cursor + BATCH_SIZE).min(self.mtu_jobs.len());
+        while self.mtu_cursor < end {
+            let (peer, path, lane) =
+                self.mtu_jobs[(self.mtu_start + self.mtu_cursor) % self.mtu_jobs.len()];
+            self.mtu_cursor += 1;
+            let Some(session) = self.transmit[peer].paths[path].probe_session else {
+                continue;
+            };
+            let tx = &mut self.transmit[peer].paths[path].lanes[lane];
+            if tx.socket.is_none() {
+                continue;
+            }
+            let before = (tx.mtu.payload_limit(), tx.mtu.state());
+            let length = tx.mtu.poll(now);
+            if let Some(length) = length
+                && now >= self.probe_time(now)
+            {
+                self.probe_slot = Some(now.as_millis() / 3);
+                self.send_mtu_probe(session, peer, path, lane, length, now)?;
+            }
+            self.mtu_changed(peer, path, lane, before, now);
+            let due = self.transmit[peer].paths[path].lanes[lane].mtu.deadline();
+            self.mtu_next = self.mtu_next.min(due.max(self.probe_time(now)));
+        }
+        if self.mtu_cursor == self.mtu_jobs.len() {
+            self.mtu_cursor = 0;
+            self.mtu_start = (self.mtu_start + 1) % self.mtu_jobs.len();
+            self.mtu_due = self.mtu_next;
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    }
+
+    fn send_mtu_probe(
+        &mut self,
+        session: usize,
+        peer: usize,
+        path: usize,
+        lane: usize,
+        length: usize,
+        now: Duration,
+    ) -> io::Result<()> {
+        let mut prefix = [0; wire::PROBE_PREFIX_LEN];
+        let Ok(piece) = self.sessions[session].tx[lane]
+            .as_mut()
+            .unwrap()
+            .probe(length, &mut prefix)
+        else {
+            self.transmit[peer].paths[path].lanes[lane].mtu.defer(now);
+            return Ok(());
+        };
+        let parts = [&prefix[..], piece.bytes];
+        let tx = &mut self.transmit[peer].paths[path].lanes[lane];
+        match tx
+            .socket
+            .as_ref()
+            .unwrap()
+            .send_batch(&[SendDatagram { parts: &parts }], length)
+        {
+            Ok(1) => {
+                let local = &mut self.sessions[session];
+                assert!(tx.mtu.submitted(
+                    pmtu::ProbeId {
+                        session,
+                        tag: local.connection.unwrap().local_tag().get(),
+                        lane: lane as u16 + 1,
+                        packet: piece.packet.number,
+                    },
+                    length,
+                    now
+                ));
+                for totals in [
+                    &mut self.counters,
+                    &mut local.totals,
+                    &mut local.tx_totals[lane],
+                ] {
+                    totals.tx_outer_bytes =
+                        totals.tx_outer_bytes.wrapping_add((length + 48) as u64);
+                }
+                local.tx_dirty |= 1_u64 << lane;
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => {
+                self.mtu_send_error(peer, path, lane, length, now)?;
+            }
+            result => {
+                tx.mtu.defer(now);
+                if result.is_err_and(|error| !transient(&error)) {
+                    self.counters.socket_errors = self.counters.socket_errors.wrapping_add(1);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn mtu_send_error(
+        &mut self,
+        peer: usize,
+        path: usize,
+        lane: usize,
+        attempted: usize,
+        now: Duration,
+    ) -> io::Result<()> {
+        self.transmit[peer].paths[path].lanes[lane].failed_payload = attempted;
+        let remote = self.mtu_error(peer, path, lane, now)?;
+        let tx = &mut self.transmit[peer].paths[path].lanes[lane];
+        if !remote && tx.failed_payload != 0 {
+            // An error without a usable hint still cannot justify this DATA size.
+            let before = (tx.mtu.payload_limit(), tx.mtu.state());
+            tx.mtu
+                .local_too_big(attempted, (attempted + 47) as u32, now);
+            self.mtu_changed(peer, path, lane, before, now);
+        }
+        Ok(())
+    }
+
+    // Return whether a remote error could have caused EMSGSIZE; it is not a local size proof.
+    fn mtu_error(
+        &mut self,
+        peer: usize,
+        path: usize,
+        lane: usize,
+        now: Duration,
+    ) -> io::Result<bool> {
+        let tx = &self.transmit[peer].paths[path].lanes[lane];
+        let error = match tx.socket.as_ref().unwrap().recv_mtu_error() {
+            Ok(Some(error)) => error,
+            Ok(None) => return Ok(false),
+            Err(error) if transient(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let address = self.transmit[peer].paths[path].address.unwrap();
+        if error.destination.ip() != address.ip() || error.destination.port() != address.port() {
+            return Ok(!error.local);
+        }
+        let before = (tx.mtu.payload_limit(), tx.mtu.state());
+        let proof = if error.local {
+            None
+        } else {
+            tx.mtu.probes(now).find_map(|(id, length)| {
+                let local = &self.sessions[id.session];
+                let connection = local.connection?;
+                if local.path != path || connection.local_tag().get() != id.tag {
+                    return None;
+                }
+                let mut header = [0; wire::HEADER_LEN];
+                Header {
+                    cookie: self.shared.config.config().sessions[id.session].cookie,
+                    receive_tag: connection.remote_tag().get(),
+                    lane: id.lane,
+                    packet_number: id.packet,
+                    record_area_len: (length - wire::HEADER_LEN) as u16,
+                }
+                .encode(&mut header);
+                (error.quoted_payload() == header).then_some(id)
+            })
+        };
+        let tx = &mut self.transmit[peer].paths[path].lanes[lane];
+        if error.local {
+            let attempted = std::mem::take(&mut tx.failed_payload);
+            tx.mtu.local_too_big(attempted, error.mtu, now);
+        } else if let Some(id) = proof {
+            tx.mtu.packet_too_big(id, error.mtu, now);
+        }
+        self.mtu_changed(peer, path, lane, before, now);
+        Ok(!error.local)
+    }
+
+    fn mtu_changed(
+        &mut self,
+        peer: usize,
+        path: usize,
+        lane: usize,
+        before: (usize, crate::counters::PathMtuState),
+        now: Duration,
+    ) {
+        let mtu = &self.transmit[peer].paths[path].lanes[lane].mtu;
+        let limit = mtu.payload_limit();
+        let state = mtu.state();
+        let due = mtu.deadline().max(self.probe_time(now));
+        self.mtu_due = self.mtu_due.min(due);
+        self.mtu_next = self.mtu_next.min(due);
+        if before == (limit, state) {
+            return;
+        }
+        for session in 0..self.sessions.len() {
+            let local = &mut self.sessions[session];
+            if self.shared.config.peer_for_session(session) != Some(peer)
+                || local.path != path
+                || local.connection.is_none()
+            {
+                continue;
+            }
+            if limit < before.0
+                && let Some(batch) = &mut local.batches[lane]
+            {
+                batch.compact();
+            }
+            local.tx_totals[lane].path_mtu_bytes = if limit == 0 { 0 } else { (limit + 48) as u64 };
+            local.tx_totals[lane].path_mtu_state = state as u64;
+            local.tx_dirty |= 1_u64 << lane;
+            Self::session_mtu(local);
+        }
+    }
+
+    fn session_mtu(local: &mut Session) {
+        let mut total = Snapshot::default();
+        for (lane, tx) in local.tx.iter().enumerate() {
+            if tx.is_some() {
+                total.merge(Snapshot {
+                    path_mtu_bytes: local.tx_totals[lane].path_mtu_bytes,
+                    path_mtu_state: local.tx_totals[lane].path_mtu_state,
+                    ..Snapshot::default()
+                });
+            }
+        }
+        local.totals.path_mtu_bytes = total.path_mtu_bytes;
+        local.totals.path_mtu_state = total.path_mtu_state;
+    }
+
+    fn feedback(&mut self, session: usize, lane: u16, packet: u64, length: u16, now: Duration) {
+        let Some(connection) = self.sessions[session].connection else {
+            return;
+        };
+        let peer = self.shared.config.peer_for_session(session).unwrap();
+        let path = self.sessions[session].path;
+        let index = usize::from(lane) - 1;
+        let mtu = &mut self.transmit[peer].paths[path].lanes[index].mtu;
+        let before = (mtu.payload_limit(), mtu.state());
+        if mtu.reply(
+            pmtu::ProbeId {
+                session,
+                tag: connection.local_tag().get(),
+                lane,
+                packet,
+            },
+            usize::from(length),
+            now,
+        ) {
+            self.mtu_changed(peer, path, index, before, now);
+        }
+        if self.id == 0 && lane == 1 && self.controls[session].probe == Some((packet, length)) {
             self.controls[session].probe = None;
             if let Some(connection) = self.sessions[session].connection {
                 let _ = self.controls[session]
@@ -2549,26 +2881,25 @@ impl Worker {
                 let config = self.shared.config.config();
                 let cookie = config.sessions[session].cookie;
                 let peer = self.shared.config.peer_for_session(session).unwrap();
-                let limit = config.peers[peer].outer_payload_limit;
-                let (mtu, mtu_state) = if command.connection.is_none() {
-                    (0, 0)
-                } else {
-                    let state = if limit == BASE_UDP_PAYLOAD {
-                        crate::counters::PathMtuState::Baseline
-                    } else {
-                        crate::counters::PathMtuState::Configured
-                    };
-                    ((limit + 48) as u64, state as u64)
-                };
                 for (index, lane) in local.tx.iter_mut().enumerate() {
                     *lane = command
                         .connection
                         .filter(|_| index % self.shared.workers() == self.id)
                         .map(|c| pack::Lane::new(cookie, c, index as u16 + 1).unwrap());
                     if index % self.shared.workers() == self.id {
+                        let mtu = &self.transmit[peer].paths[path].lanes[index].mtu;
+                        let limit = mtu.payload_limit();
                         local.tx_totals[index] = Snapshot {
-                            path_mtu_bytes: mtu,
-                            path_mtu_state: mtu_state,
+                            path_mtu_bytes: if lane.is_none() || limit == 0 {
+                                0
+                            } else {
+                                (limit + 48) as u64
+                            },
+                            path_mtu_state: if lane.is_none() {
+                                0
+                            } else {
+                                mtu.state() as u64
+                            },
                             ..Snapshot::default()
                         };
                         self.shared.transmit_counters[session][index].replace(
@@ -2579,12 +2910,26 @@ impl Worker {
                     }
                 }
                 local.tx_dirty = 0;
-                local.totals.path_mtu_bytes = mtu;
-                local.totals.path_mtu_state = mtu_state;
+                Self::session_mtu(local);
                 local.installed = Some(command);
                 local.acknowledged = Some(command);
             }
         }
+        let peer = self.shared.config.peer_for_session(session).unwrap();
+        for path in 0..2 {
+            self.transmit[peer].paths[path].probe_session = self
+                .sessions
+                .iter()
+                .enumerate()
+                .find(|(index, local)| {
+                    self.shared.config.peer_for_session(*index) == Some(peer)
+                        && local.path == path
+                        && local.connection.is_some()
+                })
+                .map(|(index, _)| index);
+        }
+        self.mtu_due = Duration::ZERO;
+        self.mtu_next = Duration::ZERO;
     }
 
     fn acknowledge(
@@ -2733,7 +3078,7 @@ impl Worker {
     }
 
     fn deadline(&self, now: Duration) -> Option<Duration> {
-        let mut due = self.setup_due;
+        let mut due = self.setup_due.min(self.mtu_due);
         for (index, control) in self.controls.iter().enumerate() {
             let peer = self.shared.config.peer_for_session(index).unwrap();
             if self.shared.peer_bound(peer)
@@ -2897,6 +3242,7 @@ mod tests {
                         Event::ProbeFeedback {
                             session: 0,
                             tag: 0,
+                            lane: 1,
                             packet: 0,
                             length: 0,
                         }
@@ -3540,6 +3886,353 @@ mod tests {
 
     #[test]
     #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn mtu_probes_route_to_lane_owners_and_survive_silent_size_filters() {
+        let (first, _tap) = receive_worker();
+        let second = Worker::new(1, Arc::clone(&first.shared), Control::new()).unwrap();
+        let mut workers = [first, second];
+        let connection = workers[0].sessions[0].connection;
+        let remote = ReceiveSocket::bind("[::1]:40101".parse().unwrap(), None).unwrap();
+        let mut payload = [0; crate::socket::MAX_UDP_PAYLOAD];
+        for (index, worker) in workers.iter_mut().enumerate() {
+            for session in 0..2 {
+                worker.command(
+                    session,
+                    Command {
+                        generation: 1,
+                        phase: Phase::Install,
+                        connection,
+                    },
+                    0,
+                );
+                worker.sessions[session].acknowledged = None;
+            }
+            let path = &mut worker.transmit[0].paths[0];
+            path.address = Some(remote.local_addr());
+            let tx = &mut path.lanes[index];
+            tx.mtu = pmtu::Path::new(crate::socket::MAX_UDP_PAYLOAD, Duration::ZERO).unwrap();
+            tx.socket = Some(TransmitSocket::connect(&remote, remote.local_addr()).unwrap());
+        }
+        let (tx, rx) = crate::spsc::channel();
+        workers[0].outgoing[1] = Some(tx);
+        workers[1].incoming[0] = Some(rx);
+        let mut reply_number = 0;
+        let mut sent = [0; 2];
+        let mut now = Duration::ZERO;
+        // The reverse path remains usable; oversized forward probes disappear without ICMP.
+        for capacity in [
+            [1452, 4096],
+            [BASE_UDP_PAYLOAD, crate::socket::MAX_UDP_PAYLOAD],
+        ] {
+            let end = now + Duration::from_secs(650);
+            loop {
+                for worker in &mut workers {
+                    assert!(!worker.mtu_timers(now).unwrap());
+                }
+                while let Ok((length, _)) = remote.recv(&mut payload) {
+                    let datagram = Datagram::decode(&payload[..length]).unwrap();
+                    assert!(matches!(datagram.records().next(), Some(Record::Probe)));
+                    let header = datagram.header();
+                    let index = usize::from(header.lane) - 1;
+                    sent[index] += 1;
+                    if length > capacity[index] {
+                        continue;
+                    }
+                    reply_number += 1;
+                    let mut reply = workers[0].free.pop().unwrap();
+                    reply.length = receive_bytes(
+                        reply_number,
+                        &[Record::ProbeReply {
+                            lane: header.lane,
+                            packet_number: header.packet_number,
+                            payload_len: length as u16,
+                        }],
+                        &mut reply.bytes,
+                    );
+                    workers[0].received.push_back(reply);
+                    workers[0]
+                        .drain_packets(now + Duration::from_millis(1))
+                        .unwrap();
+                }
+                workers[1]
+                    .drain_queues(now + Duration::from_millis(1))
+                    .unwrap();
+                if workers.iter().enumerate().all(|(index, worker)| {
+                    let mtu = &worker.transmit[0].paths[0].lanes[index].mtu;
+                    mtu.payload_limit() == capacity[index]
+                        && matches!(
+                            mtu.state(),
+                            crate::counters::PathMtuState::Baseline
+                                | crate::counters::PathMtuState::Confirmed
+                        )
+                }) {
+                    break;
+                }
+                assert!(now < end, "silent size filter did not converge");
+                let due = workers.iter().map(|w| w.mtu_due).min().unwrap();
+                now = due.max(now + Duration::from_millis(2));
+            }
+            for (index, worker) in workers.iter().enumerate() {
+                assert!(sent[index] > 1);
+                // One physical path is shared by both sessions, with independent lane limits.
+                for session in &worker.sessions {
+                    assert_eq!(
+                        session.tx_totals[index].path_mtu_bytes,
+                        (capacity[index] + 48) as u64
+                    );
+                }
+            }
+            now += Duration::from_secs(1);
+        }
+        assert_eq!(workers[0].free.len(), BUFFERS);
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn mtu_reduction_repacks_unsent_ranges_in_every_shared_session() {
+        let (mut worker, _tap) = receive_worker();
+        let now = Duration::from_millis(10);
+        let connection = worker.sessions[0].connection;
+        worker.command(
+            1,
+            Command {
+                generation: 1,
+                phase: Phase::Install,
+                connection,
+            },
+            0,
+        );
+        let mtu = &mut worker.transmit[0].paths[0].lanes[0].mtu;
+        *mtu = pmtu::Path::new(1452, Duration::ZERO).unwrap();
+        for (number, at) in [(1, Duration::ZERO), (2, now)] {
+            let length = mtu.poll(at).unwrap();
+            let id = pmtu::ProbeId {
+                session: 0,
+                tag: 1,
+                lane: 1,
+                packet: number,
+            };
+            assert!(mtu.submitted(id, length, at));
+            assert!(mtu.reply(id, length, at + Duration::from_millis(1)));
+        }
+        let old_limit = mtu.payload_limit();
+        assert!(old_limit > BASE_UDP_PAYLOAD);
+        let mut expected = [(0, 0, 0); 2];
+        for (session, expected) in expected.iter_mut().enumerate() {
+            let mut frame = worker.free.pop().unwrap();
+            frame.length = 9022;
+            frame.session = session;
+            frame.lane = 0;
+            frame.tag = 1;
+            frame.deadline = now + Duration::from_millis(100);
+            let lane = worker.sessions[session].tx[0].as_mut().unwrap();
+            frame.frame_id = lane.start_frame(frame.length).unwrap();
+            let batch = worker.sessions[session].batches[0].as_mut().unwrap();
+            batch.frames[0] = Some(frame);
+            batch.len = 1;
+            let mut batch = worker.sessions[session].batches[0].take().unwrap();
+            batch
+                .prepare(worker.sessions[session].tx[0].as_mut().unwrap(), old_limit)
+                .unwrap();
+            let last = batch.plan.packet(batch.plan.len() - 1).unwrap().number;
+            worker.submitted_batch(session, 0, &mut batch, 1);
+            let frame = batch.frames[0].as_ref().unwrap();
+            *expected = (frame.frame_id, frame.offset, last);
+            worker.sessions[session].batches[0] = Some(batch);
+        }
+        let mtu = &mut worker.transmit[0].paths[0].lanes[0].mtu;
+        let before = (mtu.payload_limit(), mtu.state());
+        assert!(mtu.local_too_big(old_limit, 1280, now));
+        worker.mtu_changed(0, 0, 0, before, now);
+        for (session, (id, offset, last)) in expected.into_iter().enumerate() {
+            let local = &mut worker.sessions[session];
+            let batch = local.batches[0].as_mut().unwrap();
+            assert!(batch.plan.is_empty());
+            assert_eq!(batch.frames[0].as_ref().unwrap().frame_id, id);
+            assert_eq!(batch.frames[0].as_ref().unwrap().offset, offset);
+            batch
+                .prepare(local.tx[0].as_mut().unwrap(), BASE_UDP_PAYLOAD)
+                .unwrap();
+            assert!(batch.plan.packet(0).unwrap().number > last);
+            assert_eq!(
+                batch.plan.pieces(0).unwrap().next().unwrap().1.start,
+                offset
+            );
+            assert!(
+                (0..batch.plan.len())
+                    .all(|i| batch.plan.packet(i).unwrap().length <= BASE_UDP_PAYLOAD)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a disposable container and network namespace capabilities"]
+    fn mtu_error_queue_rejects_forged_quotes_and_accepts_live_probe_ptb() {
+        use std::{
+            net::{SocketAddrV6, UdpSocket},
+            process::Command,
+        };
+        // SAFETY: only this test thread and its children enter the disposable namespace.
+        cvt(unsafe { libc::unshare(libc::CLONE_NEWNET) }).unwrap();
+        assert!(
+            Command::new("ip")
+                .args(["link", "set", "lo", "mtu", "9000", "up"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (mut worker, _tap) = receive_worker();
+        let remote = ReceiveSocket::bind("[::1]:40101".parse().unwrap(), None).unwrap();
+        let mut socket = TransmitSocket::connect(&remote, remote.local_addr()).unwrap();
+        socket.enable_mtu_discovery().unwrap();
+        worker.reactor.add(socket.as_fd(), TX_TOKEN, 0).unwrap();
+        worker.transmit[0].paths[0].address = Some(remote.local_addr());
+        worker.transmit[0].paths[0].lanes[0].socket = Some(socket);
+        worker.transmit[0].paths[0].lanes[0].mtu =
+            pmtu::Path::new(crate::socket::MAX_UDP_PAYLOAD, Duration::ZERO).unwrap();
+        let mut bytes = [0; crate::socket::MAX_UDP_PAYLOAD];
+        worker.mtu_timers(Duration::ZERO).unwrap();
+        let (length, _) = remote.recv(&mut bytes).unwrap();
+        let baseline = Header::decode(&bytes[..length]).unwrap();
+        worker.feedback(
+            0,
+            1,
+            baseline.packet_number,
+            length as u16,
+            Duration::from_millis(1),
+        );
+        let now = Duration::from_millis(6);
+        worker.mtu_timers(now).unwrap();
+        let (length, source) = remote.recv(&mut bytes).unwrap();
+        assert!(length > 1452);
+        let large = Header::decode(&bytes[..length]).unwrap();
+        // SAFETY: socket returns a new descriptor transferred to its sole owner.
+        let icmp = unsafe {
+            UdpSocket::from_raw_fd(
+                cvt(libc::socket(
+                    libc::AF_INET6,
+                    libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                    libc::IPPROTO_ICMPV6,
+                ))
+                .unwrap(),
+            )
+        };
+        let mut message = [0; 8 + 40 + 8 + wire::HEADER_LEN];
+        message[0] = 2;
+        message[4..8].copy_from_slice(&1500_u32.to_be_bytes());
+        let quoted = &mut message[8..];
+        quoted[0] = 0x60;
+        quoted[4..6].copy_from_slice(&((length + 8) as u16).to_be_bytes());
+        quoted[6] = libc::IPPROTO_UDP as u8;
+        quoted[7] = 64;
+        quoted[8..24].copy_from_slice(&source.ip().octets());
+        quoted[24..40].copy_from_slice(&remote.local_addr().ip().octets());
+        quoted[40..42].copy_from_slice(&source.port().to_be_bytes());
+        quoted[42..44].copy_from_slice(&remote.local_addr().port().to_be_bytes());
+        quoted[44..46].copy_from_slice(&((length + 8) as u16).to_be_bytes());
+        quoted[48..].copy_from_slice(&bytes[..wire::HEADER_LEN]);
+        let destination = SocketAddrV6::new(*source.ip(), 0, 0, 0);
+        for forged in [true, false] {
+            if forged {
+                message[8 + 48 + 4] ^= 1;
+            }
+            assert_eq!(icmp.send_to(&message, destination).unwrap(), message.len());
+            let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+            let count = worker.reactor.wait(&mut events, 100).unwrap();
+            assert!(events[..count].iter().any(|event| event.u64 == TX_TOKEN
+                && event.events & libc::EPOLLERR as u32 != 0));
+            if forged {
+                let socket = worker.transmit[0].paths[0].lanes[0]
+                    .socket
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(
+                    socket
+                        .send(&bytes[..BASE_UDP_PAYLOAD], BASE_UDP_PAYLOAD)
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(libc::EMSGSIZE)
+                );
+                worker
+                    .mtu_send_error(0, 0, 0, BASE_UDP_PAYLOAD, now)
+                    .unwrap();
+            } else {
+                assert!(worker.mtu_error(0, 0, 0, now).unwrap());
+            }
+            let mtu = &worker.transmit[0].paths[0].lanes[0].mtu;
+            assert_eq!(mtu.probes(now).count(), usize::from(forged));
+            assert_eq!(mtu.payload_limit(), BASE_UDP_PAYLOAD);
+            if forged {
+                message[8 + 48 + 4] ^= 1;
+            }
+        }
+        // An old success cannot undo an accepted reduction, and hints alone never raise DATA.
+        worker.feedback(0, 1, large.packet_number, length as u16, now);
+        assert_eq!(
+            worker.transmit[0].paths[0].lanes[0].mtu.payload_limit(),
+            BASE_UDP_PAYLOAD
+        );
+        worker.mtu_timers(Duration::from_millis(12)).unwrap();
+        let (length, _) = remote.recv(&mut bytes).unwrap();
+        assert_eq!(length, 1452);
+        let packet = Header::decode(&bytes[..length]).unwrap();
+        worker.feedback(
+            0,
+            1,
+            packet.packet_number,
+            length as u16,
+            Duration::from_millis(13),
+        );
+        assert_eq!(
+            worker.transmit[0].paths[0].lanes[0].mtu.payload_limit(),
+            1452
+        );
+        assert!(
+            worker.transmit[0].paths[0].lanes[0]
+                .socket
+                .as_ref()
+                .unwrap()
+                .gso_enabled()
+        );
+        assert!(
+            Command::new("ip")
+                .args(["link", "set", "lo", "mtu", "1400"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let now = Duration::from_millis(20);
+        let mut frame = worker.free.pop().unwrap();
+        frame.session = 0;
+        frame.tag = 1;
+        frame.lane = 0;
+        frame.length = 9022;
+        frame.deadline = Duration::from_secs(1);
+        worker.frame(frame, now).unwrap();
+        worker.flush_frames(now).unwrap();
+        let batch = worker.sessions[0].batches[0].as_ref().unwrap();
+        assert_eq!(batch.len, 1);
+        assert!(batch.plan.is_empty());
+        assert_eq!(batch.frames[0].as_ref().unwrap().offset, 0);
+        let tx = &worker.transmit[0].paths[0].lanes[0];
+        assert_eq!(tx.mtu.payload_limit(), BASE_UDP_PAYLOAD);
+        assert!(tx.socket.as_ref().unwrap().gso_enabled());
+        worker.flush_frames(now).unwrap();
+        let mut delivered = 0;
+        while let Ok((length, _)) = remote.recv(&mut bytes) {
+            assert!(length <= BASE_UDP_PAYLOAD);
+            for record in Datagram::decode(&bytes[..length]).unwrap().records() {
+                if let Record::Data { bytes, .. } = record {
+                    delivered += bytes.len();
+                }
+            }
+        }
+        assert_eq!(delivered, 9022);
+        assert!(worker.ready.is_empty());
+        assert_eq!(worker.free.len(), BUFFERS);
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
     fn transmit_batches_retain_partial_sends_expire_frames_and_quiesce() {
         let (_, mut workers) = test_workers();
         let params = wire::Params {
@@ -3711,6 +4404,7 @@ mod tests {
                         Event::ProbeFeedback {
                             session: 0,
                             tag: 0,
+                            lane: 1,
                             packet: 0,
                             length: 0,
                         }
@@ -3861,6 +4555,7 @@ mod tests {
                             Event::ProbeFeedback {
                                 session: 0,
                                 tag: 0,
+                                lane: 1,
                                 packet: 0,
                                 length: 0,
                             }

@@ -59,8 +59,8 @@ features. Its direct, RA and DHCPv6 resolver modes are available.
 Receive sockets use fixed nonzero ports and expose no send method. Transmit
 sockets inherit their receiver's binding scope, use stable dynamic ports, and
 disable IPv6 fragmentation. Send APIs take a lane payload limit from 1232 through
-8952 bytes (9000 outer IPv6 bytes); each peer defaults to 1232 and can assert a larger ceiling with
-`outer_payload_limit`. Batched
+8952 bytes (9000 outer IPv6 bytes). DATA starts at 1232; per-lane probing
+confirms larger sizes within `outer_payload_limit`, whose daemon default is 8952. Batched
 sends handle up to 64 logical datagrams per syscall. Sends can
 gather a wire prefix and original frame slice without copying the piece into an
 intermediate packet buffer. Partial sends return the successful prefix; each
@@ -517,27 +517,27 @@ session, peer and lane totals together.
 Counts and occupancy gauges sum across owners. RTT and feedback delay use the
 maximum; path MTU uses the smallest nonzero value. Aggregate MTU state prefers
 failed, probing, baseline, configured, confirmed, then unknown. Active TX lanes
-report the configured payload ceiling plus 48 bytes: baseline state (1) at
-1280, configured state (5) above it. Configured does not mean path-confirmed. RTT, feedback delay, repairs, pacing
+report their current DATA limit plus 48 bytes, or zero when baseline failure
+suspends DATA. State is baseline (1), probing (2), confirmed (3), or failed (4).
+Configured (5) remains a public counter value but workers no longer emit it.
+RTT, feedback delay, repairs, pacing
 and bytes-in-flight remain zero until recovery and congestion control are
 implemented. Cumulative counts wrap modulo 2^64.
 
 ## Path MTU status
 
-Path MTU discovery is not implemented. The per-peer `outer_payload_limit`
-defaults to 1232 UDP payload bytes and accepts values through 8952. Raising it
-asserts that every current and future path to that peer supports the larger
-outer packets; the runtime does not confirm that assertion. Transmit sockets set `IPV6_DONTFRAG` and `IPV6_PMTUDISC_DO`;
-GSO segments remain subject to that limit. Inner TAP MTU stays configured, and
-the transport splits Ethernet frames into DATA pieces.
+Each transmit socket now probes its path from the 1232-byte UDP baseline.
+The daemon's per-peer `outer_payload_limit` defaults to 8952 and accepts
+1232–8952; this bounds discovery. DATA uses larger sizes only after an exact
+reply to a successfully submitted padded probe. Sessions sharing a socket
+share its state, while independent lanes confirm their own limits. Inner TAP
+MTU stays configured; the transport splits Ethernet frames into DATA pieces.
 
 The NTT NGN production target has a 1500-byte outer IPv6 ceiling. Other paths
-may differ; active per-lane discovery remains required, capped at 9000 outer
-bytes. A padded-probe encoder now gathers a 56-byte prefix and shared zero
-padding without a packet-sized copy. A pure per-lane discovery state machine
-validates live probe identities and sizes; worker integration is still pending.
+may differ. Discovery stops at 9000 outer bytes even on loopback. Probes gather
+a 56-byte prefix and shared zero padding without a packet-sized copy.
 
-| Size, without outer extension headers | Default baseline | Asserted 1500-byte path |
+| Size, without outer extension headers | Baseline | Confirmed 1500-byte path |
 | --- | ---: | ---: |
 | Outer IPv6 packet | 1280 bytes | 1500 bytes |
 | UDP payload | 1232 bytes | 1452 bytes |
@@ -548,30 +548,18 @@ At the baseline, a 1514-byte Ethernet frame becomes pieces of 1164 and 350
 bytes; a 9022-byte frame needs eight datagrams. These are transport pieces,
 not outer IPv6 fragments.
 
-Both the runtime and socket API enforce the supplied limit. The runtime has
-no `IPV6_RECVERR` error-queue processing
-or Packet Too Big validation. If sending returns EMSGSIZE,
-it counts a socket error and drops the affected batch's unsent
-frames.
-It neither lowers the limit nor resizes the TAP. Other nontransient send errors
-follow the same path; WouldBlock and interrupted sends retain the remainder
-until its deadline.
-
-The final transport must use larger path MTUs when available, including values
-above 1500. That size describes the target access line, not a permanent transport
-ceiling. The planned RFC 8899 discovery starts each lane at the baseline and uses
-padded PROBE packets to confirm larger sizes within wire and reserved-buffer
-bounds. A reply must match a live probe and its exact size before DATA uses it;
-a local interface MTU alone is insufficient. The socket API already supports
-the product's 9000-byte outer ceiling. TAP MTU remains separately configured.
-
-The socket layer exposes explicit discovery setup and bounded error-queue reads.
-Setup enables `IPV6_PMTUDISC_PROBE` and `IPV6_RECVERR`, preserving
+Transmit setup enables `IPV6_PMTUDISC_PROBE` and `IPV6_RECVERR`, preserving
 `IPV6_DONTFRAG`. This permits probes above a learned kernel PMTU while still
-rejecting packets above the local interface MTU. Each error read retains at most
-the quoted 48-byte protocol header and distinguishes local errors from remote
-PTB reports. Callers must validate remote quotes against successful sends and
-budget error processing. Workers do not use these APIs yet.
+rejecting packets above the local interface MTU. Workers consume one error
+entry per socket event. Remote Packet Too Big reports must match a live sent
+probe's quoted header and destination. Reports quoting DATA await the retained
+send history in the recovery stage; periodic probes still detect reductions.
+
+EMSGSIZE and validated size hints lower the limit and replan unsent ranges with
+their original frame IDs and byte offsets, using fresh packet numbers. GSO
+remains enabled. If EMSGSIZE supplies no usable hint, the attempted size is
+excluded and DATA falls back as needed. Other nontransient send errors still
+drop unsent frames; WouldBlock and interruptions retain them until their deadlines.
 
 The discovery state machine retains at most three submitted proofs, each scoped
 by session, connection tag, lane and packet number. Two unanswered larger probes
@@ -589,10 +577,18 @@ run no faster than the probe timeout. They support the current unacknowledged
 DATA path and must give way to transport loss feedback when ACK processing is
 connected. [RFC 8899](https://www.rfc-editor.org/rfc/rfc8899.html)
 
-EMSGSIZE and validated ICMPv6 Packet Too Big feedback will lower the limit and
-schedule re-probing. New paths start discovery again. A path below the 1280-byte
-baseline must fail explicitly. The current small liveness probes do not establish
-that a full DATA packet fits.
+Both returned and silently filtered ICMPv6 are supported. Without a valid size
+hint, timed probes narrow the search; loss can therefore delay discovery and
+temporarily reduce throughput. A new path resets discovery. Small liveness
+probes remain separate and cannot confirm a DATA-sized path.
+
+Each timer pass visits at most 64 owned sockets before returning to ordinary
+work. Rotating scan order prevents a failing path from monopolising probes.
+Static worker slots allow nominally one padded probe per 3 ms across workers,
+at most 9000 bytes each. This is an interim probe budget, not the complete
+control-traffic pacer: shared grants and pacing of other control records remain
+Stage 3 work. All steady-state discovery storage and packet data are bounded
+and allocated before workers start.
 
 ## Operational checks
 

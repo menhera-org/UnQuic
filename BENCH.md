@@ -15,8 +15,9 @@ Split-pool, deadline-cache and first-reader lane-association trials were rejecte
 and reverted after measurements.
 
 This report separates that remaining decline from the earlier near-total
-collapse. Recovery, congestion control and PMTU discovery remain unfinished;
-their absence does not explain away a scheduling or admission failure.
+collapse. Recovery and congestion control remain unfinished; worker PMTU
+discovery is now implemented but has not been through a release rate sweep.
+These features do not explain away a scheduling or admission failure.
 
 ## Current performance gaps
 
@@ -37,7 +38,7 @@ L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 | VLAN-heavy deployment | Checked output coalescing now handles one or two tags. Single-tag delivery reaches 16.00 / 15.53 Gbit/s paced; QinQ reaches 10.49 / 9.91 with strict lane hashing | Tagged overload still declines. QinQ input concentrates on one reader; full-lane hashing helps but does not remove that bottleneck. These short runs do not pass the throughput gate. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
-| Use larger confirmed path MTUs | The runtime accepts a per-peer 1232–8952-byte payload assertion; a controlled 1452-byte sweep shows only a modest change | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. Configured capacity is not confirmed PMTU. The NTT NGN target has a 1500-byte ceiling; the product caps other outer paths at 9000. |
+| Use larger confirmed path MTUs | Workers now discover sizes up to 8952 payload bytes. Tests cover exact lane feedback, ICMPv6 PTB and silent size filters, shared sessions, reductions, recovery and retained frame ranges | No throughput sweep of active discovery yet. Older sweeps used asserted limits and do not measure this implementation. Routed-path validation and DATA-quoted PTB processing remain open. The NTT NGN ceiling is 1500 outer bytes; other paths are capped at 9000. |
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
 
 Loss under unlimited load is still high: the latest UDP-only eight-worker
@@ -48,8 +49,9 @@ an exact frame-loss decomposition.
 
 Earlier single-socket runs still declined. Calibrated profiling then found
 TAP wakeups with no available transmit buffer; the final follow-up below verifies
-their removal. Missing congestion control, recovery and PMTU remain separate
-production-performance gaps.
+their removal. Congestion control, recovery and performance validation of PMTU
+remain separate production-performance gaps. Stage 5 must revisit the original
+targets after work on later stages; no performance gate is waived.
 
 ## Local acceptance gate
 
@@ -1925,3 +1927,47 @@ loss, bounded proof history, full identity/length checks, reductions, baseline
 failure and the 600-second upward retry. This adds no runtime throughput
 evidence: workers still use the configured payload assertion until discovery
 is connected.
+
+
+
+## Worker MTU discovery, November 6
+
+Workers now start DATA at the baseline and discover each transmit socket's
+limit. The daemon default is an 8952-byte discovery ceiling, replacing the
+earlier 1232-byte default and operator assertions. Shared sessions use the
+same socket state; lane limits remain independent. No queue or receive buffer
+was enlarged.
+
+Release kernel tests verify returned PTB messages, forged quotes, GSO retention
+and a local MTU reduction while a frame is queued. A queued remote error can
+surface as EMSGSIZE on the next send: the worker checks its origin and proof
+before applying a reduction. Unsent ranges keep their frame IDs and offsets
+and are repacked with new packet numbers.
+
+A worker test with actual UDP sends and simulated time silently discards
+oversized probes. It confirms independent payload limits of 1452 and 4096,
+then detects a reduction to 1232 and an increase to 8952 after the upward retry
+interval. This validates state and routing; it is not a routed-path throughput
+measurement. The isolated socket test still captures nonfragmented 9000-byte
+probes above a cached 1500-byte PMTU.
+
+The runtime test now requires confirmed, rather than configured, MTU gauges.
+Its first release runs exposed a five-second assertion timeout shorter than
+the initial 16-second probe retry. Allowing that retry passed; the protocol
+timeout was not shortened. Startup probe loss can delay confirmation, and
+ordinary loss can also make the selected MTU conservative. Transport feedback
+must eventually replace periodic size confirmation to distinguish that case
+more effectively.
+
+No new rate sweep, CPU ceiling or real-access acceptance result accompanies
+this change. The previous performance gaps remain open. DATA-quoted PTB
+validation, full control pacing and loss recovery still need the Stage 3
+sender history and controller.
+
+
+Validation passes in release mode: the complete all-features musl suite, all
+21 isolated kernel library tests, socket/foundation checks, the CLI integration
+test and the full runtime test. The latter confirms 9000/1500-byte outer limits
+in opposite directions, forwards tagged and jumbo frames, handles restart,
+and counts zero allocations/deallocations during forwarding and periodic MTU
+confirmation. Rust 1.89 all-target checking and Clippy with warnings denied pass.

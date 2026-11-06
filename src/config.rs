@@ -86,7 +86,7 @@ pub struct Peer {
     pub scope_id: u32,
     /// Number of local transmit lanes, from 1 through 64.
     pub tx_lanes: usize,
-    /// Asserted outer UDP payload ceiling, 1232..=8952 bytes; no PMTU discovery.
+    /// Discovery ceiling in UDP payload bytes, 1232..=8952; DATA starts at 1232.
     pub outer_payload_limit: usize,
     /// Explicit congestion group, or None to share the endpoint's binding scope.
     pub path_group: Option<String>,

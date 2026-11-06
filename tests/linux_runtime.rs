@@ -564,12 +564,27 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
         })
     });
     for (control, configured_mtu) in [(&left.control, 9000), (&right.control, 1500)] {
+        // A lost startup probe retains the RFC-oriented 16-second initial timeout.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let totals = control.session_counters(2).unwrap();
+            if totals.path_mtu_bytes == configured_mtu && totals.path_mtu_state == 3 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "MTU {configured_mtu}: {totals:?}; lanes={:?}/{:?}",
+                control.transmit_lane_counters(2, 1),
+                control.transmit_lane_counters(2, 2)
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
         for session in 0..3 {
             let totals = control.session_counters(session).unwrap();
             assert!(totals.tx_outer_bytes > 60);
             assert!(totals.rx_outer_bytes > 60);
             let mtu = if session == 2 { configured_mtu } else { 1280 };
-            let state = if session == 2 { 5 } else { 1 };
+            let state = if session == 2 { 3 } else { 1 };
             assert_eq!(totals.path_mtu_bytes, mtu);
             assert_eq!(totals.path_mtu_state, state);
             let lanes = if session == 2 { 2 } else { 4 };
@@ -593,6 +608,15 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
         assert!(control.transmit_lane_counters(0, 0).is_none());
         assert!(control.receive_lane_counters(0, 0).is_none());
     }
+    let before = left.control.session_counters(2).unwrap().tx_outer_bytes;
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    DEALLOCATIONS.store(0, Ordering::Relaxed);
+    COUNTING.store(true, Ordering::SeqCst);
+    thread::sleep(Duration::from_secs(2));
+    COUNTING.store(false, Ordering::SeqCst);
+    assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
+    assert!(left.control.session_counters(2).unwrap().tx_outer_bytes - before >= 9000);
     let old_generation = left.control.session(0).unwrap().generation;
     left.control
         .supply_peer_address(0, "fd99::1".parse().unwrap(), 0)
