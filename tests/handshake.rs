@@ -711,6 +711,8 @@ fn sent_history_and_loss_timing_allocate_nothing() {
         assert!(rtt.sample(result.rtt_sent_at.unwrap(), Duration::from_millis(5), 1000));
         std::hint::black_box((rtt.loss_delay(), rtt.pto_period(3), rtt.frame_lifetime()));
         assert_eq!(history.outstanding().count(), 0);
+        assert_eq!(history.retire_oldest_resolved(), Ok(Some(number)));
+        assert_eq!(history.retire_oldest_resolved(), Ok(None));
     }
     history.reset().unwrap();
     let count = ALLOCATION_COUNT.replace(None);

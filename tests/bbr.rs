@@ -376,3 +376,36 @@ fn controller_limits_feed_shared_grants_after_partial_submission_and_late_ack() 
     assert_eq!(c.limits().window, 15360);
     assert_eq!(c.limits().rate, 35_456_000); // Startup pacing never decreases.
 }
+
+#[test]
+fn retired_loss_metadata_is_reusable_only_after_the_ack_identity_is_gone() {
+    use unquic::ack::History;
+    use unquic::wire::{AckRange, AckRanges};
+    let mut history = History::new().unwrap();
+    let mut delivery = Delivery::new();
+    // A single sampling slot models storage pressure independently of history depth.
+    history.reserve(1, 1280, true, true).unwrap();
+    assert!(history.submit(1, ns(0)));
+    let mut slot = delivery.sent(ns(0), 1280, 0, false).unwrap();
+    assert_eq!(history.retire_oldest_resolved(), Ok(None));
+    assert!(history.lose(1).is_some());
+    assert!(delivery.declared_lost(&mut slot).unwrap().is_some());
+    assert_eq!(history.retire_oldest_resolved(), Ok(Some(1)));
+    history.reserve(2, 1280, true, true).unwrap();
+    assert!(history.submit(2, ns(1)));
+    slot = delivery.sent(ns(1), 1280, 0, false).unwrap();
+    let ranges = [AckRange { start: 1, end: 2 }];
+    delivery.begin_ack(ns(10000), false).unwrap();
+    let progress = history
+        .acknowledge(AckRanges::new(&ranges).unwrap(), |a| {
+            assert_eq!(a.packet.number, 2);
+            assert!(delivery.acknowledged(&mut slot).unwrap());
+        })
+        .unwrap();
+    let sample = delivery.finish_ack(ns(0)).unwrap().unwrap();
+    assert_eq!((progress.packets, progress.released_bytes), (1, 1280));
+    assert_eq!(
+        (sample.newly_acked, delivery.delivered(), delivery.lost()),
+        (1280, 1280, 1280)
+    );
+}

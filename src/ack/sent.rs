@@ -257,6 +257,33 @@ impl History {
         Ok(())
     }
 
+    /// Retires one resolved number at the floor, including a canceled or skipped hole.
+    ///
+    /// One call does constant work. None means empty, pinned by a reservation or
+    /// charge, or at u64::MAX (which remains until connection replacement/reset).
+    /// A pending validated ACK returns Busy without advancing the floor.
+    ///
+    /// Apply earlier accounting reports before reclaiming the returned number's
+    /// sampler/journal storage. This releases no charge and declares no loss;
+    /// subsequent ACKs below the new floor cannot generate delivery callbacks.
+    pub fn retire_oldest_resolved(&mut self) -> Result<Option<u64>, HistoryError> {
+        if self.pending.is_some() {
+            return Err(HistoryError::Busy);
+        }
+        let number = self.floor;
+        let Some(next) = number.checked_add(1).filter(|_| number <= self.allocated) else {
+            return Ok(None);
+        };
+        let (word, bit) = location(number);
+        if (self.reserved[word] | self.inflight[word]) & bit != 0 {
+            return Ok(None);
+        }
+        self.submitted[word] &= !bit;
+        self.acknowledged[word] &= !bit;
+        self.floor = next;
+        Ok(Some(number))
+    }
+
     /// Cancels an unsent reservation without permitting reuse of its number.
     pub fn cancel(&mut self, number: u64) -> bool {
         if !self.contains(number) {

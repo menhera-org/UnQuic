@@ -257,6 +257,9 @@ it; do not retain ACK identities after discarding the sampling state they need.
 Retirement never declares loss, releases congestion credit or shortens a deadline.
 Apply earlier accounting reports before reusing any reclaimed metadata slot.
 PTO timers and third-PTO loss settlement must progress even when the pool is full.
+The history API retires one resolved number per call, so callers can budget holes
+as well as transmissions. The maximum packet number stays retained until connection
+replacement because no greater history floor is representable.
 
 Successful ACK-only and PROBE_REPLY transmissions carry no ordinary congestion
 charge. Retain their submission identity and timestamp while inside sender

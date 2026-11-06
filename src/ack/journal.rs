@@ -64,7 +64,8 @@ struct Frame {
 /// consume packet lists; expiry/completion consumes frame lists with a work budget.
 /// Neither operation releases packet congestion charges. Before reusing a packet
 /// slot, first secure its history reservation, then clear its old mappings. Failed
-/// history reservations must not discard old mappings.
+/// history reservations must not discard old mappings. Explicit resolved-prefix
+/// retirement also permits clearing mappings, after earlier reports have drained.
 ///
 /// Frame slots remain pinned by the caller while a prepared plan refers to them,
 /// even if their mapping list is empty. Connection replacement must retire all old

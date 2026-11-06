@@ -656,3 +656,114 @@ fn outstanding_scan_handles_empty_full_and_maximum_number_windows() {
     }
     assert_eq!(numbers, [u64::MAX - 1, u64::MAX]);
 }
+
+#[test]
+fn prefix_retirement_stops_at_reservations_and_charges_without_settling_them() {
+    let mut history = History::new().unwrap();
+    assert_eq!(history.retire_oldest_resolved(), Ok(None));
+    history.reserve(1, 1500, true, true).unwrap();
+    sent(&mut history, 2, true);
+    sent(&mut history, 3, false);
+    assert_eq!(history.retire_oldest_resolved(), Ok(None));
+    assert_eq!(history.floor(), 1);
+    assert!(history.cancel(1));
+    assert_eq!(history.retire_oldest_resolved(), Ok(Some(1)));
+    assert_eq!(history.retire_oldest_resolved(), Ok(None));
+    assert_eq!(history.inflight_bytes(), 1500);
+    assert!(history.lose(2).is_some());
+    assert_eq!(history.retire_oldest_resolved(), Ok(Some(2)));
+    assert_eq!(history.retire_oldest_resolved(), Ok(Some(3)));
+    assert_eq!(history.retire_oldest_resolved(), Ok(None));
+    assert_eq!(history.floor(), 4);
+    assert_eq!(history.highest_sent(), 3);
+    let progress = history
+        .acknowledge(ranges(&[AckRange { start: 1, end: 3 }]), |_| {
+            panic!("retired delivery")
+        })
+        .unwrap();
+    assert_eq!(progress.packets, 0); // The retired canceled hole is outside validation.
+    assert_eq!(history.inflight_bytes(), 0);
+    assert_eq!(history.packet(2), None);
+}
+
+#[test]
+fn pending_ack_pins_retirement_until_all_chunks_and_callbacks_complete() {
+    let mut history = History::new().unwrap();
+    sent(&mut history, 1, true);
+    sent(&mut history, 2, true);
+    history
+        .begin_ack(ranges(&[AckRange { start: 1, end: 2 }]))
+        .unwrap();
+    let mut delivered = Vec::new();
+    assert!(
+        history
+            .advance_ack(2, |a| delivered.push(a.packet.number))
+            .is_none()
+    );
+    assert_eq!(delivered, [1]);
+    assert_eq!(history.retire_oldest_resolved(), Err(HistoryError::Busy));
+    assert_eq!(history.floor(), 1);
+    assert!(
+        history
+            .advance_ack(4, |a| delivered.push(a.packet.number))
+            .is_some()
+    );
+    assert_eq!(delivered, [1, 2]);
+    assert_eq!(history.retire_oldest_resolved(), Ok(Some(1)));
+    assert_eq!(history.retire_oldest_resolved(), Ok(Some(2)));
+    assert_eq!(history.inflight_bytes(), 0);
+}
+
+#[test]
+fn prefix_retirement_crosses_bitmap_and_ring_boundaries_and_preserves_unsent_checks() {
+    let mut history = History::new().unwrap();
+    for number in 1..=SENT_CAPACITY as u64 + 70 {
+        sent(&mut history, number, false);
+        assert_eq!(history.retire_oldest_resolved(), Ok(Some(number)));
+        assert_eq!(history.packet(number), None);
+        assert_eq!(history.floor(), number + 1);
+    }
+    let floor = history.floor();
+    sent(&mut history, floor + 2, false);
+    assert_eq!(
+        history.validate(ranges(&[AckRange {
+            start: floor,
+            end: floor + 2
+        }])),
+        Err(HistoryError::Unsent)
+    );
+    assert_eq!(history.retire_oldest_resolved(), Ok(Some(floor)));
+    assert_eq!(history.retire_oldest_resolved(), Ok(Some(floor + 1)));
+    assert!(
+        history
+            .validate(ranges(&[AckRange {
+                start: floor,
+                end: floor + 2
+            }]))
+            .is_ok()
+    );
+    assert_eq!(history.retire_oldest_resolved(), Ok(Some(floor + 2)));
+}
+
+#[test]
+fn maximum_number_retirement_never_wraps_or_reuses_identity() {
+    let mut history = History::new().unwrap();
+    sent(&mut history, u64::MAX, false);
+    let start = history.floor();
+    for number in start..u64::MAX {
+        assert_eq!(history.retire_oldest_resolved(), Ok(Some(number)));
+    }
+    assert_eq!(history.retire_oldest_resolved(), Ok(None));
+    assert_eq!(history.floor(), u64::MAX);
+    assert!(history.packet(u64::MAX).is_some());
+    assert_eq!(
+        history.reserve(u64::MAX, 1500, false, false),
+        Err(HistoryError::Invalid)
+    );
+    assert_eq!(
+        history.reserve(1, 1500, false, false),
+        Err(HistoryError::Invalid)
+    );
+    history.reset().unwrap();
+    assert_eq!(history.retire_oldest_resolved(), Ok(None));
+}

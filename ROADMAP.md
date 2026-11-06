@@ -493,9 +493,12 @@ pending; these pure components do not enable congestion control in the daemon.
 Reserve sampling metadata against the startup memory ceiling; a full sampling
 record in every lane's 65,536 history slots would exceed that ceiling. Use bounded
 shared storage and retire only resolved sender-history prefixes, preserving
-complete sampling state above the new floor. Implement budgeted retirement and
-pool reuse ordered after earlier reports; reservations, charges and pending ACKs
-must pin history. Keep PTO progress independent of free sampler slots.
+complete sampling state above the new floor. Constant-work prefix retirement
+now stops at reservations/charges and rejects pending ACKs. Regression tests
+cover canceled holes, lost and feedback-only packets, ring wrap, maximum
+identities, and sampler reuse before a late ACK. Metadata pool allocation and
+reuse ordered after earlier reports remain pending. Keep PTO progress
+independent of free sampler slots.
 Shared sampling needs bounded grant batches: freeze shared ACK/loss application
 until all issued grants report, cap cumulative issued bytes as well as outstanding
 reservations, and close issuance when feedback waits. Commit successful sends in
