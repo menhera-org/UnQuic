@@ -258,8 +258,24 @@ Retirement never declares loss, releases congestion credit or shortens a deadlin
 Apply earlier accounting reports before reusing any reclaimed metadata slot.
 PTO timers and third-PTO loss settlement must progress even when the pool is full.
 The history API retires one resolved number per call, so callers can budget holes
-as well as transmissions. The maximum packet number stays retained until connection
-replacement because no greater history floor is representable.
+as well as transmissions. An explicit terminal flag lets the maximum packet
+number retire once without wrapping the history floor.
+
+Each history entry carries a two-byte sampling handle without growing its
+16-byte storage. ACK application takes that handle into its retained report;
+loss copies it, and explicit retirement takes it for reclamation. A live-handle
+count blocks implicit floor advancement and reset. Before reuse, the controller
+owner must consume the corresponding report; an ACKed entry cannot later return
+the same handle through retirement. Unsent slots remain owned by the grant.
+
+Keep the sampling slab on the controller owner, with at most 65,535 slots for
+the daemon. Store transmission identity with each slot and check session
+generation, lane and packet number on feedback. A two-byte handle alone cannot
+distinguish a stale report from a reused slot. Separate reserved send-report
+buffers from feedback buffers so frozen ACK work cannot prevent an outstanding
+grant from reporting. Preserve worker report order within each path group.
+Quiescence must drain reservations, pending ACK work, reports and old sampling
+handles, not merely queued transmit frames.
 
 Successful ACK-only and PROBE_REPLY transmissions carry no ordinary congestion
 charge. Retain their submission identity and timestamp while inside sender

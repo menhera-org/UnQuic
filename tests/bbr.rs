@@ -390,7 +390,13 @@ fn retired_loss_metadata_is_reusable_only_after_the_ack_identity_is_gone() {
     assert_eq!(history.retire_oldest_resolved(), Ok(None));
     assert!(history.lose(1).is_some());
     assert!(delivery.declared_lost(&mut slot).unwrap().is_some());
-    assert_eq!(history.retire_oldest_resolved(), Ok(Some(1)));
+    assert_eq!(
+        history.retire_oldest_resolved(),
+        Ok(Some(unquic::ack::RetiredEntry {
+            number: 1,
+            sample_slot: None
+        }))
+    );
     history.reserve(2, 1280, true, true).unwrap();
     assert!(history.submit(2, ns(1)));
     slot = delivery.sent(ns(1), 1280, 0, false).unwrap();

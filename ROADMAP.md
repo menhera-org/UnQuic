@@ -500,8 +500,13 @@ shared storage and retire only resolved sender-history prefixes, preserving
 complete sampling state above the new floor. Constant-work prefix retirement
 now stops at reservations/charges and rejects pending ACKs. Regression tests
 cover canceled holes, lost and feedback-only packets, ring wrap, maximum
-identities, and sampler reuse before a late ACK. Metadata pool allocation and
-reuse ordered after earlier reports remain pending. Keep PTO progress
+identities, and sampler reuse before a late ACK. Sampling handles now fit inside
+the existing 16-byte history entries: ACK and retirement take ownership, loss
+only copies it. A live-handle count prevents silent eviction/reset; the final
+packet number can retire without wrapping. Metadata slab allocation, identity
+validation and ordered report routing remain pending. Keep that slab in the
+concrete epoch coordinator, capped at 65,535 slots across the daemon; separate
+reserved send reports from feedback so frozen ACK work cannot deadlock sends. Keep PTO progress
 independent of free sampler slots.
 Shared sampling needs bounded grant batches: freeze shared ACK/loss application
 until all issued grants report, cap cumulative issued bytes as well as outstanding

@@ -1,20 +1,22 @@
 //! One connection/lane's fixed sent-packet history; payload storage is separate.
 
 use crate::wire::{AckRange, AckRanges, MAX_ACK_RANGES};
-use std::{collections::TryReserveError, time::Duration};
+use std::{collections::TryReserveError, num::NonZeroU16, time::Duration};
 
 /// Maximum retained packet-number span per lane.
 pub const SENT_CAPACITY: usize = 65_536;
 const WORDS: usize = SENT_CAPACITY / 64;
+const ELICITING: u16 = 1 << 14;
+const CHARGED: u16 = 1 << 15;
+const SIZE_MASK: u16 = ELICITING - 1;
 
 #[derive(Clone, Copy, Default)]
 struct Entry {
     // Split Duration to use its padding for transmission metadata.
     sent_seconds: u64,
     sent_nanos: u32,
-    outer_bytes: u16,
-    eliciting: bool,
-    charged: bool,
+    size_flags: u16,
+    sample_slot: Option<NonZeroU16>,
 }
 
 /// A successfully submitted physical transmission, independent of payload lifetime.
@@ -30,6 +32,17 @@ pub struct SentPacket {
     pub eliciting: bool,
     /// Whether it consumes ordinary congestion-window credit.
     pub charged: bool,
+    /// Reserved sampler handle. ACK or explicit retirement transfers its ownership.
+    pub sample_slot: Option<NonZeroU16>,
+}
+
+/// One number removed from sender history, including a canceled or skipped hole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetiredEntry {
+    /// Permanently retired packet number.
+    pub number: u64,
+    /// Sampling storage to reclaim after earlier accounting reports have drained.
+    pub sample_slot: Option<NonZeroU16>,
 }
 
 /// One newly acknowledged transmission; duplicate ACKs produce no event.
@@ -59,7 +72,7 @@ pub struct AckProgress {
 pub enum HistoryError {
     /// Zero/reused number, invalid outer size or an uncharged ACK-eliciting packet.
     Invalid,
-    /// Advancing history would forget a reservation, unresolved charge or pending ACK.
+    /// Advancing history would forget a reservation, charge, sample handle or pending ACK.
     Full,
     /// An ACK names a number above the highest successful submission.
     Future,
@@ -73,7 +86,9 @@ impl std::fmt::Display for HistoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Invalid => "invalid or reused packet reservation",
-            Self::Full => "sent history is pinned by reservations, charges or a pending ACK",
+            Self::Full => {
+                "sent history is pinned by reservations, charges, samples or a pending ACK"
+            }
             Self::Future => "ACK exceeds the highest submitted packet number",
             Self::Unsent => "ACK covers an unsent packet number",
             Self::Busy => "a validated ACK is still being applied",
@@ -148,7 +163,8 @@ impl OutstandingScan {
 /// Bounded sender history with allocation-free reservation, ACK and loss operations.
 ///
 /// Each packet uses 16 bytes of metadata plus four bitmap bits, preserving the
-/// full range and nanosecond precision of `Duration`.
+/// full range and nanosecond precision of `Duration`. Sampling handles occupy
+/// padding freed by packing outer size and transmission flags into one u16.
 ///
 /// Allocate once per connection/lane packet-number space, not per shared UDP
 /// socket. Reserve before I/O, submit only the successful prefix, and cancel
@@ -164,6 +180,8 @@ pub struct History {
     allocated: u64,
     highest_sent: u64,
     inflight_bytes: u64,
+    samples: u32,
+    final_retired: bool,
     pending: Option<PendingAck>,
 }
 
@@ -183,6 +201,8 @@ impl History {
             allocated: 0,
             highest_sent: 0,
             inflight_bytes: 0,
+            samples: 0,
+            final_retired: false,
             pending: None,
         })
     }
@@ -193,6 +213,7 @@ impl History {
     }
 
     /// Numbers below this bound are permanently outside validation history.
+    /// Retiring u64::MAX also makes that last number old without wrapping the bound.
     pub const fn floor(&self) -> u64 {
         self.floor
     }
@@ -211,6 +232,8 @@ impl History {
     ///
     /// Outer size includes 48 bytes of IPv6/UDP overhead. Every ACK-eliciting
     /// transmission is charged; feedback-only traffic may be uncharged.
+    /// While any sampler handles remain, advance the floor explicitly with
+    /// retire_oldest_resolved before reserving a number outside the current span.
     pub fn reserve(
         &mut self,
         number: u64,
@@ -228,7 +251,7 @@ impl History {
         let floor = self
             .floor
             .max(number.saturating_sub(SENT_CAPACITY as u64 - 1));
-        if self.pending.is_some() && floor != self.floor {
+        if floor != self.floor && (self.pending.is_some() || self.samples != 0) {
             return Err(HistoryError::Full);
         }
         let end = self.allocated.min(floor - 1);
@@ -249,9 +272,10 @@ impl History {
         self.entries[index] = Entry {
             sent_seconds: 0,
             sent_nanos: 0,
-            outer_bytes,
-            eliciting,
-            charged,
+            size_flags: outer_bytes
+                | if eliciting { ELICITING } else { 0 }
+                | if charged { CHARGED } else { 0 },
+            sample_slot: None,
         };
         self.reserved[index / 64] |= 1 << (index % 64);
         Ok(())
@@ -260,28 +284,33 @@ impl History {
     /// Retires one resolved number at the floor, including a canceled or skipped hole.
     ///
     /// One call does constant work. None means empty, pinned by a reservation or
-    /// charge, or at u64::MAX (which remains until connection replacement/reset).
+    /// charge. The maximum packet number can retire once without wrapping the floor.
     /// A pending validated ACK returns Busy without advancing the floor.
     ///
     /// Apply earlier accounting reports before reclaiming the returned number's
     /// sampler/journal storage. This releases no charge and declares no loss;
     /// subsequent ACKs below the new floor cannot generate delivery callbacks.
-    pub fn retire_oldest_resolved(&mut self) -> Result<Option<u64>, HistoryError> {
+    pub fn retire_oldest_resolved(&mut self) -> Result<Option<RetiredEntry>, HistoryError> {
         if self.pending.is_some() {
             return Err(HistoryError::Busy);
         }
         let number = self.floor;
-        let Some(next) = number.checked_add(1).filter(|_| number <= self.allocated) else {
+        if number > self.allocated || self.final_retired {
             return Ok(None);
-        };
+        }
         let (word, bit) = location(number);
         if (self.reserved[word] | self.inflight[word]) & bit != 0 {
             return Ok(None);
         }
         self.submitted[word] &= !bit;
         self.acknowledged[word] &= !bit;
-        self.floor = next;
-        Ok(Some(number))
+        let sample_slot = self.take_sample(number);
+        self.floor = number.saturating_add(1);
+        self.final_retired = number == u64::MAX;
+        Ok(Some(RetiredEntry {
+            number,
+            sample_slot,
+        }))
     }
 
     /// Cancels an unsent reservation without permitting reuse of its number.
@@ -308,11 +337,28 @@ impl History {
         entry.sent_seconds = now.as_secs();
         entry.sent_nanos = now.subsec_nanos();
         self.submitted[word] |= bit;
-        if entry.charged {
+        if entry.size_flags & CHARGED != 0 {
             self.inflight[word] |= bit;
-            self.inflight_bytes += u64::from(entry.outer_bytes);
+            self.inflight_bytes += u64::from(entry.size_flags & SIZE_MASK);
         }
         self.highest_sent = self.highest_sent.max(number);
+        true
+    }
+
+    /// Submits one charged packet with a sampler slot reserved before its syscall.
+    ///
+    /// The grant owns unused slots; only successful submissions attach them here.
+    /// An ACK takes the handle into its report, loss only copies it, and explicit
+    /// retirement takes it for reclamation. Never reuse it before those reports drain.
+    pub fn submit_sampled(&mut self, number: u64, now: Duration, sample_slot: NonZeroU16) -> bool {
+        if !self.contains(number)
+            || self.entries[number as usize & (SENT_CAPACITY - 1)].size_flags & CHARGED == 0
+            || !self.submit(number, now)
+        {
+            return false;
+        }
+        self.entries[number as usize & (SENT_CAPACITY - 1)].sample_slot = Some(sample_slot);
+        self.samples += 1;
         true
     }
 
@@ -327,6 +373,9 @@ impl History {
         for range in ranges.iter() {
             if range.end > self.highest_sent {
                 return Err(HistoryError::Future);
+            }
+            if self.final_retired {
+                continue;
             }
             for (word, mask) in words(range.start.max(self.floor), range.end) {
                 if self.submitted[word as usize & (WORDS - 1)] & mask != mask {
@@ -381,6 +430,7 @@ impl History {
     /// Returns cumulative progress only on completion, or None when work remains
     /// (also when no ACK is pending). A zero budget leaves all state unchanged.
     /// Reserve callback/report capacity first; callback events cannot be dropped.
+    /// Each callback takes its sampling handle; the history no longer owns it.
     pub fn advance_ack(
         &mut self,
         budget: usize,
@@ -395,6 +445,7 @@ impl History {
                 pending.bits &= !bit;
                 let index = pending.word as usize & (WORDS - 1);
                 let packet = self.metadata(number);
+                self.take_sample(number);
                 let was_in_flight = self.inflight[index] & bit != 0;
                 self.inflight[index] &= !bit;
                 self.acknowledged[index] |= bit;
@@ -413,7 +464,10 @@ impl History {
                 });
             } else if pending.range < pending.len {
                 let range = pending.ranges[pending.range];
-                if range.end < self.floor || pending.next_word > range.end >> 6 {
+                if self.final_retired
+                    || range.end < self.floor
+                    || pending.next_word > range.end >> 6
+                {
                     pending.range += 1;
                     if pending.range < pending.len {
                         pending.next_word =
@@ -504,12 +558,16 @@ impl History {
         std::iter::from_fn(move || scan.advance(self, &mut budget))
     }
 
-    /// Reuses storage only after every charge and reservation has been settled.
+    /// Reuses storage only after every charge, reservation and sampling handle is settled.
+    /// Callers must also drain earlier accounting reports before connection replacement.
     pub fn reset(&mut self) -> Result<(), HistoryError> {
         if self.pending.is_some() {
             return Err(HistoryError::Busy);
         }
-        if self.inflight_bytes != 0 || self.reserved.iter().any(|word| *word != 0) {
+        if self.inflight_bytes != 0
+            || self.samples != 0
+            || self.reserved.iter().any(|word| *word != 0)
+        {
             return Err(HistoryError::Full);
         }
         self.submitted.fill(0);
@@ -517,11 +575,20 @@ impl History {
         self.floor = 1;
         self.allocated = 0;
         self.highest_sent = 0;
+        self.final_retired = false;
         Ok(())
     }
 
     fn contains(&self, number: u64) -> bool {
-        number >= self.floor && number <= self.allocated
+        !self.final_retired && number >= self.floor && number <= self.allocated
+    }
+
+    fn take_sample(&mut self, number: u64) -> Option<NonZeroU16> {
+        let slot = self.entries[number as usize & (SENT_CAPACITY - 1)]
+            .sample_slot
+            .take();
+        self.samples -= u32::from(slot.is_some());
+        slot
     }
 
     fn metadata(&self, number: u64) -> SentPacket {
@@ -529,9 +596,10 @@ impl History {
         SentPacket {
             number,
             sent_at: Duration::new(entry.sent_seconds, entry.sent_nanos),
-            outer_bytes: entry.outer_bytes,
-            eliciting: entry.eliciting,
-            charged: entry.charged,
+            outer_bytes: entry.size_flags & SIZE_MASK,
+            eliciting: entry.size_flags & ELICITING != 0,
+            charged: entry.size_flags & CHARGED != 0,
+            sample_slot: entry.sample_slot,
         }
     }
 }

@@ -696,7 +696,11 @@ fn sent_history_and_loss_timing_allocate_nothing() {
     ALLOCATION_COUNT.set(Some(0));
     for number in 1..=SENT_CAPACITY as u64 + 128 {
         history.reserve(number, 1500, true, true).unwrap();
-        assert!(history.submit(number, Duration::ZERO));
+        assert!(history.submit_sampled(
+            number,
+            Duration::ZERO,
+            std::num::NonZeroU16::new(1).unwrap()
+        ));
         if number % 3 == 0 {
             history.lose(number).unwrap();
         }
@@ -707,11 +711,21 @@ fn sent_history_and_loss_timing_allocate_nothing() {
         let ranges = AckRanges::new(&values).unwrap();
         history.begin_ack(ranges).unwrap();
         assert_eq!(history.advance_ack(1, |_| panic!("word scan only")), None);
-        let result = history.advance_ack(2, |_| {}).unwrap();
+        let result = history
+            .advance_ack(2, |ack| {
+                assert_eq!(ack.packet.sample_slot, std::num::NonZeroU16::new(1));
+            })
+            .unwrap();
         assert!(rtt.sample(result.rtt_sent_at.unwrap(), Duration::from_millis(5), 1000));
         std::hint::black_box((rtt.loss_delay(), rtt.pto_period(3), rtt.frame_lifetime()));
         assert_eq!(history.outstanding().count(), 0);
-        assert_eq!(history.retire_oldest_resolved(), Ok(Some(number)));
+        assert_eq!(
+            history.retire_oldest_resolved(),
+            Ok(Some(unquic::ack::RetiredEntry {
+                number,
+                sample_slot: None
+            }))
+        );
         assert_eq!(history.retire_oldest_resolved(), Ok(None));
     }
     history.reset().unwrap();

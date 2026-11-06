@@ -4,7 +4,8 @@ mod journal;
 mod sent;
 pub use journal::{FramePiece, PieceJournal};
 pub use sent::{
-    AckProgress, Acknowledged, History, HistoryError, OutstandingScan, SENT_CAPACITY, SentPacket,
+    AckProgress, Acknowledged, History, HistoryError, OutstandingScan, RetiredEntry, SENT_CAPACITY,
+    SentPacket,
 };
 
 use std::time::Duration;
