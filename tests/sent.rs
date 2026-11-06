@@ -356,3 +356,35 @@ fn partial_submission_cancels_unsent_numbers_and_preserves_prior_credit() {
     assert_eq!(history.outstanding().count(), 64);
     assert_eq!(history.highest_sent(), 127);
 }
+
+#[test]
+fn compact_timestamps_preserve_full_duration_through_loss_ack_and_reset() {
+    assert_eq!(
+        History::storage_bytes(),
+        size_of::<History>() + 16 * SENT_CAPACITY
+    );
+    let mut history = History::new().unwrap();
+    for now in [
+        Duration::ZERO,
+        Duration::from_nanos(1),
+        Duration::new(1, 999_999_999),
+        Duration::MAX,
+    ] {
+        history.reserve(1, 9000, true, true).unwrap();
+        assert!(history.submit(1, now));
+        let packet = history.packet(1).unwrap();
+        assert_eq!(packet.sent_at, now);
+        assert_eq!(packet.outer_bytes, 9000);
+        assert_eq!(history.outstanding().next(), Some(packet));
+        assert_eq!(history.lose(1), Some(packet));
+        let progress = history
+            .acknowledge(ranges(&[AckRange { start: 1, end: 1 }]), |acked| {
+                assert_eq!(acked.packet, packet);
+                assert!(!acked.was_in_flight);
+            })
+            .unwrap();
+        assert_eq!(progress.rtt_sent_at, Some(now));
+        assert_eq!(progress.released_bytes, 0);
+        history.reset().unwrap();
+    }
+}

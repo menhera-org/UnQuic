@@ -9,7 +9,9 @@ const WORDS: usize = SENT_CAPACITY / 64;
 
 #[derive(Clone, Copy, Default)]
 struct Entry {
-    sent_at: Duration,
+    // Split Duration to use its padding for transmission metadata.
+    sent_seconds: u64,
+    sent_nanos: u32,
     outer_bytes: u16,
     eliciting: bool,
     charged: bool,
@@ -79,6 +81,9 @@ impl std::fmt::Display for HistoryError {
 impl std::error::Error for HistoryError {}
 
 /// Bounded sender history with allocation-free reservation, ACK and loss operations.
+///
+/// Each packet uses 16 bytes of metadata plus four bitmap bits, preserving the
+/// full range and nanosecond precision of `Duration`.
 ///
 /// Allocate once per connection/lane packet-number space, not per shared UDP
 /// socket. Reserve before I/O, submit only the successful prefix, and cancel
@@ -172,7 +177,8 @@ impl History {
         self.allocated = number;
         let index = number as usize & (SENT_CAPACITY - 1);
         self.entries[index] = Entry {
-            sent_at: Duration::ZERO,
+            sent_seconds: 0,
+            sent_nanos: 0,
             outer_bytes,
             eliciting,
             charged,
@@ -202,7 +208,8 @@ impl History {
         }
         let (word, bit) = location(number);
         let entry = &mut self.entries[number as usize & (SENT_CAPACITY - 1)];
-        entry.sent_at = now;
+        entry.sent_seconds = now.as_secs();
+        entry.sent_nanos = now.subsec_nanos();
         self.submitted[word] |= bit;
         if entry.charged {
             self.inflight[word] |= bit;
@@ -337,7 +344,7 @@ impl History {
         let entry = self.entries[number as usize & (SENT_CAPACITY - 1)];
         SentPacket {
             number,
-            sent_at: entry.sent_at,
+            sent_at: Duration::new(entry.sent_seconds, entry.sent_nanos),
             outer_bytes: entry.outer_bytes,
             eliciting: entry.eliciting,
             charged: entry.charged,
