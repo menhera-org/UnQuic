@@ -9,6 +9,50 @@ use unquic::{
 
 const I: u128 = 0x202122232425262728292a2b2c2d2e2f;
 const R: u128 = 0x303132333435363738393a3b3c3d3e3f;
+
+#[test]
+fn probe_prefix_rejects_invalid_lengths_and_identities_before_writing() {
+    use unquic::wire::{PROBE_PREFIX_LEN, encode_probe_prefix};
+    let header = Header {
+        cookie: UnquicUuid::from_bytes([1; 16]),
+        receive_tag: R,
+        lane: 1,
+        record_area_len: 0,
+        packet_number: 1,
+    };
+    let mut prefix = [0xa5; PROBE_PREFIX_LEN];
+    for length in [
+        0,
+        PROBE_PREFIX_LEN - 1,
+        HEADER_LEN + u16::MAX as usize + 1,
+        usize::MAX,
+    ] {
+        assert_eq!(
+            encode_probe_prefix(header, length, &mut prefix),
+            Err(WireError::Length)
+        );
+        assert_eq!(prefix, [0xa5; PROBE_PREFIX_LEN]);
+    }
+    for invalid in [
+        Header { lane: 0, ..header },
+        Header {
+            packet_number: 0,
+            ..header
+        },
+        Header {
+            receive_tag: 0,
+            ..header
+        },
+    ] {
+        assert_eq!(
+            encode_probe_prefix(invalid, PROBE_PREFIX_LEN, &mut prefix),
+            Err(WireError::Handshake)
+        );
+        assert_eq!(prefix, [0xa5; PROBE_PREFIX_LEN]);
+    }
+    encode_probe_prefix(header, PROBE_PREFIX_LEN, &mut prefix).unwrap();
+    assert_eq!(Datagram::decode(&prefix).unwrap().records().count(), 2);
+}
 const FRAME: u64 = 0x1234_0000_0000_0009;
 const PARAMS: Params = Params {
     port: 40000,

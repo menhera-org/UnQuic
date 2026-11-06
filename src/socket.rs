@@ -19,8 +19,9 @@ use std::{
 
 /// Maximum number of logical datagrams in one batched syscall.
 pub const BATCH_SIZE: usize = 64;
-/// UDP payload ceiling under the configured 1500-byte outer IPv6 MTU.
-pub const MAX_UDP_PAYLOAD: usize = 1500 - 40 - 8;
+/// UDP payload ceiling for a 9000-byte outer IPv6 packet without extensions.
+/// This bounds storage and probing; it does not establish a usable path MTU.
+pub const MAX_UDP_PAYLOAD: usize = 9000 - 40 - 8;
 const MAX_VECTORS: usize = 1024;
 const RECEIVE_QUEUE_BYTES: i32 = 8 * 1024 * 1024;
 pub(crate) const GSO_MAX_BYTES: usize = 65_535 - 40 - 8;
@@ -347,7 +348,7 @@ impl TransmitSocket {
 
     /// Sends one complete UDP payload within a caller-supplied lane limit.
     ///
-    /// Limits must be 1232 through 1452 bytes; callers start at 1232 and raise
+    /// Limits must be 1232 through 8952 bytes; callers start at 1232 and raise
     /// them after path confirmation, an explicit operator assertion, or for a probe.
     ///
     /// Returns kernel errors, including `WouldBlock` and `EMSGSIZE`, unchanged.
@@ -365,7 +366,7 @@ impl TransmitSocket {
 
     /// Submits up to BATCH_SIZE scatter/gather datagrams in one syscall.
     ///
-    /// All entries must fit the supplied 1232..=1452-byte lane limit. Adjacent
+    /// All entries must fit the supplied 1232..=8952-byte lane limit. Adjacent
     /// equal-sized datagrams (with an optional shorter last one) share a GSO
     /// message without payload copies. Capability/path errors disable GSO and
     /// retry through ordinary sendmmsg. Partial results count logical datagrams,
@@ -698,7 +699,7 @@ mod tests {
             rx.enable_gro().unwrap();
             let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
             tx.gso.store(gso, Ordering::Relaxed);
-            let lengths = [1232, 1232, 700, 1452, 1452, 0, 20, 20, 10];
+            let lengths = [1232, 1232, 700, 1452, 1452, 8952, 8952, 0, 20, 20, 10];
             let data: Vec<_> = lengths
                 .iter()
                 .enumerate()
@@ -716,7 +717,7 @@ mod tests {
                 tx.send_batch(&outgoing, MAX_UDP_PAYLOAD).unwrap(),
                 lengths.len()
             );
-            let mut buffers = vec![[0; 8192]; lengths.len()];
+            let mut buffers = vec![[0; 65_536]; lengths.len()];
             let mut incoming: Vec<_> = buffers
                 .iter_mut()
                 .map(|b| ReceiveDatagram::new(b))
@@ -750,9 +751,12 @@ mod tests {
         let payload = [9; MAX_UDP_PAYLOAD];
         let parts = [&payload[..]];
         let outgoing = [SendDatagram { parts: &parts }; BATCH_SIZE];
+        // Cross the GSO aggregate limit without overflowing a capped receive queue.
+        let expected = GSO_MAX_BYTES / MAX_UDP_PAYLOAD + 1;
         assert_eq!(
-            tx.send_batch(&outgoing, MAX_UDP_PAYLOAD).unwrap(),
-            BATCH_SIZE
+            tx.send_batch(&outgoing[..expected], MAX_UDP_PAYLOAD)
+                .unwrap(),
+            expected
         );
         let mut buffers = vec![vec![0; 65_536]; BATCH_SIZE];
         let mut incoming: Vec<_> = buffers
@@ -767,7 +771,7 @@ mod tests {
                 logical += 1;
             }
         }
-        assert_eq!(logical, BATCH_SIZE);
+        assert_eq!(logical, expected);
         if rx.gro_enabled() && tx.gso_enabled() {
             assert!(count >= 2);
         }

@@ -11,6 +11,8 @@ use std::fmt;
 pub const HEADER_LEN: usize = 48;
 /// Common header plus one DATA record's fixed fields, excluding its piece bytes.
 pub const DATA_PREFIX_LEN: usize = HEADER_LEN + 4 + 16;
+/// Common header, PROBE and PADDING headers, excluding zero padding bytes.
+pub const PROBE_PREFIX_LEN: usize = HEADER_LEN + 4 + 4;
 /// Maximum number of records in one datagram.
 pub const MAX_RECORDS: usize = 64;
 /// Maximum number of ranges in one ACK record.
@@ -644,6 +646,27 @@ pub fn encode_data_prefix(
     output[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&[1, 0, (length >> 8) as u8, length as u8]);
     encode_data_fields(frame_id, total_len, offset, &mut output[HEADER_LEN + 4..]);
     Ok(DATA_PREFIX_LEN + bytes.len())
+}
+
+/// Encodes a PROBE and PADDING prefix for scatter/gather I/O.
+///
+/// Append exactly `length - PROBE_PREFIX_LEN` zero bytes to this prefix.
+/// Validation precedes writes, and `length` includes the common header.
+pub fn encode_probe_prefix(
+    mut header: Header,
+    length: usize,
+    output: &mut [u8; PROBE_PREFIX_LEN],
+) -> Result<(), WireError> {
+    if length < PROBE_PREFIX_LEN {
+        return Err(WireError::Length);
+    }
+    header.record_area_len = u16::try_from(length - HEADER_LEN).map_err(|_| WireError::Length)?;
+    Record::Probe.validate_context(header, 2)?;
+    header.encode((&mut output[..HEADER_LEN]).try_into().unwrap());
+    output[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&[5, 0, 0, 4]);
+    let padding = header.record_area_len - 4;
+    output[HEADER_LEN + 4..].copy_from_slice(&[0, 0, (padding >> 8) as u8, padding as u8]);
+    Ok(())
 }
 
 fn encode_data_fields(frame_id: u64, total_len: u32, offset: u32, body: &mut [u8]) {

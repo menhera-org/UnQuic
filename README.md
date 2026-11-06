@@ -59,7 +59,7 @@ features. Its direct, RA and DHCPv6 resolver modes are available.
 Receive sockets use fixed nonzero ports and expose no send method. Transmit
 sockets inherit their receiver's binding scope, use stable dynamic ports, and
 disable IPv6 fragmentation. Send APIs take a lane payload limit from 1232 through
-1452 bytes; each peer defaults to 1232 and can assert a larger ceiling with
+8952 bytes (9000 outer IPv6 bytes); each peer defaults to 1232 and can assert a larger ceiling with
 `outer_payload_limit`. Batched
 sends handle up to 64 logical datagrams per syscall. Sends can
 gather a wire prefix and original frame slice without copying the piece into an
@@ -524,11 +524,17 @@ implemented. Cumulative counts wrap modulo 2^64.
 ## Path MTU status
 
 Path MTU discovery is not implemented. The per-peer `outer_payload_limit`
-defaults to 1232 UDP payload bytes and accepts values through 1452. Raising it
+defaults to 1232 UDP payload bytes and accepts values through 8952. Raising it
 asserts that every current and future path to that peer supports the larger
 outer packets; the runtime does not confirm that assertion. Transmit sockets set `IPV6_DONTFRAG` and `IPV6_PMTUDISC_DO`;
 GSO segments remain subject to that limit. Inner TAP MTU stays configured, and
 the transport splits Ethernet frames into DATA pieces.
+
+The NTT NGN production target has a 1500-byte outer IPv6 ceiling. Other paths
+may differ; active per-lane discovery remains required, capped at 9000 outer
+bytes. A padded-probe encoder now gathers a 56-byte prefix and shared zero
+padding without a packet-sized copy. Its runtime scheduling and reply validation
+are still pending.
 
 | Size, without outer extension headers | Default baseline | Asserted 1500-byte path |
 | --- | ---: | ---: |

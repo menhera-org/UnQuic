@@ -37,7 +37,7 @@ L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
 | VLAN-heavy deployment | Checked output coalescing now handles one or two tags. Single-tag delivery reaches 16.00 / 15.53 Gbit/s paced; QinQ reaches 10.49 / 9.91 with strict lane hashing | Tagged overload still declines. QinQ input concentrates on one reader; full-lane hashing helps but does not remove that bottleneck. These short runs do not pass the throughput gate. |
 | Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
 | Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
-| Use larger confirmed path MTUs | The runtime accepts a per-peer 1232–1452-byte payload assertion; a controlled 1452-byte sweep shows only a modest change | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. Configured capacity is not confirmed PMTU. |
+| Use larger confirmed path MTUs | The runtime accepts a per-peer 1232–8952-byte payload assertion; a controlled 1452-byte sweep shows only a modest change | Per-lane PMTU discovery and validation on larger and changing paths remain unimplemented. Configured capacity is not confirmed PMTU. The NTT NGN target has a 1500-byte ceiling; the product caps other outer paths at 9000. |
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
 
 Loss under unlimited load is still high: the latest UDP-only eight-worker
@@ -1863,3 +1863,35 @@ and expiry, with no invalid, duplicate, out-of-window or wrong-run receiver
 records and no outer fragmentation. The final policy passes the release
 suite, all 18 serial kernel library tests, Clippy and Rust 1.89 checks.
 These gains do not establish the 20 Gbit/s gate or replace active MTU probing.
+
+## Outer packet ceiling and probe encoding, November 6
+
+Socket I/O, DATA packing, configuration validation and worker admission now
+support UDP payloads through 8952 bytes, corresponding to a 9000-byte outer
+IPv6 packet without extension headers. The default remains 1232. Configured
+larger limits are still assertions: active discovery is unfinished. The
+production NTT NGN acceptance profile remains capped at 1500 outer bytes.
+
+The padded-probe encoder uses a 56-byte prefix and shared read-only zero padding.
+It allocates no packet buffer and copies no padding. Small control records keep
+their baseline-sized scratch buffer. Production receive pools and socket-buffer
+requests are unchanged. This is preparation for discovery, not a throughput
+result or a claim of kernel zero-copy.
+
+Validation: the release/all-features musl suite passes, including every probe
+size from 1232 through 8952 bytes, packet-number exhaustion, invalid input
+without output mutation, mixed-size GSO/GRO boundaries and reordered packed
+frames at 1232, 1452, 4096 and 8952 bytes. All 18 isolated kernel library tests
+pass serially. The kernel foundation test captures 1280-, 1500- and 9000-byte
+IPv6 packets without Fragment headers. The full runtime test passes with
+8952-byte payloads one way and 1452 the other, byte-exact 9014-byte Ethernet
+frames, zero forwarding allocations/deallocations, and restart handling.
+Rust 1.89 checking and Clippy also pass.
+
+A first socket test sent 64 maximum-size datagrams without draining and lost
+15 to the bounded receive queue. Its burst had grown from about 93 KB to
+573 KB when the API ceiling increased. The corrected boundary test sends just
+enough datagrams to cross the GSO aggregate limit. That fixture correction
+does not establish an overload plateau. Larger production queues remain an
+option when controlled measurements demonstrate a gain within the memory
+budget; the performance gaps above remain open.

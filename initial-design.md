@@ -26,7 +26,7 @@ The following are operator-provided deployment observations, not provider guaran
 | - | - |
 | Access | Shared 10G-EPON NTT NGN |
 | Underlay | IPv6-only UDP |
-| Underlay IP MTU | 1500 bytes on the target access line; larger confirmed MTUs used on other paths |
+| Underlay IP MTU | 1500 bytes on the target access line; probe other paths from 1280 up to 9000 bytes |
 | RTT | Approximately 4.5–7.5 ms |
 | Idle jitter | Less than approximately 1.5 ms |
 | Loss | Nonzero; rate and burst distribution remain to be measured |
@@ -197,7 +197,7 @@ ACK ranges have a count from 1 to 32 and are strictly descending, disjoint, nona
 
 A datagram containing DATA, PROBE, FRAME_ABANDON, or LANE_RETIRE elicits an ACK. ACK, PROBE_REPLY, and PADDING alone do not. Schedule feedback after 16 accepted ACK-eliciting packets on a lane or after 1 ms, whichever comes first; a newly detected gap schedules it immediately. Emit at most the newest 32 ranges from the receive window. Duplicate ACK-eliciting packets may trigger repeated feedback, limited to once per millisecond per lane. Missing older ranges can cause a bounded repair, never unbounded ACK history. ACKs may travel through any local transmit lane and name the original sender's lane explicitly.
 
-A PROBE_REPLY echoes the received probe's lane, packet number and actual UDP payload length. Accept it only against a live matching sent-probe entry; do not treat its claims as an ACK for arbitrary data. It validates liveness/size but packet-ACK accounting still occurs through ACK. A PMTU probe contains PROBE plus PADDING and no DATA. Probe records and replies do not create ping-pong loops.
+A PROBE_REPLY echoes the received probe's lane, packet number and actual UDP payload length. Accept it only against a live matching sent-probe entry; do not treat its claims as an ACK for arbitrary data. It validates liveness/size but packet-ACK accounting still occurs through ACK. A PMTU probe contains PROBE plus PADDING and no DATA. Encode its fixed prefix separately and borrow shared zero padding for scatter/gather submission. Probe records and replies do not create ping-pong loops.
 
 FRAME_ABANDON origin 0 means the frame sender stopped sending; origin 1 means the receiver discarded the frame. Reasons are deadline (1), resource limit (2), lane retirement (3), or TAP failure (4). Its frame ID must name its body lane. Origin 0 must travel on that same sender lane; if the lane has failed, use LANE_RETIRE instead. Origin 1 may travel through any local lane. Route origin 0 to the remote lane's reassembly owner and origin 1 to the local lane's transmit owner. A frame already written to TAP is never undone. Retire pending state and stop repairs. For origin 0, mark the frame sequence terminal even if its first piece has not arrived, advancing the receive frame window if necessary without allocating payload storage. This prevents reordered data from recreating a cancelled frame. For origin 1, unknown or already retired transmit frames are a no-op. Duplicates and sequences below the window floor never reopen state. Control retries use at most two retransmissions and a 100 ms lifetime. Abandonment is advisory: loss of this record does not prevent local expiry or release of buffers.
 
@@ -205,7 +205,7 @@ With a 1500-byte outer IP ceiling and no extension headers, the UDP payload ceil
 
 # 7 Packing and segmentation
 
-The transport must segment inner frames itself. Linux must never silently perform outer IPv6 fragmentation. Set `IPV6_DONTFRAG` on every transmit socket, handle `EMSGSIZE` and validated Packet Too Big feedback, and retain a per-path payload limit. Do not assume a specific access-line MTU. A configured limit or a benchmark's fixed MTU is not confirmation of end-to-end capacity. Start each lane at the IPv6 1280-byte baseline (1232-byte UDP payload) and use RFC 8899 DPLPMTUD to validate larger sizes, including above 1500 where available. Bound probes and data by the wire format and reserved buffer capacities; never allocate a larger packet buffer on the hot path. A local interface or route MTU can bound the search but cannot confirm end-to-end delivery. New paths restart at the baseline. The inner TAP MTU stays independently configured. Keep per-lane state because source-port paths can differ; ACK of ordinary traffic alone cannot validate an unsent larger size. Only a matching padded PROBE_REPLY confirms its size. A validated smaller limit reduces segmentation immediately; an unusable path below the baseline fails clearly. Probe loss never licenses fragmentation. [S8]
+The transport must segment inner frames itself. Linux must never silently perform outer IPv6 fragmentation. Set `IPV6_DONTFRAG` on every transmit socket, handle `EMSGSIZE` and validated Packet Too Big feedback, and retain a per-path payload limit. Do not assume a specific access-line MTU. A configured limit or a benchmark's fixed MTU is not confirmation of end-to-end capacity. Start each lane at the IPv6 1280-byte baseline (1232-byte UDP payload) and use RFC 8899 DPLPMTUD to validate larger sizes, including above 1500 where available. Cap outer IPv6 packets at 9000 bytes (8952 bytes of UDP payload), even on loopback; bound probes and data by reserved buffer capacities; never allocate a larger packet buffer on the hot path. A local interface or route MTU can bound the search but cannot confirm end-to-end delivery. New paths restart at the baseline. The inner TAP MTU stays independently configured. Keep per-lane state because source-port paths can differ; ACK of ordinary traffic alone cannot validate an unsent larger size. Only a matching padded PROBE_REPLY confirms its size. A validated smaller limit reduces segmentation immediately; an unusable path below the baseline fails clearly. Probe loss never licenses fragmentation. [S8]
 
 Allow one datagram to contain several records, including a frame tail followed by a piece of another frame. Each record contains enough information to recover its frame independently. No frame boundary may depend on successfully parsing a preceding datagram.
 
@@ -293,6 +293,11 @@ Minimize hot-path syscalls with preallocated buffer pools, bounded descriptor ri
 On UDP GRO receive, split the buffer into its logical datagrams using the returned segment metadata and validate each datagram, including its cookie. A coalesced receive buffer is not one large protocol packet.
 
 Keep frame buffers and reassembly slots owned by one worker. Retain references for repair and use scatter/gather I/O where it avoids extra payload copies. Measure whether packing into contiguous buffers or gathering slices is faster on target machines. Ordinary TAP and socket I/O still involves kernel copies.
+
+Use zero-copy operations where ownership and the platform permit them. Queue and
+buffer sizes may increase when controlled measurements show better performance;
+keep explicit bounds, include reserved storage in the memory ceiling, and check
+latency and overload behavior alongside throughput.
 
 Start with a small worker count and several stable transmit lanes. Measure NIC queue counters, reuseport distribution, softirq CPU, and cross-worker traffic. Optional reuseport steering can align session/lane ownership with receive workers, but must not route all traffic for a session to one core merely because the cookie is shared. [S3, S4]
 
@@ -544,7 +549,7 @@ throughput gate has not passed. Receive-side ACK scheduling/range construction
 is implemented over the existing bitmap; sender-history validation and runtime
 ACK routing are not yet connected. Recovery and congestion control remain unfinished. Current liveness
 probes do not discover MTU. The UDP limit defaults to 1232 bytes; an interim
-per-peer `outer_payload_limit` accepts 1232–1452 as an operator assertion for
+per-peer `outer_payload_limit` accepts 1232–8952 as an operator assertion for
 all destination paths. Larger configured limits report configured state, not
 confirmed PMTU. Stage 3 must replace this assertion with per-lane discovery.
 The foreground daemon now parses the documented TOML, provisions cookies through
@@ -574,7 +579,7 @@ Maintain a clear distinction between a throughput experiment and an interoperabl
 | Numeric competitive margin | Define before acceptance; evaluate 1.5-fold as a proposal |
 | Local throughput | Required: ≥20 Gbit/s each direction simultaneously at inner MTU 1500; report CPU; freeze hardware, core budget and flow count |
 | Real-access throughput | Required target: ≥5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms and nonzero loss; freeze flow count, direction, CPU model and loss profile |
-| Outer path MTU | Discover per lane from 1280; use confirmed larger sizes, including above 1500, within wire and reserved-buffer bounds |
+| Outer path MTU | Discover per lane from 1280 to 9000 bytes; NTT NGN target ceiling is 1500, while other paths may differ |
 | Maximum inner MTU and tag depth | Fixed: MTU 9000 with two VLAN tags, 9022-byte frame ceiling (section 3) |
 | Controller implementation | Decided: in-tree BBRv3 draft 07, one owner/budget per direction and path group (section 9) |
 | Retry and frame deadlines | Initial two-repair limit and bounded RTT-based sender / 100 ms receiver deadlines (section 8); tune by measurement |

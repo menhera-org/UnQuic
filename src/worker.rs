@@ -2429,9 +2429,9 @@ impl Worker {
         let Some(socket) = &self.transmit[peer].paths[path].lanes[0].socket else {
             return Ok(None);
         };
-        let limit = self.shared.config.config().peers[peer].outer_payload_limit;
-        let mut storage = [0; crate::socket::MAX_UDP_PAYLOAD];
-        let bytes = &mut storage[..limit];
+        let limit = BASE_UDP_PAYLOAD;
+        let mut storage = [0; BASE_UDP_PAYLOAD];
+        let bytes = &mut storage[..];
         let packet = if record.is_handshake() {
             let header = Header {
                 cookie: self.shared.config.config().sessions[session].cookie,

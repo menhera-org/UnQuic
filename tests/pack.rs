@@ -253,6 +253,52 @@ fn scatter_gather_pieces_borrow_original_frame_and_match_contiguous_encoding() {
     }
 }
 
+#[test]
+fn padded_probes_borrow_shared_padding_and_match_the_wire_codec() {
+    use unquic::wire::{PROBE_PREFIX_LEN, encode_datagram};
+    let mut lane = sender();
+    let mut prefix = [0xa5; PROBE_PREFIX_LEN];
+    for length in [
+        0,
+        BASE_UDP_PAYLOAD - 1,
+        unquic::socket::MAX_UDP_PAYLOAD + 1,
+        usize::MAX,
+    ] {
+        assert!(matches!(
+            lane.probe(length, &mut prefix),
+            Err(PackError::Limit)
+        ));
+        assert_eq!(prefix, [0xa5; PROBE_PREFIX_LEN]);
+    }
+    let first = lane.probe(BASE_UDP_PAYLOAD, &mut prefix).unwrap();
+    assert_eq!(first.packet.number, 1);
+    let mut previous = first.packet.number;
+    for length in BASE_UDP_PAYLOAD..=unquic::socket::MAX_UDP_PAYLOAD {
+        let probe = lane.probe(length, &mut prefix).unwrap();
+        assert_eq!(probe.packet.number, previous + 1);
+        previous = probe.packet.number;
+        assert_eq!(probe.bytes.as_ptr(), first.bytes.as_ptr());
+        assert_eq!(probe.bytes.len() + prefix.len(), length);
+        assert_eq!(probe.packet.length, length);
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(probe.bytes);
+        let datagram = Datagram::decode(&bytes).unwrap();
+        assert_eq!(datagram.header().packet_number, previous);
+        let records: Vec<_> = datagram.records().collect();
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[0], Record::Probe));
+        assert!(
+            matches!(records[1], Record::Padding { length: n } if usize::from(n) == length - PROBE_PREFIX_LEN)
+        );
+        let mut contiguous = vec![0xa5; length];
+        assert_eq!(
+            encode_datagram(datagram.header(), &records, &mut contiguous).unwrap(),
+            length
+        );
+        assert_eq!(bytes, contiguous);
+    }
+}
+
 fn pack_all(sender: &mut pack::Lane, frames: &[&[u8]], limit: usize) -> Vec<Vec<u8>> {
     let inputs: Vec<_> = frames
         .iter()
@@ -301,7 +347,12 @@ fn pack_all(sender: &mut pack::Lane, frames: &[&[u8]], limit: usize) -> Vec<Vec<
 
 #[test]
 fn packed_sequences_round_trip_with_borrowed_payloads_and_reordering() {
-    for limit in [BASE_UDP_PAYLOAD, unquic::socket::MAX_UDP_PAYLOAD] {
+    for limit in [
+        BASE_UDP_PAYLOAD,
+        1452,
+        4096,
+        unquic::socket::MAX_UDP_PAYLOAD,
+    ] {
         for seed in 0..64_u64 {
             let mut random = seed + 1;
             let frames: Vec<Vec<u8>> = (0..32)
@@ -537,7 +588,12 @@ fn packed_datagrams_send_original_slices_through_the_socket_batch() {
 
 #[test]
 fn dropping_alternate_gso_batches_leaves_no_orphan_frames() {
-    for limit in [BASE_UDP_PAYLOAD, unquic::socket::MAX_UDP_PAYLOAD] {
+    for limit in [
+        BASE_UDP_PAYLOAD,
+        1452,
+        4096,
+        unquic::socket::MAX_UDP_PAYLOAD,
+    ] {
         for size in [60, 1514, MAX_FRAME_LEN] {
             let mut sender = sender();
             let mut receiver = ReceiveLane::new(1, MAX_FRAME_LEN as u16).unwrap();

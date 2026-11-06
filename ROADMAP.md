@@ -427,15 +427,19 @@ README.md documents the baseline send-error behavior.
 - Do not assume an access-line MTU from the audit or a local benchmark. Active
   probing must confirm usable sizes and detect reductions; configured limits
   are constraints, not discovery. This requirement supersedes audit A5's
-  fixed-size recommendation for the final runtime.
+  fixed-size recommendation for the final runtime. The production NTT NGN
+  profile has a 1500-byte outer IPv6 ceiling; other deployments may differ.
+  Cap discovery at 9000 outer bytes, including on loopback.
 - `pmtu.rs`: RFC 8899 per lane from the 1232-byte UDP baseline, using larger
-  confirmed path MTUs including above 1500 outer bytes. Expand the current
-  1452-byte socket API and receive-validation ceilings together, within wire
-  and reserved-buffer bounds; keep the hot path allocation-free. Use padded
+  confirmed path MTUs up to 9000 outer bytes. Socket I/O, packing and receive
+  validation now support 8952-byte UDP payloads. The padded-probe encoder
+  borrows shared zero padding for scatter/gather sends; scheduling and feedback
+  validation remain to be connected. Keep the hot path allocation-free. Use padded
   PROBE and matching PROBE_REPLY, with `EMSGSIZE` and validated `IPV6_RECVERR`
   Packet Too Big as "shrink now, re-probe later". Local interface MTU alone
   never confirms a path. Reset discovery for new paths and keep TAP MTU
-  independent. Keep `IPV6_PMTUDISC_DO`. Test 1280-, 1500- and 9000-byte paths,
+  independent. Preserve `IPV6_DONTFRAG`; probing must be able to exceed a
+  cached PMTU without fragmentation (RFC 8899 section 4.5). Test 1280-, 1500- and 9000-byte paths,
   independent lane limits, lost probes, forged/stale replies, MTU reduction
   and recovery in disposable network namespaces; never emit outer fragments.
 - `bbr.rs`: BBRv3 as draft-ietf-ccwg-bbr-07 specifies, one owner per sending

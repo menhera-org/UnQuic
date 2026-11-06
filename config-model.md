@@ -63,7 +63,7 @@ cookies and `inner_mtu` remain explicit. Unknown TOML fields are rejected.
 | --- | --- |
 | `Daemon` | `memory_limit`: nonzero bytes, default 256 MiB |
 | `Endpoint` | Unique nonempty `name`; IPv6 `listen_address` (unspecified allowed); nonzero `listen_port`; numeric `scope_id`; optional interface/VRF `bind_device` |
-| `Peer` | Unique nonempty `name`; existing `endpoint` name; optional unicast IPv6 `address`; nonzero `peer_port`; numeric `scope_id`; `tx_lanes` 1–64; `outer_payload_limit` 1232–1452; optional nonempty `path_group` |
+| `Peer` | Unique nonempty `name`; existing `endpoint` name; optional unicast IPv6 `address`; nonzero `peer_port`; numeric `scope_id`; `tx_lanes` 1–64; `outer_payload_limit` 1232–8952; optional nonempty `path_group` |
 | `Session` | Unique nonempty `name`; existing `peer` name; unique `UnquicUuid` cookie; optional `tap_name`; `inner_mtu` 1500–9000; optional checked `MacAddress`; `queue_count` 1–64 |
 
 Names cannot contain NUL. Effective TAP names must be unique, fit in 15 bytes,
@@ -107,12 +107,18 @@ A peer's `outer_payload_limit` caps UDP payload bytes on all its transmit
 lanes and sessions. The default 1232 fits the IPv6 minimum MTU. A larger value
 asserts that every path to that peer, including future DNS candidates, supports
 that payload plus 48 bytes of IPv6/UDP headers. For example, 1452 requires a
-1500-byte outer path without extension headers. This is an operator assertion;
+1500-byte outer path without extension headers. The maximum 8952 caps outer
+IPv6 packets at 9000 bytes. This is an operator assertion;
 the runtime does not discover or confirm PMTU. Sockets forbid fragmentation.
 An EMSGSIZE send failure drops the affected batch's unsent frames and counts a
 socket error; it does not lower the configured ceiling. Prefer the default
 unless the path capacity is known. Stage 3 replaces this interim assertion
 with per-lane discovery.
+
+The production NTT NGN acceptance profile has a 1500-byte outer IPv6 ceiling.
+Other deployments can have smaller or larger paths, so discovery must probe
+within the configured ceiling, up to 9000 outer bytes. MTUs above 9000 are
+outside the product's scope, even when a local interface supports them.
 
 ## Daemon resolver selection
 

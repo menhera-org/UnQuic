@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn configured_outer_limit_reaches_the_core() {
-        for limit in [1232, 1300, 1452] {
+        for limit in [1232, 1300, 1452, 8952] {
             let text = sample().replace(
                 "tx_lanes = 4",
                 &format!("tx_lanes = 4\nouter_payload_limit = {limit}"),
@@ -348,7 +348,7 @@ mod tests {
             ),
             (
                 "tx_lanes = 4",
-                "tx_lanes = 4\nouter_payload_limit = 1453",
+                "tx_lanes = 4\nouter_payload_limit = 8953",
                 "peers.outer_payload_limit",
             ),
             ("tx_lanes = 4", "tx_lanes = 0", "peers.tx_lanes"),

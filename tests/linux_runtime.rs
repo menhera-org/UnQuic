@@ -410,6 +410,7 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
     up(&net, c"lo");
     let mut left_config = config("uq-left", 40100, 40101);
     left_config.peers[0].address = None;
+    left_config.peers[1].outer_payload_limit = unquic::socket::MAX_UDP_PAYLOAD;
     left_config.endpoints.push(Endpoint {
         name: "unavailable".into(),
         listen_address: "fd00::ffff".parse().unwrap(),
@@ -531,16 +532,25 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
     for (left_name, right_name) in [(c"uq-left-b", c"uq-right-b"), (c"uq-left-c", c"uq-right-c")] {
         let source = raw_socket(left_name, 0x88b5);
         let target = raw_socket(right_name, 0x88b5);
-        let mut frame = [0x5a; 1514];
+        let mut frame = [0x5a; 9014];
         frame[12..14].copy_from_slice(&0x88b5_u16.to_be_bytes());
-        raw_send(&source, &frame);
-        until(Duration::from_secs(2), || {
-            raw_read(&target, &mut capture).is_some_and(|n| capture[..n] == frame)
-        });
-        raw_send(&target, &frame);
-        until(Duration::from_secs(2), || {
-            raw_read(&source, &mut capture).is_some_and(|n| capture[..n] == frame)
-        });
+        for length in [60, 1514, 9014] {
+            let frame = &frame[..length];
+            ALLOCATIONS.store(0, Ordering::Relaxed);
+            DEALLOCATIONS.store(0, Ordering::Relaxed);
+            COUNTING.store(true, Ordering::SeqCst);
+            raw_send(&source, frame);
+            until(Duration::from_secs(2), || {
+                raw_read(&target, &mut capture).is_some_and(|n| &capture[..n] == frame)
+            });
+            raw_send(&target, frame);
+            until(Duration::from_secs(2), || {
+                raw_read(&source, &mut capture).is_some_and(|n| &capture[..n] == frame)
+            });
+            COUNTING.store(false, Ordering::SeqCst);
+            assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+            assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
+        }
     }
     until(Duration::from_secs(2), || {
         [&left.control, &right.control].iter().all(|control| {
@@ -553,12 +563,12 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
             })
         })
     });
-    for control in [&left.control, &right.control] {
+    for (control, configured_mtu) in [(&left.control, 9000), (&right.control, 1500)] {
         for session in 0..3 {
             let totals = control.session_counters(session).unwrap();
             assert!(totals.tx_outer_bytes > 60);
             assert!(totals.rx_outer_bytes > 60);
-            let mtu = if session == 2 { 1500 } else { 1280 };
+            let mtu = if session == 2 { configured_mtu } else { 1280 };
             let state = if session == 2 { 5 } else { 1 };
             assert_eq!(totals.path_mtu_bytes, mtu);
             assert_eq!(totals.path_mtu_state, state);

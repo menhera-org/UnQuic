@@ -10,8 +10,8 @@ use crate::{
     handshake::Connection,
     socket::{GSO_MAX_BYTES, MAX_UDP_PAYLOAD},
     wire::{
-        DATA_PREFIX_LEN, HEADER_LEN, Header, MAX_RECORDS, Record, WireError, encode_data_prefix,
-        encode_datagram,
+        DATA_PREFIX_LEN, HEADER_LEN, Header, MAX_RECORDS, PROBE_PREFIX_LEN, Record, WireError,
+        encode_data_prefix, encode_datagram, encode_probe_prefix,
     },
 };
 use std::{collections::hash_map::DefaultHasher, fmt, hash::Hasher};
@@ -19,6 +19,8 @@ use std::{collections::hash_map::DefaultHasher, fmt, hash::Hasher};
 const DATA_OVERHEAD: usize = DATA_PREFIX_LEN;
 const RECORD_PREFIX_LEN: usize = DATA_PREFIX_LEN - HEADER_LEN;
 const MAX_SEQUENCE: u64 = 0x0000_ffff_ffff_ffff;
+static PROBE_PADDING: [u8; MAX_UDP_PAYLOAD - PROBE_PREFIX_LEN] =
+    [0; MAX_UDP_PAYLOAD - PROBE_PREFIX_LEN];
 
 /// Encoding failure, with exhausted identities requiring a new connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,13 +138,37 @@ impl Lane {
         self.header.packet_number = number.checked_add(1).unwrap_or(0);
         Ok(Packet { number, length })
     }
+
+    /// Allocates a probe identity and borrows shared zero padding without copying it.
+    ///
+    /// Send the prefix and returned bytes as one datagram. Success only encodes
+    /// the probe; the owner must track actual submission and matching feedback.
+    pub fn probe(
+        &mut self,
+        length: usize,
+        prefix: &mut [u8; PROBE_PREFIX_LEN],
+    ) -> Result<Piece<'static>, PackError> {
+        if !(BASE_UDP_PAYLOAD..=MAX_UDP_PAYLOAD).contains(&length) {
+            return Err(PackError::Limit);
+        }
+        if self.header.packet_number == 0 {
+            return Err(PackError::Exhausted);
+        }
+        encode_probe_prefix(self.header, length, prefix).map_err(PackError::Wire)?;
+        let number = self.header.packet_number;
+        self.header.packet_number = number.checked_add(1).unwrap_or(0);
+        Ok(Piece {
+            packet: Packet { number, length },
+            bytes: &PROBE_PADDING[..length - PROBE_PREFIX_LEN],
+        })
+    }
 }
 
-/// One scatter/gather DATA piece, without copying its payload bytes.
+/// One scatter/gather DATA piece or probe, without copying its payload bytes.
 pub struct Piece<'a> {
     /// Encoded packet identity and combined prefix/payload length.
     pub packet: Packet,
-    /// Original frame bytes to send immediately after the encoded prefix.
+    /// Borrowed payload bytes to send immediately after the encoded prefix.
     pub bytes: &'a [u8],
 }
 
@@ -695,6 +721,24 @@ mod tests {
             lane.record(Record::Probe, &mut output),
             Err(PackError::Exhausted)
         );
+        let mut prefix = [0xa5; PROBE_PREFIX_LEN];
+        assert!(matches!(
+            lane.probe(MAX_UDP_PAYLOAD, &mut prefix),
+            Err(PackError::Exhausted)
+        ));
+        assert_eq!(prefix, [0xa5; PROBE_PREFIX_LEN]);
+        lane.header.packet_number = u64::MAX;
+        assert_eq!(
+            lane.probe(MAX_UDP_PAYLOAD, &mut prefix)
+                .unwrap()
+                .packet
+                .number,
+            u64::MAX
+        );
+        assert!(matches!(
+            lane.probe(MAX_UDP_PAYLOAD, &mut prefix),
+            Err(PackError::Exhausted)
+        ));
         lane.header.packet_number = 1;
         lane.next_frame = MAX_SEQUENCE;
         assert_eq!(lane.frame(&[0; 60]).unwrap().id(), (1 << 48) | MAX_SEQUENCE);

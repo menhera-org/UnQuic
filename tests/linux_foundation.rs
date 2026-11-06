@@ -7,7 +7,7 @@ use std::{
 };
 use unquic::{
     BASE_UDP_PAYLOAD, MAX_FRAME_LEN, MacAddress,
-    socket::{ReceiveSocket, TransmitSocket},
+    socket::{MAX_UDP_PAYLOAD, ReceiveSocket, TransmitSocket},
     tap::Tap,
 };
 
@@ -28,28 +28,34 @@ fn kernel_socket_and_tap_invariants() {
     let rx = ReceiveSocket::bind("[::1]:40000".parse().unwrap(), Some(c"lo")).unwrap();
     let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
     let capture = raw_socket(c"lo", libc::ETH_P_IPV6 as u16);
-    tx.send(&[0x5a; BASE_UDP_PAYLOAD], BASE_UDP_PAYLOAD)
-        .unwrap();
-    let mut packet = [0; 2048];
-    wait_for(|| {
-        let Some(n) = raw_read(&capture, &mut packet) else {
-            return false;
-        };
-        assert_eq!(n, 14 + 1280);
-        assert_eq!(packet[14] >> 4, 6);
-        assert_eq!(packet[20], libc::IPPROTO_UDP as u8); // No Fragment/extension header.
-        assert_eq!(u16::from_be_bytes([packet[18], packet[19]]), 1240);
-        assert_eq!(
-            u16::from_be_bytes([packet[54], packet[55]]),
-            tx.local_addr().unwrap().port()
-        );
-        assert_eq!(u16::from_be_bytes([packet[56], packet[57]]), 40000);
-        true
-    });
-    let (n, source) = rx.recv(&mut packet).unwrap();
-    assert_eq!(n, BASE_UDP_PAYLOAD);
-    assert_ne!(source.port(), 40000);
-    assert_eq!(source, tx.local_addr().unwrap());
+    let mut packet = [0; 14 + 9000];
+    for length in [BASE_UDP_PAYLOAD, 1452, MAX_UDP_PAYLOAD] {
+        while raw_read(&capture, &mut packet).is_some() {}
+        tx.send(&[0x5a; MAX_UDP_PAYLOAD][..length], length).unwrap();
+        wait_for(|| {
+            let Some(n) = raw_read(&capture, &mut packet) else {
+                return false;
+            };
+            assert_eq!(n, 14 + 48 + length);
+            assert_eq!(packet[14] >> 4, 6);
+            assert_eq!(packet[20], libc::IPPROTO_UDP as u8); // No Fragment/extension header.
+            assert_eq!(
+                usize::from(u16::from_be_bytes([packet[18], packet[19]])),
+                length + 8
+            );
+            assert_eq!(
+                u16::from_be_bytes([packet[54], packet[55]]),
+                tx.local_addr().unwrap().port()
+            );
+            assert_eq!(u16::from_be_bytes([packet[56], packet[57]]), 40000);
+            true
+        });
+        let (n, source) = rx.recv(&mut packet).unwrap();
+        assert_eq!(n, length);
+        assert_eq!(&packet[..n], &[0x5a; MAX_UDP_PAYLOAD][..n]);
+        assert_ne!(source.port(), 40000);
+        assert_eq!(source, tx.local_addr().unwrap());
+    }
     // IPv6-only wildcard sockets must leave the corresponding IPv4 port free.
     let v6 = ReceiveSocket::bind("[::]:40001".parse::<SocketAddrV6>().unwrap(), None).unwrap();
     let v4 = UdpSocket::bind("0.0.0.0:40001").unwrap();

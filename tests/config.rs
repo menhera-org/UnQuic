@@ -193,14 +193,14 @@ fn unresolved_peers_and_configuration_boundaries_are_allowed() {
 
 #[test]
 fn outer_payload_limits_are_bounded_per_peer() {
-    for limit in [1232, 1300, 1452] {
+    for limit in [1232, 1300, 1452, 8952] {
         let mut c = config();
         c.peers[1].outer_payload_limit = limit;
         let valid = c.validate().unwrap();
         assert_eq!(valid.config().peers[0].outer_payload_limit, 1232);
         assert_eq!(valid.config().peers[1].outer_payload_limit, limit);
     }
-    for limit in [0, 1231, 1453, usize::MAX] {
+    for limit in [0, 1231, 8953, usize::MAX] {
         let mut c = config();
         c.peers[1].outer_payload_limit = limit;
         let error = c.validate().err().unwrap();
