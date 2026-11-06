@@ -705,7 +705,9 @@ fn sent_history_and_loss_timing_allocate_nothing() {
             end: number,
         }];
         let ranges = AckRanges::new(&values).unwrap();
-        let result = history.acknowledge(ranges, |_| {}).unwrap();
+        history.begin_ack(ranges).unwrap();
+        assert_eq!(history.advance_ack(1, |_| panic!("word scan only")), None);
+        let result = history.advance_ack(2, |_| {}).unwrap();
         assert!(rtt.sample(result.rtt_sent_at.unwrap(), Duration::from_millis(5), 1000));
         std::hint::black_box((rtt.loss_delay(), rtt.pto_period(3), rtt.frame_lifetime()));
         assert_eq!(history.outstanding().count(), 0);

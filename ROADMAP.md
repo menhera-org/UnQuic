@@ -448,7 +448,13 @@ maximum packet numbers, and reset/retirement. Pure sender-history validation now
 distinguishes reservations, successful submissions and canceled holes, validates
 whole ACKs before mutation, and preserves unresolved charges under window pressure.
 Tests cover late ACKs, feedback-only eviction, ring wrap, maximum identities and
-allocation-free transitions. Sender entries now use 16 bytes each, retaining full
+allocation-free transitions. ACK application can now yield after a caller-supplied
+budget of bitmap scans, range transitions and callbacks. Whole-record validation
+precedes application; pending ACKs pin their history window and protect covered
+packets from interleaved loss. Tests cover a full-window ACK, duplicate-only
+scans, floor pressure, competing ACKs, late loss and RTT sampling across yields.
+Worker integration must retain the ACK's arrival time and reserve report space
+before advancing it. Sender entries now use 16 bytes each, retaining full
 `Duration` range and nanosecond precision; 64 histories save 32 MiB compared with
 the previous 24-byte entries. Worker submission accounting and incoming ACK
 application remain pending. Outgoing ACKs are now emitted through the shared

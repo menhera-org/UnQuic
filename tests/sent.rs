@@ -79,6 +79,7 @@ fn whole_ack_validation_precedes_callbacks_and_mutation() {
         Err(HistoryError::Unsent)
     );
     assert_eq!(calls, 0);
+    assert!(!history.ack_pending());
     assert_eq!(history.inflight_bytes(), 4500);
     let progress = history
         .acknowledge(
@@ -387,4 +388,151 @@ fn compact_timestamps_preserve_full_duration_through_loss_ack_and_reset() {
         assert_eq!(progress.released_bytes, 0);
         history.reset().unwrap();
     }
+}
+
+#[test]
+fn bounded_ack_yields_without_losing_callbacks_or_credit() {
+    let mut history = History::new().unwrap();
+    let end = SENT_CAPACITY as u64;
+    for number in 1..=end {
+        sent(&mut history, number, true);
+    }
+    history
+        .begin_ack(ranges(&[AckRange { start: 1, end }]))
+        .unwrap();
+    assert_eq!(history.advance_ack(0, |_| panic!("zero budget")), None);
+    assert_eq!(history.inflight_bytes(), end * 1500);
+    let mut calls = 0;
+    let progress = loop {
+        let before = calls;
+        let progress = history.advance_ack(64, |acked| {
+            calls += 1;
+            assert_eq!(acked.packet.number, calls);
+            assert!(acked.was_in_flight);
+        });
+        assert!(calls - before <= 64);
+        assert_eq!(history.inflight_bytes(), (end - calls) * 1500);
+        if let Some(progress) = progress {
+            break progress;
+        }
+        assert!(history.ack_pending());
+    };
+    assert_eq!(calls, end);
+    assert_eq!(progress.packets, SENT_CAPACITY as u32);
+    assert_eq!(progress.released_bytes, end * 1500);
+    assert_eq!(progress.rtt_sent_at, Some(Duration::from_micros(end)));
+    assert!(!history.ack_pending());
+    assert_eq!(history.advance_ack(64, |_| panic!("no pending ACK")), None);
+
+    // An all-duplicate ACK still spends its budget scanning the bitmap.
+    history
+        .begin_ack(ranges(&[AckRange { start: 1, end }]))
+        .unwrap();
+    let mut turns = 0;
+    loop {
+        turns += 1;
+        if let Some(progress) = history.advance_ack(1, |_| panic!("duplicate callback")) {
+            assert_eq!(progress, AckProgress::default());
+            break;
+        }
+        assert!(turns <= SENT_CAPACITY / 64 + 2);
+    }
+    // Packet numbers 1..=65536 straddle 1025 words, followed by one transition.
+    assert_eq!(turns, SENT_CAPACITY / 64 + 2);
+}
+
+#[test]
+fn pending_ack_pins_metadata_and_rejects_competing_operations() {
+    let mut history = History::new().unwrap();
+    sent(&mut history, 1, false);
+    let values = [AckRange { start: 1, end: 1 }];
+    history.begin_ack(ranges(&values)).unwrap();
+    assert_eq!(history.begin_ack(ranges(&values)), Err(HistoryError::Busy));
+    assert_eq!(
+        history.acknowledge(ranges(&values), |_| panic!("competing ACK")),
+        Err(HistoryError::Busy)
+    );
+    assert_eq!(history.reset(), Err(HistoryError::Busy));
+    // Submissions within the pinned window remain possible.
+    sent(&mut history, SENT_CAPACITY as u64, false);
+    let next = SENT_CAPACITY as u64 + 1;
+    assert_eq!(
+        history.reserve(next, 1500, false, false),
+        Err(HistoryError::Full)
+    );
+    assert_eq!(history.floor(), 1);
+    let mut calls = 0;
+    while history.ack_pending() {
+        history.advance_ack(1, |acked| {
+            calls += 1;
+            assert_eq!(acked.packet.number, 1);
+        });
+    }
+    assert_eq!(calls, 1);
+    sent(&mut history, next, false);
+    assert_eq!(history.floor(), 2);
+    assert_eq!(history.packet(1), None);
+    history.reset().unwrap();
+}
+
+#[test]
+fn pending_ack_protects_covered_packets_from_interleaved_loss() {
+    let mut history = History::new().unwrap();
+    for number in 1..=5 {
+        sent(&mut history, number, true);
+    }
+    history.lose(1).unwrap();
+    history
+        .begin_ack(ranges(&[
+            AckRange { start: 4, end: 5 },
+            AckRange { start: 1, end: 2 },
+        ]))
+        .unwrap();
+    assert_eq!(history.lose(4), None);
+    assert_eq!(history.lose(2), None);
+    assert!(history.lose(3).is_some());
+    assert_eq!(history.inflight_bytes(), 4500);
+    let mut seen = 0_u8;
+    let progress = loop {
+        if let Some(progress) = history.advance_ack(1, |acked| {
+            let bit = 1 << acked.packet.number;
+            assert_eq!(seen & bit, 0);
+            seen |= bit;
+            assert_eq!(acked.was_in_flight, acked.packet.number != 1);
+        }) {
+            break progress;
+        }
+        assert_eq!(history.lose(2), None);
+        assert_eq!(history.lose(5), None);
+    };
+    assert_eq!(seen, 0b110110);
+    assert_eq!(progress.packets, 4);
+    assert_eq!(progress.released_bytes, 4500);
+    assert_eq!(history.inflight_bytes(), 0);
+}
+
+#[test]
+fn bounded_ack_keeps_rtt_candidate_until_later_eliciting_range() {
+    let mut history = History::new().unwrap();
+    sent(&mut history, 1, true);
+    sent(&mut history, 3, false);
+    history
+        .begin_ack(ranges(&[
+            AckRange { start: 3, end: 3 },
+            AckRange { start: 1, end: 1 },
+        ]))
+        .unwrap();
+    // Highest packet is feedback-only; a later range makes this an RTT sample.
+    assert_eq!(
+        history.advance_ack(2, |acked| assert_eq!(acked.packet.number, 3)),
+        None
+    );
+    assert_eq!(history.inflight_bytes(), 1500);
+    let progress = loop {
+        if let Some(progress) = history.advance_ack(1, |acked| assert_eq!(acked.packet.number, 1)) {
+            break progress;
+        }
+    };
+    assert!(progress.eliciting);
+    assert_eq!(progress.rtt_sent_at, Some(Duration::from_micros(3)));
 }

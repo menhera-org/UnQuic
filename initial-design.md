@@ -633,7 +633,11 @@ throughput gate has not passed. Receive-side ACK scheduling/range construction
 is implemented over the existing bitmap. Pure sender history now validates whole
 ACKs against actual submissions, preserves unresolved charges and rejects known
 unsent holes. Each entry uses 16 bytes plus four bitmap bits, preserving full
-monotonic timestamp range and precision. Worker history integration and incoming ACK application are not yet connected.
+monotonic timestamp range and precision. ACK application has a resumable work
+budget covering word scans, range transitions and callbacks. A pending ACK pins
+history metadata and prevents loss declarations for covered packets; validation
+still completes before any callback. Worker history integration and incoming
+ACK application are not yet connected.
 Pure RTT, loss-deadline, PTO-period and frame
 lifetime calculations and per-frame byte coverage are implemented. Coverage
 tracks at most two repairs per byte and rejects stale loss against a newer

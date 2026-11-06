@@ -1,6 +1,6 @@
 //! One connection/lane's fixed sent-packet history; payload storage is separate.
 
-use crate::wire::AckRanges;
+use crate::wire::{AckRange, AckRanges, MAX_ACK_RANGES};
 use std::{collections::TryReserveError, time::Duration};
 
 /// Maximum retained packet-number span per lane.
@@ -59,26 +59,40 @@ pub struct AckProgress {
 pub enum HistoryError {
     /// Zero/reused number, invalid outer size or an uncharged ACK-eliciting packet.
     Invalid,
-    /// Advancing history would forget a reservation or unresolved congestion charge.
+    /// Advancing history would forget a reservation, unresolved charge or pending ACK.
     Full,
     /// An ACK names a number above the highest successful submission.
     Future,
     /// An ACK covers a retained number that was never successfully submitted.
     Unsent,
+    /// An earlier validated ACK still requires bounded application.
+    Busy,
 }
 
 impl std::fmt::Display for HistoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Invalid => "invalid or reused packet reservation",
-            Self::Full => "sent history still has unresolved reservations or charges",
+            Self::Full => "sent history is pinned by reservations, charges or a pending ACK",
             Self::Future => "ACK exceeds the highest submitted packet number",
             Self::Unsent => "ACK covers an unsent packet number",
+            Self::Busy => "a validated ACK is still being applied",
         })
     }
 }
 
 impl std::error::Error for HistoryError {}
+
+struct PendingAck {
+    ranges: [AckRange; MAX_ACK_RANGES],
+    len: usize,
+    range: usize,
+    next_word: u64,
+    word: u64,
+    bits: u64,
+    largest: u64,
+    progress: AckProgress,
+}
 
 /// Bounded sender history with allocation-free reservation, ACK and loss operations.
 ///
@@ -99,6 +113,7 @@ pub struct History {
     allocated: u64,
     highest_sent: u64,
     inflight_bytes: u64,
+    pending: Option<PendingAck>,
 }
 
 impl History {
@@ -117,6 +132,7 @@ impl History {
             allocated: 0,
             highest_sent: 0,
             inflight_bytes: 0,
+            pending: None,
         })
     }
 
@@ -161,6 +177,9 @@ impl History {
         let floor = self
             .floor
             .max(number.saturating_sub(SENT_CAPACITY as u64 - 1));
+        if self.pending.is_some() && floor != self.floor {
+            return Err(HistoryError::Full);
+        }
         let end = self.allocated.min(floor - 1);
         for (word, mask) in words(self.floor, end) {
             let index = word as usize & (WORDS - 1);
@@ -240,57 +259,137 @@ impl History {
         Ok(())
     }
 
-    /// Validates all ranges before changing state, then visits each new ACK once.
+    /// Whether a validated ACK still has bounded work to apply.
+    pub const fn ack_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Validates a whole ACK and retains its ranges without applying callbacks.
     ///
-    /// Old portions are ignored. Callback metadata never owns frame payloads.
-    /// A late ACK after loss does not release congestion credit a second time.
+    /// Validation visits at most 1025 bitmap words plus 31 repeated boundary-word
+    /// visits. Application is separately budgeted by advance_ack. Until it
+    /// finishes, reset and competing ACKs are rejected and the history floor
+    /// cannot advance. Loss cannot settle a packet covered by this ACK.
+    ///
+    /// Retain the original arrival time and delay outside this history; use them
+    /// for every resulting delivery/RTT report, even across later worker turns.
+    pub fn begin_ack(&mut self, ranges: AckRanges<'_>) -> Result<(), HistoryError> {
+        if self.pending.is_some() {
+            return Err(HistoryError::Busy);
+        }
+        self.validate(ranges)?;
+        let mut pending = PendingAck {
+            ranges: [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES],
+            len: ranges.len(),
+            range: 0,
+            next_word: 0,
+            word: 0,
+            bits: 0,
+            largest: 0,
+            progress: AckProgress::default(),
+        };
+        for (slot, range) in pending.ranges.iter_mut().zip(ranges.iter()) {
+            *slot = range;
+        }
+        pending.largest = pending.ranges[0].end;
+        pending.next_word = pending.ranges[0].start.max(self.floor) >> 6;
+        self.pending = Some(pending);
+        Ok(())
+    }
+
+    /// Applies a validated ACK with a fixed work budget and no allocation.
+    ///
+    /// Each bitmap-word visit, range transition and callback costs one unit.
+    /// Returns cumulative progress only on completion, or None when work remains
+    /// (also when no ACK is pending). A zero budget leaves all state unchanged.
+    /// Reserve callback/report capacity first; callback events cannot be dropped.
+    pub fn advance_ack(
+        &mut self,
+        budget: usize,
+        mut accepted: impl FnMut(Acknowledged),
+    ) -> Option<AckProgress> {
+        let mut pending = self.pending.take()?;
+        for _ in 0..budget {
+            if pending.bits != 0 {
+                let bit_index = pending.bits.trailing_zeros();
+                let bit = 1_u64 << bit_index;
+                let number = (pending.word << 6) | u64::from(bit_index);
+                pending.bits &= !bit;
+                let index = pending.word as usize & (WORDS - 1);
+                let packet = self.metadata(number);
+                let was_in_flight = self.inflight[index] & bit != 0;
+                self.inflight[index] &= !bit;
+                self.acknowledged[index] |= bit;
+                pending.progress.packets += 1;
+                pending.progress.eliciting |= packet.eliciting;
+                if was_in_flight {
+                    pending.progress.released_bytes += u64::from(packet.outer_bytes);
+                    self.inflight_bytes -= u64::from(packet.outer_bytes);
+                }
+                if number == pending.largest {
+                    pending.progress.rtt_sent_at = Some(packet.sent_at);
+                }
+                accepted(Acknowledged {
+                    packet,
+                    was_in_flight,
+                });
+            } else if pending.range < pending.len {
+                let range = pending.ranges[pending.range];
+                if range.end < self.floor || pending.next_word > range.end >> 6 {
+                    pending.range += 1;
+                    if pending.range < pending.len {
+                        pending.next_word =
+                            pending.ranges[pending.range].start.max(self.floor) >> 6;
+                    }
+                    continue;
+                }
+                let word = pending.next_word;
+                let start = range.start.max(self.floor).max(word << 6);
+                let end = range.end.min((word << 6) | 63);
+                let mask = (u64::MAX << (start % 64)) & (u64::MAX >> (63 - end % 64));
+                pending.word = word;
+                pending.next_word += 1;
+                pending.bits = mask & !self.acknowledged[word as usize & (WORDS - 1)];
+            } else {
+                break;
+            }
+        }
+        if pending.range == pending.len && pending.bits == 0 {
+            if !pending.progress.eliciting {
+                pending.progress.rtt_sent_at = None;
+            }
+            Some(pending.progress)
+        } else {
+            self.pending = Some(pending);
+            None
+        }
+    }
+
+    /// Applies one whole ACK synchronously; worker loops should use bounded application.
+    ///
+    /// Validation precedes callbacks. Old portions and duplicate ACKs are ignored;
+    /// a late ACK after loss cannot release congestion credit a second time.
     pub fn acknowledge(
         &mut self,
         ranges: AckRanges<'_>,
-        mut accepted: impl FnMut(Acknowledged),
+        accepted: impl FnMut(Acknowledged),
     ) -> Result<AckProgress, HistoryError> {
-        self.validate(ranges)?;
-        let largest = ranges.iter().next().map_or(0, |range| range.end);
-        let mut progress = AckProgress::default();
-        for range in ranges.iter() {
-            for (word, mask) in words(range.start.max(self.floor), range.end) {
-                let index = word as usize & (WORDS - 1);
-                let mut new = mask & !self.acknowledged[index];
-                while new != 0 {
-                    let bit = 1_u64 << new.trailing_zeros();
-                    let number = (word << 6) | u64::from(new.trailing_zeros());
-                    new &= !bit;
-                    let packet = self.metadata(number);
-                    let was_in_flight = self.inflight[index] & bit != 0;
-                    self.inflight[index] &= !bit;
-                    self.acknowledged[index] |= bit;
-                    progress.packets += 1;
-                    progress.eliciting |= packet.eliciting;
-                    if was_in_flight {
-                        progress.released_bytes += u64::from(packet.outer_bytes);
-                        self.inflight_bytes -= u64::from(packet.outer_bytes);
-                    }
-                    if number == largest {
-                        progress.rtt_sent_at = Some(packet.sent_at);
-                    }
-                    accepted(Acknowledged {
-                        packet,
-                        was_in_flight,
-                    });
-                }
-            }
-        }
-        if !progress.eliciting {
-            progress.rtt_sent_at = None;
-        }
-        Ok(progress)
+        self.begin_ack(ranges)?;
+        Ok(self.advance_ack(usize::MAX, accepted).unwrap_or_default())
     }
 
     /// Declares one outstanding charged packet lost and releases its charge once.
     ///
-    /// Retains submission identity for late ACKs. Payload/repair policy is separate.
+    /// Retains submission identity for late ACKs. A pending validated ACK protects
+    /// its covered packets from loss while application yields. Payload policy is separate.
     pub fn lose(&mut self, number: u64) -> Option<SentPacket> {
-        if !self.contains(number) {
+        if !self.contains(number)
+            || self.pending.as_ref().is_some_and(|pending| {
+                pending.ranges[..pending.len]
+                    .iter()
+                    .any(|range| (range.start..=range.end).contains(&number))
+            })
+        {
             return None;
         }
         let (word, bit) = location(number);
@@ -325,6 +424,9 @@ impl History {
 
     /// Reuses storage only after every charge and reservation has been settled.
     pub fn reset(&mut self) -> Result<(), HistoryError> {
+        if self.pending.is_some() {
+            return Err(HistoryError::Busy);
+        }
         if self.inflight_bytes != 0 || self.reserved.iter().any(|word| *word != 0) {
             return Err(HistoryError::Full);
         }
