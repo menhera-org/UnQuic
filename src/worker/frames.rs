@@ -7,7 +7,19 @@ pub(super) const CAPACITY: usize = 8192;
 pub(super) const HEADER_BYTES: usize = 128;
 
 const END: usize = CAPACITY;
-const UNQUEUED: usize = usize::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Link {
+    next: u16,
+    previous: u16,
+}
+
+impl Link {
+    const EMPTY: Self = Self {
+        next: u16::MAX,
+        previous: u16::MAX,
+    };
+}
 
 pub(super) struct Queue {
     head: usize,
@@ -39,51 +51,99 @@ impl Queue {
         (self.head != END).then_some(self.head)
     }
 
+    #[cfg(test)]
     pub fn iter<'a>(&self, store: &'a Store) -> impl Iterator<Item = usize> + 'a {
         std::iter::successors(self.front(), move |&index| {
-            store.links.get(index).copied().filter(|&next| next < END)
+            store
+                .links
+                .get(index)
+                .map(|link| usize::from(link.next))
+                .filter(|&next| next < END)
         })
         .take(self.len)
     }
 
     pub fn push_back(&mut self, store: &mut Store, index: usize) -> io::Result<()> {
-        if store.frame(index).is_none()
-            || store.links.get(index) != Some(&UNQUEUED)
-            || self.len >= CAPACITY
-            || (self.len != 0 && store.links.get(self.tail) != Some(&END))
-        {
-            return Err(io::Error::other("invalid transmit queue insertion"));
+        if store.frame(index).is_none() {
+            return Err(io::Error::other("missing queued transmit frame"));
         }
-        if self.len == 0 {
-            self.head = index;
-        } else if let Some(next) = store.links.get_mut(self.tail) {
-            *next = index;
-        }
-        store.links[index] = END;
-        self.tail = index;
-        self.len += 1;
-        Ok(())
+        self.insert(&mut store.links, index)
     }
 
     pub fn pop_front(&mut self, store: &mut Store) -> io::Result<Option<usize>> {
         let Some(index) = self.front() else {
             return Ok(None);
         };
-        let next = store.links.get(index).copied().unwrap_or(UNQUEUED);
-        if store.frame(index).is_none()
+        if store.frame(index).is_none() || !self.remove(&mut store.links, index)? {
+            return Err(io::Error::other("missing queued transmit frame"));
+        }
+        Ok(Some(index))
+    }
+
+    fn insert(&mut self, links: &mut [Link], index: usize) -> io::Result<()> {
+        if index >= CAPACITY
+            || links.get(index) != Some(&Link::EMPTY)
+            || self.len >= CAPACITY
+            || (self.len != 0
+                && links
+                    .get(self.tail)
+                    .is_none_or(|link| usize::from(link.next) != END))
+        {
+            return Err(io::Error::other("invalid transmit queue insertion"));
+        }
+        links[index] = Link {
+            next: END as u16,
+            previous: if self.len == 0 {
+                END as u16
+            } else {
+                self.tail as u16
+            },
+        };
+        if self.len == 0 {
+            self.head = index;
+        } else {
+            links[self.tail].next = index as u16;
+        }
+        self.tail = index;
+        self.len += 1;
+        Ok(())
+    }
+
+    // The caller selects the queue from the frame's owner; no membership search.
+    fn remove(&mut self, links: &mut [Link], index: usize) -> io::Result<bool> {
+        let Some(&link) = links.get(index).filter(|&&link| link != Link::EMPTY) else {
+            return Ok(false);
+        };
+        let (previous, next) = (usize::from(link.previous), usize::from(link.next));
+        if self.len == 0
+            || previous > END
             || next > END
-            || self.len == 0
-            || (next == END) != (self.len == 1)
+            || (previous == END && self.head != index)
+            || (next == END && self.tail != index)
+            || (previous != END
+                && links
+                    .get(previous)
+                    .is_none_or(|link| usize::from(link.next) != index))
+            || (next != END
+                && links
+                    .get(next)
+                    .is_none_or(|link| usize::from(link.previous) != index))
         {
             return Err(io::Error::other("invalid transmit queue removal"));
         }
-        self.head = next;
-        self.len -= 1;
-        if self.len == 0 {
-            self.tail = END;
+        if previous == END {
+            self.head = next;
+        } else {
+            links[previous].next = next as u16;
         }
-        store.links[index] = UNQUEUED;
-        Ok(Some(index))
+        if next == END {
+            self.tail = previous;
+        } else {
+            links[next].previous = previous as u16;
+        }
+        links[index] = Link::EMPTY;
+        self.len -= 1;
+        Ok(true)
     }
 }
 
@@ -115,13 +175,19 @@ pub(super) struct Store {
     free_sources: Vec<usize>,
     frames: Vec<Option<Frame>>,
     free_frames: Vec<usize>,
-    links: Vec<usize>,
+    links: Vec<Link>,
+    expiry: Vec<u16>,
+    expiry_position: Vec<u16>,
 }
 
 impl Store {
     pub const fn storage_bytes(capacity: usize) -> usize {
         BUFFERS * (size_of::<Option<Source>>() + size_of::<usize>())
-            + capacity * (size_of::<Option<Frame>>() + 2 * size_of::<usize>())
+            + capacity
+                * (size_of::<Option<Frame>>()
+                    + size_of::<usize>()
+                    + size_of::<Link>()
+                    + 2 * size_of::<u16>())
     }
 
     pub fn new(capacity: usize) -> io::Result<Self> {
@@ -134,7 +200,9 @@ impl Store {
             free_sources: (0..sources).rev().collect(),
             frames: std::iter::repeat_with(|| None).take(capacity).collect(),
             free_frames: (0..capacity).rev().collect(),
-            links: vec![UNQUEUED; capacity],
+            links: vec![Link::EMPTY; capacity],
+            expiry: Vec::with_capacity(capacity),
+            expiry_position: vec![END as u16; capacity],
         })
     }
 
@@ -188,6 +256,9 @@ impl Store {
         source.references = source.references.checked_add(1)?;
         self.free_frames.pop();
         *slot = Some(frame);
+        self.expiry_position[index] = self.expiry.len() as u16;
+        self.expiry.push(index as u16);
+        self.sift_expiry(self.expiry.len() - 1);
         Some(index)
     }
 
@@ -234,14 +305,103 @@ impl Store {
     }
 
     pub fn release(&mut self, index: usize) -> Option<Box<Buffer>> {
-        if self.links.get(index) != Some(&UNQUEUED) {
+        if self.links.get(index) != Some(&Link::EMPTY) {
             return None;
         }
+        self.untrack_expiry(index).ok()?;
         let frame = self.frames.get_mut(index)?.take()?;
         self.free_frames.push(index);
         let source = self.sources.get_mut(frame.source)?.as_mut()?;
         source.references = source.references.checked_sub(1)?;
         self.recycle(frame.source)
+    }
+
+    pub fn deadline(&self) -> Option<Duration> {
+        self.frame(usize::from(*self.expiry.first()?))
+            .map(|frame| frame.deadline)
+    }
+
+    /// Removes one due frame from the heap, leaving payload/ready ownership intact.
+    pub fn pop_expired(&mut self, now: Duration) -> io::Result<Option<usize>> {
+        if self.deadline().is_none_or(|deadline| deadline > now) {
+            return Ok(None);
+        }
+        let index = usize::from(self.expiry[0]);
+        self.untrack_expiry(index)?;
+        Ok(Some(index))
+    }
+
+    pub fn unqueue(&mut self, queue: &mut Queue, index: usize) -> io::Result<bool> {
+        queue.remove(&mut self.links, index)
+    }
+
+    fn expiry_before(&self, a: usize, b: usize) -> bool {
+        let key = |position| {
+            let index = self.expiry[position];
+            self.frame(usize::from(index)).map(|frame| frame.deadline)
+        };
+        key(a) < key(b)
+    }
+
+    fn swap_expiry(&mut self, a: usize, b: usize) {
+        self.expiry.swap(a, b);
+        self.expiry_position[usize::from(self.expiry[a])] = a as u16;
+        self.expiry_position[usize::from(self.expiry[b])] = b as u16;
+    }
+
+    // At most 13 levels, including out-of-order cross-worker admissions.
+    fn sift_expiry(&mut self, mut position: usize) {
+        let start = position;
+        while position != 0 {
+            let parent = (position - 1) / 2;
+            if !self.expiry_before(position, parent) {
+                break;
+            }
+            self.swap_expiry(position, parent);
+            position = parent;
+        }
+        if position != start {
+            return;
+        }
+        while position * 2 + 1 < self.expiry.len() {
+            let mut child = position * 2 + 1;
+            if child + 1 < self.expiry.len() && self.expiry_before(child + 1, child) {
+                child += 1;
+            }
+            if !self.expiry_before(child, position) {
+                break;
+            }
+            self.swap_expiry(position, child);
+            position = child;
+        }
+    }
+
+    fn untrack_expiry(&mut self, index: usize) -> io::Result<()> {
+        let Some(&position) = self.expiry_position.get(index) else {
+            return Ok(());
+        };
+        let position = usize::from(position);
+        if position == END {
+            return Ok(());
+        }
+        if self.expiry.get(position).copied() != Some(index as u16) {
+            return Err(io::Error::other("invalid transmit expiry position"));
+        }
+        self.swap_expiry(position, self.expiry.len() - 1);
+        self.expiry.pop();
+        self.expiry_position[index] = END as u16;
+        if position < self.expiry.len() {
+            self.sift_expiry(position);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn set_deadline(&mut self, index: usize, deadline: Duration) {
+        self.frame_mut(index).unwrap().deadline = deadline;
+        let position = usize::from(self.expiry_position[index]);
+        assert!(position < self.expiry.len());
+        self.sift_expiry(position);
     }
 
     /// Appends a complete frame; dead ranges remain charged until the slab recycles.
@@ -400,7 +560,7 @@ mod tests {
             .enumerate()
             .filter_map(|(i, (a, b))| (a != b).then_some(i))
             .collect();
-        assert_eq!(changes, [0]);
+        assert_eq!(changes, [0, 1]);
         assert!(store.release(0).is_none());
         for expected in 1..CAPACITY {
             let index = queue.pop_front(&mut store).unwrap().unwrap();
@@ -449,6 +609,127 @@ mod tests {
             assert_eq!(store.free_sources.len(), BUFFERS);
             assert!(store.unpin(source).is_none());
         }
+    }
+
+    fn check_expiry(store: &Store) {
+        let mut expected: Vec<_> = store
+            .frames
+            .iter()
+            .enumerate()
+            .filter_map(|(index, frame)| {
+                frame
+                    .as_ref()
+                    .filter(|_| store.expiry_position[index] != END as u16)
+                    .map(|frame| (frame.deadline, index))
+            })
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(store.deadline(), expected.first().map(|entry| entry.0));
+        assert_eq!(store.expiry.len(), expected.len());
+        for (position, &index) in store.expiry.iter().enumerate() {
+            assert_eq!(
+                usize::from(store.expiry_position[usize::from(index)]),
+                position
+            );
+            if position != 0 {
+                assert!(!store.expiry_before(position, (position - 1) / 2));
+            }
+        }
+    }
+
+    #[test]
+    fn expiry_orders_arbitrary_deadlines_and_survives_removal_and_slot_reuse() {
+        let mut store = Store::new(CAPACITY).unwrap();
+        let source = store.insert_source(buffer(60)).ok().unwrap();
+        // A permutation mixes old and new epochs, including equal deadlines.
+        for id in 0..CAPACITY {
+            let mut input = frame(source, 0..60, id as u64 + 1);
+            input.deadline = Duration::from_nanos(((id * 4051) % CAPACITY / 4) as u64);
+            store.insert_frame(input).unwrap();
+        }
+        check_expiry(&store);
+        assert!(store.pop_expired(Duration::ZERO).unwrap().is_some());
+        for index in (0..CAPACITY).step_by(3) {
+            store.release(index);
+            let mut input = frame(source, 0..60, 10000 + index as u64);
+            input.deadline = if index % 2 == 0 {
+                Duration::ZERO
+            } else {
+                Duration::MAX
+            };
+            assert_eq!(store.insert_frame(input), Some(index));
+            if index % 127 == 0 {
+                check_expiry(&store);
+            }
+        }
+        // Include an already-untracked frame from pop_expired above.
+        for index in 0..CAPACITY {
+            if store.expiry_position[index] == END as u16 {
+                store.release(index);
+            }
+        }
+        let mut previous = Duration::ZERO;
+        let count = store.expiry.len();
+        assert!(store.unpin(source).is_none());
+        for remaining in (0..count).rev() {
+            let index = store.pop_expired(Duration::MAX).unwrap().unwrap();
+            let deadline = store.frame(index).unwrap().deadline;
+            assert!(previous <= deadline);
+            previous = deadline;
+            assert_eq!(store.release(index).is_some(), remaining == 0);
+            if remaining % 127 == 0 {
+                check_expiry(&store);
+            }
+        }
+        assert_eq!(store.deadline(), None);
+        assert_eq!(store.pop_expired(Duration::MAX).unwrap(), None);
+        assert_eq!(store.available(), CAPACITY);
+    }
+
+    #[test]
+    fn expiry_unlinks_pending_middle_frames_without_reordering_or_early_release() {
+        let mut store = Store::new(4).unwrap();
+        let source = store.insert_source(buffer(60)).ok().unwrap();
+        let mut queue = Queue::default();
+        for id in [30, 10, 20, 40] {
+            let index = store.insert_frame(frame(source, 0..60, id)).unwrap();
+            queue.push_back(&mut store, index).unwrap();
+        }
+        assert_eq!(
+            store
+                .pop_expired(Duration::from_millis(10) - Duration::from_nanos(1))
+                .unwrap(),
+            None
+        );
+        let index = store
+            .pop_expired(Duration::from_millis(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.frame(index).unwrap().id, 10);
+        assert!(store.release(index).is_none());
+        assert!(store.frame(index).is_some());
+        assert!(store.unqueue(&mut queue, index).unwrap());
+        assert!(!store.unqueue(&mut queue, index).unwrap());
+        assert_eq!(
+            queue
+                .iter(&store)
+                .map(|i| store.frame(i).unwrap().id)
+                .collect::<Vec<_>>(),
+            [30, 20, 40]
+        );
+        assert!(store.release(index).is_none());
+        assert_eq!(store.deadline(), Some(Duration::from_millis(20)));
+        store.set_deadline(3, Duration::ZERO);
+        assert_eq!(store.pop_expired(Duration::ZERO).unwrap(), Some(3));
+        assert!(store.unqueue(&mut queue, 3).unwrap());
+        store.release(3);
+        store.set_deadline(2, Duration::MAX);
+        assert_eq!(store.deadline(), Some(Duration::from_millis(30)));
+        while let Some(index) = queue.pop_front(&mut store).unwrap() {
+            store.release(index);
+        }
+        assert!(store.unpin(source).is_some());
+        assert_eq!(store.deadline(), None);
     }
 
     #[test]

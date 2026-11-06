@@ -502,6 +502,12 @@ originals and repairs produce no duplicate frame or double credit release.
 This uses a synthetic clock and does not test worker scheduling or throughput.
 Allocate journal and recovery state against actual frame quotas when wiring
 payload retention and worker repair sends; none of those is connected yet.
+The current transmit store now indexes exact deadlines in a fixed-capacity heap
+and removes pending frames directly. Cleanup visits at most 64 expired frame
+views per turn, including already-prepared batches; pre-send checks defer
+remaining expired frames without extending their deadlines. Regressions cover
+out-of-order admission, slot reuse, source lifetime, blocked sockets and several
+full expired batches sharing the cleanup budget.
 
 - `ack.rs`: ACK scheduling (16 packets or 1 ms, immediate on gap), at most
   32 newest ranges, delay capped at 1000 µs, per-lane once-per-millisecond

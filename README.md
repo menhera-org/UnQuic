@@ -441,7 +441,12 @@ frames per second, CPU and drops separately from large-frame Gbit/s.
 
 The current runtime sends each DATA piece once. It retains a frame only until
 all pieces have been submitted, the connection changes, or its 100 ms sender
-deadline expires. It emits packet ACKs after full admission, but does not yet
+deadline expires. An indexed heap finds the next transmit deadline without
+scanning retained frames. Each worker turn cleans up at most 64 expired frame
+views, including frames in prepared batches; sends defer any expired views
+left for the next turn. Heap updates visit at most 13 levels and pending-queue
+removal is constant-time. All storage is reserved at startup.
+It emits packet ACKs after full admission, but does not yet
 apply received ACKs, retain sent data for repair or apply congestion control.
 A lost piece can therefore prevent that entire
 frame from reaching TAP. Receive expiry starts at the first retained piece and

@@ -929,7 +929,7 @@ impl Worker {
             more |= self.mtu_timers(now)?;
             more |= self.drain_packets(now)?;
             more |= self.drain_tap_inputs(now)?;
-            self.flush_frames(now)?;
+            more |= self.flush_frames(now)?;
             self.flush_taps(now)?;
             self.collect_acks(now)?;
             self.flush_control(now)?;
@@ -938,7 +938,9 @@ impl Worker {
                 let tx = &self.transmit[self.shared.config.peer_for_session(session).unwrap()]
                     .paths[self.sessions[session].path]
                     .lanes[lane];
-                !tx.blocked && tx.mtu.payload_limit() != 0
+                let batch = self.sessions[session].batches[lane].as_ref();
+                batch.is_some_and(|batch| batch.len == 0 && batch.pending.is_empty())
+                    || (!tx.blocked && tx.mtu.payload_limit() != 0)
             });
             self.receive_interest(more)?;
             publish_turns = publish_turns.wrapping_add(1);
@@ -2453,7 +2455,47 @@ impl Worker {
         batch.compact();
     }
 
-    fn flush_frames(&mut self, now: Duration) -> io::Result<()> {
+    fn expire_frames(&mut self, now: Duration) -> io::Result<bool> {
+        for _ in 0..BATCH_SIZE {
+            let Some(index) = self.frames.pop_expired(now)? else {
+                break;
+            };
+            let (session, lane) = self
+                .frames
+                .frame(index)
+                .and_then(|frame| {
+                    self.frames
+                        .source(frame.source)
+                        .map(|source| (source.session, frame.lane))
+                })
+                .ok_or_else(|| io::Error::other("missing expiring transmit frame"))?;
+            if !self.frame_expired(index, now) {
+                return Err(io::Error::other("early transmit expiry"));
+            }
+            let batch = self
+                .sessions
+                .get_mut(session)
+                .and_then(|session| session.batches.get_mut(lane))
+                .and_then(Option::as_mut)
+                .ok_or_else(|| io::Error::other("missing expiring transmit batch"))?;
+            if !self.frames.unqueue(&mut batch.pending, index)? {
+                let slot = batch.frames[..batch.len]
+                    .iter_mut()
+                    .find(|slot| **slot == Some(index))
+                    .ok_or_else(|| io::Error::other("unowned expiring transmit frame"))?;
+                *slot = None;
+                batch.compact();
+            }
+            self.release_frame(index);
+        }
+        Ok(self
+            .frames
+            .deadline()
+            .is_some_and(|deadline| deadline <= now))
+    }
+
+    fn flush_frames(&mut self, now: Duration) -> io::Result<bool> {
+        let more = self.expire_frames(now)?;
         let mut visited = 0;
         for _ in 0..self.ready.len().min(BATCH_SIZE) {
             let (session, lane) = self.ready.pop_front().unwrap();
@@ -2468,13 +2510,19 @@ impl Worker {
                     .and_then(|frame| self.frames.source(frame.source))
                     .ok_or_else(|| io::Error::other("missing transmit source"))?
                     .tag;
-                if !self.matches(session, tag) || self.frame_expired(index, now) {
+                if !self.matches(session, tag) {
                     batch.pending.pop_front(&mut self.frames)?;
                     self.release_frame(index);
                     visited += 1;
                     continue;
                 }
-                if !batch.plan.is_empty() || batch.len == pack::BATCH_CAPACITY {
+                if !batch.plan.is_empty()
+                    || batch.len == pack::BATCH_CAPACITY
+                    || self
+                        .frames
+                        .frame(index)
+                        .is_none_or(|frame| frame.deadline <= now)
+                {
                     break;
                 }
                 batch.frames[batch.len] = batch.pending.pop_front(&mut self.frames)?;
@@ -2497,7 +2545,7 @@ impl Worker {
                 break;
             }
         }
-        Ok(())
+        Ok(more)
     }
 
     fn flush_batch(
@@ -2519,17 +2567,13 @@ impl Worker {
             self.clear_batch(batch);
             return Ok(());
         }
-        let mut expired = false;
-        for frame in &mut batch.frames[..batch.len] {
-            if frame.is_some_and(|index| self.frame_expired(index, now)) {
-                if let Some(index) = frame.take() {
-                    self.release_frame(index);
-                }
-                expired = true;
-            }
-        }
-        if expired {
-            batch.compact();
+        // Cleanup belongs to the bounded expiry pass; never submit a stale plan.
+        if batch.frames[..batch.len].iter().flatten().any(|&index| {
+            self.frames
+                .frame(index)
+                .is_none_or(|frame| frame.deadline <= now)
+        }) {
+            return Ok(());
         }
         if batch.len == 0 {
             return Ok(());
@@ -3515,17 +3559,8 @@ impl Worker {
                 }
             }
         }
-        for &(session, lane) in &self.ready {
-            let batch = self.sessions[session].batches[lane].as_ref().unwrap();
-            for frame in batch
-                .pending
-                .iter(&self.frames)
-                .chain(batch.frames[..batch.len].iter().flatten().copied())
-            {
-                if let Some(frame) = self.frames.frame(frame) {
-                    due = due.min(frame.deadline);
-                }
-            }
+        if let Some(deadline) = self.frames.deadline() {
+            due = due.min(deadline);
         }
         Some(due.max(now))
     }
@@ -3681,6 +3716,117 @@ mod tests {
 
     #[test]
     #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn blocked_transmit_expiry_is_bounded_and_cancels_prepared_references() {
+        let (mut worker, _) = receive_worker();
+        let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
+        worker.transmit[0].paths[0].lanes[0].socket =
+            Some(TransmitSocket::connect(&rx, rx.local_addr()).unwrap());
+        worker.transmit[0].paths[0].lanes[0].blocked = true;
+        for index in 0..193 {
+            let mut buffer = worker.free.pop().unwrap();
+            buffer.session = 0;
+            buffer.lane = 0;
+            buffer.tag = 1;
+            buffer.length = 60;
+            buffer.deadline = Duration::from_millis(if index % 2 == 0 { 100 } else { 200 });
+            buffer.tx_reserved = true;
+            worker.sessions[0].tx_retained += 1;
+            worker.sessions[0].tx_bytes += buffer.length;
+            worker.input_frame(buffer, Duration::ZERO).unwrap();
+        }
+        worker.flush_frames(Duration::ZERO).unwrap();
+        let mut batch = worker.sessions[0].batches[0].take().unwrap();
+        assert_eq!(batch.len, BATCH_SIZE);
+        batch
+            .prepare(
+                worker.sessions[0].tx[0].as_mut().unwrap(),
+                &worker.frames,
+                BASE_UDP_PAYLOAD,
+            )
+            .unwrap();
+        assert!(!batch.plan.is_empty());
+        worker.sessions[0].batches[0] = Some(batch);
+        let early = Duration::from_millis(100) - Duration::from_nanos(1);
+        assert!(!worker.expire_frames(early).unwrap());
+        assert_eq!(worker.counters.expired_frames, 0);
+        assert!(worker.expire_frames(Duration::from_millis(100)).unwrap());
+        assert_eq!(worker.counters.expired_frames, BATCH_SIZE as u64);
+        assert!(
+            worker.sessions[0].batches[0]
+                .as_ref()
+                .unwrap()
+                .plan
+                .is_empty()
+        );
+        assert!(!worker.expire_frames(Duration::from_millis(100)).unwrap());
+        assert_eq!(worker.counters.expired_frames, 97);
+        let batch = worker.sessions[0].batches[0].as_ref().unwrap();
+        let remaining: Vec<_> = batch.frames[..batch.len]
+            .iter()
+            .flatten()
+            .copied()
+            .chain(batch.pending.iter(&worker.frames))
+            .map(|index| worker.frames.frame(index).unwrap().id & ((1 << 48) - 1))
+            .collect();
+        assert_eq!(remaining, (2..=192).step_by(2).collect::<Vec<_>>());
+        assert_eq!(worker.frames.deadline(), Some(Duration::from_millis(200)));
+        assert!(worker.expire_frames(Duration::from_millis(200)).unwrap());
+        assert!(!worker.expire_frames(Duration::from_millis(200)).unwrap());
+        worker.flush_frames(Duration::from_millis(200)).unwrap();
+        assert!(worker.ready.is_empty());
+        assert_eq!(worker.sessions[0].tx_ready, 0);
+        assert_eq!(worker.frames.deadline(), None);
+        assert_eq!(worker.counters.expired_frames, 193);
+        assert_eq!(worker.sessions[0].tx_retained, 0);
+        assert_eq!(worker.sessions[0].tx_bytes, 0);
+        assert_eq!(worker.free.len(), BUFFERS);
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn full_expired_batches_share_one_cleanup_budget() {
+        let (mut worker, _) = receive_worker();
+        worker.command(1, worker.sessions[0].installed.unwrap(), 0);
+        let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
+        worker.transmit[0].paths[0].lanes[0].socket =
+            Some(TransmitSocket::connect(&rx, rx.local_addr()).unwrap());
+        worker.transmit[0].paths[0].lanes[0].blocked = true;
+        for session in 0..2 {
+            for _ in 0..BATCH_SIZE {
+                let mut buffer = worker.free.pop().unwrap();
+                buffer.session = session;
+                buffer.lane = 0;
+                buffer.tag = 1;
+                buffer.length = 60;
+                buffer.deadline = Duration::from_millis(100);
+                buffer.tx_reserved = true;
+                worker.sessions[session].tx_retained += 1;
+                worker.sessions[session].tx_bytes += buffer.length;
+                worker.input_frame(buffer, Duration::ZERO).unwrap();
+            }
+            assert!(!worker.flush_frames(Duration::ZERO).unwrap());
+        }
+        for session in &worker.sessions {
+            let batch = session.batches[0].as_ref().unwrap();
+            assert_eq!(batch.len, BATCH_SIZE);
+            assert!(batch.pending.is_empty());
+        }
+        worker.transmit[0].paths[0].lanes[0].blocked = false;
+        assert!(worker.flush_frames(Duration::from_millis(100)).unwrap());
+        assert_eq!(worker.counters.expired_frames, BATCH_SIZE as u64);
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        assert_eq!(
+            rx.recv(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(!worker.flush_frames(Duration::from_millis(100)).unwrap());
+        assert_eq!(worker.counters.expired_frames, (2 * BATCH_SIZE) as u64);
+        assert!(worker.ready.is_empty());
+        assert_eq!(worker.free.len(), BUFFERS);
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
     fn transmit_fifo_survives_arrivals_between_bounded_turns() {
         for expired in [0, 65, 97] {
             let (mut worker, _) = receive_worker();
@@ -3722,7 +3868,7 @@ mod tests {
                     .into_iter()
                     .find(|&index| worker.frames.frame(index).unwrap().id == (1 << 48) | expired)
                     .unwrap();
-                worker.frames.frame_mut(index).unwrap().deadline = now;
+                worker.frames.set_deadline(index, now);
             }
             let mut received = Vec::new();
             let mut bytes = [0; BASE_UDP_PAYLOAD];
@@ -4401,7 +4547,7 @@ mod tests {
                 assert!(worker.sessions[0].tap_inputs.is_empty());
                 worker.free.extend(held);
                 let expiry = reassembly::FRAME_LIFETIME;
-                worker.flush_frames(expiry).unwrap();
+                while worker.flush_frames(expiry).unwrap() {}
                 assert!(worker.sessions[0].tap_inputs.is_empty());
                 assert_eq!(worker.sessions[0].tx_bytes, 0);
                 assert_eq!(worker.free.len(), BUFFERS);
@@ -5520,12 +5666,12 @@ mod tests {
                             && frame.id == (1 << 48) | expired
                     })
                     .unwrap();
-                worker.frames.frame_mut(index).unwrap().deadline = now;
+                worker.frames.set_deadline(index, now);
             }
             for _ in 0..3 {
                 worker.flush_frames(now).unwrap();
                 assert_eq!(worker.sessions[0].batches[0].as_ref().unwrap().len, 64);
-                assert_eq!(pending(worker).len(), 64 - usize::from(expired == 65));
+                assert_eq!(pending(worker).len(), 64 - usize::from(expired != 0));
                 assert_eq!(worker.sessions[1].batches[0].as_ref().unwrap().len, 1);
             }
             worker.transmit[0].paths[0].lanes[0].blocked = false;
@@ -5656,6 +5802,10 @@ mod tests {
         workers[0]
             .flush_batch(0, 0, &mut batch, Duration::from_millis(10))
             .unwrap();
+        assert_eq!(batch.len, 64);
+        workers[0].sessions[0].batches[0] = Some(batch);
+        assert!(!workers[0].expire_frames(Duration::from_millis(10)).unwrap());
+        let batch = workers[0].sessions[0].batches[0].take().unwrap();
         assert_eq!(batch.len, 63);
         assert!(batch.plan.is_empty());
         assert_eq!(
