@@ -106,6 +106,10 @@ impl Segments {
         self.transport + 8
     }
 
+    pub(crate) fn next_len(&self, length: usize) -> usize {
+        self.header_len() + self.size.min(length.saturating_sub(self.next))
+    }
+
     /// Rewrites only the header and returns a range in the unchanged source.
     /// Insufficient header storage leaves both cursor and output unchanged.
     pub(crate) fn write_header(

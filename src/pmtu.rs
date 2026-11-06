@@ -112,6 +112,16 @@ impl Path {
         self.due
     }
 
+    /// Reissues confirmation when the connection carrying probes changes.
+    /// Keeps a failed baseline blocked until a fresh probe succeeds.
+    pub(crate) fn reconnect(&mut self) {
+        self.count = 0;
+        self.due = Duration::ZERO;
+        if self.phase == Phase::Complete {
+            self.phase = Phase::Confirm;
+        }
+    }
+
     /// Applies expired probe timers and returns the next probe size, when due.
     /// Calling this does not claim that a packet was sent.
     pub fn poll(&mut self, now: Duration) -> Option<usize> {
@@ -372,6 +382,35 @@ mod tests {
         let stale = RTT + MIN_TIMEOUT * ATTEMPTS as u32;
         assert_eq!(path.probes(stale).count(), 0);
         assert!(!path.reply(id(2), length, stale));
+        assert_eq!(path.payload_limit(), BASE_UDP_PAYLOAD);
+    }
+
+    #[test]
+    fn reconnect_reprobes_without_reopening_failed_paths_or_accepting_old_proofs() {
+        let mut path = Path::new(1452, Duration::ZERO).unwrap();
+        let mut now = Duration::ZERO;
+        let mut packet = 1;
+        complete(&mut path, 1452, &mut now, &mut packet);
+        let raise = path.raise;
+        path.reconnect();
+        assert_eq!(path.payload_limit(), 1452);
+        assert_eq!(path.raise, raise);
+        assert_eq!(send(&mut path, now, packet), 1452);
+        assert!(path.local_too_big(1452, 1279, now));
+        now = path.deadline();
+        packet += 1;
+        assert_eq!(send(&mut path, now, packet), BASE_UDP_PAYLOAD);
+        let old = id(packet);
+        path.reconnect();
+        assert_eq!(path.payload_limit(), 0);
+        assert_eq!(path.state(), PathMtuState::Failed);
+        assert!(!path.reply(old, BASE_UDP_PAYLOAD, now + RTT));
+        assert!(!path.packet_too_big(old, 1280, now + RTT));
+        assert_eq!(path.poll(now), Some(BASE_UDP_PAYLOAD));
+        let fresh = ProbeId { tag: 13, ..old };
+        assert!(path.submitted(fresh, BASE_UDP_PAYLOAD, now));
+        assert_eq!(path.payload_limit(), 0);
+        assert!(path.reply(fresh, BASE_UDP_PAYLOAD, now + RTT));
         assert_eq!(path.payload_limit(), BASE_UDP_PAYLOAD);
     }
 

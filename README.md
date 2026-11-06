@@ -1,5 +1,8 @@
 # UnQuic Encapsulation
 
+Ethernet transport over IPv6 UDP for Linux. It is intended for general use;
+NTT NGN is one deployment and performance validation environment.
+
 - Naming: `UnQuic`, because the transport borrows ideas from QUIC without being QUIC.
 - 'Encapsulation' instead of 'VPN': people blindly expect a VPN to encrypt, and 'VPN' is a commercially contaminated marketing word.
 - Development language: pure Rust.
@@ -20,6 +23,13 @@
 - Design: see [initial-design.md](initial-design.md). Implementation order and per-step acceptance: see [ROADMAP.md](ROADMAP.md).
 
 ## Build and feature availability
+
+UnQuic targets Linux across distributions and init systems. Ubuntu 26.04 with
+Linux 7.0 is a deployment validation target, not a minimum version or exclusive
+platform. Detect optional kernel facilities at runtime and retain documented
+fallbacks. Source references to Linux 6.8 describe that implementation; they
+do not define behavior for every kernel. Benchmark and compatibility results
+must identify the kernel actually tested.
 
 The crate requires Linux and declares Rust 1.89 or later. Use a
 `*-unknown-linux-musl` target for builds. The default build depends only on
@@ -178,15 +188,17 @@ buffers by frame index and byte range, without self-references or payload copies
 `FrameInput` can also concatenate a rewritten header and borrowed payload;
 DATA pieces crossing that boundary remain one wire record. Segmentation can
 generate just the header, preserving the supplied UDP pseudo-header seed.
-These primitives have boundary, retry and allocation tests; worker retention
-still uses complete frame buffers.
+Workers use these spans for UDP segmentation. Ordinary frames share compact
+payload slabs; each frame retains its own identity, deadline and submitted range.
+Boundary, retry, capacity and allocation tests cover both representations.
 Generated sequences, reversed arrival, duplicate packets, identity exhaustion
 and small-frame bursts have tests. Two 1514-byte frames pack into three baseline
 datagrams. Workers now use this encoder and retain partial batches.
-Each lane remembers its oldest deferred frame, so bounded pending-queue
-rotation cannot admit newer frames ahead of it when a batch fills. Other lanes
-can still progress within the same 64-entry scan budget; expiry and connection
-replacement clear the marker.
+Each lane has a FIFO of pending frame handles. New arrivals cannot overtake
+older frames when a batch fills or a send completes only partly. A worker
+admits or expires at most 64 pending frames per turn, then rotates to the next
+ready lane. Full or blocked lanes cost one lane visit rather than a scan of
+their waiting frames.
 
 The runtime now forwards frames between TAPs with configured or supplied IPv6 peers.
 The isolated test exercises two workers, two peers and three sessions per endpoint,
@@ -305,19 +317,34 @@ These conservative reservations can reject large configurations before startup.
 Fixed receive storage permits at most 4096 frames and 36,954,112 reserved frame
 bytes per session, below the 8192-frame/64-MiB directional ceilings. Transmit
 reservations divide the frame and 64-MiB byte budgets among the union of the
-session's TAP readers and transmit owners, and respect their 128-buffer pools.
-Byte accounting includes retained super-frames and their expanded children;
-reads reserve worst-case space and leave one output buffer available for
-expansion. A reservation lasts until the frame buffer returns to its origin,
-including handoff and return-queue delays. Compile-time bounds and quota tests
-check these limits; no shared reservation lock or atomic is needed.
+session's TAP readers and transmit owners. Each worker preallocates 8192 frame
+views shared across its sessions and source metadata for its 128 pool
+buffers. A view holds a rewritten header of at most 128 bytes and a range in
+a retained source. Larger headers use the ordinary-frame copy path. Sources
+and views both consume frame credits; headers and queue links are included in
+the startup memory reservation.
 
-Transmit DATA uses scatter/gather slices of the original frame buffer.
+Ordinary frames share 64-KiB payload slabs from the existing pool. A slab's
+used bytes stay charged until its last frame is released; dead ranges are
+not reused while another frame refers to it. Borrowed super-frame payloads
+are charged once on the owner retaining them. A foreign source exchanges
+ownership with an empty owner buffer; the empty buffer returns the reader's
+credit without copying payload. Transfer credits remain charged until the
+return is consumed. Insufficient owner capacity drops the input and increments
+`queue_drops`. Reads leave room for a source and slab; materialization checks
+frame, byte and physical-buffer capacity.
+No shared reservation lock or atomic is needed. Static per-worker quotas
+still limit a skewed flow below the full session allowance; shared credits
+remain necessary before the retained-data recovery gate.
+
+Transmit DATA gathers rewritten headers and payload ranges from retained sources.
 Partial or failed sends retain the unsent frame ranges and rebuild packet
 headers with fresh numbers on retry. Only successful submissions advance frame
 offsets or charge transmitted bytes; an intervening control packet cannot leave
 the retry using older numbers.
-Fully submitted frames release their buffers; retaining them for repair remains unfinished.
+Fully submitted frames release their views; a source returns to its pool after
+expansion finishes and its last view is released. Retaining sent data for
+repair remains unfinished.
 If a frame reaches its 100 ms deadline, it is removed; remaining frames keep their
 IDs and submitted offsets and are repacked with fresh packet numbers. Connection
 retirement discards every queued batch before the worker acknowledges quiescence.
@@ -333,8 +360,9 @@ pooled buffer. An idle worker waiting for buffers held by other workers suppress
 socket read readiness until a buffer returns; the existing handoff notification
 wakes it. This avoids polling a readable socket with no receive storage.
 The bounded pending queue stores only buffer ownership and counts
-toward the memory ceiling. Workers drain a lane after 16 completions, on admission
-pressure, and at the end of each turn. TX, timers, control queues and readiness
+toward the memory ceiling. Workers drain a lane after 32 completions, on admission
+pressure, and at the end of each turn. Final delivery also refreshes TAP read
+interest after transmit work has released buffer credits. TX, timers, control queues and readiness
 polling run between receive turns. Ready-event service rotates so busy endpoints
 share the receive reserve. TAP WouldBlock retains frames and waits for
 EPOLLOUT before another write attempt. When the transmit buffer share is
@@ -447,10 +475,14 @@ Unknown flags, unsupported GSO types, and fragmented GSO inputs are rejected.
 Pending input retains its original connection tag and 100 ms deadline.
 Expansion yields after 64 frames or 64 KiB per worker turn; the last frame
 may cross the byte target. Sessions take turns, and each session preserves
-input order. The existing pool supplies both raw input and output buffers,
-with one output buffer reserved for progress. Both copies count toward the
-session's transmit byte limit until released. Wire DATA remains ordinary
-Ethernet frames on the input's selected lane, with unchanged packet-admission rules.
+input order. Adaptive ring reads allow up to four GSO sources per batch after
+recognizing GSO input; a preceding ordinary batch may discover more. If a
+source needs local expansion, the next read limit returns to one. Pending
+local expansion stops further reads. Expansion normally rewrites only the header and borrows the
+payload in place. Ordinary frames and headers larger than 128 bytes use
+bounded payload slabs. Frame and source credits remain charged until release.
+Wire DATA remains ordinary Ethernet frames on the input's selected lane,
+with unchanged packet-admission rules.
 
 A receive flush may combine already-complete UDP frames into one USO
 `writev`, borrowing their payloads directly from reassembly slots. Supported
@@ -551,9 +583,11 @@ counts bounded handoff/retention queue failures separately. Drops before lane
 admission appear only in worker/session totals. `socket_overflow` counts
 SO_RXQ_OVFL increments per receive socket, in kernel skb units, at worker scope.
 GRO means these are not necessarily logical datagrams. The kernel reports a
-cumulative 32-bit count on subsequent receives; wrap is handled, but a final
-drop burst without a later receive may not yet appear. Use namespace UDP
-receive-buffer error counters alongside it.
+cumulative 32-bit count on subsequent receives. Modular forward deltas below
+2³¹ handle wrap and ignore stale samples; an actual jump of 2³¹ or more
+between observations is ambiguous and is not counted. A final drop burst
+without a later receive may not yet appear. Use namespace UDP receive-buffer
+error counters alongside it.
 
 Each receive socket requests 8 MiB with `SO_RCVBUFFORCE`. On `EPERM` it falls
 back to `SO_RCVBUF`, subject to the kernel's configured limit. Worker counters
@@ -636,8 +670,12 @@ connected. [RFC 8899](https://www.rfc-editor.org/rfc/rfc8899.html)
 
 Both returned and silently filtered ICMPv6 are supported. Without a valid size
 hint, timed probes narrow the search; loss can therefore delay discovery and
-temporarily reduce throughput. A new path resets discovery. Small liveness
-probes remain separate and cannot confirm a DATA-sized path.
+temporarily reduce throughput. A new path resets discovery. Changing the
+connection used for a shared socket's probes invalidates old proofs and
+makes confirmation immediately eligible under the probe budget. Confirmed
+sizes remain usable; a failed baseline stays blocked until a fresh baseline
+reply succeeds. Other sessions do not reset an unchanged probe connection.
+Small liveness probes remain separate and cannot confirm a DATA-sized path.
 
 Each timer pass visits at most 64 owned sockets before returning to ordinary
 work. Rotating scan order prevents a failing path from monopolising probes.

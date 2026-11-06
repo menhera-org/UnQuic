@@ -1,8 +1,15 @@
 # NGN Ethernet Transport Initial Requirements and Design
 
+Linux is the platform contract, independent of distribution or init system.
+Ubuntu 26.04/Linux 7.0 is a deployment validation target, not an exclusive
+target or minimum kernel. Optional facilities need runtime detection and
+documented fallbacks. Versioned kernel source citations are evidence about
+those implementations; test version-sensitive behavior on each supported
+deployment kernel.
+
 **Draft 0.1 • 4 November 2026 • Human-life Information Platforms Institute Menhera®**
 
-Build a Linux userspace Ethernet transport for closed-area NTT NGN networks. The transport must carry inner MTUs of at least 1500 over an IPv6-only UDP underlay, without emitting outer IP fragments. The target access line has IP MTU 1500; the final transport must also use larger path MTUs where discovery confirms them. It must use loss-tolerant congestion control and target sustained delivered throughput of at least 5 Gbit/s on modest 2–4-core hosts over routed IPv6 10G-EPON access lines with 4.5–7.5 ms RTT and nonzero packet loss.
+Build a Linux userspace Ethernet transport over IPv6 UDP for general deployment. Closed-area NTT NGN is a performance validation environment, not a required network. The transport must carry inner MTUs of at least 1500 over an IPv6-only UDP underlay, without emitting outer IP fragments. The target access line has IP MTU 1500; the final transport must also use larger path MTUs where discovery confirms them. It must use loss-tolerant congestion control and target sustained delivered throughput of at least 5 Gbit/s on modest 2–4-core hosts over routed IPv6 10G-EPON access lines with 4.5–7.5 ms RTT and nonzero packet loss.
 
 Encryption is deliberately absent. A session UUID is the sole session admission cookie. The project must turn that deployment choice into materially lower processing cost and substantially higher throughput than WireGuard, SoftEther VPN, and comparable solutions under equivalent conditions.
 
@@ -325,13 +332,16 @@ There is no encryption or per-packet cryptographic authentication pass. The impl
 
 Avoid assuming every frame is host-generated TCP. Forwarded Ethernet frames, inner IPv6 extension headers, non-IP payloads, and unavailable offloads must remain supported.
 
-**Local TAP read batching.** A worker may submit up to 64 nonblocking `READV` operations through a private io_uring, borrowing existing pool buffers. Keep virtio metadata separate from Ethernet bytes. Runtime TAPs enable Internet-checksum offload and complete partial checksums in place after validating offsets and frame bounds, matching [skb_checksum_help](https://github.com/torvalds/linux/blob/v6.8/net/core/dev.c#L3088-L3107). UDP L4 super-frame reads use both USO flags; older kernels fall back to checksum-only reads. TCP read offloads remain disabled. Select the lane on the reader and hand the whole input to its transmit owner once. Retain raw input in the existing pool and expand at most 64 frames or 64 KiB per worker turn, yielding between complete frames. Preserve input order per session and rotate the first session each turn. Keep the original deadline and connection tag, reserve one output buffer for progress, and account raw input plus produced frames against the existing transmit byte/frame limits. Adjust UDP checksum seeds for the new transport length as in [Linux UDP segmentation](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/udp_offload.c#L297-L333); preserve IPv4 options, VLANs and supported IPv6 extensions. Consume every accepted completion before forwarding or releasing those buffers; preserve read order and the RX reserve. Use ordinary reads when ring setup or the operation is unavailable. No SQPOLL or persistent reads cross worker turns. An unrecoverable outstanding-request failure must not return borrowed memory. [Linux 6.8's NOWAIT path](https://github.com/torvalds/linux/blob/v6.8/io_uring/rw.c#L684-L697) disables retry, and [io_uring_enter](https://man7.org/linux/man-pages/man2/io_uring_enter.2.html) reports submissions separately from completions.
+**Local TAP read batching.** A worker may submit up to 64 nonblocking `READV` operations through a private io_uring, borrowing existing pool buffers. Keep virtio metadata separate from Ethernet bytes. Runtime TAPs enable Internet-checksum offload and complete partial checksums in place after validating offsets and frame bounds, matching [skb_checksum_help](https://github.com/torvalds/linux/blob/v6.8/net/core/dev.c#L3088-L3107). UDP L4 super-frame reads use both USO flags; older kernels fall back to checksum-only reads. TCP read offloads remain disabled. Select the lane on the reader and hand the whole input to its transmit owner once. Retain raw input in the existing pool and expand at most 64 frames or 64 KiB per worker turn, yielding between complete frames. Preserve input order per session and rotate the first session each turn. Keep the original deadline and connection tag. Borrow the original payload and rewrite only each segment's header where possible; use bounded compact slabs for ordinary frames and headers beyond the reserved header capacity. Keep sources alive through expansion and the last frame reference, including partial sends and later repairs. Charge retained source bytes once, charge slab high-water bytes until recycle, and reserve source/frame metadata against the existing byte, frame and startup-memory limits. Per-lane pending FIFOs preserve admission order across bounded turns; round-robin lane service must not scan every frame behind a blocked batch. Adjust UDP checksum seeds for the new transport length as in [Linux UDP segmentation](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/udp_offload.c#L297-L333); preserve IPv4 options, VLANs and supported IPv6 extensions. Consume every accepted completion before forwarding or releasing those buffers; preserve read order and the RX reserve. Use ordinary reads when ring setup or the operation is unavailable. No SQPOLL or persistent reads cross worker turns. An unrecoverable outstanding-request failure must not return borrowed memory. [Linux 6.8's NOWAIT path](https://github.com/torvalds/linux/blob/v6.8/io_uring/rw.c#L684-L697) disables retry, and [io_uring_enter](https://man7.org/linux/man-pages/man2/io_uring_enter.2.html) reports submissions separately from completions.
 
 Transmit quotas divide the session limit among the union of TAP readers and
 transmit owners: `max(queue_count, min(worker_count, tx_lanes))` workers.
-Charge each source and produced frame to its originating buffer pool until
-return. Bound each owner's input queue to 128 entries and reject excess;
-source handoff must not create a second independent reservation budget.
+Charge each source and produced frame to the worker retaining it. A foreign
+source exchanges ownership with an empty owner buffer; the empty buffer
+returns the reader's credit without copying payload. Keep transfer credits
+charged until the return is consumed. Bound each owner's input queue to 128
+entries and reject excess; source handoff must not create a second independent
+reservation budget.
 
 **Local TAP coalescing.** Within a bounded receive flush, combine compatible complete UDP frames into a USO write by borrowing their payloads. Preserve up to two 802.1Q/802.1ad tags, including VID and PCP/DEI, and require identical tag stacks within a group. Validate the original checksums and exact header/length relationships; IPv4 requires no options, DF and consecutive IDs, while IPv6 permits no extension headers. Preserve per-flow order, including barriers at incompatible frames in that flow. Keep every selected slot on transient write failure and release only the selected slots on success or permanent failure. Do not wait for more frames to make a larger group. Disable USO on a queue after EINVAL/EOPNOTSUPP and retain ordinary writes. This optimization changes neither packet admission nor the 100 ms receive deadline.
 
@@ -612,7 +622,8 @@ records the release throughput/CPU baseline; overload loss is severe and the
 throughput gate has not passed. Receive-side ACK scheduling/range construction
 is implemented over the existing bitmap. Pure sender history now validates whole
 ACKs against actual submissions, preserves unresolved charges and rejects known
-unsent holes. Worker history integration and ACK routing are not yet connected.
+unsent holes. Each entry uses 16 bytes plus four bitmap bits, preserving full
+monotonic timestamp range and precision. Worker history integration and ACK routing are not yet connected.
 Pure RTT, loss-deadline, PTO-period and frame
 lifetime calculations are implemented; worker loss recovery and congestion
 control remain unfinished. Per-lane MTU discovery now starts DATA at 1232 bytes

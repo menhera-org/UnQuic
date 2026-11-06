@@ -1,5 +1,7 @@
 //! Worker-owned polling primitives and transport loop support.
 
+mod frames;
+
 use crate::sys::{cvt, invalid};
 use std::{
     io,
@@ -294,12 +296,7 @@ const _: () = assert!(LANES * reassembly::FRAME_CAPACITY <= 8192);
 const _: () = assert!(LANES * reassembly::FRAME_CAPACITY * MAX_FRAME_LEN <= 64 * 1024 * 1024);
 
 const fn frame_quota(workers: usize) -> usize {
-    let bytes_limited = 64 * 1024 * 1024 / workers / MAX_FRAME_LEN;
-    if bytes_limited < BUFFERS {
-        bytes_limited
-    } else {
-        BUFFERS
-    }
+    frames::CAPACITY / workers
 }
 
 fn tap_lane(frame: &[u8], worker: usize, workers: usize, queues: usize, lanes: usize) -> usize {
@@ -330,7 +327,6 @@ pub(crate) struct Buffer {
     lane: usize,
     length: usize,
     deadline: Duration,
-    frame_id: u64,
     bytes: [u8; RECEIVE_BYTES],
 }
 
@@ -421,7 +417,8 @@ struct Session {
     tx_workers: usize,
     tx_retained: usize,
     tx_bytes: usize,
-    tap_inputs: VecDeque<Box<Buffer>>,
+    tap_inputs: VecDeque<usize>,
+    slab: Option<usize>,
     rx_totals: Vec<Snapshot>,
     tx_totals: Vec<Snapshot>,
     rx_dirty: u64,
@@ -442,9 +439,9 @@ struct SessionControl {
 
 struct TxBatch {
     plan: pack::Batch,
-    frames: [Option<Box<Buffer>>; pack::BATCH_CAPACITY],
+    frames: [Option<usize>; pack::BATCH_CAPACITY],
     len: usize,
-    deferred: u64,
+    pending: frames::Queue,
 }
 
 impl TxBatch {
@@ -453,11 +450,16 @@ impl TxBatch {
             plan: pack::Batch::new(),
             frames: std::array::from_fn(|_| None),
             len: 0,
-            deferred: 0,
+            pending: frames::Queue::default(),
         }
     }
 
-    fn prepare(&mut self, lane: &mut pack::Lane, limit: usize) -> Result<(), pack::PackError> {
+    fn prepare(
+        &mut self,
+        lane: &mut pack::Lane,
+        storage: &frames::Store,
+        limit: usize,
+    ) -> Result<(), pack::PackError> {
         let mut inputs = [pack::FrameInput {
             id: 0,
             header: &[],
@@ -465,13 +467,9 @@ impl TxBatch {
             offset: 0,
         }; pack::BATCH_CAPACITY];
         for (input, frame) in inputs.iter_mut().zip(&self.frames[..self.len]) {
-            let frame = frame.as_ref().unwrap();
-            *input = pack::FrameInput {
-                id: frame.frame_id,
-                header: &[],
-                bytes: &frame.bytes[..frame.length],
-                offset: frame.offset,
-            };
+            *input = frame
+                .and_then(|id| storage.input(id))
+                .ok_or(pack::PackError::Frame)?;
         }
         self.plan.prepare(lane, &inputs[..self.len], limit)
     }
@@ -550,7 +548,7 @@ pub(crate) struct Worker {
     peer_controls: Vec<PeerControl>,
     free: Vec<Box<Buffer>>,
     returns: Vec<Vec<Box<Buffer>>>,
-    pending: VecDeque<Box<Buffer>>,
+    frames: frames::Store,
     received: VecDeque<Box<Buffer>>,
     ready: VecDeque<(usize, usize)>,
     notifications: u64,
@@ -563,6 +561,7 @@ impl Worker {
     pub fn storage_bytes(config: &crate::config::Config, workers: usize) -> Option<usize> {
         let mut per_worker = size_of::<Self>()
             .checked_add(crate::tap::Reader::storage_bytes()?)?
+            .checked_add(frames::Store::storage_bytes())?
             .checked_add(BUFFERS.checked_mul(size_of::<Buffer>() + size_of::<Box<Buffer>>())?)?
             .checked_add(workers.checked_mul(
                 size_of::<Option<Producer<Event>>>() + size_of::<Option<Consumer<Event>>>(),
@@ -570,7 +569,7 @@ impl Worker {
             .checked_add(
                 workers
                     .checked_mul(BUFFERS)?
-                    .checked_mul(3 * size_of::<Box<Buffer>>())?,
+                    .checked_mul(2 * size_of::<Box<Buffer>>())?,
             )?
             .checked_add(workers.checked_mul(size_of::<Vec<Box<Buffer>>>())?)?
             .checked_add(
@@ -606,7 +605,7 @@ impl Worker {
             )?;
             per_worker = per_worker
                 .checked_add(size_of::<Session>() + 65_536 + 8192 + LANES * size_of::<Snapshot>())?
-                .checked_add(BUFFERS * size_of::<Box<Buffer>>())?
+                .checked_add(BUFFERS * size_of::<usize>())?
                 .checked_add(LANES.checked_mul(size_of::<Option<Box<reassembly::Lane>>>())?)?
                 .checked_add(peer.tx_lanes.checked_mul(
                     size_of::<Option<pack::Lane>>()
@@ -698,6 +697,7 @@ impl Worker {
                 tx_retained: 0,
                 tx_bytes: 0,
                 tap_inputs: VecDeque::with_capacity(BUFFERS),
+                slab: None,
                 rx_totals: vec![Snapshot::default(); LANES],
                 tx_totals: vec![Snapshot::default(); config.peers[peer].tx_lanes],
                 rx_dirty: 0,
@@ -719,7 +719,6 @@ impl Worker {
                     lane: 0,
                     length: 0,
                     deadline: Duration::ZERO,
-                    frame_id: 0,
                     bytes: [0; RECEIVE_BYTES],
                 })
             })
@@ -800,7 +799,7 @@ impl Worker {
             controls,
             free,
             returns: (0..count).map(|_| Vec::with_capacity(BUFFERS)).collect(),
-            pending: VecDeque::with_capacity(count * BUFFERS),
+            frames: frames::Store::new(),
             received: VecDeque::with_capacity(count * BUFFERS),
             ready: VecDeque::with_capacity(batch_count),
             notifications: 0,
@@ -856,17 +855,12 @@ impl Worker {
             self.flush_frames(now)?;
             self.flush_taps(now)?;
             self.flush_notifications()?;
-            more |= self
-                .pending
-                .iter()
-                .map(|b| (b.session, b.lane))
-                .chain(self.ready.iter().copied())
-                .any(|(session, lane)| {
-                    let tx = &self.transmit[self.shared.config.peer_for_session(session).unwrap()]
-                        .paths[self.sessions[session].path]
-                        .lanes[lane];
-                    !tx.blocked && tx.mtu.payload_limit() != 0
-                });
+            more |= self.ready.iter().copied().any(|(session, lane)| {
+                let tx = &self.transmit[self.shared.config.peer_for_session(session).unwrap()]
+                    .paths[self.sessions[session].path]
+                    .lanes[lane];
+                !tx.blocked && tx.mtu.payload_limit() != 0
+            });
             self.receive_interest(more)?;
             publish_turns = publish_turns.wrapping_add(1);
             if now >= publish_due || publish_turns == 0 {
@@ -1536,9 +1530,8 @@ impl Worker {
                 && let Some(total) = overflows[index]
             {
                 self.counters.socket_overflow = self.counters.socket_overflow.wrapping_add(
-                    u64::from(total.wrapping_sub(self.receive_overflow[endpoint])),
+                    advance_overflow(&mut self.receive_overflow[endpoint], total),
                 );
-                self.receive_overflow[endpoint] = total;
             }
             if index < count && !truncated[index] {
                 buffer.length = lengths[index];
@@ -1846,7 +1839,7 @@ impl Worker {
             .as_ref()
             .unwrap()
             .ready_count()
-            >= 16
+            >= 32
         {
             self.flush_rx(session, slot, now);
         }
@@ -1860,11 +1853,12 @@ impl Worker {
             return 0;
         }
         let workers = local.tx_workers;
-        // Leave one output buffer and byte credit so retained super-frames can progress.
+        // Leave a slab, a frame view and byte credit so queued inputs can progress.
         self.free
             .len()
             .saturating_sub(RECEIVE_BUFFERS - self.rx_retained + 1)
-            .min(frame_quota(workers).saturating_sub(local.tx_retained + 1))
+            .min(frame_quota(workers).saturating_sub(local.tx_retained + 2))
+            .min(self.frames.available().saturating_sub(1))
             .min(
                 (64 * 1024 * 1024 / workers).saturating_sub(local.tx_bytes + MAX_FRAME_LEN) / 65535,
             )
@@ -1898,12 +1892,15 @@ impl Worker {
             let frames = batch.results[..count].iter().filter(|r| r.is_ok()).count() as u64;
             let limit = &mut self.sessions[session].tap_read_limit;
             // A full read limited by pool availability says nothing about TAP occupancy.
-            *limit = if batch.segments.iter().any(Option::is_some) {
-                1
-            } else if frames as usize == count {
-                (*limit * 2).min(BATCH_SIZE)
+            let maximum = if batch.segments.iter().any(Option::is_some) {
+                4
             } else {
-                (frames as usize * 2).clamp(1, BATCH_SIZE)
+                BATCH_SIZE
+            };
+            *limit = if frames as usize == count {
+                (*limit * 2).min(maximum)
+            } else {
+                (frames as usize * 2).clamp(1, maximum)
             };
             for totals in [&mut self.counters, &mut self.sessions[session].totals] {
                 totals.tap_read_calls = totals.tap_read_calls.wrapping_add(batch.calls);
@@ -1923,6 +1920,9 @@ impl Worker {
                 let mut buffer = buffer.unwrap();
                 buffer.segments = segments;
                 self.read_tap_result(session, now, buffer, result)?;
+            }
+            if maximum == 4 && !self.sessions[session].tap_inputs.is_empty() {
+                self.sessions[session].tap_read_limit = 1;
             }
         } else {
             for _ in 0..BATCH_SIZE {
@@ -2045,30 +2045,225 @@ impl Worker {
         Ok(())
     }
 
-    fn input_frame(&mut self, buffer: Box<Buffer>, now: Duration) -> io::Result<()> {
+    fn input_frame(&mut self, mut buffer: Box<Buffer>, now: Duration) -> io::Result<()> {
         let session = buffer.session;
-        if buffer.segments.is_none() && self.sessions[session].tap_inputs.is_empty() {
-            return self.frame(buffer, now);
-        }
         if !self.matches(session, buffer.tag) || self.expired(&buffer, now) {
             self.release(buffer);
-        } else if self.sessions[session].tap_inputs.len() == BUFFERS {
+            return Ok(());
+        }
+        let local = &self.sessions[session];
+        let foreign = buffer.origin != self.id;
+        if local.tap_inputs.len() == BUFFERS
+            || (foreign
+                && (self.free.len() <= RECEIVE_BUFFERS - self.rx_retained + 1
+                    || local.tx_retained + 3 > frame_quota(local.tx_workers)
+                    || local.tx_bytes + buffer.length + MAX_FRAME_LEN
+                        > 64 * 1024 * 1024 / local.tx_workers))
+        {
             self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
             self.sessions[session].totals.queue_drops =
                 self.sessions[session].totals.queue_drops.wrapping_add(1);
             self.release(buffer);
-        } else {
-            self.sessions[session].tap_inputs.push_back(buffer);
+            return Ok(());
         }
+        if foreign {
+            let mut replacement = self
+                .free
+                .pop()
+                .ok_or_else(|| io::Error::other("missing exchange buffer"))?;
+            // Return the reader's buffer credit without moving the retained payload.
+            std::mem::swap(&mut buffer.origin, &mut replacement.origin);
+            replacement.session = session;
+            replacement.length = buffer.length;
+            replacement.tx_reserved = buffer.tx_reserved;
+            replacement.rx_reserved = buffer.rx_reserved;
+            buffer.tx_reserved = true;
+            buffer.rx_reserved = false;
+            self.sessions[session].tx_retained += 1;
+            self.sessions[session].tx_bytes += buffer.length;
+            self.release(replacement);
+        }
+        let plain = buffer.segments.is_none();
+        let source = match self.frames.insert_source(buffer) {
+            Ok(source) => source,
+            Err(buffer) => {
+                self.release(buffer);
+                return Err(io::Error::other("transmit source capacity exhausted"));
+            }
+        };
+        if plain
+            && self.sessions[session].tap_inputs.is_empty()
+            && self.materialize(source)?.is_some()
+        {
+            return Ok(());
+        }
+        self.sessions[session].tap_inputs.push_back(source);
         Ok(())
     }
 
+    fn slab_space(&self, session: usize, length: usize) -> bool {
+        self.sessions[session]
+            .slab
+            .and_then(|id| self.frames.source(id))
+            .is_some_and(|b| b.length + length <= b.bytes.len())
+    }
+
+    fn can_materialize(&self, source: usize) -> bool {
+        let Some(input) = self.frames.source(source) else {
+            return false;
+        };
+        let local = &self.sessions[input.session];
+        let remaining = frame_quota(local.tx_workers).saturating_sub(local.tx_retained);
+        if remaining == 0 || self.frames.available() == 0 {
+            return false;
+        }
+        if input
+            .segments
+            .is_some_and(|s| s.header_len() <= frames::HEADER_BYTES)
+        {
+            return true;
+        }
+        let length = input
+            .segments
+            .map_or(input.length, |s| s.next_len(input.length));
+        local.tx_bytes + length <= 64 * 1024 * 1024 / local.tx_workers
+            && (self.slab_space(input.session, length)
+                || (remaining >= 2 && self.free.len() > RECEIVE_BUFFERS - self.rx_retained))
+    }
+
     fn tap_can_expand(&self, session: usize) -> bool {
-        let local = &self.sessions[session];
-        let workers = local.tx_workers;
-        self.free.len() > RECEIVE_BUFFERS - self.rx_retained
-            && local.tx_retained < frame_quota(workers)
-            && local.tx_bytes + MAX_FRAME_LEN <= 64 * 1024 * 1024 / workers
+        self.sessions[session]
+            .tap_inputs
+            .front()
+            .is_some_and(|&source| self.can_materialize(source))
+    }
+
+    fn close_source(&mut self, source: usize) {
+        if let Some(buffer) = self.frames.unpin(source) {
+            self.release(buffer);
+        }
+    }
+
+    fn close_slab(&mut self, session: usize) {
+        if let Some(source) = self.sessions[session].slab.take() {
+            self.close_source(source);
+        }
+    }
+
+    fn slab(&mut self, session: usize, tag: u128, length: usize) -> io::Result<usize> {
+        if self.slab_space(session, length) {
+            return self.sessions[session]
+                .slab
+                .ok_or_else(|| io::Error::other("missing transmit slab"));
+        }
+        self.close_slab(session);
+        let mut buffer = self
+            .free
+            .pop()
+            .ok_or_else(|| io::Error::other("missing transmit buffer"))?;
+        buffer.session = session;
+        buffer.tag = tag;
+        buffer.length = 0;
+        buffer.segments = None;
+        buffer.tx_reserved = true;
+        self.sessions[session].tx_retained += 1;
+        let source = match self.frames.insert_source(buffer) {
+            Ok(source) => source,
+            Err(buffer) => {
+                self.release(buffer);
+                return Err(io::Error::other("transmit source capacity exhausted"));
+            }
+        };
+        self.sessions[session].slab = Some(source);
+        Ok(source)
+    }
+
+    fn materialize(&mut self, source: usize) -> io::Result<Option<usize>> {
+        if !self.can_materialize(source) {
+            return Ok(None);
+        }
+        let input = self
+            .frames
+            .source(source)
+            .ok_or_else(|| io::Error::other("missing transmit input"))?;
+        let (session, lane, tag, deadline, mut segments, input_length) = (
+            input.session,
+            input.lane,
+            input.tag,
+            input.deadline,
+            input.segments,
+            input.length,
+        );
+        let length = segments.map_or(input_length, |s| s.next_len(input_length));
+        let Some(sender) = self.sessions[session].tx[lane].as_mut() else {
+            self.close_source(source);
+            return Ok(Some(0));
+        };
+        let Ok(id) = sender.start_frame(length) else {
+            self.close_source(source);
+            return Ok(Some(0));
+        };
+        let mut frame = frames::Frame {
+            id,
+            deadline,
+            source,
+            range: 0..0,
+            offset: 0,
+            lane,
+            header_len: 0,
+            header: [0; frames::HEADER_BYTES],
+        };
+        if let Some(cursor) = segments
+            .as_mut()
+            .filter(|s| s.header_len() <= frames::HEADER_BYTES)
+        {
+            let input = self
+                .frames
+                .source(source)
+                .ok_or_else(|| io::Error::other("missing transmit input"))?;
+            frame.header_len = cursor.header_len();
+            frame.range = cursor
+                .write_header(&input.bytes[..input.length], &mut frame.header)
+                .ok_or_else(|| io::Error::other("invalid transmit header"))?;
+        } else {
+            let slab = self.slab(session, tag, length)?;
+            frame.range = self
+                .frames
+                .append(slab, source, segments.as_mut())
+                .ok_or_else(|| io::Error::other("invalid transmit slab range"))?;
+            frame.source = slab;
+            self.sessions[session].tx_bytes += frame.range.len();
+        }
+        if let Some(input) = self.frames.source_mut(source) {
+            input.segments = segments;
+        }
+        let frame = self
+            .frames
+            .insert_frame(frame)
+            .ok_or_else(|| io::Error::other("transmit frame capacity exhausted"))?;
+        self.sessions[session].tx_retained += 1;
+        let local = &mut self.sessions[session];
+        local.batches[lane]
+            .as_mut()
+            .ok_or_else(|| io::Error::other("missing transmit batch"))?
+            .pending
+            .push_back(&mut self.frames, frame)?;
+        if local.tx_ready & (1_u64 << lane) == 0 {
+            local.tx_ready |= 1_u64 << lane;
+            self.ready.push_back((session, lane));
+        }
+        if let Some(cursor) = segments {
+            for totals in [&mut self.counters, &mut self.sessions[session].totals] {
+                totals.tap_gso_frames = totals.tap_gso_frames.wrapping_add(1);
+                totals.tap_checksums = totals.tap_checksums.wrapping_add(1);
+            }
+            if cursor.done(input_length) {
+                self.close_source(source);
+            }
+        } else {
+            self.close_source(source);
+        }
+        Ok(Some(length))
     }
 
     fn drain_tap_inputs(&mut self, now: Duration) -> io::Result<bool> {
@@ -2083,143 +2278,150 @@ impl Worker {
         for index in 0..count {
             let session = (start + index) % count;
             while frames < BATCH_SIZE && bytes < 64 * 1024 {
-                let Some(mut input) = self.sessions[session].tap_inputs.pop_front() else {
+                let Some(source) = self.sessions[session].tap_inputs.pop_front() else {
                     break;
                 };
-                if !self.matches(session, input.tag) || self.expired(&input, now) {
-                    self.release(input);
+                let input = self
+                    .frames
+                    .source(source)
+                    .ok_or_else(|| io::Error::other("missing transmit input"))?;
+                let (tag, lane, deadline, remaining) = (
+                    input.tag,
+                    input.lane,
+                    input.deadline,
+                    input.segments.map_or(1, |s| s.remaining(input.length)) as u64,
+                );
+                if !self.matches(session, tag)
+                    || self.expired_at(session, lane, deadline, remaining, now)
+                {
+                    self.close_source(source);
                     frames += 1;
                     continue;
                 }
-                let Some(mut segments) = input.segments else {
-                    frames += 1;
-                    bytes += input.length;
-                    self.frame(input, now)?;
-                    continue;
-                };
-                if !self.tap_can_expand(session) {
-                    self.sessions[session].tap_inputs.push_front(input);
-                    break;
+                let length = self.materialize(source)?;
+                if self.frames.producing(source) {
+                    self.sessions[session].tap_inputs.push_front(source);
                 }
-                let mut output = self.free.pop().unwrap();
-                output.length = segments.write(&input.bytes[..input.length], &mut output.bytes);
-                output.session = session;
-                output.tag = input.tag;
-                output.lane = input.lane;
-                output.deadline = input.deadline;
-                output.tx_reserved = true;
-                self.sessions[session].tx_retained += 1;
-                self.sessions[session].tx_bytes += output.length;
+                let Some(length) = length else { break };
                 frames += 1;
-                bytes += output.length;
-                for totals in [&mut self.counters, &mut self.sessions[session].totals] {
-                    totals.tap_gso_frames = totals.tap_gso_frames.wrapping_add(1);
-                    totals.tap_checksums = totals.tap_checksums.wrapping_add(1);
-                }
-                if segments.done(input.length) {
-                    self.release(input);
-                } else {
-                    input.segments = Some(segments);
-                    self.sessions[session].tap_inputs.push_front(input);
-                }
-                self.frame(output, now)?;
+                bytes += length;
             }
         }
-        Ok(self.sessions.iter().enumerate().any(|(i, s)| {
-            s.tap_inputs
-                .front()
-                .is_some_and(|b| b.segments.is_none() || self.tap_can_expand(i))
-        }))
+        Ok((0..count).any(|session| self.tap_can_expand(session)))
     }
 
-    fn expired(&mut self, buffer: &Buffer, now: Duration) -> bool {
-        if now < buffer.deadline {
+    fn expired_at(
+        &mut self,
+        session: usize,
+        lane: usize,
+        deadline: Duration,
+        count: u64,
+        now: Duration,
+    ) -> bool {
+        if now < deadline {
             return false;
         }
-        let count = buffer.segments.map_or(1, |s| s.remaining(buffer.length)) as u64;
         self.counters.expired_frames = self.counters.expired_frames.wrapping_add(count);
-        let local = &mut self.sessions[buffer.session];
+        let local = &mut self.sessions[session];
         local.totals.expired_frames = local.totals.expired_frames.wrapping_add(count);
-        local.tx_totals[buffer.lane].expired_frames = local.tx_totals[buffer.lane]
-            .expired_frames
-            .wrapping_add(count);
-        local.tx_dirty |= 1_u64 << buffer.lane;
+        local.tx_totals[lane].expired_frames =
+            local.tx_totals[lane].expired_frames.wrapping_add(count);
+        local.tx_dirty |= 1_u64 << lane;
         true
     }
 
-    fn frame(&mut self, mut buffer: Box<Buffer>, now: Duration) -> io::Result<()> {
-        if !self.matches(buffer.session, buffer.tag) || self.expired(&buffer, now) {
-            self.release(buffer);
-            return Ok(());
+    fn expired(&mut self, buffer: &Buffer, now: Duration) -> bool {
+        self.expired_at(
+            buffer.session,
+            buffer.lane,
+            buffer.deadline,
+            buffer.segments.map_or(1, |s| s.remaining(buffer.length)) as u64,
+            now,
+        )
+    }
+
+    fn frame_expired(&mut self, index: usize, now: Duration) -> bool {
+        let Some(frame) = self.frames.frame(index) else {
+            return true;
+        };
+        let Some(source) = self.frames.source(frame.source) else {
+            return true;
+        };
+        let (session, lane, deadline) = (source.session, frame.lane, frame.deadline);
+        self.expired_at(session, lane, deadline, 1, now)
+    }
+
+    fn release_frame(&mut self, index: usize) {
+        let owner = self
+            .frames
+            .frame(index)
+            .and_then(|f| self.frames.source(f.source).map(|b| (b.session, f.source)));
+        if let Some((session, _)) = owner {
+            self.sessions[session].tx_retained -= 1;
         }
-        let Some(lane) = &mut self.sessions[buffer.session].tx[buffer.lane] else {
+        if let Some(buffer) = self.frames.release(index) {
             self.release(buffer);
-            return Ok(());
-        };
-        let Ok(id) = lane.start_frame(buffer.length) else {
-            self.release(buffer);
-            return Ok(());
-        };
-        buffer.frame_id = id;
-        buffer.offset = 0;
-        self.pending.push_back(buffer);
-        Ok(())
+        }
+        if let Some((session, source)) = owner
+            && self.sessions[session].slab == Some(source)
+            && self.frames.unused(source)
+        {
+            self.close_slab(session);
+        }
     }
 
     fn clear_batch(&mut self, batch: &mut TxBatch) {
         for frame in &mut batch.frames[..batch.len] {
             if let Some(buffer) = frame.take() {
-                self.release(buffer);
+                self.release_frame(buffer);
             }
         }
         batch.compact();
     }
 
     fn flush_frames(&mut self, now: Duration) -> io::Result<()> {
-        for _ in 0..self.pending.len().min(BATCH_SIZE) {
-            let buffer = self.pending.pop_front().unwrap();
-            if !self.matches(buffer.session, buffer.tag) || self.expired(&buffer, now) {
-                if let Some(batch) = &mut self.sessions[buffer.session].batches[buffer.lane]
-                    && batch.deferred == buffer.frame_id
-                {
-                    batch.deferred = 0;
-                }
-                self.release(buffer);
-                continue;
-            }
-            let session = buffer.session;
-            let lane = buffer.lane;
-            let local = &mut self.sessions[session];
-            let batch = local.batches[lane].as_mut().unwrap();
-            // Queue rotation must not let a newer frame overtake a deferred one.
-            if batch.deferred != 0 && batch.deferred != buffer.frame_id {
-                self.pending.push_back(buffer);
-                continue;
-            }
-            if !batch.plan.is_empty() || batch.len == pack::BATCH_CAPACITY {
-                batch.deferred = buffer.frame_id;
-                self.pending.push_back(buffer);
-                continue;
-            }
-            batch.deferred = 0;
-            batch.frames[batch.len] = Some(buffer);
-            batch.len += 1;
-            if local.tx_ready & (1_u64 << lane) == 0 {
-                local.tx_ready |= 1_u64 << lane;
-                self.ready.push_back((session, lane));
-            }
-        }
+        let mut visited = 0;
         for _ in 0..self.ready.len().min(BATCH_SIZE) {
             let (session, lane) = self.ready.pop_front().unwrap();
             let mut batch = self.sessions[session].batches[lane].take().unwrap();
-            let result = self.flush_batch(session, lane, &mut batch, now);
-            if batch.len != 0 {
+            while visited < BATCH_SIZE {
+                let Some(index) = batch.pending.front() else {
+                    break;
+                };
+                let tag = self
+                    .frames
+                    .frame(index)
+                    .and_then(|frame| self.frames.source(frame.source))
+                    .ok_or_else(|| io::Error::other("missing transmit source"))?
+                    .tag;
+                if !self.matches(session, tag) || self.frame_expired(index, now) {
+                    batch.pending.pop_front(&mut self.frames)?;
+                    self.release_frame(index);
+                    visited += 1;
+                    continue;
+                }
+                if !batch.plan.is_empty() || batch.len == pack::BATCH_CAPACITY {
+                    break;
+                }
+                batch.frames[batch.len] = batch.pending.pop_front(&mut self.frames)?;
+                batch.len += 1;
+                visited += 1;
+            }
+            let result = if batch.len == 0 {
+                Ok(())
+            } else {
+                self.flush_batch(session, lane, &mut batch, now)
+            };
+            if batch.len != 0 || !batch.pending.is_empty() {
                 self.ready.push_back((session, lane));
             } else {
                 self.sessions[session].tx_ready &= !(1_u64 << lane);
             }
             self.sessions[session].batches[lane] = Some(batch);
             result?;
+            if visited == BATCH_SIZE {
+                break;
+            }
         }
         Ok(())
     }
@@ -2235,7 +2437,9 @@ impl Worker {
             .iter()
             .flatten()
             .next()
-            .unwrap()
+            .and_then(|&id| self.frames.frame(id))
+            .and_then(|frame| self.frames.source(frame.source))
+            .ok_or_else(|| io::Error::other("missing transmit batch source"))?
             .tag;
         if !self.matches(session, tag) {
             self.clear_batch(batch);
@@ -2243,8 +2447,10 @@ impl Worker {
         }
         let mut expired = false;
         for frame in &mut batch.frames[..batch.len] {
-            if frame.as_ref().is_some_and(|frame| self.expired(frame, now)) {
-                self.release(frame.take().unwrap());
+            if frame.is_some_and(|index| self.frame_expired(index, now)) {
+                if let Some(index) = frame.take() {
+                    self.release_frame(index);
+                }
                 expired = true;
             }
         }
@@ -2267,22 +2473,27 @@ impl Worker {
         }
         if batch.plan.is_empty()
             && batch
-                .prepare(self.sessions[session].tx[lane].as_mut().unwrap(), limit)
+                .prepare(
+                    self.sessions[session].tx[lane].as_mut().unwrap(),
+                    &self.frames,
+                    limit,
+                )
                 .is_err()
         {
             self.clear_batch(batch);
             return Ok(());
         }
         let result = {
-            let frames =
-                std::array::from_fn::<_, { pack::BATCH_CAPACITY }, _>(|index| pack::FrameInput {
-                    id: 0,
-                    header: &[],
-                    bytes: batch.frames[index]
-                        .as_ref()
-                        .map_or(&[][..], |frame| &frame.bytes[..frame.length]),
-                    offset: 0,
-                });
+            let frames = std::array::from_fn::<_, { pack::BATCH_CAPACITY }, _>(|index| {
+                batch.frames[index]
+                    .and_then(|id| self.frames.input(id))
+                    .unwrap_or(pack::FrameInput {
+                        id: 0,
+                        header: &[],
+                        bytes: &[],
+                        offset: 0,
+                    })
+            });
             let mut slices = [&[][..]; pack::BATCH_SLICES];
             let mut starts = [0; BATCH_SIZE + 1];
             let count = batch.plan.len();
@@ -2290,7 +2501,7 @@ impl Worker {
                 let length = batch
                     .plan
                     .slices(index, &frames, &mut slices[starts[index]..])
-                    .unwrap()
+                    .map_err(|_| io::Error::other("invalid transmit frame spans"))?
                     .len();
                 starts[index + 1] = starts[index] + length;
             }
@@ -2348,7 +2559,9 @@ impl Worker {
         for packet in 0..sent {
             bytes += (batch.plan.packet(packet).unwrap().length + 48) as u64;
             for (frame, range) in batch.plan.pieces(packet).unwrap() {
-                batch.frames[frame].as_mut().unwrap().offset = range.end;
+                if let Some(frame) = batch.frames[frame].and_then(|id| self.frames.frame_mut(id)) {
+                    frame.offset = range.end;
+                }
             }
         }
         self.counters.tx_outer_bytes = self.counters.tx_outer_bytes.wrapping_add(bytes);
@@ -2359,10 +2572,11 @@ impl Worker {
         local.tx_dirty |= 1_u64 << lane;
         for frame in &mut batch.frames[..batch.len] {
             if frame
-                .as_ref()
-                .is_some_and(|frame| frame.offset == frame.length)
+                .and_then(|id| self.frames.frame(id))
+                .is_some_and(|frame| frame.offset == frame.length())
+                && let Some(index) = frame.take()
             {
-                self.release(frame.take().unwrap());
+                self.release_frame(index);
             }
         }
         // Every retry gets new packet numbers; retain only unsent frame byte ranges.
@@ -2889,6 +3103,11 @@ impl Worker {
     }
 
     fn command(&mut self, session: usize, command: Command, path: usize) {
+        let peer = self.shared.config.peer_for_session(session).unwrap();
+        let probes = self.transmit[peer].paths.each_ref().map(|path| {
+            let session = path.probe_session?;
+            Some((session, self.sessions[session].connection?.local_tag()))
+        });
         let local = &mut self.sessions[session];
         if local.installed.is_some_and(|old| {
             old.generation > command.generation
@@ -2902,6 +3121,10 @@ impl Worker {
             local.acknowledged = Some(command);
             return;
         }
+        if command.phase == Phase::Quiesce {
+            self.close_slab(session);
+        }
+        let local = &mut self.sessions[session];
         match command.phase {
             Phase::Quiesce => {
                 local.connection = None;
@@ -2911,14 +3134,10 @@ impl Worker {
             }
             Phase::Install => {
                 local.rx_index.fill(0);
-                for batch in local.batches.iter_mut().flatten() {
-                    batch.deferred = 0;
-                }
                 local.connection = command.connection;
                 local.path = path;
                 let config = self.shared.config.config();
                 let cookie = config.sessions[session].cookie;
-                let peer = self.shared.config.peer_for_session(session).unwrap();
                 for (index, lane) in local.tx.iter_mut().enumerate() {
                     *lane = command
                         .connection
@@ -2953,8 +3172,7 @@ impl Worker {
                 local.acknowledged = Some(command);
             }
         }
-        let peer = self.shared.config.peer_for_session(session).unwrap();
-        for path in 0..2 {
+        for (path, previous) in probes.into_iter().enumerate() {
             self.transmit[peer].paths[path].probe_session = self
                 .sessions
                 .iter()
@@ -2965,6 +3183,16 @@ impl Worker {
                         && local.connection.is_some()
                 })
                 .map(|(index, _)| index);
+            let selected = self.transmit[peer].paths[path]
+                .probe_session
+                .and_then(|session| {
+                    Some((session, self.sessions[session].connection?.local_tag()))
+                });
+            if selected.is_some() && selected != previous {
+                for tx in &mut self.transmit[peer].paths[path].lanes {
+                    tx.mtu.reconnect();
+                }
+            }
         }
         self.mtu_due = Duration::ZERO;
         self.mtu_next = Duration::ZERO;
@@ -3043,7 +3271,6 @@ impl Worker {
                 && local.rx.iter().all(Option::is_none)
                 && local.tx_ready == 0
                 && local.tap_inputs.is_empty()
-                && !self.pending.iter().any(|buffer| buffer.session == session)
             {
                 local.command = None;
                 local.installed = Some(command);
@@ -3134,7 +3361,9 @@ impl Worker {
             }
         }
         for session in &self.sessions {
-            if let Some(input) = session.tap_inputs.front() {
+            if let Some(input) = session.tap_inputs.front()
+                && let Some(input) = self.frames.source(*input)
+            {
                 due = due.min(input.deadline);
             }
             for lane in session.rx.iter().flatten() {
@@ -3143,16 +3372,30 @@ impl Worker {
                 }
             }
         }
-        for frame in &self.pending {
-            due = due.min(frame.deadline);
-        }
         for &(session, lane) in &self.ready {
             let batch = self.sessions[session].batches[lane].as_ref().unwrap();
-            for frame in batch.frames[..batch.len].iter().flatten() {
-                due = due.min(frame.deadline);
+            for frame in batch
+                .pending
+                .iter(&self.frames)
+                .chain(batch.frames[..batch.len].iter().flatten().copied())
+            {
+                if let Some(frame) = self.frames.frame(frame) {
+                    due = due.min(frame.deadline);
+                }
             }
         }
         Some(due.max(now))
+    }
+}
+
+fn advance_overflow(previous: &mut u32, total: u32) -> u64 {
+    let delta = total.wrapping_sub(*previous);
+    // Per-producer samples can arrive stale; accept only forward serial deltas.
+    if delta <= i32::MAX as u32 {
+        *previous = total;
+        u64::from(delta)
+    } else {
+        0
     }
 }
 
@@ -3188,6 +3431,240 @@ fn transient(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn socket_overflow_ignores_stale_samples_and_counts_forward_wrap() {
+        let mut total = 10;
+        for (sample, delta, watermark) in [
+            (8, 0, 10),
+            (10, 0, 10),
+            (12, 2, 12),
+            (12 + (1 << 31), 0, 12),
+        ] {
+            assert_eq!(advance_overflow(&mut total, sample), delta);
+            assert_eq!(total, watermark);
+        }
+        total = u32::MAX - 1;
+        assert_eq!(advance_overflow(&mut total, 1), 3);
+        assert_eq!(advance_overflow(&mut total, u32::MAX), 0);
+        assert_eq!(advance_overflow(&mut total, 4), 3);
+        assert_eq!(total, 4);
+    }
+    fn pending(worker: &super::Worker) -> Vec<usize> {
+        worker
+            .sessions
+            .iter()
+            .flat_map(|s| s.batches.iter().flatten())
+            .flat_map(|b| b.pending.iter(&worker.frames))
+            .collect()
+    }
+
+    fn pop_pending(worker: &mut super::Worker) -> Option<usize> {
+        worker
+            .sessions
+            .iter_mut()
+            .flat_map(|s| s.batches.iter_mut().flatten())
+            .find(|b| !b.pending.is_empty())
+            .and_then(|b| b.pending.pop_front(&mut worker.frames).unwrap())
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn borrowed_views_stop_at_the_session_quota_and_expire_without_stranding_sources() {
+        use crate::tap::test_common::udp;
+        use std::os::unix::net::UnixDatagram;
+        let (mut worker, _) = receive_worker();
+        worker.sessions[0].tx.truncate(1);
+        let (fd, sender) = UnixDatagram::pair().unwrap();
+        fd.set_nonblocking(true).unwrap();
+        worker
+            .reactor
+            .remove(worker.sessions[0].tap.as_ref().unwrap().as_fd())
+            .unwrap();
+        worker
+            .attach_tap(0, TapQueue::test_fd(fd.into(), true))
+            .unwrap();
+        let mut input = udp::frame(false, 65530, &[7; 10000]);
+        let mut header = udp::partial(&mut input, false);
+        header[1] = 5;
+        header[4..6].copy_from_slice(&1u16.to_ne_bytes());
+        sender
+            .send(&[header.as_slice(), input.as_slice()].concat())
+            .unwrap();
+        worker.read_tap(0, Duration::ZERO).unwrap();
+        assert_eq!(worker.sessions[0].tap_read_limit, 1);
+        let source = *worker.sessions[0].tap_inputs.front().unwrap();
+        let pointer = worker.frames.source(source).unwrap().bytes.as_ptr();
+        for _ in 0..frames::CAPACITY / BATCH_SIZE {
+            if !worker.drain_tap_inputs(Duration::ZERO).unwrap() {
+                break;
+            }
+        }
+        let quota = frame_quota(worker.sessions[0].tx_workers);
+        assert_eq!(pending(&worker).len(), quota - 1);
+        assert_eq!(worker.sessions[0].tx_retained, quota);
+        assert_eq!(worker.sessions[0].tx_bytes, input.len());
+        assert_eq!(worker.free.len(), BUFFERS - 1);
+        assert!(!worker.drain_tap_inputs(Duration::ZERO).unwrap());
+        for sequence in 0..64 {
+            let index = pop_pending(&mut worker).unwrap();
+            let frame = worker.frames.frame(index).unwrap();
+            assert_eq!(frame.id, (1 << 48) | (sequence + 1));
+            let spans = worker.frames.input(index).unwrap();
+            assert_eq!(
+                spans.bytes.as_ptr(),
+                pointer.wrapping_add(42 + sequence as usize)
+            );
+            assert_eq!(
+                frame_bytes(&worker, index),
+                udp::frame(false, 65530u16.wrapping_add(sequence as u16), &[7])
+            );
+            worker.release_frame(index);
+        }
+        worker.drain_tap_inputs(Duration::ZERO).unwrap();
+        assert_eq!(pending(&worker).len(), quota - 1);
+        assert_eq!(worker.free.len(), BUFFERS - 1);
+        worker.drain_tap_inputs(reassembly::FRAME_LIFETIME).unwrap();
+        assert!(worker.sessions[0].tap_inputs.is_empty());
+        while !pending(&worker).is_empty() {
+            worker.flush_frames(reassembly::FRAME_LIFETIME).unwrap();
+        }
+        assert_eq!(worker.counters.expired_frames, 10000 - 64);
+        assert_eq!(worker.sessions[0].tx_retained, 0);
+        assert_eq!(worker.sessions[0].tx_bytes, 0);
+        assert_eq!(worker.frames.available(), frames::CAPACITY);
+        assert_eq!(worker.free.len(), BUFFERS);
+        assert_eq!(worker.counters.queue_drops, 0);
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn transmit_fifo_survives_arrivals_between_bounded_turns() {
+        for expired in [0, 65, 97] {
+            let (mut worker, _) = receive_worker();
+            let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
+            worker.transmit[0].paths[0].lanes[0].socket =
+                Some(TransmitSocket::connect(&rx, rx.local_addr()).unwrap());
+            worker.transmit[0].paths[0].lanes[0].blocked = true;
+            for _ in 0..120 {
+                let mut frame = worker.free.pop().unwrap();
+                frame.tag = 1;
+                frame.length = 60;
+                frame.deadline = Duration::from_secs(1);
+                worker.input_frame(frame, Duration::ZERO).unwrap();
+            }
+            for index in 0..32 {
+                let frame = pop_pending(&mut worker);
+                worker.sessions[0].batches[0].as_mut().unwrap().frames[index] = frame;
+            }
+            worker.sessions[0].batches[0].as_mut().unwrap().len = 32;
+            worker.flush_frames(Duration::ZERO).unwrap();
+            assert_eq!(worker.sessions[0].batches[0].as_ref().unwrap().len, 64);
+            worker.transmit[0].paths[0].lanes[0].blocked = false;
+            let mut batch = worker.sessions[0].batches[0].take().unwrap();
+            worker
+                .flush_batch(0, 0, &mut batch, Duration::ZERO)
+                .unwrap();
+            assert_eq!(batch.len, 0);
+            worker.sessions[0].batches[0] = Some(batch);
+            for _ in 0..43 {
+                let mut frame = worker.free.pop().unwrap();
+                frame.tag = 1;
+                frame.length = 60;
+                frame.deadline = Duration::from_secs(1);
+                worker.input_frame(frame, Duration::ZERO).unwrap();
+            }
+            let now = Duration::from_millis(10);
+            if expired != 0 {
+                let index = pending(&worker)
+                    .into_iter()
+                    .find(|&index| worker.frames.frame(index).unwrap().id == (1 << 48) | expired)
+                    .unwrap();
+                worker.frames.frame_mut(index).unwrap().deadline = now;
+            }
+            let mut received = Vec::new();
+            let mut bytes = [0; BASE_UDP_PAYLOAD];
+            for _ in 0..12 {
+                worker.flush_frames(now).unwrap();
+                while let Ok((length, _)) = rx.recv(&mut bytes) {
+                    for record in Datagram::decode(&bytes[..length]).unwrap().records() {
+                        if let Record::Data {
+                            frame_id,
+                            offset: 0,
+                            ..
+                        } = record
+                        {
+                            received.push(frame_id & ((1 << 48) - 1));
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                received,
+                (1..=163).filter(|id| *id != expired).collect::<Vec<_>>()
+            );
+            assert!(worker.ready.is_empty());
+            assert_eq!(worker.sessions[0].tx_retained, 0);
+            assert_eq!(worker.free.len(), BUFFERS);
+        }
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn transmit_frame_budget_rotates_between_backlogged_lanes() {
+        let (mut worker, _) = receive_worker();
+        worker.command(1, worker.sessions[0].installed.unwrap(), 0);
+        for (session, count) in [(0, 128), (1, 64)] {
+            for _ in 0..count {
+                let mut frame = worker.free.pop().unwrap();
+                frame.session = session;
+                frame.tag = 1;
+                frame.length = 60;
+                frame.deadline = Duration::from_secs(1);
+                worker.input_frame(frame, Duration::ZERO).unwrap();
+            }
+        }
+        worker.flush_frames(Duration::ZERO).unwrap();
+        assert_eq!(
+            worker.sessions[0].batches[0]
+                .as_ref()
+                .unwrap()
+                .pending
+                .len(),
+            64
+        );
+        assert_eq!(
+            worker.sessions[1].batches[0]
+                .as_ref()
+                .unwrap()
+                .pending
+                .len(),
+            64
+        );
+        worker.flush_frames(Duration::ZERO).unwrap();
+        assert_eq!(
+            worker.sessions[0].batches[0]
+                .as_ref()
+                .unwrap()
+                .pending
+                .len(),
+            64
+        );
+        assert!(
+            worker.sessions[1].batches[0]
+                .as_ref()
+                .unwrap()
+                .pending
+                .is_empty()
+        );
+        worker.flush_frames(Duration::ZERO).unwrap();
+        assert!(worker.ready.is_empty());
+        assert_eq!(worker.free.len(), BUFFERS);
+    }
+
+    fn frame_bytes(worker: &super::Worker, id: usize) -> Vec<u8> {
+        let input = worker.frames.input(id).unwrap();
+        [input.header, input.bytes].concat()
+    }
     use super::*;
 
     // Datagram sockets give deterministic full-write/WouldBlock behavior without
@@ -3420,14 +3897,20 @@ mod tests {
         assert_eq!({ events[0].u64 }, WAKE_TOKEN);
         worker.reactor.drain(WAKE_TOKEN).unwrap();
 
-        for _ in 0..BUFFERS {
-            tap.send(&[0; 60]).unwrap();
-        }
-        for _ in 0..8 {
+        let mut sent = 0;
+        while worker.tap_capacity(0) != 0 {
+            let count = worker.tap_capacity(0).min(BATCH_SIZE);
+            for _ in 0..count {
+                tap.send(&[0; 60]).unwrap();
+                sent += 1;
+            }
             worker.read_tap(0, Duration::ZERO).unwrap();
         }
-        assert_eq!(worker.pending.len(), BUFFERS - RECEIVE_BUFFERS - 1);
-        assert_eq!(worker.free.len(), 1);
+        tap.send(&[0; 60]).unwrap();
+        let queued = sent + 1 - pending(&worker).len();
+        assert!(pending(&worker).len() > 1000);
+        assert!(worker.free.len() > RECEIVE_BUFFERS);
+        let free = worker.free.len();
         worker.flush_taps(Duration::ZERO).unwrap();
         assert!(!worker.sessions[0].tap_readable);
         assert_eq!(worker.reactor.wait(&mut events, 0).unwrap(), 0);
@@ -3438,25 +3921,27 @@ mod tests {
         let count = worker.reactor.wait(&mut events, 0).unwrap();
         assert!(events[..count].iter().any(|event| event.u64 == 2));
         assert!(!events[..count].iter().any(|event| event.u64 == TAP_TOKEN));
-        assert_eq!(worker.free.len(), RECEIVE_BUFFERS + 1);
+        assert_eq!(worker.free.len(), free + RECEIVE_BUFFERS);
         worker.read_tap(0, Duration::ZERO).unwrap();
-        assert_eq!(worker.free.len(), RECEIVE_BUFFERS + 1);
+        assert_eq!(worker.free.len(), free + RECEIVE_BUFFERS);
         for _ in 0..3 {
             worker.read_socket(0, Duration::ZERO).unwrap();
             assert_eq!(worker.rx_retained, RECEIVE_BUFFERS);
             worker.drain_packets(Duration::ZERO).unwrap();
         }
         assert_eq!(worker.rx_retained, 0);
-        while let Some(buffer) = worker.pending.pop_front() {
-            worker.release(buffer);
+        while let Some(buffer) = pop_pending(&mut worker) {
+            worker.release_frame(buffer);
         }
         assert_eq!(worker.free.len(), BUFFERS);
         worker.flush_taps(Duration::ZERO).unwrap();
         assert!(worker.sessions[0].tap_readable);
         let count = worker.reactor.wait(&mut events, 0).unwrap();
         assert!(events[..count].iter().any(|event| event.u64 == TAP_TOKEN));
-        worker.read_tap(0, Duration::ZERO).unwrap();
-        assert_eq!(worker.pending.len(), RECEIVE_BUFFERS + 1);
+        while pending(&worker).len() < queued {
+            worker.read_tap(0, Duration::ZERO).unwrap();
+        }
+        assert_eq!(pending(&worker).len(), queued);
         assert_eq!(worker.counters.admission_pressure, 0);
         assert_eq!(worker.counters.expired_frames, 0);
     }
@@ -3508,7 +3993,7 @@ mod tests {
         worker.sessions[0].tx.truncate(1);
         tap.send(&[0; 60]).unwrap();
         worker.read_tap(0, Duration::ZERO).unwrap();
-        assert_eq!(worker.pending.len(), 1);
+        assert_eq!(pending(&worker).len(), 1);
         assert_eq!(worker.counters.tap_read_batches, 0);
         assert_eq!(worker.counters.tap_ring_frames, 0);
         assert_eq!(worker.counters.tap_read_calls, 2);
@@ -3614,12 +4099,15 @@ mod tests {
                         assert_eq!(worker.sessions[0].tap_inputs.len(), retained);
                     }
                     worker.drain_tap_inputs(Duration::ZERO).unwrap();
-                    assert!(worker.pending.len() <= BATCH_SIZE + 1);
+                    assert!(pending(&worker).len() <= BATCH_SIZE + 1);
                     assert!(
-                        worker.pending.iter().map(|b| b.length).sum::<usize>()
+                        pending(&worker)
+                            .iter()
+                            .map(|&id| worker.frames.frame(id).unwrap().length())
+                            .sum::<usize>()
                             < 64 * 1024 + crate::MAX_FRAME_LEN
                     );
-                    while let Some(buffer) = worker.pending.pop_front() {
+                    while let Some(buffer) = pop_pending(&mut worker) {
                         let expected = if seen == count * 3 {
                             plain.clone()
                         } else {
@@ -3630,10 +4118,13 @@ mod tests {
                                 &payload[part * size..(part + 1) * size],
                             )
                         };
-                        assert_eq!(&buffer.bytes[..buffer.length], expected);
-                        assert_eq!(buffer.deadline, reassembly::FRAME_LIFETIME);
+                        assert_eq!(frame_bytes(&worker, buffer), expected);
+                        assert_eq!(
+                            worker.frames.frame(buffer).unwrap().deadline,
+                            reassembly::FRAME_LIFETIME
+                        );
                         seen += 1;
-                        worker.release(buffer);
+                        worker.release_frame(buffer);
                     }
                     if seen == count * 3 + 1 {
                         break;
@@ -3646,23 +4137,22 @@ mod tests {
                 assert_eq!(worker.counters.tap_gso_frames, (count * 3) as u64);
                 assert_eq!(worker.counters.queue_drops, 0);
 
-                // One spare output buffer must suffice; no wait for the whole expansion.
+                // Borrowed children need no output buffers and keep their source alive.
                 let held = worker.free.split_off(RECEIVE_BUFFERS + 2);
                 sender.send(&input).unwrap();
                 worker.read_tap(0, Duration::ZERO).unwrap();
                 assert!(!worker.drain_tap_inputs(Duration::ZERO).unwrap());
-                assert_eq!(worker.pending.len(), 1);
-                assert_eq!(worker.free.len(), RECEIVE_BUFFERS);
-                let output = worker.pending.pop_front().unwrap();
-                worker.release(output);
-                worker.drain_tap_inputs(Duration::ZERO).unwrap();
-                assert_eq!(worker.pending.len(), 1);
-                assert!(!worker.sessions[0].tap_inputs.is_empty());
+                assert_eq!(pending(&worker).len(), count);
+                assert_eq!(worker.free.len(), RECEIVE_BUFFERS + 1);
+                for _ in 0..2 {
+                    let output = pop_pending(&mut worker).unwrap();
+                    worker.release_frame(output);
+                }
+                assert_eq!(worker.free.len(), RECEIVE_BUFFERS + 1);
+                assert!(worker.sessions[0].tap_inputs.is_empty());
                 worker.free.extend(held);
                 let expiry = reassembly::FRAME_LIFETIME;
-                worker.drain_tap_inputs(expiry).unwrap();
-                let output = worker.pending.pop_front().unwrap();
-                worker.release(output);
+                worker.flush_frames(expiry).unwrap();
                 assert!(worker.sessions[0].tap_inputs.is_empty());
                 assert_eq!(worker.sessions[0].tx_bytes, 0);
                 assert_eq!(worker.free.len(), BUFFERS);
@@ -3757,7 +4247,19 @@ mod tests {
             assert!(source.segments.is_some());
             assert_eq!(source.lane, 1);
             let segments = source.segments;
+            let payload_pointer = source.bytes.as_ptr();
             workers[1].input_frame(source, Duration::ZERO).unwrap();
+            let source = *workers[1].sessions[0].tap_inputs.front().unwrap();
+            assert_eq!(
+                workers[1].frames.source(source).unwrap().bytes.as_ptr(),
+                payload_pointer
+            );
+            assert_eq!(workers[1].frames.source(source).unwrap().origin, 1);
+            workers[0].drain_queues(Duration::ZERO).unwrap();
+            assert_eq!(workers[0].free.len(), BUFFERS);
+            assert_eq!(workers[0].sessions[0].tx_retained, 0);
+            assert_eq!(workers[0].sessions[0].tx_bytes, 0);
+            assert_eq!(workers[1].free.len(), BUFFERS - 1);
             sender
                 .send(&[[0; 10].as_slice(), plain.as_slice()].concat())
                 .unwrap();
@@ -3767,13 +4269,16 @@ mod tests {
             let mut seen = 0;
             while seen < count + 1 {
                 workers[1].drain_tap_inputs(Duration::ZERO).unwrap();
-                assert!(workers[1].pending.len() <= BATCH_SIZE);
+                assert!(pending(&workers[1]).len() <= BATCH_SIZE);
                 assert!(
-                    workers[1].pending.iter().map(|b| b.length).sum::<usize>()
+                    pending(&workers[1])
+                        .iter()
+                        .map(|&id| workers[1].frames.frame(id).unwrap().length())
+                        .sum::<usize>()
                         < 64 * 1024 + MAX_FRAME_LEN
                 );
-                assert!(!workers[1].pending.is_empty());
-                while let Some(frame) = workers[1].pending.pop_front() {
+                assert!(!pending(&workers[1]).is_empty());
+                while let Some(frame) = pop_pending(&mut workers[1]) {
                     let expected = if seen == count {
                         plain.clone()
                     } else {
@@ -3786,11 +4291,18 @@ mod tests {
                         expected.splice(12..12, tags);
                         expected
                     };
-                    assert_eq!(&frame.bytes[..frame.length], expected);
-                    assert_eq!(frame.frame_id, (2 << 48) | (seen as u64 + 1));
-                    assert_eq!(frame.deadline, reassembly::FRAME_LIFETIME);
-                    assert_eq!(frame.origin, usize::from(seen != count));
-                    workers[1].release(frame);
+                    assert_eq!(frame_bytes(&workers[1], frame), expected);
+                    assert_eq!(
+                        workers[1].frames.frame(frame).unwrap().id,
+                        (2 << 48) | (seen as u64 + 1)
+                    );
+                    assert_eq!(
+                        workers[1].frames.frame(frame).unwrap().deadline,
+                        reassembly::FRAME_LIFETIME
+                    );
+                    let source = workers[1].frames.frame(frame).unwrap().source;
+                    assert_eq!(workers[1].frames.source(source).unwrap().origin, 1);
+                    workers[1].release_frame(frame);
                     seen += 1;
                 }
                 workers[0].drain_queues(Duration::ZERO).unwrap();
@@ -3805,30 +4317,36 @@ mod tests {
                 assert_eq!(worker.counters.queue_drops, 0);
             }
 
-            // Foreign inputs share a fixed queue; quiesce must return every source.
-            for _ in 0..BUFFERS {
+            let quota = frame_quota(workers[1].sessions[0].tx_workers);
+            let bytes = 64 * 1024 * 1024 / workers[1].sessions[0].tx_workers;
+            for (reserved_frames, reserved_bytes) in
+                [(quota - 2, 0), (0, bytes - MAX_FRAME_LEN - 59)]
+            {
+                workers[1].sessions[0].tx_retained = reserved_frames;
+                workers[1].sessions[0].tx_bytes = reserved_bytes;
                 let mut source = workers[0].free.pop().unwrap();
                 source.session = 0;
                 source.tag = 1;
                 source.lane = 1;
-                source.length = input.len();
-                source.segments = segments;
+                source.length = 60;
                 source.deadline = reassembly::FRAME_LIFETIME;
                 source.tx_reserved = true;
                 workers[0].sessions[0].tx_retained += 1;
-                workers[0].sessions[0].tx_bytes += source.length;
+                workers[0].sessions[0].tx_bytes += 60;
                 workers[1].input_frame(source, Duration::ZERO).unwrap();
+                assert!(workers[1].sessions[0].tap_inputs.is_empty());
+                assert_eq!(workers[1].free.len(), BUFFERS);
+                assert_eq!(workers[1].sessions[0].tx_retained, reserved_frames);
+                assert_eq!(workers[1].sessions[0].tx_bytes, reserved_bytes);
+                workers[0].drain_queues(Duration::ZERO).unwrap();
+                assert_eq!(workers[0].free.len(), BUFFERS);
+                assert_eq!(workers[0].sessions[0].tx_retained, 0);
+                assert_eq!(workers[0].sessions[0].tx_bytes, 0);
             }
-            let mut extra = workers[1].free.pop().unwrap();
-            extra.session = 0;
-            extra.tag = 1;
-            extra.lane = 1;
-            extra.length = 60;
-            extra.deadline = reassembly::FRAME_LIFETIME;
-            workers[1].input_frame(extra, Duration::ZERO).unwrap();
-            assert_eq!(workers[1].sessions[0].tap_inputs.len(), BUFFERS);
-            assert_eq!(workers[1].sessions[0].tap_inputs.capacity(), BUFFERS);
-            assert_eq!(workers[1].counters.queue_drops, 1);
+            workers[1].sessions[0].tx_retained = 0;
+            workers[1].sessions[0].tx_bytes = 0;
+
+            // Even with blocked returns, adoption leaves RX and slab progress buffers.
             for _ in 0..crate::spsc::CAPACITY {
                 assert!(
                     workers[1]
@@ -3845,6 +4363,30 @@ mod tests {
                         .is_ok()
                 );
             }
+            for _ in 0..BUFFERS {
+                let mut source = workers[0].free.pop().unwrap();
+                source.session = 0;
+                source.tag = 1;
+                source.lane = 1;
+                source.length = input.len();
+                source.segments = segments;
+                source.deadline = reassembly::FRAME_LIFETIME;
+                source.tx_reserved = true;
+                workers[0].sessions[0].tx_retained += 1;
+                workers[0].sessions[0].tx_bytes += source.length;
+                workers[1].input_frame(source, Duration::ZERO).unwrap();
+            }
+            assert_eq!(workers[1].free.len(), RECEIVE_BUFFERS + 1);
+            assert_eq!(
+                workers[1].sessions[0].tap_inputs.len(),
+                BUFFERS - RECEIVE_BUFFERS - 1
+            );
+            assert_eq!(workers[1].sessions[0].tap_inputs.capacity(), BUFFERS);
+            assert_eq!(
+                workers[1].counters.queue_drops,
+                (RECEIVE_BUFFERS + 3) as u64
+            );
+            assert_eq!(workers[1].returns[0].len(), BUFFERS);
             workers[1].command(
                 0,
                 Command {
@@ -3873,6 +4415,68 @@ mod tests {
 
     #[test]
     #[ignore = "kernel ring test; run in a disposable container"]
+    fn foreign_super_frame_reads_batch_without_expanding_on_the_reader() {
+        use crate::tap::test_common::udp;
+        use std::os::unix::net::UnixDatagram;
+        let (mut worker, _) = receive_worker();
+        worker.sessions[0].tap_read_limit = 1;
+        let (tx, mut incoming) = crate::spsc::channel();
+        worker.outgoing[1] = Some(tx);
+        let (fd, sender) = UnixDatagram::pair().unwrap();
+        fd.set_nonblocking(true).unwrap();
+        worker
+            .reactor
+            .remove(worker.sessions[0].tap.as_ref().unwrap().as_fd())
+            .unwrap();
+        worker
+            .attach_tap(0, TapQueue::test_fd(fd.into(), true))
+            .unwrap();
+        let mut sources = Vec::new();
+        for source in 0..11 {
+            let mut input = udp::frame(false, source * 70, &[7; 7000]);
+            let mut header = udp::partial(&mut input, false);
+            input.splice(12..12, [0x88, 0xa8, 0, 7, 0x81, 0, 0, 42]);
+            input[11] = (0..=255)
+                .find(|&mac| {
+                    input[11] = mac;
+                    pack::flow_hash(&input) % 2 == 1
+                })
+                .unwrap();
+            header[1] = 5;
+            header[4..6].copy_from_slice(&100u16.to_ne_bytes());
+            header[6..8].copy_from_slice(&42u16.to_ne_bytes());
+            sender
+                .send(&[header.as_slice(), input.as_slice()].concat())
+                .unwrap();
+            sources.push(input);
+        }
+        let mut seen = 0;
+        let mut reads = 0;
+        for (count, next) in [(1, 2), (2, 4), (4, 4), (4, 4)] {
+            worker.read_tap(0, Duration::ZERO).unwrap();
+            reads += count;
+            assert_eq!(worker.sessions[0].tap_read_limit, next);
+            assert_eq!(worker.counters.tap_read_requests, reads);
+            assert!(worker.sessions[0].tap_inputs.is_empty());
+            for _ in 0..count {
+                let Some(Event::Frame(source)) = incoming.try_pop() else {
+                    panic!("missing source");
+                };
+                assert_eq!(source.lane, 1);
+                assert_eq!(&source.bytes[..source.length], sources[seen]);
+                seen += 1;
+                worker.release(source);
+            }
+            assert!(incoming.try_pop().is_none());
+        }
+        assert_eq!(seen, 11);
+        assert_eq!(worker.counters.tap_gso_frames, 0);
+        assert_eq!(worker.free.len(), BUFFERS);
+        assert_eq!(worker.counters.queue_drops, 0);
+    }
+
+    #[test]
+    #[ignore = "kernel ring test; run in a disposable container"]
     fn pool_pressure_does_not_shrink_the_tap_read_budget() {
         let (mut worker, tap) = receive_worker();
         assert!(worker.tap_reader.as_ref().unwrap().enabled);
@@ -3882,14 +4486,14 @@ mod tests {
         tap.send(&[0; 60]).unwrap();
         worker.read_tap(0, Duration::ZERO).unwrap();
         assert_eq!(worker.sessions[0].tap_read_limit, BATCH_SIZE);
-        assert_eq!(worker.pending.len(), 1);
+        assert_eq!(pending(&worker).len(), 1);
         assert_eq!(worker.free.len(), RECEIVE_BUFFERS + 1);
         worker.free.extend(held);
         for _ in 0..BATCH_SIZE {
             tap.send(&[0; 60]).unwrap();
         }
         worker.read_tap(0, Duration::ZERO).unwrap();
-        assert_eq!(worker.pending.len(), BATCH_SIZE + 1);
+        assert_eq!(pending(&worker).len(), BATCH_SIZE + 1);
         assert_eq!(worker.counters.tap_read_requests, (BATCH_SIZE + 1) as u64);
         assert_eq!(worker.counters.tap_ring_frames, (BATCH_SIZE + 1) as u64);
         assert_eq!(worker.counters.tap_read_calls, 2);
@@ -3901,7 +4505,7 @@ mod tests {
         worker.read_tap(0, Duration::ZERO).unwrap();
         assert_eq!(worker.sessions[0].tap_read_limit, 2);
         worker.read_tap(0, Duration::ZERO).unwrap();
-        assert_eq!(worker.pending.len(), BATCH_SIZE + 3);
+        assert_eq!(pending(&worker).len(), BATCH_SIZE + 3);
         assert_eq!(worker.counters.queue_drops, 0);
     }
 
@@ -4099,11 +4703,11 @@ mod tests {
     fn origin_reservations_bound_every_session_direction() {
         for workers in 1..=64 {
             assert!(frame_quota(workers) * workers <= 8192);
-            assert!(frame_quota(workers) * workers * MAX_FRAME_LEN <= 64 * 1024 * 1024);
-            assert!(frame_quota(workers) <= BUFFERS);
+            assert!((64 * 1024 * 1024 / workers) * workers <= 64 * 1024 * 1024);
+            assert!(frame_quota(workers) <= frames::CAPACITY);
         }
-        assert_eq!(frame_quota(1), BUFFERS);
-        assert_eq!(frame_quota(64), 116);
+        assert_eq!(frame_quota(1), frames::CAPACITY);
+        assert_eq!(frame_quota(64), 128);
     }
 
     #[test]
@@ -4210,6 +4814,72 @@ mod tests {
 
     #[test]
     #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn reconnect_rearms_failed_mtu_only_when_the_probe_connection_changes() {
+        let (mut worker, _tap) = receive_worker();
+        let connection = worker.sessions[0].connection.unwrap();
+        let now = Duration::from_secs(20);
+        let old = pmtu::ProbeId {
+            session: 0,
+            tag: connection.local_tag().get(),
+            lane: 1,
+            packet: 1,
+        };
+        let mtu = &mut worker.transmit[0].paths[0].lanes[0].mtu;
+        assert!(mtu.local_too_big(BASE_UDP_PAYLOAD, 1279, Duration::ZERO));
+        assert_eq!(mtu.poll(now), Some(BASE_UDP_PAYLOAD));
+        assert!(mtu.submitted(old, BASE_UDP_PAYLOAD, now));
+        let deadline = mtu.deadline();
+        worker.command(
+            1,
+            Command {
+                generation: 1,
+                phase: Phase::Install,
+                connection: Some(connection),
+            },
+            0,
+        );
+        let mtu = &worker.transmit[0].paths[0].lanes[0].mtu;
+        assert_eq!(mtu.deadline(), deadline);
+        assert_eq!(mtu.probes(now).next(), Some((old, BASE_UDP_PAYLOAD)));
+        worker.command(
+            0,
+            Command {
+                generation: 2,
+                phase: Phase::Quiesce,
+                connection: None,
+            },
+            0,
+        );
+        assert_eq!(worker.transmit[0].paths[0].probe_session, Some(1));
+        let mtu = &mut worker.transmit[0].paths[0].lanes[0].mtu;
+        assert_eq!(mtu.payload_limit(), 0);
+        assert_eq!(mtu.poll(now), Some(BASE_UDP_PAYLOAD));
+        assert!(!mtu.reply(old, BASE_UDP_PAYLOAD, now));
+        let shared = pmtu::ProbeId { session: 1, ..old };
+        assert!(mtu.submitted(shared, BASE_UDP_PAYLOAD, now));
+        let install = Command {
+            generation: 2,
+            phase: Phase::Install,
+            connection: Some(Connection {
+                initiator: Tag::new(3).unwrap(),
+                ..connection
+            }),
+        };
+        worker.command(0, install, 0);
+        let mtu = &mut worker.transmit[0].paths[0].lanes[0].mtu;
+        assert_eq!(mtu.payload_limit(), 0);
+        assert!(!mtu.reply(shared, BASE_UDP_PAYLOAD, now));
+        assert_eq!(mtu.poll(now), Some(BASE_UDP_PAYLOAD));
+        let fresh = pmtu::ProbeId { tag: 3, ..old };
+        assert!(mtu.submitted(fresh, BASE_UDP_PAYLOAD, now));
+        worker.command(0, install, 0);
+        let mtu = &mut worker.transmit[0].paths[0].lanes[0].mtu;
+        assert!(mtu.reply(fresh, BASE_UDP_PAYLOAD, now + Duration::from_millis(1)));
+        assert_eq!(mtu.payload_limit(), BASE_UDP_PAYLOAD);
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
     fn mtu_reduction_repacks_unsent_ranges_in_every_shared_session() {
         let (mut worker, _tap) = receive_worker();
         let now = Duration::from_millis(10);
@@ -4246,19 +4916,22 @@ mod tests {
             frame.lane = 0;
             frame.tag = 1;
             frame.deadline = now + Duration::from_millis(100);
-            let lane = worker.sessions[session].tx[0].as_mut().unwrap();
-            frame.frame_id = lane.start_frame(frame.length).unwrap();
+            worker.input_frame(frame, now).unwrap();
             let batch = worker.sessions[session].batches[0].as_mut().unwrap();
-            batch.frames[0] = Some(frame);
+            batch.frames[0] = batch.pending.pop_front(&mut worker.frames).unwrap();
             batch.len = 1;
             let mut batch = worker.sessions[session].batches[0].take().unwrap();
             batch
-                .prepare(worker.sessions[session].tx[0].as_mut().unwrap(), old_limit)
+                .prepare(
+                    worker.sessions[session].tx[0].as_mut().unwrap(),
+                    &worker.frames,
+                    old_limit,
+                )
                 .unwrap();
             let last = batch.plan.packet(batch.plan.len() - 1).unwrap().number;
             worker.submitted_batch(session, 0, &mut batch, 1);
-            let frame = batch.frames[0].as_ref().unwrap();
-            *expected = (frame.frame_id, frame.offset, last);
+            let frame = worker.frames.frame(batch.frames[0].unwrap()).unwrap();
+            *expected = (frame.id, frame.offset, last);
             worker.sessions[session].batches[0] = Some(batch);
         }
         let mtu = &mut worker.transmit[0].paths[0].lanes[0].mtu;
@@ -4269,10 +4942,24 @@ mod tests {
             let local = &mut worker.sessions[session];
             let batch = local.batches[0].as_mut().unwrap();
             assert!(batch.plan.is_empty());
-            assert_eq!(batch.frames[0].as_ref().unwrap().frame_id, id);
-            assert_eq!(batch.frames[0].as_ref().unwrap().offset, offset);
+            assert_eq!(
+                worker.frames.frame(batch.frames[0].unwrap()).unwrap().id,
+                id
+            );
+            assert_eq!(
+                worker
+                    .frames
+                    .frame(batch.frames[0].unwrap())
+                    .unwrap()
+                    .offset,
+                offset
+            );
             batch
-                .prepare(local.tx[0].as_mut().unwrap(), BASE_UDP_PAYLOAD)
+                .prepare(
+                    local.tx[0].as_mut().unwrap(),
+                    &worker.frames,
+                    BASE_UDP_PAYLOAD,
+                )
                 .unwrap();
             assert!(batch.plan.packet(0).unwrap().number > last);
             assert_eq!(
@@ -4429,12 +5116,19 @@ mod tests {
         frame.lane = 0;
         frame.length = 9022;
         frame.deadline = Duration::from_secs(1);
-        worker.frame(frame, now).unwrap();
+        worker.input_frame(frame, now).unwrap();
         worker.flush_frames(now).unwrap();
         let batch = worker.sessions[0].batches[0].as_ref().unwrap();
         assert_eq!(batch.len, 1);
         assert!(batch.plan.is_empty());
-        assert_eq!(batch.frames[0].as_ref().unwrap().offset, 0);
+        assert_eq!(
+            worker
+                .frames
+                .frame(batch.frames[0].unwrap())
+                .unwrap()
+                .offset,
+            0
+        );
         let tx = &worker.transmit[0].paths[0].lanes[0];
         assert_eq!(tx.mtu.payload_limit(), BASE_UDP_PAYLOAD);
         assert!(tx.socket.as_ref().unwrap().gso_enabled());
@@ -4495,35 +5189,36 @@ mod tests {
                 buffer.tag = 1;
                 buffer.length = 60;
                 buffer.deadline = Duration::from_secs(1);
-                worker.frame(buffer, Duration::ZERO).unwrap();
+                worker.input_frame(buffer, Duration::ZERO).unwrap();
             }
             // Leave one batch slot and one pending frame beyond this turn's budget.
             let batch = worker.sessions[0].batches[0].as_mut().unwrap();
             for frame in &mut batch.frames[..63] {
-                *frame = worker.pending.pop_front();
+                *frame = batch.pending.pop_front(&mut worker.frames).unwrap();
             }
             batch.len = 63;
-            worker.sessions[0].tx_ready = 1;
-            worker.ready.push_back((0, 0));
             other.session = 1;
             other.tag = 1;
             other.length = 60;
             other.deadline = Duration::from_secs(1);
-            worker.frame(other, Duration::ZERO).unwrap();
+            worker.input_frame(other, Duration::ZERO).unwrap();
             worker.flush_frames(Duration::ZERO).unwrap();
             let now = Duration::from_millis(10);
             if expired != 0 {
-                worker
-                    .pending
-                    .iter_mut()
-                    .find(|b| b.session == 0 && b.frame_id == (1 << 48) | expired)
-                    .unwrap()
-                    .deadline = now;
+                let index = *pending(worker)
+                    .iter()
+                    .find(|&&id| {
+                        let frame = worker.frames.frame(id).unwrap();
+                        worker.frames.source(frame.source).unwrap().session == 0
+                            && frame.id == (1 << 48) | expired
+                    })
+                    .unwrap();
+                worker.frames.frame_mut(index).unwrap().deadline = now;
             }
             for _ in 0..3 {
                 worker.flush_frames(now).unwrap();
                 assert_eq!(worker.sessions[0].batches[0].as_ref().unwrap().len, 64);
-                assert_eq!(worker.pending.len(), 64 - usize::from(expired != 0));
+                assert_eq!(pending(worker).len(), 64 - usize::from(expired == 65));
                 assert_eq!(worker.sessions[1].batches[0].as_ref().unwrap().len, 1);
             }
             worker.transmit[0].paths[0].lanes[0].blocked = false;
@@ -4555,9 +5250,8 @@ mod tests {
                     .map(|id| (1 << 48) | id)
                     .collect::<Vec<_>>()
             );
-            assert!(worker.pending.is_empty());
+            assert!(pending(worker).is_empty());
             let command = worker.sessions[0].installed.unwrap();
-            worker.sessions[0].batches[0].as_mut().unwrap().deferred = 1;
             worker.command(
                 0,
                 Command {
@@ -4566,7 +5260,13 @@ mod tests {
                 },
                 0,
             );
-            assert_eq!(worker.sessions[0].batches[0].as_ref().unwrap().deferred, 0);
+            assert!(
+                worker.sessions[0].batches[0]
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .is_empty()
+            );
         }
     }
 
@@ -4617,15 +5317,16 @@ mod tests {
             buffer.tx_reserved = true;
             workers[0].sessions[0].tx_retained += 1;
             workers[0].sessions[0].tx_bytes += buffer.length;
-            workers[0].frame(buffer, Duration::ZERO).unwrap();
+            workers[0].input_frame(buffer, Duration::ZERO).unwrap();
         }
         workers[0].flush_frames(Duration::ZERO).unwrap();
-        assert!(workers[0].pending.is_empty());
+        assert!(pending(&workers[0]).is_empty());
         assert_eq!(workers[0].ready.len(), 1);
         let mut batch = workers[0].sessions[0].batches[0].take().unwrap();
         batch
             .prepare(
                 workers[0].sessions[0].tx[0].as_mut().unwrap(),
+                &workers[0].frames,
                 BASE_UDP_PAYLOAD,
             )
             .unwrap();
@@ -4633,7 +5334,14 @@ mod tests {
         let mut last_packet = batch.plan.packet(batch.plan.len() - 1).unwrap().number;
         // Feed a successful one-packet prefix, then hold the socket unwritable.
         workers[0].submitted_batch(0, 0, &mut batch, 1);
-        assert_eq!(batch.frames[0].as_ref().unwrap().offset, 1164);
+        assert_eq!(
+            workers[0]
+                .frames
+                .frame(batch.frames[0].unwrap())
+                .unwrap()
+                .offset,
+            1164
+        );
         workers[0]
             .flush_batch(0, 0, &mut batch, Duration::from_millis(1))
             .unwrap();
@@ -4643,9 +5351,28 @@ mod tests {
             .unwrap();
         assert_eq!(batch.len, 63);
         assert!(batch.plan.is_empty());
-        assert_eq!(batch.frames[0].as_ref().unwrap().frame_id, (1 << 48) | 2);
-        assert_eq!(batch.frames[0].as_ref().unwrap().offset, 0);
-        assert_eq!(workers[0].sessions[0].tx_retained, 63);
+        assert_eq!(
+            workers[0]
+                .frames
+                .frame(batch.frames[0].unwrap())
+                .unwrap()
+                .id,
+            (1 << 48) | 2
+        );
+        assert_eq!(
+            workers[0]
+                .frames
+                .frame(batch.frames[0].unwrap())
+                .unwrap()
+                .offset,
+            0
+        );
+        let slabs = pack::BATCH_CAPACITY.div_ceil(RECEIVE_BYTES / MAX_FRAME_LEN);
+        assert_eq!(workers[0].sessions[0].tx_retained, 63 + slabs);
+        assert_eq!(
+            workers[0].sessions[0].tx_bytes,
+            pack::BATCH_CAPACITY * MAX_FRAME_LEN
+        );
         workers[0].sessions[0].batches[0] = Some(batch);
         workers[0].transmit[0].paths[0].lanes[0].blocked = false;
         let mut reassembly = reassembly::Lane::new(1, 9022).unwrap();
@@ -4700,24 +5427,33 @@ mod tests {
             buffer.tx_reserved = true;
             workers[0].sessions[0].tx_retained += 1;
             workers[0].sessions[0].tx_bytes += buffer.length;
-            workers[0].frame(buffer, Duration::ZERO).unwrap();
+            workers[0].input_frame(buffer, Duration::ZERO).unwrap();
         }
         workers[0].flush_frames(Duration::ZERO).unwrap();
         let mut batch = workers[0].sessions[0].batches[0].take().unwrap();
         batch
             .prepare(
                 workers[0].sessions[0].tx[0].as_mut().unwrap(),
+                &workers[0].frames,
                 BASE_UDP_PAYLOAD,
             )
             .unwrap();
         let tail = batch.plan.packet(2).unwrap();
         workers[0].submitted_batch(0, 0, &mut batch, 2);
         assert_eq!(batch.len, 1);
-        assert_eq!(batch.frames[0].as_ref().unwrap().offset, 794);
+        assert_eq!(
+            workers[0]
+                .frames
+                .frame(batch.frames[0].unwrap())
+                .unwrap()
+                .offset,
+            794
+        );
         assert!(batch.plan.is_empty());
         batch
             .prepare(
                 workers[0].sessions[0].tx[0].as_mut().unwrap(),
+                &workers[0].frames,
                 BASE_UDP_PAYLOAD,
             )
             .unwrap();
@@ -4726,7 +5462,14 @@ mod tests {
         let charged = workers[0].sessions[0].totals.tx_outer_bytes;
         workers[0].submitted_batch(0, 0, &mut batch, 0);
         assert!(batch.plan.is_empty());
-        assert_eq!(batch.frames[0].as_ref().unwrap().offset, 794);
+        assert_eq!(
+            workers[0]
+                .frames
+                .frame(batch.frames[0].unwrap())
+                .unwrap()
+                .offset,
+            794
+        );
         assert_eq!(workers[0].sessions[0].totals.tx_outer_bytes, charged);
         // A control transmission may overtake the discarded packet-number suffix.
         let control = workers[0].send_record(0, Record::Probe).unwrap().unwrap();
@@ -4784,7 +5527,7 @@ mod tests {
             buffer.tx_reserved = true;
             workers[origin].sessions[session].tx_retained += 1;
             workers[origin].sessions[session].tx_bytes += buffer.length;
-            workers[0].frame(buffer, Duration::ZERO).unwrap();
+            workers[0].input_frame(buffer, Duration::ZERO).unwrap();
         }
         workers[0].flush_frames(Duration::ZERO).unwrap();
         assert_eq!(workers[0].ready.len(), 2);
@@ -4793,7 +5536,11 @@ mod tests {
             local.batches[0]
                 .as_mut()
                 .unwrap()
-                .prepare(local.tx[0].as_mut().unwrap(), BASE_UDP_PAYLOAD)
+                .prepare(
+                    local.tx[0].as_mut().unwrap(),
+                    &workers[0].frames,
+                    BASE_UDP_PAYLOAD,
+                )
                 .unwrap();
             workers[0].command(
                 session,

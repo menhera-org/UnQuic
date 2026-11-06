@@ -321,7 +321,11 @@ per-origin transmit reservations enforce the same bounds through delayed returns
 The multi-record encoder and socket slice-list API are integrated into workers,
 with borrowed payloads, bounded descriptors and round-robin batch service.
 Batch metadata uses indices/ranges so original buffers can remain owned across
-partial sends. Tests cover generated sequences, reverse/duplicate delivery,
+partial sends. UDP expansion now borrows source payloads and rewrites compact
+headers. Ordinary frames share bounded payload slabs; dead ranges stay charged
+until their slab can recycle. Fixed frame views replace one 64-KiB buffer per
+expanded frame. Static worker quotas still need shared credits for skewed,
+ACK-retained traffic; fully submitted views are currently released. Tests cover generated sequences, reverse/duplicate delivery,
 small-frame bursts, releasing early slots, individual expiry and quiescence with
 full return queues. The ten-second bidirectional TAP storm verifies integrity,
 duplicate suppression, observed packing and zero allocations/deallocations while
@@ -346,9 +350,11 @@ keep one lane. The expanded benchmark history measures this reordering without
 changing transport storage or admission. See BENCH.md for UDP/TCP comparisons.
 The November 6 cookie controls reduce reordering with aligned placement but do
 not establish a throughput gain. A separate full-batch queue rotation bug is
-fixed: newer frames cannot overtake a lane's oldest deferred frame. Tests cover
-expiry, other-session progress and connection replacement without expanding
-the scan budget. Encapsulated IPv4/IPv6/Ethernet flow hashing now includes one
+fixed with per-lane pending FIFOs. The earlier deferred-frame marker missed
+new arrivals between bounded scans. A regression reproduces that inversion;
+tests now cover interleaved arrivals, expiry, other-session progress and
+connection replacement. Admission/expiry remains bounded to 64 pending
+frames per turn, with round-robin service between ready lanes. Encapsulated IPv4/IPv6/Ethernet flow hashing now includes one
 inner header while retaining outer identity and strict pinning. Tagged SRv6
 release measurements verify that this spreads work and improves goodput;
 remaining losses and the throughput gates are still open. BENCH.md separates
@@ -429,7 +435,9 @@ maximum packet numbers, and reset/retirement. Pure sender-history validation now
 distinguishes reservations, successful submissions and canceled holes, validates
 whole ACKs before mutation, and preserves unresolved charges under window pressure.
 Tests cover late ACKs, feedback-only eviction, ring wrap, maximum identities and
-allocation-free transitions. Worker integration and feedback routing remain
+allocation-free transitions. Sender entries now use 16 bytes each, retaining full
+`Duration` range and nanosecond precision; 64 histories save 32 MiB compared with
+the previous 24-byte entries. Worker integration and feedback routing remain
 pending, so the runtime still emits no packet
 ACKs. Per-lane MTU probing is connected to the workers. Recovery and congestion
 control remain pending; README.md documents probe feedback and send-error handling.
@@ -464,6 +472,8 @@ still need integration; this does not complete the loss-detection step.
   Deterministic tests cover every supported MTU, stale/forged replies, loss and
   backpressure. Runtime scheduling now visits at most 64 owned sockets per pass,
   routes feedback to lane owners and shares socket state across sessions.
+  Probe-connection replacement now rearms confirmation without reopening a
+  failed baseline or resetting an unchanged shared-session probe history.
   Static probe slots are temporary until the shared control pacer is available.
   Keep the hot path allocation-free. Use padded
   PROBE and matching PROBE_REPLY, with `EMSGSIZE` and validated `IPV6_RECVERR`
@@ -500,6 +510,11 @@ still need integration; this does not complete the loss-detection step.
 
 ## Stage 4: composition and robustness
 
+- Validate Ubuntu 26.04/Linux 7.0 as a deployment target while keeping support
+  distribution- and init-system-independent. Check version-sensitive TAP,
+  io_uring, offload, steering and namespace behavior on the deployed kernel.
+  Record the tested kernel matrix and exercise unavailable-feature fallbacks;
+  Linux 6.8 source citations and tests alone do not establish compatibility.
 - Implement section 11's TAP lifetime contract. Keep published devices alive
   through worker/socket failures and shutdown unless removal was explicitly
   requested. Define versioned descriptor adoption and re-exec handover with no

@@ -70,9 +70,12 @@ direction. `SEGMENTS` defaults to 64. The two receivers run two seconds longer
 than the senders to include the tail. `sent.*` snapshots follow sender exit;
 `after.*` snapshots follow receiver exit. Use the former for load-interval
 CPU and the latter for final drop attribution. Before/sent snapshots also
-signal the receivers. A multi-rate invocation creates fresh daemons and
-private namespaces for each point, preventing queued packets from leaking
-into later runs. A failed child fails the run.
+signal the receivers. A multi-rate invocation keeps the daemons, sockets,
+TAPs and namespaces alive across all points, so overload and recovery exercise
+the same transport state. Load processes restart with distinct run IDs;
+receivers reject and count late packets from earlier points. Report those
+`wrong_run` counters rather than crediting them as delivery. A failed child
+fails the run.
 
 `VLAN_DEPTH=0|1|2` selects untagged, 802.1Q or QinQ traffic. Frame sizes
 include those tags. `SRV6=1` adds IPv6-in-IPv6 encapsulation with a one-segment

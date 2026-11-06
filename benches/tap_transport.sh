@@ -22,17 +22,6 @@ case "${UDP_LOAD:-}" in ''|/*) ;; *) echo "UDP_LOAD must be an absolute path" >&
 if [ -n "${UDP_LOAD:-}" ]; then
     [ "$2" -ge "$((58 + 4 * ${VLAN_DEPTH:-0} + 84 * ${SRV6:-0}))" ] || { echo "UDP_LOAD needs 16 payload bytes after headers" >&2; exit 2; }
 fi
-case "${BITRATE:-0}" in
-    *[[:space:]]*)
-        mkdir "$5"
-        index=0
-        for rate in ${BITRATE:-0}; do
-            BITRATE=$rate sh "$0" "$1" "$2" "$3" "$4" "$5/$index"
-            index=$((index + 1))
-        done
-        exit 0
-        ;;
-esac
 mkdir "$5"
 # A private mount namespace keeps ip-netns bind mounts out of the caller.
 exec unshare -m -n --propagation private sh -s -- "$@" <<'BENCH'
@@ -201,7 +190,11 @@ index=0
 for rate in ${BITRATE:-0}; do
     case "$rate" in *[!0-9.KMG]*|'') echo "invalid BITRATE: $rate" >&2; exit 2;; esac
     case "${BITRATE:-0}" in
-        *[[:space:]]*) out=$base/$index; mkdir "$out";;
+        *[[:space:]]*)
+            out=$base/$index
+            mkdir "$out"
+            cp "$base/clock-ticks" "$base/kernel" "$base/cpu-model" "$out/"
+            ;;
     esac
     echo "$rate" > "$out/bitrate"
     if [ -n "${UDP_LOAD:-}" ]; then

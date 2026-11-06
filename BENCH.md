@@ -1,57 +1,252 @@
 # Release transport overload investigation
 
-The original receive-admission collapse and a later TAP readiness busy loop
-are fixed. Bounded UDP super-frame input and conditional worker-local lanes
-deliver 16.57 / 15.60 Gbit/s paced and 16.50 / 16.45 unlimited in the latest
-60-second eight-worker pair, using 500-entry test TAP queues. A preceding
-20-second pair reached 17.95 / 17.07 unlimited. The longer run still declines
-0.45% in one direction; earlier short repeats declined 2–3%, and 10,000-entry
-queues produced larger declines. Overload stability remains unresolved.
+The original receive-admission collapse and TAP readiness busy loop are fixed.
+Compact transmit storage now keeps payloads in bounded source buffers and
+slabs, with per-lane FIFOs and zero-copy ownership exchange. A rejected
+global-queue prototype exposed a separate severe QinQ collapse; the FIFO
+regression reproduces its frame-order inversion and verifies the fix.
 
-These sweeps do not establish a plateau for every workload or the
-theoretical CPU ceiling. Neither the local **20 Gbit/s in each direction**
-gate nor the real **5 Gbit/s under loss** gate has passed.
-Split-pool, deadline-cache and first-reader lane-association trials were rejected
-and reverted after measurements.
+The latest 60-second persistent QinQ sweep delivers 16.68 / 14.43 Gbit/s
+at 21 Gbit/s requested each way, then 20.63 / 13.47 unlimited. Reverse
+goodput still falls 6.7% under excess load and recovers when the offered rate
+returns to 16 Gbit/s. Single-tag and SRv6 results differ; no workload proves
+a universal plateau or the theoretical CPU ceiling.
 
-This report separates that remaining decline from the earlier near-total
-collapse. Recovery and congestion control remain unfinished; worker PMTU
-discovery is now implemented but has not been through a release rate sweep.
-These features do not explain away a scheduling or admission failure.
+Neither the local **20 Gbit/s in each direction** gate nor the real
+**5 Gbit/s under loss** gate has passed. Recovery and congestion control
+remain unfinished. PMTU discovery is active in the latest rate sweeps and
+passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
+Missing recovery or congestion control does not explain away the remaining
+scheduling and admission problems.
 
 ## Current performance gaps
 
-Status after the TAP readiness fix, per-peer payload limit, local TAP USO
-bounded read rings, partial-checksum completion, UDP super-frame input and
-conditional worker-local lanes for unfragmented UDP.
-The split-pool, deadline-cache and lane-association experiments below are not
-in the runtime.
-The latest segmented-send results use 12 physical cores with four workers per
-daemon, or 20 with eight workers, and the capped socket-buffer fallback below.
-L→R / R→L pairs describe simultaneous traffic, not separate one-way peaks.
+The latest storage/batching results below use eight workers per daemon,
+16 flows per direction, 500-entry TAP queues, and a 1452-byte outer UDP cap.
+They keep active discovery enabled. L→R / R→L pairs are simultaneous.
+The JSON records actual offered load, CPU and counters for each observation;
+earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | The UDP-only local-lane build delivers 16.50 / 16.45 Gbit/s unlimited over 60 seconds with eight workers and 500-entry test TAP queues, from 28.39 / 27.71 Gbit/s offered; a prior 20-second pair reached 17.95 / 17.07 | Still about 1.21× / 1.22× short in the longer pair. TCP super-frame input remains unfinished. |
-| Goodput must plateau under excess traffic | The 60-second UDP-only pair declines 0.45% L→R under unlimited load | Shorter test queues reduce the long tail but do not establish a plateau: earlier left-side repeats lose 2–3%. With 10,000-entry queues, one pair loses 8.3%. Repeated longer runs, tagged/mixed traffic and more flows/sessions remain unverified. |
-| Small-frame overload must remain efficient | The UDP-only local-lane build delivers 6.05M / 6.08M 64-byte frames/s with eight workers | The local-lane paced/unlimited sweep improves under overload, with high loss. Mixed and non-coalescible traffic still need coverage. |
-| VLAN-heavy deployment | Checked output coalescing now handles one or two tags. Single-tag delivery reaches 16.00 / 15.53 Gbit/s paced; QinQ reaches 10.49 / 9.91 with strict lane hashing | Tagged overload still declines. QinQ input concentrates on one reader; full-lane hashing helps but does not remove that bottleneck. These short runs do not pass the throughput gate. |
-| Establish the CPU-limited forwarding ceiling | Worker/process CPU and per-core ticks are recorded; a sampled profile identifies TAP I/O and polling costs | No theoretical or measured zero-loss CPU ceiling has been established. Socket placement, scheduling, cross-worker work and kernel costs still need controlled attribution. |
-| Prevent split-count amplification of outer loss | Planned GSO batches end at frame boundaries, and pressure tests preserve useful tails | Runtime bounded selective repair is not implemented. Independent packet loss can still lose a split frame; aggregate-boundary alignment is not a substitute for repair. |
-| Use larger confirmed path MTUs | Workers now discover sizes up to 8952 payload bytes. Tests cover exact lane feedback, ICMPv6 PTB and silent size filters, shared sessions, reductions, recovery and retained frame ranges | No throughput sweep of active discovery yet. Older sweeps used asserted limits and do not measure this implementation. Routed-path validation and DATA-quoted PTB processing remain open. The NTT NGN ceiling is 1500 outer bytes; other paths are capped at 9000. |
-| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These results are unimpeded local loopback tests | No real-path result or independent/burst loss sweep verifies this target. Recovery, congestion control and pacing also remain unfinished. |
+| At least 20 Gbit/s each way at inner MTU 1500 | QinQ: 16.68 / 14.43 Gbit/s paced, 20.63 / 13.47 unlimited. Single tag: 17.10 / 15.27 paced, 18.26 / 16.49 unlimited | Neither workload passes both directions. Paced missing fractions remain 18–31%, far above the under-1% gate. Five successful repeats are absent. |
+| Goodput must plateau under excess traffic | Persistent QinQ reverse delivery falls 6.7%; returning to 16G restores earlier delivery without restarting transport | The severe prototype collapse is fixed, but the remaining decline is unresolved. Bounded foreign-source batching and larger receive groups reduce syscalls; reader/receive scheduling still needs attribution. |
+| Small-frame overload must remain efficient | An earlier local-lane build delivered 6.05M / 6.08M 64-byte frames/s | The compact-storage build needs the same small-frame matrix, mixed traffic and non-coalescible frames. |
+| VLAN-heavy deployment | Single- and double-tag output coalescing works. Current QinQ reports zero reordering; single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
+| Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
+| Prevent split-count amplification of outer loss | Frame-aligned GSO, receive pressure drain/retry and compact borrowed payload storage have regression coverage | Runtime bounded selective repair is not implemented. Split frames can still be lost after one outer-packet loss. |
+| Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Throughput sweeps currently cap outer packets at 1500 bytes. Larger-MTU throughput, real routed-path validation and DATA-quoted PTB processing remain open. |
+| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These throughput sweeps are local container tests without injected impairment | No real-path or independent/burst-loss result verifies the target. Recovery, congestion control and pacing remain unfinished. |
 
-Loss under unlimited load is still high: the latest UDP-only eight-worker
-60-second MTU-1500 point misses 41.71% / 40.45% of offered frames despite zero
-admission pressure and worker queue drops. TAP ingress drops, outer socket overflows
-and inner UDP receive-buffer errors are recorded. Their different units prevent
-an exact frame-loss decomposition.
+Unlimited loss remains high. TAP ingress drops, bounded worker queue drops,
+outer socket overflows, expired frames and inner UDP receive-buffer errors
+are reported separately. Their units differ: a dropped source SKB can contain
+many frames, so these counters cannot be summed into an exact frame-loss total.
 
-Earlier single-socket runs still declined. Calibrated profiling then found
-TAP wakeups with no available transmit buffer; the final follow-up below verifies
-their removal. Congestion control, recovery and performance validation of PMTU
-remain separate production-performance gaps. Stage 5 must revisit the original
-targets after work on later stages; no performance gate is waived.
+Stage 5 must return to the original performance targets after work on later
+stages. No performance gate is waived.
+
+## Compact transmit storage and source ownership (November 6)
+
+The next experiment replaces one 64-KiB buffer per expanded frame with
+bounded frame views. UDP segments borrow their source payload and retain
+small rewritten headers; ordinary frames share compact slabs. The original
+global pending queue was unsuitable for this layout: it let new arrivals
+overtake an older deferred frame and repeatedly scanned queued frames.
+A regression reproduces the inversion. Per-lane FIFOs fix it while keeping
+64-frame admission/expiry budgets and round-robin lane service.
+
+The storage-only prototype is rejected. Its QinQ delivery fell to about
+3.6–3.9 Gbit/s in one direction above the 8-Gbit/s point. FIFO service
+removes that severe collapse and measured QinQ reordering, but does not
+by itself establish a throughput improvement over the previous layout.
+
+A sampled FIFO profile then found 490–626 queued frame views on two owners
+while those owners still averaged 121–122 free physical buffers. Their
+shared TAP reader averaged only 12.7 free buffers: retained foreign sources
+still consumed the reader's pool. The deadline/arming block consumed about
+2.4–2.9% of CPU on those two owners; other corrected samples were within
+clock-noise range. This supports fixing source ownership before adding a
+deadline cache.
+
+The ownership-exchange candidate swaps an empty owner buffer for the
+reader's retained source, preserving the original payload address. Both
+sides keep their fixed pool entitlement; delayed returns retain their
+credits. Insufficient owner capacity rejects the source and increments
+`queue_drops`. No buffer pool or deadline is enlarged.
+
+All rows below are simultaneous 60-second release tests with eight workers
+per daemon, 16 flows each way and 500-entry TAP queues. The outer UDP ceiling
+is 1452 bytes; discovery remains enabled. QinQ and single-tag UDP use
+44-segment sources. SRv6 uses tagged, separately encapsulated IPv6 packets.
+Actual offered rate, CPU, per-worker counters and binary hashes are in
+[tap-transmit-storage.json](benches/tap-transmit-storage.json).
+Fresh process/socket placement can differ between observations; these
+single observations are not sufficient to attribute every throughput change.
+
+| Observation | Actual offered Gbit/s | Delivered Gbit/s | Missing % | Daemon CPU % | Reordered % |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| storage-base-qinq-0 | 45.78 / 42.40 | 12.90 / 14.03 | 71.71 / 66.80 | 477.7 / 485.0 | 10.007 / 0.278 |
+| storage-qinq-0 | 7.96 / 7.94 | 7.92 / 7.85 | 0.23 / 0.82 | 267.4 / 246.0 | 1.014 / 0.006 |
+| storage-qinq-1 | 15.91 / 15.91 | 3.85 / 15.13 | 75.72 / 4.57 | 349.6 / 296.6 | 12.505 / 0.458 |
+| storage-qinq-2 | 20.91 / 20.91 | 3.64 / 15.81 | 82.50 / 24.14 | 366.0 / 363.5 | 12.744 / 15.470 |
+| storage-qinq-3 | 57.94 / 42.72 | 3.91 / 16.46 | 93.22 / 61.34 | 375.3 / 375.5 | 12.673 / 12.782 |
+| fifo-storage-qinq-0 | 7.94 / 7.91 | 7.44 / 6.74 | 5.31 / 13.88 | 247.3 / 229.1 | 0.000 / 0.000 |
+| fifo-storage-qinq-1 | 15.89 / 15.91 | 12.30 / 13.47 | 22.25 / 14.98 | 454.9 / 440.2 | 0.000 / 0.000 |
+| fifo-storage-qinq-2 | 20.83 / 20.75 | 11.83 / 13.88 | 42.93 / 32.82 | 450.6 / 468.5 | 0.000 / 0.000 |
+| fifo-storage-qinq-3 | 46.80 / 44.15 | 12.25 / 13.94 | 73.72 / 68.30 | 457.5 / 479.1 | 0.000 / 0.000 |
+| exchange-qinq-0 | 7.99 / 7.98 | 7.95 / 7.89 | 0.11 / 0.83 | 258.0 / 246.3 | 0.000 / 0.000 |
+| exchange-qinq-1 | 15.94 / 15.94 | 14.15 / 13.45 | 10.92 / 15.34 | 474.3 / 475.5 | 0.000 / 0.000 |
+| exchange-qinq-2 | 20.79 / 20.82 | 16.30 / 13.33 | 21.32 / 35.75 | 519.5 / 521.7 | 0.000 / 0.000 |
+| exchange-qinq-3 | 35.53 / 46.73 | 18.60 / 11.96 | 47.31 / 74.25 | 545.6 / 528.3 | 0.000 / 0.000 |
+| storage-base-tag-0 | 20.79 / 20.80 | 16.29 / 14.70 | 21.34 / 29.12 | 638.6 / 639.6 | 56.468 / 45.115 |
+| storage-base-tag-1 | 29.33 / 29.07 | 15.51 / 15.57 | 46.86 / 46.20 | 682.6 / 693.4 | 47.843 / 43.516 |
+| fifo-storage-tag-0 | 20.79 / 20.83 | 16.35 / 15.37 | 21.04 / 25.96 | 593.2 / 596.1 | 46.473 / 41.123 |
+| fifo-storage-tag-1 | 30.76 / 30.50 | 16.69 / 15.63 | 45.37 / 48.41 | 695.5 / 684.9 | 38.668 / 35.897 |
+| exchange-tag-0 | 20.85 / 20.86 | 16.58 / 15.48 | 20.17 / 25.50 | 596.7 / 599.7 | 47.262 / 40.126 |
+| exchange-tag-1 | 33.59 / 35.41 | 16.38 / 14.02 | 51.03 / 60.25 | 626.8 / 633.0 | 33.772 / 37.835 |
+| storage-base-srv6-0 | 4.98 / 4.98 | 4.56 / 4.90 | 8.13 / 1.23 | 430.8 / 403.0 | 0.323 / 0.206 |
+| storage-base-srv6-1 | 7.06 / 6.93 | 5.71 / 5.89 | 18.82 / 14.73 | 525.3 / 484.4 | 0.488 / 3.184 |
+| fifo-storage-srv6-0 | 4.98 / 4.98 | 4.40 / 4.89 | 11.28 / 1.29 | 451.4 / 411.0 | 0.000 / 0.000 |
+| fifo-storage-srv6-1 | 6.95 / 7.13 | 5.32 / 6.01 | 23.04 / 15.28 | 572.2 / 514.0 | 0.000 / 0.001 |
+
+The first exchange sweep improves QinQ aggregate delivery but still loses
+reverse-direction goodput under unlimited load: 13.33 → 11.96 Gbit/s.
+Single-tag reordering remains substantial. Neither result meets the gate.
+
+Drop attribution for the exchange QinQ points follows. Values are left /
+right daemon counters, not direction-paired frame losses. TAP and socket
+drops count SKBs; source queue drops can discard multiple frames. Do not
+sum these counters as though their units matched.
+
+| Point | TAP TX drops | Worker queue drops | Admission pressure | Expired frames | Socket overflow | Inner UDP receive errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| exchange-qinq-2 | 12530 / 510652 | 464953 / 995 | 0 / 0 | 0 / 0 | 677179 / 43382 | 5881 / 26349 |
+| exchange-qinq-3 | 1190358 / 3806425 | 717107 / 6100 | 0 / 0 | 0 / 16820 | 455456 / 49930 | 10410 / 23769 |
+
+The right QinQ reader reads only one GSO source per worker turn. As reverse
+receive delivery rises from 9.94 to 12.15 GB between those points, its source
+reads fall from 1.900 to 1.605 million. The left reader handles almost no
+receive delivery and grows from 2.395 to 2.924 million reads. This is a
+verified scheduling asymmetry; its contribution to the goodput decline
+requires the bounded source-batching comparison below.
+
+The same validation exposed an independent reconnect bug: a successful
+new handshake reused a failed PMTU path whose next probe was still in the
+future. Frames expired before baseline confirmation resumed. Changing the
+selected probe connection now invalidates old proofs and makes a fresh probe
+due, preserving a failed path's zero DATA limit until confirmation succeeds.
+Unchanged shared-session probes retain their history. The global probe
+budget still applies; reconnect does not guarantee immediate confirmation
+of every lane.
+
+Correctness checks pass on Linux 6.8.0-147-generic and Ubuntu 26.04.1 /
+Linux 7.0.0-43-generic: kernel unit tests, runtime forwarding/reconnect,
+external TAP renames and namespace moves. Storm checks observe no hot-path
+allocations/deallocations, corruption or duplicates. They report bounded
+queue drops under overload instead of assuming the queues cannot fill.
+Both kernels also pass the full 650-second routed MTU sequence, including
+the real 600-second upward retry, without captured outer fragments or capture
+drops. Release/default tests, Clippy with warnings denied, Rust 1.89 checks
+and formatting pass. A short-write regression now tests the common result validator directly;
+the prior eventfd fixture returned a different error on Linux 7.0.
+No kernel or distribution is treated as the sole platform contract.
+
+### Bounded source batches and persistent overload
+
+Allowing up to four GSO source reads per batch reduced the busy QinQ
+reader's read syscalls from 1.605 million to 0.434 million in the unlimited
+observations. Delivery reached 20.34 / 12.20 Gbit/s, still below the
+bidirectional requirement. The narrower owner-batch variant restores a
+one-source read limit whenever an input needs expansion on the reader;
+foreign inputs can grow the next batch from one to two to four sources.
+Expansion still stops after 64 frames or 64 KiB.
+
+| Variant / workload / load | Actual offered Gbit/s | Delivered Gbit/s | Missing % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| four-source / QinQ / 21G | 20.85 / 20.84 | 16.31 / 13.83 | 21.47 / 33.40 | 532.5 / 556.7 |
+| four-source / QinQ / unlimited | 31.47 / 43.78 | 20.34 / 12.20 | 35.14 / 72.03 | 579.3 / 567.2 |
+| four-source / single tag / 21G | 20.69 / 20.72 | 14.95 / 14.19 | 27.47 / 31.29 | 570.8 / 586.7 |
+| four-source / single tag / unlimited | 29.94 / 30.46 | 15.32 / 15.57 | 48.61 / 48.67 | 678.4 / 694.6 |
+| owner-batch / QinQ / 21G | 20.85 / 20.87 | 16.27 / 13.64 | 21.70 / 34.39 | 526.8 / 550.1 |
+| owner-batch / QinQ / unlimited | 32.53 / 43.40 | 20.05 / 12.07 | 38.14 / 72.09 | 563.3 / 558.0 |
+| owner-batch / single tag / 21G | 20.88 / 20.92 | 14.21 / 12.72 | 31.68 / 38.98 | 508.6 / 492.7 |
+| owner-batch / single tag / unlimited | 32.04 / 30.88 | 17.52 / 15.41 | 45.08 / 49.91 | 684.0 / 706.1 |
+| owner-batch / SRv6 / 5G | 4.98 / 4.98 | 4.35 / 4.85 | 12.19 / 2.25 | 442.5 / 412.8 |
+| owner-batch / SRv6 / unlimited | 6.74 / 6.69 | 5.06 / 5.96 | 24.69 / 10.68 | 572.4 / 510.3 |
+
+The single-tag results are mixed, with substantial reordering; SRv6 shows
+no general throughput improvement from compact storage. Two additional
+four-source SRv6 observations used one generator segment per send. They
+saturated the generators at 1.86–1.96 Gbit/s offered and delivered
+1.85–1.95 Gbit/s. They are retained in the JSON as generator-limited controls,
+not compared with the 44-segment transport ceilings.
+
+The earlier multi-rate wrapper restarted the daemons at every point.
+The harness now uses its existing inner rate loop, retaining the same TAPs,
+sockets, daemons and namespaces. PID/start-time checks confirm this across
+points. Separate generator run IDs reject late traffic from earlier points.
+This removes transport restart as a confounder in overload/recovery sweeps.
+
+The owner-batch persistent QinQ sweep is:
+
+| Requested load | Actual offered Gbit/s | Delivered Gbit/s | Missing % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| 16G | 15.94 / 15.95 | 14.17 / 13.34 | 10.78 / 16.10 | 477.2 / 469.2 |
+| 21G | 20.90 / 20.91 | 16.61 / 13.78 | 20.27 / 33.90 | 532.9 / 555.9 |
+| unlimited | 31.49 / 42.02 | 20.51 / 12.75 | 34.64 / 69.55 | 573.9 / 570.6 |
+| 16G recovery | 15.93 / 15.95 | 14.09 / 13.36 | 11.25 / 15.98 | 466.4 / 466.3 |
+
+Every point reports zero reordering. The reverse direction still declines
+7.5% between 21G and unlimited load while forward delivery rises. Returning
+to 16G restores the earlier goodput: this sweep shows recovery, not an
+accumulating poisoned state. Shared reader/receive work remains a measured
+asymmetry; its full contribution to the decline and the CPU ceiling are
+not yet isolated.
+
+### Receive delivery batching
+
+The 16-completion intermediate drain fragmented receive-side USO groups.
+Raising it to 32, while retaining the same 64-record/64-datagram/64-KiB
+receive budgets and pressure drain/retry, increased the mean unlimited
+QinQ group from 12.13 / 11.90 to 18.52 / 17.63 frames. TAP write calls fell
+from 5.49 / 8.97 million to 3.78 / 6.04 million. These are separate
+persistent sweeps, so socket placement can still affect their comparison.
+
+| Workload / requested load | Actual offered Gbit/s | Delivered Gbit/s | Missing % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| qinq / 16G | 15.96 / 15.96 | 14.43 / 13.88 | 9.25 / 12.70 | 472.5 / 463.0 |
+| qinq / 21G | 20.83 / 20.89 | 16.68 / 14.43 | 19.65 / 30.70 | 529.2 / 548.3 |
+| qinq / unlimited | 33.57 / 41.67 | 20.63 / 13.46 | 38.36 / 67.58 | 575.0 / 577.2 |
+| qinq / 16G recovery | 15.95 / 15.96 | 14.39 / 13.73 | 9.36 / 13.61 | 463.4 / 460.8 |
+| tag / 21G | 20.93 / 20.94 | 17.10 / 15.27 | 18.02 / 26.83 | 573.2 / 570.6 |
+| tag / unlimited | 34.45 / 34.38 | 18.26 / 16.49 | 46.75 / 51.83 | 706.2 / 720.1 |
+| srv6 / 5G | 4.98 / 4.99 | 4.56 / 4.93 | 8.21 / 0.74 | 457.1 / 419.9 |
+| srv6 / unlimited | 6.87 / 6.71 | 5.24 / 5.98 | 23.46 / 10.67 | 587.6 / 516.1 |
+
+The reverse QinQ direction still loses 6.7% between 21G and unlimited,
+then recovers at 16G. Single-tag traffic improves at unlimited load but
+reports 32–36% reordering. SRv6 remains about 5.24 / 5.98 Gbit/s unlimited.
+Reducing writes helps this workload; it does not establish a CPU ceiling
+or satisfy the throughput, loss or overload-stability gates.
+
+Removing the intermediate drain entirely was also tested and reverted.
+It kept the same receive budgets, pressure drain/retry and final TAP-interest
+refresh after transmit work, and passed all 28 kernel tests. Its persistent
+QinQ sweep was worse:
+
+| Requested load | Actual offered Gbit/s | Delivered Gbit/s | Missing % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| 16G | 15.97 / 15.95 | 14.07 / 13.51 | 11.52 / 14.99 | 467.9 / 459.8 |
+| 21G | 20.87 / 20.92 | 16.07 / 13.17 | 22.76 / 36.80 | 525.9 / 523.7 |
+| unlimited | 28.26 / 39.73 | 19.14 / 12.25 | 32.01 / 69.05 | 560.4 / 550.4 |
+| 16G recovery | 15.89 / 15.90 | 14.25 / 13.44 | 10.00 / 15.21 | 473.3 / 468.9 |
+
+The retained implementation uses the 32-frame intermediate threshold.
+Final TAP delivery and readability updates remain after transmit processing:
+transmission can release credits after an earlier update disabled TAP reads.
+Moving that update before transmit could leave readable input disabled while
+the worker sleeps.
 
 ## Local acceptance gate
 

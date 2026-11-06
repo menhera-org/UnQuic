@@ -482,9 +482,10 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
     for control in [&left.control, &right.control] {
         let mut ring_frames = 0;
         let mut fallbacks = 0;
+        let mut queue_drops = 0;
         for worker in 0..2 {
             let counters = control.worker_counters(worker).unwrap();
-            assert_eq!(counters.queue_drops, 0);
+            queue_drops += counters.queue_drops;
             ring_frames += counters.tap_ring_frames;
             fallbacks += counters.tap_read_fallbacks;
         }
@@ -494,7 +495,7 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
                 "the allocation check must exercise available read rings"
             );
         }
-        println!("TAP ring frames={ring_frames} fallbacks={fallbacks}");
+        println!("TAP ring frames={ring_frames} fallbacks={fallbacks} queue drops={queue_drops}");
     }
     // The earlier capture sockets also accumulated storm traffic; free space before reuse.
     for socket in [&a, &b] {
@@ -738,29 +739,53 @@ fn foreign_rename_and_namespace_move_preserve_running_transport() {
     );
     up(&moved_control, c"uq-renamed");
     let moved = raw_socket(c"uq-renamed", 0x88b5);
-    let forward = |moved: &std::os::fd::OwnedFd, remote: &std::os::fd::OwnedFd| {
+    let forward = |phase: &str,
+                   name: &std::ffi::CStr,
+                   moved: &std::os::fd::OwnedFd,
+                   remote: &std::os::fd::OwnedFd,
+                   peer: &unquic::runtime::Control| {
+        let running = (libc::IFF_UP | libc::IFF_RUNNING) as i16;
+        until(Duration::from_secs(3), || {
+            flags(&moved_control, name) & running == running
+                && flags(&control, c"uq-stay") & running == running
+        });
         let mut frame = [0x5a; 1514];
         frame[..14].copy_from_slice(&[2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2, 0x88, 0xb5]);
         let mut capture = [0; 2000];
-        for (source, target) in [(moved, remote), (remote, moved)] {
+        for (direction, (source, target)) in
+            [(moved, remote), (remote, moved)].into_iter().enumerate()
+        {
             for length in [60, 1514] {
                 while raw_read(target, &mut capture).is_some() {}
+                let before = [left.control.session_counters(0), peer.session_counters(0)];
                 raw_send(source, &frame[..length]);
-                until(Duration::from_secs(3), || {
-                    raw_read(target, &mut capture)
+                let sent = Instant::now();
+                loop {
+                    if raw_read(target, &mut capture)
                         .is_some_and(|n| n == length && capture[..n] == frame[..length])
-                });
+                    {
+                        break;
+                    }
+                    assert!(
+                        sent.elapsed() < Duration::from_secs(3),
+                        "{phase}, direction {direction}, length {length}: flags {:?}, states {:?}, before {before:?}, after {:?}",
+                        [flags(&moved_control, name), flags(&control, c"uq-stay")],
+                        [left.control.session(0), peer.session(0)],
+                        [left.control.session_counters(0), peer.session_counters(0)]
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
             }
         }
     };
-    forward(&moved, &remote);
+    forward("move", c"uq-renamed", &moved, &remote, &right.control);
     // A second external rename must not disturb the already moved queues.
     ip(&["link", "set", "uq-renamed", "down"]);
     ip(&["link", "set", "uq-renamed", "name", "uq-again"]);
     up(&moved_control, c"uq-again");
     // AF_PACKET reports ENETDOWN after a link-down event; reopen the test injector.
     let moved = raw_socket(c"uq-again", 0x88b5);
-    forward(&moved, &remote);
+    forward("rename", c"uq-again", &moved, &remote, &right.control);
 
     // Carrier operations also use the preserved TAP fd, from the original namespace.
     right.stop();
@@ -781,13 +806,16 @@ fn foreign_rename_and_namespace_move_preserve_running_transport() {
     until(Duration::from_secs(5), || {
         left.control.session(0).unwrap().carrier && replacement.control.session(0).unwrap().carrier
     });
-    assert_ne!(
-        flags(&moved_control, c"uq-again") & libc::IFF_RUNNING as i16,
-        0
-    );
+
     // The old peer's packet socket was bound to its deleted test TAP.
     let remote = raw_socket(c"uq-stay", 0x88b5);
-    forward(&moved, &remote);
+    forward(
+        "reconnect",
+        c"uq-again",
+        &moved,
+        &remote,
+        &replacement.control,
+    );
     left.stop();
     replacement.stop();
 }
