@@ -1,4 +1,7 @@
-//! Pure receive-side ACK scheduling; storage admission belongs to reassembly.
+//! ACK scheduling and bounded sender validation; storage admission belongs to reassembly.
+
+mod sent;
+pub use sent::{AckProgress, Acknowledged, History, HistoryError, SENT_CAPACITY, SentPacket};
 
 use std::time::Duration;
 

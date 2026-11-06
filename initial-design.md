@@ -241,6 +241,14 @@ Do not deduplicate using only a time-limited completion cache. Window advancemen
 
 Initial resource limits are 8192 retained transmit frames and 8192 receive frames (incomplete plus queued complete) per session, with 64 MiB of payload storage per direction and at most 64 active lanes per direction. The daemon's default total transport-memory ceiling is 256 MiB, including metadata, histories, and queues; caller-provided ceilings may raise or lower it. Refuse reservations beyond either limit. The sender also keeps at most 65536 sent-packet entries per lane; if advancing would overwrite an unresolved entry, apply backpressure rather than forget its inflight charge. On startup validate fixed allocations against the ceiling. Unknown cookies allocate nothing; pending handshakes, lane tables and worker queues are bounded separately. These are initial implementation limits, not performance claims.
 
+Successful ACK-only and PROBE_REPLY transmissions carry no ordinary congestion
+charge. Retain their submission identity and timestamp while inside sender
+history, but allow them to age out without an ACK; otherwise one-way feedback
+could fill the ring before an ACK-eliciting probe is sent. This does not mark
+them acknowledged. Pending reservations and unresolved charged transmissions
+still block eviction. Canceled reservations remain known-unsent holes until
+they fall below the history floor. Payload expiry alone never resolves a charge.
+
 ## 8.3 Timers and initial ordering policy
 
 Use RFC 9002 sections 5 and 6 for RTT estimation, per-lane packet/time loss detection, and probe timeouts, with these transport parameters: initial RTT 333 ms, maximum ACK delay 1 ms, timer granularity 1 ms for loss detection, packet threshold 3, and time threshold 9/8. Pacing has its own finer schedule. ACK delay cannot reduce a sample below observed minimum RTT. Apply packet thresholds only within one lane, never across unrelated packet-number spaces. [S9]
@@ -588,8 +596,10 @@ A ten-second bidirectional TAP storm checks observed packing, integrity, duplica
 suppression and zero allocations/deallocations, while reporting drops. BENCH.md
 records the release throughput/CPU baseline; overload loss is severe and the
 throughput gate has not passed. Receive-side ACK scheduling/range construction
-is implemented over the existing bitmap; sender-history validation and runtime
-ACK routing are not yet connected. Pure RTT, loss-deadline, PTO-period and frame
+is implemented over the existing bitmap. Pure sender history now validates whole
+ACKs against actual submissions, preserves unresolved charges and rejects known
+unsent holes. Worker history integration and ACK routing are not yet connected.
+Pure RTT, loss-deadline, PTO-period and frame
 lifetime calculations are implemented; worker loss recovery and congestion
 control remain unfinished. Per-lane MTU discovery now starts DATA at 1232 bytes
 and probes up to the configured ceiling, defaulting to 8952 bytes. Limits and

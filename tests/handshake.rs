@@ -685,6 +685,37 @@ fn state_transitions_allocate_nothing() {
 }
 
 #[test]
+fn sent_history_and_loss_timing_allocate_nothing() {
+    use unquic::{
+        ack::{History, SENT_CAPACITY},
+        loss::Rtt,
+        wire::{AckRange, AckRanges},
+    };
+    let mut history = History::new().unwrap();
+    let mut rtt = Rtt::new();
+    ALLOCATION_COUNT.set(Some(0));
+    for number in 1..=SENT_CAPACITY as u64 + 128 {
+        history.reserve(number, 1500, true, true).unwrap();
+        assert!(history.submit(number, Duration::ZERO));
+        if number % 3 == 0 {
+            history.lose(number).unwrap();
+        }
+        let values = [AckRange {
+            start: number,
+            end: number,
+        }];
+        let ranges = AckRanges::new(&values).unwrap();
+        let result = history.acknowledge(ranges, |_| {}).unwrap();
+        assert!(rtt.sample(result.rtt_sent_at.unwrap(), Duration::from_millis(5), 1000));
+        std::hint::black_box((rtt.loss_delay(), rtt.pto_period(3), rtt.frame_lifetime()));
+        assert_eq!(history.outstanding().count(), 0);
+    }
+    history.reset().unwrap();
+    let count = ALLOCATION_COUNT.replace(None);
+    assert_eq!(count, Some(0));
+}
+
+#[test]
 fn cookie_lookups_allocate_nothing_in_both_storage_modes() {
     use unquic::{UnquicUuid, uuid::CookieIndex};
     for count in [4, 1024] {

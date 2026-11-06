@@ -194,7 +194,18 @@ and rate-limited duplicate feedback. Reassembly's `ack_deadline` and `take_ack`
 APIs construct at most the newest 32 ranges from the existing receive bitmap.
 Tests cover pressure rejection, reordering, window wrap, delay calculation and
 allocation-free construction. Workers do not yet transmit or process these
-ACKs; retained sender history and bounded feedback routing remain stage-3 work.
+ACKs; worker integration and bounded feedback routing remain stage-3 work.
+
+`ack::History` separately tracks reservations and successful submissions in a
+fixed 65,536-number window. It validates every ACK range before applying any,
+rejects retained unsent holes and future numbers, and ignores older portions.
+Bitmap checks bound work independently of an ACK's numeric span. Pending sends
+and unresolved congestion charges prevent window advancement; successfully
+sent, uncharged feedback can age out without waiting for another ACK. Late ACKs
+retain send metadata but cannot release a lost packet's charge twice. Allocation
+checks cover reservation, submission, ACK, loss, window wrap and reset.
+This history does not yet retain frame payloads or schedule repairs, and workers
+do not yet use it for submission accounting.
 
 `loss::Rtt` implements the pure RFC 9002 timing calculations: RTT sampling,
 packet/time loss thresholds, exponential PTO periods and sender frame lifetime.

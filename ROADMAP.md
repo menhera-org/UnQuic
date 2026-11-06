@@ -415,14 +415,18 @@ Session liveness already uses matching small probes on local lane 1.
 Receive-side ACK scheduling and range construction now use the existing
 reassembly bitmap, with no second history or hot-path allocations. Tests cover
 thresholds, gaps, duplicate rate limits, pressure rejection, word/window wrap,
-maximum packet numbers, and reset/retirement. Sender-history validation and
-worker feedback routing remain pending, so the runtime still emits no packet
+maximum packet numbers, and reset/retirement. Pure sender-history validation now
+distinguishes reservations, successful submissions and canceled holes, validates
+whole ACKs before mutation, and preserves unresolved charges under window pressure.
+Tests cover late ACKs, feedback-only eviction, ring wrap, maximum identities and
+allocation-free transitions. Worker integration and feedback routing remain
+pending, so the runtime still emits no packet
 ACKs. Per-lane MTU probing is connected to the workers. Recovery and congestion
 control remain pending; README.md documents probe feedback and send-error handling.
 
 The pure RTT estimator, loss-deadline calculation, PTO-period backoff and frame
 lifetime now live in `loss.rs`, with exact-value and boundary tests. ACK-driven
-updates, sent history, timer ownership and the shared two-probe/three-PTO policy
+updates, history integration, timer ownership and the shared two-probe/three-PTO policy
 still need integration; this does not complete the loss-detection step.
 
 - `ack.rs`: ACK scheduling (16 packets or 1 ms, immediate on gap), at most
