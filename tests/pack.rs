@@ -1051,3 +1051,286 @@ fn losing_each_original_piece_and_its_first_repair_still_delivers_once() {
         }
     }
 }
+
+fn submit_tracked(
+    batch: &pack::Batch,
+    inputs: &[pack::FrameInput<'_>],
+    attempt: u8,
+    history: &mut unquic::ack::History,
+    journal: &mut unquic::ack::PieceJournal,
+    recovery: &mut [unquic::loss::FrameRecovery],
+    now: Duration,
+) -> Vec<Vec<u8>> {
+    let mut encoded = Vec::new();
+    for index in 0..batch.len() {
+        let packet = batch.packet(index).unwrap();
+        let pieces: Vec<_> = batch
+            .pieces(index)
+            .unwrap()
+            .map(|(frame, range)| unquic::ack::FramePiece {
+                frame_slot: ((inputs[frame].id & 0x0000_ffff_ffff_ffff) - 1) as u16,
+                frame_id: inputs[frame].id,
+                start: range.start as u16,
+                end: range.end as u16,
+                attempt,
+            })
+            .collect();
+        history
+            .reserve(packet.number, (packet.length + 48) as u16, true, true)
+            .unwrap();
+        assert!(journal.reserve_packet(packet.number as usize, &pieces));
+        encoded.push(selected_packet(batch, index, inputs));
+    }
+    for index in 0..batch.len() {
+        let number = batch.packet(index).unwrap().number;
+        assert!(history.submit(number, now));
+        for piece in journal.packet(number as usize) {
+            assert!(recovery[usize::from(piece.frame_slot)].submitted(
+                usize::from(piece.start)..usize::from(piece.end),
+                piece.attempt
+            ));
+        }
+    }
+    encoded
+}
+
+fn apply_tracked_ack(
+    receiver: &mut ReceiveLane,
+    history: &mut unquic::ack::History,
+    journal: &mut unquic::ack::PieceJournal,
+    recovery: &mut [unquic::loss::FrameRecovery],
+    now: Duration,
+) -> unquic::ack::AckProgress {
+    use unquic::wire::{AckRange, MAX_ACK_RANGES};
+    let mut storage = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
+    let Record::Ack { ranges, .. } = receiver.take_ack(now, &mut storage).unwrap() else {
+        panic!("expected ACK");
+    };
+    history.begin_ack(ranges).unwrap();
+    receiver.ack_transmitted(now);
+    for _ in 0..256 {
+        if let Some(progress) = history.advance_ack(1, |acked| {
+            while let Some(piece) = journal.pop_packet(acked.packet.number as usize) {
+                assert!(
+                    recovery[usize::from(piece.frame_slot)]
+                        .acknowledge(
+                            usize::from(piece.start)..usize::from(piece.end),
+                            piece.attempt
+                        )
+                        .is_some()
+                );
+            }
+        }) {
+            return progress;
+        }
+    }
+    panic!("bounded ACK did not finish");
+}
+
+#[test]
+fn packed_tail_head_loss_recovers_through_actual_receiver_acks_without_duplicate_delivery() {
+    use unquic::{
+        ack::{History, PieceJournal},
+        loss::{FrameRecovery, Rtt},
+    };
+    let time = Duration::from_millis;
+    for (limit, length) in [
+        (BASE_UDP_PAYLOAD, 1514),
+        (1452, 1514),
+        (BASE_UDP_PAYLOAD, MAX_FRAME_LEN),
+        (1452, MAX_FRAME_LEN),
+        (unquic::socket::MAX_UDP_PAYLOAD, MAX_FRAME_LEN),
+    ] {
+        let bytes: Vec<Vec<u8>> = (0..2)
+            .map(|frame| {
+                (0..length)
+                    .map(|byte| (byte ^ (frame * 37)) as u8)
+                    .collect()
+            })
+            .collect();
+        let mut sender = sender();
+        let inputs: Vec<_> = bytes
+            .iter()
+            .map(|bytes| pack::FrameInput {
+                id: sender.start_frame(length).unwrap(),
+                header: &bytes[..128],
+                bytes: &bytes[128..],
+                offset: 0,
+                end: length,
+            })
+            .collect();
+        let mut history = History::new().unwrap();
+        let mut journal = PieceJournal::new(64, 2, 64).unwrap();
+        let mut recovery = [
+            FrameRecovery::new(length).unwrap(),
+            FrameRecovery::new(length).unwrap(),
+        ];
+        for (slot, input) in inputs.iter().enumerate() {
+            assert!(journal.bind_frame(slot, input.id, length));
+        }
+        let mut receiver = ReceiveLane::new(1, MAX_FRAME_LEN as u16).unwrap();
+        let mut batch = pack::Batch::new();
+        batch.prepare(&mut sender, &inputs, limit).unwrap();
+        let lost = (0..batch.len())
+            .find(|&p| batch.pieces(p).unwrap().count() == 2)
+            .unwrap();
+        let mixed: Vec<_> = batch.pieces(lost).unwrap().collect();
+        assert_eq!(mixed[0].0, 0);
+        assert_eq!(mixed[0].1.end, length);
+        assert_eq!(mixed[1].0, 1);
+        assert_eq!(mixed[1].1.start, 0);
+        assert!(mixed[1].1.end < length);
+        let originals = submit_tracked(
+            &batch,
+            &inputs,
+            0,
+            &mut history,
+            &mut journal,
+            &mut recovery,
+            time(0),
+        );
+        let lost_number = batch.packet(lost).unwrap().number;
+        for (index, encoded) in originals.iter().enumerate().rev() {
+            if index != lost {
+                assert_eq!(
+                    receiver.admit(&Datagram::decode(encoded).unwrap(), time(1)),
+                    Admission::Fresh
+                );
+            }
+        }
+        assert!(receiver.front(time(1)).is_none());
+        let ack = apply_tracked_ack(
+            &mut receiver,
+            &mut history,
+            &mut journal,
+            &mut recovery,
+            time(3),
+        );
+        assert_eq!(ack.packets as usize, originals.len() - 1);
+        let mut rtt = Rtt::new();
+        assert!(rtt.sample(ack.rtt_sent_at.unwrap(), time(3), 0));
+        let mut lost_number = lost_number;
+        let mut largest_acked = batch.packet(batch.len() - 1).unwrap().number;
+        let mut first_repair = Vec::new();
+        for attempt in 1..=2 {
+            let now = time(if attempt == 1 { 9 } else { 15 });
+            let mut scan = history.outstanding_scan();
+            let mut losses = 0;
+            while !scan.is_complete() {
+                let mut budget = 1;
+                if let Some(packet) = scan.advance(&history, &mut budget) {
+                    assert_eq!(packet.number, lost_number);
+                    assert!(
+                        rtt.loss_deadline(packet.number, largest_acked, packet.sent_at)
+                            .unwrap()
+                            <= now
+                    );
+                    assert_eq!(history.lose(packet.number), Some(packet));
+                    for piece in journal.packet(packet.number as usize) {
+                        assert!(recovery[usize::from(piece.frame_slot)].lost(
+                            usize::from(piece.start)..usize::from(piece.end),
+                            piece.attempt
+                        ));
+                    }
+                    losses += 1;
+                }
+            }
+            assert_eq!(losses, 1);
+            let repairs: Vec<_> = recovery
+                .iter()
+                .zip(&inputs)
+                .map(|(state, input)| {
+                    let (range, generation) = state.next_repair(usize::MAX).unwrap();
+                    assert_eq!(generation, attempt);
+                    pack::FrameInput {
+                        offset: range.start,
+                        end: range.end,
+                        ..*input
+                    }
+                })
+                .collect();
+            batch.prepare(&mut sender, &repairs, limit).unwrap();
+            assert_eq!(batch.len(), 1);
+            let encoded = submit_tracked(
+                &batch,
+                &repairs,
+                attempt,
+                &mut history,
+                &mut journal,
+                &mut recovery,
+                now + time(1),
+            );
+            if attempt == 1 {
+                first_repair = encoded[0].clone();
+                lost_number = batch.packet(0).unwrap().number;
+                // Later accepted traffic supplies the ACK needed for time-threshold loss.
+                let mut bytes = [0; BASE_UDP_PAYLOAD];
+                let probe = sender.record(Record::Probe, &mut bytes).unwrap();
+                history
+                    .reserve(probe.number, (probe.length + 48) as u16, true, true)
+                    .unwrap();
+                assert!(history.submit(probe.number, time(11)));
+                assert_eq!(
+                    receiver.admit(&Datagram::decode(&bytes[..probe.length]).unwrap(), time(12)),
+                    Admission::Fresh
+                );
+                let ack = apply_tracked_ack(
+                    &mut receiver,
+                    &mut history,
+                    &mut journal,
+                    &mut recovery,
+                    time(13),
+                );
+                assert_eq!(ack.packets, 1);
+                assert!(rtt.sample(ack.rtt_sent_at.unwrap(), time(13), 0));
+                largest_acked = probe.number;
+            } else {
+                assert_eq!(
+                    receiver.admit(&Datagram::decode(&encoded[0]).unwrap(), time(17)),
+                    Admission::Fresh
+                );
+                let mut delivered = 0;
+                while let Some(frame) = receiver.front(time(17)) {
+                    let index = (frame.id & 0x0000_ffff_ffff_ffff) as usize - 1;
+                    assert_eq!(frame.bytes, bytes[index]);
+                    assert_eq!(delivered & (1 << index), 0, "duplicate frame");
+                    delivered |= 1 << index;
+                    assert!(receiver.finish_front());
+                }
+                assert_eq!(delivered, 3);
+                let ack = apply_tracked_ack(
+                    &mut receiver,
+                    &mut history,
+                    &mut journal,
+                    &mut recovery,
+                    time(18),
+                );
+                assert_eq!(ack.packets, 1);
+                assert_eq!(history.inflight_bytes(), 0);
+                assert!(recovery.iter().all(|frame| frame.remaining() == 0));
+            }
+        }
+        for (slot, input) in inputs.iter().enumerate() {
+            while journal.pop_frame(slot, input.id).is_some() {}
+        }
+        assert_eq!(journal.available(), 64);
+        // Both previously lost copies can arrive late and be ACKed, but never redeliver.
+        for encoded in [&originals[lost], &first_repair] {
+            let datagram = Datagram::decode(encoded).unwrap();
+            assert_eq!(receiver.admit(&datagram, time(19)), Admission::Fresh);
+            assert_eq!(receiver.admit(&datagram, time(19)), Admission::Duplicate);
+        }
+        assert!(receiver.front(time(19)).is_none());
+        let ack = apply_tracked_ack(
+            &mut receiver,
+            &mut history,
+            &mut journal,
+            &mut recovery,
+            time(20),
+        );
+        assert_eq!(ack.packets, 2);
+        assert_eq!(ack.released_bytes, 0);
+        assert_eq!(history.inflight_bytes(), 0);
+        assert_eq!(journal.available(), 64);
+    }
+}

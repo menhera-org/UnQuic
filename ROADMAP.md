@@ -485,6 +485,12 @@ I/O and unlinks them directly by packet or frame. Loss retains mappings for late
 ACKs; expiry releases mappings without settling packet charges. Tests cover
 packed tails/heads, partial sends, late ACKs after repair, prepared-plan cancellation,
 history-slot reuse, bounded cleanup and allocation-free operations.
+A component integration regression now drops a packed frame tail/next-frame head
+and its first repair, then delivers both frames through the second repair. It
+uses real packer output, receiver ACK ranges, budgeted history/coverage updates
+and time-threshold loss detection at 1280/1500/9000 outer-byte ceilings. Late
+originals and repairs produce no duplicate frame or double credit release.
+This uses a synthetic clock and does not test worker scheduling or throughput.
 Allocate journal and recovery state against actual frame quotas when wiring
 payload retention and worker repair sends; none of those is connected yet.
 
