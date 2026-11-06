@@ -489,6 +489,12 @@ control remain pending; README.md documents probe feedback and send-error handli
 - Support foreign TAP renames during operation and across handover. Test unchanged
   ifindex, MAC, upper devices, bridge membership and forwarding, including reuse
   of the old name by an unrelated device. Never rename back or recreate by name.
+- Support foreign moves into another network namespace where the kernel permits
+  them. Keep workers and UDP sockets in place and forward through the existing
+  TAP descriptors. The release runtime test now verifies changed ifindex,
+  old-name reuse, repeated rename, bidirectional forwarding and carrier recovery
+  across peer restart. Never move back or alter namespace policy.
+  Do not assume existing upper devices or bridge membership can cross namespaces.
 - Audit production panic paths, including implicit bounds/overflow failures and
   thread startup/join errors. Add malformed-input and fault-injection tests that
   verify error handling preserves published TAPs; keep assertions in tests only.

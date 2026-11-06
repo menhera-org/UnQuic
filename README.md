@@ -62,8 +62,16 @@ be removed only on explicit instruction. UDP sockets may be recreated. External
 TAP renames must be respected without renaming back, recreating the old name or
 changing session identity. Production code must not panic. The current runtime
 still closes nonpersistent TAPs on shutdown, has no descriptor adoption/re-exec
-handover, and has not completed the panic-path audit or rename regression tests.
+handover, and has not completed the panic-path audit.
 These are tracked in Stage 4 of [ROADMAP.md](ROADMAP.md).
+
+Open TAP descriptors already support foreign renames and network-namespace moves
+where the kernel permits them. A release runtime test verifies forwarding after
+a move that changes ifindex, another rename, reuse of the original name by an
+unrelated device, and carrier loss/recovery across peer restart. Workers and UDP
+sockets stay in the original namespace. The external administrator must bring
+the moved device up and manage its attachments; UnQuic does not move it back.
+Bridge/upper-device migration and descriptor handover remain unverified.
 
 Receive sockets use fixed nonzero ports and expose no send method. Transmit
 sockets inherit their receiver's binding scope, use stable dynamic ports, and

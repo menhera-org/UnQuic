@@ -377,6 +377,18 @@ the old name or attach to another device that later acquires that name. Renames
 must not change the MAC, session association or forwarding behavior, including
 across descriptor handover.
 
+Support an external process moving a TAP into another network namespace when
+the kernel permits it. Continue using its open queue descriptors; keep transport
+workers and UDP sockets in their existing namespace. Never move the TAP back,
+recreate its old name or change the destination namespace's network policy.
+An ifindex can change during a move or be reused in another namespace, so it
+alone is not device identity. The external administrator owns any required
+administrative-up or attachment changes. A move may interrupt traffic while
+the device is down; resume forwarding when usable without discarding the session.
+If the kernel rejects a move, leave the existing TAP untouched. Destruction of
+the destination namespace or explicit external device deletion is device removal,
+not a move that can be made transparent.
+
 **Required restart support:** retain and hand over TAP queue file descriptors
 across daemon re-exec without a last-descriptor-close gap. TAPs and their existing
 attachments must survive; UDP sockets may close and be recreated. Follow
@@ -577,11 +589,13 @@ suppression and zero allocations/deallocations, while reporting drops. BENCH.md
 records the release throughput/CPU baseline; overload loss is severe and the
 throughput gate has not passed. Receive-side ACK scheduling/range construction
 is implemented over the existing bitmap; sender-history validation and runtime
-ACK routing are not yet connected. Recovery and congestion control remain unfinished. Current liveness
-probes do not discover MTU. The UDP limit defaults to 1232 bytes; an interim
-per-peer `outer_payload_limit` accepts 1232–8952 as an operator assertion for
-all destination paths. Larger configured limits report configured state, not
-confirmed PMTU. Stage 3 must replace this assertion with per-lane discovery.
+ACK routing are not yet connected. Worker loss recovery and congestion
+control remain unfinished. Per-lane MTU discovery now starts DATA at 1232 bytes
+and probes up to the configured ceiling, defaulting to 8952 bytes. Limits and
+gauges reflect confirmation rather than operator assertions. Release routed
+tests verify 9000/1500/1280-byte outer paths with returned and filtered PTB and
+recovery after the real upward retry interval. DATA-quoted PTB validation still
+requires sent history; periodic probes currently detect those reductions.
 The foreground daemon now parses the documented TOML, provisions cookies through
 gen-uuid, refreshes hostnames through per-peer iphost helpers after readiness,
 and joins transport workers on SIGINT/SIGTERM. Tests cover delayed DNS, address

@@ -678,3 +678,114 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
     assert_eq!(flags(&net, c"uq-wait") & libc::IFF_UP as i16, 0);
     waiting.stop();
 }
+
+#[test]
+#[ignore = "requires isolated container, tun, iproute2 and network capabilities"]
+fn foreign_rename_and_namespace_move_preserve_running_transport() {
+    // SAFETY: all links, sockets and child threads belong to disposable namespaces.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let original = std::fs::File::open("/proc/thread-self/ns/net").unwrap();
+    let destination = namespace();
+    let control = UdpSocket::bind("[::]:0").unwrap();
+    up(&control, c"lo");
+    let single = |name, port, remote| {
+        let mut config = config(name, port, remote);
+        config.sessions.truncate(1);
+        config.peers.truncate(1);
+        config
+    };
+    let mut left = Running::start(single("uq-move", 40100, 40101));
+    let mut right = Running::start(single("uq-stay", 40101, 40100));
+    until(Duration::from_secs(5), || {
+        left.control.ready() && right.control.ready()
+    });
+    up(&control, c"uq-move");
+    up(&control, c"uq-stay");
+    until(Duration::from_secs(5), || {
+        left.control.session(0).unwrap().carrier && right.control.session(0).unwrap().carrier
+    });
+    let mac = mac_address(&control, c"uq-move");
+    // SAFETY: the name is NUL-terminated and the device is live.
+    let original_index = unsafe { libc::if_nametoindex(c"uq-move".as_ptr()) };
+    assert_ne!(original_index, 0);
+    let remote = raw_socket(c"uq-stay", 0x88b5);
+
+    // Occupy the original index: an ifindex is namespace-local, not durable identity.
+    enter(&destination);
+    for index in 0..original_index {
+        ip(&["link", "add", &format!("occupy{index}"), "type", "dummy"]);
+    }
+    enter(&original);
+    let ns_path = format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        destination.as_raw_fd()
+    );
+    ip(&["link", "set", "uq-move", "down"]);
+    ip(&["link", "set", "uq-move", "name", "uq-renamed"]);
+    ip(&["link", "set", "uq-renamed", "netns", &ns_path]);
+    ip(&["link", "add", "uq-move", "type", "dummy"]);
+    let unrelated_mac = mac_address(&control, c"uq-move");
+    enter(&destination);
+    let moved_control = UdpSocket::bind("[::]:0").unwrap();
+    assert_eq!(mac_address(&moved_control, c"uq-renamed"), mac);
+    // SAFETY: the name is NUL-terminated in this namespace.
+    assert_ne!(
+        unsafe { libc::if_nametoindex(c"uq-renamed".as_ptr()) },
+        original_index
+    );
+    up(&moved_control, c"uq-renamed");
+    let moved = raw_socket(c"uq-renamed", 0x88b5);
+    let forward = |moved: &std::os::fd::OwnedFd, remote: &std::os::fd::OwnedFd| {
+        let mut frame = [0x5a; 1514];
+        frame[..14].copy_from_slice(&[2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2, 0x88, 0xb5]);
+        let mut capture = [0; 2000];
+        for (source, target) in [(moved, remote), (remote, moved)] {
+            for length in [60, 1514] {
+                while raw_read(target, &mut capture).is_some() {}
+                raw_send(source, &frame[..length]);
+                until(Duration::from_secs(3), || {
+                    raw_read(target, &mut capture)
+                        .is_some_and(|n| n == length && capture[..n] == frame[..length])
+                });
+            }
+        }
+    };
+    forward(&moved, &remote);
+    // A second external rename must not disturb the already moved queues.
+    ip(&["link", "set", "uq-renamed", "down"]);
+    ip(&["link", "set", "uq-renamed", "name", "uq-again"]);
+    up(&moved_control, c"uq-again");
+    // AF_PACKET reports ENETDOWN after a link-down event; reopen the test injector.
+    let moved = raw_socket(c"uq-again", 0x88b5);
+    forward(&moved, &remote);
+
+    // Carrier operations also use the preserved TAP fd, from the original namespace.
+    right.stop();
+    until(Duration::from_secs(35), || {
+        !left.control.session(0).unwrap().carrier
+    });
+    assert_eq!(
+        flags(&moved_control, c"uq-again") & libc::IFF_RUNNING as i16,
+        0
+    );
+    assert_eq!(mac_address(&moved_control, c"uq-again"), mac);
+    enter(&original);
+    assert_eq!(mac_address(&control, c"uq-move"), unrelated_mac);
+    assert_eq!(flags(&control, c"uq-move") & libc::IFF_UP as i16, 0);
+    let mut replacement = Running::start(single("uq-stay", 40101, 40100));
+    until(Duration::from_secs(5), || replacement.control.ready());
+    up(&control, c"uq-stay");
+    until(Duration::from_secs(5), || {
+        left.control.session(0).unwrap().carrier && replacement.control.session(0).unwrap().carrier
+    });
+    assert_ne!(
+        flags(&moved_control, c"uq-again") & libc::IFF_RUNNING as i16,
+        0
+    );
+    // The old peer's packet socket was bound to its deleted test TAP.
+    let remote = raw_socket(c"uq-stay", 0x88b5);
+    forward(&moved, &remote);
+    left.stop();
+    replacement.stop();
+}

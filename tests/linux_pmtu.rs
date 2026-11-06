@@ -14,10 +14,6 @@ use unquic::{
     wire::{HEADER_LEN, Header, PROBE_PREFIX_LEN, encode_probe_prefix},
 };
 
-fn ip(args: &[&str]) {
-    assert!(Command::new("ip").args(args).status().unwrap().success());
-}
-
 fn option(tx: &TransmitSocket, name: i32) -> i32 {
     let mut value = 0i32;
     let mut len = size_of::<i32>() as libc::socklen_t;
@@ -169,22 +165,6 @@ fn probes_exceed_learned_pmtu_without_fragmentation_and_keep_gso() {
     for _ in 0..2 {
         assert_eq!(remote.recv(&mut payload).unwrap().0, MAX_UDP_PAYLOAD);
     }
-}
-
-fn namespace() -> std::fs::File {
-    // A namespace descriptor keeps it alive without a named mount or helper process.
-    std::thread::spawn(|| {
-        // SAFETY: only this temporary thread enters the new namespace.
-        check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
-        std::fs::File::open("/proc/thread-self/ns/net").unwrap()
-    })
-    .join()
-    .unwrap()
-}
-
-fn enter(namespace: &std::fs::File) {
-    // SAFETY: the descriptor refers to a live network namespace; only this thread moves.
-    check(unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) });
 }
 
 fn tc(args: &[&str]) -> String {

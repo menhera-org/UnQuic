@@ -81,6 +81,11 @@ configuration must not rename it back or create a replacement at the old name.
 Renaming does not recompute its MAC. Published TAP removal requires an explicit
 instruction, independently of peer state or UDP socket lifetime. Descriptor
 handover and full lifetime enforcement remain Stage 4 work.
+An external namespace move must likewise retain the session when the kernel
+permits it. Queue descriptors remain the access path; the TAP's ifindex may
+change, and workers/UDP sockets stay in their original namespace. The daemon
+must not move it back or restore administrative state or attachments on behalf
+of the external administrator.
 
 `validate()` consumes the input and returns immutable numeric references or
 the first `ConfigError`. That error identifies a field, optional zero-based

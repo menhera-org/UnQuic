@@ -12,6 +12,33 @@ use std::{
 };
 use unquic::MacAddress;
 
+pub fn ip(args: &[&str]) {
+    let output = std::process::Command::new("ip")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+pub fn namespace() -> std::fs::File {
+    std::thread::spawn(|| {
+        // SAFETY: only this temporary thread enters the new namespace.
+        check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+        std::fs::File::open("/proc/thread-self/ns/net").unwrap()
+    })
+    .join()
+    .unwrap()
+}
+
+pub fn enter(namespace: &std::fs::File) {
+    // SAFETY: the descriptor refers to a live network namespace; only this thread moves.
+    check(unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) });
+}
+
 pub fn check(n: libc::c_int) -> libc::c_int {
     assert!(n >= 0, "{}", io::Error::last_os_error());
     n
