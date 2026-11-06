@@ -232,6 +232,10 @@ The pure sender history supports bounded ACK application after whole-record
 validation. It preserves callback progress and RTT accounting across yields,
 pins retained metadata, and prevents covered packets from being declared lost
 while their ACK is pending.
+The pure piece journal reserves mappings before I/O and keeps packet charges
+separate from payload lifetime. It retains mappings after loss for late ACKs;
+ACKs and bounded frame cleanup unlink mappings without scanning other histories.
+It is not yet connected to worker sends or recovery.
 
 ACK, handshake and PROBE_REPLY sends share a 4 MiB/s outer-byte ceiling per
 path group, with a burst of sixteen datagrams. Worker zero owns each fixed

@@ -644,8 +644,10 @@ Pure RTT, loss-deadline, PTO-period and frame
 lifetime calculations and per-frame byte coverage are implemented. Coverage
 tracks at most two repairs per byte and rejects stale loss against a newer
 outstanding copy; packet charges remain separate. The packer accepts exact
-repair ranges while retaining original frame lengths and IDs. Payload retention, packet
-mappings, worker loss recovery and congestion control remain unfinished. Per-lane MTU discovery now starts DATA at 1232 bytes
+repair ranges while retaining original frame lengths and IDs. A pure bounded
+packet-to-frame journal now supports reservation before I/O, late-ACK mappings
+after loss and direct cleanup by packet or frame. Its integration, payload
+retention, worker loss recovery and congestion control remain unfinished. Per-lane MTU discovery now starts DATA at 1232 bytes
 and probes up to the configured ceiling, defaulting to 8952 bytes. Limits and
 gauges reflect confirmation rather than operator assertions. Release routed
 tests verify 9000/1500/1280-byte outer paths with returned and filtered PTB and

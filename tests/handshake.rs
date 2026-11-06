@@ -1111,3 +1111,44 @@ fn repair_coverage_allocates_nothing() {
     }
     assert_eq!(ALLOCATION_COUNT.replace(None), Some(0));
 }
+
+#[test]
+fn piece_journal_reservation_feedback_and_expiry_allocate_nothing() {
+    use unquic::ack::{FramePiece, PieceJournal};
+    let mut journal = PieceJournal::new(4, 2, 128).unwrap();
+    ALLOCATION_COUNT.set(Some(0));
+    for number in 1..=10_000 {
+        let id = (1 << 48) | number;
+        assert!(journal.bind_frame(0, id, 60));
+        assert!(journal.bind_frame(1, id + 1, 60));
+        let pieces = [
+            FramePiece {
+                frame_slot: 0,
+                frame_id: id,
+                start: 0,
+                end: 60,
+                attempt: 0,
+            },
+            FramePiece {
+                frame_slot: 1,
+                frame_id: id + 1,
+                start: 0,
+                end: 60,
+                attempt: 0,
+            },
+        ];
+        assert!(journal.reserve_packet(0, &pieces));
+        assert!(journal.reserve_packet(1, &pieces));
+        assert!(!journal.reserve_packet(0, &pieces));
+        assert_eq!(journal.packet(0).count(), 2);
+        assert_eq!(journal.pop_frame(0, id), Some(pieces[0]));
+        assert_eq!(journal.pop_packet(0), Some(pieces[0]));
+        assert_eq!(journal.pop_packet(0), Some(pieces[1]));
+        assert_eq!(journal.pop_packet(1), Some(pieces[1]));
+        assert!(journal.frame_empty(0, id));
+        assert!(journal.frame_empty(1, id + 1));
+        assert_eq!(journal.available(), 128);
+    }
+    let count = ALLOCATION_COUNT.replace(None);
+    assert_eq!(count, Some(0));
+}

@@ -475,7 +475,12 @@ completion after an original piece and its first repair are both lost.
 Frame-view storage now follows each worker's actual session quotas, capped at
 8192 shared slots; startup accounting uses the same calculation. Tests cover
 unequal queue/lane counts, multiple sessions, empty stores and slot recycling.
-Allocate recovery state against those slots when wiring packet mappings,
+The pure packet-to-frame journal now reserves a whole packet's mappings before
+I/O and unlinks them directly by packet or frame. Loss retains mappings for late
+ACKs; expiry releases mappings without settling packet charges. Tests cover
+packed tails/heads, partial sends, late ACKs after repair, prepared-plan cancellation,
+history-slot reuse, bounded cleanup and allocation-free operations.
+Allocate journal and recovery state against actual frame quotas when wiring
 payload retention and worker repair sends; none of those is connected yet.
 
 - `ack.rs`: ACK scheduling (16 packets or 1 ms, immediate on gap), at most
