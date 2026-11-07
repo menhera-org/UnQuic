@@ -17,8 +17,9 @@ Neither the local **20 Gbit/s in each direction** gate nor the real
 **5 Gbit/s under loss** gate has passed. Runtime recovery and congestion control
 remain unfinished. Workers now use the shared draft-07 controller and grant
 accounting. Refreshing overtaken packet numbers removes repeated coordinator
-DATA cancellations, but the latest 20-second QinQ sweep still delivers only
-0.73 to 0.84 Gbit/s per direction using about 1.5 to 1.75 CPUs per daemon.
+DATA cancellations. Skipping empty loss-history ranges reduces CPU cost, but the
+latest 20-second QinQ sweep still delivers only 0.72 to 0.85 Gbit/s per direction
+using about 1.4 to 1.5 CPUs per daemon.
 The preceding ACK-pruning sweep delivered 1.12 to 1.22 Gbit/s. These remain
 severe integration regressions, far below the CPU ceiling.
 General application-limited detection and payload repair remain open.
@@ -51,8 +52,8 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Latest sender QinQ sweep: 0.83 / 0.80 Gbit/s paced, 0.84 / 0.81 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 95.93 / 96.11%. Five successful repeats and the under-1% gate remain unmet. |
-| Goodput must plateau under excess traffic | Latest sender sweep holds 0.73 to 0.84 Gbit/s through paced, unlimited and return points; daemon CPU stays near 1.5–1.75 cores. The earlier expiry sweep declined 2.7% forward under unlimited load | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Latest sender QinQ sweep: 0.85 / 0.83 Gbit/s paced, 0.84 / 0.81 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 95.86 / 95.95%. Five successful repeats and the under-1% gate remain unmet. |
+| Goodput must plateau under excess traffic | Latest sender sweep spans 0.72 to 0.85 Gbit/s through paced, unlimited and return points; daemon CPU stays near 1.4–1.5 cores. The earlier expiry sweep declined 2.7% forward under unlimited load | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
 | Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Current QinQ reports zero reordering; single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
@@ -276,6 +277,59 @@ and queue drops 736 / 10,653. Admission pressure, socket overflow, inner UDP
 errors, invalid/duplicate/out-of-window/wrong-run records, reordering and outer
 fragmentation remain zero at every point. These are diagnostic results, not a
 normal-release acceptance sweep.
+
+The [matched summary-index treatment](benches/tap-sender-loss-summary-diagnostic.json)
+adds 128 bytes per history and charges both index and primary-word reads to the
+existing work budget. It preserves late-ACK metadata, fixed scan endpoints and
+one read per packet in dense histories. The
+[treatment patch](benches/sender-loss-summary-diagnostic.patch) applies after the
+two diagnostic patches above.
+
+| Requested Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % | Bitmap reads, millions | Scan continuations |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 16 | 1.55 / 1.17 | 90.06 / 92.53 | 165.76 / 160.66 | 0.93 / 1.22 | 44 / 161 |
+| 21 | 1.53 / 1.43 | 92.59 / 93.06 | 168.99 / 160.39 | 0.88 / 0.85 | 21 / 9 |
+| Unlimited | 1.65 / 1.45 | 97.20 / 97.39 | 167.98 / 158.92 | 0.89 / 0.84 | 30 / 24 |
+| 16 return | 1.53 / 1.46 | 90.26 / 90.71 | 171.22 / 162.76 | 0.84 / 0.94 | 20 / 21 |
+
+At 21G, bitmap reads fall by about 97% and mid-scan continuations nearly
+disappear. Unlimited forward goodput rises from 1.20 to 1.65 Gbit/s while its
+daemon CPU falls from 197% to 168%. Other points vary, including a slower first
+reverse point; this is not evidence of a general throughput gain or a CPU
+ceiling. At 21G, TAP TX drops are 749,070 / 740,528, frame expiries 4,423 / 10,842,
+and queue drops 599 / 11,826. All four points retain zero admission pressure,
+socket overflow, inner UDP errors, record errors, duplicates, reordering and
+outer fragments. The isolated scan cost is reduced; the large sender regression
+remains. Ordinary release measurements follow separately.
+
+## Empty-history index: normal release comparison (November 7)
+
+The [clock-corrected baseline](benches/tap-sender-clock.json) and
+[summary-index build](benches/tap-sender-loss-summary.json) retain the normal
+sixteen-datagram cap. Each runs the same four twenty-second points with retained
+daemons and no diagnostic instrumentation or concurrent builds/tests.
+
+| Requested Gbit/s each way | Baseline delivered Gbit/s | Indexed delivered Gbit/s | Baseline CPU % | Indexed CPU % | Indexed missing after drain % |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 16 | 0.72 / 0.81 | 0.85 / 0.72 | 169.15 / 152.50 | 147.75 / 141.57 | 94.54 / 95.38 |
+| 21 | 0.84 / 0.80 | 0.85 / 0.83 | 163.43 / 152.65 | 152.89 / 143.01 | 95.86 / 95.95 |
+| Unlimited | 0.83 / 0.81 | 0.84 / 0.81 | 157.67 / 152.37 | 151.76 / 140.18 | 98.55 / 98.56 |
+| 16 return | 0.85 / 0.82 | 0.84 / 0.81 | 158.54 / 152.10 | 150.84 / 142.53 | 94.59 / 94.79 |
+
+At 21G, CPU falls about 6% per daemon with similar goodput. The sparse scan is
+a verified source of avoidable work, but removing it does not resolve the sender
+regression. No general throughput gain or overload acceptance follows from this
+single pair. Indexed TAP TX drops at 21G are 775,698 / 769,348, frame expiries
+4,600 / 760, and queue drops 369 / 7,168. Unlimited frame expiries are
+13,231 / 11,591. All points have zero admission pressure, socket overflow,
+inner UDP errors, invalid/duplicate/out-of-window/wrong-run records, reordering
+and outer fragmentation.
+
+The indexed build passes 335 release tests, Clippy, formatting and 56 short
+container tests, including allocation checks, retained late ACKs, sparse/dense
+scans, ring wrap, maximum packet numbers and mutations between scan steps.
+Foreign-move reconnect takes 18.62 seconds in this run; the service-delay gap
+remains. The last full routed PMTU test precedes this index change.
 
 ## Request fairness and burst-size experiments (November 7)
 

@@ -118,6 +118,7 @@ struct PendingAck {
 pub struct OutstandingScan {
     next: Option<u64>,
     end: u64,
+    skip_empty: bool,
 }
 
 impl OutstandingScan {
@@ -126,7 +127,7 @@ impl OutstandingScan {
         self.next.is_none()
     }
 
-    /// Returns one still-outstanding packet, spending one unit per bitmap read.
+    /// Returns one still-outstanding packet, spending one unit per data or summary bitmap read.
     ///
     /// None means either exhaustion of the budget or completion; check
     /// is_complete. Zero budget leaves the cursor unchanged. Call History::lose
@@ -139,6 +140,25 @@ impl OutstandingScan {
                 return None;
             }
             *budget -= 1;
+            if self.skip_empty {
+                let word = start >> 6;
+                let last_word = (self.end >> 6).min(word | 63);
+                let mask = (u64::MAX << (word % 64)) & (u64::MAX >> (63 - last_word % 64));
+                let bits = history.inflight_summary[(word >> 6) as usize & (WORDS / 64 - 1)] & mask;
+                if bits == 0 {
+                    let end = self.end.min((last_word << 6) | 63);
+                    self.next = if end == self.end {
+                        None
+                    } else {
+                        end.checked_add(1)
+                    };
+                } else {
+                    let number = ((word & !63) | u64::from(bits.trailing_zeros())) << 6;
+                    self.next = Some(number.max(start));
+                    self.skip_empty = false;
+                }
+                continue;
+            }
             let end = self.end.min(start | 63);
             let mask = (u64::MAX << (start % 64)) & (u64::MAX >> (63 - end % 64));
             let bits = history.inflight[(start >> 6) as usize & (WORDS - 1)] & mask;
@@ -155,6 +175,7 @@ impl OutstandingScan {
             if bits != 0 {
                 return Some(history.metadata(number));
             }
+            self.skip_empty = true;
         }
         None
     }
@@ -163,7 +184,8 @@ impl OutstandingScan {
 /// Bounded sender history with allocation-free reservation, ACK and loss operations.
 ///
 /// Each packet uses 16 bytes of metadata plus four bitmap bits, preserving the
-/// full range and nanosecond precision of `Duration`. Sampling handles occupy
+/// full range and nanosecond precision of `Duration`. A 128-byte index skips empty
+/// inflight bitmap words. Sampling handles occupy
 /// padding freed by packing outer size and transmission flags into one u16.
 ///
 /// Allocate once per connection/lane packet-number space, not per shared UDP
@@ -176,6 +198,7 @@ pub struct History {
     submitted: [u64; WORDS],
     acknowledged: [u64; WORDS],
     inflight: [u64; WORDS],
+    inflight_summary: [u64; WORDS / 64],
     floor: u64,
     allocated: u64,
     highest_sent: u64,
@@ -197,6 +220,7 @@ impl History {
             submitted: [0; WORDS],
             acknowledged: [0; WORDS],
             inflight: [0; WORDS],
+            inflight_summary: [0; WORDS / 64],
             floor: 1,
             allocated: 0,
             highest_sent: 0,
@@ -345,6 +369,7 @@ impl History {
         self.submitted[word] |= bit;
         if entry.size_flags & CHARGED != 0 {
             self.inflight[word] |= bit;
+            self.inflight_summary[word / 64] |= 1 << (word % 64);
             self.inflight_bytes += u64::from(entry.size_flags & SIZE_MASK);
         }
         self.highest_sent = self.highest_sent.max(number);
@@ -469,6 +494,9 @@ impl History {
                 self.take_sample(number);
                 let was_in_flight = self.inflight[index] & bit != 0;
                 self.inflight[index] &= !bit;
+                if self.inflight[index] == 0 {
+                    self.inflight_summary[index / 64] &= !(1 << (index % 64));
+                }
                 self.acknowledged[index] |= bit;
                 pending.progress.packets += 1;
                 pending.progress.eliciting |= packet.eliciting;
@@ -551,6 +579,9 @@ impl History {
         }
         let packet = self.metadata(number);
         self.inflight[word] &= !bit;
+        if self.inflight[word] == 0 {
+            self.inflight_summary[word / 64] &= !(1 << (word % 64));
+        }
         self.inflight_bytes -= u64::from(packet.outer_bytes);
         Some(packet)
     }
@@ -567,6 +598,7 @@ impl History {
                 Some(self.floor)
             },
             end: self.allocated,
+            skip_empty: false,
         }
     }
 
@@ -593,6 +625,7 @@ impl History {
         }
         self.submitted.fill(0);
         self.acknowledged.fill(0);
+        self.inflight_summary.fill(0);
         self.floor = 1;
         self.allocated = 0;
         self.highest_sent = 0;

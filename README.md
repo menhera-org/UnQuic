@@ -244,6 +244,8 @@ Validation trims already-acknowledged range boundaries before application,
 while preserving late-loss delivery and the original largest number for RTT.
 Outstanding-packet scans also yield after a bitmap-work budget and stop at a
 fixed packet number, including across sparse histories and concurrent sends.
+A 128-byte summary per history skips empty bitmap ranges without retiring
+late-ACK metadata. Both summary and packet-word reads consume the work budget.
 The pure piece journal reserves mappings before I/O and keeps packet charges
 separate from payload lifetime. It retains mappings after loss for late ACKs;
 ACKs and bounded frame cleanup unlink mappings without scanning other histories.

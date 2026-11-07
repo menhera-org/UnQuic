@@ -686,7 +686,9 @@ throughput gate has not passed. Receive-side ACK scheduling/range construction
 is implemented over the existing bitmap. Pure sender history now validates whole
 ACKs against actual submissions, preserves unresolved charges and rejects known
 unsent holes. Each entry uses 16 bytes plus four bitmap bits, preserving full
-monotonic timestamp range and precision. ACK application has a resumable work
+monotonic timestamp range and precision. A 128-byte summary per history skips
+empty inflight words during bounded loss scans; summary reads also consume the
+scan budget. ACK application has a resumable work
 budget covering word scans, range transitions and callbacks. A pending ACK pins
 history metadata and prevents loss declarations for covered packets; validation
 still completes before any callback. TX owners apply ACKs and bounded loss

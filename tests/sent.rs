@@ -545,8 +545,9 @@ fn sparse_outstanding_scan_budgets_empty_words_and_stops_at_its_original_end() {
     let mut budget = 0;
     assert_eq!(scan.advance(&history, &mut budget), None);
     assert!(!scan.is_complete());
-    for _ in 0..16 {
-        let mut budget = 64;
+    // One empty data word, then a summary read; both consume budget.
+    for _ in 0..2 {
+        let mut budget = 1;
         assert_eq!(scan.advance(&history, &mut budget), None);
         assert_eq!(budget, 0);
         assert!(!scan.is_complete());
@@ -555,10 +556,14 @@ fn sparse_outstanding_scan_budgets_empty_words_and_stops_at_its_original_end() {
     sent(&mut history, last + 1, true);
     let mut budget = 64;
     assert_eq!(scan.advance(&history, &mut budget).unwrap().number, last);
-    assert_eq!(budget, 63);
+    assert!(
+        budget >= 47,
+        "sparse history must skip empty words via the summary"
+    );
+    let remaining = budget;
     assert!(scan.is_complete());
     assert_eq!(scan.advance(&history, &mut budget), None);
-    assert_eq!(budget, 63);
+    assert_eq!(budget, remaining);
     assert_eq!(history.outstanding().count(), 2);
 }
 
@@ -1183,4 +1188,82 @@ fn pruned_ranges_handle_ring_wrap_and_maximum_identity() {
         assert_eq!(progress.released_bytes, 1500);
         assert_eq!(progress.rtt_sent_at, Some(Duration::from_micros(end)));
     }
+}
+
+#[test]
+fn summary_scan_rechecks_late_submission_and_cleared_words_after_yield() {
+    let mut history = History::new().unwrap();
+    history.reserve(128, 1500, true, true).unwrap();
+    sent(&mut history, 4096, true);
+    let mut scan = history.outstanding_scan();
+    assert_eq!(scan.advance(&history, &mut 1), None); // Empty data word.
+    assert!(history.submit(128, Duration::ZERO)); // Submission before summary read.
+    assert_eq!(scan.advance(&history, &mut 1), None); // Summary selects word 2.
+    history.lose(128).unwrap(); // Selected summary bit becomes stale before data read.
+    let mut budget = 8;
+    assert_eq!(scan.advance(&history, &mut budget).unwrap().number, 4096);
+    assert!(scan.is_complete());
+    history
+        .acknowledge(
+            ranges(&[AckRange {
+                start: 4096,
+                end: 4096,
+            }]),
+            |_| {},
+        )
+        .unwrap();
+    // Late ACK of the lost packet still has its retained metadata.
+    let mut late = 0;
+    history
+        .acknowledge(
+            ranges(&[AckRange {
+                start: 128,
+                end: 128,
+            }]),
+            |ack| {
+                assert!(!ack.was_in_flight);
+                late += 1;
+            },
+        )
+        .unwrap();
+    assert_eq!(late, 1);
+    assert!(history.outstanding_scan().is_complete());
+    history.reset().unwrap();
+    sent(&mut history, 8192, true);
+    assert_eq!(
+        history.outstanding().map(|p| p.number).collect::<Vec<_>>(),
+        [8192]
+    );
+}
+
+#[test]
+fn summary_scan_wraps_ring_and_rechecks_partial_words() {
+    let mut history = History::new().unwrap();
+    let first = SENT_CAPACITY as u64 - 65;
+    for number in [first, first + 1, SENT_CAPACITY as u64 + 128] {
+        sent(&mut history, number, true);
+    }
+    let mut scan = history.outstanding_scan();
+    let mut budget = 32;
+    assert_eq!(scan.advance(&history, &mut budget).unwrap().number, first);
+    history
+        .acknowledge(
+            ranges(&[AckRange {
+                start: first,
+                end: first,
+            }]),
+            |_| {},
+        )
+        .unwrap();
+    // Clearing one packet must retain its word's summary bit for the other packet.
+    assert_eq!(
+        scan.advance(&history, &mut budget).unwrap().number,
+        first + 1
+    );
+    history.lose(first + 1).unwrap();
+    assert_eq!(
+        scan.advance(&history, &mut budget).unwrap().number,
+        SENT_CAPACITY as u64 + 128
+    );
+    assert!(scan.is_complete());
 }

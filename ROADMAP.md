@@ -481,7 +481,9 @@ Pending ACKs pin their history window and protect covered
 packets from interleaved loss. Tests cover a full-window ACK, duplicate-only
 scans, floor pressure, competing ACKs, late loss and RTT sampling across yields.
 Outstanding-charge scans now yield on a bitmap-read budget, including empty
-words. Each pass has a fixed upper packet number and rechecks state after ACK,
+words. A 128-byte per-history summary skips empty ranges; summary reads consume
+the same budget, while dense scans retain one read per packet. Each pass has a
+fixed upper packet number and rechecks state after ACK,
 loss and eviction; new sends cannot extend a pass. Empty, sparse, full-window,
 maximum-number and allocation-free regressions pass. TX owners now run these bounded
 scans and retain reports until the controller consumes them.

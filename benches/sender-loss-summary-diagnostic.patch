@@ -1,0 +1,349 @@
+--- a/src/ack/sent.rs
++++ b/src/ack/sent.rs
+@@ -118,15 +118,17 @@
+ pub struct OutstandingScan {
+     next: Option<u64>,
+     end: u64,
++    skip_empty: bool,
+     reads: u64,
+     empty: u64,
+     span: u64,
++    summary_reads: u64,
+ }
+ 
+ impl OutstandingScan {
+-    /// Temporary diagnostic: bitmap reads, empty reads, and initial retained number span.
+-    pub const fn diagnostic(&self) -> (u64, u64, u64) {
+-        (self.reads, self.empty, self.span)
++    /// Temporary diagnostic: total reads, empty reads, initial span, and summary reads.
++    pub const fn diagnostic(&self) -> (u64, u64, u64, u64) {
++        (self.reads, self.empty, self.span, self.summary_reads)
+     }
+ 
+     /// Whether this pass has finished, including an empty history.
+@@ -134,7 +136,7 @@
+         self.next.is_none()
+     }
+ 
+-    /// Returns one still-outstanding packet, spending one unit per bitmap read.
++    /// Returns one still-outstanding packet, spending one unit per data or summary bitmap read.
+     ///
+     /// None means either exhaustion of the budget or completion; check
+     /// is_complete. Zero budget leaves the cursor unchanged. Call History::lose
+@@ -147,10 +149,31 @@
+                 return None;
+             }
+             *budget -= 1;
++            self.reads += 1;
++            if self.skip_empty {
++                self.summary_reads += 1;
++                let word = start >> 6;
++                let last_word = (self.end >> 6).min(word | 63);
++                let mask = (u64::MAX << (word % 64)) & (u64::MAX >> (63 - last_word % 64));
++                let bits = history.inflight_summary[(word >> 6) as usize & (WORDS / 64 - 1)] & mask;
++                self.empty += u64::from(bits == 0);
++                if bits == 0 {
++                    let end = self.end.min((last_word << 6) | 63);
++                    self.next = if end == self.end {
++                        None
++                    } else {
++                        end.checked_add(1)
++                    };
++                } else {
++                    let number = ((word & !63) | u64::from(bits.trailing_zeros())) << 6;
++                    self.next = Some(number.max(start));
++                    self.skip_empty = false;
++                }
++                continue;
++            }
+             let end = self.end.min(start | 63);
+             let mask = (u64::MAX << (start % 64)) & (u64::MAX >> (63 - end % 64));
+             let bits = history.inflight[(start >> 6) as usize & (WORDS - 1)] & mask;
+-            self.reads += 1;
+             self.empty += u64::from(bits == 0);
+             let number = if bits == 0 {
+                 end
+@@ -165,6 +188,7 @@
+             if bits != 0 {
+                 return Some(history.metadata(number));
+             }
++            self.skip_empty = true;
+         }
+         None
+     }
+@@ -173,7 +197,8 @@
+ /// Bounded sender history with allocation-free reservation, ACK and loss operations.
+ ///
+ /// Each packet uses 16 bytes of metadata plus four bitmap bits, preserving the
+-/// full range and nanosecond precision of `Duration`. Sampling handles occupy
++/// full range and nanosecond precision of `Duration`. A 128-byte index skips empty
++/// inflight bitmap words. Sampling handles occupy
+ /// padding freed by packing outer size and transmission flags into one u16.
+ ///
+ /// Allocate once per connection/lane packet-number space, not per shared UDP
+@@ -186,6 +211,7 @@
+     submitted: [u64; WORDS],
+     acknowledged: [u64; WORDS],
+     inflight: [u64; WORDS],
++    inflight_summary: [u64; WORDS / 64],
+     floor: u64,
+     allocated: u64,
+     highest_sent: u64,
+@@ -207,6 +233,7 @@
+             submitted: [0; WORDS],
+             acknowledged: [0; WORDS],
+             inflight: [0; WORDS],
++            inflight_summary: [0; WORDS / 64],
+             floor: 1,
+             allocated: 0,
+             highest_sent: 0,
+@@ -355,6 +382,7 @@
+         self.submitted[word] |= bit;
+         if entry.size_flags & CHARGED != 0 {
+             self.inflight[word] |= bit;
++            self.inflight_summary[word / 64] |= 1 << (word % 64);
+             self.inflight_bytes += u64::from(entry.size_flags & SIZE_MASK);
+         }
+         self.highest_sent = self.highest_sent.max(number);
+@@ -479,6 +507,9 @@
+                 self.take_sample(number);
+                 let was_in_flight = self.inflight[index] & bit != 0;
+                 self.inflight[index] &= !bit;
++                if self.inflight[index] == 0 {
++                    self.inflight_summary[index / 64] &= !(1 << (index % 64));
++                }
+                 self.acknowledged[index] |= bit;
+                 pending.progress.packets += 1;
+                 pending.progress.eliciting |= packet.eliciting;
+@@ -561,6 +592,9 @@
+         }
+         let packet = self.metadata(number);
+         self.inflight[word] &= !bit;
++        if self.inflight[word] == 0 {
++            self.inflight_summary[word / 64] &= !(1 << (word % 64));
++        }
+         self.inflight_bytes -= u64::from(packet.outer_bytes);
+         Some(packet)
+     }
+@@ -577,6 +611,7 @@
+                 Some(self.floor)
+             },
+             end: self.allocated,
++            skip_empty: false,
+             reads: 0,
+             empty: 0,
+             span: if self.final_retired || self.allocated < self.floor {
+@@ -584,6 +619,7 @@
+             } else {
+                 self.allocated - self.floor + 1
+             },
++            summary_reads: 0,
+         }
+     }
+ 
+@@ -610,6 +646,7 @@
+         }
+         self.submitted.fill(0);
+         self.acknowledged.fill(0);
++        self.inflight_summary.fill(0);
+         self.floor = 1;
+         self.allocated = 0;
+         self.highest_sent = 0;
+--- a/tests/sent.rs
++++ b/tests/sent.rs
+@@ -545,8 +545,9 @@
+     let mut budget = 0;
+     assert_eq!(scan.advance(&history, &mut budget), None);
+     assert!(!scan.is_complete());
+-    for _ in 0..16 {
+-        let mut budget = 64;
++    // One empty data word, then a summary read; both consume budget.
++    for _ in 0..2 {
++        let mut budget = 1;
+         assert_eq!(scan.advance(&history, &mut budget), None);
+         assert_eq!(budget, 0);
+         assert!(!scan.is_complete());
+@@ -555,10 +556,14 @@
+     sent(&mut history, last + 1, true);
+     let mut budget = 64;
+     assert_eq!(scan.advance(&history, &mut budget).unwrap().number, last);
+-    assert_eq!(budget, 63);
++    assert!(
++        budget >= 47,
++        "sparse history must skip empty words via the summary"
++    );
++    let remaining = budget;
+     assert!(scan.is_complete());
+     assert_eq!(scan.advance(&history, &mut budget), None);
+-    assert_eq!(budget, 63);
++    assert_eq!(budget, remaining);
+     assert_eq!(history.outstanding().count(), 2);
+ }
+ 
+@@ -1186,20 +1191,99 @@
+ }
+ 
+ #[test]
+-fn loss_scan_diagnostics_count_sparse_prefix_and_zero_inflight_fast_path() {
++fn summary_scan_rechecks_late_submission_and_cleared_words_after_yield() {
++    let mut history = History::new().unwrap();
++    history.reserve(128, 1500, true, true).unwrap();
++    sent(&mut history, 4096, true);
++    let mut scan = history.outstanding_scan();
++    assert_eq!(scan.advance(&history, &mut 1), None); // Empty data word.
++    assert!(history.submit(128, Duration::ZERO)); // Submission before summary read.
++    assert_eq!(scan.advance(&history, &mut 1), None); // Summary selects word 2.
++    history.lose(128).unwrap(); // Selected summary bit becomes stale before data read.
++    let mut budget = 8;
++    assert_eq!(scan.advance(&history, &mut budget).unwrap().number, 4096);
++    assert!(scan.is_complete());
++    history
++        .acknowledge(
++            ranges(&[AckRange {
++                start: 4096,
++                end: 4096,
++            }]),
++            |_| {},
++        )
++        .unwrap();
++    // Late ACK of the lost packet still has its retained metadata.
++    let mut late = 0;
++    history
++        .acknowledge(
++            ranges(&[AckRange {
++                start: 128,
++                end: 128,
++            }]),
++            |ack| {
++                assert!(!ack.was_in_flight);
++                late += 1;
++            },
++        )
++        .unwrap();
++    assert_eq!(late, 1);
++    assert!(history.outstanding_scan().is_complete());
++    history.reset().unwrap();
++    sent(&mut history, 8192, true);
++    assert_eq!(
++        history.outstanding().map(|p| p.number).collect::<Vec<_>>(),
++        [8192]
++    );
++}
++
++#[test]
++fn summary_scan_wraps_ring_and_rechecks_partial_words() {
++    let mut history = History::new().unwrap();
++    let first = SENT_CAPACITY as u64 - 65;
++    for number in [first, first + 1, SENT_CAPACITY as u64 + 128] {
++        sent(&mut history, number, true);
++    }
++    let mut scan = history.outstanding_scan();
++    let mut budget = 32;
++    assert_eq!(scan.advance(&history, &mut budget).unwrap().number, first);
++    history
++        .acknowledge(
++            ranges(&[AckRange {
++                start: first,
++                end: first,
++            }]),
++            |_| {},
++        )
++        .unwrap();
++    // Clearing one packet must retain its word's summary bit for the other packet.
++    assert_eq!(
++        scan.advance(&history, &mut budget).unwrap().number,
++        first + 1
++    );
++    history.lose(first + 1).unwrap();
++    assert_eq!(
++        scan.advance(&history, &mut budget).unwrap().number,
++        SENT_CAPACITY as u64 + 128
++    );
++    assert!(scan.is_complete());
++}
++
++#[test]
++fn loss_scan_diagnostics_budget_data_and_summary_reads() {
+     let mut history = History::new().unwrap();
+     sent(&mut history, 65_535, true);
+     let mut scan = history.outstanding_scan();
+-    assert_eq!(scan.diagnostic(), (0, 0, 65_535));
+-    let mut budget = 64;
++    assert_eq!(scan.diagnostic(), (0, 0, 65_535, 0));
++    let mut budget = 2;
+     assert_eq!(scan.advance(&history, &mut budget), None);
+     assert_eq!(budget, 0);
+     assert!(!scan.is_complete());
+-    assert_eq!(scan.diagnostic(), (64, 64, 65_535));
++    assert_eq!(scan.diagnostic(), (2, 2, 65_535, 1));
+     let mut budget = 2_000;
+     assert_eq!(scan.advance(&history, &mut budget).unwrap().number, 65_535);
+     assert!(scan.is_complete());
+-    assert_eq!(scan.diagnostic(), (1_024, 1_023, 65_535));
++    assert_eq!(scan.diagnostic(), (18, 16, 65_535, 16));
++    assert_eq!(budget, 1_984);
+ 
+     assert!(history.lose(65_535).is_some());
+     let mut scan = history.outstanding_scan();
+@@ -1207,5 +1291,5 @@
+     assert_eq!(scan.advance(&history, &mut budget), None);
+     assert_eq!(budget, 64);
+     assert!(scan.is_complete());
+-    assert_eq!(scan.diagnostic(), (0, 0, 65_535));
++    assert_eq!(scan.diagnostic(), (0, 0, 65_535, 0));
+ }
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -142,6 +142,7 @@
+     loss_scan_span: u64,
+     loss_scan_reads: u64,
+     loss_scan_empty: u64,
++    loss_scan_summary: u64,
+     loss_scan_completed: u64,
+     loss_scan_continuations: u64,
+     pub(super) loss_due: Option<Duration>,
+@@ -169,6 +170,7 @@
+             loss_scan_span: 0,
+             loss_scan_reads: 0,
+             loss_scan_empty: 0,
++            loss_scan_summary: 0,
+             loss_scan_completed: 0,
+             loss_scan_continuations: 0,
+             loss_due: None,
+@@ -1558,6 +1560,7 @@
+         self.counters.loss_scan_span = 0;
+         self.counters.loss_scan_reads = 0;
+         self.counters.loss_scan_empty = 0;
++        self.counters.loss_scan_summary = 0;
+         self.counters.loss_scan_completed = 0;
+         self.counters.loss_scan_continuations = 0;
+         self.counters.bytes_in_flight = 0;
+@@ -1571,6 +1574,7 @@
+             self.counters.loss_scan_span += lane.loss_scan_span;
+             self.counters.loss_scan_reads += lane.loss_scan_reads;
+             self.counters.loss_scan_empty += lane.loss_scan_empty;
++            self.counters.loss_scan_summary += lane.loss_scan_summary;
+             self.counters.loss_scan_completed += lane.loss_scan_completed;
+             self.counters.loss_scan_continuations += lane.loss_scan_continuations;
+             let local = &mut self.sessions[lane.session];
+--- a/src/worker/sender/history.rs
++++ b/src/worker/sender/history.rs
+@@ -217,6 +217,7 @@
+         let work = scan.diagnostic();
+         self.loss_scan_reads += work.0 - prior_work.0;
+         self.loss_scan_empty += work.1 - prior_work.1;
++        self.loss_scan_summary += work.3 - prior_work.3;
+         self.loss_scan_continuations += u64::from(remaining == 0 && !scan.is_complete());
+         if scan.is_complete() {
+             self.loss_scan_completed += 1;
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -139,6 +139,8 @@
+     /// Temporary loss-scan diagnostic.
+     loss_scan_empty: sum,
+     /// Temporary loss-scan diagnostic.
++    loss_scan_summary: sum,
++    /// Temporary loss-scan diagnostic.
+     loss_scan_completed: sum,
+     /// Temporary loss-scan diagnostic.
+     loss_scan_continuations: sum,
