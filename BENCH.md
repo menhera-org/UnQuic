@@ -1117,6 +1117,75 @@ readiness takes 20.813 seconds in the foreign-namespace test; the existing
 service-delay gap remains. Full routed PMTU and default-feature checks were
 not repeated for this unadopted experiment.
 
+## Sharing a bounded grant pass: unadopted experiment (November 7)
+
+The owner uses one timestamp for its request scan. The first successful grant
+advances the pacing deadline, so later workers cannot fill the same available
+quantum in that pass. A two-worker regression reproduces this: two 1280-byte
+requests fit the current window and quantum, but only one receives permission.
+
+The [isolated candidate](benches/sender-grant-pass.patch) lets one explicit
+request pass share that burst. Its first grant meets the ordinary deadline;
+additional grants append their service time. All existing window, quantum,
+metadata, probe and work limits remain. A changed rate or burst cap, another
+pass, or issuance closure ends continuation. Unused completions do not refund
+pacing time. Public strict reservation APIs are unchanged.
+
+[The release measurements](benches/tap-sender-grant-pass.json) contain nine
+ascending twenty-second candidate points and a fresh baseline/candidate pair,
+each with sixty-second 21G, unlimited and 21G-return points. Daemons persist
+within each sweep. The usual eight-worker QinQ profile, active discovery,
+1452-byte outer UDP ceiling and CPU placement apply. No builds, other tests
+or Git packing overlap load.
+
+| Candidate requested Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| 0.5 | 0.49 / 0.49 | 0.42 / 0.20 | 46.26 / 43.30 |
+| 1 | 0.99 / 0.99 | 0.16 / 0.47 | 85.59 / 81.19 |
+| 2 | 1.97 / 1.96 | 0.61 / 0.75 | 170.61 / 157.50 |
+| 3 | 2.59 / 2.74 | 12.52 / 7.61 | 232.64 / 219.04 |
+| 4 | 2.48 / 2.95 | 36.95 / 25.39 | 240.62 / 230.38 |
+| 8 | 2.42 / 2.87 | 69.15 / 63.44 | 237.16 / 233.30 |
+| 16 | 2.43 / 2.48 | 84.56 / 84.24 | 230.89 / 219.70 |
+| 21 | 2.23 / 3.16 | 89.21 / 84.74 | 237.99 / 238.24 |
+| Unlimited | 2.47 / 2.70 | 95.70 / 95.32 | 238.05 / 228.85 |
+
+| Longer comparison | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| Baseline / 21G | 2.24 / 2.41 | 89.22 / 88.24 | 217.10 / 210.15 |
+| Baseline / unlimited | 2.60 / 2.90 | 95.48 / 94.71 | 242.41 / 232.92 |
+| Baseline / 21G return | 2.74 / 3.04 | 86.86 / 85.45 | 250.35 / 241.73 |
+| Candidate / 21G | 2.82 / 2.60 | 86.48 / 87.54 | 243.92 / 235.39 |
+| Candidate / unlimited | 2.77 / 2.88 | 95.08 / 94.99 | 246.31 / 237.53 |
+| Candidate / 21G return | 2.95 / 2.85 | 85.84 / 86.30 | 254.31 / 243.03 |
+
+The candidate changes goodput by +25.7 / +7.7% at the first 21G point,
++6.4 / −0.9% unlimited, and +7.5 / −6.1% on return. The ascending candidate
+sweep still loses goodput under load: unlimited is 4.6% below its forward 3G
+peak and 14.5% below its reverse 21G peak. Run-order and controller variation
+remain substantial. These results establish neither a repeatable bidirectional
+gain nor a CPU ceiling, so the change remains outside production.
+
+At unlimited load, baseline/candidate TAP ingress drops are
+6388534 / 5967724 versus 6217682 / 6243524 SKBs; expired frames are
+23977 / 31843 versus 21831 / 38684; queue drops are 3120 / 73404 versus
+861 / 86703. ACK-buffer drops, included in those queue totals, are
+175 / 171 versus 357 / 364. Every point has zero admission pressure, socket
+overflow, inner UDP errors, corruption, duplicates, reordering and outer
+fragmentation. Counter units differ and cannot be summed into exact frame loss.
+
+The candidate passes 349 all-feature and 340 default-feature release tests,
+Clippy, formatting and 65 short kernel/integration tests. Regressions cover
+reverse completion order and per-packet inflight accounting, stale passes,
+changed limits, unused grants, PTO allowances, quantum limits, overflow and
+worker/group fairness. Full routed PMTU and Linux 7.0 checks were not repeated
+for this unadopted candidate.
+
+After these inconclusive scheduling experiments, work returns to the remaining
+stage-3 bounded recovery integration. Stage 5 must revisit profiling, the
+overload plateau and the original performance gates. Missing recovery does not
+explain away the current sender regression.
+
 ## Request fairness and burst-size experiments (November 7)
 
 Two normal-release sweeps use the ACK-pruning baseline, twenty-second points,

@@ -568,6 +568,13 @@ the same turn now applies the report and still hands off the next foreign permit
 The wider release sweep remains below 1% missing only through 2G offered per
 direction; unlimited forward goodput falls 17.2% from its 4G peak. The original
 throughput and overload gates remain open.
+Earlier completion publication and sharing one bounded grant pass across ready
+workers have now been measured in isolated normal-release builds. Neither
+establishes a repeatable bidirectional gain, so both remain outside production.
+BENCH.md retains their patches, loss/CPU data and limits. Continue bounded
+payload recovery, then return to sender profiling and all original performance
+gates in stage 5; no gate is waived and recovery is not the asserted cause of
+the current scheduling regression.
 
 The pure RTT estimator, loss-deadline calculation, PTO-period backoff and frame
 lifetime now live in `loss.rs`, with exact-value and boundary tests. ACK-driven

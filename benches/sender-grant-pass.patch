@@ -1,0 +1,712 @@
+--- a/src/pacing/grants.rs
++++ b/src/pacing/grants.rs
+@@ -17,7 +17,7 @@
+ }
+ 
+ impl Limits {
+-    fn burst(self) -> Result<u64, GrantError> {
++    pub(super) fn burst(self) -> Result<u64, GrantError> {
+         if !(1280..=9000).contains(&self.max_datagram) {
+             return Err(GrantError::Invalid);
+         }
+@@ -194,6 +194,19 @@
+         limits: Limits,
+         now: Duration,
+     ) -> Result<Grant, GrantError> {
++        self.reserve_inner(worker, bytes, probe, limits, now, false)
++    }
++
++    // Sender permits continuation only within one open, explicitly bounded pass.
++    pub(super) fn reserve_inner(
++        &mut self,
++        worker: usize,
++        bytes: u32,
++        probe: bool,
++        limits: Limits,
++        now: Duration,
++        continuing: bool,
++    ) -> Result<Grant, GrantError> {
+         let slot = self.workers.get(worker).ok_or(GrantError::Invalid)?;
+         let burst = limits.burst()?;
+         if bytes < 100 || (probe && bytes > 9000) {
+@@ -209,7 +222,7 @@
+             .ok_or(GrantError::Blocked)?;
+         if slot.is_some()
+             || limits.rate == 0
+-            || now < self.next_send
++            || (!continuing && now < self.next_send)
+             || reserved > burst
+             || (probe && self.probes == 0)
+             || (!probe && charged > limits.window)
+@@ -219,7 +232,7 @@
+         let next_id = self.next_id.checked_add(1).ok_or(GrantError::Exhausted)?;
+         let expires = now.checked_add(LIFETIME).ok_or(GrantError::Exhausted)?;
+         let nanos = (u64::from(bytes) * 1_000_000_000).div_ceil(limits.rate);
+-        let next_send = now
++        let next_send = (if continuing { self.next_send } else { now })
+             .checked_add(Duration::from_nanos(nanos))
+             .ok_or(GrantError::Exhausted)?;
+         let grant = Grant {
+--- a/src/pacing/sender.rs
++++ b/src/pacing/sender.rs
+@@ -233,6 +233,9 @@
+     #[allow(clippy::vec_box)]
+     reports: Vec<Box<Flight>>,
+     phase: Phase,
++    pass_id: u64,
++    pass_rate: u64,
++    pass_burst: u64,
+     sample_flight: u64,
+     planned: usize,
+     sent_bytes: u64,
+@@ -257,6 +260,8 @@
+     available: usize,
+     busy: u64,
+     workers: usize,
++    pass_id: u64,
++    pass_at: Duration,
+ }
+ 
+ impl Sender {
+@@ -283,6 +288,9 @@
+                 delivery: Delivery::new(),
+                 reports,
+                 phase: Phase::Open,
++                pass_id: 0,
++                pass_rate: 0,
++                pass_burst: 0,
+                 sample_flight: 0,
+                 planned: 0,
+                 sent_bytes: 0,
+@@ -340,6 +348,8 @@
+                 available: slots,
+                 busy: 0,
+                 workers,
++                pass_id: 0,
++                pass_at: Duration::ZERO,
+             },
+             flights.into_boxed_slice(),
+         ))
+@@ -399,6 +409,20 @@
+         limits: Limits,
+         now: Duration,
+     ) -> Result<(), GrantError> {
++        self.reserve_inner(group, flight, probe, limits, now, false)?;
++        self.groups[group].pass_id = 0;
++        Ok(())
++    }
++
++    fn reserve_inner(
++        &mut self,
++        group: usize,
++        flight: &mut Flight,
++        probe: bool,
++        limits: Limits,
++        now: Duration,
++        continuing: bool,
++    ) -> Result<(), GrantError> {
+         let state = self.groups.get_mut(group).ok_or(GrantError::Invalid)?;
+         if now < state.time {
+             return Err(GrantError::Invalid);
+@@ -441,9 +465,10 @@
+         {
+             return Err(GrantError::Exhausted);
+         }
+-        let grant = state
+-            .grants
+-            .reserve(flight.worker, bytes, probe, limits, now)?;
++        let grant =
++            state
++                .grants
++                .reserve_inner(flight.worker, bytes, probe, limits, now, continuing)?;
+         state.planned += flight.count;
+         if state.grants.reserved() == u64::from(bytes) {
+             state.sample_flight = state.grants.in_flight();
+@@ -514,7 +539,20 @@
+         Ok(())
+     }
+ 
+-    /// Reserves the largest fitting prefix; a rejected grant leaves the plan intact.
++    /// Begins one bounded owner request pass; later turns cannot reuse its pacing credit.
++    pub(crate) fn begin_grant_pass(&mut self, now: Duration) -> Result<u64, GrantError> {
++        if now < self.pass_at {
++            return Err(GrantError::Invalid);
++        }
++        let id = self.pass_id.checked_add(1).ok_or(GrantError::Exhausted)?;
++        self.pass_id = id;
++        self.pass_at = now;
++        Ok(id)
++    }
++
++    /// Splits one pacing burst across this pass's ready workers. A rejected grant
++    /// leaves the plan intact. Open epochs cannot consume reports, so outstanding
++    /// reservations also bound cumulative issued bytes; unused reports close the pass.
+     pub(crate) fn reserve_prefix(
+         &mut self,
+         group: usize,
+@@ -522,13 +560,27 @@
+         budget: u32,
+         probe: bool,
+         limits: Limits,
+-        now: Duration,
++        pass: u64,
+     ) -> Result<(), GrantError> {
++        if pass == 0 || pass != self.pass_id {
++            return Err(GrantError::Stale);
++        }
++        let state = self.groups.get(group).ok_or(GrantError::Invalid)?;
++        let burst = limits.burst()?;
++        let continuing = state.pass_id == pass;
++        if continuing && (state.pass_rate != limits.rate || state.pass_burst != burst) {
++            return Err(GrantError::Blocked);
++        }
+         let count = flight.count;
+         flight.truncate(budget)?;
+-        let result = self.reserve(group, flight, probe, limits, now);
++        let result = self.reserve_inner(group, flight, probe, limits, self.pass_at, continuing);
+         if result.is_err() {
+             flight.count = count;
++        } else {
++            let state = &mut self.groups[group];
++            state.pass_id = pass;
++            state.pass_rate = limits.rate;
++            state.pass_burst = burst;
+         }
+         result
+     }
+@@ -536,6 +588,7 @@
+     /// Stops new grants, including for an empty group needing pressure retirement.
+     pub fn close(&mut self, group: usize) -> Result<(), GrantError> {
+         let state = self.groups.get_mut(group).ok_or(GrantError::Invalid)?;
++        state.pass_id = 0;
+         if state.phase == Phase::Open {
+             state.phase = Phase::Closing;
+         }
+@@ -594,6 +647,7 @@
+         }
+         state.grants.reported(grant, bytes, flight.started)?;
+         state.sent_bytes += u64::from(bytes);
++        state.pass_id = 0;
+         state.phase = Phase::Closing;
+         for record in records.iter().skip(flight.successful) {
+             Self::release(
+@@ -699,6 +753,7 @@
+     /// Starts a new issuance epoch after the caller's bounded feedback pass.
+     pub fn reopen(&mut self, group: usize) -> Result<(), GrantError> {
+         let state = self.feedback(group, false)?;
++        state.pass_id = 0;
+         state.phase = Phase::Open;
+         state.planned = 0;
+         Ok(())
+@@ -999,6 +1054,7 @@
+                 bytes: 1280,
+             }))
+             .unwrap();
++        let pass = sender.begin_grant_pass(Duration::ZERO).unwrap();
+         sender
+             .reserve_prefix(
+                 0,
+@@ -1011,7 +1067,7 @@
+                     quantum: 4096,
+                     max_datagram: 1280,
+                 },
+-                Duration::ZERO,
++                pass,
+             )
+             .unwrap();
+         let grant = flight.grant().unwrap();
+@@ -1064,3 +1120,318 @@
+         assert_eq!(sender.available(), 4);
+     }
+ }
++
++#[cfg(test)]
++mod grant_pass_tests {
++    use super::*;
++
++    #[allow(clippy::vec_box)] // Exercise the movable buffers used by the worker queues.
++    fn setup(workers: usize) -> (Sender, Vec<Box<Flight>>, Limits) {
++        let (sender, flights) = Sender::new(1, workers, 64).unwrap();
++        let mut flights = flights.into_vec();
++        for flight in &mut flights {
++            let worker = flight.worker();
++            flight
++                .prepare(&[Planned {
++                    id: PacketId {
++                        session: 0,
++                        generation: 1,
++                        lane: worker as u16 + 1,
++                        number: 1,
++                    },
++                    bytes: 1280,
++                }])
++                .unwrap();
++        }
++        (
++            sender,
++            flights,
++            Limits {
++                window: 10_000,
++                rate: 1_000_000,
++                quantum: 2560,
++                max_datagram: 1280,
++            },
++        )
++    }
++
++    #[test]
++    fn one_pass_splits_the_cap_and_charges_every_byte_without_refund() {
++        let (mut sender, mut flights, limits) = setup(3);
++        let pass = sender.begin_grant_pass(Duration::ZERO).unwrap();
++        sender
++            .reserve_prefix(0, &mut flights[0], 1280, false, limits, pass)
++            .unwrap();
++        // Public reservation retains strict pacing even during an explicit pass.
++        assert_eq!(
++            sender.reserve(0, &mut flights[1], false, limits, Duration::ZERO),
++            Err(GrantError::Blocked)
++        );
++        sender
++            .reserve_prefix(0, &mut flights[1], 1280, false, limits, pass)
++            .unwrap();
++        assert_eq!(
++            sender.reserve_prefix(0, &mut flights[2], 1280, false, limits, pass),
++            Err(GrantError::Blocked)
++        );
++        assert_eq!(flights[2].packets().count(), 1);
++        assert_eq!(sender.flight_bytes(0), Some((2560, 0)));
++        let due = Duration::from_micros(2560);
++        assert_eq!(sender.deadline(0, Duration::ZERO), Some(due));
++        // Unused reports close issuance without rewinding reserved pacing time.
++        let mut unused = flights.remove(1);
++        unused.complete(0, None, false).unwrap();
++        sender.reported(unused).unwrap();
++        assert_eq!(
++            sender.reserve_prefix(0, &mut flights[1], 1280, false, limits, pass),
++            Err(GrantError::Blocked)
++        );
++        let mut sent = flights.remove(0);
++        sent.complete(1, Some(Duration::ZERO), false).unwrap();
++        sender.reported(sent).unwrap();
++        while sender.advance(0, 64).unwrap().is_some() {}
++        sender.reopen(0).unwrap();
++        assert_eq!(sender.deadline(0, Duration::ZERO), Some(due));
++        assert_eq!(
++            sender.reserve_prefix(0, &mut flights[0], 1280, false, limits, pass),
++            Err(GrantError::Blocked)
++        );
++        let fresh = sender.begin_grant_pass(Duration::from_secs(1)).unwrap();
++        sender
++            .reserve_prefix(0, &mut flights[0], 1280, false, limits, fresh)
++            .unwrap();
++        assert_eq!(
++            sender.deadline(0, Duration::from_secs(1)),
++            Some(Duration::from_secs(1) + Duration::from_micros(1280))
++        );
++    }
++
++    #[test]
++    fn pass_identity_and_changed_limits_cannot_create_extra_credit() {
++        let (mut sender, mut flights, limits) = setup(3);
++        let pass = sender.begin_grant_pass(Duration::ZERO).unwrap();
++        sender
++            .reserve_prefix(0, &mut flights[0], 1280, false, limits, pass)
++            .unwrap();
++        for changed in [
++            Limits { rate: 0, ..limits },
++            Limits {
++                rate: limits.rate / 2,
++                ..limits
++            },
++            Limits {
++                rate: limits.rate * 2,
++                ..limits
++            },
++            Limits {
++                quantum: limits.quantum * 2,
++                ..limits
++            },
++            Limits {
++                quantum: limits.quantum / 2,
++                ..limits
++            },
++            Limits {
++                window: 1280,
++                ..limits
++            },
++        ] {
++            assert_eq!(
++                sender.reserve_prefix(0, &mut flights[1], 1280, false, changed, pass),
++                Err(GrantError::Blocked)
++            );
++            assert_eq!(sender.flight_bytes(0), Some((1280, 0)));
++            assert!(flights[1].handle(0).is_none());
++        }
++        sender
++            .reserve_prefix(0, &mut flights[1], 1280, false, limits, pass)
++            .unwrap();
++        let next = sender.begin_grant_pass(Duration::ZERO).unwrap();
++        assert_eq!(
++            sender.reserve_prefix(0, &mut flights[2], 1280, false, limits, pass),
++            Err(GrantError::Stale)
++        );
++        assert_eq!(
++            sender.reserve_prefix(0, &mut flights[2], 1280, false, limits, next),
++            Err(GrantError::Blocked)
++        );
++    }
++
++    #[test]
++    fn zero_success_closure_cannot_reuse_pass_after_reopen() {
++        let (mut sender, mut flights, limits) = setup(2);
++        let pass = sender.begin_grant_pass(Duration::ZERO).unwrap();
++        sender
++            .reserve_prefix(0, &mut flights[0], 1280, false, limits, pass)
++            .unwrap();
++        let mut flight = flights.remove(0);
++        flight.complete(0, None, false).unwrap();
++        sender.reported(flight).unwrap();
++        sender.advance(0, 64).unwrap().unwrap();
++        sender.reopen(0).unwrap();
++        assert_eq!(sender.flight_bytes(0), Some((0, 0)));
++        assert_eq!(
++            sender.reserve_prefix(0, &mut flights[0], 1280, false, limits, pass),
++            Err(GrantError::Blocked)
++        );
++        let next = sender.begin_grant_pass(Duration::ZERO).unwrap();
++        assert_eq!(
++            sender.reserve_prefix(0, &mut flights[0], 1280, false, limits, next),
++            Err(GrantError::Blocked)
++        );
++        let next = sender
++            .begin_grant_pass(Duration::from_micros(1280))
++            .unwrap();
++        sender
++            .reserve_prefix(0, &mut flights[0], 1280, false, limits, next)
++            .unwrap();
++    }
++
++    #[test]
++    fn simultaneous_grants_commit_reverse_reports_in_physical_send_order() {
++        for equal_time in [false, true] {
++            let (mut sender, mut flights, limits) = setup(2);
++            let pass = sender.begin_grant_pass(Duration::ZERO).unwrap();
++            for flight in &mut flights {
++                sender
++                    .reserve_prefix(0, flight, 1280, false, limits, pass)
++                    .unwrap();
++            }
++            let packets: Vec<_> = flights
++                .iter()
++                .map(|f| (f.packets().next().unwrap().id, f.handle(0).unwrap()))
++                .collect();
++            let first = if equal_time { 0 } else { 1 };
++            let mut second = flights.pop().unwrap();
++            second
++                .complete(1, Some(Duration::from_micros(10)), false)
++                .unwrap();
++            sender.reported(second).unwrap();
++            let mut first_grant = flights.pop().unwrap();
++            first_grant
++                .complete(
++                    1,
++                    Some(Duration::from_micros(if equal_time { 10 } else { 20 })),
++                    false,
++                )
++                .unwrap();
++            sender.reported(first_grant).unwrap();
++            for (ordinal, index) in [first, 1 - first].into_iter().enumerate() {
++                assert_eq!(sender.advance(0, 1).unwrap().unwrap().worker(), index);
++                // ACKs wait until every simultaneous flight's samples commit.
++                if ordinal == 0 {
++                    assert!(!sender.feedback_ready(0));
++                }
++            }
++            for (ordinal, index) in [first, 1 - first].into_iter().enumerate() {
++                sender
++                    .begin_ack(0, Duration::from_micros(100 + ordinal as u64), false)
++                    .unwrap();
++                sender
++                    .acknowledged(0, packets[index].0, packets[index].1)
++                    .unwrap();
++                let sample = sender.finish_ack(0, Duration::ZERO).unwrap().unwrap();
++                assert_eq!(sample.last_packet, ordinal as u64 + 1);
++                assert_eq!(sample.tx_in_flight, (ordinal as u64 + 1) * 1280);
++                assert_eq!(sample.newly_acked, 1280);
++            }
++            assert_eq!(sender.flight_bytes(0), Some((0, 0)));
++        }
++    }
++
++    #[test]
++    fn same_pass_probes_bypass_only_window_and_share_two_allowances() {
++        let (mut sender, mut flights, mut limits) = setup(3);
++        limits.window = 0;
++        limits.quantum = 3840;
++        sender.probe_allowance(0, 2).unwrap();
++        let pass = sender.begin_grant_pass(Duration::ZERO).unwrap();
++        assert_eq!(
++            sender.reserve_prefix(0, &mut flights[0], 1280, false, limits, pass),
++            Err(GrantError::Blocked)
++        );
++        for flight in &mut flights[..2] {
++            sender
++                .reserve_prefix(0, flight, 1280, true, limits, pass)
++                .unwrap();
++            assert!(flight.grant().unwrap().is_probe());
++        }
++        assert_eq!(
++            sender.reserve_prefix(0, &mut flights[2], 1280, true, limits, pass),
++            Err(GrantError::Blocked)
++        );
++        assert_eq!(sender.flight_bytes(0), Some((2560, 0)));
++        assert_eq!(
++            sender.deadline(0, Duration::ZERO),
++            Some(Duration::from_micros(2560))
++        );
++    }
++
++    #[test]
++    fn multiple_workers_fill_exact_quantum_without_consuming_the_leftover_request() {
++        let (mut sender, mut flights, mut limits) = setup(4);
++        limits.window = 1_000_000;
++        limits.quantum = 65_536;
++        limits.max_datagram = 9000;
++        let pass = sender.begin_grant_pass(Duration::ZERO).unwrap();
++        for flight in &mut flights[..2] {
++            let origin = flight.origin;
++            flight
++                .prepare(&std::array::from_fn::<_, 4, _>(|index| Planned {
++                    id: PacketId {
++                        number: index as u64 + 1,
++                        ..origin
++                    },
++                    bytes: 8192,
++                }))
++                .unwrap();
++            sender
++                .reserve_prefix(0, flight, 32_768, false, limits, pass)
++                .unwrap();
++        }
++        assert_eq!(sender.flight_bytes(0), Some((65_536, 0)));
++        assert_eq!(
++            sender.reserve_prefix(0, &mut flights[2], 1280, false, limits, pass),
++            Err(GrantError::Blocked)
++        );
++        assert_eq!(flights[2].packets().count(), 1);
++        assert_eq!(
++            sender.deadline(0, Duration::ZERO),
++            Some(Duration::from_micros(65_536))
++        );
++    }
++
++    #[test]
++    fn pass_clock_identity_and_continuation_overflow_reject_atomically() {
++        let (mut sender, mut flights, mut limits) = setup(2);
++        let now = Duration::MAX - Duration::from_micros(100);
++        let pass = sender.begin_grant_pass(now).unwrap();
++        assert_eq!(
++            sender.begin_grant_pass(Duration::ZERO),
++            Err(GrantError::Invalid)
++        );
++        assert_eq!(sender.pass_id, pass);
++        assert_eq!(sender.pass_at, now);
++        limits.quantum = 12_000;
++        limits.window = 12_000;
++        limits.rate = 100_000_000;
++        for flight in &mut flights {
++            flight.records[0].bytes = 6000;
++        }
++        sender
++            .reserve_prefix(0, &mut flights[0], 6000, false, limits, pass)
++            .unwrap();
++        let due = sender.groups[0].grants.deadline(now);
++        assert_eq!(
++            sender.reserve_prefix(0, &mut flights[1], 6000, false, limits, pass),
++            Err(GrantError::Exhausted)
++        );
++        assert_eq!(sender.flight_bytes(0), Some((6000, 0)));
++        assert_eq!(sender.groups[0].grants.deadline(now), due);
++        assert!(flights[1].handle(0).is_none());
++        sender.pass_id = u64::MAX;
++        assert_eq!(sender.begin_grant_pass(now), Err(GrantError::Exhausted));
++        assert_eq!(sender.pass_id, u64::MAX);
++        assert_eq!(sender.pass_at, now);
++    }
++}
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -488,6 +488,10 @@
+                     .map_or(self.reclaim_due, |due| due.min(self.reclaim_due)),
+             );
+         }
++        let pass = self
++            .sender
++            .begin_grant_pass(now)
++            .map_err(io::Error::other)?;
+         let mut granted_next = None;
+         for _ in 0..self.requests.len().min(BATCH_SIZE) {
+             if work == 0 || outgoing.len() == outgoing.capacity() {
+@@ -582,7 +586,7 @@
+                 bytes,
+                 request.probe.is_some(),
+                 limits,
+-                now,
++                pass,
+             );
+             match result {
+                 Ok(()) => {
+@@ -1608,21 +1612,23 @@
+     use super::*;
+ 
+     fn request(mut flight: Box<Flight>, number: u64, group: usize) -> Request {
+-        flight
+-            .prepare(&[pacing::Planned {
+-                id: PacketId {
+-                    session: group,
+-                    generation: 1,
+-                    lane: if group == 0 {
+-                        flight.worker() as u16 + 1
+-                    } else {
+-                        1
+-                    },
+-                    number,
+-                },
+-                bytes: 1280,
+-            }])
+-            .unwrap();
++        let lane = if group == 0 {
++            flight.worker() as u16 + 1
++        } else {
++            1
++        };
++        // Fill the initial ten-datagram window so this remains a fairness test
++        // between passes even when short requests can share one pass.
++        let packets = std::array::from_fn::<_, 10, _>(|offset| pacing::Planned {
++            id: PacketId {
++                session: group,
++                generation: 1,
++                lane,
++                number: number + offset as u64,
++            },
++            bytes: 1280,
++        });
++        flight.prepare(&packets).unwrap();
+         Request {
+             flight,
+             group,
+@@ -1642,7 +1648,8 @@
+             owner.request(request(flight, 1, 0)).unwrap();
+         }
+         let mut outgoing = VecDeque::with_capacity(16);
+-        let mut next = [2, 2];
++        assert_eq!(owner.groups[0].controller.limits().window, 10 * 1280);
++        let mut next = [11, 11];
+         let mut selected = Vec::new();
+         let mut now = Duration::ZERO;
+         for _ in 0..6 {
+@@ -1662,7 +1669,7 @@
+             assert_eq!(origin, worker);
+             assert!(outgoing.is_empty());
+             owner.request(request(flight, next[worker], 0)).unwrap();
+-            next[worker] += 1;
++            next[worker] += 10;
+             now = owner.sender.deadline(0, now).unwrap();
+         }
+         assert_eq!(selected, [0, 1, 0, 1, 0, 1]);
+@@ -1680,7 +1687,13 @@
+             owner.request(request(flight, 1, group)).unwrap();
+         }
+         let mut outgoing = VecDeque::with_capacity(16);
+-        let mut next = [2; 3];
++        assert!(
++            owner
++                .groups
++                .iter()
++                .all(|group| group.controller.limits().window == 10 * 1280)
++        );
++        let mut next = [11; 3];
+         let mut seen = 0;
+         let mut now = Duration::ZERO;
+         for round in 0..6 {
+@@ -1703,7 +1716,7 @@
+                 owner
+                     .request(request(flight, next[worker], usize::from(worker == 2)))
+                     .unwrap();
+-                next[worker] += 1;
++                next[worker] += 10;
+             }
+             now = (0..2)
+                 .filter_map(|group| owner.sender.deadline(group, now))
+@@ -1788,3 +1801,60 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod grant_pass_tests {
++    use super::*;
++
++    #[test]
++    fn ready_workers_share_one_quantum_in_a_single_request_pass() {
++        let (mut owner, flights) =
++            Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)], Duration::ZERO).unwrap();
++        owner.timers.install(0, 1).unwrap();
++        for mut flight in flights.into_vec() {
++            flight
++                .prepare(&[pacing::Planned {
++                    id: PacketId {
++                        session: 0,
++                        generation: 1,
++                        lane: flight.worker() as u16 + 1,
++                        number: 1,
++                    },
++                    bytes: 1280,
++                }])
++                .unwrap();
++            owner
++                .request(Request {
++                    flight,
++                    group: 0,
++                    deadline: Duration::from_millis(100),
++                    probe: None,
++                    pmtu: false,
++                    mtu: 1280,
++                })
++                .unwrap();
++        }
++        let limits = owner.groups[0].controller.limits();
++        assert!(limits.quantum >= 2560 && limits.window >= 2560);
++        let mut outgoing = VecDeque::with_capacity(16);
++        owner.advance(Duration::ZERO, &mut outgoing).unwrap();
++        assert_eq!(
++            outgoing.len(),
++            2,
++            "short requests did not share the available quantum"
++        );
++        for worker in 0..2 {
++            let (destination, Message::Permit(flight)) = outgoing.pop_front().unwrap() else {
++                panic!("missing send permission");
++            };
++            assert_eq!(destination, worker);
++            assert_eq!(flight.grant().unwrap().bytes(), 1280);
++        }
++        assert_eq!(owner.sender.flight_bytes(0), Some((2560, 0)));
++        let service = (1280_u64 * 1_000_000_000).div_ceil(limits.rate);
++        assert_eq!(
++            owner.sender.deadline(0, Duration::ZERO),
++            Some(Duration::from_nanos(2 * service))
++        );
++    }
++}
+--- a/initial-design.md
++++ b/initial-design.md
+@@ -328,6 +328,8 @@
+ 
+ When a grant submits its entire permitted prefix, retain the prepared but never-attempted suffix with its original packet numbers, payload spans and reservations. Keep payload source slots stable until that suffix is consumed or discarded. After the flight buffer returns and no request or grant owns the plan, compact consumed metadata and append waiting frames within the existing frame, datagram, byte and turn budgets. Preserve every retained packet's bytes and length; append new datagrams rather than extending its final packet. Defer refill across allocator gaps so each request retains consecutive packet identities. A partial or failed socket attempt discards the remaining plan and retries unsent frame ranges with fresh numbers. Expiry, PMTU shrink and connection retirement cancel every reservation belonging to a discarded plan. Control packets that overtake a retained plan require fresh identities before DATA submission; canceled numbers are never reused.
+ 
++One bounded owner request pass may split its available burst across ready workers at the same issuance timestamp. Its first grant must meet the ordinary pacing deadline; each additional grant appends its reserved bytes' service time to that deadline. All grants share the existing quantum, window and metadata limits. Continuation requires the same pacing rate and burst cap and ends on the next owner pass or any issuance closure, including an unused completion. Delayed owner turns cannot bank missed service time, and unused reports never rewind the schedule.
++
+ Initially pace in userspace using monotonic deadlines and `timerfd`, without requiring an `fq` qdisc or host networking changes. Workers send only with current grants. Cap the combined outstanding burst allowance at the smaller of BBR's send quantum and 64 maximum-size datagrams, spread across workers; GSO aggregates obey that limit too. Timestamp at successful nonblocking socket submission and bound queued socket work. This is a testable baseline; kernel pacing remains a measured optimization. [S11]
+ 
+ ACK-only and PROBE_REPLY traffic can proceed without data-window credit to avoid feedback deadlock, but share a separate 4 MiB/s ceiling per path group with a 16-datagram burst. Coalesce pending ACKs and discard stale feedback when bounded queues fill; do not invent delivery progress. Handshake messages use the per-session one-per-second retry/reply limits and this same control ceiling. This is a ceiling, not a fixed send rate. All these bytes remain visible in counters. Worker/controller scheduling must give bounded service to feedback, fresh frames, and repairs; sender queue expiry drops whole unsent frames where possible.
