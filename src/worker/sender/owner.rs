@@ -386,7 +386,14 @@ impl Owner {
             }
             let group = self.cursor;
             self.cursor = (self.cursor + 1) % self.groups.len();
-            if let Some(flight) = self.sender.advance(group, work).map_err(io::Error::other)? {
+            while work != 0 && outgoing.len() < outgoing.capacity() {
+                let Some(flight) = self.sender.advance(group, work).map_err(io::Error::other)?
+                else {
+                    if self.sender.commit_pending(group) {
+                        work = 0;
+                    }
+                    break;
+                };
                 let count = flight.packets().len();
                 work = work.saturating_sub(count.max(1));
                 if let Some(packet) = flight.packets().next() {
@@ -401,24 +408,27 @@ impl Owner {
                 }
                 outgoing.push_back((flight.worker(), Message::Recycle(flight)));
                 more = true;
-            } else if self.sender.commit_pending(group) {
-                work = 0;
             }
             more |= self.sender.commit_pending(group);
             if self.sender.feedback_ready(group) {
-                let active = self.groups[group].ack;
-                let candidate = self.reports.iter().position(|report| {
-                    report.group == group
-                        && active.is_none_or(|id| id == (report.origin, report.id))
-                });
-                if let Some(index) =
-                    candidate.filter(|_| work != 0 && outgoing.len() < outgoing.capacity())
-                {
+                while work != 0 && outgoing.len() < outgoing.capacity() {
+                    let active = self.groups[group].ack;
+                    let Some(index) = self.reports.iter().position(|report| {
+                        report.group == group
+                            && active.is_none_or(|id| id == (report.origin, report.id))
+                    }) else {
+                        break;
+                    };
+                    let cost = self.reports[index].count.max(1);
+                    if cost > work {
+                        more = true;
+                        break;
+                    }
                     let report = self
                         .reports
                         .remove(index)
                         .ok_or(io::ErrorKind::InvalidData)?;
-                    work = work.saturating_sub(report.count.max(1));
+                    work -= cost;
                     self.apply_report(&report, now)?;
                     outgoing.push_back((report.origin, Message::ReportReturn(report)));
                     more = true;
@@ -1425,5 +1435,119 @@ mod blocked_prefix_regression {
             panic!()
         };
         assert_eq!(flight.packets().len(), 16);
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::ack::AckProgress;
+
+    fn ready(count: usize) -> Owner {
+        let (mut owner, flights) = Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)]).unwrap();
+        owner.timers.install(0, 1).unwrap();
+        let limits = pacing::Limits {
+            window: 1_000_000,
+            rate: 1_000_000_000_000,
+            quantum: 20_480,
+            max_datagram: 1280,
+        };
+        let mut completed = Vec::new();
+        for (worker, mut flight) in flights.into_vec().into_iter().enumerate() {
+            let planned: Vec<_> = (1..=count)
+                .map(|number| pacing::Planned {
+                    id: PacketId {
+                        session: 0,
+                        generation: 1,
+                        lane: worker as u16 + 1,
+                        number: number as u64,
+                    },
+                    bytes: 100,
+                })
+                .collect();
+            flight.prepare(&planned).unwrap();
+            let at = Duration::from_micros(worker as u64);
+            owner
+                .sender
+                .reserve(0, &mut flight, false, limits, at)
+                .unwrap();
+            let mut report = Box::new(Report::new(worker));
+            report.id = PacketId {
+                number: 0,
+                ..planned[0].id
+            };
+            report.count = count;
+            report.kind = ReportKind::Ack {
+                received: Duration::from_millis(1),
+                delay_us: 0,
+                first: true,
+                end: Some(AckProgress {
+                    packets: count as u32,
+                    eliciting: true,
+                    released_bytes: count as u64 * 100,
+                    rtt_sent_at: Some(at),
+                }),
+            };
+            for (index, entry) in report.entries[..count].iter_mut().enumerate() {
+                *entry = Entry {
+                    number: index as u64 + 1,
+                    sample: flight.handle(index),
+                    settled: true,
+                };
+            }
+            flight.complete(count, Some(at), false).unwrap();
+            completed.push((flight, report));
+        }
+        for (flight, report) in completed.into_iter().rev() {
+            owner.complete(flight).unwrap();
+            owner.report(report).unwrap();
+        }
+        owner
+    }
+
+    #[test]
+    fn one_turn_drains_ready_flights_and_terminal_acks_with_available_budget() {
+        let mut owner = ready(2);
+        let mut outgoing = VecDeque::with_capacity(16);
+        owner
+            .advance(Duration::from_millis(1), &mut outgoing)
+            .unwrap();
+        assert_eq!(outgoing.len(), 4);
+        assert!(matches!(outgoing[0].1, Message::Recycle(_)));
+        assert!(matches!(outgoing[1].1, Message::Recycle(_)));
+        assert!(matches!(outgoing[2].1, Message::ReportReturn(_)));
+        assert!(matches!(outgoing[3].1, Message::ReportReturn(_)));
+        assert_eq!(owner.sender.flight_bytes(0), Some((0, 0)));
+        assert!(!owner.sender.feedback_ready(0));
+        assert_eq!(owner.timers.earliest(0), None);
+    }
+
+    #[test]
+    fn ready_reports_do_not_overrun_remaining_turn_budget() {
+        let mut owner = ready(31);
+        let mut outgoing = VecDeque::with_capacity(16);
+        owner
+            .advance(Duration::from_millis(1), &mut outgoing)
+            .unwrap();
+        assert_eq!(outgoing.len(), 2);
+        assert!(
+            outgoing
+                .iter()
+                .all(|(_, message)| matches!(message, Message::Recycle(_)))
+        );
+        assert_eq!(owner.sender.flight_bytes(0), Some((0, 6200)));
+        assert!(owner.sender.feedback_ready(0));
+        outgoing.clear();
+        owner
+            .advance(Duration::from_millis(1), &mut outgoing)
+            .unwrap();
+        assert_eq!(outgoing.len(), 2);
+        assert!(
+            outgoing
+                .iter()
+                .all(|(_, message)| matches!(message, Message::ReportReturn(_)))
+        );
+        assert_eq!(owner.sender.flight_bytes(0), Some((0, 0)));
+        assert!(!owner.sender.feedback_ready(0));
     }
 }

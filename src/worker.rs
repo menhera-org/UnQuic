@@ -962,6 +962,7 @@ impl Worker {
             self.flush_taps(now)?;
             self.collect_acks(now)?;
             self.flush_control(now)?;
+            more |= self.flush_sender_messages(now)?;
             self.flush_notifications()?;
             more |= self.ready.iter().copied().any(|(session, lane)| {
                 let tx = &self.transmit[self.shared.config.peer_for_session(session).unwrap()]

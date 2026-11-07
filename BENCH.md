@@ -181,6 +181,19 @@ approximate observations at coordinator visits, not exact phase-transition
 measurements. The diagnostic builds' hashes were not captured, so these points
 are exploratory evidence and do not replace the normal release acceptance sweep.
 
+Adding bounded coordinator draining and end-of-turn message handoff to the
+instrumented prefix fix delivered 1.07 / 1.13 and 1.11 / 1.06 Gbit/s in two
+more matched points. Missing fractions were 94.67 / 94.36% and 94.51 / 94.68%;
+daemon CPU was 186.17 / 181.79% and 186.19 / 183.06%.
+The linked diagnostic file records these observations and this build's hash.
+The coordinator previously processed only one completed flight and one report
+per group per turn, even with work budget remaining. It now drains ready work
+within the same 64-unit budget; reports that cannot fit wait for the next turn.
+Requests and completions also reach handoff queues before the notification flush
+in the turn that creates them. Two regressions verify draining and budget limits.
+The measurements combine these scheduling changes and do not isolate their
+individual gains. The throughput target remains unmet.
+
 The verified facts are low delivered throughput, low CPU utilization and heavy
 upstream dropping/expiry. Grant and feedback serialization, congestion-window
 behavior and worker wakeups need attribution. Missing repair alone does not
