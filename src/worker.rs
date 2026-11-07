@@ -2676,7 +2676,14 @@ impl Worker {
                 batch.repair_next = !batch.repair;
             }
 
-            while visited < BATCH_SIZE {
+            // Stop refill so a waiting opposite class reaches the empty-batch switch.
+            let fill = batch.len == 0
+                || if batch.repair {
+                    batch.pending.is_empty()
+                } else {
+                    batch.repairs.is_empty()
+                };
+            while fill && visited < BATCH_SIZE {
                 let queue = if batch.repair {
                     &mut batch.repairs
                 } else {

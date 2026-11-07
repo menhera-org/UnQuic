@@ -41,10 +41,10 @@
     "session_cookie": "00112233-4455-4677-8899-aabbccddeeff"
   },
   "notes": [
-    "Same nine-point20-second ascending and three-point60-second21G/unlimited/21G profile as tap-runtime-recovery.json. No concurrent builds or tests.",
+    "Same nine-point, twenty-second ascending and three-point, sixty-second 21G/unlimited/21G profile as tap-runtime-recovery.json. No concurrent builds or tests.",
     "Two regression tests fail on d9867fa and pass with the source-deadline change; old materialization work on expired sources is reproducible.",
-    "No general throughput gain is established. The60-second candidate unlimited point is slower than the prior recovery build.",
-    "The60-second unlimited point has13 inner UDP receive-buffer errors at the right receiver. All other inner error deltas are zero. Outer errors and fragmentation remain zero.",
+    "No general throughput gain is established. The sixty-second candidate unlimited point is slower than the prior recovery build.",
+    "The sixty-second unlimited point has thirteen inner UDP receive-buffer errors at the right receiver. All other inner error deltas are zero. Outer errors and fragmentation remain zero.",
     "Complete-frame reordering is recorded; no corrupt, duplicate, wrong-run or too-old inner records were observed.",
     "Admission pressure, sender/receiver expiry and queue drops remain. Counter units differ; expiry does not imply missing peer TAP delivery."
   ],

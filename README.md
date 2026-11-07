@@ -302,8 +302,10 @@ A byte-by-byte reference model and boundary tests verify transitions. Packer and
 reassembly tests lose every possible original piece and its first repair, then
 verify one complete delivery after the second repair. Workers retain source
 views until acknowledgment, expiry or connection retirement. Fresh and repair
-batches share scheduling turns; half the bounded journal capacity is reserved
-for repairs so fresh traffic cannot consume every mapping.
+batches alternate when both have work. Once the opposite class waits, stop
+refilling the current batch and drain its existing frames before switching;
+continuous arrivals cannot postpone the switch indefinitely. Half the bounded
+journal capacity is reserved for repairs.
 Recovery storage counts toward `memory_limit`; configurations with many sessions
 or lanes may require an explicit higher ceiling. Startup rejects an oversized
 configuration instead of silently reducing its quotas. A release runtime

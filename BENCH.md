@@ -31,7 +31,9 @@ The recovery build regresses further: the matched sixty-second unlimited run
 falls from 2.38 / 2.50 to 2.16 / 1.79 Gbit/s and introduces admission pressure.
 Its ascending sweep falls 21.9 / 14.4% from peak to unlimited. Moving deadline
 checks before source expansion does not restore throughput: the next
-sixty-second unlimited point delivers 1.78 / 1.68 Gbit/s.
+sixty-second unlimited point delivers 1.78 / 1.68 Gbit/s. The subsequent
+fresh/repair fairness fix reaches 2.07 / 1.70 unlimited, with admission pressure
+and overload declines still present.
 PMTU discovery is active in the latest rate sweeps and
 passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
 Missing recovery or congestion control does not explain away the remaining
@@ -63,7 +65,7 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | After the source-deadline fix, sixty-second QinQ sweep: 1.90 / 1.81 Gbit/s paced, 1.78 / 1.68 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe integration regression; paced missing fractions are 90.91 / 91.31%. The recovery ascending sweep stays under 1% missing in both directions only at 0.5G offered. Five successful 20G repeats remain unmet. |
+| At least 20 Gbit/s each way at inner MTU 1500 | After the batch-fairness fix, sixty-second QinQ sweep: 2.04 / 1.73 Gbit/s paced, 2.07 / 1.70 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe integration regression; paced missing fractions are 90.20 / 91.69%. The recovery ascending sweep stays under 1% missing in both directions only at 0.5G offered. Five successful 20G repeats remain unmet. |
 | Goodput must plateau under excess traffic | The recovery ascending sweep falls 21.9 / 14.4% from its 21G peak under unlimited load. Its sixty-second repeat rises under unlimited load, but remains slower than the matched baseline and uses only about 2.1–2.3 cores per daemon | No stable plateau or CPU ceiling is established. Source-expiry work, incomplete reassembly and grant/feedback scheduling require separate attribution. |
 | Small-frame overload must remain efficient | Earlier pre-recovery tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
@@ -228,6 +230,55 @@ Further source inspection identifies a separate starvation path: class selection
 runs only when a transmit batch becomes empty. Continuous refill can keep a
 fresh batch nonempty while repairs wait, or vice versa. This needs its own
 regression and controlled measurement; the deadline results do not isolate it.
+
+## Bound fresh/repair batch service (November 7)
+
+Continuous refill could keep a fresh batch nonempty forever, preventing queued
+repairs from being selected. The same problem affected fresh frames behind
+continuous repairs. A worker regression reproduces the fresh-data case on
+`34c43c4`: after 129 actual UDP transmissions, the waiting repair has not
+been submitted. The fix stops refilling a nonempty batch while the opposite
+class waits. Existing frames, live plans and partial-grant suffixes drain before
+the normal class switch.
+
+The regression now passes in both directions, with zero expiry or grant
+cancellation. The change passes 344 all-feature and 335 default release tests,
+Clippy, formatting, 23 sender kernel tests and the end-to-end two-loss/late-original
+recovery test. No buffer, deadline or grant limit was enlarged.
+
+[Twelve release observations](benches/tap-repair-fairness.json) retain the same
+QinQ profile. The defect is reproduced and fixed, but throughput remains far
+below target and the measurements establish no general performance gain.
+
+| Requested Gbit/s each way, 20 seconds | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| 0.5 | 0.49 / 0.49 | 0.95 / 0.87 | 51.43 / 48.18 |
+| 1 | 0.97 / 0.98 | 1.79 / 0.92 | 101.04 / 93.42 |
+| 2 | 1.93 / 1.94 | 2.65 / 1.83 | 200.15 / 180.69 |
+| 3 | 1.83 / 1.78 | 37.89 / 40.02 | 218.89 / 203.21 |
+| 4 | 2.18 / 1.83 | 44.54 / 53.57 | 229.99 / 219.89 |
+| 8 | 2.09 / 1.66 | 73.40 / 79.00 | 224.85 / 213.86 |
+| 16 | 2.22 / 1.85 | 85.89 / 88.21 | 229.75 / 221.83 |
+| 21 | 2.31 / 1.68 | 88.84 / 91.86 | 230.05 / 218.07 |
+| Unlimited | 2.08 / 1.79 | 96.39 / 96.84 | 223.96 / 213.91 |
+
+| Requested Gbit/s each way, 60 seconds | Delivered Gbit/s | Missing after drain % | Daemon CPU % | Admission pressure L/R |
+| --- | ---: | ---: | ---: | ---: |
+| 21 | 2.04 / 1.73 | 90.20 / 91.69 | 223.43 / 217.39 | 34,645 / 10,745 |
+| Unlimited | 2.07 / 1.70 | 96.44 / 96.98 | 222.66 / 214.68 | 43,811 / 8,259 |
+| 21 return | 2.14 / 1.74 | 89.75 / 91.68 | 228.39 / 217.55 | 50,609 / 10,386 |
+
+Unlimited goodput in the ascending sweep is 10.0 / 8.0% below each direction's
+peak. The sixty-second unlimited point submits 979 / 126 repair DATA records,
+versus 136 / 81 in the preceding source-deadline run, but admission pressure
+remains high. All twelve points have zero socket overflow, inner UDP receive
+errors, corrupt or duplicate inner frames and outer fragmentation. Complete-frame
+reordering and per-worker drop counters are retained in the JSON.
+
+The daemon SHA-256 is
+`1b647b8e47a5ed3b363cfd40a1fd39bf748607f7b93d0392df259bb09d8d012b`.
+A separate review found that continuous ACK admission can defer ordinary loss
+scans. That hypothesis needs a distinct regression and measurement.
 
 ## Sender integration verification (November 7)
 

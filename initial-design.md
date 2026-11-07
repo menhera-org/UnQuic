@@ -289,6 +289,9 @@ Initially allocate 32 journal mappings per actual frame slot, reserving half
 for repairs. This is a bounded capacity policy, not a guarantee for every
 fragmentation pattern. Pressure delays fresh work while ready repairs retain
 service; all work still obeys the original frame deadline and pacing limits.
+When both fresh and repair queues have work, alternate bounded batches. Stop
+refilling a nonempty batch while the opposite class waits, preserving its live
+plan, partial-frame suffix and grant identity until it drains.
 Charge coverage, journal heads, mappings and queues to the existing transport
 memory ceiling. Refuse oversized configurations rather than silently changing
 their requested lane counts, quotas or memory limit.

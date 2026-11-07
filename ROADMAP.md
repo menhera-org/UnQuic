@@ -625,13 +625,15 @@ ACKs, loss and retirement update coverage before the sampler can recycle handles
 Fresh batches leave half the journal capacity for repairs. Coverage work and
 frame cleanup yield under separate fixed budgets. Partial sends settle only the
 successful prefix, and late ACKs invalidate obsolete repair selections.
+A batch stops admitting new frames while the opposite fresh/repair queue waits,
+so continuous refill cannot starve that queue. Existing plans and partial-grant
+suffixes drain before the normal class alternation.
 Sender deadlines use four smoothed RTTs, clamped to 20–100 ms, without extending
 the original read deadline. The transmit owner sets that deadline once before
 source admission; all expanded children inherit it. Overdue GSO sources discard
 remaining children in bulk before expansion or checksum work. Worker regressions
 cover mapping pressure, bounded report processing, partial sends and late-ACK
-cancellation. A bidirectional
-release runtime test drops the original prefix and first repair, verifies
+cancellation. A bidirectional release runtime test drops the original prefix and first repair, verifies
 second-repair delivery, then replays late originals without duplication or
 hot-path allocation. Sustained impaired-path throughput remains unverified.
 The current transmit store now indexes exact deadlines in a fixed-capacity heap

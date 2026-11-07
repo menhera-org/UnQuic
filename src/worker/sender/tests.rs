@@ -1681,3 +1681,118 @@ fn mapping_pressure_preserves_fresh_fifo_and_leaves_reserved_space_for_repair() 
         Some(first)
     );
 }
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn continuous_backlog_cannot_starve_the_opposite_frame_class() {
+    fn enqueue(worker: &mut Worker, repair: bool) -> u64 {
+        queue_frame(worker, 1514);
+        let batch = worker.sessions[0].batches[1].as_ref().unwrap();
+        let slot = batch.pending.iter(&worker.frames).last().unwrap();
+        let id = worker.frames.frame(slot).unwrap().id;
+        if repair {
+            let mut batch = worker.sessions[0].batches[1].take().unwrap();
+            assert!(worker.frames.unqueue(&mut batch.pending, slot).unwrap());
+            worker.frames.frame_mut(slot).unwrap().offset = 1514;
+            let coverage = worker.frames.recovery_mut(slot).unwrap();
+            assert!(coverage.submitted(0..1514, 0));
+            assert!(coverage.lost(0..1514, 0));
+            worker.recovery.set(slot, Place::Retained).unwrap();
+            worker.sessions[0].batches[1] = Some(batch);
+            worker.queue_recovery(slot).unwrap();
+        }
+        id
+    }
+
+    for repair_first in [false, true] {
+        let (mut workers, rx) = workers();
+        for worker in &mut workers {
+            worker.io_time = Some(Ok);
+        }
+        for _ in 0..pack::BATCH_CAPACITY {
+            enqueue(&mut workers[1], repair_first);
+        }
+        workers[1].flush_frames(Duration::ZERO).unwrap();
+        assert_eq!(
+            workers[1].sessions[0].batches[1].as_ref().unwrap().len,
+            pack::BATCH_CAPACITY
+        );
+        assert_eq!(
+            workers[1].sessions[0].batches[1].as_ref().unwrap().repair,
+            repair_first
+        );
+        let waiting = enqueue(&mut workers[1], !repair_first);
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        let mut packets = 0;
+        let mut seen = false;
+        let mut retained_suffix = false;
+        for tick in 1..2000 {
+            let now = Duration::from_micros(tick * 10);
+            let queued = {
+                let batch = workers[1].sessions[0].batches[1].as_ref().unwrap();
+                if repair_first {
+                    batch.repairs.len()
+                } else {
+                    batch.pending.len()
+                }
+            };
+            for _ in queued..pack::BATCH_CAPACITY {
+                enqueue(&mut workers[1], repair_first);
+            }
+            for worker in &mut workers {
+                worker.drain_queues(now).unwrap();
+                worker.service_sender(now).unwrap();
+                worker.flush_frames(now).unwrap();
+            }
+            let batch = workers[1].sessions[0].batches[1].as_ref().unwrap();
+            retained_suffix |= workers[1].counters.tx_outer_bytes != 0 && !batch.plan.is_empty();
+            for _ in 0..64 {
+                let length = match rx.recv(&mut bytes) {
+                    Ok((length, _)) => length,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("{e}"),
+                };
+                packets += 1;
+                let datagram = Datagram::decode(&bytes[..length]).unwrap();
+                assert_eq!(datagram.header().lane, 2);
+                seen |= datagram.records().any(|record| {
+                    matches!(record,
+                    Record::Data { frame_id, .. } if frame_id == waiting)
+                });
+                let number = datagram.header().packet_number;
+                let ranges = [AckRange {
+                    start: number,
+                    end: number,
+                }];
+                let observed = now + Duration::from_micros(1);
+                workers[1]
+                    .incoming_ack(0, 1, 2, 0, AckRanges::new(&ranges).unwrap(), observed)
+                    .unwrap();
+                for _ in 0..3 {
+                    for worker in &mut workers {
+                        worker.drain_queues(observed).unwrap();
+                        worker.service_sender(observed).unwrap();
+                    }
+                }
+                // A fixed64-frame batch needs at most two baseline packets/frame.
+                assert!(
+                    seen || packets <= 2 * pack::BATCH_CAPACITY,
+                    "opposite class starved: repair_first={repair_first}, packets={packets}"
+                );
+            }
+            if seen {
+                break;
+            }
+        }
+        assert!(
+            retained_suffix,
+            "fixture must exercise a retained grant suffix"
+        );
+        assert!(
+            seen,
+            "opposite class made no progress: repair_first={repair_first}"
+        );
+        assert_eq!(workers[1].counters.expired_frames, 0);
+        assert_eq!(workers[1].counters.cancelled_grants, 0);
+    }
+}
