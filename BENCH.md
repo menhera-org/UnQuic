@@ -714,6 +714,48 @@ inner UDP errors, outer fragments and receiver corruption, duplicates or
 reordering. The full JSON includes expiry, TAP drops and per-worker CPU.
 No build or other test overlapped a load interval.
 
+## Retained-tail request sizes (November 7)
+
+A [release diagnostic](benches/tap-sender-request-size-diagnostic.json) counts
+fresh and retained requests, received DATA grants and successful small-tail
+submissions with waiting same-lane frames. It uses the production four-buffer,
+one-quantum and 4 MiB/s policies. Histograms count grants, not packets; their
+byte totals include outer headers.
+
+| Request each way | Mean grant datagrams, L/R | Grants ≤16 datagrams % | Short retained-tail grants with backlog % | Their share of granted bytes % |
+| --- | ---: | ---: | ---: | ---: |
+| 16 Gbit/s | 18.12 / 17.80 | 51.14 / 52.51 | 18.86 / 18.65 | 7.43 / 7.21 |
+| 21 Gbit/s | 18.26 / 17.75 | 50.57 / 52.18 | 19.57 / 18.38 | 7.50 / 7.28 |
+| Unlimited | 18.69 / 17.73 | 49.60 / 52.14 | 21.03 / 18.52 | 7.55 / 7.37 |
+| 16 Gbit/s return | 18.25 / 17.74 | 50.57 / 52.31 | 19.33 / 18.40 | 7.37 / 7.36 |
+
+At 21G, 51% of requests use a retained plan. Fresh requests average
+37.9 / 36.6 datagrams, retained requests 16.1 / 16.5, and grants 18.3 / 17.7.
+The small retained tails above pay a separate request/permission/completion
+exchange while the lane has more queued work. The current flush path refuses
+to add frames until the retained plan empties. This verifies the mechanism and
+its frequency; a refill experiment must still establish a goodput gain.
+Window-trimmed prefixes also contribute to small grants, so filling tails
+cannot remove all their overhead.
+
+The diagnostic delivers 2.18 / 2.04 Gbit/s at 21G and 2.39 / 2.07 unlimited,
+using 214.3 / 202.8% and 222.7 / 206.1% daemon CPU. Missing fractions are
+89.43 / 90.08% and 96.02 / 96.21%. The added counters and bounded packet-size
+sums have a cost; these observations are not an exact production baseline.
+All four points have zero admission pressure, socket overflow, inner UDP errors,
+outer fragments and receiver corruption, duplicates or reordering.
+The JSON retains all loss counters and per-worker CPU.
+
+The diagnostic passes 340 ordinary release tests, fifteen sender kernel
+regressions, Clippy and formatting. A separate broader check of the production
+ACK-counter build passes 54 library kernel tests, foundation, load-tool and CLI
+checks, plus foreign rename/namespace move. Its runtime forwarding test times
+out on a single additional-session frame after the ten-second storm while a
+diagnostic build is running. The identical binary passes alone in 43.60 seconds.
+Build contention is a hypothesis; the failure is not attributed or fixed.
+Keep builds separate from timing-sensitive runtime tests as well as throughput
+measurements. No build or other test overlaps the diagnostic load intervals.
+
 ## Request fairness and burst-size experiments (November 7)
 
 Two normal-release sweeps use the ACK-pruning baseline, twenty-second points,
