@@ -243,6 +243,7 @@ pub struct Lane {
     deadline: Option<Duration>,
     retained_bytes: usize,
     expired_frames: u64,
+    expired_incomplete_frames: u64,
     duplicate_pieces: u64,
 }
 
@@ -264,6 +265,7 @@ impl Lane {
             deadline: None,
             retained_bytes: 0,
             expired_frames: 0,
+            expired_incomplete_frames: 0,
             duplicate_pieces: 0,
         })
     }
@@ -298,6 +300,11 @@ impl Lane {
     /// Frames released at their deadline since the last reset.
     pub const fn expired_frames(&self) -> u64 {
         self.expired_frames
+    }
+
+    /// Incomplete frames released at their deadline; a subset of expired_frames.
+    pub const fn expired_incomplete_frames(&self) -> u64 {
+        self.expired_incomplete_frames
     }
 
     /// Entire DATA pieces already terminal or fully covered since the last reset.
@@ -354,6 +361,7 @@ impl Lane {
         self.frame_limit = frame_limit;
         self.retired = false;
         self.expired_frames = 0;
+        self.expired_incomplete_frames = 0;
         self.duplicate_pieces = 0;
         self.packets.reset();
         self.ack = Schedule::new();
@@ -535,6 +543,9 @@ impl Lane {
                 continue;
             }
             if frame.deadline <= now {
+                self.expired_incomplete_frames = self
+                    .expired_incomplete_frames
+                    .wrapping_add(u64::from(frame.remaining != 0));
                 self.terminal.mark(frame.sequence);
                 self.release(slot);
                 expired += 1;

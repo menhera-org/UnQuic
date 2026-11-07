@@ -597,6 +597,14 @@ struct PeerControl {
     unsent: u64,
 }
 
+#[derive(Clone, Copy)]
+enum TxExpiry {
+    Input,
+    Unsent,
+    Partial,
+    Sent,
+}
+
 pub(crate) struct Worker {
     sender: sender::State,
     #[cfg(test)]
@@ -1155,6 +1163,19 @@ impl Worker {
         let lane = local.rx[slot].as_ref().unwrap();
         let totals = &mut local.rx_totals[slot];
         let expired = lane.expired_frames().wrapping_sub(totals.expired_frames);
+        let incomplete = lane
+            .expired_incomplete_frames()
+            .wrapping_sub(totals.rx_expired_incomplete_frames);
+        let ready = expired.wrapping_sub(incomplete);
+        for target in [&mut self.counters, &mut local.totals] {
+            target.rx_expired_incomplete_frames =
+                target.rx_expired_incomplete_frames.wrapping_add(incomplete);
+            target.rx_expired_ready_frames = target.rx_expired_ready_frames.wrapping_add(ready);
+        }
+        totals.rx_expired_incomplete_frames = lane.expired_incomplete_frames();
+        totals.rx_expired_ready_frames = lane
+            .expired_frames()
+            .wrapping_sub(lane.expired_incomplete_frames());
         let duplicates = lane
             .duplicate_pieces()
             .wrapping_sub(totals.duplicate_pieces);
@@ -2517,6 +2538,25 @@ impl Worker {
         Ok((0..count).any(|session| self.tap_can_expand(session)))
     }
 
+    fn record_tx_expiry(&mut self, session: usize, lane: usize, count: u64, kind: TxExpiry) {
+        let local = &mut self.sessions[session];
+        for totals in [
+            &mut self.counters,
+            &mut local.totals,
+            &mut local.tx_totals[lane],
+        ] {
+            totals.expired_frames = totals.expired_frames.wrapping_add(count);
+            let classified = match kind {
+                TxExpiry::Input => &mut totals.tx_expired_input_frames,
+                TxExpiry::Unsent => &mut totals.tx_expired_unsent_frames,
+                TxExpiry::Partial => &mut totals.tx_expired_partial_frames,
+                TxExpiry::Sent => &mut totals.tx_expired_sent_frames,
+            };
+            *classified = classified.wrapping_add(count);
+        }
+        local.tx_dirty |= 1_u64 << lane;
+    }
+
     fn expired_at(
         &mut self,
         session: usize,
@@ -2528,12 +2568,7 @@ impl Worker {
         if now < deadline {
             return false;
         }
-        self.counters.expired_frames = self.counters.expired_frames.wrapping_add(count);
-        let local = &mut self.sessions[session];
-        local.totals.expired_frames = local.totals.expired_frames.wrapping_add(count);
-        local.tx_totals[lane].expired_frames =
-            local.tx_totals[lane].expired_frames.wrapping_add(count);
-        local.tx_dirty |= 1_u64 << lane;
+        self.record_tx_expiry(session, lane, count, TxExpiry::Input);
         true
     }
 
@@ -2554,8 +2589,22 @@ impl Worker {
         let Some(source) = self.frames.source(frame.source) else {
             return true;
         };
-        let (session, lane, deadline) = (source.session, frame.lane, frame.deadline);
-        self.expired_at(session, lane, deadline, 1, now)
+        if now < frame.deadline {
+            return false;
+        }
+        let submitted = self
+            .frames
+            .recovery(index)
+            .map_or(frame.offset, |state| state.sent());
+        let kind = if submitted == 0 {
+            TxExpiry::Unsent
+        } else if submitted < frame.length() {
+            TxExpiry::Partial
+        } else {
+            TxExpiry::Sent
+        };
+        self.record_tx_expiry(source.session, frame.lane, 1, kind);
+        true
     }
 
     fn release_frame_storage(&mut self, index: usize) {
@@ -4153,6 +4202,18 @@ mod tests {
                 assert_eq!(worker.frames.available(), frames::CAPACITY);
                 assert_eq!(worker.counters.tap_gso_frames, 0);
                 assert_eq!(worker.counters.expired_frames, if gso { 128 } else { 1 });
+                assert_eq!(
+                    worker.counters.tx_expired_input_frames,
+                    worker.counters.expired_frames
+                );
+                assert_eq!(
+                    worker.sessions[0].totals.tx_expired_input_frames,
+                    worker.counters.expired_frames
+                );
+                assert_eq!(
+                    worker.sessions[0].tx_totals[0].tx_expired_input_frames,
+                    worker.counters.expired_frames
+                );
                 if foreign {
                     let Some(Event::Free(buffer)) = returned.try_pop() else {
                         panic!("overdue foreign source was not returned");
@@ -4207,6 +4268,16 @@ mod tests {
             assert_eq!(worker.counters.tap_gso_frames, materialized as u64);
             assert_eq!(worker.counters.expired_frames, (128 - materialized) as u64);
             worker.flush_frames(Duration::from_millis(21)).unwrap();
+            assert_eq!(worker.counters.expired_frames, 128);
+            assert_eq!(
+                worker.counters.tx_expired_input_frames,
+                (128 - materialized) as u64
+            );
+            assert_eq!(
+                worker.counters.tx_expired_unsent_frames,
+                materialized as u64
+            );
+            worker.flush_frames(Duration::from_millis(22)).unwrap();
             assert_eq!(worker.counters.expired_frames, 128);
             assert_eq!(worker.frames.available(), frames::CAPACITY);
             assert_eq!(worker.free.len(), BUFFERS);
@@ -7086,6 +7157,23 @@ mod tests {
         assert_eq!(totals.reassembly_frames, 0);
         assert_eq!(totals.reassembly_bytes, 0);
         assert_eq!(lane.counters.expired_frames, 1);
+        assert_eq!(lane.counters.rx_expired_incomplete_frames, 1);
+        assert_eq!(lane.counters.rx_expired_ready_frames, 0);
+        assert_eq!(totals.rx_expired_incomplete_frames, 1);
+        assert_eq!(totals.rx_expired_ready_frames, 0);
+        assert_eq!(
+            totals.rx_expired_incomplete_frames + totals.rx_expired_ready_frames,
+            totals.expired_frames
+        );
+        worker.flush_taps(reassembly::FRAME_LIFETIME).unwrap();
+        worker.publish_counters();
+        assert_eq!(worker.counters.rx_expired_incomplete_frames, 1);
+        assert_eq!(
+            shared.session_counters[0]
+                .snapshot()
+                .rx_expired_incomplete_frames,
+            1
+        );
         assert_eq!(
             shared.transmit_counters[0][0]
                 .snapshot()
@@ -7113,6 +7201,18 @@ mod tests {
                 .all(|c| c.snapshot().is_none())
         );
         assert_eq!(shared.session_counters[0].snapshot().expired_frames, 1);
+        assert_eq!(
+            shared.session_counters[0]
+                .snapshot()
+                .rx_expired_incomplete_frames,
+            1
+        );
+        assert_eq!(
+            shared.session_counters[0]
+                .snapshot()
+                .rx_expired_ready_frames,
+            0
+        );
         // One GRO aggregate crosses cookies and owners; invalid siblings cannot hide valid DATA.
         let connections = [
             replacement,

@@ -106,6 +106,30 @@ metrics! {
     duplicate_pieces: sum,
     /// Frames discarded at their sender or receiver deadline.
     expired_frames: sum,
+    /// Source children expired before materialization; a subset of expired_frames.
+    tx_expired_input_frames: sum,
+    /// Materialized frames expired before any successful DATA submission; a subset of expired_frames.
+    tx_expired_unsent_frames: sum,
+    /// Frames expired after submitting only a prefix; a subset of expired_frames.
+    tx_expired_partial_frames: sum,
+    /// Fully submitted frames expired before ACK completion; a subset of expired_frames.
+    tx_expired_sent_frames: sum,
+    /// Incomplete receive frames expired; a subset of expired_frames.
+    rx_expired_incomplete_frames: sum,
+    /// Completed receive frames expired while awaiting TAP; a subset of expired_frames.
+    rx_expired_ready_frames: sum,
+    /// Cleanup calls exhausting their budget with work remaining; worker totals only.
+    recovery_cleanup_yields: sum,
+    /// Maximum cleanup queue length, including mapping removal; worker gauge only.
+    recovery_cleanup_peak: max,
+    /// Reports whose packet mappings finished staging for shared accounting; worker totals only.
+    recovery_staged_reports: sum,
+    /// Staging calls exhausting their budget before report dispatch; worker totals only.
+    recovery_staging_yields: sum,
+    /// Granted DATA prefixes rejected for insufficient journal capacity; worker totals only.
+    recovery_mapping_pressure: sum,
+    /// Granted DATA prefixes rejected after selected coverage changed; worker totals only.
+    recovery_selection_changed: sum,
     /// Entries rejected because a bounded queue was full.
     queue_drops: sum,
     /// ACK records dropped for lack of a reserved receive buffer; a subset of queue_drops, not additive.

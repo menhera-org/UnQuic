@@ -1417,6 +1417,8 @@ fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
         first: true,
         end: None,
     };
+    // One additional physical copy keeps two mappings per frame after staging two ACKs.
+    assert!(worker.recovery.journal.reserve_packet(3, &pieces));
     report.count = 3;
     for ordinal in 0..3 {
         report.entries[ordinal] = Entry {
@@ -1428,6 +1430,9 @@ fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
     worker.recovery.staged = Some(report);
     assert!(worker.stage_recovery().unwrap());
     assert_eq!(worker.recovery.cursor, 2);
+    assert_eq!(worker.counters.recovery_staging_yields, 1);
+    assert_eq!(worker.counters.recovery_staged_reports, 0);
+    assert_eq!(worker.counters.recovery_cleanup_peak, 64);
     assert!(
         !worker
             .sender
@@ -1443,10 +1448,18 @@ fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
             .iter()
             .all(|&slot| worker.frames.recovery(slot).unwrap().remaining() == 0)
     );
+    assert!(worker.cleanup_frames().unwrap());
+    assert_eq!(worker.counters.recovery_cleanup_yields, 1);
     assert!(!worker.cleanup_frames().unwrap());
+    assert_eq!(worker.counters.recovery_cleanup_yields, 1);
     assert_eq!(worker.sessions[0].tx_retained, 0);
     assert!(worker.recovery.journal.packet_empty(2));
+    assert!(worker.recovery.journal.packet_empty(3));
     assert!(!worker.stage_recovery().unwrap());
+    assert_eq!(worker.counters.recovery_staged_reports, 1);
+    assert_eq!(worker.counters.recovery_staging_yields, 1);
+    assert!(!worker.stage_recovery().unwrap());
+    assert_eq!(worker.counters.recovery_staged_reports, 1);
     assert!(
         worker
             .sender
@@ -1648,6 +1661,8 @@ fn mapping_pressure_preserves_fresh_fifo_and_leaves_reserved_space_for_repair() 
         )
         .unwrap();
     assert!(!worker.reserve_pieces(&batch, 1).unwrap());
+    assert_eq!(worker.counters.recovery_mapping_pressure, 1);
+    assert_eq!(worker.counters.recovery_selection_changed, 0);
     worker.yield_batch(0, 1, &mut batch).unwrap();
     assert_eq!(
         batch.pending.iter(&worker.frames).collect::<Vec<_>>(),
@@ -2058,4 +2073,90 @@ fn an_empty_history_still_drains_its_ack_loss_fence_before_replacement() {
     }
     assert!(worker.sender.lanes[index].idle());
     worker.sender.lanes[index].install(2).unwrap();
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn transmit_expiry_classifies_successful_prefixes_once() {
+    let (mut workers, _rx) = workers();
+    let worker = &mut workers[1];
+    for _ in 0..3 {
+        queue_frame(worker, 60);
+    }
+    let slots: Vec<_> = worker.sessions[0].batches[1]
+        .as_ref()
+        .unwrap()
+        .pending
+        .iter(&worker.frames)
+        .collect();
+    assert!(
+        worker
+            .frames
+            .recovery_mut(slots[1])
+            .unwrap()
+            .submitted(0..30, 0)
+    );
+    assert!(
+        worker
+            .frames
+            .recovery_mut(slots[2])
+            .unwrap()
+            .submitted(0..60, 0)
+    );
+    assert!(!worker.expire_frames(Duration::from_millis(100)).unwrap());
+    assert!(!worker.cleanup_frames().unwrap());
+    for totals in [
+        &worker.counters,
+        &worker.sessions[0].totals,
+        &worker.sessions[0].tx_totals[1],
+    ] {
+        assert_eq!(totals.expired_frames, 3);
+        assert_eq!(totals.tx_expired_input_frames, 0);
+        assert_eq!(totals.tx_expired_unsent_frames, 1);
+        assert_eq!(totals.tx_expired_partial_frames, 1);
+        assert_eq!(totals.tx_expired_sent_frames, 1);
+        assert_eq!(
+            totals.tx_expired_input_frames
+                + totals.tx_expired_unsent_frames
+                + totals.tx_expired_partial_frames
+                + totals.tx_expired_sent_frames,
+            totals.expired_frames
+        );
+    }
+    assert!(!worker.expire_frames(Duration::from_millis(101)).unwrap());
+    assert_eq!(worker.counters.expired_frames, 3);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn changed_coverage_rejection_is_distinct_from_mapping_pressure() {
+    let (mut workers, _rx) = workers();
+    let worker = &mut workers[1];
+    queue_frame(worker, 60);
+    let mut batch = worker.sessions[0].batches[1].take().unwrap();
+    let index = batch
+        .pending
+        .pop_front(&mut worker.frames)
+        .unwrap()
+        .unwrap();
+    batch.frames[0] = Some(index);
+    batch.len = 1;
+    batch
+        .prepare(
+            worker.sessions[0].tx[1].as_mut().unwrap(),
+            &worker.frames,
+            BASE_UDP_PAYLOAD,
+        )
+        .unwrap();
+    assert!(
+        worker
+            .frames
+            .recovery_mut(index)
+            .unwrap()
+            .submitted(0..1, 0)
+    );
+    assert!(!worker.reserve_pieces(&batch, 1).unwrap());
+    assert_eq!(worker.counters.recovery_selection_changed, 1);
+    assert_eq!(worker.counters.recovery_mapping_pressure, 0);
+    assert_eq!(worker.counters.cancelled_grants, 0);
 }

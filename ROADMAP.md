@@ -639,6 +639,11 @@ cover mapping pressure, bounded report processing, partial sends and late-ACK
 cancellation. A bidirectional release runtime test drops the original prefix and first repair, verifies
 second-repair delivery, then replays late originals without duplication or
 hot-path allocation. Sustained impaired-path throughput remains unverified.
+Counters now partition expiry into unmaterialized input, unsent/partial/full
+transmit frames, and incomplete/TAP-queued receive frames. Worker counters also
+separate mapping-capacity rejection from changed selections and record cleanup
+and report-staging continuations. These identify work deferred by bounded
+budgets without treating all expiry as lost inner traffic.
 The current transmit store now indexes exact deadlines in a fixed-capacity heap
 and removes pending frames directly. Cleanup visits at most 64 expired frame
 views per turn, including already-prepared batches; pre-send checks defer

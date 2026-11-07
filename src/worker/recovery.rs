@@ -122,6 +122,10 @@ impl Worker {
                 return Err(io::ErrorKind::InvalidData.into());
             }
             self.recovery.cleanup.push_back(index);
+            self.counters.recovery_cleanup_peak = self
+                .counters
+                .recovery_cleanup_peak
+                .max(self.recovery.cleanup.len() as u64);
         }
         Ok(())
     }
@@ -165,6 +169,10 @@ impl Worker {
                 .ok_or(io::ErrorKind::InvalidData)? = Slot::default();
             self.release_frame_storage(index);
             work -= 1;
+        }
+        if work == 0 && !self.recovery.cleanup.is_empty() {
+            self.counters.recovery_cleanup_yields =
+                self.counters.recovery_cleanup_yields.wrapping_add(1);
         }
         Ok(self.recovery.has_cleanup())
     }
@@ -363,9 +371,13 @@ impl Worker {
         if self.recovery.cursor == report.count {
             self.recovery.cursor = 0;
             self.sender.queue(0, sender::Message::Report(report))?;
+            self.counters.recovery_staged_reports =
+                self.counters.recovery_staged_reports.wrapping_add(1);
             Ok(false)
         } else {
             self.recovery.staged = Some(report);
+            self.counters.recovery_staging_yields =
+                self.counters.recovery_staging_yields.wrapping_add(1);
             Ok(true)
         }
     }
@@ -383,6 +395,8 @@ impl Worker {
         if needed > available
             || (!batch.repair && needed > available.saturating_sub(self.recovery.reserve))
         {
+            self.counters.recovery_mapping_pressure =
+                self.counters.recovery_mapping_pressure.wrapping_add(1);
             return Ok(false);
         }
         // Validate complete selected ranges before linking any packet. Later pieces of
@@ -404,6 +418,8 @@ impl Worker {
                 .ok_or(io::ErrorKind::InvalidData)?
                 .can_submit(range, batch.selection[ordinal].attempt)
             {
+                self.counters.recovery_selection_changed =
+                    self.counters.recovery_selection_changed.wrapping_add(1);
                 return Ok(false);
             }
         }

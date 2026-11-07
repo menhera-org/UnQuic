@@ -718,3 +718,25 @@ fn pressure_validates_all_lengths_and_defers_controls_until_full_admission() {
     );
     assert!(lane.front(Duration::ZERO).is_none());
 }
+
+#[test]
+fn expiry_distinguishes_incomplete_and_ready_frames_once() {
+    let mut lane = Lane::new(1, 9022).unwrap();
+    assert_eq!(
+        admit(
+            &mut lane,
+            1,
+            &[piece(1, 0, &[1; 30]), piece(2, 0, &[2; 60])],
+            Duration::ZERO
+        ),
+        Admission::Fresh
+    );
+    assert_eq!(lane.expire(FRAME_LIFETIME), 2);
+    assert_eq!(lane.expired_frames(), 2);
+    assert_eq!(lane.expired_incomplete_frames(), 1);
+    assert_eq!(lane.expire(FRAME_LIFETIME), 0);
+    assert_eq!(lane.expired_incomplete_frames(), 1);
+    lane.reset(1, 9022).unwrap();
+    assert_eq!(lane.expired_frames(), 0);
+    assert_eq!(lane.expired_incomplete_frames(), 0);
+}

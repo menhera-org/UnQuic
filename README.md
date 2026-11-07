@@ -738,6 +738,24 @@ sum of reserved full frame lengths, including incomplete frames, rather than the
 number of piece bytes received so far. `reassembly_frames` includes complete
 frames waiting for TAP.
 
+Expiry totals are partitioned into source children not yet materialized
+(`tx_expired_input_frames`), materialized frames with no submitted DATA
+(`tx_expired_unsent_frames`), submitted prefixes
+(`tx_expired_partial_frames`), fully submitted frames awaiting ACK completion
+(`tx_expired_sent_frames`), and incomplete or TAP-queued receive frames
+(`rx_expired_incomplete_frames` / `rx_expired_ready_frames`). These are subsets
+of `expired_frames`, published at worker, session and lane scope. They do not
+measure application loss: a fully submitted frame may already have reached TAP.
+
+Worker-only recovery counters report cleanup budget exhaustion and maximum
+queue depth (`recovery_cleanup_yields` / `recovery_cleanup_peak`), reports
+dispatched to shared accounting and staging continuations
+(`recovery_staged_reports` / `recovery_staging_yields`), and granted DATA
+prefixes rejected for mapping capacity or changed coverage
+(`recovery_mapping_pressure` / `recovery_selection_changed`). The cleanup
+peak is a lifetime maximum, not a current queue gauge. Updates reuse existing
+work and publication paths without new clocks, allocations or syscalls.
+
 Pressure is attributed where detected. `admission_pressure` counts datagrams
 still not fully admitted after the drain/retry attempt; useful existing pieces
 may have been retained, but that packet is not ACK-eligible. `queue_drops`

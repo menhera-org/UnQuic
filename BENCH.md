@@ -83,6 +83,36 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Recovery pressure diagnostics and kernel recheck (November 7)
+
+Counters now partition `expired_frames` into unmaterialized source children,
+materialized unsent/partial/full transmit frames, incomplete receive frames,
+and completed frames awaiting TAP. The six subsets retain the existing total
+and publish at worker, session and lane scope. Worker-only counters also report
+cleanup budget exhaustion and peak queue depth, report-staging continuations,
+and mapping-capacity versus changed-selection rejection. Updates add no clocks,
+allocations, syscalls or scans. Tests verify exact classification, publication,
+reset and repeated-cleanup behavior. The diagnostic build passes 345 all-feature
+and 336 default release tests, Clippy, 30 targeted kernel checks and the
+two-loss relay. Throughput measurements with these counters are pending.
+
+The broader recheck found a post-address-migration forwarding timeout at
+`tests/linux_runtime.rs:637` on both Linux 6.8 and Linux 7.0. The affected test
+sends one frame after both peers publish newer generations; that frame did not
+arrive within two seconds. A focused Linux 7.0 repeat passes, so the cause is
+not yet established. Do not treat the full runtime matrix as passed. Published
+generations prove installation-barrier completion but do not reset the shared
+path group's congestion state or backed-off PTO. Whether that gate caused the
+loss still needs evidence.
+
+The corrected Linux 7.0 fixture passes 66 library checks, foundation, short
+PMTU, external rename/move, two-loss recovery, CLI and generator tests. The
+first fixture attempt omitted loopback setup inside its private namespace;
+its address-binding failures were harness errors. The diagnostic Linux 6.8
+build passes 68 library checks, foundation, short PMTU, rename/move and two-loss
+recovery before the same migration timeout. Long routed PMTU checks are
+running independently on both kernels.
+
 ## ACK admission and ordinary loss fairness (November 7)
 
 Continuous duplicate ACK input could indefinitely postpone ordinary loss
