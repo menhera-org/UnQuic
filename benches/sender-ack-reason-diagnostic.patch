@@ -1,0 +1,246 @@
+--- a/src/ack.rs
++++ b/src/ack.rs
+@@ -14,6 +14,9 @@
+ 
+ pub(crate) struct Schedule {
+     pub highest: u64,
++    reason: u8,
++    fresh: u64,
++    first_at: Option<Duration>,
+     highest_at: Duration,
+     eliciting: u8,
+     pub deadline: Option<Duration>,
+@@ -24,6 +27,9 @@
+     pub const fn new() -> Self {
+         Self {
+             highest: 0,
++            reason: 0,
++            fresh: 0,
++            first_at: None,
+             highest_at: Duration::ZERO,
+             eliciting: 0,
+             deadline: None,
+@@ -38,12 +44,18 @@
+             self.highest_at = now;
+         }
+         if eliciting {
++            self.fresh = self.fresh.saturating_add(1);
++            self.first_at.get_or_insert(now);
+             self.eliciting = self.eliciting.saturating_add(1);
+-            self.schedule(if gap || self.eliciting >= 16 {
+-                now
+-            } else {
+-                now.saturating_add(DELAY)
+-            });
++            let reason = u8::from(self.eliciting >= 16) | (u8::from(gap) << 1);
++            self.schedule(
++                if reason != 0 {
++                    now
++                } else {
++                    now.saturating_add(DELAY)
++                },
++                if reason != 0 { reason } else { 4 },
++            );
+         }
+     }
+ 
+@@ -57,14 +69,30 @@
+             } else {
+                 now
+             };
+-            self.schedule(due);
++            self.schedule(due, 8);
+         }
+     }
+ 
+-    fn schedule(&mut self, due: Duration) {
++    fn schedule(&mut self, due: Duration, reason: u8) {
++        if self.deadline.is_none_or(|old| due < old) {
++            self.reason = reason;
++        } else if self.deadline == Some(due) {
++            self.reason |= reason;
++        }
+         self.deadline = Some(self.deadline.map_or(due, |old| old.min(due)));
+     }
+ 
++    pub(crate) fn diagnostic(&self, now: Duration) -> [u64; 5] {
++        let ns = |time: Duration| now.saturating_sub(time).as_nanos().min(u64::MAX as u128) as u64;
++        [
++            u64::from(self.reason),
++            self.fresh,
++            ns(self.highest_at),
++            self.deadline.map_or(0, ns),
++            self.first_at.map_or(0, ns),
++        ]
++    }
++
+     pub fn transmitted(&mut self, now: Duration) {
+         let sent = self.last_feedback.map_or(now, |old| old.max(now));
+         self.last_feedback = Some(sent);
+@@ -81,6 +109,9 @@
+         }
+         self.deadline = None;
+         self.eliciting = 0;
++        self.reason = 0;
++        self.fresh = 0;
++        self.first_at = None;
+         self.last_feedback = Some(now);
+         Some(now.saturating_sub(self.highest_at).as_micros().min(1000) as u32)
+     }
+@@ -179,3 +210,47 @@
+         assert_eq!(ack.take(Duration::MAX), None);
+     }
+ }
++
++#[cfg(test)]
++mod diagnostic_tests {
++    use super::*;
++    fn us(n: u64) -> Duration {
++        Duration::from_micros(n)
++    }
++
++    #[test]
++    fn earliest_cause_survives_coalescing_and_take_resets_fresh_count() {
++        let mut ack = Schedule::new();
++        ack.accepted(2, true, us(10));
++        for number in 3..=18 {
++            ack.accepted(number, true, us(20));
++        }
++        assert_eq!(ack.diagnostic(us(30)), [2, 17, 10_000, 20_000, 20_000]);
++        assert_eq!(ack.take(us(30)), Some(10));
++        assert_eq!(ack.diagnostic(us(30))[..2], [0, 0]);
++        ack.accepted(19, true, us(100));
++        for number in 20..=34 {
++            ack.accepted(number, true, us(1200));
++        }
++        // Timer already became eligible before the threshold was reached.
++        assert_eq!(
++            ack.diagnostic(us(1300)),
++            [4, 16, 100_000, 200_000, 1_200_000]
++        );
++    }
++
++    #[test]
++    fn earlier_threshold_replaces_timer_and_tied_gap_is_retained() {
++        let mut ack = Schedule::new();
++        for number in 1..16 {
++            ack.accepted(number, true, us(10));
++        }
++        ack.accepted(17, true, us(20));
++        assert_eq!(ack.diagnostic(us(20))[..2], [3, 16]);
++        ack.duplicate(us(20));
++        assert_eq!(ack.diagnostic(us(20))[0], 11);
++        assert!(ack.take(us(20)).is_some());
++        ack.duplicate(us(30));
++        assert_eq!(ack.diagnostic(us(1020))[..2], [8, 0]);
++    }
++}
+--- a/src/reassembly.rs
++++ b/src/reassembly.rs
+@@ -316,6 +316,11 @@
+     }
+ 
+     /// Earliest pending ACK construction time, independent of frame expiry.
++    pub(crate) fn ack_diagnostic(&self, now: Duration) -> [u64; 5] {
++        self.ack.diagnostic(now)
++    }
++
++    /// Next scheduled ACK eligibility time.
+     pub const fn ack_deadline(&self) -> Option<Duration> {
+         self.ack.deadline
+     }
+--- a/src/worker/feedback.rs
++++ b/src/worker/feedback.rs
+@@ -6,6 +6,7 @@
+ pub(super) const REPLIES: usize = 16;
+ 
+ pub(crate) struct Feedback {
++    diagnostic: [u64; 5],
+     origin: usize,
+     session: usize,
+     tag: u128,
+@@ -22,6 +23,7 @@
+ impl Feedback {
+     pub(super) fn new(origin: usize) -> Self {
+         Self {
++            diagnostic: [0; 5],
+             origin,
+             session: 0,
+             tag: 0,
+@@ -143,6 +145,7 @@
+             let Some(mut feedback) = self.feedback_free.pop() else {
+                 break;
+             };
++            feedback.diagnostic = lane.ack_diagnostic(now);
+             let Some(Record::Ack {
+                 lane,
+                 delay_us,
+@@ -152,6 +155,7 @@
+                 self.feedback_free.push(feedback);
+                 continue;
+             };
++            self.counters.ack_constructed += 1;
+             feedback.count = ranges.len();
+             feedback.lane = lane;
+             feedback.delay_us = delay_us;
+@@ -282,6 +286,25 @@
+                             now,
+                         )? {
+                             feedback.sent = Some(started);
++                            let [reason, fresh, highest_age, overdue, first_age] =
++                                feedback.diagnostic;
++                            self.counters.ack_emitted += 1;
++                            self.counters.ack_reason_threshold += u64::from(reason & 1 != 0);
++                            self.counters.ack_reason_gap += u64::from(reason & 2 != 0);
++                            self.counters.ack_reason_timer += u64::from(reason & 4 != 0);
++                            self.counters.ack_reason_duplicate += u64::from(reason & 8 != 0);
++                            self.counters.ack_fresh_packets += fresh;
++                            self.counters.ack_fresh_below_threshold +=
++                                u64::from((1..16).contains(&fresh));
++                            self.counters.ack_fresh_zero += u64::from(fresh == 0);
++                            self.counters.ack_highest_age_ns += highest_age;
++                            self.counters.ack_first_age_ns += first_age;
++                            self.counters.ack_eligible_overdue_ns += overdue;
++                            self.counters.ack_queue_ns += started
++                                .saturating_sub(feedback.created)
++                                .as_nanos()
++                                .min(u64::MAX as u128)
++                                as u64;
+                         }
+                     }
+                     self.return_feedback(feedback, now)?;
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -154,6 +154,32 @@
+     sender_feedback_ns: sum,
+     /// Temporary sender diagnostic.
+     ack_samples: sum,
++    /// Temporary ACK scheduling diagnostic.
++    ack_constructed: sum,
++    /// Temporary ACK scheduling diagnostic.
++    ack_emitted: sum,
++    /// Temporary ACK scheduling diagnostic.
++    ack_reason_threshold: sum,
++    /// Temporary ACK scheduling diagnostic.
++    ack_reason_gap: sum,
++    /// Temporary ACK scheduling diagnostic.
++    ack_reason_timer: sum,
++    /// Temporary ACK scheduling diagnostic.
++    ack_reason_duplicate: sum,
++    /// Temporary ACK scheduling diagnostic.
++    ack_fresh_packets: sum,
++    /// Temporary ACK scheduling diagnostic.
++    ack_fresh_below_threshold: sum,
++    /// Temporary ACK scheduling diagnostic.
++    ack_fresh_zero: sum,
++    /// Temporary ACK scheduling diagnostic.
++    ack_highest_age_ns: sum,
++    /// Temporary ACK scheduling diagnostic.
++    ack_first_age_ns: sum,
++    /// Temporary ACK scheduling diagnostic.
++    ack_eligible_overdue_ns: sum,
++    /// Temporary ACK scheduling diagnostic.
++    ack_queue_ns: sum,
+     /// Temporary loss-scan diagnostic.
+     loss_scan_starts: sum,
+     /// Temporary loss-scan diagnostic.

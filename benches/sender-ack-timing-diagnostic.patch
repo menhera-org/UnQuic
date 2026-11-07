@@ -1,0 +1,338 @@
+--- a/src/ack.rs
++++ b/src/ack.rs
+@@ -17,6 +17,9 @@
+     reason: u8,
+     fresh: u64,
+     first_at: Option<Duration>,
++    highest_received: Option<Duration>,
++    first_received: Option<Duration>,
++    last_eliciting: bool,
+     highest_at: Duration,
+     eliciting: u8,
+     pub deadline: Option<Duration>,
+@@ -30,6 +33,9 @@
+             reason: 0,
+             fresh: 0,
+             first_at: None,
++            highest_received: None,
++            first_received: None,
++            last_eliciting: false,
+             highest_at: Duration::ZERO,
+             eliciting: 0,
+             deadline: None,
+@@ -38,6 +44,7 @@
+     }
+ 
+     pub fn accepted(&mut self, number: u64, eliciting: bool, now: Duration) {
++        self.last_eliciting = eliciting;
+         let gap = number > self.highest.saturating_add(1);
+         if number > self.highest {
+             self.highest = number;
+@@ -82,7 +89,16 @@
+         self.deadline = Some(self.deadline.map_or(due, |old| old.min(due)));
+     }
+ 
+-    pub(crate) fn diagnostic(&self, now: Duration) -> [u64; 5] {
++    pub(crate) fn diagnostic_received(&mut self, number: u64, received: Duration) {
++        if number == self.highest {
++            self.highest_received = Some(received);
++        }
++        if self.last_eliciting && self.fresh == 1 {
++            self.first_received = Some(received);
++        }
++    }
++
++    pub(crate) fn diagnostic(&self, now: Duration) -> [u64; 7] {
+         let ns = |time: Duration| now.saturating_sub(time).as_nanos().min(u64::MAX as u128) as u64;
+         [
+             u64::from(self.reason),
+@@ -90,6 +106,8 @@
+             ns(self.highest_at),
+             self.deadline.map_or(0, ns),
+             self.first_at.map_or(0, ns),
++            self.highest_received.map_or(0, ns),
++            self.first_received.map_or(0, ns),
+         ]
+     }
+ 
+@@ -112,6 +130,7 @@
+         self.reason = 0;
+         self.fresh = 0;
+         self.first_at = None;
++        self.first_received = None;
+         self.last_feedback = Some(now);
+         Some(now.saturating_sub(self.highest_at).as_micros().min(1000) as u32)
+     }
+@@ -225,7 +244,7 @@
+         for number in 3..=18 {
+             ack.accepted(number, true, us(20));
+         }
+-        assert_eq!(ack.diagnostic(us(30)), [2, 17, 10_000, 20_000, 20_000]);
++        assert_eq!(ack.diagnostic(us(30))[..5], [2, 17, 10_000, 20_000, 20_000]);
+         assert_eq!(ack.take(us(30)), Some(10));
+         assert_eq!(ack.diagnostic(us(30))[..2], [0, 0]);
+         ack.accepted(19, true, us(100));
+@@ -234,7 +253,7 @@
+         }
+         // Timer already became eligible before the threshold was reached.
+         assert_eq!(
+-            ack.diagnostic(us(1300)),
++            ack.diagnostic(us(1300))[..5],
+             [4, 16, 100_000, 200_000, 1_200_000]
+         );
+     }
+@@ -254,3 +273,29 @@
+         assert_eq!(ack.diagnostic(us(1020))[..2], [8, 0]);
+     }
+ }
++
++#[cfg(test)]
++mod receive_clock_diagnostic_tests {
++    use super::*;
++    #[test]
++    fn socket_receive_age_is_separate_from_cached_admission_clock() {
++        let mut schedule = Schedule::new();
++        schedule.accepted(2, true, Duration::from_micros(100));
++        schedule.diagnostic_received(2, Duration::from_micros(50));
++        assert_eq!(
++            schedule.diagnostic(Duration::from_micros(200)),
++            [2, 1, 100_000, 100_000, 100_000, 150_000, 150_000]
++        );
++        schedule.accepted(3, false, Duration::from_micros(120));
++        schedule.diagnostic_received(3, Duration::from_micros(90));
++        assert_eq!(
++            schedule.diagnostic(Duration::from_micros(200)),
++            [2, 1, 80_000, 100_000, 100_000, 110_000, 150_000]
++        );
++        assert!(schedule.take(Duration::from_micros(200)).is_some());
++        assert_eq!(
++            &schedule.diagnostic(Duration::from_micros(210))[5..],
++            &[120_000, 0]
++        );
++    }
++}
+--- a/src/reassembly.rs
++++ b/src/reassembly.rs
+@@ -316,7 +316,11 @@
+     }
+ 
+     /// Earliest pending ACK construction time, independent of frame expiry.
+-    pub(crate) fn ack_diagnostic(&self, now: Duration) -> [u64; 5] {
++    pub(crate) fn ack_diagnostic_received(&mut self, number: u64, at: Duration) {
++        self.ack.diagnostic_received(number, at);
++    }
++
++    pub(crate) fn ack_diagnostic(&self, now: Duration) -> [u64; 7] {
+         self.ack.diagnostic(now)
+     }
+ 
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -1856,6 +1856,10 @@
+         }
+         match admission {
+             Admission::Fresh => {
++                self.sessions[session].rx[slot]
++                    .as_mut()
++                    .unwrap()
++                    .ack_diagnostic_received(header.packet_number, buffer.deadline);
+                 for record in datagram.records() {
+                     match record {
+                         Record::Probe => {
+--- a/src/worker/feedback.rs
++++ b/src/worker/feedback.rs
+@@ -6,7 +6,11 @@
+ pub(super) const REPLIES: usize = 16;
+ 
+ pub(crate) struct Feedback {
+-    diagnostic: [u64; 5],
++    diagnostic: [u64; 7],
++    constructed: Duration,
++    enqueued: Duration,
++    control_wait_ns: u64,
++    control_deferrals: u64,
+     origin: usize,
+     session: usize,
+     tag: u128,
+@@ -20,10 +24,27 @@
+     ranges: [AckRange; MAX_ACK_RANGES],
+ }
+ 
++fn diagnostic_ns(duration: Duration) -> u64 {
++    duration.as_nanos().min(u64::MAX as u128) as u64
++}
++
+ impl Feedback {
++    fn diagnostic_times(&self, sent: Duration) -> [u64; 4] {
++        [
++            diagnostic_ns(self.constructed.saturating_sub(self.created)),
++            diagnostic_ns(sent.saturating_sub(self.constructed)),
++            diagnostic_ns(self.enqueued.saturating_sub(self.constructed)),
++            diagnostic_ns(sent.saturating_sub(self.enqueued)),
++        ]
++    }
++
+     pub(super) fn new(origin: usize) -> Self {
+         Self {
+-            diagnostic: [0; 5],
++            diagnostic: [0; 7],
++            constructed: Duration::ZERO,
++            enqueued: Duration::ZERO,
++            control_wait_ns: 0,
++            control_deferrals: 0,
+             origin,
+             session: 0,
+             tag: 0,
+@@ -88,8 +109,9 @@
+         });
+     }
+ 
+-    pub(super) fn receive_feedback(&mut self, feedback: Box<Feedback>) -> io::Result<()> {
++    pub(super) fn receive_feedback(&mut self, mut feedback: Box<Feedback>) -> io::Result<()> {
+         if feedback.count != 0 && self.id == 0 {
++            feedback.enqueued = monotonic_now()?;
+             self.pending_control.push_back(Pending::Ack(feedback));
+         } else if feedback.count == 0 && feedback.origin == self.id {
+             if self.matches(feedback.session, feedback.tag) {
+@@ -114,6 +136,7 @@
+         if now < self.feedback_retry {
+             return Ok(());
+         }
++        let mut diagnostic_clock = self.io_clock(now);
+         let slots = self.sessions.len() * LANES;
+         for _ in 0..slots.min(BATCH_SIZE) {
+             if self.feedback_free.is_empty() {
+@@ -145,7 +168,11 @@
+             let Some(mut feedback) = self.feedback_free.pop() else {
+                 break;
+             };
+-            feedback.diagnostic = lane.ack_diagnostic(now);
++            feedback.constructed = diagnostic_clock()?;
++            feedback.enqueued = feedback.constructed;
++            feedback.control_wait_ns = 0;
++            feedback.control_deferrals = 0;
++            feedback.diagnostic = lane.ack_diagnostic(feedback.constructed);
+             let Some(Record::Ack {
+                 lane,
+                 delay_us,
+@@ -268,6 +295,8 @@
+                     {
+                         let due = self.control_due(feedback.session, now);
+                         if due > now {
++                            feedback.control_deferrals += 1;
++                            feedback.control_wait_ns += diagnostic_ns(due - now);
+                             feedback.due = due;
+                             self.pending_control.push_back(Pending::Ack(feedback));
+                             continue;
+@@ -286,9 +315,36 @@
+                             now,
+                         )? {
+                             feedback.sent = Some(started);
+-                            let [reason, fresh, highest_age, overdue, first_age] =
+-                                feedback.diagnostic;
++                            let [
++                                reason,
++                                fresh,
++                                highest_age,
++                                overdue,
++                                first_age,
++                                highest_rx_age,
++                                first_rx_age,
++                            ] = feedback.diagnostic;
+                             self.counters.ack_emitted += 1;
++                            self.counters.ack_ranges += feedback.count as u64;
++                            self.counters.ack_ranges_full +=
++                                u64::from(feedback.count == MAX_ACK_RANGES);
++                            self.counters.ack_control_outer_bytes +=
++                                (108 + 16 * feedback.count) as u64;
++                            self.counters.ack_control_deferrals += feedback.control_deferrals;
++                            self.counters.ack_control_wait_ns += feedback.control_wait_ns;
++                            let [stale, queue, handoff, service] =
++                                feedback.diagnostic_times(started);
++                            self.counters.ack_stale_turn_ns += stale;
++                            self.counters.ack_actual_queue_ns += queue;
++                            self.counters.ack_handoff_ns += handoff;
++                            self.counters.ack_owner_service_ns += service;
++                            if feedback.origin == 0 {
++                                self.counters.ack_local_count += 1;
++                                self.counters.ack_local_queue_ns += queue;
++                            } else {
++                                self.counters.ack_foreign_count += 1;
++                                self.counters.ack_foreign_queue_ns += queue;
++                            }
+                             self.counters.ack_reason_threshold += u64::from(reason & 1 != 0);
+                             self.counters.ack_reason_gap += u64::from(reason & 2 != 0);
+                             self.counters.ack_reason_timer += u64::from(reason & 4 != 0);
+@@ -299,6 +355,8 @@
+                             self.counters.ack_fresh_zero += u64::from(fresh == 0);
+                             self.counters.ack_highest_age_ns += highest_age;
+                             self.counters.ack_first_age_ns += first_age;
++                            self.counters.ack_highest_rx_age_ns += highest_rx_age;
++                            self.counters.ack_first_rx_age_ns += first_rx_age;
+                             self.counters.ack_eligible_overdue_ns += overdue;
+                             self.counters.ack_queue_ns += started
+                                 .saturating_sub(feedback.created)
+@@ -613,3 +671,24 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod timing_diagnostic_tests {
++    use super::*;
++    #[test]
++    fn cached_turn_time_is_separate_from_handoff_and_owner_service() {
++        let mut feedback = Feedback::new(1);
++        feedback.created = Duration::from_micros(10);
++        feedback.constructed = Duration::from_micros(110);
++        feedback.enqueued = Duration::from_micros(160);
++        let times = feedback.diagnostic_times(Duration::from_micros(210));
++        assert_eq!(times, [100_000, 100_000, 50_000, 50_000]);
++        assert_eq!(times[1], times[2] + times[3]);
++        feedback.origin = 0;
++        feedback.enqueued = feedback.constructed;
++        assert_eq!(
++            feedback.diagnostic_times(Duration::from_micros(210)),
++            [100_000, 100_000, 0, 100_000]
++        );
++    }
++}
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -180,6 +180,36 @@
+     ack_eligible_overdue_ns: sum,
+     /// Temporary ACK scheduling diagnostic.
+     ack_queue_ns: sum,
++    /// Temporary ACK receive-clock diagnostic.
++    ack_highest_rx_age_ns: sum,
++    /// Temporary ACK receive-clock diagnostic.
++    ack_first_rx_age_ns: sum,
++    /// Temporary ACK timing diagnostic.
++    ack_ranges: sum,
++    /// Temporary ACK timing diagnostic.
++    ack_ranges_full: sum,
++    /// Temporary ACK timing diagnostic.
++    ack_control_outer_bytes: sum,
++    /// Temporary ACK timing diagnostic.
++    ack_control_deferrals: sum,
++    /// Temporary ACK timing diagnostic.
++    ack_control_wait_ns: sum,
++    /// Temporary ACK timing diagnostic.
++    ack_stale_turn_ns: sum,
++    /// Temporary ACK timing diagnostic.
++    ack_actual_queue_ns: sum,
++    /// Temporary ACK timing diagnostic.
++    ack_handoff_ns: sum,
++    /// Temporary ACK timing diagnostic.
++    ack_owner_service_ns: sum,
++    /// Temporary ACK timing diagnostic.
++    ack_local_count: sum,
++    /// Temporary ACK timing diagnostic.
++    ack_local_queue_ns: sum,
++    /// Temporary ACK timing diagnostic.
++    ack_foreign_count: sum,
++    /// Temporary ACK timing diagnostic.
++    ack_foreign_queue_ns: sum,
+     /// Temporary loss-scan diagnostic.
+     loss_scan_starts: sum,
+     /// Temporary loss-scan diagnostic.

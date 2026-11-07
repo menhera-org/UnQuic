@@ -1,0 +1,38 @@
+--- a/src/pacing.rs
++++ b/src/pacing.rs
+@@ -9,7 +9,7 @@
+ pub use sender::{Flight, PacketId, Planned, Sender};
+ use std::{io, time::Duration};
+ 
+-const RATE: u64 = 4 * 1024 * 1024;
++const RATE: u64 = 16 * 1024 * 1024;
+ const BURST: usize = 16;
+ 
+ /// A single path group's successful control transmissions, owned by worker zero.
+@@ -105,7 +105,7 @@
+         }
+         assert_eq!(
+             control.deadline(),
+-            Some(idle + Duration::from_nanos(23_842))
++            Some(idle + Duration::from_nanos(5_961))
+         );
+     }
+ 
+@@ -148,7 +148,7 @@
+                 .send(1280, Duration::ZERO, || Ok(Duration::ZERO))
+                 .unwrap();
+         }
+-        assert_eq!(control.deadline(), Some(Duration::from_nanos(305_176)));
++        assert_eq!(control.deadline(), Some(Duration::from_nanos(76_294)));
+     }
+ 
+     #[test]
+@@ -159,7 +159,7 @@
+         for _ in 1..BURST {
+             control.send(1280, at, || Ok(at)).unwrap();
+         }
+-        assert_eq!(control.deadline(), Some(at + Duration::from_nanos(305_176)));
++        assert_eq!(control.deadline(), Some(at + Duration::from_nanos(76_294)));
+         assert_eq!(
+             control
+                 .send(1280, at, || panic!("unbudgeted send"))

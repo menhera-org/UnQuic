@@ -440,6 +440,73 @@ the cause. A per-lane sixteen-packet/1-ms ACK threshold can delay a shared
 window, but packet-number gaps can trigger earlier ACKs. Their actual frequency
 and ACK queue residence need measurement.
 
+## ACK range overhead and control-budget pressure (November 7)
+
+The [fresh-clock ACK diagnostic](benches/tap-sender-ack-timing-diagnostic.json)
+measures actual socket-receive, snapshot-construction, coordinator-enqueue and
+successful pre-syscall times. The
+[reason patch](benches/sender-ack-reason-diagnostic.patch) and
+[timing patch](benches/sender-ack-timing-diagnostic.patch) extend the Open
+diagnostic above. An earlier counter used the cached worker-turn timestamp as
+construction time; its apparent queue delay included work before construction.
+The corrected counters separate that offset and reconcile queue time exactly
+as handoff plus coordinator residence.
+
+At 21G, 99.80 / 99.84% of successfully emitted ACKs contain all 32 ranges.
+Each such ACK occupies 620 outer bytes. ACK traffic uses
+4.00 / 3.95 MB/s, about 95 / 94% of the 4 MiB/s control ceiling.
+Timer expiry is the earliest eligibility cause for only 5.44 / 4.51% of ACKs;
+threshold and packet-gap causes can overlap on equal deadlines.
+
+| Mean ACK interval at 21G | Left µs | Right µs |
+| --- | ---: | ---: |
+| Cached turn start to actual construction | 37.79 | 35.42 |
+| Actual construction to coordinator enqueue | 17.01 | 9.52 |
+| Coordinator enqueue to successful syscall | 204.01 | 179.67 |
+| Required control-pacing wait within that residence | 170.79 | 149.49 |
+| Actual construction to successful syscall | 221.02 | 189.19 |
+| Highest acknowledged packet's socket receive to construction | 92.94 | 78.18 |
+
+The [matched control-rate experiment](benches/tap-sender-ack-rate-diagnostic.json)
+changes only the control byte ceiling from 4 to 16 MiB/s; its
+[patch](benches/sender-ack-rate-diagnostic.patch) retains the sixteen-packet
+burst and all other scheduling rules. Both are instrumented release builds
+from the same diagnostic lineage, without the later startup-clock and
+packet-round corrections. Each uses a fresh container and four retained-daemon
+twenty-second points; no builds or other tests overlap load.
+
+| Control MiB/s / requested Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| 4 / 16 | 1.66 / 1.38 | 89.39 / 91.11 | 169.05 / 161.40 |
+| 4 / 21 | 1.60 / 1.56 | 92.24 / 92.37 | 172.93 / 165.07 |
+| 4 / Unlimited | 1.62 / 1.53 | 97.27 / 97.07 | 174.09 / 164.84 |
+| 4 / 16 return | 1.53 / 1.45 | 90.24 / 90.74 | 169.50 / 163.87 |
+| 16 / 16 | 3.30 / 2.75 | 78.88 / 82.36 | 250.02 / 240.18 |
+| 16 / 21 | 3.16 / 2.90 | 84.70 / 85.91 | 252.67 / 238.25 |
+| 16 / Unlimited | 3.23 / 3.12 | 94.34 / 94.40 | 257.15 / 247.70 |
+| 16 / 16 return | 3.33 / 3.18 | 78.89 / 79.81 | 266.24 / 250.37 |
+
+At 21G the higher ceiling raises goodput by 98 / 86% and eliminates explicit
+control-pacing deferrals. Actual ACK queue time falls to 17.40 / 16.42 µs;
+ACK traffic rises to 5.74 / 6.01 MB/s. This isolates the control ceiling as a
+substantial bottleneck in this workload. It does not explain all remaining
+cost: Closing and Feedback together occupy roughly 40 / 34% of sender time
+in that treatment, and neither performance gate is close.
+
+With the 4 MiB/s build, 21G counters report 742,018 / 724,012 TAP TX drops,
+13,972 / 5,662 frame expiries and 1,838 / 13,751 worker queue drops.
+With 16 MiB/s they report 680,446 / 663,332, 3,889 / 4,878 and
+1,846 / 25,993 respectively. All eight points report zero admission pressure,
+socket overflow, inner UDP errors, invalid/duplicate/out-of-window/wrong-run
+records, reordering and outer fragmentation.
+
+The production ceiling remains 4 MiB/s. Source inspection finds that after a grant sends only part of a prepared batch,
+the worker discards its never-attempted suffix, leaving packet-number holes. Receive history retains those holes and emits its newest 32 ranges;
+sender-side ACK pruning cannot reduce those wire bytes. Retaining never-attempted
+suffixes is the next candidate. Reducing the ACK timer is not supported by these
+measurements, and dropping older ACK ranges without delivery evidence would
+change recovery behavior.
+
 ## Request fairness and burst-size experiments (November 7)
 
 Two normal-release sweeps use the ACK-pruning baseline, twenty-second points,
