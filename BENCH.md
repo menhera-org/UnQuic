@@ -161,6 +161,63 @@ scheduling variation prevent treating it as a speed comparison.
 brackets. The [diagnostic patch](benches/sender-service-diagnostic.patch)
 reproduces the counters and sampled timing.
 
+### Service timing after rate/window relief
+
+The same instrumented build also ran with both diagnostic overrides: 4 GB/s
+outer pacing and an 8 MiB window, preserving ProbeRTT's drain and the stalled
+PTO window. The controller-derived quantum, packet limits, storage and grant
+accounting stay unchanged. An instrumented mode-0 repeat follows it. These
+runs use the same twenty-second profile and isolation as above.
+
+| Diagnostic | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | Daemon CPU % L / R |
+| --- | --- | --- | --- | --- |
+| Both overrides | 1 Gbit/s | 0.988 / 0.987 | 0.033 / 0.042 | 95.65 / 93.92 |
+| Both overrides | 4 Gbit/s | 1.920 / 3.398 | 51.293 / 14.147 | 309.44 / 249.78 |
+| Both overrides | 21 Gbit/s | 2.782 / 3.108 | 86.572 / 84.997 | 314.42 / 265.94 |
+| Both overrides | Unlimited | 2.084 / 3.433 | 96.378 / 93.853 | 310.69 / 259.62 |
+| Mode 0 repeat | 1 Gbit/s | 0.975 / 0.975 | 1.047 / 0.978 | 99.46 / 96.49 |
+| Mode 0 repeat | 4 Gbit/s | 1.704 / 1.546 | 56.653 / 60.718 | 211.31 / 204.92 |
+| Mode 0 repeat | 21 Gbit/s | 1.710 / 1.572 | 91.697 / 92.370 | 213.90 / 204.65 |
+| Mode 0 repeat | Unlimited | 1.744 / 1.574 | 96.947 / 97.078 | 215.09 / 206.98 |
+
+The repeat remains near the original instrumented baseline. With both overrides,
+forward goodput falls 25.1% from the 21G point to unlimited; reverse goodput
+rises. Window relief therefore does not remove the overload decline or establish
+a CPU ceiling.
+
+At unlimited load, grants average 49,951 / 48,801 outer bytes and
+33.74 / 32.97 packets. They fill their burst allowance 83.11 / 83.39% of the
+time, compared with 15.02 / 10.40% in the initial mode-0 run. Only
+0.31 / 0% of accepted grants are shortened by window credit. Epochs average
+1.199 / 1.228 grants. Successfully submitted bytes are 98.74 / 99.18% of
+reservations; zero-success completions are 1.17 / 0.72%, with no nonzero
+partial completions.
+
+Sampled reservation-to-report time remains 85.41 / 77.44 µs, including
+zero-success completions. Successful samples spend 26.79 / 24.70 µs from
+reservation to send and another 55.77 / 51.07 µs before owner reporting.
+Mean busy-owner entry intervals are 15.68 / 22.14 µs, while sampled owner
+calls take 0.97 / 1.67 µs of wall time. Grant intervals, including gaps and
+drain, average 179.07 / 108.79 µs. These observations expose substantial
+service delay after window relief; they do not isolate its cause or prove
+that removing the epoch barrier is safe.
+
+Unlimited admission pressure is zero, queue drops are 1,128 / 28,118
+(including 937 / 777 ACK-buffer drops), and TAP ingress drops are
+2,152,132 / 2,017,996 source SKBs. Expiry totals are 827,352 / 163,452,
+including 821,960 / 131,985 never-submitted transmit frames and
+1,127 / 399 incomplete receive frames. No completed receive frame expires.
+Outer socket overflow is 33 / 11 SKBs. Across all four override points,
+outer UDP error totals match reported overflow; inner UDP errors, invalid
+or duplicate application records and outer fragmentation remain zero.
+Maximum reordering is 0.02359%. Every mode-0 repeat point has zero socket
+overflow, UDP errors, fragmentation and application reordering.
+
+The raw service report includes both added sweeps and the override binary hash.
+The existing diagnostic patch contains the compile-time selector. Neither
+override is adopted. The next isolated experiment tests the owner's shared
+commit/feedback work budget without changing its burst or congestion bounds.
+
 ## Controller rate/window isolation (November 7)
 
 Five sequential release sweeps compare unchanged controller outputs, a fixed
@@ -268,6 +325,16 @@ is independently verified; it does not fully explain the migration failure.
 No throughput gain is claimed for this fix. Further diagnostics must distinguish
 unsent frames from successfully submitted frames missing before receive admission.
 
+A later test-only capture keeps the production library byte-for-byte unchanged
+and samples existing counters only after the original timeout. It fails on its
+first Linux 7.0 sequence: the target lane has zero submitted outer bytes, zero
+send grants and one never-submitted transmit expiry, while both sessions report
+carrier up and generation 2. There are no grant cancellations, expired grants
+or partially/fully submitted expiries on that lane. This occurrence stalls
+before physical DATA transmission. Nine earlier runs with added diagnostic
+gauges passed; those passes do not clear the uninstrumented failure.
+The remaining investigation concerns request/grant, feedback and migration state.
+
 ## Bounded pacing-credit experiment (November 7)
 
 A diagnostic candidate retains elapsed pacing credit up to one existing send
@@ -339,6 +406,9 @@ and sub-baseline hints. The existing short routed/GSO PMTU test also passes. The
 kernel tests and the live-probe quote test pass on Linux 7.0 as well.
 This change has no throughput measurement and does not clear the migration
 failure or either performance gate.
+A later Linux 7.0 run with the liveness fix also passes the full routed
+9000→1500→1280→9000 sequence in 649.92 seconds, including the real upward
+retry and all outer-fragmentation assertions.
 
 ## Recovery pressure diagnostics and kernel recheck (November 7)
 
