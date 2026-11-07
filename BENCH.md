@@ -560,6 +560,60 @@ TAP rename/namespace movement, daemon restart and short MTU tests. The full
 routed test also passes 9000 → 1500 → 1280 → 9000 with returned and filtered
 ICMPv6 PTB, the normal upward retry and zero outer fragmentation.
 
+## ACK timing after suffix retention (November 7)
+
+The [matched current-source diagnostic](benches/tap-sender-retained-ack-diagnostic.json)
+applies identical [instrumentation](benches/sender-current-ack-diagnostic.patch)
+to the cap64 baseline and retained-suffix build. Both include the startup-clock
+and packet-round corrections. Each runs four twenty-second points with the
+same placement and active PMTU discovery, without concurrent builds or tests.
+These instrumented observations supplement the normal release sweep above.
+
+| At 21G offered each way | Baseline L / R | Retained suffix L / R |
+| --- | ---: | ---: |
+| Delivered Gbit/s | 1.60 / 1.55 | 2.34 / 1.99 |
+| Daemon CPU % | 170.21 / 165.61 | 225.27 / 209.10 |
+| Mean ranges per ACK | 31.97 / 31.97 | 24.53 / 22.04 |
+| ACKs carrying all 32 ranges % | 99.80 / 99.83 | 58.27 / 39.98 |
+| Packet gap among earliest ACK causes % | 81.02 / 83.52 | 1.41 / 1.32 |
+| Timer among earliest ACK causes % | 5.43 / 4.53 | 15.32 / 8.86 |
+| ACK traffic MB/s | 4.01 / 3.99 | 3.80 / 3.77 |
+| Mean actual ACK queue µs | 215.17 / 192.85 | 35.65 / 34.85 |
+| Mean required control-pacing wait µs | 165.04 / 152.78 | 15.69 / 15.41 |
+
+Reason categories can overlap on tied deadlines. Actual queue time excludes
+the cached-turn timestamp offset; the control-wait counter excludes wakeup
+lateness. Retention substantially reduces artificial packet gaps and control
+waiting, but ACK range history remains costly. All eight points have zero
+admission pressure, socket overflow, inner UDP errors, invalid/duplicate/
+out-of-window/wrong-run records, reordering and outer fragmentation.
+
+After retention, Open occupies 74.73 / 78.07% of sender time. Within Open,
+pacing blocks 46.43 / 43.59% and the congestion window blocks 35.76 / 39.59%;
+ready work waiting for service occupies 8.91 / 9.43%. Closing occupies
+20.30 / 17.16% of total sender time. These separate remaining scheduling and
+window constraints from the reduced ACK-control delay; they do not establish
+the CPU ceiling.
+
+A [normal-release control-rate experiment](benches/tap-sender-retained-control16.json)
+then raises only the control ceiling from 4 to 16 MiB/s, retaining the literal
+sixteen-datagram burst and all other limits.
+
+| Requested Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| 16 | 2.55 / 2.26 | 83.76 / 85.66 | 235.72 / 217.96 |
+| 21 | 2.61 / 2.26 | 87.38 / 89.04 | 234.67 / 219.39 |
+| Unlimited | 2.61 / 2.16 | 95.38 / 96.00 | 235.97 / 218.21 |
+| 16 return | 2.74 / 2.43 | 82.62 / 84.61 | 244.15 / 230.07 |
+
+The paced point improves about 8% each way over the normal retained-suffix
+baseline, but reverse goodput falls 4.5% under unlimited load. At 21G, counters
+report 704,430 / 693,896 TAP TX drops, 9,488 / 13,113 frame expiries and
+575 / 20,792 queue drops. All four points pass the same zero-error checks above.
+The three control-pacing tests and Clippy pass. This ceiling change remains
+an experiment: the gain is modest, it does not fix the plateau, and it has not
+passed the complete runtime acceptance suite. Production stays at 4 MiB/s.
+
 ## Request fairness and burst-size experiments (November 7)
 
 Two normal-release sweeps use the ACK-pruning baseline, twenty-second points,
