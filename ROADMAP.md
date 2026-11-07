@@ -510,6 +510,9 @@ differences and integer rounding are recorded in tests/vectors/bbr-07/README.md.
 Runtime feedback ordering, controller ownership and worker enforcement are
 connected. Controller creation uses the runtime clock; a one-day-uptime regression
 prevents the first ACK from spuriously entering ProbeRTT.
+Successful window-use evidence now survives multiple ACKs of one packet-timed
+round, including its boundary ACK. Unused reservations do not set it, and an
+application-limited idle restart clears it. Zero inflight alone does not prove idle.
 General application-limited detection and payload recovery remain
 unfinished; congestion-control integration is not complete.
 Reserve sampling metadata against the startup memory ceiling; a full sampling

@@ -511,6 +511,8 @@ for DATA, PMTU and liveness probes from worker zero's per-group controller.
 ACK-only and PROBE_REPLY traffic retain their separate control ceiling.
 Controllers start from the runtime's monotonic clock, so host uptime does not
 make the first ACK trigger an expired ProbeRTT timer.
+Successful window use is retained across ACKs in a packet-timed round; unused
+grant reservations do not count. An application-limited idle restart clears that evidence.
 
 The pure `bbr::Delivery` sampler now follows draft-07's delivery-rate rules,
 with fixed vectors under `tests/vectors/bbr-07`. It counts newly acknowledged

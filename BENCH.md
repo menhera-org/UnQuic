@@ -331,6 +331,24 @@ scans, ring wrap, maximum packet numbers and mutations between scan steps.
 Foreign-move reconnect takes 18.62 seconds in this run; the service-delay gap
 remains. The last full routed PMTU test precedes this index change.
 
+## Packet-round window evidence (November 7)
+
+A separate controller-integration defect cleared congestion-window-use evidence
+after every delivering ACK. In ProbeBW_UP with a finite long-term inflight cap,
+later ACKs from the same full flight could therefore stop contributing to cap
+growth. A first-flight regression reproduces that loss of evidence.
+
+The owner now records successful window use, excluding unused grant reservations.
+The controller retains it through the packet-round boundary ACK and carries fresh
+boundary evidence into the new round. A proven application-limited idle restart
+clears both layers; zero inflight with queued work does not. Regressions cover
+first-flight and boundary ACKs, unused/full-window grants, and idle versus queued
+restarts. The precise tracking interpretation is documented with the
+[draft-07 vectors](tests/vectors/bbr-07/README.md). No throughput gain is attributed
+to this correctness fix before measurement. The fix passes 338 release tests,
+Clippy and 56 short container tests; foreign-move reconnect takes 1.00 second
+in this observation.
+
 ## Request fairness and burst-size experiments (November 7)
 
 Two normal-release sweeps use the ACK-pruning baseline, twenty-second points,

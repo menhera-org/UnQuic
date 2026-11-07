@@ -35,6 +35,16 @@ These are model vectors, not a network simulator or throughput measurement.
 Unit tests additionally cover RTT refresh, loss, recovery undo, filter expiry,
 application limitation, integer boundaries and a tenfold capacity reduction.
 
+For the window-use flag defined in [section 2.2](https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-07.html#section-2.2),
+the transport reports fresh evidence from successful transmissions, excluding
+unused reservations. The controller accumulates it across ACKs. A round-boundary
+ACK consumes the accumulated flag, then retains only fresh evidence for the new
+round. This preserves the first full flight's evidence across its ACKs; a
+zero-inflight, application-limited restart clears it. Draining a flight while
+work remains queued does not prove idle. The draft does not prescribe this
+transport-side tracking algorithm. Regressions cover first-flight ACKs, boundary
+ACKs with and without fresh evidence, and idle restart.
+
 ## Pinned draft interpretations
 
 The controller follows the draft-07 pseudocode when its prose differs:

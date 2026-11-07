@@ -108,6 +108,7 @@ pub struct Controller {
     min_rtt_stamp: Duration,
 
     round_start: bool,
+    cwnd_limited: bool,
     next_round_delivered: u64,
     drain_rounds: u8,
     loss_round_delivered: u64,
@@ -194,6 +195,7 @@ impl Controller {
             min_rtt: srtt,
             min_rtt_stamp: now,
             round_start: false,
+            cwnd_limited: false,
             next_round_delivered: 0,
             drain_rounds: 0,
             loss_round_delivered: 0,
@@ -273,6 +275,7 @@ impl Controller {
         self.check_time(now)?;
         self.now = now;
         if in_flight == 0 && app_limited {
+            self.cwnd_limited = false;
             self.idle_restart = true;
             self.extra_start = now;
             if self.state.probe_bw() {
@@ -286,8 +289,9 @@ impl Controller {
 
     /// Updates the model after one complete, newly delivering ACK.
     ///
-    /// cwnd_limited means the sender used the full window during the packet-timed
-    /// round being observed. rtt uses the newest ACKed packet's original receive
+    /// cwnd_limited reports fresh successful window use since the preceding ACK.
+    /// The controller retains it through the ACK completing this packet-timed round.
+    /// rtt uses the newest ACKed packet's original receive
     /// time, not the time a delayed owner processed its report.
     /// Returns true when the sampler must mark an application-limited bubble
     /// because this ACK ran the ProbeRTT procedure.
@@ -332,7 +336,8 @@ impl Controller {
         {
             self.start_down();
         }
-        self.update_probe_bw(&sample, in_flight, cwnd_limited);
+        self.cwnd_limited |= cwnd_limited;
+        self.update_probe_bw(&sample, in_flight, self.cwnd_limited);
         let expired = self.update_min_rtt(rtt);
         let mark_app_limited = self.check_probe_rtt(in_flight, expired);
         if sample.delivered != 0 {
@@ -347,6 +352,10 @@ impl Controller {
         self.set_pacing(self.state.pacing_gain());
         self.set_quantum();
         self.set_cwnd(sample.newly_acked);
+        if self.round_start {
+            // Consume the completed round, retaining fresh evidence for the newly observed flight.
+            self.cwnd_limited = cwnd_limited;
+        }
         Ok(mark_app_limited)
     }
 

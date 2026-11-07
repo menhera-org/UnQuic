@@ -471,3 +471,59 @@ fn successive_loss_rounds_follow_a_tenfold_capacity_reduction() {
     c.start_refill();
     assert_eq!((c.bw_shortterm, c.inflight_shortterm), (INFINITY, INFINITY));
 }
+
+fn limited_probe() -> Controller {
+    let mut c = controller();
+    c.state = State::Up;
+    c.full_bw_reached = true;
+    c.inflight_longterm = 30_000;
+    c.cwnd = 30_000;
+    c.probe_up_acked_per_inc = 1500;
+    c
+}
+
+#[test]
+fn first_full_flight_keeps_window_evidence_through_its_packet_round() {
+    for fresh_on_boundary in [false, true] {
+        let mut c = limited_probe();
+        for (turn, prior, fresh, expected, boundary) in [
+            (1, 0, true, 0, true),
+            (2, 0, false, 1500, false),
+            (3, 1500, fresh_on_boundary, 3000, true),
+            (
+                4,
+                1500,
+                false,
+                if fresh_on_boundary { 4500 } else { 3000 },
+                false,
+            ),
+        ] {
+            let mut s = sample(&c, 1_500_000, 1500);
+            s.prior_delivered = prior;
+            s.delivered = c.delivered + s.newly_acked - prior;
+            c.on_ack(s, Some(ms(10)), 28_500, fresh, ms(turn)).unwrap();
+            assert_eq!(c.round_start, boundary);
+            assert_eq!(
+                c.probe_up_acked, expected,
+                "ACK {turn}, fresh boundary={fresh_on_boundary}"
+            );
+        }
+    }
+}
+
+#[test]
+fn drained_transmission_preserves_round_evidence_without_idle_proof() {
+    for app_limited in [false, true] {
+        let mut c = limited_probe();
+        let s = sample(&c, 1_500_000, 1500);
+        c.on_ack(s, Some(ms(10)), 28_500, true, ms(1)).unwrap();
+        assert!(c.cwnd_limited);
+        c.on_transmit(ms(2), 0, app_limited).unwrap();
+        assert_eq!(c.cwnd_limited, !app_limited);
+        let s = sample(&c, 1_500_000, 1500);
+        c.on_ack(s, Some(ms(10)), 1500, false, ms(3)).unwrap();
+        assert!(c.round_start);
+        assert_eq!(c.probe_up_acked, if app_limited { 0 } else { 1500 });
+        assert!(!c.cwnd_limited);
+    }
+}

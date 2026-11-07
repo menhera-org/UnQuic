@@ -145,10 +145,20 @@ impl Owner {
     }
 
     pub(super) fn complete(&mut self, flight: Box<Flight>) -> io::Result<()> {
+        let sent = flight.completion().is_some_and(|(count, _, _)| count != 0);
         let group = flight.group().ok_or(io::ErrorKind::InvalidInput)?;
         self.sender
             .reported(flight)
             .map_err(|(error, _)| io::Error::other(format!("sender completion: {error}")))?;
+        let (_, inflight) = self
+            .sender
+            .flight_bytes(group)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let state = &mut self.groups[group];
+        let limits = state.controller.limits();
+        state.cwnd_limited |= sent
+            && inflight != 0
+            && limits.window.saturating_sub(inflight) < u64::from(limits.max_datagram);
         self.rescan |= group < self.cursor;
         Ok(())
     }
@@ -512,13 +522,13 @@ impl Owner {
                 .controller
                 .set_max_datagram(request.mtu)
                 .map_err(io::Error::other)?;
+            let app_limited = self.sender.is_app_limited(request.group).unwrap_or(false);
+            if inflight == 0 && app_limited {
+                state.cwnd_limited = false;
+            }
             state
                 .controller
-                .on_transmit(
-                    now,
-                    inflight,
-                    self.sender.is_app_limited(request.group).unwrap_or(false),
-                )
+                .on_transmit(now, inflight, app_limited)
                 .map_err(io::Error::other)?;
             let mut limits = state.controller.limits();
             if state.pto.stalled() {
@@ -553,7 +563,6 @@ impl Owner {
                 .window
                 .saturating_sub(inflight)
                 .saturating_sub(reserved);
-            state.cwnd_limited |= available < u64::from(limits.max_datagram);
             let mut budget = u64::from(limits.quantum.min(16 * u32::from(limits.max_datagram)))
                 .saturating_sub(reserved);
             if request.probe.is_none() {
@@ -789,8 +798,16 @@ mod tests {
             panic!()
         };
         assert_eq!(flight.packets().len(), 10);
+        assert!(
+            !owner.groups[0].cwnd_limited,
+            "reservations are not successful window use"
+        );
         flight.complete(10, Some(Duration::ZERO), false).unwrap();
         owner.complete(flight).unwrap();
+        assert!(
+            owner.groups[0].cwnd_limited,
+            "the final successful grant fills the window"
+        );
         owner
             .advance(Duration::from_millis(1), &mut outgoing)
             .unwrap();
@@ -1696,6 +1713,78 @@ mod fairness_regression {
                 assert_eq!(seen, 0b111);
                 seen = 0;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod window_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn unused_grant_adds_no_evidence_and_drained_retry_preserves_prior_evidence() {
+        for app_limited in [false, true] {
+            let (mut owner, flights) = Owner::new(1, 1, &[(0, 1, 0)], Duration::ZERO).unwrap();
+            owner.timers.install(0, 1).unwrap();
+            let mut flight = flights.into_vec().pop().unwrap();
+            let packets: Vec<_> = (1..=10)
+                .map(|number| pacing::Planned {
+                    id: PacketId {
+                        session: 0,
+                        generation: 1,
+                        lane: 1,
+                        number,
+                    },
+                    bytes: 1280,
+                })
+                .collect();
+            flight.prepare(&packets).unwrap();
+            owner
+                .request(Request {
+                    flight,
+                    group: 0,
+                    deadline: Duration::from_secs(1),
+                    probe: None,
+                    mtu: 1280,
+                    pmtu: false,
+                })
+                .unwrap();
+            let mut outgoing = VecDeque::with_capacity(16);
+            owner.advance(Duration::ZERO, &mut outgoing).unwrap();
+            let (_, Message::Permit(mut flight)) = outgoing.pop_front().unwrap() else {
+                panic!()
+            };
+            assert!(!owner.groups[0].cwnd_limited);
+            flight.complete(0, None, false).unwrap();
+            owner.complete(flight).unwrap();
+            assert!(!owner.groups[0].cwnd_limited);
+            owner
+                .advance(Duration::from_millis(1), &mut outgoing)
+                .unwrap();
+            let (_, Message::Recycle(mut flight)) = outgoing.pop_front().unwrap() else {
+                panic!()
+            };
+            flight.prepare(&packets).unwrap();
+            owner.groups[0].cwnd_limited = true; // An earlier flight was entirely declared lost.
+            if app_limited {
+                owner.sender.close(0).unwrap();
+                owner.sender.advance(0, BATCH_SIZE).unwrap();
+                owner.sender.application_limited(0).unwrap();
+            }
+            owner
+                .request(Request {
+                    flight,
+                    group: 0,
+                    deadline: Duration::from_secs(1),
+                    probe: None,
+                    mtu: 1280,
+                    pmtu: false,
+                })
+                .unwrap();
+            owner
+                .advance(Duration::from_millis(1), &mut outgoing)
+                .unwrap();
+            assert_eq!(owner.groups[0].cwnd_limited, !app_limited);
         }
     }
 }
