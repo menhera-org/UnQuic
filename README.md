@@ -287,9 +287,10 @@ packet/time loss thresholds, exponential PTO periods and sender frame lifetime.
 It applies [verified erratum 7539](https://www.rfc-editor.org/errata/eid7539),
 which computes deviation before updating the smoothed RTT. Tests cover delay
 bounds, backward time, numeric limits and exact estimator values. Worker ACK
-processing and shared PTO timers use these calculations. Admission shortens each
-sender frame's original deadline to the measured RTT-based lifetime, bounded
-between 20 and 100 ms; repairs never extend it.
+processing and shared PTO timers use these calculations. The transmit owner
+shortens a source's read-time deadline once at admission using the measured
+RTT-based lifetime, bounded between 20 and 100 ms. Every expanded frame inherits
+that deadline; queued expansion and repairs never extend it.
 
 The pure `loss::FrameRecovery` tracks acknowledged and outstanding byte ranges
 and permits at most two repairs per byte. It excludes unsent bytes, ignores
@@ -625,7 +626,10 @@ UDP expansion accepts IPv4 options, VLAN tags, and IPv6 hop-by-hop, routing
 and destination headers. It validates protocol, lengths and checksum offsets,
 adjusts the supplied pseudo-header checksum seed, and advances IPv4 IDs.
 Unknown flags, unsupported GSO types, and fragmented GSO inputs are rejected.
-Pending input retains its original connection tag and 100 ms deadline.
+Pending input retains its original connection tag. The transmit owner shortens
+the initial 100 ms read-time deadline to its current 20–100 ms RTT-based lifetime
+before admitting the source. Expired sources release all unexpanded children
+without computing their headers or checksums.
 Expansion yields after 64 frames or 64 KiB per worker turn; the last frame
 may cross the byte target. Sessions take turns, and each session preserves
 input order. Adaptive ring reads allow up to four GSO sources per batch after

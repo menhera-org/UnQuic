@@ -579,7 +579,7 @@ the current scheduling regression.
 The pure RTT estimator, loss-deadline calculation, PTO-period backoff and frame
 lifetime now live in `loss.rs`, with exact-value and boundary tests. ACK-driven
 RTT updates and indexed group PTO timers are connected. RTT-based frame admission
-deadlines still need runtime integration.
+deadlines are connected to retained sources and frame views below.
 The pure shared PTO state now limits each expiry to two aggregate probe
 permissions, backs off across lanes and requests one loss-declaration pass on
 the third unanswered expiry. It then stops ordinary grants and keeps backed-off
@@ -597,7 +597,7 @@ unanswered expiry waits for forced settlement before probes. Stable per-worker
 message ordering preserves this barrier under queue pressure; accepted ACKs
 finish before scans, and new ACKs wait. Tests cover crossed groups, generation
 replacement, elapsed loss deadlines and saturated handoff queues. Payload repair
-still needs runtime integration.
+is connected through the bounded coverage and journal path below.
 
 Pure per-frame byte coverage now lives in `loss::FrameRecovery`, with two-repair
 limits, outstanding-generation checks, late ACK handling and bounded slot reuse.
@@ -626,8 +626,11 @@ Fresh batches leave half the journal capacity for repairs. Coverage work and
 frame cleanup yield under separate fixed budgets. Partial sends settle only the
 successful prefix, and late ACKs invalidate obsolete repair selections.
 Sender deadlines use four smoothed RTTs, clamped to 20–100 ms, without extending
-the original read deadline. Worker regressions cover mapping pressure, bounded
-report processing, partial sends and late-ACK cancellation. A bidirectional
+the original read deadline. The transmit owner sets that deadline once before
+source admission; all expanded children inherit it. Overdue GSO sources discard
+remaining children in bulk before expansion or checksum work. Worker regressions
+cover mapping pressure, bounded report processing, partial sends and late-ACK
+cancellation. A bidirectional
 release runtime test drops the original prefix and first repair, verifies
 second-repair delivery, then replays late originals without duplication or
 hot-path allocation. Sustained impaired-path throughput remains unverified.

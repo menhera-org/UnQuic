@@ -2235,6 +2235,18 @@ impl Worker {
 
     fn input_frame(&mut self, mut buffer: Box<Buffer>, now: Duration) -> io::Result<()> {
         let session = buffer.session;
+        let lifetime = self
+            .sender_index(session, buffer.lane)
+            .ok()
+            .map(|index| self.sender.lanes[index].rtt.frame_lifetime())
+            .unwrap_or(reassembly::FRAME_LIFETIME);
+        // Freeze the owner's lifetime before admitting or expanding this source.
+        buffer.deadline = buffer.deadline.min(
+            buffer
+                .deadline
+                .saturating_sub(reassembly::FRAME_LIFETIME)
+                .saturating_add(lifetime),
+        );
         if !self.matches(session, buffer.tag) || self.expired(&buffer, now) {
             self.release(buffer);
             return Ok(());
@@ -2391,16 +2403,7 @@ impl Worker {
             self.close_source(source);
             return Ok(Some(0));
         };
-        let lifetime = self
-            .sender_index(session, lane)
-            .ok()
-            .map(|index| self.sender.lanes[index].rtt.frame_lifetime())
-            .unwrap_or(Duration::from_millis(100));
-        let deadline = deadline.min(
-            deadline
-                .saturating_sub(Duration::from_millis(100))
-                .saturating_add(lifetime),
-        );
+
         let mut frame = frames::Frame {
             id,
             deadline,
@@ -4091,6 +4094,119 @@ mod tests {
             .flat_map(|s| s.batches.iter_mut().flatten())
             .find(|b| !b.pending.is_empty())
             .and_then(|b| b.pending.pop_front(&mut worker.frames).unwrap())
+    }
+
+    fn deadline_input(worker: &mut Worker, gso: bool) -> Box<Buffer> {
+        use crate::tap::test_common::udp;
+        use std::os::unix::net::UnixDatagram;
+        let mut buffer = worker.free.pop().unwrap();
+        let mut input = udp::frame(false, 42, &vec![7; if gso { 12800 } else { 60 }]);
+        let mut header = udp::partial(&mut input, false);
+        if gso {
+            header[1] = 5;
+            header[4..6].copy_from_slice(&100u16.to_ne_bytes());
+        }
+        let (fd, sender) = UnixDatagram::pair().unwrap();
+        sender
+            .send(&[header.as_slice(), input.as_slice()].concat())
+            .unwrap();
+        let mut tap = TapQueue::test_fd(fd.into(), true);
+        (buffer.length, buffer.segments) = tap.read_input(&mut buffer.bytes).unwrap();
+        buffer.session = 0;
+        buffer.lane = 0;
+        buffer.tag = 1;
+        buffer.deadline = reassembly::FRAME_LIFETIME;
+        buffer.tx_reserved = true;
+        worker.sessions[0].tx_retained += 1;
+        worker.sessions[0].tx_bytes += buffer.length;
+        buffer
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn owner_rejects_overdue_plain_and_gso_sources_before_admission() {
+        for foreign in [false, true] {
+            for gso in [false, true] {
+                let (mut worker, _) = receive_worker();
+                let (_, [_, mut reader]) = test_workers();
+                let (tx, mut returned) = crate::spsc::channel();
+                worker.outgoing[1] = Some(tx);
+                let lane = worker.sender_index(0, 0).unwrap();
+                assert!(worker.sender.lanes[lane].rtt.sample(
+                    Duration::ZERO,
+                    Duration::from_millis(1),
+                    0
+                ));
+                let buffer = deadline_input(if foreign { &mut reader } else { &mut worker }, gso);
+                worker
+                    .input_frame(buffer, Duration::from_millis(21))
+                    .unwrap();
+                assert!(worker.sessions[0].tap_inputs.is_empty());
+                assert!(pending(&worker).is_empty());
+                assert_eq!(worker.frames.available(), frames::CAPACITY);
+                assert_eq!(worker.counters.tap_gso_frames, 0);
+                assert_eq!(worker.counters.expired_frames, if gso { 128 } else { 1 });
+                if foreign {
+                    let Some(Event::Free(buffer)) = returned.try_pop() else {
+                        panic!("overdue foreign source was not returned");
+                    };
+                    assert_eq!(buffer.origin, 1);
+                    reader.release(buffer);
+                    assert_eq!(reader.free.len(), BUFFERS);
+                    assert_eq!(reader.sessions[0].tx_retained, 0);
+                    assert_eq!(reader.sessions[0].tx_bytes, 0);
+                }
+                assert_eq!(worker.free.len(), BUFFERS);
+                assert_eq!(worker.sessions[0].tx_retained, 0);
+                assert_eq!(worker.sessions[0].tx_bytes, 0);
+                assert_eq!(worker.counters.queue_drops, 0);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn queued_gso_source_keeps_its_deadline_and_expires_children_in_bulk() {
+        for expand in [false, true] {
+            let (mut worker, _) = receive_worker();
+            let lane = worker.sender_index(0, 0).unwrap();
+            assert!(worker.sender.lanes[lane].rtt.sample(
+                Duration::ZERO,
+                Duration::from_millis(1),
+                0
+            ));
+            let buffer = deadline_input(&mut worker, true);
+            worker.input_frame(buffer, Duration::ZERO).unwrap();
+            let source = *worker.sessions[0].tap_inputs.front().unwrap();
+            assert_eq!(
+                worker.frames.source(source).unwrap().deadline,
+                Duration::from_millis(20)
+            );
+            // A later, larger RTT cannot extend this admitted source or its children.
+            worker.sender.lanes[lane].rtt = crate::loss::Rtt::new();
+            if expand {
+                worker.drain_tap_inputs(Duration::from_millis(10)).unwrap();
+                assert_eq!(pending(&worker).len(), BATCH_SIZE);
+                for index in pending(&worker) {
+                    assert_eq!(
+                        worker.frames.frame(index).unwrap().deadline,
+                        Duration::from_millis(20)
+                    );
+                }
+            }
+            let materialized = if expand { BATCH_SIZE } else { 0 };
+            worker.drain_tap_inputs(Duration::from_millis(21)).unwrap();
+            assert!(worker.sessions[0].tap_inputs.is_empty());
+            assert_eq!(worker.counters.tap_gso_frames, materialized as u64);
+            assert_eq!(worker.counters.expired_frames, (128 - materialized) as u64);
+            worker.flush_frames(Duration::from_millis(21)).unwrap();
+            assert_eq!(worker.counters.expired_frames, 128);
+            assert_eq!(worker.frames.available(), frames::CAPACITY);
+            assert_eq!(worker.free.len(), BUFFERS);
+            assert_eq!(worker.sessions[0].tx_retained, 0);
+            assert_eq!(worker.sessions[0].tx_bytes, 0);
+            assert_eq!(worker.counters.queue_drops, 0);
+        }
     }
 
     #[test]

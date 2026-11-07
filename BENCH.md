@@ -29,7 +29,9 @@ General application-limited detection remains open. The rates above predate
 runtime payload retention and repair; they are not recovery-build measurements.
 The recovery build regresses further: the matched sixty-second unlimited run
 falls from 2.38 / 2.50 to 2.16 / 1.79 Gbit/s and introduces admission pressure.
-Its ascending sweep falls 21.9 / 14.4% from peak to unlimited.
+Its ascending sweep falls 21.9 / 14.4% from peak to unlimited. Moving deadline
+checks before source expansion does not restore throughput: the next
+sixty-second unlimited point delivers 1.78 / 1.68 Gbit/s.
 PMTU discovery is active in the latest rate sweeps and
 passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
 Missing recovery or congestion control does not explain away the remaining
@@ -61,10 +63,10 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Recovery-build sixty-second QinQ sweep: 1.96 / 1.75 Gbit/s paced, 2.16 / 1.79 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe integration regression; paced missing fractions are 90.50 / 91.55%. The recovery ascending sweep stays under 1% missing in both directions only at 0.5G offered. Five successful 20G repeats remain unmet. |
+| At least 20 Gbit/s each way at inner MTU 1500 | After the source-deadline fix, sixty-second QinQ sweep: 1.90 / 1.81 Gbit/s paced, 1.78 / 1.68 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe integration regression; paced missing fractions are 90.91 / 91.31%. The recovery ascending sweep stays under 1% missing in both directions only at 0.5G offered. Five successful 20G repeats remain unmet. |
 | Goodput must plateau under excess traffic | The recovery ascending sweep falls 21.9 / 14.4% from its 21G peak under unlimited load. Its sixty-second repeat rises under unlimited load, but remains slower than the matched baseline and uses only about 2.1–2.3 cores per daemon | No stable plateau or CPU ceiling is established. Source-expiry work, incomplete reassembly and grant/feedback scheduling require separate attribution. |
-| Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
-| VLAN-heavy deployment | Single- and double-tag output coalescing works. Final sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
+| Small-frame overload must remain efficient | Earlier pre-recovery tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
+| VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
 | Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Throughput sweeps currently cap outer packets at 1500 bytes. Larger-MTU throughput, real routed-path validation and DATA-quoted PTB processing remain open. |
@@ -181,6 +183,51 @@ The first ascending attempt exited with ConnectionRefused before producing a
 complete dataset. Its failure logs were not retained, leaving the cause
 unconfirmed. The table reports the complete retry; subsequent wrappers retain
 artifacts on failure before deleting their containers.
+
+## Reject expired sources before expansion (November 7)
+
+The transmit owner now applies the RTT lifetime once before admitting a source.
+All expanded children inherit it. Previously, the source could remain queued
+for 100 ms while each materialized child received a shorter deadline and was
+discarded after header/checksum work. Regressions fail on `d9867fa` and pass
+with the fix, covering plain/GSO input, local/foreign ownership, queued children,
+RTT changes and exact buffer-credit return. The change passes 344 all-feature
+and 335 default-feature release tests, both Clippy configurations, formatting
+and four targeted kernel checks.
+
+[Twelve release observations](benches/tap-source-deadline.json) use the same
+profile as the recovery-build comparison. They establish no general throughput
+gain. The source fix does not resolve admission pressure or the overload decline.
+
+| Requested Gbit/s each way, 20 seconds | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| 0.5 | 0.49 / 0.49 | 0.82 / 0.01 | 50.07 / 46.91 |
+| 1 | 0.97 / 0.98 | 1.61 / 0.85 | 100.39 / 93.15 |
+| 2 | 1.95 / 1.95 | 1.79 / 1.55 | 196.29 / 175.80 |
+| 3 | 2.26 / 1.81 | 23.35 / 38.99 | 230.76 / 212.86 |
+| 4 | 1.98 / 1.68 | 49.70 / 57.33 | 222.59 / 211.84 |
+| 8 | 2.16 / 1.84 | 72.57 / 76.65 | 231.58 / 220.45 |
+| 16 | 2.31 / 1.83 | 85.31 / 88.37 | 235.63 / 221.47 |
+| 21 | 1.87 / 1.73 | 90.94 / 91.62 | 219.99 / 208.71 |
+| Unlimited | 2.02 / 1.72 | 96.49 / 96.78 | 221.17 / 212.61 |
+
+| Requested Gbit/s each way, 60 seconds | Delivered Gbit/s | Missing after drain % | Daemon CPU % | Admission pressure L/R |
+| --- | ---: | ---: | ---: | ---: |
+| 21 | 1.90 / 1.81 | 90.91 / 91.31 | 222.69 / 213.07 | 36,958 / 14,038 |
+| Unlimited | 1.78 / 1.68 | 96.85 / 96.86 | 220.28 / 203.99 | 41,966 / 7,010 |
+| 21 return | 2.04 / 1.72 | 90.21 / 91.76 | 224.10 / 213.37 | 42,143 / 9,043 |
+
+The sixty-second unlimited point has thirteen inner UDP receive-buffer errors
+at the right receiver; all other inner error deltas are zero. All twelve points
+have zero outer socket overflow, outer fragmentation, corrupt or duplicate
+inner frames. Reordering and all drop counters remain in the JSON. The daemon
+SHA-256 is
+`95a130265740033ec8e6cd906f2f429abc5f81c3b9cd86c628b02edde5957ac4`.
+
+Further source inspection identifies a separate starvation path: class selection
+runs only when a transmit batch becomes empty. Continuous refill can keep a
+fresh batch nonempty while repairs wait, or vice versa. This needs its own
+regression and controlled measurement; the deadline results do not isolate it.
 
 ## Sender integration verification (November 7)
 
