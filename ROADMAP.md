@@ -693,8 +693,12 @@ full expired batches sharing the cleanup budget.
   router: every lane confirms 9000, reduces to 1500 with returned PTB, reduces
   to 1280 with PTB filtered, then recovers to 9000 after the real 600-second
   retry interval. It checks bidirectional QinQ frames and captures without outer
-  fragmentation or capture drops. DATA-quoted PTB validation awaits sent history;
-  retain independent-lane, lost-probe and forged/stale-feedback regression coverage.
+  fragmentation or capture drops. DATA-quoted PTB now matches the current
+  socket destination, path, connection/generation and exact retained submitted
+  header/length. Unsent reservations and hints predating newer MTU evidence are
+  rejected. Kernel checks inject forged and valid DATA quotes; pure checks cover
+  replay after reduction/reconfirmation and future send times. Retain independent-lane,
+  lost-probe and forged/stale-feedback regression coverage.
 - `bbr.rs`: BBRv3 as draft-ietf-ccwg-bbr-07 specifies, one owner per sending
   direction and path group, charging outer IP bytes, initial window ten
   datagrams. Pin deterministic vectors derived from the draft's pseudocode

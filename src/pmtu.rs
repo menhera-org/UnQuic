@@ -3,8 +3,8 @@
 //! The owner supplies monotonic time, records only successful socket submissions,
 //! validates ICMP quotes, and limits DATA to payload_limit(). A new socket/path
 //! needs a new Path. Independent lanes never share confirmation state.
-//! Periodic confirmation detects reductions until DATA-quoted PTB and transport
-//! blackhole feedback are connected to discovery.
+//! Periodic confirmation detects silent reductions; retained send history validates
+//! DATA-quoted PTB without treating a size hint as successful delivery.
 
 use crate::{BASE_UDP_PAYLOAD, counters::PathMtuState, socket::MAX_UDP_PAYLOAD};
 use std::time::Duration;
@@ -55,6 +55,7 @@ pub struct Path {
     due: Duration,
     raise: Duration,
     timeout: Duration,
+    evidence_at: Option<Duration>,
 }
 
 impl Path {
@@ -82,6 +83,7 @@ impl Path {
                 due: now,
                 raise: Duration::MAX,
                 timeout: INITIAL_TIMEOUT,
+                evidence_at: None,
             })
     }
 
@@ -222,6 +224,7 @@ impl Path {
         };
         // A measured path permits faster black-hole detection than the initial timeout.
         self.timeout = (now - at).saturating_mul(4).max(MIN_TIMEOUT);
+        self.evidence_at = Some(now);
         self.limit = self.limit.max(length);
         if length > self.upper {
             self.upper = self.ceiling;
@@ -244,6 +247,20 @@ impl Path {
         self.local_too_big(length, outer_mtu, now)
     }
 
+    // Retained DATA must postdate newer MTU evidence; replayed hints cannot undo confirmation.
+    pub(crate) fn sent_too_big(
+        &mut self,
+        length: usize,
+        sent_at: Duration,
+        outer_mtu: u32,
+        now: Duration,
+    ) -> bool {
+        if sent_at > now || self.evidence_at.is_some_and(|at| sent_at <= at) {
+            return false;
+        }
+        self.local_too_big(length, outer_mtu, now)
+    }
+
     /// Applies a kernel-local size error for a known send attempt.
     /// The owner must not pass an unvalidated remote ICMP report here.
     pub fn local_too_big(&mut self, attempted: usize, outer_mtu: u32, now: Duration) -> bool {
@@ -251,6 +268,7 @@ impl Path {
         if attempted == 0 || attempted > MAX_UDP_PAYLOAD || limit >= attempted {
             return false;
         }
+        self.evidence_at = Some(now);
         let failed = self.phase == Phase::Failed;
         self.upper = limit.min(if failed { self.ceiling } else { self.upper });
         self.count = 0;
@@ -279,6 +297,7 @@ impl Path {
     /// Restarts baseline confirmation after transport feedback indicates a black hole.
     /// Invalidates all old proofs immediately, including delayed replies to larger probes.
     pub fn black_hole(&mut self, now: Duration) {
+        self.evidence_at = Some(now);
         self.limit = BASE_UDP_PAYLOAD;
         self.target = BASE_UDP_PAYLOAD;
         self.upper = self.ceiling;
@@ -471,6 +490,27 @@ mod tests {
         assert_eq!(path.payload_limit(), larger);
         assert_eq!(path.upper, MAX_UDP_PAYLOAD);
         assert_eq!(path.probes(now + RTT).count(), 0);
+    }
+
+    #[test]
+    fn sent_packet_hints_cannot_replay_past_newer_mtu_evidence() {
+        let mut path = Path::new(MAX_UDP_PAYLOAD, Duration::ZERO).unwrap();
+        let mut now = Duration::ZERO;
+        let mut packet = 1;
+        complete(&mut path, MAX_UDP_PAYLOAD, &mut now, &mut packet);
+        assert!(!path.sent_too_big(MAX_UDP_PAYLOAD, now, 1500, now + RTT));
+        let sent = now + RTT;
+        now = sent + RTT;
+        assert!(!path.sent_too_big(MAX_UDP_PAYLOAD, now + RTT, 1500, now));
+        assert!(!path.sent_too_big(MAX_UDP_PAYLOAD, sent, 9000, now));
+        assert!(path.sent_too_big(MAX_UDP_PAYLOAD, sent, 1500, now));
+        assert_eq!(path.payload_limit(), BASE_UDP_PAYLOAD);
+        assert!(!path.sent_too_big(MAX_UDP_PAYLOAD, sent, 1280, now + RTT));
+        complete(&mut path, 1452, &mut now, &mut packet);
+        assert_eq!(path.payload_limit(), 1452);
+        assert!(!path.sent_too_big(MAX_UDP_PAYLOAD, sent, 1280, now + RTT));
+        assert!(path.sent_too_big(1452, now + RTT, 1279, now + RTT * 2));
+        assert_eq!(path.payload_limit(), 0);
     }
 
     #[test]

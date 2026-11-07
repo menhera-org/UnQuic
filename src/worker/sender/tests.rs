@@ -2160,3 +2160,132 @@ fn changed_coverage_rejection_is_distinct_from_mapping_pressure() {
     assert_eq!(worker.counters.recovery_mapping_pressure, 0);
     assert_eq!(worker.counters.cancelled_grants, 0);
 }
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn sent_mtu_quotes_require_exact_current_successful_history() {
+    let (mut workers, rx) = workers();
+    queue_frame(&mut workers[0], 1514);
+    workers[0].flush_frames(Duration::ZERO).unwrap();
+    for _ in 0..8 {
+        service(&mut workers);
+    }
+    let worker = &mut workers[0];
+    let mut bytes = [0; BASE_UDP_PAYLOAD];
+    let length = rx.recv(&mut bytes).unwrap().0;
+    let header = Header::decode(&bytes[..length]).unwrap();
+    let quote = &bytes[..wire::HEADER_LEN];
+    let proof = Some((length, Duration::from_millis(1)));
+    assert_eq!(worker.sent_mtu_quote(0, 0, 0, quote), proof);
+    for size in 0..wire::HEADER_LEN {
+        assert_eq!(worker.sent_mtu_quote(0, 0, 0, &quote[..size]), None);
+    }
+    for byte in 0..wire::HEADER_LEN {
+        let mut forged = [0; wire::HEADER_LEN];
+        forged.copy_from_slice(quote);
+        forged[byte] ^= 1;
+        assert_eq!(worker.sent_mtu_quote(0, 0, 0, &forged), None, "byte {byte}");
+    }
+    for (peer, path, lane) in [(1, 0, 0), (0, 1, 0), (0, 0, 1), (0, 0, usize::MAX)] {
+        assert_eq!(worker.sent_mtu_quote(peer, path, lane, quote), None);
+    }
+    let index = worker.sender_index(0, 0).unwrap();
+    worker.sender.lanes[index].generation += 1;
+    assert_eq!(worker.sent_mtu_quote(0, 0, 0, quote), None);
+    worker.sender.lanes[index].generation -= 1;
+    let connection = worker.sessions[0].connection.take();
+    assert_eq!(worker.sent_mtu_quote(0, 0, 0, quote), None);
+    worker.sessions[0].connection = connection;
+    assert_eq!(worker.sent_mtu_quote(0, 0, 0, quote), proof);
+
+    let number = worker.sender.lanes[index].history.highest_sent() + 1;
+    worker.sender.lanes[index]
+        .history
+        .reserve(number, (length + 48) as u16, true, true)
+        .unwrap();
+    let mut unsent = [0; wire::HEADER_LEN];
+    Header {
+        packet_number: number,
+        ..header
+    }
+    .encode(&mut unsent);
+    assert_eq!(worker.sent_mtu_quote(0, 0, 0, &unsent), None);
+    assert!(worker.sender.lanes[index].history.cancel(number));
+    assert_eq!(worker.sent_mtu_quote(0, 0, 0, &unsent), None);
+}
+
+#[test]
+#[ignore = "requires a disposable container and network namespace capabilities"]
+fn data_quoted_ptb_reduces_only_after_successful_send() {
+    // SAFETY: only this test thread and its children enter the disposable namespace.
+    cvt(unsafe { libc::unshare(libc::CLONE_NEWNET) }).unwrap();
+    assert!(
+        std::process::Command::new("ip")
+            .args(["link", "set", "lo", "mtu", "9000", "up"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (mut workers, rx) = workers();
+    let worker = &mut workers[0];
+    worker.transmit[0].paths[0].address = Some(rx.local_addr());
+    let tx = &mut worker.transmit[0].paths[0].lanes[0];
+    tx.socket.as_mut().unwrap().enable_mtu_discovery().unwrap();
+    worker
+        .reactor
+        .add(tx.socket.as_ref().unwrap().as_fd(), TX_TOKEN, 0)
+        .unwrap();
+    // Establish a 1500-byte path before exercising the actual DATA/error-queue path.
+    tx.mtu = pmtu::Path::new(1452, Duration::ZERO).unwrap();
+    let mut now = Duration::ZERO;
+    let mut number = 1;
+    while tx.mtu.payload_limit() < 1452 {
+        let length = tx.mtu.poll(now).unwrap();
+        let id = pmtu::ProbeId {
+            session: 0,
+            tag: 1,
+            lane: 1,
+            packet: number,
+        };
+        assert!(tx.mtu.submitted(id, length, now));
+        now += Duration::from_micros(1);
+        assert!(tx.mtu.reply(id, length, now));
+        number += 1;
+    }
+    queue_frame(worker, 1514);
+    worker.flush_frames(Duration::ZERO).unwrap();
+    for _ in 0..8 {
+        service(&mut workers);
+    }
+    let worker = &mut workers[0];
+    let mut bytes = [0; 1452];
+    let (length, source) = rx.recv(&mut bytes).unwrap();
+    assert_eq!(length, 1452);
+    assert!(
+        Datagram::decode(&bytes[..length])
+            .unwrap()
+            .records()
+            .any(|r| matches!(r, Record::Data { .. }))
+    );
+    for forged in [true, false] {
+        if forged {
+            bytes[4] ^= 1;
+        }
+        super::super::tests::inject_ptb(source, rx.local_addr(), &bytes[..length], 1400);
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+        let count = worker.reactor.wait(&mut events, 100).unwrap();
+        assert!(
+            events[..count]
+                .iter()
+                .any(|event| event.u64 == TX_TOKEN && event.events & libc::EPOLLERR as u32 != 0)
+        );
+        assert!(worker.mtu_error(0, 0, 0, Duration::from_millis(2)).unwrap());
+        assert_eq!(
+            worker.transmit[0].paths[0].lanes[0].mtu.payload_limit(),
+            if forged { 1452 } else { BASE_UDP_PAYLOAD }
+        );
+        if forged {
+            bytes[4] ^= 1;
+        }
+    }
+}

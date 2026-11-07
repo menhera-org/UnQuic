@@ -830,9 +830,13 @@ not outer IPv6 fragments.
 Transmit setup enables `IPV6_PMTUDISC_PROBE` and `IPV6_RECVERR`, preserving
 `IPV6_DONTFRAG`. This permits probes above a learned kernel PMTU while still
 rejecting packets above the local interface MTU. Workers consume one error
-entry per socket event. Remote Packet Too Big reports must match a live sent
-probe's quoted header and destination. Reports quoting DATA await the retained
-send history in the recovery stage; periodic probes still detect reductions.
+entry per socket event. Remote Packet Too Big reports must match the socket's
+destination and either a live probe or retained successful send history.
+DATA quotes must match the entire header, including cookie, connection tag,
+lane, packet number and actual submitted length, on the current path and
+generation. Unsent reservations cannot justify a size change. Retained sends
+older than newer MTU evidence are ignored, so replayed hints cannot undo a
+fresh confirmation. Periodic probes continue to detect silently dropped PTB.
 
 EMSGSIZE and validated size hints lower the limit and replan unsent ranges with
 their original frame IDs and byte offsets, using fresh packet numbers. GSO

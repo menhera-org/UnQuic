@@ -72,7 +72,7 @@ earlier tables retain their original builds and test conditions.
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
-| Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Throughput sweeps currently cap outer packets at 1500 bytes. Larger-MTU throughput, real routed-path validation and DATA-quoted PTB processing remain open. |
+| Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Throughput sweeps currently cap outer packets at 1500 bytes. Larger-MTU throughput and real routed-path validation remain open. DATA-quoted PTB validation now has targeted kernel coverage. |
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These throughput sweeps are local container tests without injected impairment | No real-path or independent/burst-loss result verifies the target. Recovery is connected; sustained lossy-path performance and complete congestion-control integration remain unverified. |
 
 Unlimited loss remains high. TAP ingress drops, bounded worker queue drops,
@@ -82,6 +82,24 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## DATA-quoted Packet Too Big validation (November 7)
+
+Remote ICMPv6 size reports now use retained successful transmission history
+when no live probe matches. The lookup checks the receiving transmit socket's
+destination, current session/path/generation and all 48 quoted header bytes,
+including actual submitted length. It uses the existing cookie index and
+packet-history lookup without allocation, a history scan or another syscall.
+Unsent reservations are rejected. A per-path timestamp rejects retained quotes
+older than a later confirmation, reduction or black-hole reset.
+
+The release kernel suite passes 70 checks, including real DATA transmission
+followed by forged and valid ICMPv6 quotes, every quoted-byte mutation,
+truncation, wrong ownership/path/generation, unsent and canceled reservations.
+Pure tests cover replay after reduction and reconfirmation, future timestamps,
+and sub-baseline hints. The existing short routed/GSO PMTU test also passes.
+This change has no throughput measurement and does not clear the migration
+failure or either performance gate.
 
 ## Recovery pressure diagnostics and kernel recheck (November 7)
 

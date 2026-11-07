@@ -746,8 +746,10 @@ Per-lane MTU discovery now starts DATA at 1232 bytes
 and probes up to the configured ceiling, defaulting to 8952 bytes. Limits and
 gauges reflect confirmation rather than operator assertions. Release routed
 tests verify 9000/1500/1280-byte outer paths with returned and filtered PTB and
-recovery after the real upward retry interval. DATA-quoted PTB validation still
-requires sent history; periodic probes currently detect those reductions.
+recovery after the real upward retry interval. DATA-quoted PTB now validates
+the destination and exact current-path, current-generation sent header against
+retained successful history. Unsent reservations and quotes older than newer
+MTU evidence cannot lower the limit. Periodic probes detect silent reductions.
 The foreground daemon now parses the documented TOML, provisions cookies through
 gen-uuid, refreshes hostnames through per-peer iphost helpers after readiness,
 and joins transport workers on SIGINT/SIGTERM. Tests cover delayed DNS, address

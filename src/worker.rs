@@ -3380,6 +3380,43 @@ impl Worker {
         Ok(())
     }
 
+    fn sent_mtu_quote(
+        &self,
+        peer: usize,
+        path: usize,
+        lane: usize,
+        quote: &[u8],
+    ) -> Option<(usize, Duration)> {
+        let quote: &[u8; wire::HEADER_LEN] = quote.try_into().ok()?;
+        let cookie = crate::UnquicUuid::from_bytes(quote.get(4..20)?.try_into().ok()?);
+        let session = self.shared.config.session_for_cookie(cookie)?;
+        if self.shared.config.peer_for_session(session) != Some(peer) {
+            return None;
+        }
+        let local = self.sessions.get(session)?;
+        let connection = local.connection?;
+        let history = self
+            .sender
+            .lanes
+            .get(self.sender_index(session, lane).ok()?)?;
+        if local.path != path || local.installed?.generation != history.generation {
+            return None;
+        }
+        let number = u64::from_be_bytes(quote.get(40..48)?.try_into().ok()?);
+        let sent = history.history.packet(number)?;
+        let payload = usize::from(sent.outer_bytes).checked_sub(48)?;
+        let mut expected = [0; wire::HEADER_LEN];
+        Header {
+            cookie,
+            receive_tag: connection.remote_tag().get(),
+            lane: u16::try_from(lane).ok()?.checked_add(1)?,
+            packet_number: number,
+            record_area_len: u16::try_from(payload.checked_sub(wire::HEADER_LEN)?).ok()?,
+        }
+        .encode(&mut expected);
+        (*quote == expected).then_some((payload, sent.sent_at))
+    }
+
     // Return whether a remote error could have caused EMSGSIZE; it is not a local size proof.
     fn mtu_error(
         &mut self,
@@ -3421,12 +3458,17 @@ impl Worker {
                 (error.quoted_payload() == header).then_some(id)
             })
         };
+        let sent = (!error.local && proof.is_none())
+            .then(|| self.sent_mtu_quote(peer, path, lane, error.quoted_payload()))
+            .flatten();
         let tx = &mut self.transmit[peer].paths[path].lanes[lane];
         if error.local {
             let attempted = std::mem::take(&mut tx.failed_payload);
             tx.mtu.local_too_big(attempted, error.mtu, now);
         } else if let Some(id) = proof {
             tx.mtu.packet_too_big(id, error.mtu, now);
+        } else if let Some((length, sent_at)) = sent {
+            tx.mtu.sent_too_big(length, sent_at, error.mtu, now);
         }
         self.mtu_changed(peer, path, lane, before, now);
         Ok(!error.local)
@@ -6271,13 +6313,46 @@ mod tests {
         }
     }
 
+    pub(super) fn inject_ptb(
+        source: std::net::SocketAddrV6,
+        remote: std::net::SocketAddrV6,
+        bytes: &[u8],
+        mtu: u32,
+    ) {
+        let length = bytes.len();
+        // SAFETY: socket returns a new descriptor transferred to its sole owner.
+        let icmp = unsafe {
+            std::net::UdpSocket::from_raw_fd(
+                cvt(libc::socket(
+                    libc::AF_INET6,
+                    libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                    libc::IPPROTO_ICMPV6,
+                ))
+                .unwrap(),
+            )
+        };
+        let mut message = [0; 8 + 40 + 8 + wire::HEADER_LEN];
+        message[0] = 2;
+        message[4..8].copy_from_slice(&mtu.to_be_bytes());
+        let quoted = &mut message[8..];
+        quoted[0] = 0x60;
+        quoted[4..6].copy_from_slice(&((length + 8) as u16).to_be_bytes());
+        quoted[6] = libc::IPPROTO_UDP as u8;
+        quoted[7] = 64;
+        quoted[8..24].copy_from_slice(&source.ip().octets());
+        quoted[24..40].copy_from_slice(&remote.ip().octets());
+        quoted[40..42].copy_from_slice(&source.port().to_be_bytes());
+        quoted[42..44].copy_from_slice(&remote.port().to_be_bytes());
+        quoted[44..46].copy_from_slice(&((length + 8) as u16).to_be_bytes());
+        quoted[48..].copy_from_slice(&bytes[..wire::HEADER_LEN]);
+        let destination = std::net::SocketAddrV6::new(*source.ip(), 0, 0, 0);
+        assert_eq!(icmp.send_to(&message, destination).unwrap(), message.len());
+    }
+
     #[test]
     #[ignore = "requires a disposable container and network namespace capabilities"]
     fn mtu_error_queue_rejects_forged_quotes_and_accepts_live_probe_ptb() {
-        use std::{
-            net::{SocketAddrV6, UdpSocket},
-            process::Command,
-        };
+        use std::process::Command;
         // SAFETY: only this test thread and its children enter the disposable namespace.
         cvt(unsafe { libc::unshare(libc::CLONE_NEWNET) }).unwrap();
         assert!(
@@ -6312,37 +6387,11 @@ mod tests {
         let (length, source) = remote.recv(&mut bytes).unwrap();
         assert!(length > 1452);
         let large = Header::decode(&bytes[..length]).unwrap();
-        // SAFETY: socket returns a new descriptor transferred to its sole owner.
-        let icmp = unsafe {
-            UdpSocket::from_raw_fd(
-                cvt(libc::socket(
-                    libc::AF_INET6,
-                    libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                    libc::IPPROTO_ICMPV6,
-                ))
-                .unwrap(),
-            )
-        };
-        let mut message = [0; 8 + 40 + 8 + wire::HEADER_LEN];
-        message[0] = 2;
-        message[4..8].copy_from_slice(&1500_u32.to_be_bytes());
-        let quoted = &mut message[8..];
-        quoted[0] = 0x60;
-        quoted[4..6].copy_from_slice(&((length + 8) as u16).to_be_bytes());
-        quoted[6] = libc::IPPROTO_UDP as u8;
-        quoted[7] = 64;
-        quoted[8..24].copy_from_slice(&source.ip().octets());
-        quoted[24..40].copy_from_slice(&remote.local_addr().ip().octets());
-        quoted[40..42].copy_from_slice(&source.port().to_be_bytes());
-        quoted[42..44].copy_from_slice(&remote.local_addr().port().to_be_bytes());
-        quoted[44..46].copy_from_slice(&((length + 8) as u16).to_be_bytes());
-        quoted[48..].copy_from_slice(&bytes[..wire::HEADER_LEN]);
-        let destination = SocketAddrV6::new(*source.ip(), 0, 0, 0);
         for forged in [true, false] {
             if forged {
-                message[8 + 48 + 4] ^= 1;
+                bytes[4] ^= 1;
             }
-            assert_eq!(icmp.send_to(&message, destination).unwrap(), message.len());
+            inject_ptb(source, remote.local_addr(), &bytes[..length], 1500);
             let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
             let count = worker.reactor.wait(&mut events, 100).unwrap();
             assert!(events[..count].iter().any(|event| event.u64 == TX_TOKEN
@@ -6369,7 +6418,7 @@ mod tests {
             assert_eq!(mtu.probes(now).count(), usize::from(forged));
             assert_eq!(mtu.payload_limit(), BASE_UDP_PAYLOAD);
             if forged {
-                message[8 + 48 + 4] ^= 1;
+                bytes[4] ^= 1;
             }
         }
         // An old success cannot undo an accepted reduction, and hints alone never raise DATA.
