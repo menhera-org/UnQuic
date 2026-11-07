@@ -258,7 +258,10 @@ worker loss dispatch. Before PTO, the coordinator waits for issued sends to
 commit and for every worker to finish a bounded loss scan and receive its final
 report back. A third unanswered PTO also waits for forced loss settlement before
 issuing probes. New ACK work waits behind these finite scans; already accepted
-ACK transactions finish first.
+ACK transactions finish first. Ordinary ACK admission also pauses until the
+accepted transactions and their resulting loss scans finish, so continuous ACK
+traffic cannot starve repair. A scan already in progress finishes before a fresh
+pass applies the newer ACK evidence. Waiting ACKs stay in bounded storage.
 
 ACK, handshake and PROBE_REPLY sends share a 4 MiB/s outer-byte ceiling per
 path group, with a burst of sixteen datagrams. Worker zero owns each fixed

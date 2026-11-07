@@ -3,7 +3,10 @@ use super::*;
 
 impl Lane {
     pub(in crate::worker) fn idle(&self) -> bool {
-        self.ack.is_none() && !self.report_pending && self.history.is_retired()
+        self.ack.is_none()
+            && !self.report_pending
+            && self.loss_passes == 0
+            && self.history.is_retired()
     }
 
     pub(in crate::worker) fn install(&mut self, generation: u64) -> io::Result<()> {
@@ -13,7 +16,7 @@ impl Lane {
         if generation == self.generation {
             return Ok(());
         }
-        if self.ack.is_some() || self.report_pending {
+        if self.ack.is_some() || self.report_pending || self.loss_passes != 0 {
             return Err(io::ErrorKind::WouldBlock.into());
         }
         self.history.reset().map_err(io::Error::other)?;
@@ -207,6 +210,7 @@ impl Lane {
         }
         *budget -= allowance - remaining;
         if scan.is_complete() {
+            self.loss_passes = self.loss_passes.saturating_sub(1);
             self.scan = None;
             self.scan_cutoff = None;
             self.loss_due = match (self.loss_due, self.scan_due.take()) {

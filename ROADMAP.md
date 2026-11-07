@@ -596,7 +596,10 @@ physical send commits, bounded worker scans and final report returns. The third
 unanswered expiry waits for forced settlement before probes. Stable per-worker
 message ordering preserves this barrier under queue pressure; accepted ACKs
 finish before scans, and new ACKs wait. Tests cover crossed groups, generation
-replacement, elapsed loss deadlines and saturated handoff queues. Payload repair
+replacement, elapsed loss deadlines and saturated handoff queues. Ordinary ACK
+admission also waits for the accepted batch's resulting loss passes, preventing
+continuous ACK input from postponing repair indefinitely. A pre-existing scan
+finishes before a fresh pass uses newer ACK evidence. Payload repair
 is connected through the bounded coverage and journal path below.
 
 Pure per-frame byte coverage now lives in `loss::FrameRecovery`, with two-repair

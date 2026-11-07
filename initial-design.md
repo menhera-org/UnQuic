@@ -317,6 +317,12 @@ they fall below the history floor. Payload expiry alone never resolves a charge.
 
 Use RFC 9002 sections 5 and 6 for RTT estimation, per-lane packet/time loss detection, and probe timeouts, with these transport parameters: initial RTT 333 ms, maximum ACK delay 1 ms, timer granularity 1 ms for loss detection, packet threshold 3, and time threshold 9/8. Pacing has its own finer schedule. ACK delay cannot reduce a sample below observed minimum RTT. Apply packet thresholds only within one lane, never across unrelated packet-number spaces. [S9]
 
+Bound ordinary ACK admission as well as loss-scan work. Finish already admitted
+ACK transactions, then their resulting loss passes before admitting more ACKs.
+If a scan was already active, finish its fixed endpoint and run a fresh pass
+using the newer ACK evidence. Keep waiting ACKs in bounded input storage; a
+continuous stream must not postpone loss detection indefinitely.
+
 At transmit-owner source admission, set the sender deadline to the original TAP read time plus `clamp(4 * smoothed_rtt, 20 ms, 100 ms)`, capped by the original read deadline. All frames expanded from that source inherit this fixed deadline. Reject overdue sources before expansion; waiting for ownership or queue capacity never extends retention. The receiver deadline is 100 ms after the first retained piece and is not extended by repairs or duplicates. The two-repair limit and the deadline both apply. Deliver completed frames immediately in v1; do not add a per-flow reorder queue before measurements justify one. Pin each inner flow to a lane, with a fallback key of MAC addresses, VLAN stack, and EtherType for non-IP or unparseable traffic. Fragmented IP traffic uses a consistent address/protocol key without transport ports for all fragments. Strict flow pinning is the baseline. It may be relaxed where measurements show
 that cross-worker handoffs harm performance; retain it otherwise. Current
 measurements justify reader-local lanes for unfragmented UDP with at most one

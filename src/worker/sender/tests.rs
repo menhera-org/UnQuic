@@ -1796,3 +1796,266 @@ fn continuous_backlog_cannot_starve_the_opposite_frame_class() {
         assert_eq!(workers[1].counters.cancelled_grants, 0);
     }
 }
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn admitted_acks_finish_then_loss_progresses_under_continuous_ack_input() {
+    for (partial_scan, checked) in [(false, false), (true, false), (true, true)] {
+        let (mut workers, _rx) = workers();
+        let [peer, worker] = &mut workers;
+        queue_frame(worker, 60);
+        let mut batch = worker.sessions[0].batches[1].take().unwrap();
+        let slot = batch
+            .pending
+            .pop_front(&mut worker.frames)
+            .unwrap()
+            .unwrap();
+        let frame_id = worker.frames.frame(slot).unwrap().id;
+        worker.frames.frame_mut(slot).unwrap().offset = 60;
+        assert!(
+            worker
+                .frames
+                .recovery_mut(slot)
+                .unwrap()
+                .submitted(0..60, 0)
+        );
+        worker.recovery.set(slot, Place::Retained).unwrap();
+        worker.sessions[0].batches[1] = Some(batch);
+        assert!(worker.recovery.journal.reserve_packet(
+            0,
+            &[crate::ack::FramePiece {
+                frame_slot: slot as u16,
+                frame_id,
+                start: 0,
+                end: 60,
+                attempt: 0,
+            }]
+        ));
+        let index = worker.sender_index(0, 1).unwrap();
+        for number in 1..=130 {
+            worker.sender.lanes[index]
+                .history
+                .reserve(number, 1280, true, true)
+                .unwrap();
+            assert!(worker.sender.lanes[index].submitted(
+                number,
+                Duration::ZERO,
+                if number == 1 {
+                    NonZeroU16::new(1)
+                } else {
+                    None
+                }
+            ));
+        }
+        let now = Duration::from_millis(1);
+        worker.sessions[1].connection = worker.sessions[0].connection;
+        let other = worker.sender_index(1, 1).unwrap();
+        worker.sender.lanes[other].install(1).unwrap();
+        worker.sender.lanes[other]
+            .history
+            .reserve(1, 1280, true, true)
+            .unwrap();
+        assert!(worker.sender.lanes[other].submitted(1, Duration::ZERO, None));
+        let covered = [AckRange { start: 1, end: 1 }];
+        worker
+            .incoming_ack(1, 1, 2, 0, AckRanges::new(&covered).unwrap(), now)
+            .unwrap();
+        if partial_scan {
+            let lane = &mut worker.sender.lanes[index];
+            let mut scan = lane.history.outstanding_scan();
+            assert_eq!(scan.advance(&lane.history, &mut 64).unwrap().number, 1);
+            lane.scan = Some(scan);
+        }
+        let accepted = [AckRange { start: 2, end: 130 }];
+        worker
+            .incoming_ack(0, 1, 2, 0, AckRanges::new(&accepted).unwrap(), now)
+            .unwrap();
+        worker.begin_sender_ack().unwrap();
+        assert!(worker.sender.lanes[index].ack.is_some());
+        if checked {
+            worker
+                .sender_message(
+                    Message::CheckLoss {
+                        group: 0,
+                        token: 99,
+                        before: now,
+                        force: false,
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+        let duplicate = [AckRange {
+            start: 130,
+            end: 130,
+        }];
+        let mut accepted_done = false;
+        let mut other_done = false;
+        let mut chunks = 0;
+        let mut lost = false;
+        let mut resumed = false;
+        let mut held = None;
+        let mut checked_done = !checked;
+        for turn in 0..64 {
+            // Keep input nonempty while the first, already-validated ACK is applied in chunks.
+            if !worker.sender.ack_free.is_empty() {
+                worker
+                    .incoming_ack(0, 1, 2, 0, AckRanges::new(&duplicate).unwrap(), now)
+                    .unwrap();
+            }
+            worker.service_sender(now).unwrap();
+            if let Some(report) = held.take() {
+                assert!(peer.incoming[1].as_mut().unwrap().try_pop().is_none());
+                worker
+                    .sender_message(Message::ReportReturn(report), now)
+                    .unwrap();
+                continue;
+            }
+            while let Some(event) = peer.incoming[1].as_mut().unwrap().try_pop() {
+                let Event::Sender(message) = event else {
+                    panic!("unexpected event")
+                };
+                if let Message::LossChecked { token: 99, .. } = message {
+                    assert!(accepted_done && other_done && lost);
+                    checked_done = true;
+                    continue;
+                }
+                let Message::Report(report) = message else {
+                    panic!("unexpected message")
+                };
+                match report.kind {
+                    ReportKind::Ack { end, .. } => {
+                        if report.id.session == 1 {
+                            other_done |= end.is_some();
+                        } else if !accepted_done {
+                            chunks += 1;
+                            if end.is_some() {
+                                accepted_done = true;
+                            }
+                        } else if lost && end.is_some() {
+                            resumed = true;
+                        }
+                    }
+                    ReportKind::Loss => {
+                        assert!(accepted_done && other_done, "loss overtook an accepted ACK");
+                        assert_eq!(report.id.session, 0);
+                        assert_eq!(report.count, 1);
+                        assert_eq!(
+                            report.entries[0].number, 1,
+                            "ACK-covered packet declared lost"
+                        );
+                        lost = true;
+                    }
+                    ReportKind::Retire => panic!("unexpected retirement"),
+                }
+                if turn == 0 {
+                    held = Some(report);
+                } else {
+                    worker
+                        .sender_message(Message::ReportReturn(report), now)
+                        .unwrap();
+                }
+            }
+            if resumed {
+                break;
+            }
+        }
+        assert!(chunks >= 3, "fixture must span multiple ACK reports");
+        assert!(
+            lost,
+            "continuous ACK admission starved an immediately eligible packet loss"
+        );
+        assert!(
+            resumed,
+            "waiting ACKs did not resume after the finite loss pass"
+        );
+        assert!(checked_done);
+        assert_eq!(
+            worker.frames.recovery(slot).unwrap().next_repair(9022),
+            Some((0..60, 1))
+        );
+        assert_eq!(
+            worker.sessions[0].batches[1]
+                .as_ref()
+                .unwrap()
+                .repairs
+                .front(),
+            Some(slot)
+        );
+        assert_eq!(worker.counters.expired_frames, 0);
+        // Stop feeding ACKs; neither the fence nor a report may pin generation replacement.
+        for _ in 0..64 {
+            worker.service_sender(now).unwrap();
+            while let Some(Event::Sender(Message::Report(report))) =
+                peer.incoming[1].as_mut().unwrap().try_pop()
+            {
+                worker
+                    .sender_message(Message::ReportReturn(report), now)
+                    .unwrap();
+            }
+            if worker.sender.incoming.is_empty()
+                && worker.sender.acks_pending == 0
+                && worker.sender.report.is_some()
+                && worker.sender.lanes[index].scan.is_none()
+                && worker.sender.lanes[index].loss_due.is_none()
+            {
+                break;
+            }
+        }
+        worker.detach_frame(slot).unwrap();
+        worker.release_frame(slot).unwrap();
+        while worker.cleanup_frames().unwrap() {}
+        for index in [index, other] {
+            let lane = &mut worker.sender.lanes[index];
+            while lane.history.retire_oldest_resolved().unwrap().is_some() {}
+            assert!(lane.idle());
+            lane.install(2).unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn an_empty_history_still_drains_its_ack_loss_fence_before_replacement() {
+    let (mut workers, _rx) = workers();
+    let [peer, worker] = &mut workers;
+    let index = worker.sender_index(0, 1).unwrap();
+    worker.sender.lanes[index]
+        .history
+        .reserve(1, 1280, true, true)
+        .unwrap();
+    assert!(worker.sender.lanes[index].submitted(1, Duration::ZERO, None));
+    let now = Duration::from_millis(1);
+    let future = [AckRange { start: 2, end: 2 }];
+    worker
+        .incoming_ack(0, 1, 2, 0, AckRanges::new(&future).unwrap(), now)
+        .unwrap();
+    worker.begin_sender_ack().unwrap();
+    assert!(worker.sender.lanes[index].ack.is_none());
+    let valid = [AckRange { start: 1, end: 1 }];
+    worker
+        .incoming_ack(0, 1, 2, 0, AckRanges::new(&valid).unwrap(), now)
+        .unwrap();
+    worker.service_sender(now).unwrap();
+    let Some(Event::Sender(Message::Report(report))) = peer.incoming[1].as_mut().unwrap().try_pop()
+    else {
+        panic!("missing ACK report")
+    };
+    assert!(matches!(report.kind, ReportKind::Ack { end: Some(_), .. }));
+    worker
+        .sender_message(Message::ReportReturn(report), now)
+        .unwrap();
+    let lane = &mut worker.sender.lanes[index];
+    assert!(lane.history.retire_oldest_resolved().unwrap().is_some());
+    assert!(lane.history.is_retired());
+    assert!(!lane.idle(), "empty history must finish its owed scan");
+    assert_eq!(
+        lane.install(2).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    for _ in 0..4 {
+        worker.service_sender(now).unwrap();
+    }
+    assert!(worker.sender.lanes[index].idle());
+    worker.sender.lanes[index].install(2).unwrap();
+}

@@ -32,8 +32,9 @@ falls from 2.38 / 2.50 to 2.16 / 1.79 Gbit/s and introduces admission pressure.
 Its ascending sweep falls 21.9 / 14.4% from peak to unlimited. Moving deadline
 checks before source expansion does not restore throughput: the next
 sixty-second unlimited point delivers 1.78 / 1.68 Gbit/s. The subsequent
-fresh/repair fairness fix reaches 2.07 / 1.70 unlimited, with admission pressure
-and overload declines still present.
+fresh/repair fairness fix reaches 2.07 / 1.70 unlimited. Preventing ordinary
+loss starvation under continuous ACK input then measures 1.82 / 1.64 unlimited;
+admission pressure and overload declines remain.
 PMTU discovery is active in the latest rate sweeps and
 passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
 Missing recovery or congestion control does not explain away the remaining
@@ -45,14 +46,14 @@ The sender integration passes forwarding/restart and allocation checks,
 plus control-pressure, stale-feedback and bounded transmit-expiry regressions.
 The recovery build adds successful two-repair delivery checks, but its latest
 rate sweeps reveal a new regression and nonzero reassembly admission pressure.
-Its first paced/unlimited sweep is much slower than the earlier runtime. Low CPU
-use, zero outer socket overflow and zero admission pressure point away from the
-previous receive-capacity explanation; grant/feedback scheduling needs profiling.
-The new matched expiry comparison establishes no general throughput gain and
-still has a forward overload decline. Earlier storage/batching sweeps predate
-ACK emission. Subsequent sender-accounting and I/O-timestamp changes have
-correctness coverage and a first post-integration rate sweep. No matched
-before/after sweep isolates their individual costs yet.
+The initial sender-integration sweep already showed low CPU use and poor
+throughput with zero admission pressure or outer socket overflow. Recovery then
+introduced admission pressure; that observation does not explain the earlier
+regression. Grant/feedback scheduling and recovery pressure need separate
+attribution. Moving expiry checks before source expansion establishes no general
+throughput gain. Earlier storage/batching sweeps predate ACK emission.
+Sender-accounting and I/O-timestamp changes have correctness coverage and
+post-integration rate sweeps, but no matched comparison isolates their costs.
 Frame-view allocations now follow actual per-worker quotas instead of reserving
 8192 slots on every worker. This reduces reserved metadata; it does not establish
 a goodput gain or change the session retention limits.
@@ -65,8 +66,8 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | After the batch-fairness fix, sixty-second QinQ sweep: 2.04 / 1.73 Gbit/s paced, 2.07 / 1.70 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe integration regression; paced missing fractions are 90.20 / 91.69%. The recovery ascending sweep stays under 1% missing in both directions only at 0.5G offered. Five successful 20G repeats remain unmet. |
-| Goodput must plateau under excess traffic | The recovery ascending sweep falls 21.9 / 14.4% from its 21G peak under unlimited load. Its sixty-second repeat rises under unlimited load, but remains slower than the matched baseline and uses only about 2.1–2.3 cores per daemon | No stable plateau or CPU ceiling is established. Source-expiry work, incomplete reassembly and grant/feedback scheduling require separate attribution. |
+| At least 20 Gbit/s each way at inner MTU 1500 | After the ACK/loss fairness fix, sixty-second QinQ sweep: 1.82 / 1.58 Gbit/s paced, 1.82 / 1.64 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe integration regression; paced missing fractions are 91.26 / 92.28%. The recovery ascending sweep stays under 1% missing in both directions only at 0.5G offered. Five successful 20G repeats remain unmet. |
+| Goodput must plateau under excess traffic | The latest ascending sweep falls 11.73 / 15.58% from each direction's peak under unlimited load. Its sixty-second repeat remains near 1.82 / 1.64 Gbit/s and uses about 2.1 / 2.0 cores | No stable plateau or CPU ceiling is established. Source-expiry work, incomplete reassembly and grant/feedback scheduling require separate attribution. |
 | Small-frame overload must remain efficient | Earlier pre-recovery tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
@@ -81,6 +82,69 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## ACK admission and ordinary loss fairness (November 7)
+
+Continuous duplicate ACK input could indefinitely postpone ordinary loss
+detection, even after an accepted ACK proved a packet eligible for repair.
+A deterministic worker regression reproduces this on `2765533`. ACK admission
+now waits for the accepted batch and its resulting finite loss passes. A scan
+already in progress finishes before a fresh pass applies newer ACK evidence.
+The fix adds a per-lane pass count and an aggregate count, with no allocation
+or new full-table scan. Accepted ACK transactions still finish before loss.
+
+The regression covers multi-report ACKs, accepted ACKs on another lane, delayed
+report returns, ordinary/explicit loss-scan crossover, resumption of waiting ACKs,
+and generation replacement after an empty-history scan. All 25 sender kernel
+checks and the two-loss/late-original runtime relay pass, along with 344
+all-feature and 335 default release tests, Clippy and formatting.
+
+[Twelve release observations](benches/tap-loss-fence.json) retain the preceding
+QinQ profile, generator and placement. The ascending twenty-second sweep is:
+
+| Requested Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| 0.50 | 0.49 / 0.49 | 0.94 / 0.78 | 53.27 / 48.84 |
+| 1.00 | 0.98 / 0.96 | 0.06 / 1.75 | 100.10 / 94.42 |
+| 2.00 | 1.79 / 1.95 | 9.62 / 1.61 | 194.50 / 178.97 |
+| 3.00 | 1.82 / 1.71 | 38.09 / 42.18 | 211.94 / 201.08 |
+| 4.00 | 2.04 / 1.65 | 47.99 / 58.00 | 223.38 / 211.49 |
+| 8.00 | 1.79 / 1.62 | 77.33 / 79.47 | 212.04 / 203.60 |
+| 16.00 | 1.77 / 1.57 | 88.77 / 89.96 | 208.67 / 200.00 |
+| 21.00 | 1.72 / 1.53 | 91.48 / 92.22 | 203.97 / 194.82 |
+| Unlimited | 1.80 / 1.64 | 96.85 / 97.01 | 209.10 / 203.12 |
+
+Unlimited delivery is 11.73 / 15.58% below each direction's observed peak.
+Only the 0.5G point keeps both missing fractions below 1%. The sixty-second
+sequence retains the same daemon processes across all three points:
+
+| Requested Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| 21.00 | 1.82 / 1.58 | 91.26 / 92.28 | 212.34 / 205.66 |
+| Unlimited | 1.82 / 1.64 | 96.85 / 97.11 | 209.62 / 202.64 |
+| 21.00 | 2.23 / 1.80 | 89.26 / 91.34 | 230.64 / 218.50 |
+
+The unlimited point is 12.08 / 3.88% slower than the preceding batch-fairness
+build's 2.07 / 1.70 Gbit/s. The return point improves, showing substantial
+within-sequence variation. This correctness fix establishes neither a general
+throughput gain nor an overload plateau.
+
+At sixty-second unlimited load, endpoint L/R reports 6,424,733 / 6,202,688
+TAP ingress SKB drops, 5,123 / 71,885 worker queue drops (including 717 / 481
+ACK-buffer drops), 3,597,801 / 5,475,889 expired frames, 38,679 / 7,047
+admission-pressure events and 362 / 238 submitted repair records. All twelve
+observations have zero outer socket overflow, inner UDP receive errors,
+corrupt or duplicate inner records and outer fragmentation. Complete-frame
+reordering peaks at 0.00424%.
+
+Expiry currently merges unmaterialized source children, materialized transmit
+frames and receive frames. It cannot establish how many incomplete receive
+slots resulted from sender abandonment. Bounded cleanup and coverage staging
+can also span turns before buffers or shared inflight charges are released;
+their contribution remains unmeasured. The next diagnostic separates expiry
+classes and counts actual cleanup, staging and mapping-pressure events.
+Missing FRAME_ABANDON is a verified orphan-slot mechanism, but its measured
+contribution is still unknown.
 
 ## Bounded payload recovery integration (November 7)
 

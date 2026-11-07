@@ -145,6 +145,8 @@ pub(super) struct Lane {
     pub(super) ack: Option<Box<Ack>>,
     pub(super) ack_first: bool,
     pub(super) report_pending: bool,
+    // Complete an older scan, if any, then one pass using the admitted ACK.
+    pub(super) loss_passes: u8,
     pub(super) probes: [Option<(u64, u16)>; 2],
 }
 
@@ -166,6 +168,7 @@ impl Lane {
             ack: None,
             ack_first: true,
             report_pending: false,
+            loss_passes: 0,
             probes: [None; 2],
         })
     }
@@ -209,6 +212,7 @@ pub(super) struct State {
     loss_cursor: usize,
     checks_pending: usize,
     acks_pending: usize,
+    loss_fences: usize,
     pub(super) offsets: Vec<usize>,
     pub(super) lanes: Vec<Lane>,
     pub(super) cursor: usize,
@@ -306,6 +310,7 @@ impl State {
             loss_cursor: 0,
             checks_pending: 0,
             acks_pending: 0,
+            loss_fences: 0,
             offsets,
             lanes,
             cursor: 0,
@@ -415,7 +420,7 @@ impl Worker {
 
     pub(super) fn begin_sender_ack(&mut self) -> io::Result<()> {
         // A finite loss pass cannot wait behind an endless stream of duplicate ACKs.
-        if self.sender.checks_pending != 0 {
+        if self.sender.checks_pending != 0 || self.sender.loss_fences != 0 {
             return Ok(());
         }
         for _ in 0..self.sender.incoming.len().min(BATCH_SIZE) {
@@ -446,6 +451,12 @@ impl Worker {
                 self.return_ack(ack)?;
             } else {
                 self.sender.acks_pending += 1;
+                lane.loss_passes = 1 + u8::from(lane.scan.is_some());
+                self.sender.loss_fences = self
+                    .sender
+                    .loss_fences
+                    .checked_add(1)
+                    .ok_or(io::ErrorKind::InvalidData)?;
             }
         }
         Ok(())
@@ -846,7 +857,13 @@ impl Worker {
                     .take()
                     .ok_or(io::ErrorKind::InvalidData)?;
                 let prior = *budget;
+                let fenced = lane.loss_passes != 0;
                 let produced = lane.advance_report(&mut report, now, budget)?;
+                self.sender.loss_fences = self
+                    .sender
+                    .loss_fences
+                    .checked_sub(usize::from(fenced && lane.loss_passes == 0))
+                    .ok_or(io::ErrorKind::InvalidData)?;
                 if *budget == prior {
                     *budget -= 1;
                 }
@@ -946,8 +963,14 @@ impl Worker {
             }
             let quiescing = self.sessions[lane.session].connection.is_none();
             let retire = quiescing || self.sender.reclaim.is_some();
+            let fenced = lane.loss_passes != 0;
             let produced = lane.advance_report(&mut report, now, &mut budget)?
                 || (retire && lane.retire_report(&mut report, &mut budget)?);
+            self.sender.loss_fences = self
+                .sender
+                .loss_fences
+                .checked_sub(usize::from(fenced && lane.loss_passes == 0))
+                .ok_or(io::ErrorKind::InvalidData)?;
             if lane.ack.is_some() {
                 self.sender.cursor = index;
             }
