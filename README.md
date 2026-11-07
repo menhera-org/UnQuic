@@ -464,10 +464,10 @@ scanning retained frames. Each worker turn cleans up at most 64 expired frame
 views, including frames in prepared batches; sends defer any expired views
 left for the next turn. Heap updates visit at most 13 levels and pending-queue
 removal is constant-time. All storage is reserved at startup.
-It emits packet ACKs after full admission, but does not yet
-apply received ACKs, retain sent data for repair or apply congestion control.
-A lost piece can therefore prevent that entire
-frame from reaching TAP. Receive expiry starts at the first retained piece and
+It emits packet ACKs only after full admission and applies received ACK/loss
+reports to the shared congestion controller. Sent payloads are not yet retained
+for repair, so a lost piece can still prevent the entire frame from reaching TAP.
+Receive expiry starts at the first retained piece and
 does not move when duplicates arrive.
 
 Completed frames are delivered as they become available, without a per-flow
