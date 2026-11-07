@@ -83,6 +83,89 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Controller rate/window isolation (November 7)
+
+Five sequential release sweeps compare unchanged controller outputs, a fixed
+4 GB/s outer pacing rate, a fixed 8 MiB window, both overrides, then unchanged
+outputs again. Each point lasts twenty seconds. The window override preserves
+ProbeRTT's drain window; stalled PTO still closes ordinary grants. Quantum,
+packet size, outstanding accounting, grant lifetime and storage capacities stay
+unchanged. BBR continues observing feedback. These are diagnostic builds based
+on the recovery-counter revision, before the later PTB and liveness fixes.
+None is a production candidate.
+
+The diagnostic baseline passes 347 ordinary release tests and Clippy. Tests
+cover all four combinations, ProbeRTT drain, grant expiry, accepted completion
+accounting and stalled PTO. No local builds, kernel tests, live snapshots or
+Git packing overlapped throughput measurement.
+
+| Override | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | Daemon CPU % L / R |
+| --- | --- | --- | --- | --- |
+| Baseline before | 1 Gbit/s | 0.966 / 0.965 | 0.028 / 0.083 | 101.24 / 95.05 |
+| Baseline before | 4 Gbit/s | 1.645 / 1.523 | 58.209 / 61.379 | 204.35 / 199.85 |
+| Baseline before | 21 Gbit/s | 1.745 / 1.588 | 91.547 / 92.200 | 207.32 / 199.60 |
+| Baseline before | Unlimited | 1.695 / 1.593 | 97.272 / 96.865 | 198.37 / 195.25 |
+| Rate only | 1 Gbit/s | 0.990 / 0.990 | 0.000 / 0.018 | 97.59 / 94.85 |
+| Rate only | 4 Gbit/s | 1.791 / 1.616 | 54.512 / 59.026 | 214.24 / 209.59 |
+| Rate only | 21 Gbit/s | 1.847 / 1.584 | 91.055 / 92.322 | 219.92 / 208.55 |
+| Rate only | Unlimited | 1.915 / 1.690 | 96.781 / 96.847 | 220.64 / 211.39 |
+| Window only | 1 Gbit/s | 0.979 / 0.988 | 0.895 / 0.056 | 92.93 / 88.82 |
+| Window only | 4 Gbit/s | 3.052 / 2.893 | 22.590 / 26.656 | 275.75 / 259.65 |
+| Window only | 21 Gbit/s | 2.876 / 2.924 | 86.046 / 85.801 | 275.01 / 259.13 |
+| Window only | Unlimited | 2.350 / 3.021 | 96.170 / 94.036 | 286.70 / 249.04 |
+| Both | 1 Gbit/s | 0.943 / 0.981 | 4.594 / 0.772 | 110.59 / 89.31 |
+| Both | 4 Gbit/s | 2.594 / 3.165 | 34.461 / 20.069 | 311.44 / 276.34 |
+| Both | 21 Gbit/s | 2.674 / 3.206 | 87.071 / 84.488 | 325.73 / 265.03 |
+| Both | Unlimited | 2.328 / 3.317 | 95.988 / 93.705 | 320.10 / 262.37 |
+| Baseline after | 1 Gbit/s | 0.978 / 0.978 | 0.931 / 0.895 | 96.44 / 96.83 |
+| Baseline after | 4 Gbit/s | 1.926 / 1.730 | 51.046 / 56.080 | 223.02 / 213.47 |
+| Baseline after | 21 Gbit/s | 2.158 / 1.854 | 89.584 / 91.041 | 232.23 / 220.10 |
+| Baseline after | Unlimited | 2.198 / 1.757 | 96.164 / 96.856 | 228.58 / 216.04 |
+
+The repeated baseline varies substantially: unlimited goodput rises
+29.6 / 10.3% between its two observations. The rate-only result falls within
+that range, so this run cannot establish a rate-only gain. The window override
+exceeds both baselines at the 4G and 21G points and nearly eliminates receive
+admission pressure. This implicates the window and its interaction with
+scheduling/recovery; it does not justify bypassing congestion control.
+
+Forward goodput still falls under unlimited load: 23.0% below the window-only
+4G peak and 13.0% below the combined override's 21G peak. Reverse goodput rises.
+Even the combined override reaches only 2.33 / 3.32 Gbit/s unlimited. No
+CPU ceiling or overload plateau is established.
+
+| Unlimited build | Admission pressure L / R | Queue drops L / R | Expiry L / R | Socket overflow L / R | Repairs L / R |
+| --- | --- | --- | --- | --- | --- |
+| mode0 | 9950 / 433 | 2239 / 24355 | 1366205 / 1937595 | 0 / 0 | 126 / 0 |
+| rate | 24756 / 5719 | 1618 / 24021 | 1120774 / 1787293 | 0 / 0 | 229 / 109 |
+| window | 0 / 215 | 2767 / 31785 | 808346 / 317347 | 144 / 14 | 0 / 11627 |
+| both | 0 / 0 | 4213 / 28434 | 785360 / 259454 | 142 / 27 | 8880 / 11683 |
+| repeat | 14718 / 1277 | 1577 / 24058 | 728853 / 1618418 | 0 / 0 | 209 / 199 |
+
+At unlimited load, unsent transmit expiry is 734,600 / 226,486 with the window
+override and 769,315 / 220,271 with both. Incomplete receive expiry falls to
+2,233 / 5,200 and 1,711 / 596 respectively; completed receive expiry remains
+zero. TAP ingress drops are still millions of source SKBs. These counters have
+different units and cannot provide an exact frame-loss sum.
+
+Window and combined overrides introduce outer socket overflow, including
+144 / 14 and 142 / 27 events under unlimited load. Every point has zero
+corrupt, duplicate, wrong-run or too-old application records, inner UDP errors
+and outer fragments. The largest reordered fraction is 0.086731%.
+Boundary snapshots do not show whether the 8 MiB window was reached during
+load; ProbeRTT and PTO remain possible constraints.
+
+Code review also confirms at most one grant per path group per owner pass:
+all requests use the same timestamp, and a successful grant advances the next
+eligible send time. That fact does not establish its performance cost. Exact
+grant sizes, epoch occupancy and sampled handoff/service delays are the next
+measurements.
+
+[Raw results](benches/tap-controller-limits.json) retain actual offered load,
+thread CPU and all drop counters. The
+[diagnostic patch](benches/controller-limits-diagnostic.patch) reproduces each
+compile-time override. Both original performance targets remain open.
+
 ## Liveness probes under DATA pressure (November 7)
 
 A deterministic kernel regression reproduced a scheduling defect: the timer

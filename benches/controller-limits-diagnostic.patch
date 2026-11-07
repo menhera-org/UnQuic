@@ -1,0 +1,160 @@
+diff --git a/src/worker/sender/owner.rs b/src/worker/sender/owner.rs
+index 0029301..9c2e272 100644
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -40,6 +40,37 @@ struct Group {
+     probe: Option<(Option<PacketId>, u8)>,
+ }
+ 
++// Isolated causal experiment; absent at compile time leaves controller outputs unchanged.
++const DIAGNOSTIC_MODE: u8 = match option_env!("UNQUIC_CONTROLLER_DIAGNOSTIC") {
++    None => 0,
++    Some(value) => match value.as_bytes() {
++        [b'r', b'a', b't', b'e'] => 1,
++        [b'w', b'i', b'n', b'd', b'o', b'w'] => 2,
++        [b'b', b'o', b't', b'h'] => 3,
++        _ => panic!("invalid UNQUIC_CONTROLLER_DIAGNOSTIC"),
++    },
++};
++
++fn diagnostic_limits(mut limits: pacing::Limits, mode: u8, probe_rtt: bool) -> pacing::Limits {
++    if mode & 1 != 0 {
++        limits.rate = 4_000_000_000;
++    }
++    if mode & 2 != 0 && !probe_rtt {
++        limits.window = 8 * 1024 * 1024;
++    }
++    limits
++}
++
++impl Group {
++    fn effective_limits(&self) -> pacing::Limits {
++        diagnostic_limits(
++            self.controller.limits(),
++            DIAGNOSTIC_MODE,
++            self.controller.state() == crate::bbr::State::ProbeRtt,
++        )
++    }
++}
++
+ pub(in crate::worker) struct Owner {
+     sender: Sender,
+     pub(super) timers: timers::Timers,
+@@ -155,7 +186,7 @@ impl Owner {
+             .flight_bytes(group)
+             .ok_or(io::ErrorKind::InvalidData)?;
+         let state = &mut self.groups[group];
+-        let limits = state.controller.limits();
++        let limits = state.effective_limits();
+         state.cwnd_limited |= sent
+             && inflight != 0
+             && limits.window.saturating_sub(inflight) < u64::from(limits.max_datagram);
+@@ -185,7 +216,7 @@ impl Owner {
+             rtt_ns: state.rtt.minimum().map_or(0, |_| {
+                 state.rtt.smoothed().as_nanos().min(u64::MAX as u128) as u64
+             }),
+-            pacing_bytes_per_second: state.controller.limits().rate,
++            pacing_bytes_per_second: state.effective_limits().rate,
+             bytes_in_flight: self.sender.flight_bytes(group)?.1,
+             ..Snapshot::default()
+         })
+@@ -530,7 +561,7 @@ impl Owner {
+                 .controller
+                 .on_transmit(now, inflight, app_limited)
+                 .map_err(io::Error::other)?;
+-            let mut limits = state.controller.limits();
++            let mut limits = state.effective_limits();
+             if state.pto.stalled() {
+                 limits.window = 0;
+             }
+@@ -1788,3 +1819,90 @@ mod window_evidence_tests {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod diagnostic_tests {
++    use super::*;
++
++    #[test]
++    fn factorial_changes_only_selected_limits_and_preserves_probe_rtt_drain() {
++        for probe_rtt in [false, true] {
++            for mode in 0..=3 {
++                let raw = pacing::Limits {
++                    window: 5120,
++                    rate: 12_345_678,
++                    quantum: 2560,
++                    max_datagram: 1280,
++                };
++                let limits = diagnostic_limits(raw, mode, probe_rtt);
++                assert_eq!(
++                    limits.rate,
++                    if mode & 1 != 0 {
++                        4_000_000_000
++                    } else {
++                        raw.rate
++                    }
++                );
++                assert_eq!(
++                    limits.window,
++                    if mode & 2 != 0 && !probe_rtt {
++                        8 * 1024 * 1024
++                    } else {
++                        raw.window
++                    }
++                );
++                assert_eq!(limits.quantum, raw.quantum);
++                assert_eq!(limits.max_datagram, raw.max_datagram);
++            }
++        }
++    }
++
++    #[test]
++    fn every_mode_preserves_expiry_accounting_burst_and_stalled_pto_bounds() {
++        for mode in 0..=3 {
++            let raw = pacing::Limits {
++                window: 5120,
++                rate: 128_000_000,
++                quantum: 2560,
++                max_datagram: 1280,
++            };
++            let limits = diagnostic_limits(raw, mode, false);
++            let mut grants = crate::pacing::Grants::new(2).unwrap();
++            let first = grants
++                .reserve(0, 2560, false, limits, Duration::ZERO)
++                .unwrap();
++            assert_eq!(first.expires(), Duration::from_micros(100));
++            assert_eq!(
++                grants.reserve(1, 1280, false, limits, Duration::from_secs(1)),
++                Err(GrantError::Blocked)
++            );
++            assert_eq!(grants.reserved(), 2560);
++            grants.reported(first, 1280, Some(Duration::ZERO)).unwrap();
++            assert_eq!((grants.reserved(), grants.in_flight()), (0, 1280));
++            assert_eq!(grants.reported(first, 0, None), Err(GrantError::Stale));
++            let stalled = pacing::Limits {
++                window: 0,
++                ..limits
++            };
++            assert_eq!(
++                grants.reserve(0, 1280, false, stalled, Duration::from_secs(1)),
++                Err(GrantError::Blocked)
++            );
++            grants.probe_allowance(1).unwrap();
++            let probe = grants
++                .reserve(0, 1280, true, stalled, Duration::from_secs(1))
++                .unwrap();
++            assert!(probe.is_probe());
++            grants
++                .reported(probe, 1280, Some(Duration::from_secs(1)))
++                .unwrap();
++            assert_eq!(grants.in_flight(), 2560);
++            assert_eq!(
++                grants.reserve(1, 1280, true, stalled, Duration::from_secs(2)),
++                Err(GrantError::Blocked)
++            );
++            grants.settled(2560).unwrap();
++            assert_eq!(grants.in_flight(), 0);
++        }
++    }
++}
