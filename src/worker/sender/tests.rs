@@ -2279,7 +2279,7 @@ fn data_quoted_ptb_reduces_only_after_successful_send() {
                 .iter()
                 .any(|event| event.u64 == TX_TOKEN && event.events & libc::EPOLLERR as u32 != 0)
         );
-        assert!(worker.mtu_error(0, 0, 0, Duration::from_millis(2)).unwrap());
+        assert!(worker.mtu_error(0, 0, 0, Duration::ZERO).unwrap());
         assert_eq!(
             worker.transmit[0].paths[0].lanes[0].mtu.payload_limit(),
             if forged { 1452 } else { BASE_UDP_PAYLOAD }

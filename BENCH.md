@@ -89,15 +89,17 @@ Remote ICMPv6 size reports now use retained successful transmission history
 when no live probe matches. The lookup checks the receiving transmit socket's
 destination, current session/path/generation and all 48 quoted header bytes,
 including actual submitted length. It uses the existing cookie index and
-packet-history lookup without allocation, a history scan or another syscall.
-Unsent reservations are rejected. A per-path timestamp rejects retained quotes
+packet-history lookup without allocation or a history scan. An accepted
+error-queue entry samples the clock after I/O, since a successful send can
+postdate the worker turn's original timestamp. Unsent reservations are rejected. A per-path timestamp rejects retained quotes
 older than a later confirmation, reduction or black-hole reset.
 
 The release kernel suite passes 70 checks, including real DATA transmission
 followed by forged and valid ICMPv6 quotes, every quoted-byte mutation,
 truncation, wrong ownership/path/generation, unsent and canceled reservations.
 Pure tests cover replay after reduction and reconfirmation, future timestamps,
-and sub-baseline hints. The existing short routed/GSO PMTU test also passes.
+and sub-baseline hints. The existing short routed/GSO PMTU test also passes. The two sent-history
+kernel tests and the live-probe quote test pass on Linux 7.0 as well.
 This change has no throughput measurement and does not clear the migration
 failure or either performance gate.
 

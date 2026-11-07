@@ -3436,6 +3436,8 @@ impl Worker {
         if error.destination.ip() != address.ip() || error.destination.port() != address.port() {
             return Ok(!error.local);
         }
+        // Successful sends in this turn can postdate its original timestamp.
+        let now = self.io_clock(now)()?;
         let before = (tx.mtu.payload_limit(), tx.mtu.state());
         let proof = if error.local {
             None
