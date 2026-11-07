@@ -14,8 +14,8 @@ Earlier pre-ACK sweeps reached higher rates with another kernel build and TAP qu
 No workload proves a universal plateau or the theoretical CPU ceiling.
 
 Neither the local **20 Gbit/s in each direction** gate nor the real
-**5 Gbit/s under loss** gate has passed. Runtime recovery and congestion control
-remain unfinished. Workers now use the shared draft-07 controller and grant
+**5 Gbit/s under loss** gate has passed. Bounded runtime recovery is now connected;
+complete congestion-control integration remains unfinished. Workers use the shared draft-07 controller and grant
 accounting. Refreshing overtaken packet numbers removes repeated coordinator
 DATA cancellations. Skipping empty loss-history ranges reduces CPU cost, but the
 larger bounded DATA burst, retained packet-plan refill and earlier local feedback
@@ -25,7 +25,8 @@ still falls 17.2% forward from its 4G peak; both directions stay under 1%
 missing only through the 2G offered point.
 The preceding ACK-pruning sweep delivered 1.12 to 1.22 Gbit/s. These remain
 severe integration regressions, far below earlier forwarding rates.
-General application-limited detection and payload repair remain open.
+General application-limited detection remains open. The rates above predate
+runtime payload retention and repair; they are not recovery-build measurements.
 PMTU discovery is active in the latest rate sweeps and
 passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
 Missing recovery or congestion control does not explain away the remaining
@@ -60,9 +61,9 @@ earlier tables retain their original builds and test conditions.
 | Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Final sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
-| Prevent split-count amplification of outer loss | Frame-aligned GSO, receive pressure drain/retry and compact borrowed payload storage have regression coverage | Runtime bounded selective repair is not implemented. Split frames can still be lost after one outer-packet loss. |
+| Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
 | Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Throughput sweeps currently cap outer packets at 1500 bytes. Larger-MTU throughput, real routed-path validation and DATA-quoted PTB processing remain open. |
-| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These throughput sweeps are local container tests without injected impairment | No real-path or independent/burst-loss result verifies the target. Recovery, congestion control and pacing remain unfinished. |
+| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These throughput sweeps are local container tests without injected impairment | No real-path or independent/burst-loss result verifies the target. Recovery is connected; sustained lossy-path performance and complete congestion-control integration remain unverified. |
 
 Unlimited loss remains high. TAP ingress drops, bounded worker queue drops,
 outer socket overflows, expired frames and inner UDP receive-buffer errors
@@ -71,6 +72,45 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## Bounded payload recovery integration (November 7)
+
+The release runtime now retains submitted payloads and selectively repairs
+missing byte ranges, with at most two repairs per byte. It reuses the existing
+coverage state, piece journal and shared grant/accounting path. Packet mappings
+are reserved before I/O; partial sends commit only their successful prefix.
+ACK and retirement coverage changes finish before sampling handles can be reused.
+Loss keeps mappings available for late original ACKs. Frame cleanup and report
+processing have fixed work budgets, and repairs retain the original frame ID,
+lane and deadline.
+
+The new bidirectional runtime regression drops each target frame's original
+prefix and first repair, then requires delivery through the second repair.
+Replaying the original afterward must not duplicate TAP delivery. The same
+fixture on `91c28ac` completes handshake and warmup but times out waiting for the
+lost frames; the recovery build passes with zero hot-path allocations or
+deallocations. Separate worker tests cover packed mapping budgets, late ACK
+cancellation, partial sends, fresh-data FIFO order under mapping pressure,
+reserved repair capacity and connection cleanup.
+
+The build passes 344 all-feature and 335 default-feature release tests, both
+Clippy configurations, formatting, and 69 short Linux 6.8 kernel/runtime checks.
+These include external TAP renames and namespace moves, peer restart, a
+bidirectional frame storm, the CLI and load generator. The three-session stress
+fixture now explicitly permits 512 MiB because its recovery storage exceeds the
+unchanged 256 MiB default. A separate accounting regression verifies that the
+normal eight-worker/eight-lane configuration fits the default and that larger
+configurations require an explicit ceiling.
+
+The release daemon SHA-256 is
+`d142c0b4d699c0c1f0d13e8cd99e4057c972c631ac5e68bd888d7f289a058f2b`.
+No throughput claim follows from these correctness checks. The new build's rate
+sweeps, sustained independent/burst-loss tests, long routed-PMTU test and Linux 7.0
+matrix remain to be run. Fresh-data journal pressure can still request an unusable
+grant before yielding it; profiling must determine its cost.
+The `repairs` counter now counts successfully submitted repair DATA records.
+Sender expiry can occur after peer TAP delivery if feedback is lost, so expiry
+counts cannot be treated as an exact count of missing inner frames.
 
 ## Sender integration verification (November 7)
 

@@ -268,6 +268,31 @@ count blocks implicit floor advancement and reset. Before reuse, the controller
 owner must consume the corresponding report; an ACKed entry cannot later return
 the same handle through retirement. Unsent slots remain owned by the grant.
 
+Retain frame coverage in stable, preallocated slots alongside the worker's
+payload views. Index the packet-to-frame journal by the granted sampling handle,
+not the reusable sent-history ring index. Reserve a whole granted prefix's
+mappings before I/O, and clear unsuccessful mappings before returning unused
+grants. For ACK and explicit retirement, finish worker-local mapping updates
+before forwarding the report that permits the controller to recycle its handles.
+Loss keeps mappings for a late original ACK. Frame expiry removes payload
+mappings without settling the independent packet congestion charge.
+
+Budget feedback coverage separately from history bitmap scans: at most 128
+piece operations and 64 KiB of covered ranges per worker turn. Begin a packet
+only with at least 64 piece credits and 9000 byte credits left, then debit its
+actual work. The immutable encoded packet must establish the mapped-byte bound
+before submission. Each packet finishes atomically; the report-entry cursor may
+continue next turn. Frame cleanup has its own bounded mapping budget, and frame
+identities cannot recycle while a mapping or prepared plan still refers to them.
+
+Initially allocate 32 journal mappings per actual frame slot, reserving half
+for repairs. This is a bounded capacity policy, not a guarantee for every
+fragmentation pattern. Pressure delays fresh work while ready repairs retain
+service; all work still obeys the original frame deadline and pacing limits.
+Charge coverage, journal heads, mappings and queues to the existing transport
+memory ceiling. Refuse oversized configurations rather than silently changing
+their requested lane counts, quotas or memory limit.
+
 Keep the sampling slab on the controller owner, with at most 65,535 slots for
 the daemon. Store transmission identity with each slot and check session
 generation, lane and packet number on feedback. A two-byte handle alone cannot
@@ -639,8 +664,10 @@ sampling records. Pressure retirement can run with no free sampling slot.
 The controller has fixed cycle vectors, model/loss/recovery boundary tests and
 allocation checks; tests/vectors/bbr-07/README.md records draft interpretations.
 Bounded grant batches and shared controller ownership are connected.
-General application-limited detection and sender payload recovery remain
-unfinished.
+Worker-local payload retention, packet-to-frame mappings and two-generation
+selective repair are connected. ACK/retirement coverage work and frame cleanup
+are bounded independently of congestion-charge settlement. General
+application-limited detection remains unfinished.
 Configuration
 validation now freezes named endpoint/peer/session relationships into numeric
 indices. Cookie lookup uses short scans for small sets and randomized hashing

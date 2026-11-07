@@ -492,9 +492,9 @@ before advancing it. Sender entries now use 16 bytes each, retaining full
 `Duration` range and nanosecond precision; 64 histories save 32 MiB compared with
 the previous 24-byte entries. Worker submission accounting and incoming ACK
 application now use these histories. Outgoing ACKs are now emitted through the shared
-control queue. Per-lane MTU probing is connected to the workers. Payload recovery
-and complete congestion-control integration remain pending; README.md documents
-probe feedback and send-error handling.
+control queue. Per-lane MTU probing and bounded payload recovery are connected
+to the workers. Complete congestion-control integration remains pending;
+README.md documents probe feedback, recovery and send-error handling.
 
 The pure draft-07 delivery sampler now has fixed vectors for ACK compression,
 idle restart, application bubbles, late ACKs after loss and duplicate suppression.
@@ -513,8 +513,8 @@ prevents the first ACK from spuriously entering ProbeRTT.
 Successful window-use evidence now survives multiple ACKs of one packet-timed
 round, including its boundary ACK. Unused reservations do not set it, and an
 application-limited idle restart clears it. Zero inflight alone does not prove idle.
-General application-limited detection and payload recovery remain
-unfinished; congestion-control integration is not complete.
+General application-limited detection remains unfinished;
+congestion-control integration is not complete.
 Reserve sampling metadata against the startup memory ceiling; a full sampling
 record in every lane's 65,536 history slots would exceed that ceiling. Use bounded
 shared storage and retire only resolved sender-history prefixes, preserving
@@ -619,8 +619,18 @@ uses real packer output, receiver ACK ranges, budgeted history/coverage updates
 and time-threshold loss detection at 1280/1500/9000 outer-byte ceilings. Late
 originals and repairs produce no duplicate frame or double credit release.
 This uses a synthetic clock and does not test worker scheduling or throughput.
-Allocate journal and recovery state against actual frame quotas when wiring
-payload retention and worker repair sends; none of those is connected yet.
+Workers now allocate stable coverage state and journal mappings against actual
+frame quotas and the startup memory ceiling. Successful sends retain payloads;
+ACKs, loss and retirement update coverage before the sampler can recycle handles.
+Fresh batches leave half the journal capacity for repairs. Coverage work and
+frame cleanup yield under separate fixed budgets. Partial sends settle only the
+successful prefix, and late ACKs invalidate obsolete repair selections.
+Sender deadlines use four smoothed RTTs, clamped to 20–100 ms, without extending
+the original read deadline. Worker regressions cover mapping pressure, bounded
+report processing, partial sends and late-ACK cancellation. A bidirectional
+release runtime test drops the original prefix and first repair, verifies
+second-repair delivery, then replays late originals without duplication or
+hot-path allocation. Sustained impaired-path throughput remains unverified.
 The current transmit store now indexes exact deadlines in a fixed-capacity heap
 and removes pending frames directly. Cleanup visits at most 64 expired frame
 views per turn, including already-prepared batches; pre-send checks defer

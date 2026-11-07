@@ -554,6 +554,53 @@ mod tests {
     }
 
     #[test]
+    fn recovery_storage_respects_default_and_explicit_memory_limits() {
+        use crate::config::{Endpoint, Peer, Session};
+        let mut config = Config::default();
+        config.endpoints.push(Endpoint {
+            name: "rx".into(),
+            listen_address: Ipv6Addr::LOCALHOST,
+            listen_port: 40000,
+            scope_id: 0,
+            bind_device: None,
+        });
+        config.peers.push(Peer {
+            name: "peer".into(),
+            endpoint: "rx".into(),
+            address: Some(Ipv6Addr::LOCALHOST),
+            peer_port: 40001,
+            scope_id: 0,
+            tx_lanes: 8,
+            outer_payload_limit: 8952,
+            path_group: None,
+        });
+        config.sessions.push(Session {
+            name: "memory-test".into(),
+            peer: "peer".into(),
+            cookie: crate::UnquicUuid::from_bytes([1; 16]),
+            tap_name: None,
+            inner_mtu: 1500,
+            mac: None,
+            queue_count: 8,
+        });
+        let normal = config.clone().validate().unwrap();
+        let normal_bytes = storage_bytes(&normal, 8).unwrap();
+        assert!(normal_bytes <= normal.config().daemon.memory_limit);
+
+        config.peers[0].tx_lanes = 64;
+        let larger = config.clone().validate().unwrap();
+        let larger_bytes = storage_bytes(&larger, 8).unwrap();
+        assert!(larger_bytes > larger.config().daemon.memory_limit);
+        assert!(larger_bytes > normal_bytes);
+
+        config.daemon.memory_limit = larger_bytes;
+        let explicit = config.clone().validate().unwrap();
+        assert_eq!(storage_bytes(&explicit, 8), Some(larger_bytes));
+        assert_eq!(explicit.config().peers[0].tx_lanes, 64);
+        assert_eq!(explicit.config().sessions[0].queue_count, 8);
+    }
+
+    #[test]
     fn accounting_includes_reserved_config_capacity_and_worker_queues() {
         let empty = Config::default().validate().unwrap();
         let baseline = storage_bytes(&empty, 1).unwrap();

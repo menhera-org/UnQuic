@@ -45,8 +45,8 @@ impl Ack {
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct Entry {
-    number: u64,
-    sample: Option<NonZeroU16>,
+    pub(super) number: u64,
+    pub(super) sample: Option<NonZeroU16>,
     settled: bool,
 }
 
@@ -67,9 +67,9 @@ pub(crate) struct Report {
     origin: usize,
     group: usize,
     id: PacketId,
-    kind: ReportKind,
-    count: usize,
-    entries: [Entry; BATCH_SIZE],
+    pub(super) kind: ReportKind,
+    pub(super) count: usize,
+    pub(super) entries: [Entry; BATCH_SIZE],
 }
 
 impl Report {
@@ -341,7 +341,7 @@ impl State {
             .min()
     }
 
-    fn queue(&mut self, worker: usize, message: Message) -> io::Result<()> {
+    pub(super) fn queue(&mut self, worker: usize, message: Message) -> io::Result<()> {
         if self.outgoing.len() == self.outgoing.capacity() {
             return Err(io::Error::other("sender message storage exhausted"));
         }
@@ -851,7 +851,7 @@ impl Worker {
                     *budget -= 1;
                 }
                 if produced {
-                    self.sender.queue(0, Message::Report(report))?;
+                    self.recovery.staged = Some(report);
                     more = true;
                     break;
                 }
@@ -959,7 +959,7 @@ impl Worker {
                     .and_then(|left| left.checked_sub(1).filter(|&n| n != 0));
             }
             if produced {
-                self.sender.queue(0, Message::Report(report))?;
+                self.recovery.staged = Some(report);
                 more = true;
             } else {
                 budget = budget.saturating_sub(1);
@@ -967,6 +967,7 @@ impl Worker {
             }
         }
         more |= budget == 0 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0);
+        more |= self.stage_recovery()?;
         if self.sender.owner.is_some() {
             // Apply local feedback before the shared owner considers fresh grants.
             more |= self.flush_sender_messages(now)?;
@@ -1031,7 +1032,10 @@ impl Worker {
         if !self.sender_enabled() {
             return true;
         }
-        if self.sender.job.is_some_and(|job| job.session == session) {
+        if self.recovery.quiesce.is_some()
+            || self.sessions[session].tx_retained != 0
+            || self.sender.job.is_some_and(|job| job.session == session)
+        {
             return false;
         }
         let Some((&first, &end)) = self
@@ -1262,8 +1266,10 @@ impl Worker {
             .flight
             .take()
             .ok_or(io::ErrorKind::InvalidData)?;
+        self.settle_sent_pieces(&flight, count)?;
         let retain_suffix =
             matches!(job.kind, JobKind::Data) && count != 0 && count == flight.packets().len();
+
         for offset in 0..if retain_suffix { count } else { job.count } {
             let number = job.first + offset as u64;
             if offset < count {

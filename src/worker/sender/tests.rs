@@ -105,7 +105,15 @@ fn fresh_grant_clock_survives_older_worker_turn_through_handoff() {
     assert_eq!(packet.sent_at, Duration::from_millis(1));
     assert!(packet.sample_slot.is_some());
     assert!(workers[1].sender.job.is_none());
-    assert_eq!(workers[1].sessions[0].tx_retained, 0);
+    assert!(workers[1].sessions[0].tx_retained != 0);
+    assert_eq!(
+        workers[1]
+            .recovery
+            .journal
+            .packet(usize::from(packet.sample_slot.unwrap().get()) - 1)
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -240,7 +248,7 @@ fn steady_control_does_not_starve_local_data_or_consume_another_grant() {
             Err(crate::ack::HistoryError::Unsent)
         );
         assert!(workers[0].sender.job.is_none());
-        assert_eq!(workers[0].sessions[0].tx_retained, 0);
+        assert!(workers[0].sessions[0].tx_retained != 0);
     }
     assert_eq!(workers[0].counters.send_grants, 8);
     assert_eq!(workers[0].counters.cancelled_grants, 0);
@@ -526,7 +534,8 @@ fn partial_batches_with_feedback(feedback: bool) {
         }
     }
     assert_eq!(workers[0].counters.cancelled_grants, 0);
-    for worker in &workers {
+    for worker in &mut workers {
+        while worker.cleanup_frames().unwrap() {}
         assert_eq!(worker.sessions[0].tx_retained, 0);
         assert_eq!(worker.counters.expired_frames, 0);
         assert_eq!(worker.counters.queue_drops, 0);
@@ -663,6 +672,7 @@ fn loss_check_waits_for_final_report_return_and_survives_replacement_and_queue_p
         )
         .unwrap();
     assert!(worker.advance_loss_checks(Duration::ZERO, &mut 64).unwrap());
+    assert!(!worker.stage_recovery().unwrap());
     let (_, Message::Report(report)) = worker.sender.outgoing.pop_front().unwrap() else {
         panic!()
     };
@@ -682,6 +692,7 @@ fn loss_check_waits_for_final_report_return_and_survives_replacement_and_queue_p
         .unwrap();
     for _ in 0..4 {
         worker.advance_loss_checks(Duration::ZERO, &mut 64).unwrap();
+        worker.stage_recovery().unwrap();
         if let Some((_, Message::Report(report))) = worker.sender.outgoing.pop_front() {
             worker
                 .sender_message(Message::ReportReturn(report), Duration::ZERO)
@@ -948,7 +959,7 @@ fn refresh_history_pressure_reports_unused_and_preserves_frame() {
             .records()
             .any(|r| matches!(r, Record::Data { .. }))
     );
-    assert_eq!(workers[0].sessions[0].tx_retained, 0);
+    assert!(workers[0].sessions[0].tx_retained != 0);
 }
 
 #[test]
@@ -1011,14 +1022,16 @@ fn retained_suffix_reservations_survive_recycle_and_leave_on_discard() {
                 .is_empty()
         );
         if cause == 2 {
-            for _ in 0..16 {
+            for _ in 0..(frames::CAPACITY / BATCH_SIZE + 16) {
                 for worker in &mut workers {
                     worker.io_time = Some(Ok);
                     worker.drain_queues(Duration::from_millis(2)).unwrap();
                     worker.service_sender(Duration::from_millis(2)).unwrap();
+                    worker.flush_frames(Duration::from_millis(2)).unwrap();
                 }
             }
             assert!(workers[1].sender_idle(0));
+
             workers[1]
                 .progress_barriers(Duration::from_millis(2))
                 .unwrap();
@@ -1077,6 +1090,8 @@ fn partial_attempt_discards_all_unsent_reservations_and_retries_fresh_numbers() 
         .iter()
         .flat_map(|part| part.iter().copied())
         .collect();
+    let granted = worker.sender.flight.as_ref().unwrap().packets().len();
+    assert!(worker.reserve_pieces(&batch, granted).unwrap());
     worker.transmit[0].paths[0].lanes[1]
         .socket
         .as_ref()
@@ -1354,4 +1369,315 @@ fn canceled_probe_defers_refill_until_reserved_suffix_drains() {
     assert_eq!(workers[1].sender.lanes[index].history.inflight_bytes(), 0);
     workers[1].flush_frames(observed).unwrap();
     assert!(workers[1].sender.job.unwrap().first > job.first + count);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
+    let (mut workers, _rx) = workers();
+    let worker = &mut workers[1];
+    for _ in 0..64 {
+        queue_frame(worker, 60);
+    }
+    let slots: Vec<_> = worker.sessions[0].batches[1]
+        .as_ref()
+        .unwrap()
+        .pending
+        .iter(&worker.frames)
+        .collect();
+    assert_eq!(slots.len(), 64);
+    let mut pieces = [crate::ack::FramePiece::default(); 64];
+    for attempt in 0..=2 {
+        for (piece, &index) in pieces.iter_mut().zip(&slots) {
+            let frame = worker.frames.frame(index).unwrap();
+            *piece = crate::ack::FramePiece {
+                frame_slot: index as u16,
+                frame_id: frame.id,
+                start: 0,
+                end: 60,
+                attempt,
+            };
+            let state = worker.frames.recovery_mut(index).unwrap();
+            if attempt != 0 {
+                assert!(state.lost(0..60, attempt - 1));
+            }
+            assert!(state.submitted(0..60, attempt));
+        }
+        assert!(
+            worker
+                .recovery
+                .journal
+                .reserve_packet(usize::from(attempt), &pieces)
+        );
+    }
+    let mut report = worker.sender.report.take().unwrap();
+    report.kind = ReportKind::Ack {
+        received: Duration::from_millis(2),
+        delay_us: 0,
+        first: true,
+        end: None,
+    };
+    report.count = 3;
+    for ordinal in 0..3 {
+        report.entries[ordinal] = Entry {
+            number: ordinal as u64 + 1,
+            sample: NonZeroU16::new(ordinal as u16 + 1),
+            settled: true,
+        };
+    }
+    worker.recovery.staged = Some(report);
+    assert!(worker.stage_recovery().unwrap());
+    assert_eq!(worker.recovery.cursor, 2);
+    assert!(
+        !worker
+            .sender
+            .outgoing
+            .iter()
+            .any(|(_, message)| matches!(message, Message::Report(_)))
+    );
+    assert!(worker.recovery.journal.packet_empty(0));
+    assert!(worker.recovery.journal.packet_empty(1));
+    assert!(!worker.recovery.journal.packet_empty(2));
+    assert!(
+        slots
+            .iter()
+            .all(|&slot| worker.frames.recovery(slot).unwrap().remaining() == 0)
+    );
+    assert!(!worker.cleanup_frames().unwrap());
+    assert_eq!(worker.sessions[0].tx_retained, 0);
+    assert!(worker.recovery.journal.packet_empty(2));
+    assert!(!worker.stage_recovery().unwrap());
+    assert!(
+        worker
+            .sender
+            .outgoing
+            .iter()
+            .any(|(_, message)| matches!(message, Message::Report(_)))
+    );
+    assert!(
+        slots
+            .iter()
+            .all(|&slot| worker.frames.frame(slot).is_none())
+    );
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn lost_original_repairs_only_missing_bytes_and_late_ack_cancels_prepared_repair() {
+    let (mut workers, rx) = workers();
+    for worker in &mut workers {
+        worker.io_time = Some(Ok);
+    }
+    queue_frame(&mut workers[1], 1514);
+    for _ in 0..12 {
+        for worker in &mut workers {
+            worker.drain_queues(Duration::from_millis(1)).unwrap();
+            worker.service_sender(Duration::from_millis(1)).unwrap();
+            worker.flush_frames(Duration::from_millis(1)).unwrap();
+        }
+    }
+    let mut bytes = [0; BASE_UDP_PAYLOAD];
+    let first = rx.recv(&mut bytes).unwrap().0;
+    let original = Datagram::decode(&bytes[..first]).unwrap();
+    let number = original.header().packet_number;
+    let Some(Record::Data {
+        frame_id,
+        offset: 0,
+        bytes: head,
+        ..
+    }) = original.records().next()
+    else {
+        panic!()
+    };
+    let end = head.len();
+    let tail = rx.recv(&mut bytes).unwrap().0;
+    let tail = Datagram::decode(&bytes[..tail])
+        .unwrap()
+        .header()
+        .packet_number;
+    let lane = workers[1].sender_index(0, 1).unwrap();
+    let sample = workers[1].sender.lanes[lane]
+        .history
+        .packet(number)
+        .unwrap()
+        .sample_slot
+        .unwrap();
+    let piece = workers[1]
+        .recovery
+        .journal
+        .packet(usize::from(sample.get()) - 1)
+        .next()
+        .unwrap();
+    let slot = usize::from(piece.frame_slot);
+    assert_eq!(workers[1].frames.frame(slot).unwrap().id, frame_id);
+    assert_eq!(workers[1].frames.frame(slot).unwrap().offset, 1514);
+    assert!(workers[1].sessions[0].tx_retained != 0);
+    let ranges = [AckRange {
+        start: tail,
+        end: tail,
+    }];
+    let now = Duration::from_millis(2);
+    workers[1]
+        .incoming_ack(0, 1, 2, 0, AckRanges::new(&ranges).unwrap(), now)
+        .unwrap();
+    for _ in 0..8 {
+        for worker in &mut workers {
+            worker.drain_queues(now).unwrap();
+            worker.service_sender(now).unwrap();
+        }
+    }
+    assert_eq!(workers[1].frames.recovery(slot).unwrap().remaining(), end);
+    workers[1].sender.lanes[lane].force_loss(Duration::from_millis(3));
+    for _ in 0..8 {
+        for worker in &mut workers {
+            worker.drain_queues(Duration::from_millis(3)).unwrap();
+            worker.service_sender(Duration::from_millis(3)).unwrap();
+        }
+    }
+    assert_eq!(
+        workers[1].frames.recovery(slot).unwrap().next_repair(9022),
+        Some((0..end, 1))
+    );
+    assert_eq!(
+        workers[1].sessions[0].batches[1]
+            .as_ref()
+            .unwrap()
+            .repairs
+            .front(),
+        Some(slot)
+    );
+    workers[1].flush_frames(Duration::from_millis(3)).unwrap();
+    let batch = workers[1].sessions[0].batches[1].as_ref().unwrap();
+    assert!(batch.repair && !batch.plan.is_empty());
+    assert!(
+        batch
+            .plan
+            .pieces(0)
+            .unwrap()
+            .all(|(_, range)| range.end <= end)
+    );
+    let ranges = [AckRange {
+        start: number,
+        end: number,
+    }];
+    workers[1]
+        .incoming_ack(
+            0,
+            1,
+            2,
+            0,
+            AckRanges::new(&ranges).unwrap(),
+            Duration::from_millis(4),
+        )
+        .unwrap();
+    // Apply local coverage before allowing the held repair request to reach its coordinator.
+    workers[1].begin_sender_ack().unwrap();
+    let mut report = workers[1].sender.report.take().unwrap();
+    assert!(
+        workers[1].sender.lanes[lane]
+            .advance_report(&mut report, Duration::from_millis(4), &mut 64)
+            .unwrap()
+    );
+    workers[1].recovery.staged = Some(report);
+    workers[1].stage_recovery().unwrap();
+    assert!(
+        workers[1].sessions[0].batches[1]
+            .as_ref()
+            .unwrap()
+            .plan
+            .is_empty()
+    );
+    assert_eq!(workers[1].frames.recovery(slot).unwrap().remaining(), 0);
+    workers[1].cleanup_frames().unwrap();
+    assert!(workers[1].frames.frame(slot).is_none());
+    assert!(
+        workers[1]
+            .recovery
+            .journal
+            .packet_empty(usize::from(sample.get()) - 1)
+    );
+    assert_eq!(workers[1].sessions[0].tx_retained, 0);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn mapping_pressure_preserves_fresh_fifo_and_leaves_reserved_space_for_repair() {
+    let (mut workers, rx) = workers();
+    let worker = &mut workers[1];
+    worker.recovery = recovery::Recovery::new(3).unwrap();
+    queue_frame(worker, 9022);
+    queue_frame(worker, 60);
+    queue_frame(worker, 60);
+    let mut batch = worker.sessions[0].batches[1].take().unwrap();
+    let old = batch
+        .pending
+        .pop_front(&mut worker.frames)
+        .unwrap()
+        .unwrap();
+    let id = worker.frames.frame(old).unwrap().id;
+    worker.frames.frame_mut(old).unwrap().offset = 9022;
+    let state = worker.frames.recovery_mut(old).unwrap();
+    assert!(state.submitted(0..9022, 0));
+    assert!(state.lost(0..100, 0));
+    worker.recovery.set(old, Place::Retained).unwrap();
+    let pieces: Vec<_> = (0..48)
+        .map(|piece| crate::ack::FramePiece {
+            frame_slot: old as u16,
+            frame_id: id,
+            start: piece * 100,
+            end: (piece + 1) * 100,
+            attempt: 0,
+        })
+        .collect();
+    assert!(worker.recovery.journal.reserve_packet(65534, &pieces));
+    assert!(!worker.recovery.fresh_capacity());
+    let first = batch
+        .pending
+        .pop_front(&mut worker.frames)
+        .unwrap()
+        .unwrap();
+    let second = batch.pending.front().unwrap();
+    batch.frames[0] = Some(first);
+    batch.len = 1;
+    worker.recovery.set(first, Place::Batch).unwrap();
+    batch
+        .prepare(
+            worker.sessions[0].tx[1].as_mut().unwrap(),
+            &worker.frames,
+            BASE_UDP_PAYLOAD,
+        )
+        .unwrap();
+    assert!(!worker.reserve_pieces(&batch, 1).unwrap());
+    worker.yield_batch(0, 1, &mut batch).unwrap();
+    assert_eq!(
+        batch.pending.iter(&worker.frames).collect::<Vec<_>>(),
+        [first, second]
+    );
+    worker.sessions[0].batches[1] = Some(batch);
+    worker.queue_recovery(old).unwrap();
+    worker.flush_frames(Duration::from_millis(1)).unwrap();
+    let batch = worker.sessions[0].batches[1].as_ref().unwrap();
+    assert!(batch.repair);
+    assert_eq!(batch.frames[0], Some(old));
+    for _ in 0..8 {
+        service(&mut workers);
+    }
+    let mut bytes = [0; BASE_UDP_PAYLOAD];
+    let length = rx.recv(&mut bytes).unwrap().0;
+    let packet = Datagram::decode(&bytes[..length]).unwrap();
+    assert!(packet.records().any(|record| matches!(record,
+        Record::Data { frame_id, offset: 0, bytes, .. } if frame_id == id && bytes.len() == 100)));
+    assert_eq!(workers[1].counters.repairs, 1);
+    assert_eq!(
+        workers[1].frames.recovery(old).unwrap().next_repair(9022),
+        None
+    );
+    assert_eq!(
+        workers[1].sessions[0].batches[1]
+            .as_ref()
+            .unwrap()
+            .pending
+            .front(),
+        Some(first)
+    );
 }

@@ -1,6 +1,6 @@
 //! Owner-local payload storage and compact frame handles.
 use super::{BUFFERS, Buffer};
-use crate::{pack, tap::Segments};
+use crate::{loss::FrameRecovery, pack, tap::Segments};
 use std::{io, mem::size_of, ops::Range, time::Duration};
 
 pub(super) const CAPACITY: usize = 8192;
@@ -68,6 +68,30 @@ impl Queue {
             return Err(io::Error::other("missing queued transmit frame"));
         }
         self.insert(&mut store.links, index)
+    }
+
+    pub fn push_front(&mut self, store: &mut Store, index: usize) -> io::Result<()> {
+        if self.is_empty() {
+            return self.push_back(store, index);
+        }
+        if store.frame(index).is_none()
+            || store.links.get(index) != Some(&Link::EMPTY)
+            || self.len >= CAPACITY
+            || store
+                .links
+                .get(self.head)
+                .is_none_or(|link| usize::from(link.previous) != END)
+        {
+            return Err(io::Error::other("invalid transmit queue prepend"));
+        }
+        store.links[index] = Link {
+            next: self.head as u16,
+            previous: END as u16,
+        };
+        store.links[self.head].previous = index as u16;
+        self.head = index;
+        self.len += 1;
+        Ok(())
     }
 
     pub fn pop_front(&mut self, store: &mut Store) -> io::Result<Option<usize>> {
@@ -174,6 +198,7 @@ pub(super) struct Store {
     sources: Vec<Option<Source>>,
     free_sources: Vec<usize>,
     frames: Vec<Option<Frame>>,
+    recovery: Vec<FrameRecovery>,
     free_frames: Vec<usize>,
     links: Vec<Link>,
     expiry: Vec<u16>,
@@ -185,6 +210,7 @@ impl Store {
         BUFFERS * (size_of::<Option<Source>>() + size_of::<usize>())
             + capacity
                 * (size_of::<Option<Frame>>()
+                    + size_of::<FrameRecovery>()
                     + size_of::<usize>()
                     + size_of::<Link>()
                     + 2 * size_of::<u16>())
@@ -194,11 +220,19 @@ impl Store {
         if capacity > CAPACITY {
             return Err(io::ErrorKind::InvalidInput.into());
         }
+        let mut recovery = Vec::new();
+        recovery
+            .try_reserve_exact(capacity)
+            .map_err(io::Error::other)?;
+        for _ in 0..capacity {
+            recovery.push(FrameRecovery::new(14).ok_or(io::ErrorKind::InvalidData)?);
+        }
         let sources = BUFFERS;
         Ok(Self {
             sources: std::iter::repeat_with(|| None).take(sources).collect(),
             free_sources: (0..sources).rev().collect(),
             frames: std::iter::repeat_with(|| None).take(capacity).collect(),
+            recovery,
             free_frames: (0..capacity).rev().collect(),
             links: vec![Link::EMPTY; capacity],
             expiry: Vec::with_capacity(capacity),
@@ -242,6 +276,16 @@ impl Store {
         self.frames.get_mut(index)?.as_mut()
     }
 
+    pub fn recovery(&self, index: usize) -> Option<&FrameRecovery> {
+        self.frame(index)?;
+        self.recovery.get(index)
+    }
+
+    pub fn recovery_mut(&mut self, index: usize) -> Option<&mut FrameRecovery> {
+        self.frame(index)?;
+        self.recovery.get_mut(index)
+    }
+
     pub fn insert_frame(&mut self, frame: Frame) -> Option<usize> {
         let &index = self.free_frames.last()?;
         let slot = self.frames.get_mut(index)?;
@@ -249,11 +293,15 @@ impl Store {
         if frame.header_len > frame.header.len()
             || frame.range.start > frame.range.end
             || frame.range.end > source.buffer.length
-            || frame.offset >= frame.length()
         {
             return None;
         }
-        source.references = source.references.checked_add(1)?;
+        let length = frame.header_len.checked_add(frame.range.len())?;
+        let references = source.references.checked_add(1)?;
+        if frame.offset >= length || !self.recovery.get_mut(index)?.reset(length) {
+            return None;
+        }
+        source.references = references;
         self.free_frames.pop();
         *slot = Some(frame);
         self.expiry_position[index] = self.expiry.len() as u16;
@@ -479,6 +527,71 @@ mod tests {
         assert!(store.unpin(source).is_some());
         assert!(store.frames.is_empty());
         assert!(store.links.is_empty());
+        assert_eq!(store.recovery.capacity(), 0);
+        assert!(store.recovery(0).is_none());
+        assert!(store.recovery_mut(0).is_none());
+    }
+
+    #[test]
+    fn recovery_storage_is_stable_and_invalid_admission_preserves_ownership() {
+        let mut store = Store::new(1).unwrap();
+        let source = store.insert_source(buffer(MAX_FRAME_LEN + 1)).ok().unwrap();
+        let index = store
+            .insert_frame(frame(source, 0..MAX_FRAME_LEN, 1))
+            .unwrap();
+        let address = store.recovery(index).unwrap() as *const FrameRecovery;
+        let recovery = store.recovery_mut(index).unwrap();
+        assert!(recovery.submitted(0..MAX_FRAME_LEN, 0));
+        assert_eq!(recovery.acknowledge(0..60, 0), Some(60));
+        assert!(store.release(index).is_none());
+        assert!(store.recovery(index).is_none());
+        assert!(store.recovery_mut(index).is_none());
+
+        for length in [0, 13, MAX_FRAME_LEN + 1] {
+            assert!(store.insert_frame(frame(source, 0..length, 2)).is_none());
+            assert_eq!(store.available(), 1);
+            assert_eq!(store.sources[source].as_ref().unwrap().references, 0);
+            assert_eq!(store.recovery[index].sent(), MAX_FRAME_LEN);
+            assert_eq!(store.recovery[index].remaining(), MAX_FRAME_LEN - 60);
+        }
+        // Reference overflow must reject before resetting a recycled recovery slot.
+        store.sources[source].as_mut().unwrap().references = usize::MAX;
+        assert!(store.insert_frame(frame(source, 0..60, 2)).is_none());
+        assert_eq!(store.recovery[index].remaining(), MAX_FRAME_LEN - 60);
+        store.sources[source].as_mut().unwrap().references = 0;
+
+        for length in [60, MAX_FRAME_LEN] {
+            assert_eq!(store.insert_frame(frame(source, 0..length, 3)), Some(index));
+            let recovery = store.recovery_mut(index).unwrap();
+            assert_eq!(recovery as *const FrameRecovery, address);
+            assert_eq!(recovery.sent(), 0);
+            assert_eq!(recovery.remaining(), length);
+            assert!(recovery.submitted(0..length, 0));
+            assert!(recovery.lost(0..length, 0));
+            assert_eq!(recovery.next_repair(length), Some((0..length, 1)));
+            assert!(recovery.submitted(0..length, 1));
+            assert_eq!(recovery.acknowledge(0..length, 0), Some(length));
+            assert!(store.release(index).is_none());
+        }
+        assert!(store.unpin(source).is_some());
+        assert_eq!(store.available(), 1);
+    }
+
+    #[test]
+    fn recovery_storage_is_charged_for_exact_frame_capacity() {
+        let per_frame = size_of::<Option<Frame>>()
+            + size_of::<FrameRecovery>()
+            + size_of::<usize>()
+            + size_of::<Link>()
+            + 2 * size_of::<u16>();
+        for capacity in [1, 17, CAPACITY] {
+            assert_eq!(
+                Store::storage_bytes(capacity) - Store::storage_bytes(0),
+                capacity * per_frame
+            );
+        }
+        assert_eq!(size_of::<FrameRecovery>(), 3392);
+        assert!(size_of::<Frame>() < 256);
     }
 
     #[test]
@@ -561,7 +674,21 @@ mod tests {
             .filter_map(|(i, (a, b))| (a != b).then_some(i))
             .collect();
         assert_eq!(changes, [0, 1]);
+        let before = store.links.clone();
+        queue.push_front(&mut store, 0).unwrap();
+        let changes: Vec<_> = before
+            .iter()
+            .zip(&store.links)
+            .enumerate()
+            .filter_map(|(i, (a, b))| (a != b).then_some(i))
+            .collect();
+        assert_eq!(changes, [0, 1]);
+        assert_eq!(queue.front(), Some(0));
+        assert_eq!(queue.len(), CAPACITY);
+        assert!(queue.push_front(&mut store, 0).is_err());
+        assert_eq!(queue.pop_front(&mut store).unwrap(), Some(0));
         assert!(store.release(0).is_none());
+
         for expected in 1..CAPACITY {
             let index = queue.pop_front(&mut store).unwrap().unwrap();
             assert_eq!(index, expected);

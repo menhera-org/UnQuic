@@ -2,7 +2,9 @@
 
 mod feedback;
 mod frames;
+mod recovery;
 mod sender;
+use recovery::Place;
 
 use crate::sys::{cvt, invalid};
 use std::{
@@ -462,11 +464,22 @@ struct SessionControl {
     queued: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+struct Selection {
+    start: u16,
+    end: u16,
+    attempt: u8,
+}
+
 struct TxBatch {
     plan: pack::Batch,
     frames: [Option<usize>; pack::BATCH_CAPACITY],
     len: usize,
     pending: frames::Queue,
+    repairs: frames::Queue,
+    repair: bool,
+    repair_next: bool,
+    selection: [Selection; pack::BATCH_CAPACITY],
 }
 
 impl TxBatch {
@@ -476,6 +489,10 @@ impl TxBatch {
             frames: std::array::from_fn(|_| None),
             len: 0,
             pending: frames::Queue::default(),
+            repairs: frames::Queue::default(),
+            repair: false,
+            repair_next: true,
+            selection: [Selection::default(); pack::BATCH_CAPACITY],
         }
     }
 
@@ -492,10 +509,14 @@ impl TxBatch {
             offset: 0,
             end: 0,
         }; pack::BATCH_CAPACITY];
-        for (input, frame) in inputs.iter_mut().zip(&self.frames[..self.len]) {
+        for (index, (input, frame)) in inputs.iter_mut().zip(&self.frames[..self.len]).enumerate() {
             *input = frame
                 .and_then(|id| storage.input(id))
                 .ok_or(pack::PackError::Frame)?;
+            if self.repair {
+                input.offset = usize::from(self.selection[index].start);
+                input.end = usize::from(self.selection[index].end);
+            }
         }
         if self.plan.is_empty() {
             self.plan.prepare(lane, &inputs[..self.len], limit)
@@ -515,6 +536,7 @@ impl TxBatch {
         }
         self.plan.compact(removed)?;
         self.frames.copy_within(removed..self.len, 0);
+        self.selection.copy_within(removed..self.len, 0);
         self.frames[self.len - removed..self.len].fill(None);
         self.len -= removed;
         Ok(())
@@ -532,6 +554,7 @@ impl TxBatch {
         for index in 0..self.len {
             if self.frames[index].is_some() {
                 self.frames.swap(len, index);
+                self.selection.swap(len, index);
                 len += 1;
             }
         }
@@ -614,6 +637,7 @@ pub(crate) struct Worker {
     free: Vec<Box<Buffer>>,
     returns: Vec<Vec<Box<Buffer>>>,
     frames: frames::Store,
+    recovery: recovery::Recovery,
     received: VecDeque<Box<Buffer>>,
     ready: VecDeque<(usize, usize)>,
     notifications: u64,
@@ -683,9 +707,10 @@ impl Worker {
                 )?)?;
         }
         let frame_storage = (0..workers).try_fold(0_usize, |bytes, id| {
-            bytes.checked_add(frames::Store::storage_bytes(frame_capacity(
-                config, workers, id,
-            )?))
+            let capacity = frame_capacity(config, workers, id)?;
+            bytes
+                .checked_add(frames::Store::storage_bytes(capacity))?
+                .checked_add(recovery::Recovery::storage_bytes(capacity)?)
         })?;
         per_worker
             .checked_mul(workers)?
@@ -916,6 +941,9 @@ impl Worker {
             free,
             returns: (0..count).map(|_| Vec::with_capacity(BUFFERS)).collect(),
             frames: frames::Store::new(
+                frame_capacity(config, count, id).ok_or(io::ErrorKind::InvalidInput)?,
+            )?,
+            recovery: recovery::Recovery::new(
                 frame_capacity(config, count, id).ok_or(io::ErrorKind::InvalidInput)?,
             )?,
             received: VecDeque::with_capacity(count * BUFFERS),
@@ -2363,6 +2391,16 @@ impl Worker {
             self.close_source(source);
             return Ok(Some(0));
         };
+        let lifetime = self
+            .sender_index(session, lane)
+            .ok()
+            .map(|index| self.sender.lanes[index].rtt.frame_lifetime())
+            .unwrap_or(Duration::from_millis(100));
+        let deadline = deadline.min(
+            deadline
+                .saturating_sub(Duration::from_millis(100))
+                .saturating_add(lifetime),
+        );
         let mut frame = frames::Frame {
             id,
             deadline,
@@ -2402,6 +2440,12 @@ impl Worker {
             .insert_frame(frame)
             .ok_or_else(|| io::Error::other("transmit frame capacity exhausted"))?;
         self.sessions[session].tx_retained += 1;
+        if self.sender_enabled() {
+            self.recovery.bind(
+                frame,
+                self.frames.frame(frame).ok_or(io::ErrorKind::InvalidData)?,
+            )?;
+        }
         let local = &mut self.sessions[session];
         local.batches[lane]
             .as_mut()
@@ -2511,7 +2555,7 @@ impl Worker {
         self.expired_at(session, lane, deadline, 1, now)
     }
 
-    fn release_frame(&mut self, index: usize) {
+    fn release_frame_storage(&mut self, index: usize) {
         let owner = self
             .frames
             .frame(index)
@@ -2535,13 +2579,14 @@ impl Worker {
         batch.discard(index.map(|index| &mut self.sender.lanes[index].history));
     }
 
-    fn clear_batch(&mut self, session: usize, lane: usize, batch: &mut TxBatch) {
+    fn clear_batch(&mut self, session: usize, lane: usize, batch: &mut TxBatch) -> io::Result<()> {
         for frame in &mut batch.frames[..batch.len] {
             if let Some(buffer) = frame.take() {
-                self.release_frame(buffer);
+                self.release_frame(buffer)?;
             }
         }
         self.discard_batch(session, lane, batch);
+        Ok(())
     }
 
     fn expire_frames(&mut self, now: Duration) -> io::Result<bool> {
@@ -2549,6 +2594,9 @@ impl Worker {
             let Some(index) = self.frames.pop_expired(now)? else {
                 break;
             };
+            if self.sender_enabled() && self.recovery.place(index)? == Place::Cleanup {
+                continue;
+            }
             let (session, lane) = self
                 .frames
                 .frame(index)
@@ -2567,16 +2615,38 @@ impl Worker {
                 .and_then(|session| session.batches.get_mut(lane))
                 .and_then(Option::take)
                 .ok_or_else(|| io::Error::other("missing expiring transmit batch"))?;
-            if !self.frames.unqueue(&mut batch.pending, index)? {
-                let slot = batch.frames[..batch.len]
+            let queue = if self.sender_enabled() && self.recovery.place(index)? == Place::Repair {
+                &mut batch.repairs
+            } else {
+                &mut batch.pending
+            };
+            let queued = if self.sender_enabled()
+                && matches!(
+                    self.recovery.place(index)?,
+                    Place::Retained | Place::Cleanup
+                ) {
+                false
+            } else {
+                self.frames.unqueue(queue, index)?
+            };
+            if !queued {
+                if let Some(slot) = batch.frames[..batch.len]
                     .iter_mut()
                     .find(|slot| **slot == Some(index))
-                    .ok_or_else(|| io::Error::other("unowned expiring transmit frame"))?;
-                *slot = None;
-                self.discard_batch(session, lane, &mut batch);
+                {
+                    *slot = None;
+                    self.discard_batch(session, lane, &mut batch);
+                } else if !self.sender_enabled()
+                    || !matches!(
+                        self.recovery.place(index)?,
+                        Place::Retained | Place::Cleanup
+                    )
+                {
+                    return Err(io::Error::other("unowned expiring transmit frame"));
+                }
             }
             self.sessions[session].batches[lane] = Some(batch);
-            self.release_frame(index);
+            self.release_frame(index)?;
         }
         Ok(self
             .frames
@@ -2585,7 +2655,7 @@ impl Worker {
     }
 
     fn flush_frames(&mut self, now: Duration) -> io::Result<bool> {
-        let more = self.expire_frames(now)?;
+        let more = self.expire_frames(now)? | self.cleanup_frames()?;
         let mut visited = 0;
         for _ in 0..self.ready.len().min(BATCH_SIZE) {
             let (session, lane) = self.ready.pop_front().unwrap();
@@ -2595,8 +2665,21 @@ impl Worker {
             if refill && !batch.plan.is_empty() {
                 batch.compact().map_err(io::Error::other)?;
             }
+            if batch.len == 0 {
+                batch.repair = !batch.repairs.is_empty()
+                    && (batch.pending.is_empty()
+                        || batch.repair_next
+                        || !self.recovery.fresh_capacity());
+                batch.repair_next = !batch.repair;
+            }
+
             while visited < BATCH_SIZE {
-                let Some(index) = batch.pending.front() else {
+                let queue = if batch.repair {
+                    &mut batch.repairs
+                } else {
+                    &mut batch.pending
+                };
+                let Some(index) = queue.front() else {
                     break;
                 };
                 let tag = self
@@ -2606,8 +2689,8 @@ impl Worker {
                     .ok_or_else(|| io::Error::other("missing transmit source"))?
                     .tag;
                 if !self.matches(session, tag) {
-                    batch.pending.pop_front(&mut self.frames)?;
-                    self.release_frame(index);
+                    queue.pop_front(&mut self.frames)?;
+                    self.release_frame(index)?;
                     visited += 1;
                     continue;
                 }
@@ -2620,8 +2703,34 @@ impl Worker {
                 {
                     break;
                 }
-                batch.frames[batch.len] = batch.pending.pop_front(&mut self.frames)?;
-                batch.len += 1;
+                let selected = if batch.repair {
+                    self.frames
+                        .recovery(index)
+                        .and_then(|state| state.next_repair(crate::MAX_FRAME_LEN))
+                        .map(|(range, attempt)| Selection {
+                            start: range.start as u16,
+                            end: range.end as u16,
+                            attempt,
+                        })
+                } else {
+                    Some(Selection::default())
+                };
+                queue.pop_front(&mut self.frames)?;
+                if let Some(selected) = selected {
+                    batch.frames[batch.len] = Some(index);
+                    batch.selection[batch.len] = selected;
+                    batch.len += 1;
+                    if self.sender_enabled() {
+                        self.recovery.set(index, Place::Batch)?;
+                    }
+                } else {
+                    self.recovery.set(index, Place::Retained)?;
+                    self.sessions[session].batches[lane] = Some(batch);
+                    self.queue_recovery(index)?;
+                    batch = self.sessions[session].batches[lane]
+                        .take()
+                        .ok_or(io::ErrorKind::InvalidData)?;
+                }
                 visited += 1;
             }
             let result = if batch.len == 0 {
@@ -2629,7 +2738,7 @@ impl Worker {
             } else {
                 self.flush_batch(session, lane, &mut batch, now)
             };
-            if batch.len != 0 || !batch.pending.is_empty() {
+            if batch.len != 0 || !batch.pending.is_empty() || !batch.repairs.is_empty() {
                 self.ready.push_back((session, lane));
             } else {
                 self.sessions[session].tx_ready &= !(1_u64 << lane);
@@ -2659,7 +2768,7 @@ impl Worker {
             .ok_or_else(|| io::Error::other("missing transmit batch source"))?
             .tag;
         if !self.matches(session, tag) {
-            self.clear_batch(session, lane, batch);
+            self.clear_batch(session, lane, batch)?;
             return Ok(());
         }
         // Cleanup belongs to the bounded expiry pass; never submit a stale plan.
@@ -2686,7 +2795,7 @@ impl Worker {
         let tx = &self.transmit[peer].paths[path].lanes[lane];
         let limit = tx.mtu.payload_limit();
         if tx.socket.is_none() {
-            self.clear_batch(session, lane, batch);
+            self.clear_batch(session, lane, batch)?;
             return Ok(());
         }
         if tx.blocked || limit == 0 {
@@ -2723,7 +2832,7 @@ impl Worker {
                 )
                 .is_err()
         {
-            self.clear_batch(session, lane, batch);
+            self.clear_batch(session, lane, batch)?;
             return Ok(());
         }
         let grant = if self.sender_enabled() {
@@ -2759,6 +2868,11 @@ impl Worker {
         } else {
             batch.plan.len()
         };
+        if grant.is_some() && !self.reserve_pieces(batch, count)? {
+            self.finish_sender_send(0, None, true)?;
+            self.yield_batch(session, lane, batch)?;
+            return Ok(());
+        }
         let result = {
             let frames = std::array::from_fn::<_, { pack::BATCH_CAPACITY }, _>(|index| {
                 batch.frames[index]
@@ -2855,7 +2969,7 @@ impl Worker {
                 local.tx_totals[lane].socket_errors =
                     local.tx_totals[lane].socket_errors.wrapping_add(1);
                 local.tx_dirty |= 1_u64 << lane;
-                self.clear_batch(session, lane, batch);
+                self.clear_batch(session, lane, batch)?;
             }
         }
         Ok(())
@@ -2870,27 +2984,45 @@ impl Worker {
         retain_suffix: bool,
     ) -> io::Result<()> {
         let mut bytes = 0;
+        let mut repairs = 0;
         for packet in 0..sent {
             bytes += (batch.plan.packet(packet).unwrap().length + 48) as u64;
-            for (frame, range) in batch.plan.pieces(packet).unwrap() {
-                if let Some(frame) = batch.frames[frame].and_then(|id| self.frames.frame_mut(id)) {
+            for (slot, range) in batch.plan.pieces(packet).unwrap() {
+                if batch.repair {
+                    repairs += 1;
+                    batch.selection[slot].start = range.end as u16;
+                } else if let Some(frame) =
+                    batch.frames[slot].and_then(|id| self.frames.frame_mut(id))
+                {
                     frame.offset = range.end;
                 }
             }
         }
         self.counters.tx_outer_bytes = self.counters.tx_outer_bytes.wrapping_add(bytes);
+        self.counters.repairs = self.counters.repairs.wrapping_add(repairs);
         let local = &mut self.sessions[session];
+        local.totals.repairs = local.totals.repairs.wrapping_add(repairs);
+        local.tx_totals[lane].repairs = local.tx_totals[lane].repairs.wrapping_add(repairs);
+
         local.totals.tx_outer_bytes = local.totals.tx_outer_bytes.wrapping_add(bytes);
         local.tx_totals[lane].tx_outer_bytes =
             local.tx_totals[lane].tx_outer_bytes.wrapping_add(bytes);
         local.tx_dirty |= 1_u64 << lane;
-        for frame in &mut batch.frames[..batch.len] {
-            if frame
-                .and_then(|id| self.frames.frame(id))
-                .is_some_and(|frame| frame.offset == frame.length())
-                && let Some(index) = frame.take()
-            {
-                self.release_frame(index);
+        for slot in 0..batch.len {
+            let complete = if batch.repair {
+                batch.selection[slot].start == batch.selection[slot].end
+            } else {
+                batch.frames[slot]
+                    .and_then(|id| self.frames.frame(id))
+                    .is_some_and(|frame| frame.offset == frame.length())
+            };
+            if complete && let Some(index) = batch.frames[slot].take() {
+                if self.sender_enabled() {
+                    self.recovery.set(index, Place::Retained)?;
+                    self.queue_recovery_in(batch, index)?;
+                } else {
+                    self.release_frame(index)?;
+                }
             }
         }
         if retain_suffix {
@@ -3554,7 +3686,11 @@ impl Worker {
         }
         if command.phase == Phase::Quiesce {
             self.close_slab(session);
+            if self.sender_enabled() {
+                self.recovery.begin_quiesce(&self.frames);
+            }
         }
+
         let local = &mut self.sessions[session];
         match command.phase {
             Phase::Quiesce => {
@@ -3870,6 +4006,10 @@ impl Worker {
         if let Some(deadline) = self.frames.deadline() {
             due = due.min(deadline);
         }
+        if self.recovery.has_cleanup() || self.recovery.staged.is_some() {
+            due = due.min(now);
+        }
+
         Some(due.max(now))
     }
 }
@@ -4004,7 +4144,7 @@ mod tests {
                 frame_bytes(&worker, index),
                 udp::frame(false, 65530u16.wrapping_add(sequence as u16), &[7])
             );
-            worker.release_frame(index);
+            worker.release_frame(index).unwrap();
         }
         worker.drain_tap_inputs(Duration::ZERO).unwrap();
         assert_eq!(pending(&worker).len(), quota - 1);
@@ -4819,7 +4959,7 @@ mod tests {
         }
         assert_eq!(worker.rx_retained, 0);
         while let Some(buffer) = pop_pending(&mut worker) {
-            worker.release_frame(buffer);
+            worker.release_frame(buffer).unwrap();
         }
         assert_eq!(worker.free.len(), BUFFERS);
         worker.flush_taps(Duration::ZERO).unwrap();
@@ -5012,7 +5152,7 @@ mod tests {
                             reassembly::FRAME_LIFETIME
                         );
                         seen += 1;
-                        worker.release_frame(buffer);
+                        worker.release_frame(buffer).unwrap();
                     }
                     if seen == count * 3 + 1 {
                         break;
@@ -5034,7 +5174,7 @@ mod tests {
                 assert_eq!(worker.free.len(), RECEIVE_BUFFERS + 1);
                 for _ in 0..2 {
                     let output = pop_pending(&mut worker).unwrap();
-                    worker.release_frame(output);
+                    worker.release_frame(output).unwrap();
                 }
                 assert_eq!(worker.free.len(), RECEIVE_BUFFERS + 1);
                 assert!(worker.sessions[0].tap_inputs.is_empty());
@@ -5194,7 +5334,7 @@ mod tests {
                     );
                     let source = workers[1].frames.frame(frame).unwrap().source;
                     assert_eq!(workers[1].frames.source(source).unwrap().origin, 1);
-                    workers[1].release_frame(frame);
+                    workers[1].release_frame(frame).unwrap();
                     seen += 1;
                 }
                 workers[0].drain_queues(Duration::ZERO).unwrap();

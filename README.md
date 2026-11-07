@@ -229,7 +229,7 @@ return to the receive owner to enforce duplicate spacing. ACK delay is finalized
 using that send timestamp; control service starts no earlier than submission,
 so a delayed worker cannot accumulate a catch-up burst. Connection tags and
 lane identity are rechecked before sends and buffer returns. Incoming ACKs now
-reach TX-owned histories and bounded loss scans; payload recovery remains Stage 3 work.
+reach TX-owned histories, bounded loss scans and selective payload recovery.
 UDP receive batches retain a timestamp taken after the receive call, including
 across GRO expansion and worker handoff. Data sends recheck frame deadlines
 immediately before each syscall and GSO fallback. Expired plans return to bounded
@@ -249,7 +249,9 @@ late-ACK metadata. Both summary and packet-word reads consume the work budget.
 The pure piece journal reserves mappings before I/O and keeps packet charges
 separate from payload lifetime. It retains mappings after loss for late ACKs;
 ACKs and bounded frame cleanup unlink mappings without scanning other histories.
-It is not yet connected to worker sends or recovery.
+Workers reserve these mappings before sending DATA and settle only the successful
+prefix. They apply coverage changes before returning ACK or retirement reports
+to the sampler owner, preventing premature handle reuse.
 The path-group PTO state provides shared backoff and the three-PTO
 stop/settlement transition. Indexed timers and aggregate probe grants now drive
 worker loss dispatch. Before PTO, the coordinator waits for issued sends to
@@ -278,15 +280,16 @@ sent, uncharged feedback can age out without waiting for another ACK. Late ACKs
 retain send metadata but cannot release a lost packet's charge twice. Allocation
 checks cover reservation, submission, ACK, loss, window wrap and reset.
 Workers use this history for submission accounting and incoming ACKs.
-It does not retain frame payloads or schedule repairs.
+Worker-local frame storage and the piece journal retain payloads and schedule repairs.
 
 `loss::Rtt` implements the pure RFC 9002 timing calculations: RTT sampling,
 packet/time loss thresholds, exponential PTO periods and sender frame lifetime.
 It applies [verified erratum 7539](https://www.rfc-editor.org/errata/eid7539),
 which computes deviation before updating the smoothed RTT. Tests cover delay
 bounds, backward time, numeric limits and exact estimator values. Worker ACK
-processing and shared PTO timers use these calculations. RTT-based frame lifetimes
-and payload recovery remain unfinished.
+processing and shared PTO timers use these calculations. Admission shortens each
+sender frame's original deadline to the measured RTT-based lifetime, bounded
+between 20 and 100 ms; repairs never extend it.
 
 The pure `loss::FrameRecovery` tracks acknowledged and outstanding byte ranges
 and permits at most two repairs per byte. It excludes unsent bytes, ignores
@@ -296,10 +299,18 @@ clears only words needed by the new frame length. Old frame-ID mappings must
 be rejected after reuse, while their packet charges remain in `History`.
 A byte-by-byte reference model and boundary tests verify transitions. Packer and
 reassembly tests lose every possible original piece and its first repair, then
-verify one complete delivery after the second repair. Workers
-still need payload retention, packet-to-frame mappings and repair submission.
+verify one complete delivery after the second repair. Workers retain source
+views until acknowledgment, expiry or connection retirement. Fresh and repair
+batches share scheduling turns; half the bounded journal capacity is reserved
+for repairs so fresh traffic cannot consume every mapping.
+Recovery storage counts toward `memory_limit`; configurations with many sessions
+or lanes may require an explicit higher ceiling. Startup rejects an oversized
+configuration instead of silently reducing its quotas. A release runtime
+regression drops each direction's original frame prefix and first repair,
+requires delivery through the second repair, and replays the late original
+without duplicate TAP delivery or hot-path allocation.
 
-Recovery, complete BBRv3 integration,
+Complete BBRv3 integration,
 descriptor adoption and daemon process integration remain unfinished. No throughput
 target has been demonstrated. [BENCH.md](BENCH.md) records the release
 TAP-to-TAP baseline, including severe overload loss, small-frame rates and CPU.
@@ -398,8 +409,8 @@ return is consumed. Insufficient owner capacity drops the input and increments
 `queue_drops`. Reads leave room for a source and slab; materialization checks
 frame, byte and physical-buffer capacity.
 No shared reservation lock or atomic is needed. Static per-worker quotas
-still limit a skewed flow below the full session allowance; shared credits
-remain necessary before the retained-data recovery gate.
+still limit a skewed flow below the full session allowance. This remains a
+performance limitation for the Stage 5 skewed-flow and lossy-path tests.
 
 Transmit DATA gathers rewritten headers and payload ranges from retained sources.
 When a grant sends its entire permitted prefix, the never-attempted suffix keeps
@@ -413,10 +424,10 @@ Partial or failed sends retain the unsent frame ranges and rebuild packet
 headers with fresh numbers on retry. Only successful submissions advance frame
 offsets or charge transmitted bytes; an intervening control packet cannot leave
 the retry using older numbers.
-Fully submitted frames release their views; a source returns to its pool after
-expansion finishes and its last view is released. Retaining sent data for
-repair remains unfinished.
-If a frame reaches its 100 ms deadline, it is removed; remaining frames keep their
+Fully submitted frames retain their views for ACK or bounded repair. A source
+returns to its pool after expansion finishes and its last view is released.
+If a frame reaches its original 20–100 ms sender deadline, it is removed;
+remaining frames keep their
 IDs and submitted offsets and are repacked with fresh packet numbers. Connection
 retirement discards every queued batch before the worker acknowledges quiescence.
 Receive reassembly copies pieces into 64 fixed frame slots per lane and retains
@@ -454,7 +465,8 @@ contain several frames; a long queue continues across batches without resetting
 frame identities. Planning stops before starting a frame that would cross the
 GSO aggregate's byte limit. The final UDP datagram may be short. Thus local
 aggregate drops do not leave orphan pieces in adjacent batches. Individual
-on-wire datagram losses still require the planned bounded selective repair. Batch storage and scheduling entries count toward startup's
+on-wire datagram losses use bounded selective repair. Batch storage, recovery
+coverage, journal mappings and scheduling entries count toward startup's
 memory reservation. Available read rings batch TAP reads, and eligible UDP
 frames share a TAP write as described below. No throughput target follows
 from allocation checks alone. Small-frame acceptance must report delivered
@@ -462,16 +474,19 @@ frames per second, CPU and drops separately from large-frame Gbit/s.
 
 ## Delivery and liveness
 
-The current runtime sends each DATA piece once. It retains a frame only until
-all pieces have been submitted, the connection changes, or its 100 ms sender
-deadline expires. An indexed heap finds the next transmit deadline without
+The runtime sends each DATA range once and permits at most two repairs per byte.
+It retains a frame until all bytes are acknowledged, the connection changes,
+or its original sender deadline expires. An indexed heap finds the next transmit deadline without
 scanning retained frames. Each worker turn cleans up at most 64 expired frame
 views, including frames in prepared batches; sends defer any expired views
 left for the next turn. Heap updates visit at most 13 levels and pending-queue
 removal is constant-time. All storage is reserved at startup.
 It emits packet ACKs only after full admission and applies received ACK/loss
-reports to the shared congestion controller. Sent payloads are not yet retained
-for repair, so a lost piece can still prevent the entire frame from reaching TAP.
+reports to the shared congestion controller. Lost pieces remain eligible for
+repair within the original frame lifetime and shared congestion/pacing limits.
+Worker coverage processing yields after 128 mappings or 64 KiB of mapped bytes;
+it processes each packet atomically. Journal cleanup unlinks at most 128 mappings
+or frame views per turn, independently of packet-charge settlement.
 Receive expiry starts at the first retained piece and
 does not move when duplicates arrive.
 
@@ -480,7 +495,7 @@ reorder queue. For unfragmented UDP with at most one VLAN tag, in sessions
 with a TAP queue on every worker, each reader hashes among its own transmit
 lanes. This removes measured handoff costs. The hash stays stable while TAP queue placement stays stable; Linux queue migration may
 put later frames of the same flow on another lane and cause reordering.
-A frame's pieces and any future repairs stay on its original lane.
+A frame's pieces and repairs stay on its original lane.
 
 Stacked VLANs, TCP, fragmented IP and other traffic retain strict flow hashing.
 Stacked VLAN traffic can concentrate on one TAP queue; hashing it across all
@@ -528,7 +543,8 @@ with fixed vectors under `tests/vectors/bbr-07`. It counts newly acknowledged
 physical transmissions, including late originals and repairs, and preserves
 one ACK sample across bounded processing turns. It distinguishes application
 bubbles from host-queue limitation. The pure BBRv3 controller implements draft-07's
-model and state machine; worker integration and runtime recovery remain unfinished.
+model and state machine. Worker integration includes recovery, but general
+application-limited detection and the performance gates remain unfinished.
 
 `pacing::Sender` combines the grant ledger with a shared bounded sampling slab
 and ordered completion processing. One reusable flight buffer per worker carries
@@ -563,8 +579,7 @@ without resetting PTO backoff. After a long outage, carrier can return before
 backed-off probing restores DATA service.
 
 Release forwarding, reconnect, allocation and routed-MTU regression tests pass.
-General application-limited detection, payload retention and selective repair
-remain unfinished. This integration
+General application-limited detection remains unfinished. This integration
 does not establish the performance gates.
 
 ## TAP read batching
@@ -757,7 +772,8 @@ shared rate, so summing session rates can count a group more than once.
 `send_grants` counts received permissions; `expired_grants` counts permissions
 rejected at dispatch or the syscall boundary after expiry; `cancelled_grants`
 counts rejected plans, frame deadlines, paths or connection identities.
-Feedback delay and repair counters remain zero until their runtime integration.
+`repairs` counts successfully submitted repair DATA records, including separate
+pieces of the same range. Feedback delay remains zero until its integration.
 Cumulative counts wrap modulo 2^64.
 
 ## Path MTU status

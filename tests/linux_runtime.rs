@@ -48,7 +48,10 @@ unsafe impl GlobalAlloc for Allocator {
 
 fn config(name: &str, port: u16, remote: u16) -> Config {
     let mut config = Config {
-        daemon: Daemon::default(),
+        // Three sessions retain independent payloads, histories and recovery state.
+        daemon: Daemon {
+            memory_limit: 512 * 1024 * 1024,
+        },
         endpoints: vec![Endpoint {
             name: "rx".into(),
             listen_address: Ipv6Addr::UNSPECIFIED,
@@ -866,4 +869,224 @@ fn foreign_rename_and_namespace_move_preserve_running_transport() {
     );
     left.stop();
     replacement.stop();
+}
+
+#[test]
+#[ignore = "requires disposable container with tun and network namespace capabilities"]
+fn outer_loss_repairs_twice_and_late_original_never_duplicates_tap_delivery() {
+    struct Relay {
+        sockets: [UdpSocket; 2],
+        target: [Option<u64>; 2],
+        drops: [usize; 2],
+        original: [[u8; 9000]; 2],
+        lengths: [usize; 2],
+    }
+    impl Relay {
+        fn pump(&mut self) {
+            let mut bytes = [0; 9000];
+            for direction in 0..2 {
+                for _ in 0..128 {
+                    let n = match self.sockets[direction].recv(&mut bytes) {
+                        Ok(n) => n,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("{error}"),
+                    };
+                    let packet = unquic::wire::Datagram::decode(&bytes[..n]).unwrap();
+                    // The relay also translates the port advertised by the handshake.
+                    let translated = packet.records().find_map(|record| match record {
+                        unquic::wire::Record::Hello {
+                            initiator,
+                            mut params,
+                        } => {
+                            params.port = if direction == 0 { 41203 } else { 41202 };
+                            Some(unquic::wire::Record::Hello { initiator, params })
+                        }
+                        unquic::wire::Record::Challenge {
+                            initiator,
+                            responder,
+                            mut params,
+                        } => {
+                            params.port = if direction == 0 { 41203 } else { 41202 };
+                            Some(unquic::wire::Record::Challenge {
+                                initiator,
+                                responder,
+                                params,
+                            })
+                        }
+                        _ => None,
+                    });
+                    let header = packet.header();
+                    let prefix = packet.records().find_map(|record| match record {
+                        unquic::wire::Record::Data {
+                            frame_id,
+                            offset: 0,
+                            bytes,
+                            ..
+                        } if bytes.get(14..22) == Some(&b"UQREPAIR"[..])
+                            && bytes.get(22) == Some(&200) =>
+                        {
+                            Some(frame_id)
+                        }
+                        _ => None,
+                    });
+                    if let Some(id) = prefix {
+                        let target = self.target[direction].get_or_insert(id);
+                        assert_eq!(*target, id);
+                        if self.drops[direction] < 2 {
+                            if self.drops[direction] == 0 {
+                                self.original[direction][..n].copy_from_slice(&bytes[..n]);
+                                self.lengths[direction] = n;
+                            }
+                            self.drops[direction] += 1;
+                            continue;
+                        }
+                    }
+                    let n = if let Some(record) = translated {
+                        unquic::wire::encode_datagram(header, &[record], &mut bytes).unwrap()
+                    } else {
+                        n
+                    };
+                    let port = if direction == 0 { 41201 } else { 41200 };
+                    assert_eq!(
+                        self.sockets[direction]
+                            .send_to(&bytes[..n], (Ipv6Addr::LOCALHOST, port))
+                            .unwrap(),
+                        n
+                    );
+                }
+            }
+        }
+
+        fn replay_originals(&self) {
+            for direction in 0..2 {
+                let n = self.lengths[direction];
+                assert!(n != 0);
+                let port = if direction == 0 { 41201 } else { 41200 };
+                assert_eq!(
+                    self.sockets[direction]
+                        .send_to(&self.original[direction][..n], (Ipv6Addr::LOCALHOST, port))
+                        .unwrap(),
+                    n
+                );
+            }
+        }
+    }
+
+    // SAFETY: only this test thread and its newly spawned daemons enter the namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let net = UdpSocket::bind("[::]:0").unwrap();
+    up(&net, c"lo");
+    let mut relay = Relay {
+        sockets: [
+            UdpSocket::bind("[::1]:41202").unwrap(),
+            UdpSocket::bind("[::1]:41203").unwrap(),
+        ],
+        target: [None; 2],
+        drops: [0; 2],
+        original: [[0; 9000]; 2],
+        lengths: [0; 2],
+    };
+    for socket in &relay.sockets {
+        socket.set_nonblocking(true).unwrap();
+    }
+    let single = |name, listen, remote| {
+        let mut config = config(name, listen, remote);
+        config.sessions.truncate(1);
+        config.peers.truncate(1);
+        config.daemon.memory_limit = Daemon::default().memory_limit;
+        config.sessions[0].queue_count = 1;
+        config.peers[0].tx_lanes = 1;
+        config
+    };
+    let mut left = Running::start(single("uq-repair-left", 41200, 41202));
+    let mut right = Running::start(single("uq-repair-right", 41201, 41203));
+    until(Duration::from_secs(5), || {
+        relay.pump();
+        left.control.ready() && right.control.ready()
+    });
+    up(&net, c"uq-repair-left");
+    up(&net, c"uq-repair-right");
+    until(Duration::from_secs(5), || {
+        relay.pump();
+        left.control.session(0).unwrap().carrier && right.control.session(0).unwrap().carrier
+    });
+    let sockets = [
+        raw_socket(c"uq-repair-left", 0x88b5),
+        raw_socket(c"uq-repair-right", 0x88b5),
+    ];
+    let mut frames = [[0x5a; 1514]; 2];
+    for (direction, frame) in frames.iter_mut().enumerate() {
+        frame[..12].copy_from_slice(&[2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2]);
+        frame[12..14].copy_from_slice(&0x88b5_u16.to_be_bytes());
+        frame[14..22].copy_from_slice(b"UQREPAIR");
+        frame[22] = 0;
+        frame[23] = direction as u8;
+        for _ in 0..4 {
+            raw_send(&sockets[direction], frame);
+        }
+    }
+    // Establish measured RTT before the two losses; initial RTT is intentionally 333 ms.
+    until(Duration::from_secs(3), || {
+        relay.pump();
+        [&left.control, &right.control].iter().all(|control| {
+            let counters = control.worker_counters(0).unwrap();
+            counters.delivered_frame_bytes >= 4 * 1514 && counters.bytes_in_flight == 0
+        })
+    });
+    let mut input = [0; 9022];
+    for socket in &sockets {
+        while raw_read(socket, &mut input).is_some() {}
+    }
+    for frame in &mut frames {
+        frame[22] = 200;
+    }
+    let mut seen = [0; 2];
+    let mut fillers = frames;
+    for frame in &mut fillers {
+        frame[22] = 1;
+    }
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    DEALLOCATIONS.store(0, Ordering::Relaxed);
+    COUNTING.store(true, Ordering::SeqCst);
+    for direction in 0..2 {
+        raw_send(&sockets[direction], &frames[direction]);
+    }
+    let mut rounds = 0;
+    until(Duration::from_secs(2), || {
+        // Later packet numbers drive loss detection even if a repair has no RTT sample yet.
+        if rounds < 64 {
+            for direction in 0..2 {
+                raw_send(&sockets[direction], &fillers[direction]);
+            }
+            rounds += 1;
+        }
+        relay.pump();
+        for direction in 0..2 {
+            while let Some(n) = raw_read(&sockets[1 - direction], &mut input) {
+                if input.get(22) == Some(&200) {
+                    assert_eq!(&input[..n], &frames[direction]);
+                    seen[direction] += 1;
+                    assert_eq!(seen[direction], 1, "duplicate repaired frame");
+                }
+            }
+        }
+        seen == [1, 1]
+    });
+    relay.replay_originals();
+    let end = Instant::now() + Duration::from_millis(50);
+    while Instant::now() < end {
+        relay.pump();
+        for socket in &sockets {
+            while raw_read(socket, &mut input).is_some() {
+                assert_ne!(input[22], 200, "late original duplicated repaired frame");
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    COUNTING.store(false, Ordering::SeqCst);
+    assert_eq!(relay.drops, [2, 2]);
+    assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
+    left.stop();
+    right.stop();
 }
