@@ -565,6 +565,9 @@ The coordinator now runs a bounded handoff of newly produced local ACK/loss
 reports to the shared owner before the next grant pass. A regression reproduces the previous
 extra turn with settled local history but an outstanding shared inflight charge;
 the same turn now applies the report and still hands off the next foreign permit.
+The wider release sweep remains below 1% missing only through 2G offered per
+direction; unlimited forward goodput falls 17.2% from its 4G peak. The original
+throughput and overload gates remain open.
 
 The pure RTT estimator, loss-deadline calculation, PTO-period backoff and frame
 lifetime now live in `loss.rs`, with exact-value and boundary tests. ACK-driven
