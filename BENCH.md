@@ -18,11 +18,11 @@ Neither the local **20 Gbit/s in each direction** gate nor the real
 remain unfinished. Workers now use the shared draft-07 controller and grant
 accounting. Refreshing overtaken packet numbers removes repeated coordinator
 DATA cancellations. Skipping empty loss-history ranges reduces CPU cost, but the
-larger bounded DATA burst, retained never-attempted packet plans and bounded
-refill raise the final sixty-second QinQ sweep to 2.35–2.51 Gbit/s per direction
-using about 2.1–2.3 CPUs per daemon.
+larger bounded DATA burst, retained packet-plan refill and earlier local feedback
+raise the latest sixty-second QinQ sweep to 2.41–2.91 Gbit/s per direction
+using about 2.2–2.4 CPUs per daemon.
 The preceding ACK-pruning sweep delivered 1.12 to 1.22 Gbit/s. These remain
-severe integration regressions, far below the CPU ceiling.
+severe integration regressions, far below earlier forwarding rates.
 General application-limited detection and payload repair remain open.
 PMTU discovery is active in the latest rate sweeps and
 passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
@@ -53,8 +53,8 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Final sixty-second QinQ sweep: 2.41 / 2.44 Gbit/s paced, 2.47 / 2.35 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 88.41 / 88.27%. Five successful repeats and the under-1% gate remain unmet. |
-| Goodput must plateau under excess traffic | The final sixty-second sweep rises 2.4% forward and falls 3.4% reverse under unlimited load, using about 2.1–2.3 cores per daemon. One earlier short sweep declines 18.1% forward; its repeat rises 13.9% | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Latest sixty-second QinQ sweep: 2.63 / 2.55 Gbit/s paced, 2.56 / 2.61 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 87.32 / 87.69%. Five successful repeats and the under-1% gate remain unmet. |
+| Goodput must plateau under excess traffic | The latest sixty-second sweep falls 2.8% forward and rises 2.3% reverse under unlimited load, using about 2.2–2.4 cores per daemon. One earlier short sweep declines 18.1% forward; its repeat rises 13.9% | The low sender throughput is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
 | Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Final sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
@@ -861,6 +861,58 @@ zero admission pressure, outer socket overflow, inner UDP errors, malformed
 or invalid records, duplicates, reordering and outer fragmentation.
 The earlier thirteen reordered frames remain unattributed. This follow-up
 does not isolate the registration fix's performance effect.
+
+## Coordinator-local feedback scheduling (November 7)
+
+A focused regression reproduces another avoidable sender delay: local history
+has applied an ACK, but the shared controller still counts 176 bytes in flight
+after the worker's service turn. The coordinator produced its report after its
+first outgoing handoff and called the shared owner before handing off that report.
+
+An additional bounded handoff before the owner advances removes that extra turn
+when the outgoing queue has room. It preserves destination FIFO, blocked-queue
+behavior and the 64-entry handoff budget. The regression now settles the shared
+charge and still hands off the next foreign worker's permit. Long or blocked
+queues may defer reports; this is not an unbounded drain.
+
+[Matched normal release sweeps](benches/tap-sender-local-feedback.json) compare
+the previous combined build with this change. Each keeps its daemons through
+sixty-second 21G, unlimited and 21G-return points. QinQ frames, CPU placement,
+active discovery and the 1452-byte outer UDP ceiling are unchanged. No builds,
+other tests or Git packing overlap load.
+
+| Build / requested Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| Baseline / 21 | 2.42 / 2.37 | 88.38 / 88.56 | 218.82 / 211.46 |
+| Baseline / unlimited | 2.31 / 2.39 | 95.94 / 95.52 | 214.57 / 209.23 |
+| Baseline / 21 return | 2.81 / 2.33 | 86.47 / 88.74 | 235.10 / 221.44 |
+| Earlier feedback / 21 | 2.63 / 2.55 | 87.32 / 87.69 | 233.14 / 222.41 |
+| Earlier feedback / unlimited | 2.56 / 2.61 | 95.50 / 95.30 | 230.03 / 221.56 |
+| Earlier feedback / 21 return | 2.91 / 2.41 | 86.02 / 88.39 | 238.81 / 222.72 |
+
+The first paced point improves 8.8 / 7.5%, unlimited improves 10.6 / 9.0%,
+and the return point improves 3.5 / 3.2%. This is one matched pair. The
+candidate still falls 2.8% forward under unlimited load; reverse rises 2.3%.
+It does not establish a repeatable plateau, a CPU ceiling or either throughput
+gate. The zero-loss forwarding limit and notification delays still need profiling.
+
+| Build, unlimited | TAP TX drops (SKBs) | Expired frames | Queue drops | ACK-buffer drops (included in queue drops) |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline | 6336366 / 5859332 | 22994 / 32228 | 7003 / 61260 | 625 / 495 |
+| Earlier feedback | 6299603 / 6073092 | 19800 / 30796 | 6538 / 66606 | 371 / 228 |
+
+All six points have zero admission pressure, outer socket overflow, inner UDP
+errors, malformed/invalid/duplicate/out-of-window/wrong-run/reordered records
+and outer IPv6 fragmentation. These counters distinguish observed loss locations;
+their different units do not permit an exact frame-loss sum.
+
+The change passes 341 ordinary release tests, 332 default-feature tests,
+65 short kernel/integration tests, Clippy and formatting. Runtime tests pass
+in 83.96 seconds without concurrent compilation, including foreign rename/move,
+restart, control pressure and the frame storm. The sender change adds no
+allocation, lock, payload copy or syscall. The full routed PMTU test passes
+in 653.11 seconds: 9000 → 1500 → 1280 → 9000 on every lane, returned and
+filtered PTB, the normal upward retry interval and no outer fragments.
 
 ## Request fairness and burst-size experiments (November 7)
 

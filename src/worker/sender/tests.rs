@@ -110,6 +110,74 @@ fn fresh_grant_clock_survives_older_worker_turn_through_handoff() {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
+fn local_ack_settles_before_the_owner_grants_again() {
+    let (mut workers, rx) = workers();
+    frame(&mut workers[0]);
+    let number = workers[0].sender.job.unwrap().first;
+    for _ in 0..8 {
+        service(&mut workers);
+    }
+    let mut bytes = [0; BASE_UDP_PAYLOAD];
+    let length = rx.recv(&mut bytes).unwrap().0;
+    assert_eq!(
+        Datagram::decode(&bytes[..length])
+            .unwrap()
+            .header()
+            .packet_number,
+        number
+    );
+    assert!(
+        workers[0]
+            .sender
+            .owner
+            .as_ref()
+            .unwrap()
+            .snapshot(0)
+            .unwrap()
+            .bytes_in_flight
+            != 0
+    );
+    let now = Duration::from_millis(2);
+    for worker in &mut workers {
+        worker.io_time = Some(Ok);
+    }
+    let ranges = [AckRange {
+        start: number,
+        end: number,
+    }];
+    workers[0]
+        .incoming_ack(0, 1, 1, 0, AckRanges::new(&ranges).unwrap(), now)
+        .unwrap();
+    // A foreign request is already eligible when the coordinator produces its local ACK report.
+    frame(&mut workers[1]);
+    workers[1].flush_sender_messages(now).unwrap();
+    workers[0].drain_queues(now).unwrap();
+    workers[0].service_sender(now).unwrap();
+    let index = workers[0].sender_index(0, 0).unwrap();
+    assert_eq!(workers[0].sender.lanes[index].history.inflight_bytes(), 0);
+    assert_eq!(
+        workers[0]
+            .sender
+            .owner
+            .as_ref()
+            .unwrap()
+            .snapshot(0)
+            .unwrap()
+            .bytes_in_flight,
+        0,
+        "local settlement must reach the shared owner before issuing another grant"
+    );
+    assert!(!workers[0].sender.lanes[index].report_pending);
+    assert!(workers[0].sender.report.is_some());
+    workers[1].drain_queues(now).unwrap();
+    assert!(
+        workers[1].sender.permitted,
+        "the normal post-advance permit handoff still runs"
+    );
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
 fn steady_control_does_not_starve_local_data_or_consume_another_grant() {
     let (mut workers, rx) = workers();
     for worker in &mut workers {

@@ -561,6 +561,10 @@ Refill defers across packet-number gaps. Two matched release sweeps average
 2.55 / 2.45 Gbit/s paced and 2.45 / 2.79 unlimited, still far below the gates;
 individual directions remain variable. BENCH.md records the remaining loss,
 forward decline in one sweep and thirteen reordered frames in another point.
+The coordinator now runs a bounded handoff of newly produced local ACK/loss
+reports to the shared owner before the next grant pass. A regression reproduces the previous
+extra turn with settled local history but an outstanding shared inflight charge;
+the same turn now applies the report and still hands off the next foreign permit.
 
 The pure RTT estimator, loss-deadline calculation, PTO-period backoff and frame
 lifetime now live in `loss.rs`, with exact-value and boundary tests. ACK-driven

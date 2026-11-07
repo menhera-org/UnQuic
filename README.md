@@ -542,7 +542,9 @@ reports use storage separate from send completions. Startup memory accounting
 includes these histories, the shared sampler and all reserved message buffers.
 The coordinator drains ready completions and feedback within one shared
 64-unit work budget. Workers hand off newly queued requests and completions
-before the end-of-turn notification flush.
+before the end-of-turn notification flush. The coordinator also runs a bounded
+handoff of its newly produced ACK/loss reports before the shared owner's grant
+pass, avoiding an extra turn when the outgoing queue can accept them.
 Request priority advances after the first granted worker, so a full scan or
 another path group's later grant cannot repeatedly favor the same worker.
 

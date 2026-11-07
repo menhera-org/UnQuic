@@ -968,6 +968,8 @@ impl Worker {
         }
         more |= budget == 0 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0);
         if self.sender.owner.is_some() {
+            // Apply local feedback before the shared owner considers fresh grants.
+            more |= self.flush_sender_messages(now)?;
             // Reports can have arrived after the worker turn's original timestamp.
             let observed = self.io_clock(now)()?;
             if let Some(owner) = &mut self.sender.owner {
