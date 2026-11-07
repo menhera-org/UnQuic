@@ -4738,3 +4738,25 @@ Release/default suites, Clippy, Rust 1.89 and formatting pass. All 23 library
 kernel tests and both runtime tests pass. The new handoff regression covers
 44 normal segments, 10000 one-byte segments, a following ordinary frame,
 bounded expansion, full input/return queues, quiesce and reservation return.
+
+## Wake ordering review and address-request continuation
+
+A source review found no classic empty-queue/rearm race in worker handoffs.
+Every successful SPSC push marks the destination for notification, and each
+worker writes those eventfds before sleeping. The eventfds use level-triggered
+readiness. After consuming a wake, the receiver drains queues before sleeping
+again; exhausting a worker-pair queue's 64-item budget requests another turn.
+A full outgoing queue can still wait for the existing 1 ms backpressure retry.
+
+The separate external address-request queue holds 1,024 entries, but its drain
+previously stopped after 64 without requesting another turn. When one consumed
+wake covered more than 64 peer updates, the remainder could wait for another
+event or timer. The drain now returns a continuation flag to the worker loop.
+A deterministic queue test covers empty, partial, exact-budget, over-budget and
+full-capacity batches using only that initial wake. This is a separate correctness
+fix; it does not explain the single-peer throughput or migration observations.
+
+Validation: 347 all-feature and 338 default-feature ordinary release tests,
+Clippy and formatting pass. All 73 library kernel checks and three runtime
+tests pass on Linux 6.8. The separate intermittent Linux 7 migration failure
+remains under investigation; this change does not claim to fix it.

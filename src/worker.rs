@@ -597,6 +597,21 @@ struct PeerControl {
     unsent: u64,
 }
 
+fn receive_address_requests(
+    requests: &mut Consumer<AddressRequest>,
+    controls: &mut [PeerControl],
+) -> bool {
+    for _ in 0..BATCH_SIZE {
+        let Some(request) = requests.try_pop() else {
+            return false;
+        };
+        debug_assert!(controls[request.peer].pending.is_none());
+        controls[request.peer].pending = Some(request);
+    }
+    // A coalesced wake can cover more than one bounded drain.
+    true
+}
+
 #[derive(Clone, Copy)]
 enum TxExpiry {
     Input,
@@ -1014,7 +1029,7 @@ impl Worker {
                 self.setup(now)?;
             }
             more |= self.distribute_receivers();
-            self.addresses(now)?;
+            more |= self.addresses(now)?;
             more |= self.service_sender(now)?;
             self.progress_barriers(now)?;
             self.timers(now)?;
@@ -1291,16 +1306,11 @@ impl Worker {
         Ok(())
     }
 
-    fn addresses(&mut self, now: Duration) -> io::Result<()> {
-        if let Some(requests) = &mut self.requests {
-            for _ in 0..BATCH_SIZE {
-                let Some(request) = requests.try_pop() else {
-                    break;
-                };
-                debug_assert!(self.peer_controls[request.peer].pending.is_none());
-                self.peer_controls[request.peer].pending = Some(request);
-            }
-        }
+    fn addresses(&mut self, now: Duration) -> io::Result<bool> {
+        let more = self
+            .requests
+            .as_mut()
+            .is_some_and(|requests| receive_address_requests(requests, &mut self.peer_controls));
         for peer in 0..self.peer_controls.len() {
             if let Some(request) = self.peer_controls[peer].pending {
                 let mut used = [false; 2];
@@ -1402,7 +1412,7 @@ impl Worker {
                 }
             }
         }
-        Ok(())
+        Ok(more)
     }
 
     fn install_receiver(&mut self, endpoint: usize, mut socket: ReceiveSocket) -> io::Result<()> {
@@ -4164,6 +4174,45 @@ fn transient(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coalesced_address_requests_continue_after_a_full_drain() {
+        use crate::spsc;
+        for count in [
+            0,
+            BATCH_SIZE - 1,
+            BATCH_SIZE,
+            BATCH_SIZE + 1,
+            spsc::CAPACITY,
+        ] {
+            let (mut producer, mut consumer) = spsc::channel();
+            let mut controls: Vec<_> = (0..count).map(|_| PeerControl::default()).collect();
+            let address = "[::1]:40001".parse().unwrap();
+            for peer in 0..count {
+                assert!(producer.try_push(AddressRequest { peer, address }).is_ok());
+            }
+            // One initial wake; further turns depend only on the continuation.
+            let mut more = true;
+            let mut turns = 0;
+            while more {
+                more = receive_address_requests(&mut consumer, &mut controls);
+                turns += 1;
+                assert!(turns <= count / BATCH_SIZE + 1);
+                let received = controls
+                    .iter()
+                    .filter(|control| control.pending.is_some())
+                    .count();
+                assert_eq!(received, count.min(turns * BATCH_SIZE));
+            }
+            assert_eq!(turns, count / BATCH_SIZE + 1);
+            assert!(consumer.try_pop().is_none());
+            for (peer, control) in controls.iter().enumerate() {
+                let request = control.pending.unwrap();
+                assert_eq!(request.peer, peer);
+                assert_eq!(request.address, address);
+            }
+        }
+    }
+
     #[test]
     fn socket_overflow_ignores_stale_samples_and_counts_forward_wrap() {
         let mut total = 10;
