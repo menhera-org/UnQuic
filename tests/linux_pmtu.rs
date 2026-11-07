@@ -276,9 +276,13 @@ fn routed_mtu(
         }
         assert!(
             Instant::now() < deadline,
-            "MTU {mtu} did not converge: {:?} / {:?}",
-            runtimes[0].control.session_counters(0),
-            runtimes[1].control.session_counters(0)
+            "MTU {mtu} did not converge: {:?}",
+            runtimes
+                .iter()
+                .map(|runtime| (1..=2)
+                    .map(|lane| runtime.control.transmit_lane_counters(0, lane))
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>()
         );
         std::thread::sleep(Duration::from_millis(20));
     }

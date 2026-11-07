@@ -15,8 +15,10 @@ No workload proves a universal plateau or the theoretical CPU ceiling.
 
 Neither the local **20 Gbit/s in each direction** gate nor the real
 **5 Gbit/s under loss** gate has passed. Runtime recovery and congestion control
-remain unfinished. The pure draft-07 controller has deterministic model and
-allocation tests, but is not active in the daemon and establishes no throughput gain. PMTU discovery is active in the latest rate sweeps and
+remain unfinished. Workers now use the shared draft-07 controller and grant
+accounting, but this integration has no matched throughput sweep yet.
+General application-limited detection and payload repair remain open.
+PMTU discovery is active in the latest rate sweeps and
 passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
 Missing recovery or congestion control does not explain away the remaining
 scheduling and admission problems.
@@ -57,6 +59,53 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## Sender integration verification (November 7)
+
+DATA, PMTU and liveness probes now request shared pacing/window grants.
+The earlier throughput tables measured the runtime before this integration;
+they do not measure its cost.
+
+Initial release integration tests exposed small-burst stalls: one run delivered
+18 of 32 frames before the remaining sender frames expired. Admission pressure,
+socket overflow and worker queue drops were zero in that observation.
+Code inspection and targeted regressions found that blocked PMTU requests could
+retain a worker's sole flight buffer, and held ordinary requests could prevent
+PTO probes from running. The owner now returns blocked PMTU requests and preempts
+ungranted ordinary work when dispatching a PTO probe. Tests also cover partial
+commit continuation, bounded ACK processing, control packets overtaking deferred
+DATA, and connection-generation changes. These fixes close specific scheduling
+defects; they do not establish an overload plateau.
+
+The release runtime test now passes its 512-frame burst/USO allocation checks,
+a ten-second mixed-frame storm and reconnection. One storm observation injected
+1,294,336 frames each way and received 475,906 / 522,958, with no payload
+corruption or duplicate delivery. Worker queue-drop counters were
+181,796 / 176,203. This is a correctness stress test with mixed frame lengths,
+not a controlled goodput or CPU measurement; its losses remain substantial.
+No before/after rate-sweep or CPU improvement is claimed.
+
+The foreign-rename/namespace-move test also passes after waiting for new-generation
+ACK progress. In one release run that took 5.35 seconds after carrier returned:
+the unchanged path group retains PTO backoff after the remote daemon's outage.
+The test bounds this wait and then checks both frame sizes in both directions.
+A new handshake does not itself reset congestion or PTO state.
+
+Routed discovery also exposed a probe-sizing deadlock after silent MTU reduction:
+a 5140-byte candidate fit the pacing burst but exceeded the 5120-byte congestion
+window. It could never receive permission to send. Candidates now fit both the
+burst and the total window, without raising the confirmed DATA limit. A regression
+reproduces this exact mismatch and verifies that the resized probe receives a grant.
+The release routed test then passed 9000 → 1500 → 1280 → 9000, including
+returned and filtered PTB, the normal upward retry and no outer fragmentation.
+Default and all-feature release suites, kernel regressions, Clippy and the
+Rust 1.89 compatibility check pass. These checks establish correctness for the
+tested cases, not a throughput improvement.
+
+Controlled release rate sweeps, unlimited-load profiling, complete loss-before-PTO
+ordering, general application-limited detection and runtime payload repair remain
+required. Grant issuance, expiry and cancellation counters now distinguish send
+permission failures from admission pressure, queue drops and socket overflow.
 
 ## Bounded transmit expiry (November 6)
 

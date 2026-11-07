@@ -126,6 +126,12 @@ metrics! {
     feedback_delay_ns: max,
     /// Current pacing rate in outer IP bytes per second.
     pacing_bytes_per_second: sum,
+    /// Issued send permissions received by transmit workers.
+    send_grants: sum,
+    /// Send permissions rejected after their submission interval elapsed.
+    expired_grants: sum,
+    /// Send permissions canceled by a changed plan, path or connection.
+    cancelled_grants: sum,
     /// Currently charged outer IP bytes in flight.
     bytes_in_flight: sum,
     /// Current outer IP size ceiling; consult path_mtu_state for its basis.

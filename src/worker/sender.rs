@@ -1,0 +1,1320 @@
+//! TX-owner histories and reserved cross-worker sender messages.
+use super::*;
+use crate::{
+    ack::{AckProgress, History, OutstandingScan},
+    loss::Rtt,
+    pacing::{Flight, PacketId},
+    wire::{AckRange, AckRanges, MAX_ACK_RANGES},
+};
+use std::num::NonZeroU16;
+
+mod history;
+mod owner;
+#[cfg(test)]
+mod tests;
+mod timers;
+use owner::{Owner, Request};
+
+const ACK_BUFFERS: usize = 4;
+
+pub(crate) struct Ack {
+    origin: usize,
+    session: usize,
+    tag: u128,
+    lane: u16,
+    received: Duration,
+    delay_us: u32,
+    count: usize,
+    ranges: [AckRange; MAX_ACK_RANGES],
+}
+
+impl Ack {
+    fn new(origin: usize) -> Self {
+        Self {
+            origin,
+            session: 0,
+            tag: 0,
+            lane: 0,
+            received: Duration::ZERO,
+            delay_us: 0,
+            count: 0,
+            ranges: [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct Entry {
+    number: u64,
+    sample: Option<NonZeroU16>,
+    settled: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ReportKind {
+    Ack {
+        received: Duration,
+        delay_us: u32,
+        first: bool,
+        end: Option<AckProgress>,
+    },
+    Loss,
+    Retire,
+}
+
+/// Independent of send completions: frozen feedback cannot consume their storage.
+pub(crate) struct Report {
+    origin: usize,
+    group: usize,
+    id: PacketId,
+    kind: ReportKind,
+    count: usize,
+    entries: [Entry; BATCH_SIZE],
+}
+
+impl Report {
+    fn new(origin: usize) -> Self {
+        Self {
+            origin,
+            group: 0,
+            id: PacketId::default(),
+            kind: ReportKind::Retire,
+            count: 0,
+            entries: [Entry::default(); BATCH_SIZE],
+        }
+    }
+}
+
+pub(crate) enum Message {
+    Ack(Box<Ack>),
+    AckReturn(Box<Ack>),
+    Request(Request),
+    Permit(Box<Flight>),
+    Complete(Box<Flight>),
+    Recycle(Box<Flight>),
+    Resize {
+        flight: Box<Flight>,
+        payload: usize,
+    },
+    Report(Box<Report>),
+    ReportReturn(Box<Report>),
+    Probe {
+        group: usize,
+        epoch: u64,
+        session: usize,
+        generation: u64,
+        lane: u16,
+        count: u8,
+    },
+    ProbeReturn {
+        group: usize,
+        epoch: u64,
+        count: u8,
+    },
+    Lost {
+        group: usize,
+        epoch: u64,
+        before: Duration,
+    },
+    ProbeReplied {
+        group: usize,
+    },
+    Reclaim,
+}
+
+pub(super) struct Lane {
+    pub(super) session: usize,
+    pub(super) lane: u16,
+    pub(super) group: usize,
+    pub(super) history: History,
+    pub(super) generation: u64,
+    pub(super) rtt: Rtt,
+    pub(super) largest_ack: u64,
+    pub(super) scan: Option<OutstandingScan>,
+    pub(super) loss_due: Option<Duration>,
+    pub(super) scan_due: Option<Duration>,
+    pub(super) forced_before: Option<Duration>,
+    pub(super) scan_cutoff: Option<Duration>,
+    pub(super) ack: Option<Box<Ack>>,
+    pub(super) ack_first: bool,
+    pub(super) report_pending: bool,
+    pub(super) probes: [Option<(u64, u16)>; 2],
+}
+
+impl Lane {
+    fn new(session: usize, lane: u16, group: usize) -> io::Result<Self> {
+        Ok(Self {
+            session,
+            lane,
+            group,
+            history: History::new().map_err(io::Error::other)?,
+            generation: 0,
+            rtt: Rtt::new(),
+            largest_ack: 0,
+            scan: None,
+            loss_due: None,
+            scan_due: None,
+            forced_before: None,
+            scan_cutoff: None,
+            ack: None,
+            ack_first: true,
+            report_pending: false,
+            probes: [None; 2],
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum JobKind {
+    Data,
+    Probe { length: usize, pmtu: bool },
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Job {
+    pub(super) session: usize,
+    pub(super) generation: u64,
+    pub(super) lane: usize,
+    pub(super) path: usize,
+    pub(super) first: u64,
+    pub(super) count: usize,
+    pub(super) deadline: Duration,
+    pub(super) kind: JobKind,
+}
+
+pub(super) struct State {
+    pub(super) owner: Option<Owner>,
+    pub(super) fresh: Vec<bool>,
+    reclaim: Option<usize>,
+    pub(super) permitted: bool,
+    pub(super) probes: Vec<Option<(u64, PacketId, u8)>>,
+    pub(super) losses: Vec<Option<(u64, Duration, usize)>>,
+    pub(super) offsets: Vec<usize>,
+    pub(super) lanes: Vec<Lane>,
+    pub(super) cursor: usize,
+    pub(super) flight: Option<Box<Flight>>,
+    pub(super) job: Option<Job>,
+    pub(super) report: Option<Box<Report>>,
+    #[allow(clippy::vec_box)]
+    pub(super) ack_free: Vec<Box<Ack>>,
+    pub(super) incoming: VecDeque<Box<Ack>>,
+    pub(super) outgoing: VecDeque<(usize, Message)>,
+}
+
+impl State {
+    pub(super) fn new(
+        config: &crate::config::Validated,
+        workers: usize,
+        id: usize,
+    ) -> io::Result<Self> {
+        let mut offsets = Vec::new();
+        offsets
+            .try_reserve_exact(config.config().sessions.len() + 1)
+            .map_err(io::Error::other)?;
+        offsets.push(0);
+        for session in 0..config.config().sessions.len() {
+            let peer = config
+                .peer_for_session(session)
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            let count = (id..config.config().peers[peer].tx_lanes)
+                .step_by(workers)
+                .count();
+            let next = offsets
+                .last()
+                .copied()
+                .unwrap_or(0usize)
+                .checked_add(count)
+                .ok_or(io::ErrorKind::OutOfMemory)?;
+            offsets.push(next);
+        }
+        let count = offsets.last().copied().unwrap_or(0);
+        let mut lanes = Vec::new();
+        lanes.try_reserve_exact(count).map_err(io::Error::other)?;
+        for session in 0..config.config().sessions.len() {
+            let peer = config
+                .peer_for_session(session)
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            let group = config
+                .path_group_for_peer(peer)
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            for lane in (id..config.config().peers[peer].tx_lanes).step_by(workers) {
+                lanes.push(Lane::new(session, lane as u16 + 1, group)?);
+            }
+        }
+        let mut ack_free = Vec::new();
+        ack_free
+            .try_reserve_exact(ACK_BUFFERS)
+            .map_err(io::Error::other)?;
+        for _ in 0..ACK_BUFFERS {
+            ack_free.push(boxed(Ack::new(id))?);
+        }
+        let mut incoming = VecDeque::new();
+        incoming
+            .try_reserve_exact(workers * ACK_BUFFERS)
+            .map_err(io::Error::other)?;
+        let mut outgoing = VecDeque::new();
+        outgoing
+            .try_reserve_exact(workers * (ACK_BUFFERS + 4))
+            .map_err(io::Error::other)?;
+        let mut probes = Vec::new();
+        probes
+            .try_reserve_exact(config.path_groups())
+            .map_err(io::Error::other)?;
+        probes.resize(config.path_groups(), None);
+        let mut losses = Vec::new();
+        losses
+            .try_reserve_exact(config.path_groups())
+            .map_err(io::Error::other)?;
+        losses.resize(config.path_groups(), None);
+        Ok(Self {
+            fresh: {
+                let mut fresh = Vec::new();
+                fresh
+                    .try_reserve_exact(config.path_groups())
+                    .map_err(io::Error::other)?;
+                fresh.resize(config.path_groups(), false);
+                fresh
+            },
+            reclaim: None,
+            owner: None,
+            permitted: false,
+            probes,
+            losses,
+            offsets,
+            lanes,
+            cursor: 0,
+            flight: None,
+            job: None,
+            report: Some(boxed(Report::new(id))?),
+            ack_free,
+            incoming,
+            outgoing,
+        })
+    }
+
+    fn lane_index(&self, session: usize, lane: usize, workers: usize, id: usize) -> Option<usize> {
+        if lane % workers != id {
+            return None;
+        }
+        let index = self.offsets.get(session)?.checked_add(lane / workers)?;
+        (index < *self.offsets.get(session + 1)?).then_some(index)
+    }
+
+    fn queue(&mut self, worker: usize, message: Message) -> io::Result<()> {
+        if self.outgoing.len() == self.outgoing.capacity() {
+            return Err(io::Error::other("sender message storage exhausted"));
+        }
+        self.outgoing.push_back((worker, message));
+        Ok(())
+    }
+}
+
+fn boxed<T>(value: T) -> io::Result<Box<T>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(1).map_err(io::Error::other)?;
+    values.push(value);
+    let array: Box<[T; 1]> = values
+        .into_boxed_slice()
+        .try_into()
+        .map_err(|_| io::Error::other("invalid sender allocation"))?;
+    // SAFETY: a one-element array has the same layout and alignment as T.
+    Ok(unsafe { Box::from_raw(Box::into_raw(array).cast::<T>()) })
+}
+
+impl Worker {
+    pub(super) fn incoming_ack(
+        &mut self,
+        session: usize,
+        tag: u128,
+        lane: u16,
+        delay_us: u32,
+        ranges: AckRanges<'_>,
+        received: Duration,
+    ) -> io::Result<()> {
+        if lane == 0 || usize::from(lane) > self.sessions[session].tx.len() {
+            return Ok(());
+        }
+        let Some(mut ack) = self.sender.ack_free.pop() else {
+            self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
+            self.sessions[session].totals.queue_drops =
+                self.sessions[session].totals.queue_drops.wrapping_add(1);
+            return Ok(());
+        };
+        ack.session = session;
+        ack.tag = tag;
+        ack.lane = lane;
+        ack.delay_us = delay_us;
+        ack.received = received;
+        ack.count = ranges.len();
+        for (slot, range) in ack.ranges.iter_mut().zip(ranges.iter()) {
+            *slot = range;
+        }
+        let owner = (usize::from(lane) - 1) % self.shared.workers();
+        if owner == self.id {
+            self.sender.incoming.push_back(ack);
+        } else {
+            self.sender.queue(owner, Message::Ack(ack))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn return_ack(&mut self, ack: Box<Ack>) -> io::Result<()> {
+        if ack.origin == self.id {
+            self.sender.ack_free.push(ack);
+        } else {
+            self.sender.queue(ack.origin, Message::AckReturn(ack))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn begin_sender_ack(&mut self) -> io::Result<()> {
+        for _ in 0..self.sender.incoming.len().min(BATCH_SIZE) {
+            let Some(ack) = self.sender.incoming.pop_front() else {
+                break;
+            };
+            if !self.matches(ack.session, ack.tag) {
+                self.return_ack(ack)?;
+                continue;
+            }
+            let Some(index) = self.sender.lane_index(
+                ack.session,
+                usize::from(ack.lane) - 1,
+                self.shared.workers(),
+                self.id,
+            ) else {
+                self.return_ack(ack)?;
+                continue;
+            };
+            let Some(lane) = self.sender.lanes.get_mut(index) else {
+                return Err(io::Error::other("missing sender lane"));
+            };
+            if lane.ack.is_some() || lane.report_pending {
+                self.sender.incoming.push_back(ack);
+                continue;
+            }
+            if let Err(ack) = lane.begin_ack(ack) {
+                self.return_ack(ack)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl State {
+    pub(super) fn storage_bytes(
+        config: &crate::config::Validated,
+        workers: usize,
+    ) -> Option<usize> {
+        let descriptors = descriptors(config).ok()?;
+        let lanes = descriptors.len();
+        let groups = config.path_groups();
+        let per_worker = (config.config().sessions.len() + 1)
+            .checked_mul(size_of::<usize>())?
+            .checked_add(ACK_BUFFERS * (size_of::<Ack>() + size_of::<Box<Ack>>()))?
+            .checked_add(size_of::<Report>())?
+            .checked_add(workers.checked_mul(ACK_BUFFERS * size_of::<Box<Ack>>())?)?
+            .checked_add(
+                (workers * (ACK_BUFFERS + 4))
+                    .next_power_of_two()
+                    .checked_mul(size_of::<(usize, Message)>())?,
+            )?
+            .checked_add(groups.checked_mul(
+                size_of::<Option<(u64, PacketId, u8)>>()
+                    + size_of::<Option<(u64, Duration, usize)>>()
+                    + size_of::<bool>(),
+            )?)?;
+        workers
+            .checked_mul(per_worker)?
+            .checked_add(lanes.checked_mul(
+                size_of::<Lane>() + History::storage_bytes() - size_of::<History>(),
+            )?)?
+            .checked_add(if groups == 0 || descriptors.is_empty() {
+                0
+            } else {
+                Owner::storage_bytes(groups, workers, &descriptors)?
+            })
+    }
+}
+
+fn descriptors(config: &crate::config::Validated) -> io::Result<Vec<(usize, u16, usize)>> {
+    let count = (0..config.config().sessions.len())
+        .try_fold(0usize, |total, session| {
+            total.checked_add(
+                config
+                    .config()
+                    .peers
+                    .get(config.peer_for_session(session)?)?
+                    .tx_lanes,
+            )
+        })
+        .ok_or(io::ErrorKind::OutOfMemory)?;
+    let mut descriptors = Vec::new();
+    descriptors
+        .try_reserve_exact(count)
+        .map_err(io::Error::other)?;
+    for session in 0..config.config().sessions.len() {
+        let peer = config
+            .peer_for_session(session)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        let group = config
+            .path_group_for_peer(peer)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        for lane in 1..=config.config().peers[peer].tx_lanes {
+            descriptors.push((session, lane as u16, group));
+        }
+    }
+    Ok(descriptors)
+}
+
+impl Worker {
+    pub(crate) fn init_senders(workers: &mut [Self]) -> io::Result<()> {
+        let first = workers.first().ok_or(io::ErrorKind::InvalidInput)?;
+        let groups = first.shared.config.path_groups();
+        if groups == 0 {
+            return Ok(());
+        }
+        let descriptors = descriptors(&first.shared.config)?;
+        if descriptors.is_empty() {
+            return Ok(());
+        }
+        let (owner, flights) = Owner::new(groups, workers.len(), &descriptors)?;
+        for (worker, flight) in workers.iter_mut().zip(flights.into_vec()) {
+            worker.sender.flight = Some(flight);
+        }
+        workers
+            .first_mut()
+            .ok_or(io::ErrorKind::InvalidInput)?
+            .sender
+            .owner = Some(owner);
+        Ok(())
+    }
+
+    pub(super) fn sender_enabled(&self) -> bool {
+        #[cfg(test)]
+        if self.unpaced_fixture {
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn sender_index(&self, session: usize, lane: usize) -> io::Result<usize> {
+        self.sender
+            .lane_index(session, lane, self.shared.workers(), self.id)
+            .ok_or_else(|| io::Error::other("transmit history on the wrong worker"))
+    }
+
+    pub(super) fn sender_message(&mut self, message: Message, now: Duration) -> io::Result<()> {
+        match message {
+            Message::Ack(ack) => {
+                if self.sender.incoming.len() == self.sender.incoming.capacity() {
+                    return Err(io::Error::other("duplicate incoming ACK buffer"));
+                }
+                self.sender.incoming.push_back(ack);
+            }
+            Message::AckReturn(ack) => {
+                if ack.origin != self.id || self.sender.ack_free.len() == ACK_BUFFERS {
+                    return Err(io::Error::other("invalid returned ACK buffer"));
+                }
+                self.sender.ack_free.push(ack);
+            }
+            Message::Request(request) => self
+                .sender
+                .owner
+                .as_mut()
+                .ok_or(io::ErrorKind::InvalidData)?
+                .request(request)?,
+            Message::Complete(flight) => self
+                .sender
+                .owner
+                .as_mut()
+                .ok_or(io::ErrorKind::InvalidData)?
+                .complete(flight)?,
+            Message::Report(report) => self
+                .sender
+                .owner
+                .as_mut()
+                .ok_or(io::ErrorKind::InvalidData)?
+                .report(report)?,
+            Message::Permit(flight) => {
+                self.counters.send_grants = self.counters.send_grants.wrapping_add(1);
+                if let Some(job) = self.sender.job {
+                    let local = &mut self.sessions[job.session];
+                    local.totals.send_grants = local.totals.send_grants.wrapping_add(1);
+                    local.tx_totals[job.lane].send_grants =
+                        local.tx_totals[job.lane].send_grants.wrapping_add(1);
+                    local.tx_dirty |= 1_u64 << job.lane;
+                }
+                if self.sender.flight.is_some() || self.sender.job.is_none() {
+                    return Err(io::Error::other("unexpected send permission"));
+                }
+                self.sender.flight = Some(flight);
+                self.sender.permitted = true;
+            }
+            Message::Resize { flight, payload } => {
+                if let Some(job) = self.sender.job
+                    && let JobKind::Probe { pmtu: true, .. } = job.kind
+                {
+                    let peer = self
+                        .shared
+                        .config
+                        .peer_for_session(job.session)
+                        .ok_or(io::ErrorKind::InvalidInput)?;
+                    self.transmit[peer].paths[job.path].lanes[job.lane]
+                        .mtu
+                        .limit_probe(payload, now);
+                }
+                self.sender_message(Message::Recycle(flight), now)?;
+            }
+            Message::Recycle(flight) => {
+                if self.sender.flight.is_some() {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                if let Some(job) = self.sender.job.take() {
+                    if matches!(job.kind, JobKind::Probe { pmtu: true, .. })
+                        && flight.completion().is_none_or(|(sent, _, _)| sent == 0)
+                    {
+                        let peer = self
+                            .shared
+                            .config
+                            .peer_for_session(job.session)
+                            .ok_or(io::ErrorKind::InvalidInput)?;
+                        self.transmit[peer].paths[job.path].lanes[job.lane]
+                            .mtu
+                            .defer(now);
+                    }
+                    // A rejected request still owns the packet-number reservations.
+                    let index = self.sender_index(job.session, job.lane)?;
+                    for offset in 0..job.count {
+                        self.sender.lanes[index]
+                            .history
+                            .cancel(job.first + offset as u64);
+                    }
+                    if let Some(batch) = self.sessions[job.session].batches[job.lane].as_mut()
+                        && batch.plan.packet(0).is_some_and(|p| p.number == job.first)
+                    {
+                        batch.compact();
+                    }
+                }
+                self.sender.flight = Some(flight);
+                self.sender.permitted = false;
+            }
+            Message::ReportReturn(report) => {
+                if self.sender.report.is_some() {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                let index =
+                    self.sender_index(report.id.session, usize::from(report.id.lane) - 1)?;
+                let ack = self.sender.lanes[index].report_completed(&report)?;
+                if matches!(report.kind, ReportKind::Ack { end: None, .. }) {
+                    self.sender.cursor = index;
+                }
+                if let Some(ack) = ack {
+                    self.return_ack(ack)?;
+                }
+                self.sender.report = Some(report);
+            }
+            Message::ProbeReturn {
+                group,
+                epoch,
+                count,
+            } => self
+                .sender
+                .owner
+                .as_mut()
+                .ok_or(io::ErrorKind::InvalidData)?
+                .return_probe(group, epoch, count)?,
+            Message::Lost {
+                group,
+                epoch,
+                before,
+            } => {
+                let loss = self
+                    .sender
+                    .losses
+                    .get_mut(group)
+                    .ok_or(io::ErrorKind::InvalidInput)?;
+                if loss.is_none_or(|(old, _, _)| epoch > old) {
+                    *loss = Some((epoch, before, 0));
+                }
+            }
+            Message::Probe {
+                group,
+                epoch,
+                session,
+                generation,
+                lane,
+                count,
+            } => {
+                let probe = self
+                    .sender
+                    .probes
+                    .get_mut(group)
+                    .ok_or(io::ErrorKind::InvalidInput)?;
+                *probe = Some((
+                    epoch,
+                    PacketId {
+                        session,
+                        generation,
+                        lane,
+                        number: 0,
+                    },
+                    count,
+                ));
+            }
+            Message::Reclaim => self.sender.reclaim = Some(self.sender.lanes.len()),
+            Message::ProbeReplied { group } => self
+                .sender
+                .owner
+                .as_mut()
+                .ok_or(io::ErrorKind::InvalidData)?
+                .probe_replied(group)?,
+        }
+        let _ = now;
+        Ok(())
+    }
+
+    pub(super) fn flush_sender_messages(&mut self, now: Duration) -> io::Result<bool> {
+        let mut progress = false;
+        for _ in 0..self.sender.outgoing.len().min(BATCH_SIZE) {
+            let Some((worker, message)) = self.sender.outgoing.pop_front() else {
+                break;
+            };
+            if worker == self.id {
+                self.sender_message(message, now)?;
+                progress = true;
+            } else {
+                match self.push(worker, Event::Sender(message)) {
+                    Ok(()) => progress = true,
+                    Err(Event::Sender(message)) => {
+                        self.sender.outgoing.push_back((worker, message));
+                    }
+                    Err(_) => return Err(io::ErrorKind::InvalidData.into()),
+                }
+            }
+        }
+        Ok(progress)
+    }
+
+    pub(super) fn service_sender(&mut self, now: Duration) -> io::Result<bool> {
+        if !self.sender_enabled() {
+            return Ok(false);
+        }
+        let mut more = self.flush_sender_messages(now)?;
+        self.begin_sender_ack()?;
+        for group in 0..self.sender.fresh.len() {
+            if self.sender.fresh[group]
+                && self.sender.outgoing.len()
+                    < self
+                        .sender
+                        .outgoing
+                        .capacity()
+                        .saturating_sub(6 * self.shared.workers())
+            {
+                self.sender.queue(0, Message::ProbeReplied { group })?;
+                self.sender.fresh[group] = false;
+            }
+        }
+        let mut budget = BATCH_SIZE;
+        for group in 0..self.sender.losses.len() {
+            let Some((_, before, cursor)) = &mut self.sender.losses[group] else {
+                continue;
+            };
+            while budget != 0 && *cursor < self.sender.lanes.len() {
+                let lane = &mut self.sender.lanes[*cursor];
+                if lane.group == group {
+                    lane.force_loss(*before);
+                }
+                *cursor += 1;
+                budget -= 1;
+            }
+            if *cursor == self.sender.lanes.len() {
+                self.sender.losses[group] = None;
+            }
+            if budget == 0 {
+                more = true;
+                break;
+            }
+        }
+        for _ in 0..self.sender.lanes.len().min(BATCH_SIZE) {
+            if budget == 0 {
+                more = true;
+                break;
+            }
+            let Some(mut report) = self.sender.report.take() else {
+                break;
+            };
+            let index = self.sender.cursor;
+            self.sender.cursor = (index + 1) % self.sender.lanes.len();
+            let lane = &mut self.sender.lanes[index];
+            if self.sessions[lane.session].connection.is_none() {
+                lane.force_loss(now);
+            }
+            let quiescing = self.sessions[lane.session].connection.is_none();
+            let retire = quiescing || self.sender.reclaim.is_some();
+            let produced = lane.advance_report(&mut report, now, &mut budget)?
+                || (retire && lane.retire_report(&mut report, &mut budget)?);
+            if lane.ack.is_some() {
+                self.sender.cursor = index;
+            }
+            more |= lane.work_pending(now) || (quiescing && !lane.idle());
+            if retire && !lane.report_pending {
+                self.sender.reclaim = self
+                    .sender
+                    .reclaim
+                    .and_then(|left| left.checked_sub(1).filter(|&n| n != 0));
+            }
+            if produced {
+                self.sender.queue(0, Message::Report(report))?;
+                more = true;
+            } else {
+                budget = budget.saturating_sub(1);
+                self.sender.report = Some(report);
+            }
+        }
+        if self.sender.owner.is_some() {
+            // Reports can have arrived after the worker turn's original timestamp.
+            let observed = self.io_clock(now)()?;
+            if let Some(owner) = &mut self.sender.owner {
+                more |= owner.advance(observed, &mut self.sender.outgoing)?;
+            }
+        }
+        more |= self.flush_sender_messages(now)?;
+        if self.sender.permitted {
+            self.use_sender_permit(now)?;
+            more = true;
+        }
+        if self.sender.job.is_none() && self.sender.flight.is_some() {
+            for group in 0..self.sender.probes.len() {
+                if let Some((epoch, id, count)) = self.sender.probes[group] {
+                    let installed = self.sessions.get(id.session).and_then(|s| s.installed);
+                    if installed
+                        .is_some_and(|c| c.generation == id.generation && c.connection.is_some())
+                    {
+                        self.request_probe(
+                            id.session,
+                            usize::from(id.lane) - 1,
+                            BASE_UDP_PAYLOAD,
+                            false,
+                            Some(epoch),
+                            now,
+                        )?;
+                        if self.sender.job.is_some() {
+                            self.sender.probes[group] =
+                                (count > 1).then_some((epoch, id, count - 1));
+                        }
+                    } else if self.sender.outgoing.len()
+                        < self
+                            .sender
+                            .outgoing
+                            .capacity()
+                            .saturating_sub(6 * self.shared.workers())
+                    {
+                        self.sender.queue(
+                            0,
+                            Message::ProbeReturn {
+                                group,
+                                epoch,
+                                count,
+                            },
+                        )?;
+                        self.sender.probes[group] = None;
+                        more = true;
+                    } else {
+                        more = true;
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(more)
+    }
+
+    pub(super) fn sender_idle(&self, session: usize) -> bool {
+        if !self.sender_enabled() {
+            return true;
+        }
+        if self.sender.job.is_some_and(|job| job.session == session) {
+            return false;
+        }
+        let Some((&first, &end)) = self
+            .sender
+            .offsets
+            .get(session)
+            .zip(self.sender.offsets.get(session + 1))
+        else {
+            return false;
+        };
+        self.sender.lanes[first..end].iter().all(Lane::idle)
+    }
+
+    pub(super) fn install_sender(
+        &mut self,
+        session: usize,
+        generation: u64,
+        active: bool,
+    ) -> io::Result<()> {
+        if !self.sender_enabled() {
+            return Ok(());
+        }
+        let (&first, &end) = self
+            .sender
+            .offsets
+            .get(session)
+            .zip(self.sender.offsets.get(session + 1))
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        for lane in &mut self.sender.lanes[first..end] {
+            lane.install(generation)?;
+        }
+        if active && let Some(owner) = &mut self.sender.owner {
+            owner.timers.install(session, generation)?;
+        }
+        Ok(())
+    }
+}
+
+impl Worker {
+    pub(super) fn request_batch(
+        &mut self,
+        session: usize,
+        lane: usize,
+        batch: &TxBatch,
+        deadline: Duration,
+        mtu: usize,
+    ) -> io::Result<()> {
+        if self.sender.job.is_some() || self.sender.flight.is_none() {
+            return Ok(());
+        }
+        let index = self.sender_index(session, lane)?;
+        let generation = self.sessions[session]
+            .installed
+            .ok_or(io::ErrorKind::InvalidData)?
+            .generation;
+        let mut packets = [pacing::Planned::default(); BATCH_SIZE];
+        let mut count = 0;
+        for (ordinal, planned) in packets.iter_mut().take(batch.plan.len()).enumerate() {
+            let packet = batch
+                .plan
+                .packet(ordinal)
+                .ok_or(io::ErrorKind::InvalidData)?;
+            match self.sender.lanes[index].history.reserve(
+                packet.number,
+                (packet.length + 48) as u16,
+                true,
+                true,
+            ) {
+                Ok(()) => {}
+                Err(crate::ack::HistoryError::Full) => {
+                    self.sender.reclaim = Some(self.sender.lanes.len());
+                    break;
+                }
+                Err(error) => return Err(io::Error::other(error)),
+            }
+            *planned = pacing::Planned {
+                id: PacketId {
+                    session,
+                    generation,
+                    lane: lane as u16 + 1,
+                    number: packet.number,
+                },
+                bytes: (packet.length + 48) as u16,
+            };
+            count += 1;
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let mut flight = self
+            .sender
+            .flight
+            .take()
+            .ok_or(io::ErrorKind::InvalidData)?;
+        flight
+            .prepare(&packets[..count])
+            .map_err(io::Error::other)?;
+        self.sender.job = Some(Job {
+            session,
+            generation,
+            lane,
+            path: self.sessions[session].path,
+            first: packets[0].id.number,
+            count,
+            deadline,
+            kind: JobKind::Data,
+        });
+        self.sender.queue(
+            0,
+            Message::Request(Request {
+                flight,
+                group: self.sender.lanes[index].group,
+                deadline,
+                probe: None,
+                pmtu: false,
+                mtu: (mtu + 48).max(1280) as u16,
+            }),
+        )
+    }
+
+    pub(super) fn request_probe(
+        &mut self,
+        session: usize,
+        lane: usize,
+        length: usize,
+        pmtu: bool,
+        probe: Option<u64>,
+        now: Duration,
+    ) -> io::Result<()> {
+        if self.sender.job.is_some() || self.sender.flight.is_none() {
+            return Ok(());
+        }
+        let index = self.sender_index(session, lane)?;
+        let local = self
+            .sessions
+            .get_mut(session)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        let Some(generation) = local
+            .installed
+            .filter(|_| local.connection.is_some())
+            .map(|c| c.generation)
+        else {
+            return Ok(());
+        };
+        let mut prefix = [0; wire::PROBE_PREFIX_LEN];
+        let Some(tx) = local.tx.get_mut(lane).and_then(Option::as_mut) else {
+            return Ok(());
+        };
+        let piece = tx.probe(length, &mut prefix).map_err(io::Error::other)?;
+        match self.sender.lanes[index].history.reserve(
+            piece.packet.number,
+            (length + 48) as u16,
+            true,
+            true,
+        ) {
+            Ok(()) => {}
+            Err(crate::ack::HistoryError::Full) => {
+                self.sender.reclaim = Some(self.sender.lanes.len());
+                return Ok(());
+            }
+            Err(error) => return Err(io::Error::other(error)),
+        }
+        let mut flight = self
+            .sender
+            .flight
+            .take()
+            .ok_or(io::ErrorKind::InvalidData)?;
+        flight
+            .prepare(&[pacing::Planned {
+                id: PacketId {
+                    session,
+                    generation,
+                    lane: lane as u16 + 1,
+                    number: piece.packet.number,
+                },
+                bytes: (length + 48) as u16,
+            }])
+            .map_err(io::Error::other)?;
+        let peer = self
+            .shared
+            .config
+            .peer_for_session(session)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        let mtu = (self.transmit[peer].paths[local.path].lanes[lane]
+            .mtu
+            .payload_limit()
+            + 48)
+            .max(1280);
+        let deadline = now.saturating_add(Duration::from_millis(100));
+        self.sender.job = Some(Job {
+            session,
+            generation,
+            lane,
+            path: local.path,
+            first: piece.packet.number,
+            count: 1,
+            deadline,
+            kind: JobKind::Probe { length, pmtu },
+        });
+        self.sender.queue(
+            0,
+            Message::Request(Request {
+                flight,
+                group: self.sender.lanes[index].group,
+                deadline,
+                probe,
+                pmtu,
+                mtu: mtu as u16,
+            }),
+        )
+    }
+
+    pub(super) fn finish_sender_send(
+        &mut self,
+        count: usize,
+        at: Option<Duration>,
+        host_limited: bool,
+    ) -> io::Result<()> {
+        let job = self.sender.job.ok_or(io::ErrorKind::InvalidData)?;
+        let index = self.sender_index(job.session, job.lane)?;
+        let mut flight = self
+            .sender
+            .flight
+            .take()
+            .ok_or(io::ErrorKind::InvalidData)?;
+        for offset in 0..job.count {
+            let number = job.first + offset as u64;
+            if offset < count {
+                if !self.sender.lanes[index].submitted(
+                    number,
+                    at.ok_or(io::ErrorKind::InvalidData)?,
+                    flight.handle(offset),
+                ) {
+                    return Err(io::Error::other("submitted packet has no reservation"));
+                }
+            } else {
+                self.sender.lanes[index].history.cancel(number);
+            }
+        }
+        flight
+            .complete(count, at, host_limited || count < flight.packets().len())
+            .map_err(io::Error::other)?;
+        self.sender.permitted = false;
+        self.sender.queue(0, Message::Complete(flight))
+    }
+
+    pub(super) fn rejected_sender_grant(&mut self, session: usize, lane: usize, expired: bool) {
+        let local = &mut self.sessions[session];
+        local.tx_dirty |= 1_u64 << lane;
+        for counters in [
+            &mut self.counters,
+            &mut local.totals,
+            &mut local.tx_totals[lane],
+        ] {
+            let count = if expired {
+                &mut counters.expired_grants
+            } else {
+                &mut counters.cancelled_grants
+            };
+            *count = count.wrapping_add(1);
+        }
+    }
+
+    pub(super) fn use_sender_permit(&mut self, now: Duration) -> io::Result<()> {
+        let now = self.io_clock(now)()?;
+        let job = self.sender.job.ok_or(io::ErrorKind::InvalidData)?;
+        let local = self
+            .sessions
+            .get(job.session)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let grant = self
+            .sender
+            .flight
+            .as_ref()
+            .and_then(|f| f.grant())
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let index = self.sender_index(job.session, job.lane)?;
+        if job.first <= self.sender.lanes[index].history.highest_sent()
+            || now >= job.deadline
+            || !grant.valid_at(now)
+            || local.connection.is_none()
+            || local.path != job.path
+            || local
+                .installed
+                .is_none_or(|c| c.generation != job.generation)
+        {
+            self.rejected_sender_grant(job.session, job.lane, !grant.valid_at(now));
+            self.finish_sender_send(0, None, false)?;
+            if let Some(batch) = self.sessions[job.session].batches[job.lane].as_mut() {
+                batch.compact();
+            }
+            return Ok(());
+        }
+        match job.kind {
+            JobKind::Data => {
+                let mut batch = self.sessions[job.session].batches[job.lane]
+                    .take()
+                    .ok_or(io::ErrorKind::InvalidData)?;
+                if batch
+                    .plan
+                    .packet(0)
+                    .is_none_or(|packet| packet.number != job.first)
+                {
+                    self.rejected_sender_grant(job.session, job.lane, false);
+                    self.finish_sender_send(0, None, false)?;
+                } else {
+                    self.flush_batch(job.session, job.lane, &mut batch, now)?;
+                    if self.sender.permitted {
+                        self.rejected_sender_grant(job.session, job.lane, false);
+                        self.finish_sender_send(0, None, false)?;
+                        batch.compact();
+                    }
+                }
+                self.sessions[job.session].batches[job.lane] = Some(batch);
+            }
+            JobKind::Probe { length, pmtu } => {
+                let mut clock = self.io_clock(now);
+                let local = &self.sessions[job.session];
+                let connection = local.connection.ok_or(io::ErrorKind::InvalidData)?;
+                let header = Header {
+                    cookie: self.shared.config.config().sessions[job.session].cookie,
+                    receive_tag: connection.remote_tag().get(),
+                    lane: job.lane as u16 + 1,
+                    packet_number: job.first,
+                    record_area_len: 0,
+                };
+                let mut prefix = [0; wire::PROBE_PREFIX_LEN];
+                wire::encode_probe_prefix(header, length, &mut prefix).map_err(io::Error::other)?;
+                let padding = pack::PROBE_PADDING
+                    .get(..length - wire::PROBE_PREFIX_LEN)
+                    .ok_or(io::ErrorKind::InvalidInput)?;
+                let parts = [&prefix[..], padding];
+                let peer = self
+                    .shared
+                    .config
+                    .peer_for_session(job.session)
+                    .ok_or(io::ErrorKind::InvalidInput)?;
+                let socket = self.transmit[peer].paths[job.path].lanes[job.lane]
+                    .socket
+                    .as_ref();
+                let mut rejected = None;
+                let result = if let Some(socket) = socket {
+                    socket.send_batch_checked(&[SendDatagram { parts: &parts }], length, || {
+                        let at = clock()?;
+                        if !grant.valid_at(at) || at >= job.deadline {
+                            rejected = Some(!grant.valid_at(at));
+                            return Err(io::ErrorKind::WouldBlock.into());
+                        }
+                        Ok(at)
+                    })
+                } else {
+                    Err(io::ErrorKind::NotConnected.into())
+                };
+                if let Some(expired) = rejected {
+                    self.rejected_sender_grant(job.session, job.lane, expired);
+                }
+                let sent = result.as_ref().ok().copied();
+                self.finish_sender_send(
+                    sent.map_or(0, |(n, _)| n),
+                    sent.and_then(|(n, at)| (n != 0).then_some(at)),
+                    result
+                        .as_ref()
+                        .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock),
+                )?;
+                if let Some((1, at)) = sent {
+                    let index = self.sender_index(job.session, job.lane)?;
+                    self.sender.lanes[index].probes.rotate_left(1);
+                    self.sender.lanes[index].probes[1] = Some((job.first, length as u16));
+                    let local = &mut self.sessions[job.session];
+                    if pmtu {
+                        let mtu = &mut self.transmit[peer].paths[job.path].lanes[job.lane].mtu;
+                        if !mtu.submitted(
+                            pmtu::ProbeId {
+                                session: job.session,
+                                tag: connection.local_tag().get(),
+                                lane: job.lane as u16 + 1,
+                                packet: job.first,
+                            },
+                            length,
+                            at,
+                        ) {
+                            mtu.defer(at);
+                        }
+                    } else if self.id == 0 && job.lane == 0 {
+                        self.controls[job.session].probe = Some((job.first, length as u16));
+                        self.controls[job.session].probe_due =
+                            at.saturating_add(Duration::from_secs(1));
+                    }
+                    for totals in [
+                        &mut self.counters,
+                        &mut local.totals,
+                        &mut local.tx_totals[job.lane],
+                    ] {
+                        totals.tx_outer_bytes =
+                            totals.tx_outer_bytes.wrapping_add((length + 48) as u64);
+                    }
+                    local.tx_dirty |= 1_u64 << job.lane;
+                } else {
+                    if pmtu {
+                        self.transmit[peer].paths[job.path].lanes[job.lane]
+                            .mtu
+                            .defer(now);
+                    }
+                    if let Err(error) = result {
+                        if error.raw_os_error() == Some(libc::EMSGSIZE) {
+                            self.mtu_send_error(peer, job.path, job.lane, length, now)?;
+                        } else if !transient(&error) {
+                            self.counters.socket_errors =
+                                self.counters.socket_errors.wrapping_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Worker {
+    pub(super) fn quiesced_sender(&mut self, session: usize) -> io::Result<()> {
+        if !self.sender_enabled() {
+            return Ok(());
+        }
+        let index = self.sender_index(session, 0)?;
+        let generation = self.sender.lanes[index].generation;
+        if let Some(owner) = &mut self.sender.owner
+            && owner.timers.matches(PacketId {
+                session,
+                generation,
+                lane: 1,
+                number: 0,
+            })
+        {
+            owner.timers.quiesce(session, generation)?;
+        }
+        Ok(())
+    }
+}
+
+impl Worker {
+    pub(super) fn publish_sender(&mut self) {
+        self.counters.rtt_ns = 0;
+        self.counters.bytes_in_flight = 0;
+        self.counters.pacing_bytes_per_second = 0;
+        for local in &mut self.sessions {
+            local.totals.bytes_in_flight = 0;
+            local.totals.rtt_ns = 0;
+        }
+        for lane in &self.sender.lanes {
+            let local = &mut self.sessions[lane.session];
+            let totals = &mut local.tx_totals[usize::from(lane.lane) - 1];
+            totals.bytes_in_flight = lane.history.inflight_bytes();
+            totals.rtt_ns = lane.rtt.minimum().map_or(0, |_| {
+                lane.rtt.smoothed().as_nanos().min(u64::MAX as u128) as u64
+            });
+            local.tx_dirty |= 1_u64 << (lane.lane - 1);
+            local.totals.bytes_in_flight += totals.bytes_in_flight;
+            local.totals.rtt_ns = local.totals.rtt_ns.max(totals.rtt_ns);
+            self.counters.bytes_in_flight += totals.bytes_in_flight;
+            self.counters.rtt_ns = self.counters.rtt_ns.max(totals.rtt_ns);
+        }
+        if let Some(owner) = &self.sender.owner {
+            for group in 0..self.shared.config.path_groups() {
+                if let Some(snapshot) = owner.snapshot(group) {
+                    self.counters.pacing_bytes_per_second = self
+                        .counters
+                        .pacing_bytes_per_second
+                        .saturating_add(snapshot.pacing_bytes_per_second);
+                }
+            }
+            for (session, local) in self.sessions.iter_mut().enumerate() {
+                if let Some(snapshot) = self
+                    .shared
+                    .config
+                    .peer_for_session(session)
+                    .and_then(|peer| self.shared.config.path_group_for_peer(peer))
+                    .and_then(|group| owner.snapshot(group))
+                {
+                    local.totals.pacing_bytes_per_second = snapshot.pacing_bytes_per_second;
+                }
+            }
+        }
+    }
+}

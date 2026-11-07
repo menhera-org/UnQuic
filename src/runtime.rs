@@ -356,6 +356,7 @@ pub fn run(config: Config, control: Control) -> io::Result<()> {
     let mut workers = (0..count)
         .map(|id| Worker::new(id, Arc::clone(&shared), control.clone()))
         .collect::<io::Result<Vec<_>>>()?;
+    Worker::init_senders(&mut workers)?;
     workers[0].requests = Some(request_rx);
     for from in 0..count {
         for to in 0..count {
@@ -477,7 +478,7 @@ fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
         .checked_add(raw.peers.len().checked_mul(2 * size_of::<usize>())?)?
         .checked_add(sessions.checked_mul(128)?)?;
     [
-        Worker::storage_bytes(raw, workers)?,
+        Worker::storage_bytes(config, workers)?,
         commands,
         lane_counters,
         totals,

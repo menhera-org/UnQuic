@@ -228,8 +228,8 @@ ACK delay includes queue residence, capped at 1 ms. Successful-send timestamps
 return to the receive owner to enforce duplicate spacing. ACK delay is finalized
 using that send timestamp; control service starts no earlier than submission,
 so a delayed worker cannot accumulate a catch-up burst. Connection tags and
-lane identity are rechecked before sends and buffer returns. Incoming ACK
-application to sender history, loss detection and recovery remains Stage 3 work.
+lane identity are rechecked before sends and buffer returns. Incoming ACKs now
+reach TX-owned histories and bounded loss scans; payload recovery remains Stage 3 work.
 UDP receive batches retain a timestamp taken after the receive call, including
 across GRO expansion and worker handoff. Data sends recheck frame deadlines
 immediately before each syscall and GSO fallback. Expired plans return to bounded
@@ -246,9 +246,9 @@ The pure piece journal reserves mappings before I/O and keeps packet charges
 separate from payload lifetime. It retains mappings after loss for late ACKs;
 ACKs and bounded frame cleanup unlink mappings without scanning other histories.
 It is not yet connected to worker sends or recovery.
-A pure path-group PTO state now provides shared backoff and the three-PTO
-stop/settlement transition. Worker timer ownership, aggregate probe grants and
-loss dispatch remain unconnected.
+The path-group PTO state provides shared backoff and the three-PTO
+stop/settlement transition. Indexed timers and aggregate probe grants now drive
+worker loss dispatch. Complete loss-before-PTO ordering remains open.
 
 ACK, handshake and PROBE_REPLY sends share a 4 MiB/s outer-byte ceiling per
 path group, with a burst of sixteen datagrams. Worker zero owns each fixed
@@ -259,7 +259,7 @@ canceled, expired and superseded flights are discarded before sending.
 Named groups share across endpoints. The default groups endpoints by local
 address, scope ID and binding device, ignoring names and UDP ports.
 Configure a shared group when different bindings use the same bottleneck.
-Data/probe congestion grants remain unfinished.
+DATA and probes use the separate shared congestion and pacing grants.
 
 `ack::History` separately tracks reservations and successful submissions in a
 fixed 65,536-number window. It validates every ACK range before applying any,
@@ -269,16 +269,16 @@ and unresolved congestion charges prevent window advancement; successfully
 sent, uncharged feedback can age out without waiting for another ACK. Late ACKs
 retain send metadata but cannot release a lost packet's charge twice. Allocation
 checks cover reservation, submission, ACK, loss, window wrap and reset.
-This history does not yet retain frame payloads or schedule repairs, and workers
-do not yet use it for submission accounting.
+Workers use this history for submission accounting and incoming ACKs.
+It does not retain frame payloads or schedule repairs.
 
 `loss::Rtt` implements the pure RFC 9002 timing calculations: RTT sampling,
 packet/time loss thresholds, exponential PTO periods and sender frame lifetime.
 It applies [verified erratum 7539](https://www.rfc-editor.org/errata/eid7539),
 which computes deviation before updating the smoothed RTT. Tests cover delay
-bounds, backward time, numeric limits and exact estimator values. These
-calculations are not yet connected to worker ACK processing or the shared
-PTO probe budget; they do not provide recovery on their own.
+bounds, backward time, numeric limits and exact estimator values. Worker ACK
+processing and shared PTO timers use these calculations. RTT-based frame lifetimes
+and payload recovery remain unfinished.
 
 The pure `loss::FrameRecovery` tracks acknowledged and outstanding byte ranges
 and permits at most two repairs per byte. It excludes unsent bytes, ignores
@@ -291,7 +291,7 @@ reassembly tests lose every possible original piece and its first repair, then
 verify one complete delivery after the second repair. Workers
 still need payload retention, packet-to-frame mappings and repair submission.
 
-Recovery, BBRv3,
+Recovery, complete BBRv3 integration,
 descriptor adoption and daemon process integration remain unfinished. No throughput
 target has been demonstrated. [BENCH.md](BENCH.md) records the release
 TAP-to-TAP baseline, including severe overload loss, small-frame rates and CPU.
@@ -496,8 +496,11 @@ handoff and retains it until a worker reports successful and unused bytes.
 A grant permits syscall starts for 100 microseconds; a call that returns later
 still reports its successful bytes. Expiry alone frees no credit. Probe grants
 share a two-datagram PTO allowance and may exceed the confirmed MTU for
-discovery, while obeying the aggregate burst cap. The ledger is not yet wired
-to workers or BBR; the current runtime remains unpaced for DATA.
+discovery, while obeying the aggregate burst cap. Discovery candidates also fit
+within the total congestion window; resizing never confirms a larger DATA MTU.
+Workers now request grants
+for DATA, PMTU and liveness probes from worker zero's per-group controller.
+ACK-only and PROBE_REPLY traffic retain their separate control ceiling.
 
 The pure `bbr::Delivery` sampler now follows draft-07's delivery-rate rules,
 with fixed vectors under `tests/vectors/bbr-07`. It counts newly acknowledged
@@ -512,8 +515,21 @@ requests, permissions and successful prefixes. The coordinator waits for every
 issued grant report before committing sends in timestamp order, then accepts
 generation-qualified ACK, loss and retirement reports. Tests cover delayed and
 reversed completions, partial sends, metadata pressure and allocation-free reuse.
-This coordinator is not yet connected to worker I/O; it does not enable runtime
-congestion control or repair.
+TX owners now retain sent histories and route ACKs by the acknowledged lane,
+independently of the lane carrying the ACK. Bounded ACK, loss and retirement
+reports use storage separate from send completions. Startup memory accounting
+includes these histories, the shared sampler and all reserved message buffers.
+
+Blocked PMTU requests return their flight buffer so DATA can proceed. A PTO
+probe can preempt an ungranted ordinary request; it still uses the shared
+two-probe allowance. Pending probe commands survive connection replacement
+without resetting PTO backoff. After a long outage, carrier can return before
+backed-off probing restores DATA service.
+
+Release forwarding, reconnect, allocation and routed-MTU regression tests pass.
+General application-limited detection, complete loss-before-PTO ordering,
+payload retention and selective repair remain unfinished. This integration
+does not establish the performance gates.
 
 ## TAP read batching
 
@@ -697,9 +713,14 @@ failed, probing, baseline, configured, confirmed, then unknown. Active TX lanes
 report their current DATA limit plus 48 bytes, or zero when baseline failure
 suspends DATA. State is baseline (1), probing (2), confirmed (3), or failed (4).
 Configured (5) remains a public counter value but workers no longer emit it.
-RTT, feedback delay, repairs, pacing
-and bytes-in-flight remain zero until recovery and congestion control are
-implemented. Cumulative counts wrap modulo 2^64.
+TX lanes now report smoothed RTT and charged outer bytes in flight. Worker
+zero reports the sum of group pacing rates; each session reports its group's
+shared rate, so summing session rates can count a group more than once.
+`send_grants` counts received permissions; `expired_grants` counts permissions
+rejected at dispatch or the syscall boundary after expiry; `cancelled_grants`
+counts rejected plans, frame deadlines, paths or connection identities.
+Feedback delay and repair counters remain zero until their runtime integration.
+Cumulative counts wrap modulo 2^64.
 
 ## Path MTU status
 

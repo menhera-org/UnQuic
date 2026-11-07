@@ -440,7 +440,9 @@ through the existing handoff rings. A shared control queue rotates blocked
 groups and returns, with at most 64 construction visits and 64 service visits
 per turn. Tests cover rejected packed tails/heads, full handoff and return
 queues, stale identities, control-class fairness and actual-send duplicate
-spacing. Incoming ACK application and runtime congestion grants/data pacing remain pending.
+spacing. Incoming ACKs now reach TX-owned histories; DATA and probes use shared
+controller grants. Release forwarding, reconnect, allocation and routed-MTU
+regression tests pass.
 The pure shared grant ledger now reserves credit before handoff, keeps it through
 100-microsecond expiry, and consumes each sent/unused report once. Partial
 submissions convert only successful outer bytes to inflight charges. Workers
@@ -448,8 +450,9 @@ share the send quantum and sixteen-maximum-datagram byte cap; PTO rounds share
 at most two one-datagram grants, with epoch checks on unused reports.
 Exact pacing deadlines, delayed completion, duplicate reports, limit reductions,
 late ACK/loss settlement and allocation-free transitions have regression coverage.
-BBR output, reliable report routing, startup accounting and worker enforcement
-still need integration. PMTU candidates must fit the current grant quantum;
+BBR output, retained report routing, startup accounting and worker enforcement
+are now connected. PMTU candidates must fit the current grant quantum and total
+congestion window;
 limit the candidate size without treating an unconfirmed probe as the effective
 MSS. The socket batch API now supports a timestamp/permission callback immediately
 before each syscall, including a retry without GSO. Tests force that fallback,
@@ -462,8 +465,7 @@ attempts revalidate expiry at submission; successful handshake/liveness timers
 and PMTU proofs use pre-send time. ACK delay and duplicate spacing share that
 timestamp, and the control service ceiling cannot bank a delayed send's elapsed
 time. Receive batches retain post-receive time across expansion and handoff.
-Regressions inject delayed clocks for these paths. Neither these changes nor
-the ledger enables runtime data pacing.
+Regressions inject delayed clocks for these paths.
 Receive-side ACK scheduling and range construction now use the existing
 reassembly bitmap, with no second history or hot-path allocations. Tests cover
 thresholds, gaps, duplicate rate limits, pressure rejection, word/window wrap,
@@ -479,15 +481,16 @@ scans, floor pressure, competing ACKs, late loss and RTT sampling across yields.
 Outstanding-charge scans now yield on a bitmap-read budget, including empty
 words. Each pass has a fixed upper packet number and rechecks state after ACK,
 loss and eviction; new sends cannot extend a pass. Empty, sparse, full-window,
-maximum-number and allocation-free regressions pass. These scans remain pure
-components until the worker loss loop is connected.
-Worker integration must retain the ACK's arrival time and reserve report space
+maximum-number and allocation-free regressions pass. TX owners now run these bounded
+scans and retain reports until the controller consumes them.
+Worker integration retains the ACK's arrival time and reserves report space
 before advancing it. Sender entries now use 16 bytes each, retaining full
 `Duration` range and nanosecond precision; 64 histories save 32 MiB compared with
 the previous 24-byte entries. Worker submission accounting and incoming ACK
-application remain pending. Outgoing ACKs are now emitted through the shared
-control queue. Per-lane MTU probing is connected to the workers. Recovery and congestion
-control remain pending; README.md documents probe feedback and send-error handling.
+application now use these histories. Outgoing ACKs are now emitted through the shared
+control queue. Per-lane MTU probing is connected to the workers. Payload recovery
+and complete congestion-control integration remain pending; README.md documents
+probe feedback and send-error handling.
 
 The pure draft-07 delivery sampler now has fixed vectors for ACK compression,
 idle restart, application bubbles, late ACKs after loss and duplicate suppression.
@@ -500,8 +503,9 @@ MTU changes, loss thresholds, RTT probing and a tenfold capacity reduction.
 Sampler/controller/grant tests cover partial submissions and late originals.
 Steady-state sampling and model updates allocate nothing. Pseudocode/prose
 differences and integer rounding are recorded in tests/vectors/bbr-07/README.md.
-Runtime feedback ordering, controller ownership and worker enforcement remain
-pending; these pure components do not enable congestion control in the daemon.
+Runtime feedback ordering, controller ownership and worker enforcement are
+connected. General application-limited detection and payload recovery remain
+unfinished; congestion-control integration is not complete.
 Reserve sampling metadata against the startup memory ceiling; a full sampling
 record in every lane's 65,536 history slots would exceed that ceiling. Use bounded
 shared storage and retire only resolved sender-history prefixes, preserving
@@ -523,14 +527,15 @@ reversed reports, all 64 workers, partial sends, stale identities, bounded ACK
 transactions, full-pool PTO/loss/retirement progress and counter exhaustion before
 permission to send. Allocation instrumentation covers sorting and 66,000
 history/slot reuse cycles; reserved-memory estimates match actual allocations.
-Controller ownership, worker routing and runtime activation remain pending.
-Keep send-report storage separate from feedback buffers, preserve original
-receive time for RTT and use fresh owner time for delivery accounting. The
+Worker zero owns the controllers and ordered sampler; TX workers own histories.
+Send-report storage is separate from feedback buffers. RTT uses original receive
+time, while delivery accounting uses fresh owner observation time. The
 one-flight-per-worker bound and epoch latency still need throughput measurement.
 
 The pure RTT estimator, loss-deadline calculation, PTO-period backoff and frame
 lifetime now live in `loss.rs`, with exact-value and boundary tests. ACK-driven
-updates, history integration and timer ownership still need integration.
+RTT updates and indexed group PTO timers are connected. RTT-based frame admission
+deadlines still need runtime integration.
 The pure shared PTO state now limits each expiry to two aggregate probe
 permissions, backs off across lanes and requests one loss-declaration pass on
 the third unanswered expiry. It then stops ordinary grants and keeps backed-off
@@ -538,9 +543,12 @@ probes running until fresh directional feedback. A first matching probe reply
 clears the silence count; only a new ACK of eliciting traffic resets backoff.
 Tests cover multiple lanes, deferred probes, fresh probe replies,
 late/duplicate/feedback-only ACKs, long pauses,
-overflow and allocation-free transitions. Runtime grant/allowance enforcement,
-loss-pass dispatch and liveness/PMTU probe gating remain unfinished; this does
-not complete the loss-detection step.
+overflow and allocation-free transitions. Runtime grants now enforce the allowance;
+workers run bounded loss passes and gate liveness/PMTU probes. Blocked PMTU requests
+release their flight buffer; PTO dispatch preempts an ungranted ordinary request.
+Pending probe commands survive generation changes without resetting backoff.
+Complete loss-before-PTO ordering and payload repair still need verification
+and integration.
 
 Pure per-frame byte coverage now lives in `loss::FrameRecovery`, with two-repair
 limits, outstanding-generation checks, late ACK handling and bounded slot reuse.

@@ -416,7 +416,9 @@ mod tests {
     #[ignore = "kernel descriptor test; run in a disposable container"]
     fn control_queue_shares_released_slots_between_handshakes_replies_and_acks() {
         let (mut worker, _) = receive_worker();
-        worker.command(1, worker.sessions[0].installed.unwrap(), 0);
+        worker
+            .command(1, worker.sessions[0].installed.unwrap(), 0)
+            .unwrap();
         worker.shared.bound[0].store(3, Ordering::Release);
         let rx = socket(&mut worker);
         let now = Duration::from_millis(10);
@@ -492,7 +494,7 @@ mod tests {
             connection: Some(connection),
         };
         for worker in &mut workers {
-            worker.command(0, command, 0);
+            worker.command(0, command, 0).unwrap();
         }
         let mut lane = workers[0].sessions[0].free.pop().unwrap();
         lane.reset(7, 9022).unwrap();
@@ -564,15 +566,17 @@ mod tests {
             responder: Tag::new(4).unwrap(),
             ..connection
         };
-        workers[1].command(
-            0,
-            Command {
-                generation: 2,
-                connection: Some(replacement),
-                ..command
-            },
-            0,
-        );
+        workers[1]
+            .command(
+                0,
+                Command {
+                    generation: 2,
+                    connection: Some(replacement),
+                    ..command
+                },
+                0,
+            )
+            .unwrap();
         workers[1].sessions[0].ack_inflight = 1 << 3;
         while workers[1].incoming[0].as_mut().unwrap().try_pop().is_some() {}
         workers[0].flush_control(now + 2 * RETRY).unwrap();

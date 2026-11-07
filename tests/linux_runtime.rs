@@ -116,7 +116,11 @@ fn storm_frame(bytes: &mut [u8; 1514], direction: usize, sequence: usize) -> usi
     length
 }
 
-fn uso_delivery_allocates_nothing(net: &UdpSocket) {
+fn uso_delivery_allocates_nothing(
+    net: &UdpSocket,
+    left: &unquic::runtime::Control,
+    right: &unquic::runtime::Control,
+) {
     let control = UdpSocket::bind("0.0.0.0:0").unwrap();
     let mut req = request(c"uq-right");
     let mut addr = libc::sockaddr {
@@ -166,6 +170,7 @@ fn uso_delivery_allocates_nothing(net: &UdpSocket) {
             raw_send(&source, frame);
         }
         let mut received = 0;
+        let wait = Instant::now();
         until(Duration::from_secs(2), || match receiver.recv(&mut input) {
             Ok(n) => {
                 assert_eq!(n % 1472, 0);
@@ -181,6 +186,13 @@ fn uso_delivery_allocates_nothing(net: &UdpSocket) {
             }
             Err(e) => {
                 assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+                assert!(
+                    wait.elapsed() < Duration::from_millis(1900),
+                    "delivered {received}/{}: left {:?}, right {:?}",
+                    batch.len(),
+                    left.session_counters(0),
+                    right.session_counters(0)
+                );
                 false
             }
         });
@@ -411,7 +423,7 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
                 && right.control.session(session).unwrap().carrier
         })
     });
-    uso_delivery_allocates_nothing(&net);
+    uso_delivery_allocates_nothing(&net, &left.control, &right.control);
     until(Duration::from_secs(2), || {
         (0..2)
             .map(|worker| left.control.worker_counters(worker).unwrap().tap_gso_frames)
@@ -769,6 +781,21 @@ fn foreign_rename_and_namespace_move_preserve_running_transport() {
                     thread::sleep(Duration::from_millis(1));
                 }
             }
+        }
+        if phase == "reconnect" {
+            // Connection replacement preserves the path group's backed-off PTO.
+            let started = Instant::now();
+            until(Duration::from_secs(90), || {
+                [&left.control, peer].into_iter().all(|control| {
+                    let generation = control.session(0).unwrap().generation;
+                    (1..=4).any(|lane| {
+                        control
+                            .transmit_lane_counters(0, lane)
+                            .is_some_and(|s| s.generation == generation && s.counters.rtt_ns != 0)
+                    })
+                })
+            });
+            eprintln!("reconnect ACK readiness after {:?}", started.elapsed());
         }
         let mut frame = [0x5a; 1514];
         frame[..14].copy_from_slice(&[2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2, 0x88, 0xb5]);

@@ -2,6 +2,7 @@
 
 mod feedback;
 mod frames;
+mod sender;
 
 use crate::sys::{cvt, invalid};
 use std::{
@@ -369,6 +370,7 @@ pub(crate) enum Event {
     Frame(Box<Buffer>),
     Free(Box<Buffer>),
     Feedback(Box<feedback::Feedback>),
+    Sender(sender::Message),
     Register {
         buffer: Box<Buffer>,
         lane: Box<reassembly::Lane>,
@@ -546,6 +548,9 @@ struct PeerControl {
 }
 
 pub(crate) struct Worker {
+    sender: sender::State,
+    #[cfg(test)]
+    unpaced_fixture: bool,
     #[cfg(test)]
     io_time: Option<fn(Duration) -> io::Result<Duration>>,
     tap_reader: Option<crate::tap::Reader>,
@@ -591,7 +596,8 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
-    pub fn storage_bytes(config: &crate::config::Config, workers: usize) -> Option<usize> {
+    pub fn storage_bytes(validated: &crate::config::Validated, workers: usize) -> Option<usize> {
+        let config = validated.config();
         let mut per_worker = size_of::<Self>()
             .checked_add(crate::tap::Reader::storage_bytes()?)?
             .checked_add(
@@ -656,6 +662,7 @@ impl Worker {
         })?;
         per_worker
             .checked_mul(workers)?
+            .checked_add(sender::State::storage_bytes(validated, workers)?)?
             .checked_add(frame_storage)?
             .checked_add(batches)?
             .checked_add(
@@ -806,6 +813,9 @@ impl Worker {
             }
         }
         Ok(Self {
+            sender: sender::State::new(&shared.config, count, id)?,
+            #[cfg(test)]
+            unpaced_fixture: false,
             #[cfg(test)]
             io_time: None,
             tap_reader,
@@ -942,6 +952,7 @@ impl Worker {
             }
             more |= self.distribute_receivers();
             self.addresses(now)?;
+            more |= self.service_sender(now)?;
             self.progress_barriers(now)?;
             self.timers(now)?;
             more |= self.mtu_timers(now)?;
@@ -958,7 +969,10 @@ impl Worker {
                     .lanes[lane];
                 let batch = self.sessions[session].batches[lane].as_ref();
                 batch.is_some_and(|batch| batch.len == 0 && batch.pending.is_empty())
-                    || (!tx.blocked && tx.mtu.payload_limit() != 0)
+                    || (!tx.blocked
+                        && tx.mtu.payload_limit() != 0
+                        && (!self.sender_enabled()
+                            || (self.sender.flight.is_some() && self.sender.job.is_none())))
             });
             self.receive_interest(more)?;
             publish_turns = publish_turns.wrapping_add(1);
@@ -1026,6 +1040,7 @@ impl Worker {
     }
 
     fn publish_counters(&mut self) {
+        self.publish_sender();
         self.counters.reassembly_frames = self
             .sessions
             .iter()
@@ -1162,7 +1177,8 @@ impl Worker {
     }
 
     fn has_backpressure(&self) -> bool {
-        self.returns.iter().any(|v| !v.is_empty())
+        !self.sender.outgoing.is_empty()
+            || self.returns.iter().any(|v| !v.is_empty())
             || self
                 .sessions
                 .iter()
@@ -1487,6 +1503,7 @@ impl Worker {
                     Event::Frame(buffer) => self.input_frame(buffer, now)?,
                     Event::Free(buffer) => self.release(buffer),
                     Event::Feedback(feedback) => self.receive_feedback(feedback)?,
+                    Event::Sender(message) => self.sender_message(message, now)?,
                     Event::Register { mut buffer, lane } => {
                         let session = buffer.session;
                         if self.matches(session, buffer.tag) {
@@ -1514,7 +1531,7 @@ impl Worker {
                         session,
                         command,
                         path,
-                    } => self.command(session, command, path),
+                    } => self.command(session, command, path)?,
                     Event::Address(change) => self.address(change)?,
                     Event::Acknowledge {
                         session,
@@ -1882,6 +1899,20 @@ impl Worker {
                                     },
                                 );
                             }
+                        }
+                        Record::Ack {
+                            lane,
+                            delay_us,
+                            ranges,
+                        } if self.sender_enabled() => {
+                            self.incoming_ack(
+                                session,
+                                header.receive_tag,
+                                lane,
+                                delay_us,
+                                ranges,
+                                buffer.deadline,
+                            )?;
                         }
                         Record::LaneRetire { lane } => {
                             if self.id == 0 {
@@ -2606,6 +2637,7 @@ impl Worker {
         };
         let mut clock = self.io_clock(now);
         let mut expired = false;
+        let mut grant_expired = false;
         if batch.len == 0 {
             return Ok(());
         }
@@ -2620,6 +2652,16 @@ impl Worker {
         if tx.blocked || limit == 0 {
             return Ok(());
         }
+        if self.sender_enabled()
+            && (self.sender.job.is_some() || self.sender.flight.is_none())
+            && !(self.sender.permitted
+                && self
+                    .sender
+                    .job
+                    .is_some_and(|job| job.session == session && job.lane == lane))
+        {
+            return Ok(());
+        }
         if batch.plan.is_empty()
             && batch
                 .prepare(
@@ -2632,6 +2674,29 @@ impl Worker {
             self.clear_batch(batch);
             return Ok(());
         }
+        let grant = if self.sender_enabled() {
+            if !self.sender.permitted
+                || self
+                    .sender
+                    .job
+                    .is_none_or(|job| job.session != session || job.lane != lane)
+            {
+                self.request_batch(session, lane, batch, deadline, limit)?;
+                if self.sender.job.is_none() {
+                    batch.compact();
+                }
+                return Ok(());
+            }
+            Some(
+                self.sender
+                    .flight
+                    .as_ref()
+                    .and_then(|f| f.grant())
+                    .ok_or(io::ErrorKind::InvalidData)?,
+            )
+        } else {
+            None
+        };
         let result = {
             let frames = std::array::from_fn::<_, { pack::BATCH_CAPACITY }, _>(|index| {
                 batch.frames[index]
@@ -2646,7 +2711,16 @@ impl Worker {
             });
             let mut slices = [&[][..]; pack::BATCH_SLICES];
             let mut starts = [0; BATCH_SIZE + 1];
-            let count = batch.plan.len();
+            let count = if grant.is_some() {
+                self.sender
+                    .flight
+                    .as_ref()
+                    .ok_or(io::ErrorKind::InvalidData)?
+                    .packets()
+                    .len()
+            } else {
+                batch.plan.len()
+            };
             for index in 0..count {
                 let length = batch
                     .plan
@@ -2669,14 +2743,30 @@ impl Worker {
                 .unwrap()
                 .send_batch_checked(&packets[..count], limit, || {
                     let at = clock()?;
-                    if at >= deadline {
+                    if at >= deadline || grant.is_some_and(|grant| !grant.valid_at(at)) {
                         expired = true;
+                        grant_expired = grant.is_some_and(|grant| !grant.valid_at(at));
                         return Err(io::ErrorKind::WouldBlock.into());
                     }
                     Ok(at)
                 })
         };
+        if grant.is_some() {
+            let submitted = result.as_ref().ok().copied();
+            self.finish_sender_send(
+                submitted.map_or(0, |(count, _)| count),
+                submitted.and_then(|(count, at)| (count != 0).then_some(at)),
+                !expired
+                    && result
+                        .as_ref()
+                        .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock),
+            )?;
+        }
         if expired {
+            if grant.is_some() {
+                self.rejected_sender_grant(session, lane, grant_expired);
+                batch.compact();
+            }
             return Ok(());
         }
         match result {
@@ -2948,6 +3038,13 @@ impl Worker {
         length: usize,
         now: Duration,
     ) -> io::Result<()> {
+        if self.sender_enabled() {
+            self.request_probe(session, lane, length, true, None, now)?;
+            if self.sender.job.is_none() {
+                self.transmit[peer].paths[path].lanes[lane].mtu.defer(now);
+            }
+            return Ok(());
+        }
         let clock = self.io_clock(now);
         let mut prefix = [0; wire::PROBE_PREFIX_LEN];
         let Ok(piece) = self.sessions[session].tx[lane]
@@ -3131,6 +3228,19 @@ impl Worker {
         let Some(connection) = self.sessions[session].connection else {
             return;
         };
+        if self.sender_enabled()
+            && let Ok(index) = self.sender_index(session, usize::from(lane) - 1)
+        {
+            let state = &mut self.sender.lanes[index];
+            if let Some(proof) = state
+                .probes
+                .iter_mut()
+                .find(|proof| **proof == Some((packet, length)))
+            {
+                *proof = None;
+                self.sender.fresh[state.group] = true;
+            }
+        }
         let peer = self.shared.config.peer_for_session(session).unwrap();
         let path = self.sessions[session].path;
         let index = usize::from(lane) - 1;
@@ -3164,6 +3274,15 @@ impl Worker {
         record: Record<'_>,
         now: Duration,
     ) -> io::Result<Option<(u64, u16, Duration)>> {
+        if self.sender_enabled() && matches!(record, Record::Probe) {
+            self.request_probe(session, 0, BASE_UDP_PAYLOAD, false, None, now)?;
+            return Ok(None);
+        }
+        let history = if self.sender_enabled() && !record.is_handshake() {
+            Some(self.sender_index(session, 0)?)
+        } else {
+            None
+        };
         let mut clock = self.io_clock(now);
         let prepared = clock()?;
         let peer = self.shared.config.peer_for_session(session).unwrap();
@@ -3198,6 +3317,18 @@ impl Worker {
         let Some(packet) = packet else {
             return Ok(None);
         };
+        if let Some(index) = history {
+            match self.sender.lanes[index].history.reserve(
+                packet.number,
+                (packet.length + 48) as u16,
+                false,
+                false,
+            ) {
+                Ok(()) => {}
+                Err(crate::ack::HistoryError::Full) => return Ok(None),
+                Err(error) => return Err(io::Error::other(error)),
+            }
+        }
         let mut handshake = record
             .is_handshake()
             .then(|| &mut self.controls[session].state);
@@ -3242,6 +3373,21 @@ impl Worker {
                 .ok_or_else(|| io::Error::other("control transmission on a non-owner worker"))?;
             budget.send(packet.length + 48, prepared, send)
         };
+        if let Some(index) = history {
+            match &result {
+                Ok(started)
+                    if !self.sender.lanes[index].submitted(packet.number, *started, None) =>
+                {
+                    return Err(io::Error::other(
+                        "control packet has no history reservation",
+                    ));
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    self.sender.lanes[index].history.cancel(packet.number);
+                }
+            }
+        }
         match result {
             Ok(started) => {
                 self.counters.tx_outer_bytes = self
@@ -3314,7 +3460,7 @@ impl Worker {
         Ok(())
     }
 
-    fn command(&mut self, session: usize, command: Command, path: usize) {
+    fn command(&mut self, session: usize, command: Command, path: usize) -> io::Result<()> {
         let peer = self.shared.config.peer_for_session(session).unwrap();
         let probes = self.transmit[peer].paths.each_ref().map(|path| {
             let session = path.probe_session?;
@@ -3327,11 +3473,14 @@ impl Worker {
                     && old.phase == Phase::Install
                     && command.phase == Phase::Quiesce)
         }) {
-            return;
+            return Ok(());
         }
         if local.installed == Some(command) {
             local.acknowledged = Some(command);
-            return;
+            return Ok(());
+        }
+        if command.phase == Phase::Install {
+            self.install_sender(session, command.generation, command.connection.is_some())?;
         }
         if command.phase == Phase::Quiesce {
             self.close_slab(session);
@@ -3409,6 +3558,7 @@ impl Worker {
         }
         self.mtu_due = Duration::ZERO;
         self.mtu_next = Duration::ZERO;
+        Ok(())
     }
 
     fn acknowledge(
@@ -3420,6 +3570,7 @@ impl Worker {
     ) -> io::Result<()> {
         match self.controls[session].barrier.acknowledge(worker, command) {
             Progress::Quiesced => {
+                self.quiesced_sender(session)?;
                 for owner in &self.shared.owners[session] {
                     owner.store(0, Ordering::Release);
                 }
@@ -3461,7 +3612,7 @@ impl Worker {
                 if let Some(command) = self.controls[session].barrier.pending(worker) {
                     if worker == self.id {
                         self.controls[session].barrier.sent(worker, command);
-                        self.command(session, command, self.controls[session].install_path);
+                        self.command(session, command, self.controls[session].install_path)?;
                     } else if self
                         .push(
                             worker,
@@ -3479,8 +3630,10 @@ impl Worker {
             }
         }
         for session in 0..self.sessions.len() {
+            let sender_idle = self.sender_idle(session);
             let local = &mut self.sessions[session];
             if let Some(command) = local.command
+                && sender_idle
                 && local.rx.iter().all(Option::is_none)
                 && local.tx_ready == 0
                 && local.tap_inputs.is_empty()
@@ -3592,6 +3745,14 @@ impl Worker {
 
     fn deadline(&self, now: Duration) -> Option<Duration> {
         let mut due = self.setup_due.min(self.mtu_due);
+        if let Some(at) = self.sender.owner.as_ref().and_then(|owner| owner.due) {
+            due = due.min(at);
+        }
+        for lane in &self.sender.lanes {
+            if let Some(at) = lane.deadline() {
+                due = due.min(at);
+            }
+        }
         if let Some(feedback) = self.feedback_deadline() {
             due = due.min(feedback);
         }
@@ -3865,7 +4026,9 @@ mod tests {
     #[ignore = "kernel descriptor test; run in a disposable container"]
     fn full_expired_batches_share_one_cleanup_budget() {
         let (mut worker, _) = receive_worker();
-        worker.command(1, worker.sessions[0].installed.unwrap(), 0);
+        worker
+            .command(1, worker.sessions[0].installed.unwrap(), 0)
+            .unwrap();
         let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
         worker.transmit[0].paths[0].lanes[0].socket =
             Some(TransmitSocket::connect(&rx, rx.local_addr()).unwrap());
@@ -3980,7 +4143,9 @@ mod tests {
     #[ignore = "kernel descriptor test; run in a disposable container"]
     fn transmit_frame_budget_rotates_between_backlogged_lanes() {
         let (mut worker, _) = receive_worker();
-        worker.command(1, worker.sessions[0].installed.unwrap(), 0);
+        worker
+            .command(1, worker.sessions[0].installed.unwrap(), 0)
+            .unwrap();
         for (session, count) in [(0, 128), (1, 64)] {
             for _ in 0..count {
                 let mut frame = worker.free.pop().unwrap();
@@ -4056,15 +4221,17 @@ mod tests {
             },
             max_frame_len: 9022,
         };
-        worker.command(
-            0,
-            Command {
-                generation: 1,
-                phase: Phase::Install,
-                connection: Some(connection),
-            },
-            0,
-        );
+        worker
+            .command(
+                0,
+                Command {
+                    generation: 1,
+                    phase: Phase::Install,
+                    connection: Some(connection),
+                },
+                0,
+            )
+            .unwrap();
         let mut lane = worker.sessions[0].free.pop().unwrap();
         lane.reset(7, 9022).unwrap();
         worker.sessions[0].rx[0] = Some(lane);
@@ -4176,7 +4343,9 @@ mod tests {
     #[ignore = "kernel descriptor test; run in a disposable container"]
     fn shared_control_budget_defers_handshakes_and_counts_only_successful_sends() {
         let (mut worker, _) = receive_worker();
-        worker.command(1, worker.sessions[0].installed.unwrap(), 0);
+        worker
+            .command(1, worker.sessions[0].installed.unwrap(), 0)
+            .unwrap();
         let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
         worker.transmit[0].paths[0].lanes[0].socket =
             Some(TransmitSocket::connect(&rx, rx.local_addr()).unwrap());
@@ -4368,15 +4537,18 @@ mod tests {
         let (first, _tap) = receive_worker();
         let mut second = Worker::new(1, Arc::clone(&first.shared), Control::new()).unwrap();
         second.io_time = Some(Ok);
-        second.command(
-            0,
-            Command {
-                generation: 1,
-                phase: Phase::Install,
-                connection: first.sessions[0].connection,
-            },
-            0,
-        );
+        second.unpaced_fixture = true;
+        second
+            .command(
+                0,
+                Command {
+                    generation: 1,
+                    phase: Phase::Install,
+                    connection: first.sessions[0].connection,
+                },
+                0,
+            )
+            .unwrap();
         let mut workers = [first, second];
         for from in 0..2 {
             let (tx, rx) = crate::spsc::channel();
@@ -4734,15 +4906,17 @@ mod tests {
 
                 sender.send(&input).unwrap();
                 worker.read_tap(0, expiry).unwrap();
-                worker.command(
-                    0,
-                    Command {
-                        generation: 2,
-                        phase: Phase::Quiesce,
-                        connection: None,
-                    },
-                    0,
-                );
+                worker
+                    .command(
+                        0,
+                        Command {
+                            generation: 2,
+                            phase: Phase::Quiesce,
+                            connection: None,
+                        },
+                        0,
+                    )
+                    .unwrap();
                 worker.drain_tap_inputs(expiry).unwrap();
                 assert!(worker.sessions[0].tap_inputs.is_empty());
                 assert_eq!(worker.sessions[0].tx_retained, 0);
@@ -4768,22 +4942,24 @@ mod tests {
                 let (tx, rx) = crate::spsc::channel();
                 workers[from].outgoing[1 - from] = Some(tx);
                 workers[1 - from].incoming[from] = Some(rx);
-                workers[from].command(
-                    0,
-                    Command {
-                        generation: 1,
-                        phase: Phase::Install,
-                        connection: Some(Connection {
-                            role: handshake::Role::Initiator,
-                            initiator: Tag::new(1).unwrap(),
-                            responder: Tag::new(2).unwrap(),
-                            local: params,
-                            peer: params,
-                            max_frame_len: 9022,
-                        }),
-                    },
-                    0,
-                );
+                workers[from]
+                    .command(
+                        0,
+                        Command {
+                            generation: 1,
+                            phase: Phase::Install,
+                            connection: Some(Connection {
+                                role: handshake::Role::Initiator,
+                                initiator: Tag::new(1).unwrap(),
+                                responder: Tag::new(2).unwrap(),
+                                local: params,
+                                peer: params,
+                                max_frame_len: 9022,
+                            }),
+                        },
+                        0,
+                    )
+                    .unwrap();
             }
             let tags = [0x88, 0xa8, 0, 7, 0x81, 0, 0, 42];
             let payload: Vec<_> = (0..size * count).map(|i| (i * 13) as u8).collect();
@@ -4961,15 +5137,17 @@ mod tests {
                 (RECEIVE_BUFFERS + 3) as u64
             );
             assert_eq!(workers[1].returns[0].len(), BUFFERS);
-            workers[1].command(
-                0,
-                Command {
-                    generation: 2,
-                    phase: Phase::Quiesce,
-                    connection: None,
-                },
-                0,
-            );
+            workers[1]
+                .command(
+                    0,
+                    Command {
+                        generation: 2,
+                        phase: Phase::Quiesce,
+                        connection: None,
+                    },
+                    0,
+                )
+                .unwrap();
             for _ in 0..BUFFERS / BATCH_SIZE {
                 workers[1].drain_tap_inputs(Duration::ZERO).unwrap();
             }
@@ -5348,21 +5526,24 @@ mod tests {
         let (first, _tap) = receive_worker();
         let mut second = Worker::new(1, Arc::clone(&first.shared), Control::new()).unwrap();
         second.io_time = Some(Ok);
+        second.unpaced_fixture = true;
         let mut workers = [first, second];
         let connection = workers[0].sessions[0].connection;
         let remote = ReceiveSocket::bind("[::1]:40101".parse().unwrap(), None).unwrap();
         let mut payload = [0; crate::socket::MAX_UDP_PAYLOAD];
         for (index, worker) in workers.iter_mut().enumerate() {
             for session in 0..2 {
-                worker.command(
-                    session,
-                    Command {
-                        generation: 1,
-                        phase: Phase::Install,
-                        connection,
-                    },
-                    0,
-                );
+                worker
+                    .command(
+                        session,
+                        Command {
+                            generation: 1,
+                            phase: Phase::Install,
+                            connection,
+                        },
+                        0,
+                    )
+                    .unwrap();
                 worker.sessions[session].acknowledged = None;
             }
             let path = &mut worker.transmit[0].paths[0];
@@ -5462,27 +5643,31 @@ mod tests {
         assert_eq!(mtu.poll(now), Some(BASE_UDP_PAYLOAD));
         assert!(mtu.submitted(old, BASE_UDP_PAYLOAD, now));
         let deadline = mtu.deadline();
-        worker.command(
-            1,
-            Command {
-                generation: 1,
-                phase: Phase::Install,
-                connection: Some(connection),
-            },
-            0,
-        );
+        worker
+            .command(
+                1,
+                Command {
+                    generation: 1,
+                    phase: Phase::Install,
+                    connection: Some(connection),
+                },
+                0,
+            )
+            .unwrap();
         let mtu = &worker.transmit[0].paths[0].lanes[0].mtu;
         assert_eq!(mtu.deadline(), deadline);
         assert_eq!(mtu.probes(now).next(), Some((old, BASE_UDP_PAYLOAD)));
-        worker.command(
-            0,
-            Command {
-                generation: 2,
-                phase: Phase::Quiesce,
-                connection: None,
-            },
-            0,
-        );
+        worker
+            .command(
+                0,
+                Command {
+                    generation: 2,
+                    phase: Phase::Quiesce,
+                    connection: None,
+                },
+                0,
+            )
+            .unwrap();
         assert_eq!(worker.transmit[0].paths[0].probe_session, Some(1));
         let mtu = &mut worker.transmit[0].paths[0].lanes[0].mtu;
         assert_eq!(mtu.payload_limit(), 0);
@@ -5498,14 +5683,14 @@ mod tests {
                 ..connection
             }),
         };
-        worker.command(0, install, 0);
+        worker.command(0, install, 0).unwrap();
         let mtu = &mut worker.transmit[0].paths[0].lanes[0].mtu;
         assert_eq!(mtu.payload_limit(), 0);
         assert!(!mtu.reply(shared, BASE_UDP_PAYLOAD, now));
         assert_eq!(mtu.poll(now), Some(BASE_UDP_PAYLOAD));
         let fresh = pmtu::ProbeId { tag: 3, ..old };
         assert!(mtu.submitted(fresh, BASE_UDP_PAYLOAD, now));
-        worker.command(0, install, 0);
+        worker.command(0, install, 0).unwrap();
         let mtu = &mut worker.transmit[0].paths[0].lanes[0].mtu;
         assert!(mtu.reply(fresh, BASE_UDP_PAYLOAD, now + Duration::from_millis(1)));
         assert_eq!(mtu.payload_limit(), BASE_UDP_PAYLOAD);
@@ -5517,15 +5702,17 @@ mod tests {
         let (mut worker, _tap) = receive_worker();
         let now = Duration::from_millis(10);
         let connection = worker.sessions[0].connection;
-        worker.command(
-            1,
-            Command {
-                generation: 1,
-                phase: Phase::Install,
-                connection,
-            },
-            0,
-        );
+        worker
+            .command(
+                1,
+                Command {
+                    generation: 1,
+                    phase: Phase::Install,
+                    connection,
+                },
+                0,
+            )
+            .unwrap();
         let mtu = &mut worker.transmit[0].paths[0].lanes[0].mtu;
         *mtu = pmtu::Path::new(1452, Duration::ZERO).unwrap();
         for (number, at) in [(1, Duration::ZERO), (2, now)] {
@@ -5796,22 +5983,24 @@ mod tests {
                 optional_features: 0,
             };
             for session in 0..2 {
-                worker.command(
-                    session,
-                    Command {
-                        generation: 0,
-                        phase: Phase::Install,
-                        connection: Some(Connection {
-                            role: handshake::Role::Initiator,
-                            initiator: Tag::new(1).unwrap(),
-                            responder: Tag::new(2).unwrap(),
-                            local: params,
-                            peer: params,
-                            max_frame_len: 1514,
-                        }),
-                    },
-                    0,
-                );
+                worker
+                    .command(
+                        session,
+                        Command {
+                            generation: 0,
+                            phase: Phase::Install,
+                            connection: Some(Connection {
+                                role: handshake::Role::Initiator,
+                                initiator: Tag::new(1).unwrap(),
+                                responder: Tag::new(2).unwrap(),
+                                local: params,
+                                peer: params,
+                                max_frame_len: 1514,
+                            }),
+                        },
+                        0,
+                    )
+                    .unwrap();
             }
             let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
             worker.transmit[0].paths[0].lanes[0].socket =
@@ -5885,14 +6074,16 @@ mod tests {
             );
             assert!(pending(worker).is_empty());
             let command = worker.sessions[0].installed.unwrap();
-            worker.command(
-                0,
-                Command {
-                    generation: command.generation + 1,
-                    ..command
-                },
-                0,
-            );
+            worker
+                .command(
+                    0,
+                    Command {
+                        generation: command.generation + 1,
+                        ..command
+                    },
+                    0,
+                )
+                .unwrap();
             assert!(
                 worker.sessions[0].batches[0]
                     .as_ref()
@@ -5914,25 +6105,27 @@ mod tests {
             optional_features: 0,
         };
         for session in 0..2 {
-            workers[0].command(
-                session,
-                Command {
-                    generation: 0,
-                    phase: Phase::Install,
-                    connection: Some(Connection {
-                        role: handshake::Role::Initiator,
-                        initiator: Tag::new(1 + session as u128 * 10).unwrap(),
-                        responder: Tag::new(2).unwrap(),
-                        local: params,
-                        peer: wire::Params {
-                            port: 40001,
-                            ..params
-                        },
-                        max_frame_len: 9022,
-                    }),
-                },
-                0,
-            );
+            workers[0]
+                .command(
+                    session,
+                    Command {
+                        generation: 0,
+                        phase: Phase::Install,
+                        connection: Some(Connection {
+                            role: handshake::Role::Initiator,
+                            initiator: Tag::new(1 + session as u128 * 10).unwrap(),
+                            responder: Tag::new(2).unwrap(),
+                            local: params,
+                            peer: wire::Params {
+                                port: 40001,
+                                ..params
+                            },
+                            max_frame_len: 9022,
+                        }),
+                    },
+                    0,
+                )
+                .unwrap();
             workers[0].sessions[session].acknowledged = None;
         }
         let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
@@ -6182,15 +6375,17 @@ mod tests {
                     BASE_UDP_PAYLOAD,
                 )
                 .unwrap();
-            workers[0].command(
-                session,
-                Command {
-                    generation: 1,
-                    phase: Phase::Quiesce,
-                    connection: None,
-                },
-                0,
-            );
+            workers[0]
+                .command(
+                    session,
+                    Command {
+                        generation: 1,
+                        phase: Phase::Quiesce,
+                        connection: None,
+                    },
+                    0,
+                )
+                .unwrap();
         }
         workers[0].progress_barriers(Duration::ZERO).unwrap();
         assert!(workers[0].sessions.iter().all(|s| s.command.is_some()));
@@ -6283,6 +6478,7 @@ mod tests {
         let workers: [Worker; 2] = std::array::from_fn(|id| {
             let mut worker = Worker::new(id, Arc::clone(&shared), Control::new()).unwrap();
             worker.io_time = Some(Ok);
+            worker.unpaced_fixture = true;
             worker
         });
 
@@ -6347,7 +6543,7 @@ mod tests {
             connection: Some(connection),
         };
         for worker in &mut workers {
-            worker.command(0, initial, 0);
+            worker.command(0, initial, 0).unwrap();
             worker.sessions[0].acknowledged = None;
         }
         let mut lane = workers[0].sessions[0].free.pop().unwrap();
@@ -6399,15 +6595,17 @@ mod tests {
                     .number,
                 1
             );
-            worker.command(0, command, 0);
-            worker.command(
-                0,
-                Command {
-                    phase: Phase::Quiesce,
-                    ..command
-                },
-                0,
-            );
+            worker.command(0, command, 0).unwrap();
+            worker
+                .command(
+                    0,
+                    Command {
+                        phase: Phase::Quiesce,
+                        ..command
+                    },
+                    0,
+                )
+                .unwrap();
             assert_eq!(worker.sessions[0].connection, Some(replacement));
             assert_eq!(
                 worker.sessions[0].tx[own_lane]
@@ -6482,15 +6680,17 @@ mod tests {
                 .generation,
             generation
         );
-        worker.command(
-            0,
-            Command {
-                generation: generation + 1,
-                phase: Phase::Quiesce,
-                connection: None,
-            },
-            0,
-        );
+        worker
+            .command(
+                0,
+                Command {
+                    generation: generation + 1,
+                    phase: Phase::Quiesce,
+                    connection: None,
+                },
+                0,
+            )
+            .unwrap();
         worker.flush_taps(reassembly::FRAME_LIFETIME).unwrap();
         worker.publish_counters();
         assert!(
@@ -6510,15 +6710,17 @@ mod tests {
         ];
         for worker in &mut workers {
             for (session, connection) in connections.iter().enumerate() {
-                worker.command(
-                    session,
-                    Command {
-                        generation: generation + 2,
-                        phase: Phase::Install,
-                        connection: Some(*connection),
-                    },
-                    0,
-                );
+                worker
+                    .command(
+                        session,
+                        Command {
+                            generation: generation + 2,
+                            phase: Phase::Install,
+                            connection: Some(*connection),
+                        },
+                        0,
+                    )
+                    .unwrap();
                 worker.sessions[session].acknowledged = None;
             }
         }

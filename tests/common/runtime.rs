@@ -17,7 +17,13 @@ impl Running {
     pub fn start(config: Config) -> Self {
         let control = Control::new();
         let worker_control = control.clone();
-        let thread = Some(thread::spawn(move || runtime::run(config, worker_control)));
+        let thread = Some(thread::spawn(move || {
+            let result = runtime::run(config, worker_control);
+            if let Err(error) = &result {
+                eprintln!("runtime failed: {error:?}");
+            }
+            result
+        }));
         Self { control, thread }
     }
 

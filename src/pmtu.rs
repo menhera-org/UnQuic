@@ -3,8 +3,8 @@
 //! The owner supplies monotonic time, records only successful socket submissions,
 //! validates ICMP quotes, and limits DATA to payload_limit(). A new socket/path
 //! needs a new Path. Independent lanes never share confirmation state.
-//! Periodic confirmation supports the runtime's currently unacknowledged DATA;
-//! it must be replaced by transport loss feedback when ACK processing is integrated.
+//! Periodic confirmation detects reductions until DATA-quoted PTB and transport
+//! blackhole feedback are connected to discovery.
 
 use crate::{BASE_UDP_PAYLOAD, counters::PathMtuState, socket::MAX_UDP_PAYLOAD};
 use std::time::Duration;
@@ -120,6 +120,22 @@ impl Path {
         if self.phase == Phase::Complete {
             self.phase = Phase::Confirm;
         }
+    }
+
+    /// Limits an upward probe after all prior proofs expire, or before its first submission.
+    /// Confirmed DATA size, live proofs and the path ceiling remain unchanged.
+    pub(crate) fn limit_probe(&mut self, max_payload: usize, now: Duration) -> bool {
+        if self.phase != Phase::Search
+            || self.live(now).next().is_some()
+            || self.sent[..self.count].iter().any(|entry| now < entry.at)
+            || max_payload <= self.limit
+            || max_payload >= self.target
+        {
+            return false;
+        }
+        self.count = 0;
+        self.target = max_payload;
+        true
     }
 
     /// Applies expired probe timers and returns the next probe size, when due.
@@ -539,5 +555,129 @@ mod tests {
         assert!(path.reply(id(u64::MAX), BASE_UDP_PAYLOAD, Duration::MAX));
         path.defer(Duration::MAX);
         assert_eq!(path.deadline(), Duration::MAX);
+    }
+}
+
+#[cfg(test)]
+mod grant_tests {
+    use super::*;
+
+    const RTT: Duration = Duration::from_millis(5);
+
+    fn id(packet: u64) -> ProbeId {
+        ProbeId {
+            session: 1,
+            tag: 1,
+            lane: 1,
+            packet,
+        }
+    }
+
+    #[test]
+    fn every_mtu_converges_with_two_mss_grants_with_or_without_ptb() {
+        for ptb in [false, true] {
+            for capacity in BASE_UDP_PAYLOAD..=MAX_UDP_PAYLOAD {
+                let mut path = Path::new(MAX_UDP_PAYLOAD, Duration::ZERO).unwrap();
+                let mut now = Duration::ZERO;
+                for packet in 1..=256 {
+                    let budget = 2 * (path.payload_limit() + 48) - 48;
+                    let original_limit = path.payload_limit();
+                    path.limit_probe(budget, now);
+                    assert_eq!(path.payload_limit(), original_limit);
+                    let length = path.poll(now).unwrap();
+                    assert!(length <= budget);
+                    assert!(path.submitted(id(packet), length, now));
+                    if length <= capacity {
+                        now += RTT;
+                        assert!(path.reply(id(packet), length, now));
+                    } else if ptb {
+                        now += RTT;
+                        assert!(path.packet_too_big(id(packet), (capacity + 48) as u32, now));
+                    } else {
+                        now = path.deadline();
+                    }
+                    assert!(path.payload_limit() <= capacity);
+                    assert_eq!(path.ceiling, MAX_UDP_PAYLOAD);
+                    if path.phase == Phase::Complete {
+                        break;
+                    }
+                }
+                assert!(path.phase == Phase::Complete);
+                assert_eq!(path.payload_limit(), capacity);
+            }
+        }
+    }
+
+    #[test]
+    fn grant_limit_changes_only_unsent_search_target() {
+        let mut path = Path::new(MAX_UDP_PAYLOAD, Duration::ZERO).unwrap();
+        assert!(!path.limit_probe(1500, Duration::ZERO));
+        assert!(path.submitted(id(1), BASE_UDP_PAYLOAD, Duration::ZERO));
+        assert!(path.reply(id(1), BASE_UDP_PAYLOAD, RTT));
+        let deadline = path.deadline();
+        let upper = path.upper;
+        let target = path.target;
+        for invalid in [0, BASE_UDP_PAYLOAD, target, usize::MAX] {
+            assert!(!path.limit_probe(invalid, RTT));
+            assert_eq!(path.target, target);
+        }
+        assert!(path.limit_probe(1500, RTT));
+        assert_eq!(path.target, 1500);
+        assert_eq!(path.upper, upper);
+        assert_eq!(path.deadline(), deadline);
+        assert_eq!(path.payload_limit(), BASE_UDP_PAYLOAD);
+        assert!(path.submitted(id(2), 1500, RTT));
+        assert!(!path.limit_probe(1400, RTT));
+        assert_eq!(path.target, 1500);
+        assert_eq!(path.probes(RTT).collect::<Vec<_>>(), [(id(2), 1500)]);
+        assert!(path.reply(id(2), 1500, RTT * 2));
+        path.black_hole(RTT * 3);
+        assert!(!path.limit_probe(1400, RTT * 3));
+        assert_eq!(path.poll(RTT * 3), Some(BASE_UDP_PAYLOAD));
+        assert!(!path.reply(id(2), 1500, RTT * 3));
+        assert!(path.submitted(id(3), BASE_UDP_PAYLOAD, RTT * 3));
+        assert!(path.reply(id(3), BASE_UDP_PAYLOAD, RTT * 4));
+        assert!(path.limit_probe(1400, RTT * 4));
+        assert_eq!(path.target, 1400);
+    }
+}
+
+#[cfg(test)]
+mod expiry_grant_tests {
+    use super::*;
+
+    #[test]
+    fn smaller_probe_waits_for_all_proofs_to_expire_without_confirming_data() {
+        let mut path = Path::new(MAX_UDP_PAYLOAD, Duration::ZERO).unwrap();
+        let mut id = ProbeId {
+            session: 1,
+            tag: 1,
+            lane: 1,
+            packet: 1,
+        };
+        assert!(path.submitted(id, BASE_UDP_PAYLOAD, Duration::ZERO));
+        let now = Duration::from_millis(5);
+        assert!(path.reply(id, BASE_UDP_PAYLOAD, now));
+        let target = path.poll(now).unwrap();
+        id.packet += 1;
+        assert!(path.submitted(id, target, now));
+        let expiry = now + path.timeout * ATTEMPTS as u32;
+        for at in [Duration::ZERO, now, expiry - Duration::from_nanos(1)] {
+            assert!(!path.limit_probe(1500, at));
+            assert_eq!(path.target, target);
+            assert_eq!(path.count, 1);
+        }
+        let upper = path.upper;
+        assert!(path.limit_probe(1500, expiry));
+        assert_eq!(path.count, 0);
+        assert_eq!(path.upper, upper);
+        assert_eq!(path.payload_limit(), BASE_UDP_PAYLOAD);
+        assert!(!path.reply(id, target, expiry));
+        assert!(!path.packet_too_big(id, 1500, expiry));
+        assert_eq!(path.poll(expiry), Some(1500));
+        id.packet += 1;
+        assert!(path.submitted(id, 1500, expiry));
+        assert!(path.reply(id, 1500, expiry + Duration::from_millis(5)));
+        assert_eq!(path.payload_limit(), 1500);
     }
 }

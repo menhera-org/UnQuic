@@ -622,17 +622,19 @@ duplicate spacing. Data submissions recheck frame expiry before each socket
 attempt, including GSO fallback. Handshake/liveness timers and PMTU proofs
 use pre-send time; receive buffers retain post-receive time across GRO expansion
 and handoff. Delayed control sends start their service at submission rather
-than accumulating credit from an earlier worker turn. Incoming
-ACK application and runtime data grants remain unfinished. Pure shared grant
-accounting, draft-07 delivery sampling and the pure BBR controller are implemented.
+than accumulating credit from an earlier worker turn. Incoming ACKs now route
+to TX histories; DATA and probes use the shared grant coordinator and BBR
+controller. Release forwarding, reconnect, allocation and routed-MTU regression
+tests pass; full loss-before-PTO ordering remains open.
 The shared accounting coordinator now reserves sampling handles before grants,
 orders complete send reports and validates generation-qualified feedback. Its
 fixed storage includes one flight buffer per worker and at most 65,535 shared
 sampling records. Pressure retirement can run with no free sampling slot.
 The controller has fixed cycle vectors, model/loss/recovery boundary tests and
 allocation checks; tests/vectors/bbr-07/README.md records draft interpretations.
-Bounded grant batches, shared controller ownership and sender recovery still
-need runtime integration.
+Bounded grant batches and shared controller ownership are connected.
+General application-limited detection and sender payload recovery remain
+unfinished.
 Configuration
 validation now freezes named endpoint/peer/session relationships into numeric
 indices. Cookie lookup uses short scans for small sets and randomized hashing
@@ -683,8 +685,8 @@ unsent holes. Each entry uses 16 bytes plus four bitmap bits, preserving full
 monotonic timestamp range and precision. ACK application has a resumable work
 budget covering word scans, range transitions and callbacks. A pending ACK pins
 history metadata and prevents loss declarations for covered packets; validation
-still completes before any callback. Worker history integration and incoming
-ACK application are not yet connected.
+still completes before any callback. TX owners apply ACKs and bounded loss
+scans, retaining reports until the controller consumes them.
 Pure RTT, loss-deadline, PTO-period and frame
 lifetime calculations and per-frame byte coverage are implemented. Coverage
 tracks at most two repairs per byte and rejects stale loss against a newer
@@ -692,9 +694,11 @@ outstanding copy; packet charges remain separate. The packer accepts exact
 repair ranges while retaining original frame lengths and IDs. A pure bounded
 packet-to-frame journal now supports reservation before I/O, late-ACK mappings
 after loss and direct cleanup by packet or frame. Shared PTO backoff and the
-three-expiry stop/settlement transition are implemented as a pure state machine;
-runtime timer ownership and enforcement remain pending. Its integration, payload
-retention, worker loss recovery and congestion control remain unfinished. Per-lane MTU discovery now starts DATA at 1232 bytes
+three-expiry stop/settlement transition now use indexed group timers and shared
+probe allowances. Worker messages preserve unused pending probe commands across
+connection replacement without resetting backoff. Payload retention, selective
+repair and complete congestion-control integration remain unfinished.
+Per-lane MTU discovery now starts DATA at 1232 bytes
 and probes up to the configured ceiling, defaulting to 8952 bytes. Limits and
 gauges reflect confirmation rather than operator assertions. Release routed
 tests verify 9000/1500/1280-byte outer paths with returned and filtered PTB and

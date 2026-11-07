@@ -624,6 +624,13 @@ impl Sender {
         Ok(Some(report))
     }
 
+    /// Whether a bounded commit pass can continue without another worker report.
+    pub(crate) fn commit_pending(&self, group: usize) -> bool {
+        self.groups.get(group).is_some_and(|state| {
+            state.grants.reserved() == 0 && matches!(state.phase, Phase::Closing | Phase::Commit)
+        })
+    }
+
     /// Whether all epoch sends have committed and feedback may be consumed.
     pub fn feedback_ready(&self, group: usize) -> bool {
         self.groups
@@ -804,6 +811,46 @@ fn delivery_error(error: DeliveryError) -> GrantError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_commit_requires_another_turn_but_unreported_grants_do_not() {
+        let (mut sender, flights) = Sender::new(1, 1, 2).unwrap();
+        let mut flight = flights.into_vec().pop().unwrap();
+        let packets = [1, 2].map(|number| Planned {
+            id: PacketId {
+                number,
+                ..PacketId::default()
+            },
+            bytes: 100,
+        });
+        flight.prepare(&packets).unwrap();
+        sender
+            .reserve(
+                0,
+                &mut flight,
+                false,
+                Limits {
+                    window: 1280,
+                    rate: 1_000_000,
+                    quantum: 1280,
+                    max_datagram: 1280,
+                },
+                Duration::ZERO,
+            )
+            .unwrap();
+        sender.close(0).unwrap();
+        assert!(!sender.commit_pending(0));
+        flight.complete(2, Some(Duration::ZERO), false).unwrap();
+        sender.reported(flight).unwrap();
+        assert!(sender.commit_pending(0));
+        assert!(sender.advance(0, 1).unwrap().is_none());
+        assert!(sender.commit_pending(0));
+        assert!(!sender.feedback_ready(0));
+        assert!(sender.advance(0, 1).unwrap().is_some());
+        assert!(!sender.commit_pending(0));
+        assert!(sender.feedback_ready(0));
+        assert!(!sender.commit_pending(1));
+    }
 
     #[test]
     fn identity_and_lifetime_byte_exhaustion_precede_permission_to_send() {

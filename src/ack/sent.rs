@@ -213,6 +213,12 @@ impl History {
     }
 
     /// Numbers below this bound are permanently outside validation history.
+    /// Whether bounded retirement has released every allocated packet number.
+    /// Includes canceled reservations and skipped holes above the last submission.
+    pub const fn is_retired(&self) -> bool {
+        self.final_retired || self.floor > self.allocated
+    }
+
     /// Retiring u64::MAX also makes that last number old without wrapping the bound.
     pub const fn floor(&self) -> u64 {
         self.floor

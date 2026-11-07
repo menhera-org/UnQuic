@@ -19,7 +19,7 @@ use std::{collections::hash_map::DefaultHasher, fmt, hash::Hasher};
 const DATA_OVERHEAD: usize = DATA_PREFIX_LEN;
 const RECORD_PREFIX_LEN: usize = DATA_PREFIX_LEN - HEADER_LEN;
 const MAX_SEQUENCE: u64 = 0x0000_ffff_ffff_ffff;
-static PROBE_PADDING: [u8; MAX_UDP_PAYLOAD - PROBE_PREFIX_LEN] =
+pub(crate) static PROBE_PADDING: [u8; MAX_UDP_PAYLOAD - PROBE_PREFIX_LEN] =
     [0; MAX_UDP_PAYLOAD - PROBE_PREFIX_LEN];
 
 /// Encoding failure, with exhausted identities requiring a new connection.

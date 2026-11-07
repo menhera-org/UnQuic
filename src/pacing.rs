@@ -1,8 +1,7 @@
 //! Owner-local byte grants and the separate control-traffic ceiling.
 //!
-//! The runtime currently uses only control service. Data grants are a pure
-//! accounting component with bounded ordered completion processing. BBR and
-//! worker report routing remain to be connected.
+//! Workers use shared data grants and bounded ordered completion processing.
+//! ACK-only feedback has a separate control ceiling to avoid window deadlock.
 
 mod grants;
 mod sender;
