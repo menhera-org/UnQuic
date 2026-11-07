@@ -339,3 +339,248 @@ fn acked_partial_batches_resume_after_recycle_without_waiting_for_expiry() {
         assert_eq!(worker.counters.queue_drops, 0);
     }
 }
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn crossed_group_acks_finish_before_loss_checks_use_the_only_report() {
+    let (mut workers, _rx) = workers();
+    let descriptors = [(0, 1, 0), (0, 2, 0), (1, 1, 1), (1, 2, 1)];
+    let (mut owner, flights) = Owner::new(2, 2, &descriptors).unwrap();
+    for session in 0..2 {
+        owner.timers.install(session, 1).unwrap();
+    }
+    for (worker, flight) in workers.iter_mut().zip(flights.into_vec()) {
+        let command = worker.sessions[0].installed.unwrap();
+        worker.command(1, command, 0).unwrap();
+        worker.install_sender(1, 1, true).unwrap();
+        worker.sender.owner = None;
+        worker.sender.flight = Some(flight);
+        worker.sender.fresh.resize(2, false);
+        worker.sender.probes.resize(2, None);
+        worker.sender.losses.resize(2, None);
+        for lane in &mut worker.sender.lanes {
+            lane.group = lane.session;
+            for number in 1..=130 {
+                lane.history.reserve(number, 1280, true, true).unwrap();
+                assert!(lane.submitted(number, Duration::ZERO, None));
+            }
+            owner
+                .timers
+                .submitted(lane.session, lane.lane, 1, 130, Duration::ZERO)
+                .unwrap();
+        }
+        let session = 1 - worker.id;
+        let mut ack = worker.sender.ack_free.pop().unwrap();
+        ack.session = session;
+        ack.tag = 1;
+        ack.lane = worker.id as u16 + 1;
+        ack.received = Duration::from_millis(1);
+        ack.count = 1;
+        ack.ranges[0] = AckRange { start: 1, end: 130 };
+        worker.sender.incoming.push_back(ack);
+        worker.begin_sender_ack().unwrap();
+        let index = worker.sender_index(session, worker.id).unwrap();
+        let mut report = worker.sender.report.take().unwrap();
+        assert!(
+            worker.sender.lanes[index]
+                .advance_report(&mut report, Duration::from_millis(1), &mut 64,)
+                .unwrap()
+        );
+        assert!(matches!(report.kind, ReportKind::Ack { end: None, .. }));
+        owner.report(report).unwrap();
+    }
+    let mut outgoing = VecDeque::with_capacity(16);
+    for _ in 0..2 {
+        owner
+            .advance(Duration::from_millis(1), &mut outgoing)
+            .unwrap();
+    }
+    while let Some((worker, message)) = outgoing.pop_front() {
+        workers[worker]
+            .sender_message(message, Duration::from_millis(1))
+            .unwrap();
+    }
+    workers[0].sender.owner = Some(owner);
+    for worker in &mut workers {
+        assert_eq!(worker.sender.acks_pending, 1);
+        worker
+            .sender_message(
+                Message::CheckLoss {
+                    group: worker.id,
+                    token: 1,
+                    before: Duration::ZERO,
+                    force: true,
+                },
+                Duration::from_millis(1),
+            )
+            .unwrap();
+        // New duplicate feedback must remain queued while the accepted partial ACK finishes.
+        let mut duplicate = worker.sender.ack_free.pop().unwrap();
+        duplicate.session = 1 - worker.id;
+        duplicate.tag = 1;
+        duplicate.lane = worker.id as u16 + 1;
+        duplicate.received = Duration::from_millis(1);
+        duplicate.count = 1;
+        duplicate.ranges[0] = AckRange { start: 1, end: 130 };
+        worker.sender.incoming.push_back(duplicate);
+        worker.begin_sender_ack().unwrap();
+        assert_eq!(worker.sender.incoming.len(), 1);
+    }
+    for _ in 0..100 {
+        service(&mut workers);
+    }
+    for worker in &workers {
+        assert_eq!(worker.sender.checks_pending, 0);
+        assert_eq!(worker.sender.acks_pending, 0);
+        assert!(worker.sender.incoming.is_empty());
+        assert!(worker.sender.report.is_some());
+        assert!(worker.sender.lanes.iter().all(|lane| {
+            lane.ack.is_none()
+                && !lane.report_pending
+                && lane.history.outstanding().next().is_none()
+        }));
+    }
+    let owner = workers[0].sender.owner.as_ref().unwrap();
+    assert!(owner.timers.earliest(0).is_none());
+    assert!(owner.timers.earliest(1).is_none());
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn loss_check_waits_for_final_report_return_and_survives_replacement_and_queue_pressure() {
+    let (mut workers, _rx) = workers();
+    let worker = &mut workers[1];
+    let index = worker.sender_index(0, 1).unwrap();
+    for number in 1..=65 {
+        worker.sender.lanes[index]
+            .history
+            .reserve(number, 1280, true, true)
+            .unwrap();
+        assert!(worker.sender.lanes[index].submitted(number, Duration::ZERO, None));
+    }
+    worker
+        .sender_message(
+            Message::CheckLoss {
+                group: 0,
+                token: 7,
+                before: Duration::ZERO,
+                force: true,
+            },
+            Duration::ZERO,
+        )
+        .unwrap();
+    assert!(worker.advance_loss_checks(Duration::ZERO, &mut 64).unwrap());
+    let (_, Message::Report(report)) = worker.sender.outgoing.pop_front().unwrap() else {
+        panic!()
+    };
+    assert!(report.count < 65);
+    worker.setup_due = Duration::MAX;
+    worker.mtu_due = Duration::MAX;
+    let other = worker.sender_index(1, 1).unwrap();
+    worker.sender.lanes[other]
+        .begin_loss_check(Duration::ZERO, false)
+        .unwrap();
+    assert_eq!(worker.sender.lanes[other].deadline(), Some(Duration::ZERO));
+    assert_eq!(worker.deadline(Duration::ZERO), Some(Duration::MAX));
+    assert!(!worker.advance_loss_checks(Duration::ZERO, &mut 64).unwrap());
+    assert!(worker.sender.outgoing.is_empty());
+    worker
+        .sender_message(Message::ReportReturn(report), Duration::ZERO)
+        .unwrap();
+    for _ in 0..4 {
+        worker.advance_loss_checks(Duration::ZERO, &mut 64).unwrap();
+        if let Some((_, Message::Report(report))) = worker.sender.outgoing.pop_front() {
+            worker
+                .sender_message(Message::ReportReturn(report), Duration::ZERO)
+                .unwrap();
+        }
+        if worker.sender.lanes[index].scan.is_none() {
+            break;
+        }
+    }
+    // A replacement is allowed only after all reports and old history have drained.
+    while worker.sender.lanes[index]
+        .history
+        .retire_oldest_resolved()
+        .unwrap()
+        .is_some()
+    {}
+    worker.sender.lanes[index].install(2).unwrap();
+    let capacity = worker.sender.outgoing.capacity();
+    for _ in 0..capacity {
+        worker
+            .sender
+            .outgoing
+            .push_back((0, Message::ProbeReplied { group: 0 }));
+    }
+    assert!(!worker.advance_loss_checks(Duration::ZERO, &mut 64).unwrap());
+    assert_eq!(worker.sender.checks_pending, 1);
+    worker.sender.outgoing.clear();
+    assert!(worker.advance_loss_checks(Duration::ZERO, &mut 64).unwrap());
+    assert_eq!(worker.sender.checks_pending, 0);
+    assert!(matches!(
+        worker.sender.outgoing.pop_front().unwrap().1,
+        Message::LossChecked {
+            token: 7,
+            worker: 1,
+            ..
+        }
+    ));
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn sender_queue_pressure_preserves_destination_order_across_partial_sweeps() {
+    let (mut workers, _rx) = workers();
+    let [worker, peer] = &mut workers;
+    let mut filled = 0;
+    while worker
+        .push(1, Event::Sender(Message::ProbeReplied { group: 0 }))
+        .is_ok()
+    {
+        filled += 1;
+    }
+    assert!(filled > 64);
+    worker.sender.outgoing = VecDeque::with_capacity(128);
+    for token in 1..=70 {
+        worker
+            .sender
+            .queue(
+                1,
+                Message::CheckLoss {
+                    group: 0,
+                    token,
+                    before: Duration::ZERO,
+                    force: false,
+                },
+            )
+            .unwrap();
+        if token == 1 {
+            worker.sender.queue(0, Message::Reclaim).unwrap();
+        }
+    }
+    assert!(worker.flush_sender_messages(Duration::ZERO).unwrap());
+    assert!(
+        worker.sender.reclaim.is_some(),
+        "another destination must still progress"
+    );
+    let incoming = peer.incoming[0].as_mut().unwrap();
+    assert!(incoming.try_pop().is_some());
+    // Space appears between budget chunks; the failed head still precedes its suffix.
+    assert!(!worker.flush_sender_messages(Duration::ZERO).unwrap());
+    let mut retained = 0;
+    while let Some(event) = incoming.try_pop() {
+        assert!(matches!(event, Event::Sender(Message::ProbeReplied { .. })));
+        retained += 1;
+    }
+    assert_eq!(retained, filled - 1);
+    for _ in 0..2 {
+        worker.flush_sender_messages(Duration::ZERO).unwrap();
+    }
+    let mut received = Vec::new();
+    while let Some(Event::Sender(Message::CheckLoss { token, .. })) = incoming.try_pop() {
+        received.push(token);
+    }
+    assert_eq!(received, (1..=70).collect::<Vec<_>>());
+    assert!(worker.sender.outgoing.is_empty());
+}

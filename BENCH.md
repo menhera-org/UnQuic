@@ -18,7 +18,8 @@ Neither the local **20 Gbit/s in each direction** gate nor the real
 remain unfinished. Workers now use the shared draft-07 controller and grant
 accounting. Its first 20-second QinQ sweep delivers only about 0.7 Gbit/s each
 way while using about 1.6–1.7 CPUs per daemon: a severe integration regression,
-far below the CPU ceiling. A matched attribution experiment is still needed.
+far below the CPU ceiling. An instrumented comparison below identifies one
+batch-shrinking defect; it leaves most of the regression unresolved.
 General application-limited detection and payload repair remain open.
 PMTU discovery is active in the latest rate sweeps and
 passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
@@ -50,7 +51,7 @@ earlier tables retain their original builds and test conditions.
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
 | At least 20 Gbit/s each way at inner MTU 1500 | First sender-integration QinQ sweep: 0.76 / 0.70 Gbit/s paced, 0.75 / 0.71 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 96.29 / 96.56%. Five successful repeats and the under-1% gate remain unmet. |
-| Goodput must plateau under excess traffic | Latest QinQ declines 2.7% forward and rises 3.1% reverse from 21G to unlimited; the 16G return delivers 7.63 / 14.71 versus 7.76 / 14.88 initially | The severe prototype collapse is fixed, but the remaining decline is unresolved. Bounded foreign-source batching and larger receive groups reduce syscalls; reader/receive scheduling still needs attribution. |
+| Goodput must plateau under excess traffic | First sender sweep stays near 0.7 Gbit/s from 16G through unlimited; daemon CPU remains below two cores. The earlier expiry sweep declined 2.7% forward under unlimited load | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
 | Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Current QinQ reports zero reordering; single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
@@ -109,10 +110,19 @@ Default-feature tests, the all-feature release suite, kernel regressions,
 Clippy and the Rust 1.89 compatibility check pass. These checks establish correctness for the
 tested cases, not a throughput improvement.
 
-Controlled release rate sweeps, unlimited-load profiling, complete loss-before-PTO
-ordering, general application-limited detection and runtime payload repair remain
-required. Grant issuance, expiry and cancellation counters now distinguish send
+Further controlled release rate sweeps, unlimited-load profiling, general
+application-limited detection and runtime payload repair remain required.
+Grant issuance, expiry and cancellation counters now distinguish send
 permission failures from admission pressure, queue drops and socket overflow.
+
+The loss-before-PTO barrier now waits for send commits, every worker's bounded
+loss scan and the final report return. Third-expiry forced loss settlement also
+finishes before probes. Saturated handoffs retain per-destination message order.
+The combined barrier and rejected-grant fix pass 322 release tests, 51 short
+kernel tests and the routed 9000 → 1500 → 1280 → 9000 test (651.69 seconds),
+plus Clippy and Rust 1.89 checks. The routed test verifies no outer fragments.
+One reconnect needed 28.90 seconds after carrier returned before new-generation
+ACK progress; that service delay remains a gap despite the regression test passing.
 
 ## First paced sender sweep (November 7)
 
@@ -142,6 +152,34 @@ Of 164,797 / 167,474 received send grants, 1,047 / 865 expired and
 14,533 / 19,015 were canceled. These units differ; they cannot be summed into
 an exact frame-loss total. Final pacing gauges were sampled after draining and
 must not be used as steady-load controller rates.
+
+### Rejected grant shrinks later batches
+
+A regression test reproduces a scheduling defect: a closed sender trims a
+prepared sixteen-packet request to ten packets before rejecting the grant.
+Even when later credit fits sixteen, the request retains only ten. Reserving
+the prefix now restores the original plan on rejection; the same test then
+receives all sixteen packets in its grant.
+
+[Instrumented observations](benches/tap-sender-prefix-diagnostic.json) compare
+`c999431` with this fix alone. Both builds contain identical temporary counters
+and receive one statistics signal per second. Each pair uses two consecutive
+ten-second points at 21 Gbit/s requested each way, with the same QinQ profile
+as the release sweep above. Builds and other tests were stopped during measurement.
+
+| Build / point | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| Instrumented baseline / 1 | 0.68 / 0.55 | 96.52 / 97.22 | 163.51 / 145.46 |
+| Instrumented baseline / 2 | 0.71 / 0.65 | 96.41 / 96.72 | 165.14 / 152.15 |
+| Preserve rejected batch / 1 | 0.98 / 0.95 | 95.10 / 95.31 | 166.44 / 164.00 |
+| Preserve rejected batch / 2 | 0.97 / 0.95 | 95.18 / 95.31 | 174.71 / 172.16 |
+
+The regression test proves the defect. The measured gain leaves throughput far
+below the target. Sampled waiting time is concentrated in send-commit/feedback
+serialization and pacing; sampling storage never fills. These timings are
+approximate observations at coordinator visits, not exact phase-transition
+measurements. The diagnostic builds' hashes were not captured, so these points
+are exploratory evidence and do not replace the normal release acceptance sweep.
 
 The verified facts are low delivered throughput, low CPU utilization and heavy
 upstream dropping/expiry. Grant and feedback serialization, congestion-window

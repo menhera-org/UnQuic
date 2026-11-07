@@ -73,6 +73,21 @@ impl Lane {
         submitted
     }
 
+    /// Starts a fresh barrier pass only after the preceding pass/report has finished.
+    pub(super) fn begin_loss_check(&mut self, before: Duration, force: bool) -> io::Result<()> {
+        if self.ack.is_some() || self.report_pending || self.scan.is_some() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        self.scan = Some(self.history.outstanding_scan());
+        self.scan_cutoff = self.forced_before.take();
+        if force {
+            self.scan_cutoff = Some(self.scan_cutoff.map_or(before, |old| old.max(before)));
+        }
+        self.scan_due = None;
+        self.loss_due = None;
+        Ok(())
+    }
+
     /// Queue a fixed-cutoff sweep; newer sends cannot extend an in-progress pass.
     pub(in crate::worker) fn force_loss(&mut self, cutoff: Duration) {
         if self.scan_cutoff.is_none_or(|old| cutoff > old) {

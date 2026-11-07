@@ -111,10 +111,17 @@ pub(crate) enum Message {
         epoch: u64,
         count: u8,
     },
-    Lost {
+    CheckLoss {
         group: usize,
-        epoch: u64,
+        token: u64,
         before: Duration,
+        force: bool,
+    },
+    LossChecked {
+        group: usize,
+        token: u64,
+        worker: usize,
+        next_due: Option<Duration>,
     },
     ProbeReplied {
         group: usize,
@@ -182,13 +189,26 @@ pub(super) struct Job {
     pub(super) kind: JobKind,
 }
 
+#[derive(Clone, Copy)]
+struct LossCheck {
+    token: u64,
+    before: Duration,
+    force: bool,
+    cursor: usize,
+    started: Option<u64>,
+    next_due: Option<Duration>,
+}
+
 pub(super) struct State {
     pub(super) owner: Option<Owner>,
     pub(super) fresh: Vec<bool>,
     reclaim: Option<usize>,
     pub(super) permitted: bool,
     pub(super) probes: Vec<Option<(u64, PacketId, u8)>>,
-    pub(super) losses: Vec<Option<(u64, Duration, usize)>>,
+    losses: Vec<Option<LossCheck>>,
+    loss_cursor: usize,
+    checks_pending: usize,
+    acks_pending: usize,
     pub(super) offsets: Vec<usize>,
     pub(super) lanes: Vec<Lane>,
     pub(super) cursor: usize,
@@ -199,6 +219,9 @@ pub(super) struct State {
     pub(super) ack_free: Vec<Box<Ack>>,
     pub(super) incoming: VecDeque<Box<Ack>>,
     pub(super) outgoing: VecDeque<(usize, Message)>,
+    outgoing_cursor: usize,
+    outgoing_left: usize,
+    outgoing_blocked: u64,
 }
 
 impl State {
@@ -280,6 +303,9 @@ impl State {
             permitted: false,
             probes,
             losses,
+            loss_cursor: 0,
+            checks_pending: 0,
+            acks_pending: 0,
             offsets,
             lanes,
             cursor: 0,
@@ -289,6 +315,9 @@ impl State {
             ack_free,
             incoming,
             outgoing,
+            outgoing_cursor: 0,
+            outgoing_left: 0,
+            outgoing_blocked: 0,
         })
     }
 
@@ -298,6 +327,18 @@ impl State {
         }
         let index = self.offsets.get(session)?.checked_add(lane / workers)?;
         (index < *self.offsets.get(session + 1)?).then_some(index)
+    }
+
+    pub(super) fn feedback_deadline(&self) -> Option<Duration> {
+        // Report returns wake us. Active checks instead schedule their own bounded continuation.
+        if self.report.is_none() || self.checks_pending != 0 {
+            return None;
+        }
+        self.lanes
+            .iter()
+            .filter(|lane| self.acks_pending == 0 || lane.ack.is_some())
+            .filter_map(Lane::deadline)
+            .min()
     }
 
     fn queue(&mut self, worker: usize, message: Message) -> io::Result<()> {
@@ -368,6 +409,10 @@ impl Worker {
     }
 
     pub(super) fn begin_sender_ack(&mut self) -> io::Result<()> {
+        // A finite loss pass cannot wait behind an endless stream of duplicate ACKs.
+        if self.sender.checks_pending != 0 {
+            return Ok(());
+        }
         for _ in 0..self.sender.incoming.len().min(BATCH_SIZE) {
             let Some(ack) = self.sender.incoming.pop_front() else {
                 break;
@@ -394,6 +439,8 @@ impl Worker {
             }
             if let Err(ack) = lane.begin_ack(ack) {
                 self.return_ack(ack)?;
+            } else {
+                self.sender.acks_pending += 1;
             }
         }
         Ok(())
@@ -420,7 +467,7 @@ impl State {
             )?
             .checked_add(groups.checked_mul(
                 size_of::<Option<(u64, PacketId, u8)>>()
-                    + size_of::<Option<(u64, Duration, usize)>>()
+                    + size_of::<Option<LossCheck>>()
                     + size_of::<bool>(),
             )?)?;
         workers
@@ -609,6 +656,7 @@ impl Worker {
                     self.sender.cursor = index;
                 }
                 if let Some(ack) = ack {
+                    self.sender.acks_pending -= 1;
                     self.return_ack(ack)?;
                 }
                 self.sender.report = Some(report);
@@ -623,19 +671,41 @@ impl Worker {
                 .as_mut()
                 .ok_or(io::ErrorKind::InvalidData)?
                 .return_probe(group, epoch, count)?,
-            Message::Lost {
+            Message::CheckLoss {
                 group,
-                epoch,
+                token,
                 before,
+                force,
             } => {
                 let loss = self
                     .sender
                     .losses
                     .get_mut(group)
                     .ok_or(io::ErrorKind::InvalidInput)?;
-                if loss.is_none_or(|(old, _, _)| epoch > old) {
-                    *loss = Some((epoch, before, 0));
+                if loss.is_some() {
+                    return Err(io::Error::other("overlapping loss checks"));
                 }
+                *loss = Some(LossCheck {
+                    token,
+                    before,
+                    force,
+                    cursor: 0,
+                    started: None,
+                    next_due: None,
+                });
+                self.sender.checks_pending += 1;
+            }
+            Message::LossChecked {
+                group,
+                token,
+                worker,
+                next_due,
+            } => {
+                self.sender
+                    .owner
+                    .as_mut()
+                    .ok_or(io::ErrorKind::InvalidData)?
+                    .loss_checked(group, token, worker, next_due)?;
             }
             Message::Probe {
                 group,
@@ -674,11 +744,31 @@ impl Worker {
     }
 
     pub(super) fn flush_sender_messages(&mut self, now: Duration) -> io::Result<bool> {
+        if self.sender.outgoing_left == 0 {
+            self.sender.outgoing_cursor = 0;
+            self.sender.outgoing_blocked = 0;
+            self.sender.outgoing_left = self.sender.outgoing.len();
+        }
         let mut progress = false;
-        for _ in 0..self.sender.outgoing.len().min(BATCH_SIZE) {
-            let Some((worker, message)) = self.sender.outgoing.pop_front() else {
-                break;
-            };
+        for _ in 0..self.sender.outgoing_left.min(BATCH_SIZE) {
+            let index = self.sender.outgoing_cursor;
+            let worker = self
+                .sender
+                .outgoing
+                .get(index)
+                .ok_or(io::ErrorKind::InvalidData)?
+                .0;
+            self.sender.outgoing_left -= 1;
+            let bit = 1_u64 << worker;
+            if self.sender.outgoing_blocked & bit != 0 {
+                self.sender.outgoing_cursor += 1;
+                continue;
+            }
+            let (_, message) = self
+                .sender
+                .outgoing
+                .remove(index)
+                .ok_or(io::ErrorKind::InvalidData)?;
             if worker == self.id {
                 self.sender_message(message, now)?;
                 progress = true;
@@ -686,13 +776,122 @@ impl Worker {
                 match self.push(worker, Event::Sender(message)) {
                     Ok(()) => progress = true,
                     Err(Event::Sender(message)) => {
-                        self.sender.outgoing.push_back((worker, message));
+                        // Keep destination FIFO across partial sweeps and mid-sweep queue relief.
+                        self.sender.outgoing.insert(index, (worker, message));
+                        self.sender.outgoing_cursor += 1;
+                        self.sender.outgoing_blocked |= bit;
                     }
                     Err(_) => return Err(io::ErrorKind::InvalidData.into()),
                 }
             }
         }
-        Ok(progress)
+        Ok(progress || self.sender.outgoing_left != 0)
+    }
+
+    fn advance_loss_checks(&mut self, now: Duration, budget: &mut usize) -> io::Result<bool> {
+        let mut more = false;
+        for _ in 0..self.sender.losses.len().min(BATCH_SIZE) {
+            if *budget == 0 {
+                return Ok(self.sender.checks_pending != 0);
+            }
+            let group = self.sender.loss_cursor;
+            self.sender.loss_cursor = (group + 1) % self.sender.losses.len();
+            let Some(mut check) = self.sender.losses[group] else {
+                continue;
+            };
+            *budget -= 1;
+            while *budget != 0 && check.cursor < self.sender.lanes.len() {
+                let lane = &mut self.sender.lanes[check.cursor];
+                if lane.group != group {
+                    check.cursor += 1;
+                    *budget -= 1;
+                    continue;
+                }
+                if lane.report_pending || self.sender.report.is_none() {
+                    break;
+                }
+                if check
+                    .started
+                    .is_some_and(|generation| generation != lane.generation)
+                {
+                    // Installing another generation required all old reports and charges to drain.
+                    check.started = None;
+                    check.cursor += 1;
+                    *budget -= 1;
+                    continue;
+                }
+                if check.started.is_some() && lane.scan.is_none() {
+                    check.next_due = match (check.next_due, lane.loss_due) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    check.started = None;
+                    check.cursor += 1;
+                    *budget -= 1;
+                    continue;
+                }
+                if lane.scan.is_none() {
+                    lane.begin_loss_check(check.before, check.force)?;
+                    check.started = Some(lane.generation);
+                }
+                let mut report = self
+                    .sender
+                    .report
+                    .take()
+                    .ok_or(io::ErrorKind::InvalidData)?;
+                let prior = *budget;
+                let produced = lane.advance_report(&mut report, now, budget)?;
+                if *budget == prior {
+                    *budget -= 1;
+                }
+                if produced {
+                    self.sender.queue(0, Message::Report(report))?;
+                    more = true;
+                    break;
+                }
+                self.sender.report = Some(report);
+            }
+            if check.cursor == self.sender.lanes.len()
+                && self.sender.outgoing.len()
+                    < self
+                        .sender
+                        .outgoing
+                        .capacity()
+                        .saturating_sub(6 * self.shared.workers())
+            {
+                self.sender.queue(
+                    0,
+                    Message::LossChecked {
+                        group,
+                        token: check.token,
+                        worker: self.id,
+                        next_due: check.next_due,
+                    },
+                )?;
+                self.sender.losses[group] = None;
+                self.sender.checks_pending -= 1;
+                more = true;
+            } else {
+                self.sender.losses[group] = Some(check);
+                // Reports in transit wake us when returned; do not spin waiting for them.
+                more |= self.sender.report.is_some()
+                    && self.sender.outgoing.len()
+                        < self
+                            .sender
+                            .outgoing
+                            .capacity()
+                            .saturating_sub(6 * self.shared.workers());
+            }
+        }
+        Ok(more
+            || (self.sender.checks_pending != 0
+                && self.sender.report.is_some()
+                && self.sender.outgoing.len()
+                    < self
+                        .sender
+                        .outgoing
+                        .capacity()
+                        .saturating_sub(6 * self.shared.workers())))
     }
 
     pub(super) fn service_sender(&mut self, now: Duration) -> io::Result<bool> {
@@ -715,25 +914,8 @@ impl Worker {
             }
         }
         let mut budget = BATCH_SIZE;
-        for group in 0..self.sender.losses.len() {
-            let Some((_, before, cursor)) = &mut self.sender.losses[group] else {
-                continue;
-            };
-            while budget != 0 && *cursor < self.sender.lanes.len() {
-                let lane = &mut self.sender.lanes[*cursor];
-                if lane.group == group {
-                    lane.force_loss(*before);
-                }
-                *cursor += 1;
-                budget -= 1;
-            }
-            if *cursor == self.sender.lanes.len() {
-                self.sender.losses[group] = None;
-            }
-            if budget == 0 {
-                more = true;
-                break;
-            }
+        if self.sender.acks_pending == 0 {
+            more |= self.advance_loss_checks(now, &mut budget)?;
         }
         for _ in 0..self.sender.lanes.len().min(BATCH_SIZE) {
             if budget == 0 {
@@ -746,6 +928,13 @@ impl Worker {
             let index = self.sender.cursor;
             self.sender.cursor = (index + 1) % self.sender.lanes.len();
             let lane = &mut self.sender.lanes[index];
+            if lane.ack.is_none()
+                && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0)
+            {
+                self.sender.report = Some(report);
+                budget -= 1;
+                continue;
+            }
             if self.sessions[lane.session].connection.is_none() {
                 lane.force_loss(now);
             }
@@ -771,6 +960,7 @@ impl Worker {
                 self.sender.report = Some(report);
             }
         }
+        more |= budget == 0 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0);
         if self.sender.owner.is_some() {
             // Reports can have arrived after the worker turn's original timestamp.
             let observed = self.io_clock(now)()?;

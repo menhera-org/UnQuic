@@ -530,7 +530,8 @@ history/slot reuse cycles; reserved-memory estimates match actual allocations.
 Worker zero owns the controllers and ordered sampler; TX workers own histories.
 Send-report storage is separate from feedback buffers. RTT uses original receive
 time, while delivery accounting uses fresh owner observation time. The
-one-flight-per-worker bound and epoch latency still need throughput measurement.
+first paced release sweep delivers only 0.67 to 0.76 Gbit/s per direction;
+`BENCH.md` records the regression and ongoing scheduling investigation.
 
 The pure RTT estimator, loss-deadline calculation, PTO-period backoff and frame
 lifetime now live in `loss.rs`, with exact-value and boundary tests. ACK-driven
@@ -547,8 +548,13 @@ overflow and allocation-free transitions. Runtime grants now enforce the allowan
 workers run bounded loss passes and gate liveness/PMTU probes. Blocked PMTU requests
 release their flight buffer; PTO dispatch preempts an ungranted ordinary request.
 Pending probe commands survive generation changes without resetting backoff.
-Complete loss-before-PTO ordering and payload repair still need verification
-and integration.
+The coordinator now closes grants before each PTO loss check and waits for
+physical send commits, bounded worker scans and final report returns. The third
+unanswered expiry waits for forced settlement before probes. Stable per-worker
+message ordering preserves this barrier under queue pressure; accepted ACKs
+finish before scans, and new ACKs wait. Tests cover crossed groups, generation
+replacement, elapsed loss deadlines and saturated handoff queues. Payload repair
+still needs runtime integration.
 
 Pure per-frame byte coverage now lives in `loss::FrameRecovery`, with two-repair
 limits, outstanding-generation checks, late ACK handling and bounded slot reuse.

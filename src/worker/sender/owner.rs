@@ -17,6 +17,16 @@ pub(crate) struct Request {
     pub pmtu: bool,
 }
 
+struct LossBarrier {
+    token: u64,
+    before: Duration,
+    force: bool,
+    unsent: u64,
+    pending: u64,
+    next_due: Option<Duration>,
+    dirty: bool,
+}
+
 struct Group {
     controller: Controller,
     rtt: Rtt,
@@ -25,8 +35,8 @@ struct Group {
     ack: Option<(usize, PacketId)>,
     cwnd_limited: bool,
     recovery: Option<Duration>,
-    lost: u64,
-    lost_at: Duration,
+    loss_serial: u64,
+    check: Option<LossBarrier>,
     probe: Option<(Option<PacketId>, u8)>,
 }
 
@@ -64,8 +74,8 @@ impl Owner {
                 ack: None,
                 cwnd_limited: false,
                 recovery: None,
-                lost: 0,
-                lost_at: Duration::ZERO,
+                loss_serial: 0,
+                check: None,
                 probe: None,
             });
         }
@@ -143,6 +153,12 @@ impl Owner {
             return Err(io::Error::other("duplicate sender feedback"));
         }
         self.sender.close(report.group).map_err(io::Error::other)?;
+        if matches!(report.kind, ReportKind::Ack { .. })
+            && let Some(check) = &mut self.groups[report.group].check
+            && check.pending & (1_u64 << report.origin) == 0
+        {
+            check.dirty = true;
+        }
         self.rescan |= report.group < self.cursor;
         self.reports.push_back(report);
         Ok(())
@@ -186,6 +202,172 @@ impl Owner {
         state.probe = Some((None, total.ok_or(io::ErrorKind::InvalidInput)?));
         self.rescan |= group < self.cursor;
         Ok(())
+    }
+
+    fn start_loss_check(&mut self, group: usize, before: Duration, force: bool) -> io::Result<()> {
+        self.sender.close(group).map_err(io::Error::other)?;
+        let state = &mut self.groups[group];
+        state.loss_serial = state
+            .loss_serial
+            .checked_add(1)
+            .ok_or(io::ErrorKind::Other)?;
+        let mask = u64::MAX >> (64 - self.requests.len());
+        state.check = Some(LossBarrier {
+            token: state.loss_serial,
+            before,
+            force,
+            unsent: mask,
+            pending: mask,
+            next_due: None,
+            dirty: false,
+        });
+        Ok(())
+    }
+
+    pub(super) fn loss_checked(
+        &mut self,
+        group: usize,
+        token: u64,
+        worker: usize,
+        next_due: Option<Duration>,
+    ) -> io::Result<()> {
+        if worker >= self.requests.len() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let state = self
+            .groups
+            .get_mut(group)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        let Some(check) = &mut state.check else {
+            return Ok(());
+        };
+        if token != check.token {
+            return Ok(());
+        }
+        let bit = 1_u64 << worker;
+        if check.unsent & bit != 0 || check.pending & bit == 0 {
+            return Err(io::Error::other("unexpected loss-check completion"));
+        }
+        check.pending &= !bit;
+        check.next_due = match (check.next_due, next_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.rescan |= group < self.cursor;
+        Ok(())
+    }
+
+    fn advance_pto(
+        &mut self,
+        group: usize,
+        now: Duration,
+        outgoing: &mut VecDeque<(usize, Message)>,
+    ) -> io::Result<bool> {
+        let latest = self.timers.earliest(group);
+        let due = self.groups[group]
+            .pto
+            .deadline(&self.groups[group].rtt, latest.map(|(_, at)| at));
+        let mut more = false;
+        if self.groups[group].check.is_none() && due.is_some_and(|at| at <= now) {
+            self.start_loss_check(group, now, false)?;
+            more = true;
+        }
+        if let Some(check) = &self.groups[group].check
+            && check.pending == 0
+        {
+            let force = check.force;
+            let repeat = check.dirty || check.next_due.is_some_and(|at| at <= now);
+            self.groups[group].check = None;
+            if !force && due.is_some_and(|at| at <= now) {
+                if repeat {
+                    self.start_loss_check(group, now, false)?;
+                } else {
+                    let state = &mut self.groups[group];
+                    if let Some(expiry) =
+                        state.pto.expire(now, &state.rtt, latest.map(|(_, at)| at))
+                    {
+                        state.epoch = state.epoch.checked_add(1).ok_or(io::ErrorKind::Other)?;
+                        state.probe = Some((
+                            latest
+                                .map(|(id, _)| id)
+                                .or_else(|| self.timers.installed(group)),
+                            expiry.probe_limit,
+                        ));
+                        if expiry.declare_lost {
+                            self.start_loss_check(group, now, true)?;
+                        } else {
+                            self.sender
+                                .probe_allowance(group, expiry.probe_limit)
+                                .map_err(io::Error::other)?;
+                        }
+                    }
+                }
+            } else if force && let Some((_, count)) = self.groups[group].probe {
+                self.sender
+                    .probe_allowance(group, count)
+                    .map_err(io::Error::other)?;
+            }
+            more = true;
+        }
+        if let Some(check) = &mut self.groups[group].check {
+            if self.sender.feedback_ready(group)
+                && check.unsent != 0
+                && outgoing.len() < outgoing.capacity().saturating_sub(6 * self.requests.len())
+            {
+                let worker = check.unsent.trailing_zeros() as usize;
+                outgoing.push_back((
+                    worker,
+                    Message::CheckLoss {
+                        group,
+                        token: check.token,
+                        before: check.before,
+                        force: check.force,
+                    },
+                ));
+                check.unsent &= !(1_u64 << worker);
+                more = true;
+            }
+            // Completions and returned reports wake the owner. An expired PTO must not spin.
+            return Ok(more);
+        }
+        if self.sender.feedback_ready(group) {
+            self.sender.reopen(group).map_err(io::Error::other)?;
+        }
+        let state = &mut self.groups[group];
+        if let Some(at) = state.pto.deadline(&state.rtt, latest.map(|(_, at)| at)) {
+            self.round_due = Some(self.round_due.map_or(at, |old| old.min(at)));
+        }
+        if outgoing.len() < outgoing.capacity().saturating_sub(6 * self.requests.len())
+            && let Some((target, count)) = state.probe
+            && let Some(id) = target
+                .filter(|id| self.timers.matches(*id))
+                .or_else(|| self.timers.installed(group))
+        {
+            let worker = (usize::from(id.lane) - 1) % self.requests.len();
+            let preempt = self.requests[worker]
+                .as_ref()
+                .is_some_and(|r| r.probe.is_none());
+            if outgoing.capacity() - outgoing.len() < 1 + usize::from(preempt) {
+                return Ok(more);
+            }
+            if preempt && let Some(request) = self.requests[worker].take() {
+                outgoing.push_back((worker, Message::Recycle(request.flight)));
+            }
+            state.probe = None;
+            outgoing.push_back((
+                worker,
+                Message::Probe {
+                    group,
+                    epoch: state.epoch,
+                    session: id.session,
+                    generation: id.generation,
+                    lane: id.lane,
+                    count,
+                },
+            ));
+            more = true;
+        }
+        Ok(more)
     }
 
     // All producers retain their pooled message when the handoff queue is full.
@@ -242,83 +424,18 @@ impl Owner {
                     more = true;
                 }
                 if self.groups[group].ack.is_none()
+                    && self.groups[group].check.is_none()
                     && !self.reports.iter().any(|r| r.group == group)
                 {
                     self.sender.reopen(group).map_err(io::Error::other)?;
                 } else {
-                    more |= self.groups[group].ack.is_none();
+                    more |= self.groups[group].ack.is_none()
+                        && self.reports.iter().any(|r| r.group == group);
                 }
             }
             // A feedback transaction takes precedence over PTO and cannot lose its ACKed entries.
             if self.groups[group].ack.is_none() && !self.reports.iter().any(|r| r.group == group) {
-                let latest = self.timers.earliest(group);
-                let state = &mut self.groups[group];
-                if let Some(expiry) = state.pto.expire(now, &state.rtt, latest.map(|(_, at)| at)) {
-                    state.epoch = state.epoch.checked_add(1).ok_or(io::ErrorKind::Other)?;
-                    self.sender
-                        .probe_allowance(group, expiry.probe_limit)
-                        .map_err(io::Error::other)?;
-                    state.probe = Some((
-                        latest
-                            .map(|(id, _)| id)
-                            .or_else(|| self.timers.installed(group)),
-                        expiry.probe_limit,
-                    ));
-                    if expiry.declare_lost {
-                        state.lost = u64::MAX >> (64 - self.requests.len());
-                        state.lost_at = now;
-                    }
-                }
-                if let Some(at) = state.pto.deadline(&state.rtt, latest.map(|(_, at)| at)) {
-                    self.round_due = Some(self.round_due.map_or(at, |old| old.min(at)));
-                }
-                if state.lost != 0
-                    && outgoing.len() < outgoing.capacity().saturating_sub(6 * self.requests.len())
-                {
-                    let worker = state.lost.trailing_zeros() as usize;
-                    outgoing.push_back((
-                        worker,
-                        Message::Lost {
-                            group,
-                            epoch: state.epoch,
-                            before: state.lost_at,
-                        },
-                    ));
-                    state.lost &= state.lost - 1;
-                    more = true;
-                }
-                if state.lost == 0
-                    && outgoing.len() < outgoing.capacity().saturating_sub(6 * self.requests.len())
-                    && let Some((target, count)) = state.probe
-                    && let Some(id) = target
-                        .filter(|id| self.timers.matches(*id))
-                        .or_else(|| self.timers.installed(group))
-                {
-                    let worker = (usize::from(id.lane) - 1) % self.requests.len();
-                    let preempt = self.requests[worker]
-                        .as_ref()
-                        .is_some_and(|r| r.probe.is_none());
-                    if outgoing.capacity() - outgoing.len() < 1 + usize::from(preempt) {
-                        more = true;
-                        continue;
-                    }
-                    if preempt && let Some(request) = self.requests[worker].take() {
-                        outgoing.push_back((worker, Message::Recycle(request.flight)));
-                    }
-                    state.probe = None;
-                    outgoing.push_back((
-                        worker,
-                        Message::Probe {
-                            group,
-                            epoch: state.epoch,
-                            session: id.session,
-                            generation: id.generation,
-                            lane: id.lane,
-                            count,
-                        },
-                    ));
-                    more = true;
-                }
+                more |= self.advance_pto(group, now, outgoing)?;
             }
         }
         // Complete one bounded sweep before sleeping or replacing its minimum.
@@ -434,15 +551,14 @@ impl Owner {
                 }
                 bytes = next;
             }
-            let result = request.flight.truncate(bytes).and_then(|_| {
-                self.sender.reserve(
-                    request.group,
-                    &mut request.flight,
-                    request.probe.is_some(),
-                    limits,
-                    now,
-                )
-            });
+            let result = self.sender.reserve_prefix(
+                request.group,
+                &mut request.flight,
+                bytes,
+                request.probe.is_some(),
+                limits,
+                now,
+            );
             match result {
                 Ok(()) => {
                     outgoing.push_back((worker, Message::Permit(request.flight)));
@@ -1080,5 +1196,234 @@ mod returned_probe_tests {
         assert_eq!(owner.groups[0].probe, Some((None, 2)));
         owner.return_probe(0, 2, 2).unwrap();
         assert_eq!(owner.groups[0].probe, Some((None, 2)));
+    }
+}
+
+#[cfg(test)]
+mod loss_barrier_tests {
+    use super::*;
+
+    fn setup() -> (Owner, VecDeque<(usize, Message)>) {
+        let (mut owner, _) = Owner::new(1, 1, &[(0, 1, 0)]).unwrap();
+        owner.timers.install(0, 1).unwrap();
+        owner.timers.submitted(0, 1, 1, 1, Duration::ZERO).unwrap();
+        (owner, VecDeque::with_capacity(8))
+    }
+
+    fn check(
+        owner: &mut Owner,
+        outgoing: &mut VecDeque<(usize, Message)>,
+        now: Duration,
+    ) -> (u64, bool) {
+        for _ in 0..3 {
+            owner.advance(now, outgoing).unwrap();
+            if let Some((0, Message::CheckLoss { token, force, .. })) = outgoing.pop_front() {
+                return (token, force);
+            }
+        }
+        panic!("missing loss check");
+    }
+
+    fn settle(owner: &mut Owner, outgoing: &mut VecDeque<(usize, Message)>, now: Duration) {
+        let mut report = Box::new(Report::new(0));
+        report.id = PacketId {
+            session: 0,
+            generation: 1,
+            lane: 1,
+            number: 0,
+        };
+        report.kind = ReportKind::Loss;
+        report.count = 1;
+        report.entries[0] = Entry {
+            number: 1,
+            sample: None,
+            settled: true,
+        };
+        owner.report(report).unwrap();
+        owner.advance(now, outgoing).unwrap();
+        assert!(matches!(
+            outgoing.pop_front().unwrap().1,
+            Message::ReportReturn(_)
+        ));
+    }
+
+    #[test]
+    fn time_loss_settlement_removes_pto_and_waiting_does_not_spin() {
+        let (mut owner, mut outgoing) = setup();
+        let now = owner.groups[0]
+            .pto
+            .deadline(&owner.groups[0].rtt, Some(Duration::ZERO))
+            .unwrap();
+        let (token, force) = check(&mut owner, &mut outgoing, now);
+        assert!(!force);
+        assert!(!owner.advance(now, &mut outgoing).unwrap());
+        assert!(outgoing.is_empty());
+        assert_eq!(owner.due, None);
+        settle(&mut owner, &mut outgoing, now);
+        assert!(!owner.advance(now, &mut outgoing).unwrap());
+        owner.loss_checked(0, token, 0, None).unwrap();
+        owner.advance(now, &mut outgoing).unwrap();
+        assert!(outgoing.is_empty());
+        assert!(owner.groups[0].check.is_none());
+        assert!(!owner.groups[0].pto.stalled());
+        assert_eq!(owner.groups[0].epoch, 0);
+    }
+
+    #[test]
+    fn third_expiry_waits_for_forced_reports_and_worker_completion_before_probes() {
+        let (mut owner, mut outgoing) = setup();
+        for _ in 0..2 {
+            let state = &mut owner.groups[0];
+            let now = state
+                .pto
+                .deadline(&state.rtt, Some(Duration::ZERO))
+                .unwrap();
+            state
+                .pto
+                .expire(now, &state.rtt, Some(Duration::ZERO))
+                .unwrap();
+        }
+        let now = owner.groups[0]
+            .pto
+            .deadline(&owner.groups[0].rtt, Some(Duration::ZERO))
+            .unwrap();
+        let (normal, force) = check(&mut owner, &mut outgoing, now);
+        assert!(!force);
+        owner.loss_checked(0, normal, 0, None).unwrap();
+        let (forced, force) = check(&mut owner, &mut outgoing, now);
+        assert!(force && forced > normal);
+        assert!(owner.groups[0].pto.stalled());
+        settle(&mut owner, &mut outgoing, now);
+        assert!(!owner.advance(now, &mut outgoing).unwrap());
+        assert!(outgoing.is_empty());
+        owner.loss_checked(0, normal, 0, None).unwrap(); // old token cannot release the gate
+        assert!(owner.groups[0].check.is_some());
+        owner.loss_checked(0, forced, 0, None).unwrap();
+        owner.advance(now, &mut outgoing).unwrap();
+        assert!(matches!(
+            outgoing.pop_front().unwrap().1,
+            Message::Probe { count: 2, .. }
+        ));
+        assert!(owner.groups[0].check.is_none());
+    }
+
+    #[test]
+    fn loss_deadline_crossed_in_transit_requires_another_bounded_check() {
+        let (mut owner, mut outgoing) = setup();
+        let now = owner.groups[0]
+            .pto
+            .deadline(&owner.groups[0].rtt, Some(Duration::ZERO))
+            .unwrap();
+        let (token, _) = check(&mut owner, &mut outgoing, now);
+        owner
+            .loss_checked(0, token, 0, Some(now + Duration::from_millis(1)))
+            .unwrap();
+        let (next, force) = check(&mut owner, &mut outgoing, now + Duration::from_millis(2));
+        assert!(next > token && !force);
+        assert_eq!(owner.groups[0].epoch, 0);
+        assert!(owner.loss_checked(0, next, 0, None).is_ok());
+        assert!(owner.loss_checked(0, next, 0, None).is_err());
+    }
+
+    #[test]
+    fn existing_grant_must_commit_before_worker_snapshot_is_requested() {
+        let (mut owner, flights) = Owner::new(1, 1, &[(0, 1, 0)]).unwrap();
+        owner.timers.install(0, 1).unwrap();
+        owner.timers.submitted(0, 1, 1, 1, Duration::ZERO).unwrap();
+        let mut flight = flights.into_vec().pop().unwrap();
+        flight
+            .prepare(&[pacing::Planned {
+                id: PacketId {
+                    session: 0,
+                    generation: 1,
+                    lane: 1,
+                    number: 2,
+                },
+                bytes: 1280,
+            }])
+            .unwrap();
+        owner
+            .sender
+            .reserve(
+                0,
+                &mut flight,
+                false,
+                owner.groups[0].controller.limits(),
+                Duration::ZERO,
+            )
+            .unwrap();
+        let now = owner.groups[0]
+            .pto
+            .deadline(&owner.groups[0].rtt, Some(Duration::ZERO))
+            .unwrap();
+        let mut outgoing = VecDeque::with_capacity(8);
+        owner.advance(now, &mut outgoing).unwrap();
+        assert!(outgoing.is_empty());
+        assert!(!owner.advance(now, &mut outgoing).unwrap());
+        flight.complete(1, Some(Duration::ZERO), false).unwrap();
+        owner.complete(flight).unwrap();
+        owner.advance(now, &mut outgoing).unwrap();
+        assert!(matches!(
+            outgoing.pop_front().unwrap().1,
+            Message::Recycle(_)
+        ));
+        assert!(matches!(
+            outgoing.pop_front().unwrap().1,
+            Message::CheckLoss { .. }
+        ));
+        assert_eq!(owner.sender.flight_bytes(0), Some((0, 1280)));
+        assert_eq!(owner.timers.earliest(0).unwrap().1, Duration::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod blocked_prefix_regression {
+    use super::*;
+    #[test]
+    fn blocked_grant_keeps_the_full_prepared_request() {
+        let (mut owner, flights) = Owner::new(1, 1, &[(0, 1, 0)]).unwrap();
+        owner.timers.install(0, 1).unwrap();
+        let mut flight = flights.into_vec().pop().unwrap();
+        let packets = std::array::from_fn::<_, 16, _>(|index| pacing::Planned {
+            id: PacketId {
+                session: 0,
+                generation: 1,
+                lane: 1,
+                number: index as u64 + 1,
+            },
+            bytes: 1280,
+        });
+        flight.prepare(&packets).unwrap();
+        owner
+            .request(Request {
+                flight,
+                group: 0,
+                deadline: Duration::from_millis(100),
+                probe: None,
+                mtu: 1280,
+                pmtu: false,
+            })
+            .unwrap();
+        owner.sender.close(0).unwrap();
+        owner.groups[0].ack = Some((0, packets[0].id));
+        let mut outgoing = VecDeque::with_capacity(8);
+        owner.advance(Duration::ZERO, &mut outgoing).unwrap();
+        assert!(outgoing.is_empty());
+        assert_eq!(
+            owner.requests[0].as_ref().unwrap().flight.packets().len(),
+            16
+        );
+        owner.groups[0].ack = None;
+        owner.groups[0]
+            .controller
+            .enter_recovery(Duration::ZERO, 100_000, true)
+            .unwrap();
+        owner
+            .advance(Duration::from_millis(1), &mut outgoing)
+            .unwrap();
+        let (_, Message::Permit(flight)) = outgoing.pop_front().unwrap() else {
+            panic!()
+        };
+        assert_eq!(flight.packets().len(), 16);
     }
 }

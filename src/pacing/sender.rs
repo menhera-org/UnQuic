@@ -475,6 +475,25 @@ impl Sender {
         Ok(())
     }
 
+    /// Reserves the largest fitting prefix; a rejected grant leaves the plan intact.
+    pub(crate) fn reserve_prefix(
+        &mut self,
+        group: usize,
+        flight: &mut Flight,
+        budget: u32,
+        probe: bool,
+        limits: Limits,
+        now: Duration,
+    ) -> Result<(), GrantError> {
+        let count = flight.count;
+        flight.truncate(budget)?;
+        let result = self.reserve(group, flight, probe, limits, now);
+        if result.is_err() {
+            flight.count = count;
+        }
+        result
+    }
+
     /// Stops new grants, including for an empty group needing pressure retirement.
     pub fn close(&mut self, group: usize) -> Result<(), GrantError> {
         let state = self.groups.get_mut(group).ok_or(GrantError::Invalid)?;

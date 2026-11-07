@@ -3748,10 +3748,8 @@ impl Worker {
         if let Some(at) = self.sender.owner.as_ref().and_then(|owner| owner.due) {
             due = due.min(at);
         }
-        for lane in &self.sender.lanes {
-            if let Some(at) = lane.deadline() {
-                due = due.min(at);
-            }
+        if let Some(at) = self.sender.feedback_deadline() {
+            due = due.min(at);
         }
         if let Some(feedback) = self.feedback_deadline() {
             due = due.min(feedback);

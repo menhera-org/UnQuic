@@ -625,7 +625,11 @@ and handoff. Delayed control sends start their service at submission rather
 than accumulating credit from an earlier worker turn. Incoming ACKs now route
 to TX histories; DATA and probes use the shared grant coordinator and BBR
 controller. Release forwarding, reconnect, allocation and routed-MTU regression
-tests pass; full loss-before-PTO ordering remains open.
+tests pass. Before PTO, the runtime waits for issued-send commits and each
+worker's bounded loss scan, including the final report return. Third-expiry
+forced settlement completes before probes. Accepted ACK transactions finish
+first; new ACKs wait behind the finite scan. Per-destination FIFO ordering
+preserves these barriers when handoff queues fill.
 The shared accounting coordinator now reserves sampling handles before grants,
 orders complete send reports and validates generation-qualified feedback. Its
 fixed storage includes one flight buffer per worker and at most 65,535 shared

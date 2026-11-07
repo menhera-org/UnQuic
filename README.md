@@ -248,7 +248,11 @@ ACKs and bounded frame cleanup unlink mappings without scanning other histories.
 It is not yet connected to worker sends or recovery.
 The path-group PTO state provides shared backoff and the three-PTO
 stop/settlement transition. Indexed timers and aggregate probe grants now drive
-worker loss dispatch. Complete loss-before-PTO ordering remains open.
+worker loss dispatch. Before PTO, the coordinator waits for issued sends to
+commit and for every worker to finish a bounded loss scan and receive its final
+report back. A third unanswered PTO also waits for forced loss settlement before
+issuing probes. New ACK work waits behind these finite scans; already accepted
+ACK transactions finish first.
 
 ACK, handshake and PROBE_REPLY sends share a 4 MiB/s outer-byte ceiling per
 path group, with a burst of sixteen datagrams. Worker zero owns each fixed
@@ -520,6 +524,8 @@ independently of the lane carrying the ACK. Bounded ACK, loss and retirement
 reports use storage separate from send completions. Startup memory accounting
 includes these histories, the shared sampler and all reserved message buffers.
 
+A rejected grant preserves the complete prepared packet plan, so temporary
+window or pacing pressure cannot permanently shrink subsequent batches.
 Blocked PMTU requests return their flight buffer so DATA can proceed. A PTO
 probe can preempt an ungranted ordinary request; it still uses the shared
 two-probe allowance. Pending probe commands survive connection replacement
@@ -527,8 +533,8 @@ without resetting PTO backoff. After a long outage, carrier can return before
 backed-off probing restores DATA service.
 
 Release forwarding, reconnect, allocation and routed-MTU regression tests pass.
-General application-limited detection, complete loss-before-PTO ordering,
-payload retention and selective repair remain unfinished. This integration
+General application-limited detection, payload retention and selective repair
+remain unfinished. This integration
 does not establish the performance gates.
 
 ## TAP read batching
