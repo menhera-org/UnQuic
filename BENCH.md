@@ -83,6 +83,58 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Bounded pacing-credit experiment (November 7)
+
+A diagnostic candidate retains elapsed pacing credit up to one existing send
+quantum. The current pacer instead starts the next interval at grant issuance,
+so a late owner turn loses elapsed credit. The candidate changes no congestion
+window, outstanding reservation limit, grant lifetime or PTO rule, and never
+refunds unused reservations. Its unit tests demonstrate recovery of late
+partial-quantum opportunities and bounded bursts. It passes 351 release tests,
+Clippy and 68 kernel library checks.
+
+Three sequential release sweeps compare the baseline, candidate and baseline
+again, using the same twenty-second QinQ profile. No live snapshots, local
+builds, local kernel tests or Git packing overlapped measurement. Kernel checks
+ran on a separate machine.
+
+| Build | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | Daemon CPU % L / R |
+| --- | --- | --- | --- | --- |
+| baseline-before | 1 Gbit/s | 0.956 / 0.957 | 0.981 / 0.928 | 101.24 / 95.55 |
+| baseline-before | 4 Gbit/s | 1.781 / 1.610 | 54.784 / 59.162 | 211.24 / 205.30 |
+| baseline-before | 21 Gbit/s | 1.786 / 1.652 | 91.354 / 91.892 | 209.55 / 201.44 |
+| baseline-before | Unlimited | 1.759 / 1.609 | 96.956 / 96.775 | 199.41 / 198.37 |
+| candidate | 1 Gbit/s | 0.979 / 0.980 | 0.987 / 0.888 | 100.64 / 92.88 |
+| candidate | 4 Gbit/s | 1.827 / 1.607 | 53.615 / 59.244 | 214.89 / 206.28 |
+| candidate | 21 Gbit/s | 1.731 / 1.559 | 91.624 / 92.373 | 206.98 / 200.79 |
+| candidate | Unlimited | 1.683 / 1.495 | 96.961 / 96.972 | 197.67 / 192.23 |
+| baseline-after | 1 Gbit/s | 0.979 / 0.979 | 0.941 / 0.903 | 99.75 / 94.95 |
+| baseline-after | 4 Gbit/s | 1.811 / 1.569 | 53.966 / 60.188 | 208.66 / 206.68 |
+| baseline-after | 21 Gbit/s | 1.805 / 1.631 | 91.258 / 92.054 | 213.26 / 207.03 |
+| baseline-after | Unlimited | 1.823 / 1.638 | 96.825 / 96.591 | 208.66 / 203.02 |
+
+The candidate's unlimited goodput is below both baseline observations:
+4.3–7.6% lower forward and 7.1–8.7% lower reverse. Admission pressure is
+16,593 / 1,469, compared with 6,843 / 391 before and 13,830 / 2,464 after.
+Candidate queue drops are 2,481 / 24,455 and expiry totals
+1,409,521 / 2,101,558; unsent transmit frames account for
+1,175,411 / 1,780,018 of those expiries. TAP ingress drops number
+2,077,129 / 1,809,408 source SKBs. No completed receive frame expires.
+
+All twelve points have zero outer socket overflow, outer UDP errors, outer
+fragments, inner UDP errors and invalid or duplicate application records.
+The largest reordered fraction is 0.005361%. These twenty-second runs do not
+establish confidence intervals, but provide no reason to adopt the candidate.
+It remains an unapplied diagnostic patch. Full-quantum requests exhaust its
+credit, so this result does not rule out recurring owner scheduling delay as
+a bottleneck. Controller rate/window limits and service delay still need
+separate measurements.
+
+Raw results, hashes and CPU/drop attribution are in
+[benches/tap-pacing-credit.json](benches/tap-pacing-credit.json); the exact
+candidate is [benches/pacing-credit-diagnostic.patch](benches/pacing-credit-diagnostic.patch).
+Both performance targets remain unmet.
+
 ## DATA-quoted Packet Too Big validation (November 7)
 
 Remote ICMPv6 size reports now use retained successful transmission history

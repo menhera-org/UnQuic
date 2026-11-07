@@ -1,0 +1,515 @@
+diff --git a/src/pacing/grants.rs b/src/pacing/grants.rs
+index 425ced0..32ef843 100644
+--- a/src/pacing/grants.rs
++++ b/src/pacing/grants.rs
+@@ -90,6 +90,63 @@ impl std::fmt::Display for GrantError {
+ 
+ impl std::error::Error for GrantError {}
+ 
++// Experimental DATA pacer: scaled bytes avoid discarding fractional service.
++#[derive(Default)]
++struct Pacer {
++    credit: u128,
++    at: Option<Duration>,
++    rate: u64,
++    capacity: u64,
++    retry: Option<Duration>,
++}
++
++impl Pacer {
++    fn take(
++        &mut self,
++        bytes: u32,
++        capacity: u64,
++        rate: u64,
++        now: Duration,
++    ) -> Result<(), GrantError> {
++        const SCALE: u128 = 1_000_000_000;
++        let credit = match self.at {
++            None => u128::from(capacity) * SCALE,
++            Some(at) => {
++                let elapsed = now.checked_sub(at).ok_or(GrantError::Invalid)?;
++                self.credit
++                    .saturating_add(elapsed.as_nanos().saturating_mul(u128::from(self.rate)))
++                    .min(u128::from(self.capacity) * SCALE)
++                    .min(u128::from(capacity) * SCALE)
++            }
++        };
++        let cost = u128::from(bytes) * SCALE;
++        let accepted = rate != 0 && credit >= cost;
++        let remaining = if accepted { credit - cost } else { credit };
++        let needed = if accepted { 100 * SCALE } else { cost };
++        let retry = if rate == 0 || remaining >= needed {
++            None
++        } else {
++            let nanos = (needed - remaining).div_ceil(u128::from(rate));
++            Some(
++                now.checked_add(Duration::from_nanos(
++                    u64::try_from(nanos).map_err(|_| GrantError::Exhausted)?,
++                ))
++                .ok_or(GrantError::Exhausted)?,
++            )
++        };
++        self.credit = remaining;
++        self.at = Some(now);
++        self.rate = rate;
++        self.capacity = capacity;
++        self.retry = retry;
++        if accepted {
++            Ok(())
++        } else {
++            Err(GrantError::Blocked)
++        }
++    }
++}
++
+ /// Fixed-capacity, allocation-free grant accounting for one shared path owner.
+ ///
+ /// Each worker may hold one grant in this group. Reservation precedes handoff;
+@@ -105,7 +162,7 @@ pub struct Grants {
+     next_id: u64,
+     reserved: u64,
+     in_flight: u64,
+-    next_send: Duration,
++    pacer: Pacer,
+     probe_epoch: u64,
+     probes: u8,
+ }
+@@ -124,7 +181,7 @@ impl Grants {
+             next_id: 1,
+             reserved: 0,
+             in_flight: 0,
+-            next_send: Duration::ZERO,
++            pacer: Pacer::default(),
+             probe_epoch: 0,
+             probes: 0,
+         })
+@@ -153,7 +210,7 @@ impl Grants {
+     /// The owner arms this only while work is waiting. Other blocked requests
+     /// require a worker report, ACK/loss settlement or new controller limits.
+     pub fn deadline(&self, now: Duration) -> Option<Duration> {
+-        (now < self.next_send).then_some(self.next_send)
++        self.pacer.retry.filter(|&at| now < at)
+     }
+ 
+     /// Replaces unissued PTO allowance with zero, one or two aggregate probes.
+@@ -184,8 +241,8 @@ impl Grants {
+     /// estimate, but must fit the shared burst budget; do not inflate that
+     /// estimate to authorize an unconfirmed probe.
+     ///
+-    /// Pacing charges reserved bytes conservatively; unused reports do not
+-    /// rewind the schedule or create a catch-up burst after a delayed worker.
++    /// Diagnostic policy: elapsed service accumulates up to one shared burst.
++    /// Reservations consume it; unused reports never refund pacing credit.
+     pub fn reserve(
+         &mut self,
+         worker: usize,
+@@ -208,8 +265,6 @@ impl Grants {
+             .checked_add(reserved)
+             .ok_or(GrantError::Blocked)?;
+         if slot.is_some()
+-            || limits.rate == 0
+-            || now < self.next_send
+             || reserved > burst
+             || (probe && self.probes == 0)
+             || (!probe && charged > limits.window)
+@@ -218,10 +273,13 @@ impl Grants {
+         }
+         let next_id = self.next_id.checked_add(1).ok_or(GrantError::Exhausted)?;
+         let expires = now.checked_add(LIFETIME).ok_or(GrantError::Exhausted)?;
+-        let nanos = (u64::from(bytes) * 1_000_000_000).div_ceil(limits.rate);
+-        let next_send = now
+-            .checked_add(Duration::from_nanos(nanos))
+-            .ok_or(GrantError::Exhausted)?;
++        // Keep representability checks independent of accumulated service.
++        if limits.rate != 0 {
++            let nanos = (u64::from(bytes) * 1_000_000_000).div_ceil(limits.rate);
++            now.checked_add(Duration::from_nanos(nanos))
++                .ok_or(GrantError::Exhausted)?;
++        }
++        self.pacer.take(bytes, burst, limits.rate, now)?;
+         let grant = Grant {
+             id: self.next_id,
+             worker,
+@@ -233,7 +291,6 @@ impl Grants {
+         self.workers[worker] = Some(grant);
+         self.next_id = next_id;
+         self.reserved = reserved;
+-        self.next_send = next_send;
+         if probe {
+             self.probes -= 1;
+         }
+@@ -323,3 +380,164 @@ mod tests {
+         assert_eq!(grants.probes, 1);
+     }
+ }
++
++#[cfg(test)]
++mod credit_tests {
++    use super::*;
++
++    fn limits() -> Limits {
++        Limits {
++            window: u64::MAX,
++            rate: 128_000_000,
++            quantum: 2560,
++            max_datagram: 1280,
++        }
++    }
++
++    #[test]
++    fn repeated_late_service_preserves_partial_quantum_credit() {
++        let limits = limits();
++        let mut grants = Grants::new(1).unwrap();
++        let initial = grants
++            .reserve(0, 2560, false, limits, Duration::ZERO)
++            .unwrap();
++        grants.reported(initial, 0, None).unwrap();
++        let mut strict_due = Duration::from_micros(20);
++        let mut strict_count = 0;
++        let mut credited_count = 0;
++        for visit in 0..32 {
++            let now = Duration::from_micros(25 + visit * 15);
++            if now >= strict_due {
++                strict_count += 1;
++                strict_due = now + Duration::from_micros(10);
++            }
++            let mut count = 0;
++            loop {
++                match grants.reserve(0, 1280, false, limits, now) {
++                    Ok(grant) => {
++                        grants.reported(grant, 0, None).unwrap();
++                        count += 1;
++                    }
++                    Err(GrantError::Blocked) => break,
++                    Err(error) => panic!("{error}"),
++                }
++            }
++            assert!(count <= 2);
++            credited_count += count;
++        }
++        assert_eq!(strict_count, 32);
++        assert_eq!(credited_count, 48);
++    }
++
++    #[test]
++    fn idle_credit_is_one_total_quantum_and_unused_or_partial_sends_never_refund_it() {
++        for sent in [0, 1280, 2560] {
++            let mut grants = Grants::new(2).unwrap();
++            let limits = limits();
++            let now = Duration::from_secs(1000);
++            let first = grants.reserve(0, 2560, false, limits, now).unwrap();
++            grants
++                .reported(first, sent, (sent != 0).then_some(now))
++                .unwrap();
++            assert_eq!(grants.in_flight(), u64::from(sent));
++            assert_eq!(
++                grants.reserve(1, 1280, false, limits, now),
++                Err(GrantError::Blocked)
++            );
++            assert_eq!(grants.deadline(now), Some(now + Duration::from_micros(10)));
++            let next = grants
++                .reserve(1, 1280, false, limits, now + Duration::from_micros(10))
++                .unwrap();
++            grants.reported(next, 0, None).unwrap();
++            assert_eq!(grants.in_flight(), u64::from(sent));
++            assert_eq!(
++                grants.reserve(0, 100, false, limits, now + Duration::from_micros(10)),
++                Err(GrantError::Blocked)
++            );
++        }
++    }
++
++    #[test]
++    fn rate_changes_use_old_rate_until_observation_and_growth_mints_no_credit() {
++        let mut pacer = Pacer::default();
++        let us = Duration::from_micros;
++        pacer.take(2560, 2560, 128_000_000, us(0)).unwrap();
++        pacer.take(1280, 2560, 64_000_000, us(10)).unwrap();
++        assert_eq!(
++            pacer.take(1280, 2560, 64_000_000, us(20)),
++            Err(GrantError::Blocked)
++        );
++        assert_eq!(pacer.retry, Some(us(30)));
++        assert_eq!(
++            pacer.take(1280, 5120, 256_000_000, us(20)),
++            Err(GrantError::Blocked)
++        );
++        assert_eq!(pacer.retry, Some(Duration::from_nanos(22_500)));
++        pacer
++            .take(1280, 5120, 256_000_000, Duration::from_nanos(22_500))
++            .unwrap();
++        assert_eq!(pacer.credit, 0);
++        assert_eq!(
++            pacer.take(100, 5120, 0, Duration::from_nanos(22_500)),
++            Err(GrantError::Blocked)
++        );
++        assert_eq!(
++            pacer.take(100, 5120, 256_000_000, us(1000)),
++            Err(GrantError::Blocked)
++        );
++        assert_eq!(pacer.credit, 0);
++    }
++
++    #[test]
++    fn shrink_caps_credit_and_backward_time_or_overflow_cannot_spend_it() {
++        let mut pacer = Pacer::default();
++        let us = Duration::from_micros;
++        pacer.take(100, 2560, 128_000_000, us(10)).unwrap();
++        assert_eq!(
++            pacer.take(100, 2560, 128_000_000, us(9)),
++            Err(GrantError::Invalid)
++        );
++        assert_eq!(pacer.at, Some(us(10)));
++        assert_eq!(pacer.credit, 2460 * 1_000_000_000);
++        pacer.take(1280, 1280, 128_000_000, us(1000)).unwrap();
++        assert_eq!(pacer.credit, 0);
++        let prior = (pacer.credit, pacer.at, pacer.retry);
++        assert_eq!(
++            pacer.take(1280, 1280, 1, Duration::MAX),
++            Err(GrantError::Exhausted)
++        );
++        assert_eq!((pacer.credit, pacer.at, pacer.retry), prior);
++    }
++
++    #[test]
++    fn outstanding_expired_grants_and_pto_allowance_still_bound_credit() {
++        let mut grants = Grants::new(3).unwrap();
++        let limits = Limits {
++            window: 0,
++            ..limits()
++        };
++        grants.probe_allowance(2).unwrap();
++        let a = grants
++            .reserve(0, 1280, true, limits, Duration::ZERO)
++            .unwrap();
++        let b = grants
++            .reserve(1, 1280, true, limits, Duration::ZERO)
++            .unwrap();
++        assert_eq!(
++            grants.reserve(2, 100, true, limits, Duration::from_secs(1)),
++            Err(GrantError::Blocked)
++        );
++        assert_eq!(grants.reserved(), 2560);
++        grants.reported(a, 1280, Some(Duration::ZERO)).unwrap();
++        grants.reported(b, 1280, Some(Duration::ZERO)).unwrap();
++        assert_eq!(
++            grants.reserve(2, 100, true, limits, Duration::from_secs(1)),
++            Err(GrantError::Blocked)
++        );
++        assert_eq!(
++            grants.reserve(2, 100, false, limits, Duration::from_secs(1)),
++            Err(GrantError::Blocked)
++        );
++        assert_eq!(grants.in_flight(), 2560);
++    }
++}
+diff --git a/src/worker/sender/owner.rs b/src/worker/sender/owner.rs
+index 0029301..f0b3f19 100644
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -56,6 +56,13 @@ pub(in crate::worker) struct Owner {
+ }
+ 
+ impl Owner {
++    #[cfg(test)]
++    pub(super) fn small_quantum_for_test(&mut self) {
++        self.groups[0].controller =
++            Controller::new(1280, Some(Duration::from_millis(100)), Duration::ZERO, 1).unwrap();
++        assert_eq!(self.groups[0].controller.limits().quantum, 2560);
++    }
++
+     pub(super) fn reidentify(&mut self, flight: &mut Flight, first: u64) -> Result<(), GrantError> {
+         self.sender.reidentify(flight, first)
+     }
+@@ -1620,7 +1627,7 @@ mod fairness_regression {
+                     },
+                     number,
+                 },
+-                bytes: 1280,
++                bytes: 2560,
+             }])
+             .unwrap();
+         Request {
+@@ -1637,6 +1644,9 @@ mod fairness_regression {
+     fn continuously_ready_workers_alternate_across_pacer_deadlines() {
+         let (mut owner, flights) =
+             Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)], Duration::ZERO).unwrap();
++        owner.groups[0].controller =
++            Controller::new(1280, Some(Duration::from_millis(100)), Duration::ZERO, 1).unwrap();
++        assert_eq!(owner.groups[0].controller.limits().quantum, 2560);
+         owner.timers.install(0, 1).unwrap();
+         for flight in flights.into_vec() {
+             owner.request(request(flight, 1, 0)).unwrap();
+@@ -1668,11 +1678,71 @@ mod fairness_regression {
+         assert_eq!(selected, [0, 1, 0, 1, 0, 1]);
+     }
+ 
++    #[test]
++    fn smaller_retry_survives_a_later_larger_request_and_another_owner_turn() {
++        let (mut owner, flights) =
++            Owner::new(1, 3, &[(0, 1, 0), (0, 2, 0), (0, 3, 0)], Duration::ZERO).unwrap();
++        owner.groups[0].controller =
++            Controller::new(1280, Some(Duration::from_millis(100)), Duration::ZERO, 1).unwrap();
++        let limits = owner.groups[0].controller.limits();
++        assert_eq!(limits.quantum, 2560);
++        owner.timers.install(0, 1).unwrap();
++        let mut flights = flights.into_vec().into_iter();
++        owner
++            .request(request(flights.next().unwrap(), 1, 0))
++            .unwrap();
++        let mut outgoing = VecDeque::with_capacity(16);
++        owner.advance(Duration::ZERO, &mut outgoing).unwrap();
++        let (_, Message::Permit(mut initial)) = outgoing.pop_front().unwrap() else {
++            panic!()
++        };
++        initial.complete(0, None, false).unwrap();
++        owner.complete(initial).unwrap();
++        owner.advance(Duration::ZERO, &mut outgoing).unwrap();
++        assert!(matches!(
++            outgoing.pop_front().unwrap().1,
++            Message::Recycle(_)
++        ));
++        assert!(outgoing.is_empty());
++
++        let mut smaller = request(flights.next().unwrap(), 1, 0);
++        let packet = smaller.flight.packets().next().unwrap();
++        smaller
++            .flight
++            .prepare(&[pacing::Planned {
++                bytes: 1280,
++                ..packet
++            }])
++            .unwrap();
++        owner.request(smaller).unwrap();
++        owner
++            .request(request(flights.next().unwrap(), 1, 0))
++            .unwrap();
++        let small_due = Duration::from_nanos(1_280_000_000_000_u64.div_ceil(limits.rate));
++        let large_due = Duration::from_nanos(2_560_000_000_000_u64.div_ceil(limits.rate));
++        for _ in 0..2 {
++            owner.advance(Duration::ZERO, &mut outgoing).unwrap();
++            assert!(outgoing.is_empty());
++            assert_eq!(owner.due, Some(small_due));
++            assert_eq!(owner.sender.deadline(0, Duration::ZERO), Some(large_due));
++        }
++        owner.advance(small_due, &mut outgoing).unwrap();
++        assert!(matches!(
++            outgoing.pop_front(),
++            Some((1, Message::Permit(_)))
++        ));
++        assert!(outgoing.is_empty());
++        assert!(owner.requests[2].is_some());
++    }
++
+     #[test]
+     fn later_group_grants_do_not_starve_another_workers_group() {
+         let (mut owner, flights) =
+             Owner::new(2, 3, &[(0, 1, 0), (0, 2, 0), (1, 1, 1)], Duration::ZERO).unwrap();
+         for session in 0..2 {
++            owner.groups[session].controller =
++                Controller::new(1280, Some(Duration::from_millis(100)), Duration::ZERO, 1).unwrap();
++            assert_eq!(owner.groups[session].controller.limits().quantum, 2560);
+             owner.timers.install(session, 1).unwrap();
+         }
+         for flight in flights.into_vec() {
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index 9c0e109..379afea 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -796,8 +796,18 @@ fn feedback_overtakes_a_request_held_by_pacing_without_starving_it() {
+     for worker in &mut workers {
+         worker.io_time = Some(Ok);
+     }
++    workers[0]
++        .sender
++        .owner
++        .as_mut()
++        .unwrap()
++        .small_quantum_for_test();
+     let now = Duration::from_millis(1);
+-    frame(&mut workers[0]);
++    // Spend the complete quantum so the next request must wait for elapsed service.
++    for _ in 0..2 {
++        queue_frame(&mut workers[0], BASE_UDP_PAYLOAD - wire::DATA_PREFIX_LEN);
++    }
++    workers[0].flush_frames(Duration::ZERO).unwrap();
+     for _ in 0..8 {
+         for w in &mut workers {
+             w.drain_queues(now).unwrap();
+@@ -805,7 +815,9 @@ fn feedback_overtakes_a_request_held_by_pacing_without_starving_it() {
+         }
+     }
+     let mut bytes = [0; BASE_UDP_PAYLOAD];
+-    rx.recv(&mut bytes).unwrap();
++    for _ in 0..2 {
++        assert_eq!(rx.recv(&mut bytes).unwrap().0, BASE_UDP_PAYLOAD);
++    }
+     frame(&mut workers[0]);
+     let old = workers[0].sender.job.unwrap().first;
+     for _ in 0..4 {
+diff --git a/tests/pacing.rs b/tests/pacing.rs
+index a83767c..c6e8c70 100644
+--- a/tests/pacing.rs
++++ b/tests/pacing.rs
+@@ -31,12 +31,8 @@ fn expired_grants_hold_credit_until_one_partial_or_unused_report() {
+     assert!(a.valid_at(us(0)));
+     assert!(a.valid_at(us(100) - Duration::from_nanos(1)));
+     assert!(!a.valid_at(us(100)));
+-    assert_eq!(grants.deadline(us(0)), Some(us(40)));
+-    assert_eq!(
+-        grants.reserve(1, 2560, false, limits, us(39)),
+-        Err(Error::Blocked)
+-    );
+-    let b = grants.reserve(1, 2560, false, limits, us(40)).unwrap();
++    assert_eq!(grants.deadline(us(0)), None);
++    let b = grants.reserve(1, 2560, false, limits, us(39)).unwrap();
+     assert_eq!((grants.reserved(), grants.in_flight()), (7680, 0));
+     for worker in 0..3 {
+         assert_eq!(
+@@ -76,7 +72,7 @@ fn workers_share_quantum_and_sixty_four_datagram_cap_without_idle_catchup() {
+         };
+         let cap = quantum.min(64 * 1280);
+         let a = grants.reserve(0, cap - 1280, false, limits, us(0)).unwrap();
+-        let at = grants.deadline(us(0)).unwrap();
++        let at = us(0);
+         let b = grants.reserve(1, 1280, false, limits, at).unwrap();
+         assert_eq!(grants.reserved(), u64::from(cap));
+         assert_eq!(
+@@ -93,7 +89,7 @@ fn workers_share_quantum_and_sixty_four_datagram_cap_without_idle_catchup() {
+         );
+         assert_eq!(
+             grants.deadline(us(10_000)),
+-            Some(us(10_000) + Duration::from_nanos(u64::from(cap) * 1_000_000_000 / limits.rate))
++            Some(us(10_000) + Duration::from_nanos(100_000_000_000_u64.div_ceil(limits.rate)))
+         );
+     }
+ }
+@@ -108,10 +104,6 @@ fn probes_bypass_only_window_and_share_two_permissions_across_workers() {
+     let data = grants.reserve(0, 1280, false, limits, us(0)).unwrap();
+     grants.reported(data, 1280, Some(us(0))).unwrap();
+     grants.probe_allowance(2).unwrap();
+-    assert_eq!(
+-        grants.reserve(0, 1280, true, limits, us(9)),
+-        Err(Error::Blocked)
+-    );
+     let a = grants.reserve(0, 1280, true, limits, us(10)).unwrap();
+     let b = grants.reserve(1, 100, true, limits, us(20)).unwrap();
+     assert!(a.is_probe());
+@@ -260,6 +252,7 @@ fn invalid_limits_zero_rate_and_time_overflow_preserve_credit() {
+             false,
+             Limits {
+                 rate: u64::MAX,
++                quantum: 1280,
+                 ..limits()
+             },
+             us(0),
+@@ -271,7 +264,7 @@ fn invalid_limits_zero_rate_and_time_overflow_preserve_credit() {
+         grants.reserve(0, 1280, false, limits(), us(0)),
+         Err(Error::Blocked)
+     );
+-    let grant = grants.reserve(0, 1280, false, limits(), us(1)).unwrap();
++    let grant = grants.reserve(0, 1280, false, limits(), us(10)).unwrap();
+     assert!(!grant.valid_at(us(0)));
+     assert_eq!(
+         grants.reported(grant, 1280, Some(us(0))),
