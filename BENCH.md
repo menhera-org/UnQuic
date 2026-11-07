@@ -16,10 +16,10 @@ No workload proves a universal plateau or the theoretical CPU ceiling.
 Neither the local **20 Gbit/s in each direction** gate nor the real
 **5 Gbit/s under loss** gate has passed. Runtime recovery and congestion control
 remain unfinished. Workers now use the shared draft-07 controller and grant
-accounting. Its first 20-second QinQ sweep delivers only about 0.7 Gbit/s each
-way while using about 1.6–1.7 CPUs per daemon: a severe integration regression,
-far below the CPU ceiling. An instrumented comparison below identifies one
-batch-shrinking defect; it leaves most of the regression unresolved.
+accounting. After sender scheduling fixes, the latest 20-second QinQ sweep
+delivers 1.10 to 1.18 Gbit/s per direction using about 1.9 to 2.0 CPUs per daemon.
+This improves on the first paced sweep's roughly 0.7 Gbit/s but remains a severe
+integration regression, far below the CPU ceiling.
 General application-limited detection and payload repair remain open.
 PMTU discovery is active in the latest rate sweeps and
 passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
@@ -50,8 +50,8 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | First sender-integration QinQ sweep: 0.76 / 0.70 Gbit/s paced, 0.75 / 0.71 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 96.29 / 96.56%. Five successful repeats and the under-1% gate remain unmet. |
-| Goodput must plateau under excess traffic | First sender sweep stays near 0.7 Gbit/s from 16G through unlimited; daemon CPU remains below two cores. The earlier expiry sweep declined 2.7% forward under unlimited load | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Latest sender QinQ sweep: 1.10 / 1.14 Gbit/s paced, 1.12 / 1.17 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 94.64 / 94.39%. Five successful repeats and the under-1% gate remain unmet. |
+| Goodput must plateau under excess traffic | Latest sender sweep holds 1.10 to 1.18 Gbit/s through paced, unlimited and return points; daemon CPU stays near two cores. The earlier expiry sweep declined 2.7% forward under unlimited load | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
 | Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Current QinQ reports zero reordering; single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
@@ -153,6 +153,36 @@ Of 164,797 / 167,474 received send grants, 1,047 / 865 expired and
 an exact frame-loss total. Final pacing gauges were sampled after draining and
 must not be used as steady-load controller rates.
 
+## Sender scheduling release sweep (November 7)
+
+[Four normal release observations](benches/tap-sender-turn.json) measure
+`f0ccac0` with the same profile, twenty-second duration and retained daemons
+as the first paced sender sweep. Temporary diagnostics are absent. No builds
+or other tests overlap the workload.
+
+| Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | 15.97 / 15.89 | 1.11 / 1.13 | 92.93 / 92.76 | 190.99 / 185.30 |
+| 21 | 20.96 / 20.70 | 1.10 / 1.14 | 94.64 / 94.39 | 188.37 / 186.44 |
+| Unlimited | 61.22 / 57.16 | 1.12 / 1.17 | 98.13 / 97.93 | 193.50 / 190.89 |
+| 16 return | 15.98 / 15.97 | 1.16 / 1.18 | 92.60 / 92.45 | 197.57 / 195.50 |
+
+Compared with `c999431`, this includes loss-before-PTO ordering, blocked-plan
+preservation, bounded coordinator draining and same-turn handoff. The 21G point
+improves from 0.76 / 0.70 to 1.10 / 1.14 Gbit/s. Their individual effects are
+not isolated by this sweep. Unlimited load does not reduce goodput in this run;
+the low CPU utilization still rules out treating this as the CPU ceiling.
+
+All points have zero admission pressure, outer socket overflow, inner UDP receive
+errors, malformed payloads, duplicate delivery and outer fragmentation.
+Occasional reordering reaches 0.0021%. At 21G, endpoint L/R counters report
+724,174 / 679,880 TAP TX drops, 341,490 / 406,065 expired frames and
+17,742 / 51,627 worker queue drops. Of 168,905 / 178,758 send grants,
+1,318 / 708 expired and 4,365 / 8,233 were canceled. Drop units differ.
+The combined build passes 324 release tests and 51 short kernel tests.
+One reconnect resumed ACK progress after 8.91 seconds; the earlier 28.90-second
+observation still demonstrates an unresolved service-delay risk.
+
 ### Rejected grant shrinks later batches
 
 A regression test reproduces a scheduling defect: a closed sender trims a
@@ -193,6 +223,16 @@ Requests and completions also reach handoff queues before the notification flush
 in the turn that creates them. Two regressions verify draining and budget limits.
 The measurements combine these scheduling changes and do not isolate their
 individual gains. The throughput target remains unmet.
+
+An additional diagnostic build raised the extra burst cap from sixteen to
+sixty-four maximum-sized datagrams while retaining BBR's quantum (at most
+65,536 bytes), window, pacing rate and 100-microsecond grant lifetime.
+It delivered 1.81 / 1.87 and 1.95 / 1.93 Gbit/s, with 182.16 / 178.33%
+and 191.28 / 187.37% daemon CPU. Missing fractions remained 90.39 to 91.03%.
+Admission pressure and outer socket overflow stayed zero. Main retains the
+sixteen-datagram policy: this experiment identifies batching sensitivity but
+does not establish an acceptable burst policy or meet the performance target.
+The linked diagnostic file includes its hash and counters.
 
 The verified facts are low delivered throughput, low CPU utilization and heavy
 upstream dropping/expiry. Grant and feedback serialization, congestion-window
