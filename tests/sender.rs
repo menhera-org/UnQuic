@@ -574,3 +574,102 @@ fn all_workers_complete_equal_timestamp_runs_in_grant_order_without_allocations(
     assert_eq!(sender.available(), 64);
     assert_eq!(ALLOCATIONS.replace(None), Some((0, 0, 0)));
 }
+
+#[test]
+fn request_prefix_trimming_is_atomic_whole_packet_and_allocation_free() {
+    let (_sender, flights) = Sender::new(1, 1, 3).unwrap();
+    let mut flight = buffers(flights).pop().unwrap();
+    let plan = [packet(7, 10, 100), packet(7, 12, 200), packet(7, 13, 300)];
+    ALLOCATIONS.set(Some((0, 0, 0)));
+    assert_eq!(flight.truncate(1000), Err(Error::Invalid));
+    assert_eq!(flight.packets().len(), 0);
+    flight.prepare(&plan).unwrap();
+    assert_eq!(flight.completion(), None);
+    for budget in [0, 99] {
+        assert_eq!(flight.truncate(budget), Err(Error::Blocked));
+        assert_eq!(flight.packets().len(), 3);
+    }
+    assert_eq!(flight.truncate(u32::MAX), Ok(3));
+    for (actual, expected) in flight.packets().zip(plan) {
+        assert_eq!((actual.id, actual.bytes), (expected.id, expected.bytes));
+    }
+    assert_eq!(flight.truncate(299), Ok(1));
+    assert_eq!(flight.truncate(u32::MAX), Ok(1)); // Trimming cannot restore a suffix.
+    flight.prepare(&plan).unwrap();
+    assert_eq!(flight.truncate(300), Ok(2));
+    assert_eq!(
+        flight.packets().map(|p| u32::from(p.bytes)).sum::<u32>(),
+        300
+    );
+    assert_eq!(flight.truncate(99), Err(Error::Blocked));
+    assert_eq!(flight.packets().len(), 2);
+    assert_eq!(ALLOCATIONS.replace(None), Some((0, 0, 0)));
+}
+
+#[test]
+fn granted_requests_cannot_trim_and_completion_survives_return_until_reprepared() {
+    let (mut sender, flights) = Sender::new(1, 1, 3).unwrap();
+    let mut flight = buffers(flights).pop().unwrap();
+    let plan = [packet(4, 5, 100), packet(4, 6, 200), packet(4, 7, 300)];
+    flight.prepare(&plan).unwrap();
+    flight.truncate(300).unwrap();
+    sender
+        .reserve(0, &mut flight, false, limits(), us(0))
+        .unwrap();
+    let handle = flight.handle(0).unwrap();
+    ALLOCATIONS.set(Some((0, 0, 0)));
+    assert_eq!(flight.truncate(100), Err(Error::Blocked));
+    assert_eq!(flight.packets().len(), 2);
+    assert_eq!(flight.completion(), None);
+    flight.complete(1, Some(us(1)), true).unwrap();
+    assert_eq!(flight.completion(), Some((1, Some(us(1)), true)));
+    assert_eq!(flight.packets().len(), 2);
+    sender.reported(flight).unwrap();
+    let mut flight = commit(&mut sender, 0);
+    assert_eq!(flight.completion(), Some((1, Some(us(1)), true)));
+    assert_eq!(flight.packets().len(), 1);
+    let actual = flight.packets().next().unwrap();
+    assert_eq!((actual.id, actual.bytes), (plan[0].id, plan[0].bytes));
+    assert_eq!(flight.truncate(100), Err(Error::Invalid));
+    assert_eq!(sender.available(), 2);
+    flight.prepare(&plan[2..]).unwrap();
+    assert_eq!(flight.completion(), None);
+    assert_eq!(flight.packets().next().unwrap().id, plan[2].id);
+    acknowledge(&mut sender, 0, plan[0], handle, 2);
+    sender.reopen(0).unwrap();
+    sender
+        .reserve(0, &mut flight, false, limits(), us(3))
+        .unwrap();
+    flight.complete(0, None, false).unwrap();
+    sender.reported(flight).unwrap();
+    let flight = commit(&mut sender, 0);
+    assert_eq!(flight.completion(), Some((0, None, false)));
+    assert_eq!(flight.packets().len(), 0);
+    assert_eq!(sender.available(), 3);
+    assert_eq!(ALLOCATIONS.replace(None), Some((0, 0, 0)));
+}
+
+#[test]
+fn application_limited_marker_is_read_from_each_groups_sampler() {
+    let (mut sender, flights) = Sender::new(2, 1, 1).unwrap();
+    let mut flight = buffers(flights).pop().unwrap();
+    assert_eq!(sender.is_app_limited(2), None);
+    assert_eq!(sender.is_app_limited(0), Some(false));
+    sender.close(0).unwrap();
+    assert!(sender.advance(0, 1).unwrap().is_none());
+    sender.application_limited(0).unwrap();
+    assert_eq!(sender.is_app_limited(0), Some(true));
+    assert_eq!(sender.is_app_limited(1), Some(false));
+    sender.reopen(0).unwrap();
+    let planned = packet(0, 1, 100);
+    flight.prepare(&[planned]).unwrap();
+    sender
+        .reserve(0, &mut flight, false, limits(), us(0))
+        .unwrap();
+    let handle = flight.handle(0).unwrap();
+    flight.complete(1, Some(us(1)), false).unwrap();
+    sender.reported(flight).unwrap();
+    let _flight = commit(&mut sender, 0);
+    assert!(acknowledge(&mut sender, 0, planned, handle, 2).app_limited);
+    assert_eq!(sender.is_app_limited(0), Some(false));
+}

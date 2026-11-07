@@ -77,6 +77,58 @@ impl Flight {
         self.records.get(ordinal)?.slot
     }
 
+    /// Prepared packets, or the successful prefix after the owner returns this flight.
+    /// Completion metadata remains readable until prepare replaces the request.
+    pub fn packets(&self) -> impl ExactSizeIterator<Item = Planned> + '_ {
+        let count = if self.completed && self.grant.is_none() {
+            self.successful
+        } else {
+            self.count
+        };
+        self.records[..count].iter().map(|record| Planned {
+            id: PacketId {
+                number: record.number,
+                ..self.origin
+            },
+            bytes: record.bytes,
+        })
+    }
+
+    /// Successful count, pre-syscall time and host-limited flag, once completed.
+    /// Zero-success completions have no timestamp.
+    pub const fn completion(&self) -> Option<(usize, Option<Duration>, bool)> {
+        if self.completed {
+            Some((self.successful, self.started, self.host_limited))
+        } else {
+            None
+        }
+    }
+
+    /// Keeps the largest whole-packet prefix fitting an outer-byte budget.
+    /// Only ungranted prepared requests may be trimmed. Zero-fitting budgets
+    /// return Blocked without changing the request; empty requests are Invalid.
+    pub fn truncate(&mut self, budget: u32) -> Result<usize, GrantError> {
+        if self.grant.is_some() {
+            return Err(GrantError::Blocked);
+        }
+        if self.count == 0 {
+            return Err(GrantError::Invalid);
+        }
+        let mut bytes = 0_u32;
+        let count = self.records[..self.count]
+            .iter()
+            .take_while(|record| {
+                bytes += u32::from(record.bytes);
+                bytes <= budget
+            })
+            .count();
+        if count == 0 {
+            return Err(GrantError::Blocked);
+        }
+        self.count = count;
+        Ok(count)
+    }
+
     /// Replaces an ungranted request without allocating.
     ///
     /// One request contains 1..=64 charged packets from one lane/generation in
@@ -316,6 +368,11 @@ impl Sender {
     pub fn flight_bytes(&self, group: usize) -> Option<(u64, u64)> {
         let group = self.groups.get(group)?;
         Some((group.grants.reserved(), group.grants.in_flight()))
+    }
+
+    /// Current sampler application-limited marker for the shared group.
+    pub fn is_app_limited(&self, group: usize) -> Option<bool> {
+        Some(self.groups.get(group)?.delivery.is_app_limited())
     }
 
     /// Pacing deadline, independent of report and sampler backpressure.
