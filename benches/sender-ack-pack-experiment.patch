@@ -1,0 +1,511 @@
+--- a/src/pack.rs
++++ b/src/pack.rs
+@@ -137,16 +137,24 @@
+     /// the record's content and re-encode with a fresh number before retrying.
+     /// Handshake records cannot use this established-lane encoder.
+     pub fn record(&mut self, record: Record<'_>, output: &mut [u8]) -> Result<Packet, PackError> {
++        self.records(&[record], output)
++    }
++
++    pub(crate) fn records(
++        &mut self,
++        records: &[Record<'_>],
++        output: &mut [u8],
++    ) -> Result<Packet, PackError> {
+         if self.header.packet_number == 0 {
+             return Err(PackError::Exhausted);
+         }
+-        if matches!(record, Record::Data { total_len, .. } if total_len > u32::from(self.frame_limit))
++        if records.iter().any(|record| matches!(record, Record::Data { total_len, .. } if *total_len > u32::from(self.frame_limit)))
+         {
+             return Err(PackError::Frame);
+         }
+         let limit = output.len().min(BASE_UDP_PAYLOAD);
+-        let length = encode_datagram(self.header, &[record], &mut output[..limit])
+-            .map_err(PackError::Wire)?;
++        let length =
++            encode_datagram(self.header, records, &mut output[..limit]).map_err(PackError::Wire)?;
+         let number = self.header.packet_number;
+         self.header.packet_number = number.checked_add(1).unwrap_or(0);
+         Ok(Packet { number, length })
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -3314,6 +3314,23 @@
+         record: Record<'_>,
+         now: Duration,
+     ) -> io::Result<Option<(u64, u16, Duration)>> {
++        self.send_records(session, &[record], now)
++    }
++
++    fn send_records(
++        &mut self,
++        session: usize,
++        records: &[Record<'_>],
++        now: Duration,
++    ) -> io::Result<Option<(u64, u16, Duration)>> {
++        let record = *records.first().ok_or(io::ErrorKind::InvalidInput)?;
++        if records.len() > 1
++            && records
++                .iter()
++                .any(|record| !matches!(record, Record::Ack { .. }))
++        {
++            return Err(io::ErrorKind::InvalidInput.into());
++        }
+         if self.sender_enabled() && matches!(record, Record::Probe) {
+             self.request_probe(session, 0, BASE_UDP_PAYLOAD, false, None, now)?;
+             return Ok(None);
+@@ -3352,7 +3369,7 @@
+         } else {
+             self.sessions[session].tx[0]
+                 .as_mut()
+-                .and_then(|lane| lane.record(record, bytes).ok())
++                .and_then(|lane| lane.records(records, bytes).ok())
+         };
+         let Some(packet) = packet else {
+             return Ok(None);
+@@ -3379,22 +3396,26 @@
+             {
+                 return Err(io::ErrorKind::WouldBlock.into());
+             }
+-            if let Record::Ack {
+-                lane,
+-                delay_us,
+-                ranges,
+-            } = record
+-            {
+-                // Finalize queue delay using the same clock as successful-send bookkeeping.
+-                Record::Ack {
++            let mut offset = wire::HEADER_LEN;
++            for record in records {
++                if let Record::Ack {
+                     lane,
++                    delay_us,
+                     ranges,
+-                    delay_us: delay_us
+-                        .saturating_add(at.saturating_sub(now).as_micros().min(1000) as u32)
+-                        .min(1000),
++                } = *record
++                {
++                    // Every snapshot gets its own final delay at the physical send boundary.
++                    Record::Ack {
++                        lane,
++                        ranges,
++                        delay_us: delay_us
++                            .saturating_add(at.saturating_sub(now).as_micros().min(1000) as u32)
++                            .min(1000),
++                    }
++                    .encode(&mut bytes[offset..offset + record.encoded_len()])
++                    .map_err(io::Error::other)?;
+                 }
+-                .encode(&mut bytes[wire::HEADER_LEN..packet.length])
+-                .map_err(io::Error::other)?;
++                offset += record.encoded_len();
+             }
+             socket.send(&bytes[..packet.length], limit)?;
+             Ok(at)
+--- a/src/worker/feedback.rs
++++ b/src/worker/feedback.rs
+@@ -193,8 +193,18 @@
+             .max(now)
+     }
+ 
++    fn feedback_valid(&self, feedback: &Feedback) -> bool {
++        feedback.count != 0
++            && self.matches(feedback.session, feedback.tag)
++            && self.shared.owners[feedback.session][usize::from(feedback.lane)]
++                .load(Ordering::Acquire)
++                == feedback.origin as u8 + 1
++    }
++
+     pub(super) fn flush_control(&mut self, now: Duration) -> io::Result<()> {
+-        for _ in 0..self.pending_control.len().min(BATCH_SIZE) {
++        let mut work = self.pending_control.len().min(BATCH_SIZE);
++        while work != 0 {
++            work -= 1;
+             let now = self.io_clock(now)()?;
+             let Some(job) = self.pending_control.pop_front() else {
+                 break;
+@@ -256,35 +266,64 @@
+                     self.control_replies -= 1;
+                 }
+                 Pending::Ack(mut feedback) => {
+-                    if feedback.count != 0
+-                        && self.matches(feedback.session, feedback.tag)
+-                        && self.shared.owners[feedback.session][usize::from(feedback.lane)]
+-                            .load(Ordering::Acquire)
+-                            == feedback.origin as u8 + 1
+-                    {
+-                        let due = self.control_due(feedback.session, now);
+-                        if due > now {
+-                            feedback.due = due;
+-                            self.pending_control.push_back(Pending::Ack(feedback));
+-                            continue;
++                    if !self.feedback_valid(&feedback) {
++                        self.return_feedback(feedback, now)?;
++                        continue;
++                    }
++                    let due = self.control_due(feedback.session, now);
++                    if due > now {
++                        feedback.due = due;
++                        self.pending_control.push_back(Pending::Ack(feedback));
++                        continue;
++                    }
++                    let (session, tag) = (feedback.session, feedback.tag);
++                    let mut bytes = wire::HEADER_LEN + 12 + 16 * feedback.count;
++                    // Match the peer worker's four reserved incoming ACK buffers.
++                    let mut batch = [Some(feedback), None, None, None];
++                    let mut count = 1;
++                    for slot in &mut batch[1..] {
++                        let Some(Pending::Ack(next)) = self.pending_control.front() else {
++                            break;
++                        };
++                        let length = 12 + 16 * next.count;
++                        if work == 0
++                            || next.session != session
++                            || next.tag != tag
++                            || next.due > now
++                            || !self.feedback_valid(next)
++                            || bytes + length > BASE_UDP_PAYLOAD
++                        {
++                            break;
+                         }
++                        let Some(Pending::Ack(next)) = self.pending_control.pop_front() else {
++                            return Err(io::Error::other("queued ACK disappeared"));
++                        };
++                        *slot = Some(next);
++                        count += 1;
++                        work -= 1;
++                        bytes += length;
++                    }
++                    let mut records = [Record::Padding { length: 0 }; 4];
++                    for (record, feedback) in records.iter_mut().zip(batch.iter().flatten()) {
+                         let queued =
+                             now.saturating_sub(feedback.created).as_micros().min(1000) as u32;
+-                        let ranges = AckRanges::new(&feedback.ranges[..feedback.count])
+-                            .map_err(io::Error::other)?;
+-                        if let Some((_, _, started)) = self.send_record(
+-                            feedback.session,
+-                            Record::Ack {
+-                                lane: feedback.lane,
+-                                delay_us: (feedback.delay_us + queued).min(1000),
+-                                ranges,
+-                            },
+-                            now,
+-                        )? {
+-                            feedback.sent = Some(started);
+-                        }
++                        *record = Record::Ack {
++                            lane: feedback.lane,
++                            delay_us: (feedback.delay_us + queued).min(1000),
++                            ranges: AckRanges::new(&feedback.ranges[..feedback.count])
++                                .map_err(io::Error::other)?,
++                        };
++                    }
++                    let result = self.send_records(session, &records[..count], now);
++                    let sent = result
++                        .as_ref()
++                        .ok()
++                        .and_then(|packet| packet.map(|(_, _, at)| at));
++                    for mut feedback in batch.into_iter().flatten() {
++                        feedback.sent = sent;
++                        self.return_feedback(feedback, now)?;
+                     }
+-                    self.return_feedback(feedback, now)?;
++                    result?;
+                 }
+             }
+         }
+@@ -589,4 +628,293 @@
+             io::ErrorKind::WouldBlock
+         );
+     }
++
++    fn queue_snapshot(worker: &mut Worker, session: usize, lane: u16, count: usize, age: u64) {
++        let mut feedback = worker.feedback_free.pop().unwrap();
++        feedback.session = session;
++        feedback.tag = 1;
++        feedback.lane = lane;
++        feedback.slot = 0;
++        feedback.count = count;
++        feedback.created = Duration::from_micros(age);
++        feedback.delay_us = age as u32 / 10;
++        feedback.due = Duration::ZERO;
++        feedback.sent = None;
++        for (index, range) in feedback.ranges[..count].iter_mut().enumerate() {
++            let number = ((count - index) * 2) as u64;
++            *range = AckRange {
++                start: number,
++                end: number,
++            };
++        }
++        worker.shared.owners[session][usize::from(lane)].store(1, Ordering::Release);
++        worker.pending_control.push_back(Pending::Ack(feedback));
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn packed_acks_fit_baseline_and_charge_one_physical_packet() {
++        for ranges in [1, MAX_ACK_RANGES] {
++            let (mut worker, _) = receive_worker();
++            let rx = socket(&mut worker);
++            worker.unpaced_fixture = false;
++            worker.io_time = Some(|_| Ok(Duration::from_micros(700)));
++            for index in 0..4 {
++                queue_snapshot(&mut worker, 0, index + 7, ranges, u64::from(index) * 100);
++            }
++            worker.flush_control(Duration::from_micros(300)).unwrap();
++            assert_eq!(worker.feedback_free.len(), BUFFERS);
++            assert!(worker.pending_control.is_empty());
++            let packets = if ranges == 1 { 1 } else { 2 };
++            let per_packet = 4 / packets;
++            let mut bytes = [0; BASE_UDP_PAYLOAD];
++            let mut outer = 0;
++            for number in 1..=packets {
++                let length = rx.recv(&mut bytes).unwrap().0;
++                assert_eq!(length, wire::HEADER_LEN + per_packet * (12 + 16 * ranges));
++                let datagram = Datagram::decode(&bytes[..length]).unwrap();
++                assert_eq!(datagram.header().packet_number, number as u64);
++                assert_eq!(datagram.records().count(), per_packet);
++                for (offset, record) in datagram.records().enumerate() {
++                    let index = (number - 1) * per_packet + offset;
++                    let Record::Ack {
++                        lane,
++                        delay_us,
++                        ranges: received,
++                    } = record
++                    else {
++                        panic!()
++                    };
++                    assert_eq!(lane, index as u16 + 7);
++                    assert_eq!(delay_us, 700 - 90 * index as u32);
++                    assert_eq!(received.len(), ranges);
++                    assert_eq!(received.iter().next().unwrap().end, (ranges * 2) as u64);
++                }
++                outer += length + 48;
++                let index = worker.sender_index(0, 0).unwrap();
++                let sent = worker.sender.lanes[index]
++                    .history
++                    .packet(number as u64)
++                    .unwrap();
++                assert_eq!(usize::from(sent.outer_bytes), length + 48);
++                assert!(!sent.charged && !sent.eliciting);
++            }
++            assert_eq!(worker.counters.tx_outer_bytes, outer as u64);
++            assert_eq!(
++                rx.recv(&mut bytes).unwrap_err().kind(),
++                io::ErrorKind::WouldBlock
++            );
++            let reply = Record::ProbeReply {
++                lane: 7,
++                packet_number: 1,
++                payload_len: 52,
++            };
++            for _ in packets..16 {
++                assert!(
++                    worker
++                        .send_record(0, reply, Duration::from_micros(700))
++                        .unwrap()
++                        .is_some()
++                );
++            }
++            assert!(
++                worker
++                    .send_record(0, reply, Duration::from_micros(700))
++                    .unwrap()
++                    .is_none()
++            );
++        }
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn packed_acks_keep_snapshot_budget_and_session_order() {
++        let (mut worker, _) = receive_worker();
++        let rx = socket(&mut worker);
++        worker.io_time = Some(Ok);
++        for _ in 0..BATCH_SIZE - 2 {
++            worker.pending_control.push_back(Pending::Reply {
++                session: 0,
++                tag: 1,
++                lane: 7,
++                packet: 1,
++                length: 52,
++                due: Duration::from_secs(1),
++            });
++        }
++        for lane in 7..11 {
++            queue_snapshot(&mut worker, 0, lane, 1, 0);
++        }
++        worker.flush_control(Duration::ZERO).unwrap();
++        let mut bytes = [0; BASE_UDP_PAYLOAD];
++        let length = rx.recv(&mut bytes).unwrap().0;
++        assert_eq!(
++            Datagram::decode(&bytes[..length])
++                .unwrap()
++                .records()
++                .count(),
++            2
++        );
++        assert_eq!(worker.feedback_free.len(), 2);
++        assert_eq!(worker.pending_control.len(), BATCH_SIZE);
++        worker.flush_control(Duration::ZERO).unwrap();
++        let length = rx.recv(&mut bytes).unwrap().0;
++        assert_eq!(
++            Datagram::decode(&bytes[..length])
++                .unwrap()
++                .records()
++                .count(),
++            2
++        );
++        assert_eq!(worker.feedback_free.len(), BUFFERS);
++        worker.pending_control.clear();
++        worker
++            .command(1, worker.sessions[0].installed.unwrap(), 0)
++            .unwrap();
++        for (lane, session) in [(7, 0), (8, 1), (9, 0), (10, 1)] {
++            queue_snapshot(&mut worker, session, lane, 1, 0);
++        }
++        worker.flush_control(Duration::ZERO).unwrap();
++        for session in [0, 1, 0, 1] {
++            let length = rx.recv(&mut bytes).unwrap().0;
++            let datagram = Datagram::decode(&bytes[..length]).unwrap();
++            assert_eq!(datagram.records().count(), 1);
++            assert_eq!(
++                datagram.header().cookie,
++                worker.shared.config.config().sessions[session].cookie
++            );
++        }
++        assert_eq!(
++            rx.recv(&mut bytes).unwrap_err().kind(),
++            io::ErrorKind::WouldBlock
++        );
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn packed_ack_send_failure_returns_all_snapshots_and_cancels_history() {
++        let (mut worker, _) = receive_worker();
++        let rx = socket(&mut worker);
++        worker.unpaced_fixture = false;
++        std::thread_local! { static STEP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
++        STEP.set(0);
++        worker.io_time = Some(|_| {
++            if STEP.replace(STEP.get() + 1) == 2 {
++                Err(io::ErrorKind::WouldBlock.into())
++            } else {
++                Ok(Duration::ZERO)
++            }
++        });
++        for lane in 7..11 {
++            queue_snapshot(&mut worker, 0, lane, 1, 0);
++        }
++        worker.flush_control(Duration::ZERO).unwrap();
++        assert_eq!(worker.feedback_free.len(), BUFFERS);
++        assert!(
++            worker
++                .feedback_free
++                .iter()
++                .all(|feedback| feedback.sent.is_none())
++        );
++        assert!(worker.pending_control.is_empty());
++        assert_eq!(worker.counters.tx_outer_bytes, 0);
++        assert_eq!(worker.control_budgets[0].deadline(), None);
++        let index = worker.sender_index(0, 0).unwrap();
++        assert_eq!(worker.sender.lanes[index].history.highest_sent(), 0);
++        assert!(!worker.sender.lanes[index].history.is_reserved(1));
++        let mut bytes = [0; BASE_UDP_PAYLOAD];
++        assert_eq!(
++            rx.recv(&mut bytes).unwrap_err().kind(),
++            io::ErrorKind::WouldBlock
++        );
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn packed_ack_admission_dispatches_every_record_once() {
++        let (mut worker, _) = receive_worker();
++        let rx = socket(&mut worker);
++        worker.unpaced_fixture = false;
++        worker.io_time = Some(Ok);
++        for lane in [1, 2, 1, 2] {
++            queue_snapshot(&mut worker, 0, lane, 1, 0);
++        }
++        worker.flush_control(Duration::ZERO).unwrap();
++        let mut buffer = worker.free.pop().unwrap();
++        buffer.length = rx.recv(&mut buffer.bytes).unwrap().0;
++        let mut header = Datagram::decode(&buffer.bytes[..buffer.length])
++            .unwrap()
++            .header();
++        header.receive_tag = 1;
++        header.lane = 7;
++        header.encode((&mut buffer.bytes[..wire::HEADER_LEN]).try_into().unwrap());
++        let copy = buffer.bytes[..buffer.length].to_vec();
++        let mut budget = ReceiveBudget::default();
++        let buffer = worker
++            .packet_one(buffer, Duration::ZERO, &mut budget)
++            .unwrap()
++            .unwrap();
++        assert_eq!(budget.datagrams, 1);
++        assert_eq!(budget.records, 4);
++        assert_eq!(worker.sender.ack_free.len(), 0);
++        assert_eq!(worker.sender.incoming.len(), 2);
++        assert_eq!(worker.sender.outgoing.len(), 2);
++        assert_eq!(worker.counters.queue_drops, 0);
++        worker.free.push(buffer);
++        let mut duplicate = worker.free.pop().unwrap();
++        duplicate.length = copy.len();
++        duplicate.bytes[..copy.len()].copy_from_slice(&copy);
++        worker
++            .packet_one(duplicate, Duration::ZERO, &mut ReceiveBudget::default())
++            .unwrap();
++        assert_eq!(worker.counters.duplicate_packets, 1);
++        assert_eq!(worker.counters.queue_drops, 0);
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn ack_packing_stops_at_future_or_stale_front_snapshot() {
++        for stale in [false, true] {
++            let (mut worker, _) = receive_worker();
++            let rx = socket(&mut worker);
++            worker.io_time = Some(Ok);
++            for lane in 7..11 {
++                queue_snapshot(&mut worker, 0, lane, 1, 0);
++            }
++            let Pending::Ack(next) = &mut worker.pending_control[1] else {
++                panic!()
++            };
++            if stale {
++                next.tag = 9;
++            } else {
++                next.due = Duration::from_millis(1);
++            }
++            worker.flush_control(Duration::ZERO).unwrap();
++            let mut bytes = [0; BASE_UDP_PAYLOAD];
++            for count in [1, 2] {
++                let length = rx.recv(&mut bytes).unwrap().0;
++                assert_eq!(
++                    Datagram::decode(&bytes[..length])
++                        .unwrap()
++                        .records()
++                        .count(),
++                    count
++                );
++            }
++            assert_eq!(
++                rx.recv(&mut bytes).unwrap_err().kind(),
++                io::ErrorKind::WouldBlock
++            );
++            assert_eq!(worker.pending_control.len(), usize::from(!stale));
++            if !stale {
++                worker.flush_control(Duration::from_millis(1)).unwrap();
++                let length = rx.recv(&mut bytes).unwrap().0;
++                assert!(matches!(
++                    Datagram::decode(&bytes[..length]).unwrap().records().next(),
++                    Some(Record::Ack { lane: 8, .. })
++                ));
++            }
++            assert_eq!(worker.feedback_free.len(), BUFFERS);
++        }
++    }
+ }

@@ -1,0 +1,22 @@
+--- a/src/bbr/controller.rs
++++ b/src/bbr/controller.rs
+@@ -790,7 +790,7 @@
+     }
+ 
+     fn quantized(&self, cap: u64) -> u64 {
+-        let cap = cap.max(u64::from(self.quantum)).max(self.min_cwnd());
++        let cap = cap.max(3 * u64::from(self.quantum)).max(self.min_cwnd());
+         if self.state == State::Up {
+             cap.saturating_add(2 * u64::from(self.mss))
+         } else {
+--- a/src/bbr/controller/tests.rs
++++ b/src/bbr/controller/tests.rs
+@@ -344,7 +344,7 @@
+     c.set_cwnd(1500);
+     assert_eq!(c.cwnd, 6000);
+     c.state = State::Up;
+-    assert_eq!(c.quantized(0), 9000);
++    assert_eq!(c.quantized(0), 12000);
+     assert_eq!(bytes_in(u64::MAX, Duration::MAX, true), u64::MAX);
+     assert_eq!(bytes_in(1, Duration::from_nanos(1), true), 1);
+     assert_eq!(bytes_in(1, Duration::from_nanos(1), false), 0);

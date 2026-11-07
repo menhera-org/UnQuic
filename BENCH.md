@@ -614,6 +614,65 @@ The three control-pacing tests and Clippy pass. This ceiling change remains
 an experiment: the gain is modest, it does not fix the plateau, and it has not
 passed the complete runtime acceptance suite. Production stays at 4 MiB/s.
 
+## ACK packing and offload-window experiments (November 7)
+
+Three normal release experiments use `aa1ca3d`, the same generator and
+twenty-second retained-daemon sweep. None is adopted. Reproduction patches
+and full four-point results are retained for
+[ACK packing](benches/tap-sender-ack-pack-experiment.json),
+[a three-quanta offload floor](benches/tap-sender-offload-budget-experiment.json)
+and [that floor with 16 MiB/s control](benches/tap-sender-offload-control-experiment.json).
+
+ACK packing combines up to four already eligible same-session ACK records
+within the base packet ceiling. It preserves the 64-record control turn
+budget, charges physical packet bytes and finalizes every ACK delay at send
+time. The experiment passes 339 ordinary release tests and 65 short kernel
+tests, including multi-record dispatch, duplicate suppression, queue bounds,
+session boundaries and failed-send cleanup. Its reverse unlimited goodput
+falls 5.2% from the retained-suffix baseline. There is no clear overall gain;
+the experiment does not measure how often records actually combine.
+
+The offload experiment raises the congestion-window floor from one to three
+send quanta. The one-quantum DATA burst, 64-datagram cap and loss/recovery
+bounds stay unchanged. Draft-07 permits a
+[transport-specific offload budget](https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-07.html#section-5.5.8);
+this tests a policy choice, not a verified defect in the existing floor.
+It improves paced goodput by 12% / 28% and unlimited goodput by 13% / 20%.
+Both offload builds pass ordinary release tests and Clippy, but full kernel
+and routed PMTU acceptance remain pending.
+
+| Variant / requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| Retained suffix / 21 | 20.99 / 20.96 | 2.41 / 2.09 | 88.36 / 89.88 | 218.09 / 207.07 |
+| Retained suffix / unlimited | 58.84 / 58.06 | 2.53 / 2.23 | 95.63 / 96.10 | 222.53 / 213.71 |
+| ACK packing / 21 | 20.98 / 20.96 | 2.40 / 2.22 | 88.39 / 89.26 | 226.02 / 212.08 |
+| ACK packing / unlimited | 57.33 / 54.61 | 2.46 / 2.10 | 95.63 / 96.08 | 222.38 / 206.88 |
+| Three-quanta floor / 21 | 20.99 / 20.96 | 2.71 / 2.68 | 86.92 / 87.03 | 249.73 / 236.96 |
+| Three-quanta floor / unlimited | 57.08 / 55.49 | 2.85 / 2.68 | 94.93 / 95.09 | 249.61 / 235.70 |
+| Floor + 16 MiB/s control / 21 | 20.98 / 20.97 | 3.13 / 2.93 | 84.84 / 85.84 | 271.22 / 253.71 |
+| Floor + 16 MiB/s control / unlimited | 57.52 / 47.12 | 2.93 / 2.67 | 94.83 / 94.26 | 249.61 / 233.94 |
+
+The combined floor/control experiment declines 6.5% / 8.8% from paced to
+unlimited load. Its right inner receiver reports 350 UDP receive-buffer
+errors, also visible through socket overflow reporting; these count SKBs,
+not exact missing frames. The reverse receiver has zero such errors yet
+also declines. A repeat and further attribution are needed before changing
+production policy. No experiment establishes a CPU ceiling or either target.
+
+| Variant, unlimited | TAP TX drops (SKBs) | Expired frames | Worker queue drops |
+| --- | ---: | ---: | ---: |
+| Retained suffix | 2169877 / 2130616 | 5140 / 6347 | 912 / 20730 |
+| ACK packing | 2111869 / 2001600 | 5186 / 13191 | 490 / 19491 |
+| Three-quanta floor | 2083941 / 2003580 | 8468 / 10542 | 669 / 25425 |
+| Floor + 16 MiB/s control | 2104290 / 1686535 | 10309 / 4204 | 1563 / 29439 |
+
+All other inner UDP error counts are zero. Every observation has zero outer
+socket overflow, outer fragmentation, admission pressure, malformed packets,
+and invalid, duplicate, reordered or out-of-window receiver records.
+Worker queue drops remain substantial and are not yet attributed by cause.
+The JSON files retain every point's per-worker counters and CPU use.
+No builds or other tests ran during the load intervals.
+
 ## Request fairness and burst-size experiments (November 7)
 
 Two normal-release sweeps use the ACK-pruning baseline, twenty-second points,
