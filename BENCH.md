@@ -401,7 +401,9 @@ At 21G, endpoint counters report 745,518 / 733,256 TAP TX drops,
 All four points have zero admission pressure, socket overflow, inner UDP errors,
 invalid/duplicate/out-of-window/wrong-run records, reordering and outer fragments.
 The combined build passes 338 release tests, Clippy and 56 short container
-tests. Full routed PMTU validation of this combined build remains pending.
+tests. Both additional PMTU tests pass; routed discovery takes 651.15 seconds
+and confirms every lane at 9000 → 1500 → 1280 → 9000, including returned
+and filtered PTB, the normal upward retry and zero outer fragmentation.
 
 ## Grant-wait attribution (November 7)
 
