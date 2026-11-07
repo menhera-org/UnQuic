@@ -6,7 +6,7 @@ slabs, with per-lane FIFOs and zero-copy ownership exchange. A rejected
 global-queue prototype exposed a separate severe QinQ collapse; the FIFO
 regression reproduces its frame-order inversion and verifies the fix.
 
-The latest 60-second QinQ sweep with bounded transmit expiry delivers
+The last 60-second QinQ sweep before shared sender grants delivered
 7.76 / 16.70 Gbit/s at 21 Gbit/s requested each way, then 7.55 / 17.21
 unlimited: a 2.7% forward decline and a 3.1% reverse increase.
 Matched builds remain strongly asymmetric.
@@ -16,7 +16,9 @@ No workload proves a universal plateau or the theoretical CPU ceiling.
 Neither the local **20 Gbit/s in each direction** gate nor the real
 **5 Gbit/s under loss** gate has passed. Runtime recovery and congestion control
 remain unfinished. Workers now use the shared draft-07 controller and grant
-accounting, but this integration has no matched throughput sweep yet.
+accounting. Its first 20-second QinQ sweep delivers only about 0.7 Gbit/s each
+way while using about 1.6–1.7 CPUs per daemon: a severe integration regression,
+far below the CPU ceiling. A matched attribution experiment is still needed.
 General application-limited detection and payload repair remain open.
 PMTU discovery is active in the latest rate sweeps and
 passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
@@ -25,12 +27,16 @@ scheduling and admission problems.
 
 ## Current performance gaps
 
-The latest release passes forwarding/restart and allocation checks,
+The sender integration passes forwarding/restart and allocation checks,
 plus control-pressure, stale-feedback and bounded transmit-expiry regressions.
+Its first paced/unlimited sweep is much slower than the earlier runtime. Low CPU
+use, zero outer socket overflow and zero admission pressure point away from the
+previous receive-capacity explanation; grant/feedback scheduling needs profiling.
 The new matched expiry comparison establishes no general throughput gain and
 still has a forward overload decline. Earlier storage/batching sweeps predate
 ACK emission. Subsequent sender-accounting and I/O-timestamp changes have
-correctness coverage only; no matched throughput sweep measures their cost yet.
+correctness coverage and a first post-integration rate sweep. No matched
+before/after sweep isolates their individual costs yet.
 Frame-view allocations now follow actual per-worker quotas instead of reserving
 8192 slots on every worker. This reduces reserved metadata; it does not establish
 a goodput gain or change the session retention limits.
@@ -43,7 +49,7 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Latest QinQ: 7.76 / 16.70 Gbit/s paced, 7.55 / 17.21 unlimited. Earlier pre-ACK QinQ: 16.68 / 14.43 paced, 20.63 / 13.47 unlimited | Neither build passes both directions. Latest paced missing fractions are 62.84 / 20.08%, far above the under-1% gate. Five successful repeats are absent. |
+| At least 20 Gbit/s each way at inner MTU 1500 | First sender-integration QinQ sweep: 0.76 / 0.70 Gbit/s paced, 0.75 / 0.71 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 96.29 / 96.56%. Five successful repeats and the under-1% gate remain unmet. |
 | Goodput must plateau under excess traffic | Latest QinQ declines 2.7% forward and rises 3.1% reverse from 21G to unlimited; the 16G return delivers 7.63 / 14.71 versus 7.76 / 14.88 initially | The severe prototype collapse is fixed, but the remaining decline is unresolved. Bounded foreign-source batching and larger receive groups reduce syscalls; reader/receive scheduling still needs attribution. |
 | Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Current QinQ reports zero reordering; single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
@@ -64,7 +70,8 @@ stages. No performance gate is waived.
 
 DATA, PMTU and liveness probes now request shared pacing/window grants.
 The earlier throughput tables measured the runtime before this integration;
-they do not measure its cost.
+they do not measure its cost. The first post-integration sweep below records
+a severe regression.
 
 Initial release integration tests exposed small-burst stalls: one run delivered
 18 of 32 frames before the remaining sender frames expired. Admission pressure,
@@ -83,7 +90,7 @@ a ten-second mixed-frame storm and reconnection. One storm observation injected
 corruption or duplicate delivery. Worker queue-drop counters were
 181,796 / 176,203. This is a correctness stress test with mixed frame lengths,
 not a controlled goodput or CPU measurement; its losses remain substantial.
-No before/after rate-sweep or CPU improvement is claimed.
+No throughput or CPU improvement follows from this stress test.
 
 The foreign-rename/namespace-move test also passes after waiting for new-generation
 ACK progress. In one release run that took 5.35 seconds after carrier returned:
@@ -98,14 +105,48 @@ burst and the total window, without raising the confirmed DATA limit. A regressi
 reproduces this exact mismatch and verifies that the resized probe receives a grant.
 The release routed test then passed 9000 → 1500 → 1280 → 9000, including
 returned and filtered PTB, the normal upward retry and no outer fragmentation.
-Default and all-feature release suites, kernel regressions, Clippy and the
-Rust 1.89 compatibility check pass. These checks establish correctness for the
+Default-feature tests, the all-feature release suite, kernel regressions,
+Clippy and the Rust 1.89 compatibility check pass. These checks establish correctness for the
 tested cases, not a throughput improvement.
 
 Controlled release rate sweeps, unlimited-load profiling, complete loss-before-PTO
 ordering, general application-limited detection and runtime payload repair remain
 required. Grant issuance, expiry and cancellation counters now distinguish send
 permission failures from admission pressure, queue drops and socket overflow.
+
+## First paced sender sweep (November 7)
+
+[Four release observations](benches/tap-sender-integration.json) measure
+`c999431` with eight workers per daemon, sixteen flows each way, QinQ,
+1522-byte frames, 44-segment generator batches, 500-entry TAP queues and a
+1452-byte outer UDP ceiling. Each point lasts twenty seconds; the same daemons
+and sockets persist through the sweep. Builds and other tests were stopped
+during measurement.
+
+| Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | 15.95 / 15.94 | 0.69 / 0.67 | 95.46 / 95.59 | 164.59 / 156.73 |
+| 21 | 20.95 / 20.84 | 0.76 / 0.70 | 96.29 / 96.56 | 169.40 / 163.17 |
+| Unlimited | 59.51 / 53.62 | 0.75 / 0.71 | 98.71 / 98.65 | 170.55 / 167.50 |
+| 16 return | 15.98 / 15.93 | 0.73 / 0.73 | 95.29 / 95.35 | 167.57 / 171.58 |
+
+This is a severe integration regression, not a CPU-limited plateau. Earlier
+sixty-second expiry runs reached 7.76 / 16.70 Gbit/s at 21G requested, but other
+sender changes and duration differ, so that comparison does not isolate a cause.
+
+All four points have zero admission pressure, outer socket overflow, inner UDP
+receive errors, invalid records, duplicates, reordering and outer fragmentation.
+At 21G, endpoint L/R counters report 770,589 / 757,044 TAP TX drops,
+111,842 / 228,251 expired frames, and 5,890 / 14,609 worker queue drops.
+Of 164,797 / 167,474 received send grants, 1,047 / 865 expired and
+14,533 / 19,015 were canceled. These units differ; they cannot be summed into
+an exact frame-loss total. Final pacing gauges were sampled after draining and
+must not be used as steady-load controller rates.
+
+The verified facts are low delivered throughput, low CPU utilization and heavy
+upstream dropping/expiry. Grant and feedback serialization, congestion-window
+behavior and worker wakeups need attribution. Missing repair alone does not
+explain this result. No performance target is waived.
 
 ## Bounded transmit expiry (November 6)
 
