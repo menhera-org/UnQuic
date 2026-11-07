@@ -1524,7 +1524,8 @@ impl Worker {
                             self.sessions[session].rx_index[usize::from(id)] = slot as u8 + 1;
                             self.sessions[session].rx[slot] = Some(lane);
                             self.install_rx_counters(session, slot);
-                            self.received.push_back(buffer);
+                            // Direct receives queued during registration must not overtake its first packet.
+                            self.received.push_front(buffer);
                         } else {
                             self.return_lane(session, lane);
                             if buffer.advance() {
@@ -4567,6 +4568,80 @@ mod tests {
                 .map(|w| w.receive[0].as_ref().unwrap().as_fd().as_raw_fd())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn registration_precedes_already_queued_direct_packets() {
+        let (first, _tap) = receive_worker();
+        let mut second = Worker::new(1, Arc::clone(&first.shared), Control::new()).unwrap();
+        second.io_time = Some(Ok);
+        second.unpaced_fixture = true;
+        second
+            .command(
+                0,
+                Command {
+                    generation: 1,
+                    phase: Phase::Install,
+                    connection: first.sessions[0].connection,
+                },
+                0,
+            )
+            .unwrap();
+        let mut workers = [first, second];
+        for from in 0..2 {
+            let (tx, rx) = crate::spsc::channel();
+            workers[from].outgoing[1 - from] = Some(tx);
+            workers[1 - from].incoming[from] = Some(rx);
+        }
+        let lane = 9_u16;
+        let packet = |worker: &mut Worker, sequence: u64| {
+            let mut buffer = worker.free.pop().unwrap();
+            buffer.length = wire::encode_datagram(
+                Header {
+                    cookie: crate::UnquicUuid::from_bytes([1; 16]),
+                    receive_tag: 1,
+                    lane,
+                    packet_number: sequence,
+                    record_area_len: 0,
+                },
+                &[Record::Data {
+                    frame_id: (u64::from(lane) << 48) | sequence,
+                    total_len: 60,
+                    offset: 0,
+                    bytes: &[sequence as u8; 60],
+                }],
+                &mut buffer.bytes,
+            )
+            .unwrap();
+            buffer
+        };
+        // The socket owner forwards the first packet while its lane is unregistered.
+        let first = packet(&mut workers[1], 1);
+        workers[1].received.push_back(first);
+        workers[1].drain_packets(Duration::ZERO).unwrap();
+        workers[0].drain_queues(Duration::ZERO).unwrap();
+        workers[0].drain_packets(Duration::ZERO).unwrap();
+        assert_eq!(
+            workers[0].shared.owners[0][usize::from(lane)].load(Ordering::Acquire),
+            2
+        );
+        assert_eq!(workers[1].sessions[0].rx_index[usize::from(lane)], 0);
+        // A direct receive can already be queued when Register arrives from worker zero.
+        let second = packet(&mut workers[1], 2);
+        workers[1].received.push_back(second);
+        workers[1].drain_queues(Duration::ZERO).unwrap();
+        workers[1].drain_packets(Duration::ZERO).unwrap();
+        let slot = usize::from(workers[1].sessions[0].rx_index[usize::from(lane)] - 1);
+        let receiver = workers[1].sessions[0].rx[slot].as_mut().unwrap();
+        for sequence in [1_u64, 2] {
+            let frame = receiver.front(Duration::ZERO).unwrap();
+            assert_eq!(frame.id, (u64::from(lane) << 48) | sequence);
+            assert_eq!(frame.bytes, &[sequence as u8; 60]);
+            assert!(receiver.finish_front());
+        }
+        assert!(receiver.front(Duration::ZERO).is_none());
+        assert_eq!(workers[1].counters.queue_drops, 0);
     }
 
     #[test]
