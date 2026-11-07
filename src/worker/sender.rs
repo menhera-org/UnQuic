@@ -1287,6 +1287,72 @@ impl Worker {
         }
     }
 
+    // Only the coordinator sends uncharged feedback directly on its DATA lane.
+    // Refresh unsent identities locally; the existing grant keeps its byte and time limits.
+    fn refresh_sender_numbers(&mut self, job: Job, index: usize) -> io::Result<bool> {
+        let Some(owner) = self.sender.owner.as_mut() else {
+            return Ok(false);
+        };
+        let flight = self
+            .sender
+            .flight
+            .as_mut()
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let local = &mut self.sessions[job.session];
+        let tx = local.tx[job.lane]
+            .as_mut()
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let first = match job.kind {
+            JobKind::Data => {
+                let batch = local.batches[job.lane]
+                    .as_mut()
+                    .ok_or(io::ErrorKind::InvalidData)?;
+                if batch
+                    .plan
+                    .packet(0)
+                    .is_none_or(|packet| packet.number != job.first)
+                {
+                    return Ok(false);
+                }
+                batch.plan.renumber(tx)
+            }
+            JobKind::Probe { .. } => tx.allocate_packets(1),
+        };
+        let Ok(first) = first else { return Ok(false) };
+        let history = &mut self.sender.lanes[index].history;
+        let mut reserved = 0;
+        for packet in flight.packets() {
+            match history.reserve(first + reserved as u64, packet.bytes, true, true) {
+                Ok(()) => reserved += 1,
+                Err(error) => {
+                    for offset in 0..reserved {
+                        history.cancel(first + offset as u64);
+                    }
+                    return if error == crate::ack::HistoryError::Full {
+                        Ok(false)
+                    } else {
+                        Err(io::Error::other(error))
+                    };
+                }
+            }
+        }
+        if let Err(error) = owner.reidentify(flight, first) {
+            for offset in 0..reserved {
+                history.cancel(first + offset as u64);
+            }
+            return Err(io::Error::other(error));
+        }
+        for offset in 0..job.count {
+            history.cancel(job.first + offset as u64);
+        }
+        self.sender.job = Some(Job {
+            first,
+            count: reserved,
+            ..job
+        });
+        Ok(true)
+    }
+
     pub(super) fn use_sender_permit(&mut self, now: Duration) -> io::Result<()> {
         let now = self.io_clock(now)()?;
         let job = self.sender.job.ok_or(io::ErrorKind::InvalidData)?;
@@ -1301,8 +1367,7 @@ impl Worker {
             .and_then(|f| f.grant())
             .ok_or(io::ErrorKind::InvalidData)?;
         let index = self.sender_index(job.session, job.lane)?;
-        if job.first <= self.sender.lanes[index].history.highest_sent()
-            || now >= job.deadline
+        if now >= job.deadline
             || !grant.valid_at(now)
             || local.connection.is_none()
             || local.path != job.path
@@ -1317,6 +1382,17 @@ impl Worker {
             }
             return Ok(());
         }
+        if job.first <= self.sender.lanes[index].history.highest_sent()
+            && !self.refresh_sender_numbers(job, index)?
+        {
+            self.rejected_sender_grant(job.session, job.lane, false);
+            self.finish_sender_send(0, None, false)?;
+            if let Some(batch) = self.sessions[job.session].batches[job.lane].as_mut() {
+                batch.compact();
+            }
+            return Ok(());
+        }
+        let job = self.sender.job.ok_or(io::ErrorKind::InvalidData)?;
         match job.kind {
             JobKind::Data => {
                 let mut batch = self.sessions[job.session].batches[job.lane]

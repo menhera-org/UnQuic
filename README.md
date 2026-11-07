@@ -531,6 +531,12 @@ before the end-of-turn notification flush.
 Request priority advances after the first granted worker, so a full scan or
 another path group's later grant cannot repeatedly favor the same worker.
 
+If coordinator feedback overtakes prepared DATA or a probe, the worker refreshes
+its unsent packet numbers, history reservations and sampling identities under the
+same grant. Payload spans, byte limits and deadlines stay unchanged. Old numbers
+remain unsent; history pressure returns the unused grant and preserves the frame
+for retry. The syscall boundary still checks grant and frame deadlines.
+
 A rejected grant preserves the complete prepared packet plan, so temporary
 window or pacing pressure cannot permanently shrink subsequent batches.
 Blocked PMTU requests return their flight buffer so DATA can proceed. A PTO
@@ -784,9 +790,8 @@ that probe's RTT, with a one-second floor. This deliberately uses a shorter
 timeout than RFC 8899's greater-than-15-second recommendation on measured low-RTT
 paths, to limit black-hole loss. Loss can make the selected size conservative;
 the state machine retries upward after 600 seconds. Current-size confirmations
-run no faster than the probe timeout. They support the current unacknowledged
-DATA path and must give way to transport loss feedback when ACK processing is
-connected. [RFC 8899](https://www.rfc-editor.org/rfc/rfc8899.html)
+run no faster than the probe timeout. They still drive DATA-limit fallback; integrating
+transport ACK/loss feedback into that decision remains unfinished. [RFC 8899](https://www.rfc-editor.org/rfc/rfc8899.html)
 
 Both returned and silently filtered ICMPv6 are supported. Without a valid size
 hint, timed probes narrow the search; loss can therefore delay discovery and
@@ -800,8 +805,8 @@ Small liveness probes remain separate and cannot confirm a DATA-sized path.
 Each timer pass visits at most 64 owned sockets before returning to ordinary
 work. Rotating scan order prevents a failing path from monopolising probes.
 Static worker slots allow nominally one padded probe per 3 ms across workers,
-at most 9000 bytes each. Padded probes still need the shared congestion grants
-from Stage 3; replies already use the separate path-group control ceiling.
+at most 9000 bytes each. Padded probes use the shared congestion and pacing
+grants; replies use the separate path-group control ceiling.
 All steady-state discovery storage and packet data are bounded
 and allocated before workers start.
 

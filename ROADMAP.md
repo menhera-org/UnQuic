@@ -538,6 +538,11 @@ Ready completion/feedback batches now use the remaining coordinator budget,
 and end-of-turn handoff avoids an extra worker-loop delay.
 Request scans retain priority after their first successful grant; regressions
 cover continuously ready workers in one group and across groups.
+Coordinator feedback can overtake deferred DATA and probe numbers. Local grants
+now refresh unsent headers and accounting identities without copying payloads or
+extending permission. Regressions cover steady feedback, pacing-held requests,
+queued permits, trimmed grants, probe identity and history-pressure retry. The
+first three fail on the previous send path and pass with refresh.
 
 The pure RTT estimator, loss-deadline calculation, PTO-period backoff and frame
 lifetime now live in `loss.rs`, with exact-value and boundary tests. ACK-driven

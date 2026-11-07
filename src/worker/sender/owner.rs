@@ -56,6 +56,10 @@ pub(in crate::worker) struct Owner {
 }
 
 impl Owner {
+    pub(super) fn reidentify(&mut self, flight: &mut Flight, first: u64) -> Result<(), GrantError> {
+        self.sender.reidentify(flight, first)
+    }
+
     pub(super) fn new(
         groups: usize,
         workers: usize,

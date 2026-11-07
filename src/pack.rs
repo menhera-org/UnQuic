@@ -88,6 +88,19 @@ impl Lane {
         })
     }
 
+    /// Allocates fresh consecutive packet identities without wrapping.
+    pub(crate) fn allocate_packets(&mut self, count: usize) -> Result<u64, PackError> {
+        let first = self.header.packet_number;
+        if first == 0 || count == 0 || count > BATCH_CAPACITY {
+            return Err(PackError::Exhausted);
+        }
+        let last = first
+            .checked_add(count as u64 - 1)
+            .ok_or(PackError::Exhausted)?;
+        self.header.packet_number = last.checked_add(1).unwrap_or(0);
+        Ok(first)
+    }
+
     /// Allocates a frame identity and borrows its bytes until segmentation ends.
     ///
     /// Dropping the encoder abandons the unsent tail and never reuses its ID.
@@ -348,6 +361,19 @@ impl Batch {
         } else {
             None
         }
+    }
+
+    /// Replaces unsent packet identities without changing payload spans or sizes.
+    pub(crate) fn renumber(&mut self, lane: &mut Lane) -> Result<u64, PackError> {
+        let first = lane.allocate_packets(self.count)?;
+        for (offset, plan) in self.packets[..self.count].iter_mut().enumerate() {
+            plan.packet.number = first + offset as u64;
+            let mut header = lane.header;
+            header.packet_number = plan.packet.number;
+            header.record_area_len = (plan.packet.length - HEADER_LEN) as u16;
+            header.encode(&mut plan.header);
+        }
+        Ok(first)
     }
 
     /// Frame indices and byte ranges submitted by a particular packet.
@@ -823,5 +849,46 @@ mod tests {
         lane.next_frame = MAX_SEQUENCE;
         assert_eq!(lane.frame(&[0; 60]).unwrap().id(), (1 << 48) | MAX_SEQUENCE);
         assert!(matches!(lane.frame(&[0; 60]), Err(PackError::Exhausted)));
+    }
+}
+
+#[cfg(test)]
+mod renumber_tests {
+    use super::*;
+
+    #[test]
+    fn renumber_changes_only_headers_and_checks_exhaustion_before_mutation() {
+        let mut lane = super::tests::lane();
+        let mut batch = Batch::new();
+        let frames = [FrameInput {
+            id: lane.start_frame(1514).unwrap(),
+            header: &[],
+            bytes: &[7; 1514],
+            offset: 0,
+            end: 1514,
+        }];
+        batch.prepare(&mut lane, &frames, BASE_UDP_PAYLOAD).unwrap();
+        assert_eq!(batch.len(), 2);
+        let packets = batch.packets;
+        let prefixes = batch.prefixes;
+        let mut control = [0; BASE_UDP_PAYLOAD];
+        let overtaker = lane.record(Record::Probe, &mut control).unwrap().number;
+        let first = batch.renumber(&mut lane).unwrap();
+        assert!(first > overtaker);
+        assert_eq!(batch.prefixes, prefixes);
+        for (index, original) in packets[..2].iter().enumerate() {
+            let plan = batch.packets[index];
+            assert_eq!(plan.packet.number, first + index as u64);
+            assert_eq!(plan.packet.length, original.packet.length);
+            assert_eq!(&plan.header[..40], &original.header[..40]);
+            assert_eq!(&plan.header[40..], &(first + index as u64).to_be_bytes());
+            assert_eq!((plan.first, plan.count), (original.first, original.count));
+        }
+        lane.header.packet_number = u64::MAX;
+        assert_eq!(batch.renumber(&mut lane), Err(PackError::Exhausted));
+        assert_eq!(batch.packet(0).unwrap().number, first);
+        assert_eq!(lane.header.packet_number, u64::MAX);
+        assert_eq!(lane.allocate_packets(1), Ok(u64::MAX));
+        assert_eq!(lane.allocate_packets(1), Err(PackError::Exhausted));
     }
 }

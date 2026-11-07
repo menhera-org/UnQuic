@@ -475,6 +475,45 @@ impl Sender {
         Ok(())
     }
 
+    /// Replaces an unsent grant's packet numbers after local control overtakes it.
+    /// Sizes, origin, handles and grant timing remain unchanged. Validate every
+    /// reservation before changing either copy of the identities.
+    pub(crate) fn reidentify(&mut self, flight: &mut Flight, first: u64) -> Result<(), GrantError> {
+        let group = flight.group.ok_or(GrantError::Stale)?;
+        if flight.grant.is_none()
+            || flight.completed
+            || flight.count == 0
+            || first <= flight.records[flight.count - 1].number
+            || first.checked_add(flight.count as u64 - 1).is_none()
+        {
+            return Err(GrantError::Invalid);
+        }
+        for record in &flight.records[..flight.count] {
+            let handle = record.slot.ok_or(GrantError::Stale)?;
+            let slot = self
+                .slots
+                .get(usize::from(handle.get()) - 1)
+                .ok_or(GrantError::Stale)?;
+            if slot.group != group
+                || slot.id
+                    != (PacketId {
+                        number: record.number,
+                        ..flight.origin
+                    })
+                || slot.bytes != record.bytes
+                || !matches!(slot.state, SlotState::Reserved)
+            {
+                return Err(GrantError::Stale);
+            }
+        }
+        for (offset, record) in flight.records[..flight.count].iter_mut().enumerate() {
+            let handle = record.slot.ok_or(GrantError::Stale)?;
+            record.number = first + offset as u64;
+            self.slots[usize::from(handle.get()) - 1].id.number = record.number;
+        }
+        Ok(())
+    }
+
     /// Reserves the largest fitting prefix; a rejected grant leaves the plan intact.
     pub(crate) fn reserve_prefix(
         &mut self,
@@ -938,5 +977,90 @@ mod tests {
             assert_eq!(sender.flight_bytes(0), Some((0, 0)));
             assert_eq!(sender.available(), 3);
         }
+    }
+}
+
+#[cfg(test)]
+mod reidentify_tests {
+    use super::*;
+
+    #[test]
+    fn refresh_preserves_grant_handles_and_exact_delivery_identity() {
+        let (mut sender, flights) = Sender::new(1, 1, 4).unwrap();
+        let mut flight = flights.into_vec().pop().unwrap();
+        flight
+            .prepare(&[1, 2, 3].map(|number| Planned {
+                id: PacketId {
+                    session: 4,
+                    generation: 5,
+                    lane: 6,
+                    number,
+                },
+                bytes: 1280,
+            }))
+            .unwrap();
+        sender
+            .reserve_prefix(
+                0,
+                &mut flight,
+                2560,
+                false,
+                Limits {
+                    window: 4096,
+                    rate: 1_000_000,
+                    quantum: 4096,
+                    max_datagram: 1280,
+                },
+                Duration::ZERO,
+            )
+            .unwrap();
+        let grant = flight.grant().unwrap();
+        let handles = [flight.handle(0).unwrap(), flight.handle(1).unwrap()];
+        let reserved = sender.flight_bytes(0);
+        let due = sender.deadline(0, Duration::ZERO);
+        assert_eq!(
+            sender.reidentify(&mut flight, u64::MAX),
+            Err(GrantError::Invalid)
+        );
+        assert_eq!(sender.reidentify(&mut flight, 2), Err(GrantError::Invalid));
+        // An invalid later slot must not mutate the earlier valid slot.
+        let second = usize::from(handles[1].get()) - 1;
+        sender.slots[second].bytes = 1281;
+        assert_eq!(sender.reidentify(&mut flight, 20), Err(GrantError::Stale));
+        assert_eq!(flight.packets().next().unwrap().id.number, 1);
+        assert_eq!(sender.slots[usize::from(handles[0].get()) - 1].id.number, 1);
+        sender.slots[second].bytes = 1280;
+        sender.close(0).unwrap(); // Another completion may already have closed the epoch.
+        sender.reidentify(&mut flight, 20).unwrap();
+        assert_eq!(flight.grant().unwrap().id, grant.id);
+        assert_eq!(sender.flight_bytes(0), reserved);
+        assert_eq!(sender.deadline(0, Duration::ZERO), due);
+        assert_eq!(
+            [flight.handle(0).unwrap(), flight.handle(1).unwrap()],
+            handles
+        );
+        let id = flight.packets().next().unwrap().id;
+        flight.complete(1, Some(Duration::ZERO), false).unwrap();
+        assert_eq!(sender.reidentify(&mut flight, 30), Err(GrantError::Invalid));
+        sender.reported(flight).unwrap();
+        let _flight = sender.advance(0, 64).unwrap().unwrap();
+        sender
+            .begin_ack(0, Duration::from_millis(1), false)
+            .unwrap();
+        assert!(
+            sender
+                .acknowledged(0, PacketId { number: 1, ..id }, handles[0])
+                .is_err()
+        );
+        sender.acknowledged(0, id, handles[0]).unwrap();
+        assert_eq!(
+            sender
+                .finish_ack(0, Duration::ZERO)
+                .unwrap()
+                .unwrap()
+                .newly_acked,
+            1280
+        );
+        assert_eq!(sender.available(), 4);
     }
 }

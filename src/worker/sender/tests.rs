@@ -105,11 +105,104 @@ fn fresh_grant_clock_survives_older_worker_turn_through_handoff() {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
-fn control_overtaking_cancels_deferred_data_then_repacks_with_fresh_number() {
+fn steady_control_does_not_starve_local_data_or_consume_another_grant() {
     let (mut workers, rx) = workers();
-    frame(&mut workers[0]);
-    let old = workers[0].sender.job.unwrap().first;
-    let control = workers[0]
+    for worker in &mut workers {
+        worker.io_time = Some(Ok);
+    }
+    let index = workers[0].sender_index(0, 0).unwrap();
+    let mut previous = 0;
+    for turn in 1..=8 {
+        let now = Duration::from_millis(turn);
+        frame(&mut workers[0]);
+        let old = workers[0].sender.job.unwrap().first;
+        let ranges = [wire::AckRange { start: 1, end: 1 }];
+        let control = workers[0]
+            .send_record(
+                0,
+                Record::Ack {
+                    lane: 1,
+                    delay_us: 0,
+                    ranges: wire::AckRanges::new(&ranges).unwrap(),
+                },
+                now,
+            )
+            .unwrap()
+            .unwrap()
+            .0;
+        assert!(control > old && old > previous);
+        for _ in 0..8 {
+            for worker in &mut workers {
+                worker.drain_queues(now).unwrap();
+                worker.service_sender(now).unwrap();
+            }
+        }
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        let length = rx.recv(&mut bytes).unwrap().0;
+        assert_eq!(
+            Datagram::decode(&bytes[..length])
+                .unwrap()
+                .header()
+                .packet_number,
+            control
+        );
+        let length = rx.recv(&mut bytes).unwrap().0;
+        let data = Datagram::decode(&bytes[..length]).unwrap();
+        previous = data.header().packet_number;
+        assert!(previous > control);
+        assert!(
+            data.records()
+                .any(|r| matches!(r, Record::Data { bytes, .. } if bytes == [0xa5; 60]))
+        );
+        let history = &workers[0].sender.lanes[index].history;
+        assert!(history.packet(previous).unwrap().sample_slot.is_some());
+        assert_eq!(
+            history.validate(
+                wire::AckRanges::new(&[wire::AckRange {
+                    start: old,
+                    end: old
+                }])
+                .unwrap()
+            ),
+            Err(crate::ack::HistoryError::Unsent)
+        );
+        assert!(workers[0].sender.job.is_none());
+        assert_eq!(workers[0].sessions[0].tx_retained, 0);
+    }
+    assert_eq!(workers[0].counters.send_grants, 8);
+    assert_eq!(workers[0].counters.cancelled_grants, 0);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn control_overtaking_a_permit_behind_a_full_message_turn_refreshes_it() {
+    let (mut workers, rx) = workers();
+    let worker = &mut workers[0];
+    frame(worker);
+    worker.flush_sender_messages(Duration::ZERO).unwrap();
+    let now = Duration::from_millis(1);
+    // Model a full bounded message turn before the local permit; allocation is fixture setup.
+    worker.sender.outgoing.reserve(BATCH_SIZE + 1);
+    for _ in 0..BATCH_SIZE {
+        worker.sender.outgoing.push_back((0, Message::Reclaim));
+    }
+    worker
+        .sender
+        .owner
+        .as_mut()
+        .unwrap()
+        .advance(now, &mut worker.sender.outgoing)
+        .unwrap();
+    worker.flush_sender_messages(now).unwrap();
+    assert!(!worker.sender.permitted);
+    assert!(
+        worker
+            .sender
+            .outgoing
+            .iter()
+            .any(|(_, m)| matches!(m, Message::Permit(_)))
+    );
+    let control = worker
         .send_record(
             0,
             Record::ProbeReply {
@@ -117,12 +210,14 @@ fn control_overtaking_cancels_deferred_data_then_repacks_with_fresh_number() {
                 packet_number: 99,
                 payload_len: BASE_UDP_PAYLOAD as u16,
             },
-            Duration::ZERO,
+            now,
         )
         .unwrap()
         .unwrap()
         .0;
-    assert!(control > old);
+    for _ in 0..8 {
+        service(&mut workers);
+    }
     let mut bytes = [0; BASE_UDP_PAYLOAD];
     let length = rx.recv(&mut bytes).unwrap().0;
     assert_eq!(
@@ -132,42 +227,12 @@ fn control_overtaking_cancels_deferred_data_then_repacks_with_fresh_number() {
             .packet_number,
         control
     );
-    for _ in 0..8 {
-        service(&mut workers);
-    }
-    assert_eq!(
-        rx.recv(&mut bytes).unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
-    );
-    let index = workers[0].sender_index(0, 0).unwrap();
-    assert!(workers[0].sender.lanes[index].history.packet(old).is_none());
-    assert!(workers[0].sender.job.is_none());
-
-    for worker in &mut workers {
-        worker.io_time = Some(|_| Ok(Duration::from_millis(10)));
-    }
-    workers[0].flush_frames(Duration::from_millis(10)).unwrap();
-    let fresh = workers[0].sender.job.unwrap().first;
-    assert!(fresh > control);
-    for _ in 0..8 {
-        service(&mut workers);
-    }
     let length = rx.recv(&mut bytes).unwrap().0;
-    let datagram = Datagram::decode(&bytes[..length]).unwrap();
-    assert_eq!(datagram.header().packet_number, fresh);
-    assert!(
-        datagram
-            .records()
-            .any(|record| matches!(record, Record::Data { bytes: data, .. } if data == [0xa5; 60]))
-    );
-    assert!(
-        workers[0].sender.lanes[index]
-            .history
-            .packet(fresh)
-            .unwrap()
-            .sample_slot
-            .is_some()
-    );
+    let data = Datagram::decode(&bytes[..length]).unwrap();
+    assert!(data.header().packet_number > control);
+    assert!(data.records().any(|r| matches!(r, Record::Data { .. })));
+    assert_eq!(workers[0].counters.send_grants, 1);
+    assert_eq!(workers[0].counters.cancelled_grants, 0);
 }
 
 #[test]
@@ -251,6 +316,16 @@ fn inactive_install_does_not_quiesce_a_newer_uninstalled_timer_generation() {
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
 fn acked_partial_batches_resume_after_recycle_without_waiting_for_expiry() {
+    partial_batches_with_feedback(false);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn trimmed_grants_refresh_only_the_submitted_prefix_under_feedback() {
+    partial_batches_with_feedback(true);
+}
+
+fn partial_batches_with_feedback(feedback: bool) {
     let (mut workers, rx) = workers();
     for worker in &mut workers {
         worker.io_time = Some(Ok);
@@ -277,6 +352,19 @@ fn acked_partial_batches_resume_after_recycle_without_waiting_for_expiry() {
             worker.drain_queues(now).unwrap();
             worker.service_sender(now).unwrap();
             worker.flush_frames(now).unwrap();
+            if feedback && worker.id == 0 && worker.sender.job.is_some() {
+                worker
+                    .send_record(
+                        0,
+                        Record::ProbeReply {
+                            lane: 1,
+                            packet_number: 99,
+                            payload_len: BASE_UDP_PAYLOAD as u16,
+                        },
+                        now,
+                    )
+                    .unwrap();
+            }
         }
         for _ in 0..64 {
             let length = match rx.recv(&mut storage) {
@@ -333,6 +421,7 @@ fn acked_partial_batches_resume_after_recycle_without_waiting_for_expiry() {
         }
     }
     assert_eq!(complete, 64, "received {received:?}");
+    assert_eq!(workers[0].counters.cancelled_grants, 0);
     for worker in &workers {
         assert_eq!(worker.sessions[0].tx_retained, 0);
         assert_eq!(worker.counters.expired_frames, 0);
@@ -583,4 +672,162 @@ fn sender_queue_pressure_preserves_destination_order_across_partial_sweeps() {
     }
     assert_eq!(received, (1..=70).collect::<Vec<_>>());
     assert!(worker.sender.outgoing.is_empty());
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn feedback_overtakes_a_request_held_by_pacing_without_starving_it() {
+    let (mut workers, rx) = workers();
+    for worker in &mut workers {
+        worker.io_time = Some(Ok);
+    }
+    let now = Duration::from_millis(1);
+    frame(&mut workers[0]);
+    for _ in 0..8 {
+        for w in &mut workers {
+            w.drain_queues(now).unwrap();
+            w.service_sender(now).unwrap();
+        }
+    }
+    let mut bytes = [0; BASE_UDP_PAYLOAD];
+    rx.recv(&mut bytes).unwrap();
+    frame(&mut workers[0]);
+    let old = workers[0].sender.job.unwrap().first;
+    for _ in 0..4 {
+        for w in &mut workers {
+            w.drain_queues(now).unwrap();
+            w.service_sender(now).unwrap();
+        }
+    }
+    assert_eq!(workers[0].counters.send_grants, 1);
+    assert_eq!(workers[0].sender.job.unwrap().first, old);
+    let control = workers[0]
+        .send_record(
+            0,
+            Record::ProbeReply {
+                lane: 1,
+                packet_number: 99,
+                payload_len: BASE_UDP_PAYLOAD as u16,
+            },
+            now,
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+    let later = Duration::from_millis(2);
+    for _ in 0..8 {
+        for w in &mut workers {
+            w.drain_queues(later).unwrap();
+            w.service_sender(later).unwrap();
+        }
+    }
+    rx.recv(&mut bytes).unwrap();
+    let length = rx.recv(&mut bytes).unwrap().0;
+    let data = Datagram::decode(&bytes[..length]).unwrap();
+    assert!(data.header().packet_number > control);
+    assert!(data.records().any(|r| matches!(r, Record::Data { .. })));
+    assert_eq!(workers[0].counters.send_grants, 2);
+    assert_eq!(workers[0].counters.cancelled_grants, 0);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn overtaken_probe_refreshes_its_history_and_reply_identity() {
+    let (mut workers, rx) = workers();
+    workers[0]
+        .request_probe(0, 0, BASE_UDP_PAYLOAD, false, None, Duration::ZERO)
+        .unwrap();
+    let old = workers[0].sender.job.unwrap().first;
+    let control = workers[0]
+        .send_record(
+            0,
+            Record::ProbeReply {
+                lane: 1,
+                packet_number: 99,
+                payload_len: BASE_UDP_PAYLOAD as u16,
+            },
+            Duration::ZERO,
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+    for _ in 0..8 {
+        service(&mut workers);
+    }
+    let mut bytes = [0; BASE_UDP_PAYLOAD];
+    rx.recv(&mut bytes).unwrap();
+    let length = rx.recv(&mut bytes).unwrap().0;
+    let packet = Datagram::decode(&bytes[..length]).unwrap();
+    let number = packet.header().packet_number;
+    assert!(number > control && control > old);
+    assert!(packet.records().any(|r| matches!(r, Record::Probe)));
+    let index = workers[0].sender_index(0, 0).unwrap();
+    let lane = &workers[0].sender.lanes[index];
+    assert_eq!(lane.probes[1], Some((number, BASE_UDP_PAYLOAD as u16)));
+    assert!(lane.history.packet(number).unwrap().sample_slot.is_some());
+    assert_eq!(workers[0].counters.cancelled_grants, 0);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn refresh_history_pressure_reports_unused_and_preserves_frame() {
+    let (mut workers, rx) = workers();
+    frame(&mut workers[0]);
+    let retained = workers[0].sessions[0].tx_retained;
+    let old = workers[0].sender.job.unwrap().first;
+    let tx = workers[0].sessions[0].tx[0].as_mut().unwrap();
+    let mut skip = 65536 - 2;
+    while skip != 0 {
+        let count = skip.min(BATCH_SIZE);
+        tx.allocate_packets(count).unwrap();
+        skip -= count;
+    }
+    let control = workers[0]
+        .send_record(
+            0,
+            Record::ProbeReply {
+                lane: 1,
+                packet_number: 99,
+                payload_len: BASE_UDP_PAYLOAD as u16,
+            },
+            Duration::ZERO,
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(control, 65536);
+    for _ in 0..8 {
+        service(&mut workers);
+    }
+    let index = workers[0].sender_index(0, 0).unwrap();
+    assert!(workers[0].sender.lanes[index].history.packet(old).is_none());
+    assert_eq!(workers[0].sender.lanes[index].history.inflight_bytes(), 0);
+    assert!(workers[0].sender.job.is_none());
+    assert_eq!(workers[0].sessions[0].tx_retained, retained);
+    assert_eq!(workers[0].counters.cancelled_grants, 1);
+    let mut bytes = [0; BASE_UDP_PAYLOAD];
+    rx.recv(&mut bytes).unwrap();
+    assert_eq!(
+        rx.recv(&mut bytes).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    for worker in &mut workers {
+        worker.io_time = Some(Ok);
+    }
+    let later = Duration::from_millis(2);
+    workers[0].flush_frames(later).unwrap();
+    for _ in 0..8 {
+        for w in &mut workers {
+            w.drain_queues(later).unwrap();
+            w.service_sender(later).unwrap();
+        }
+    }
+    let length = rx.recv(&mut bytes).unwrap().0;
+    assert!(
+        Datagram::decode(&bytes[..length])
+            .unwrap()
+            .records()
+            .any(|r| matches!(r, Record::Data { .. }))
+    );
+    assert_eq!(workers[0].sessions[0].tx_retained, 0);
 }
