@@ -659,7 +659,7 @@ full expired batches sharing the cleanup budget.
   datagrams. Pin deterministic vectors derived from the draft's pseudocode
   before optimising anything. Do not substitute a simpler controller.
 - `pacing.rs`: grants with 100 µs expiry and reservation-before-grant,
-  burst cap of min(send quantum, 16 datagrams), `timerfd` deadlines, the
+  burst cap of min(send quantum, 64 datagrams), `timerfd` deadlines, the
   separate 4 MiB/s control-traffic ceiling with a 16-datagram burst.
 - Liveness from section 5.3: PROBE once per second on idle, degraded after
   3 s, inactive after 30 s, replacement handshake with automatic election.

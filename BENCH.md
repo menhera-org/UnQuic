@@ -19,8 +19,8 @@ remain unfinished. Workers now use the shared draft-07 controller and grant
 accounting. Refreshing overtaken packet numbers removes repeated coordinator
 DATA cancellations. Skipping empty loss-history ranges reduces CPU cost, but the
 larger bounded DATA burst and retained never-attempted packet plans raise the
-latest 20-second QinQ sweep to 2.03–2.74 Gbit/s per direction using about
-2.1–2.3 CPUs per daemon.
+normal 20-second QinQ sweeps to 1.95–2.74 Gbit/s per direction using about
+2.0–2.3 CPUs per daemon.
 The preceding ACK-pruning sweep delivered 1.12 to 1.22 Gbit/s. These remain
 severe integration regressions, far below the CPU ceiling.
 General application-limited detection and payload repair remain open.
@@ -53,8 +53,8 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Latest sender QinQ sweep: 2.41 / 2.09 Gbit/s paced, 2.53 / 2.23 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 88.36 / 89.88%. Five successful repeats and the under-1% gate remain unmet. |
-| Goodput must plateau under excess traffic | Latest sender sweep spans 2.03 to 2.74 Gbit/s through paced, unlimited and return points; daemon CPU stays near 2.1–2.3 cores. The earlier expiry sweep declined 2.7% forward under unlimited load | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Latest production-policy QinQ sweep with ACK-drop counters: 2.15 / 1.96 Gbit/s paced, 2.24 / 1.99 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 89.57 / 90.50%. Five successful repeats and the under-1% gate remain unmet. |
+| Goodput must plateau under excess traffic | Recent production-policy sender sweeps span 1.95 to 2.74 Gbit/s through paced, unlimited and return points; daemon CPU stays near 2.0–2.3 cores. The earlier expiry sweep declined 2.7% forward under unlimited load | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
 | Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Current QinQ reports zero reordering; single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
