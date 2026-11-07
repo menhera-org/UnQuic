@@ -83,6 +83,84 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Current sender service measurements (November 7)
+
+The current production build includes sent-history PTB validation and the
+liveness scheduling fix. A separate diagnostic counts exact grant and
+completion bytes, epoch occupancy and window constraints. Existing timestamps
+measure owner/grant intervals; one extra clock per 64 owner calls and per
+64 grants per worker samples call and handoff wall time. Counters publish at
+the existing cadence, without per-packet logging or allocation.
+
+The diagnostic passes 351 ordinary release tests, Clippy and all 73 kernel
+library checks. Production and diagnostic sweeps use the same twenty-second
+QinQ profile, with production measured before and after instrumentation.
+No local builds, kernel tests, live snapshots or Git packing overlap the
+measurement. Migration tests run on a separate machine.
+
+| Build | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | Daemon CPU % L / R |
+| --- | --- | --- | --- | --- |
+| Production before | 1 Gbit/s | 0.980 / 0.980 | 0.874 / 0.867 | 89.99 / 83.00 |
+| Production before | 4 Gbit/s | 1.696 / 1.528 | 56.927 / 61.227 | 213.86 / 204.44 |
+| Production before | 21 Gbit/s | 1.692 / 1.544 | 91.709 / 92.432 | 207.92 / 198.41 |
+| Production before | Unlimited | 1.679 / 1.547 | 97.111 / 97.379 | 208.06 / 201.67 |
+| Instrumented | 1 Gbit/s | 0.986 / 0.977 | 0.049 / 0.933 | 99.60 / 93.91 |
+| Instrumented | 4 Gbit/s | 1.774 / 1.530 | 54.644 / 60.920 | 212.07 / 204.10 |
+| Instrumented | 21 Gbit/s | 1.770 / 1.539 | 91.437 / 92.550 | 215.11 / 206.79 |
+| Instrumented | Unlimited | 1.748 / 1.517 | 96.930 / 97.143 | 208.32 / 201.43 |
+| Production after | 1 Gbit/s | 0.977 / 0.975 | 0.846 / 0.980 | 101.58 / 93.67 |
+| Production after | 4 Gbit/s | 1.701 / 1.560 | 56.808 / 60.411 | 213.71 / 207.38 |
+| Production after | 21 Gbit/s | 1.741 / 1.550 | 91.546 / 92.478 | 215.29 / 208.56 |
+| Production after | Unlimited | 1.758 / 1.594 | 96.949 / 97.108 | 219.14 / 207.33 |
+
+Current production remains at roughly 1.5–1.8 Gbit/s per direction using about
+two cores per daemon. These four-point observations show no large overload
+decline in the production build, but establish neither a general plateau nor
+a CPU ceiling. The original 20 Gbit/s and real-path targets remain unmet.
+
+| Unlimited diagnostic | Left | Right |
+| --- | ---: | ---: |
+| Accepted grants | 134,156 | 127,314 |
+| Mean reserved outer bytes per grant | 39,118 | 35,520 |
+| Mean physical packets per grant | 26.40 | 23.98 |
+| Reserved bytes successfully submitted (%) | 97.06 | 98.11 |
+| Zero-success completions (%) | 2.67 | 1.67 |
+| Grants filling the shared burst (%) | 15.02 | 10.40 |
+| Mean grants per completed epoch | 1.021 | 1.031 |
+| Accepted grants shortened by window credit | 105,703 | 98,530 |
+| Request visits without first-packet window credit | 2,088,846 | 2,681,531 |
+| Mean interval between consecutive busy owner entries (µs) | 24.52 | 25.36 |
+| Mean interval between grants, including gaps/drain (µs) | 163.04 | 170.50 |
+| Sampled owner-call wall duration (µs) | 1.14 | 1.38 |
+| Sampled reservation→send (µs) | 22.94 | 22.59 |
+| Sampled send→owner completion (µs) | 56.05 | 45.44 |
+
+Window credit shortens 78.79 / 77.39% of accepted grants. Insufficient credit
+can coexist with burst, pacing or accounting barriers, so blocked visits are
+not an exclusive cause count. Epochs average about one grant, but most grants
+do not fill the burst. This rejects full-quantum reservations as a sufficient
+description of the bottleneck. Window constraints and delayed feedback need
+further isolation.
+
+Owner-call wall time includes preemption and is not CPU usage. Successful-send
+timing partitions use 2,042 / 1,948 samples; reservation-to-report time also
+includes zero-success completions and averages 83.53 / 74.47 µs from
+2,098 / 1,988 samples. There are no clock anomalies or nonzero partial
+completions. The lifetime peak of reserved plus inflight credit is
+277,760 / 249,178 outer bytes; it is not an average window. Lifetime peak
+epoch size is four. Peaks include earlier points and cannot be subtracted.
+
+Instrumented unlimited admission pressure is 12,029 / 3,040. Raw results
+retain queue drops, each expiry class, TAP ingress drops and thread CPU.
+All instrumented points have zero outer socket overflow, outer/inner UDP
+errors, outer fragments, invalid or duplicate application records and
+reordered records. The diagnostic remains unapplied; instrumentation and
+scheduling variation prevent treating it as a speed comparison.
+
+[Raw measurements](benches/tap-sender-service.json) include both production
+brackets. The [diagnostic patch](benches/sender-service-diagnostic.patch)
+reproduces the counters and sampled timing.
+
 ## Controller rate/window isolation (November 7)
 
 Five sequential release sweeps compare unchanged controller outputs, a fixed

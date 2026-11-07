@@ -1,0 +1,756 @@
+diff --git a/src/counters.rs b/src/counters.rs
+index 0631ce9..1892d87 100644
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -152,6 +152,70 @@ metrics! {
+     feedback_delay_ns: max,
+     /// Current pacing rate in outer IP bytes per second.
+     pacing_bytes_per_second: sum,
++    /// Diagnostic only: Accepted grants.
++    service_grants: sum,
++    /// Diagnostic only: Exact outer bytes reserved by accepted grants.
++    service_reserved_bytes: sum,
++    /// Diagnostic only: Packets authorized by accepted grants.
++    service_planned_packets: sum,
++    /// Diagnostic only: Exact outer bytes charged by accepted completions.
++    service_submitted_bytes: sum,
++    /// Diagnostic only: Accepted completions, including zero-success grants.
++    service_completions: sum,
++    /// Diagnostic only: Accepted zero-success completions.
++    service_zero_completions: sum,
++    /// Diagnostic only: Accepted nonzero completions using less than their grant.
++    service_partial_completions: sum,
++    /// Diagnostic only: Grants leaving less than one maximum datagram in the shared burst.
++    service_burst_filled: sum,
++    /// Diagnostic only: Reopened epochs that contained a grant.
++    service_epochs: sum,
++    /// Diagnostic only: Grants in completed nonempty epochs.
++    service_epoch_grants: sum,
++    /// Diagnostic only: Maximum grants in one completed epoch.
++    service_epoch_grants_peak: max,
++    /// Diagnostic only: Maximum observed reserved plus inflight outer bytes.
++    service_charged_peak: max,
++    /// Diagnostic only: Ordinary request visits whose first packet did not fit the remaining window; other blockers may coexist.
++    service_window_insufficient: sum,
++    /// Diagnostic only: accepted prefixes whose next packet exceeded remaining window credit; burst limits may coexist.
++    service_window_limited_grants: sum,
++    /// Diagnostic only: Owner advance calls.
++    service_owner_passes: sum,
++    /// Diagnostic only: Owner advance calls with a pending request at entry.
++    service_busy_passes: sum,
++    /// Diagnostic only: Intervals between consecutive owner calls that both had pending requests.
++    service_busy_intervals: sum,
++    /// Diagnostic only: Nanoseconds in measured consecutive busy owner intervals.
++    service_busy_interval_ns: sum,
++    /// Diagnostic only: Maximum consecutive busy owner interval.
++    service_busy_interval_max_ns: max,
++    /// Diagnostic only: Intervals between successful grants in the same group.
++    service_grant_intervals: sum,
++    /// Diagnostic only: Nanoseconds in measured grant intervals, including idle gaps.
++    service_grant_interval_ns: sum,
++    /// Diagnostic only: Maximum same-group grant interval.
++    service_grant_interval_max_ns: max,
++    /// Diagnostic only: Sampled owner calls with a valid end timestamp.
++    service_owner_samples: sum,
++    /// Diagnostic only: Sampled owner advance wall time, including preemption.
++    service_owner_sample_ns: sum,
++    /// Diagnostic only: Maximum sampled owner advance wall time.
++    service_owner_sample_max_ns: max,
++    /// Diagnostic only: Accepted completions with sampled reservation-to-report time.
++    service_report_samples: sum,
++    /// Diagnostic only: Sampled reservation-to-owner-completion nanoseconds.
++    service_reserve_report_ns: sum,
++    /// Diagnostic only: Maximum sampled reservation-to-owner-completion time.
++    service_reserve_report_max_ns: max,
++    /// Diagnostic only: Sampled successful completions with both timing partitions.
++    service_send_samples: sum,
++    /// Diagnostic only: Sampled reservation-to-pre-syscall nanoseconds.
++    service_reserve_send_ns: sum,
++    /// Diagnostic only: Sampled pre-syscall-to-owner-completion nanoseconds.
++    service_send_report_ns: sum,
++    /// Diagnostic only: Diagnostic timestamps that moved backwards.
++    service_clock_anomalies: sum,
+     /// Issued send permissions received by transmit workers.
+     send_grants: sum,
+     /// Send permissions rejected after their submission interval elapsed.
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 07101de..1b06ebf 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -8,6 +8,7 @@ use crate::{
+ };
+ use std::num::NonZeroU16;
+ 
++mod diagnostic;
+ mod history;
+ mod owner;
+ #[cfg(test)]
+@@ -589,12 +590,23 @@ impl Worker {
+                 .as_mut()
+                 .ok_or(io::ErrorKind::InvalidData)?
+                 .request(request)?,
+-            Message::Complete(flight) => self
+-                .sender
+-                .owner
+-                .as_mut()
+-                .ok_or(io::ErrorKind::InvalidData)?
+-                .complete(flight)?,
++            Message::Complete(flight) => {
++                let sampled = self
++                    .sender
++                    .owner
++                    .as_ref()
++                    .is_some_and(|owner| owner.diagnostic.sample_completion(flight.worker()));
++                let observed = if sampled {
++                    Some(self.io_clock(now)()?)
++                } else {
++                    None
++                };
++                self.sender
++                    .owner
++                    .as_mut()
++                    .ok_or(io::ErrorKind::InvalidData)?
++                    .complete_observed(flight, observed)?;
++            }
+             Message::Report(report) => self
+                 .sender
+                 .owner
+@@ -998,9 +1010,20 @@ impl Worker {
+             more |= self.flush_sender_messages(now)?;
+             // Reports can have arrived after the worker turn's original timestamp.
+             let observed = self.io_clock(now)()?;
++            let sampled = self
++                .sender
++                .owner
++                .as_ref()
++                .is_some_and(|owner| owner.diagnostic.sample_pass());
+             if let Some(owner) = &mut self.sender.owner {
+                 more |= owner.advance(observed, &mut self.sender.outgoing)?;
+             }
++            if sampled {
++                let finished = self.io_clock(now)()?;
++                if let Some(owner) = &mut self.sender.owner {
++                    owner.diagnostic.pass_finished(observed, finished);
++                }
++            }
+         }
+         more |= self.flush_sender_messages(now)?;
+         if self.sender.permitted {
+@@ -1660,6 +1683,7 @@ impl Worker {
+             self.counters.rtt_ns = self.counters.rtt_ns.max(totals.rtt_ns);
+         }
+         if let Some(owner) = &self.sender.owner {
++            owner.diagnostic.publish(&mut self.counters);
+             for group in 0..self.shared.config.path_groups() {
+                 if let Some(snapshot) = owner.snapshot(group) {
+                     self.counters.pacing_bytes_per_second = self
+diff --git a/src/worker/sender/diagnostic.rs b/src/worker/sender/diagnostic.rs
+new file mode 100644
+index 0000000..0aa5a97
+--- /dev/null
++++ b/src/worker/sender/diagnostic.rs
+@@ -0,0 +1,253 @@
++//! Isolated service-ceiling measurements; never changes admission or ordering.
++use super::*;
++
++#[derive(Clone, Copy, Default)]
++struct Sample {
++    sequence: u64,
++    issued: Option<Duration>,
++}
++
++pub(super) struct Diagnostic {
++    values: Snapshot,
++    samples: [Sample; 64],
++    previous_busy: Option<Duration>,
++}
++
++impl Diagnostic {
++    pub(super) fn new() -> Self {
++        Self {
++            values: Snapshot::default(),
++            samples: [Sample::default(); 64],
++            previous_busy: None,
++        }
++    }
++
++    pub(super) fn publish(&self, values: &mut Snapshot) {
++        values.service_grants = self.values.service_grants;
++        values.service_reserved_bytes = self.values.service_reserved_bytes;
++        values.service_planned_packets = self.values.service_planned_packets;
++        values.service_submitted_bytes = self.values.service_submitted_bytes;
++        values.service_completions = self.values.service_completions;
++        values.service_zero_completions = self.values.service_zero_completions;
++        values.service_partial_completions = self.values.service_partial_completions;
++        values.service_burst_filled = self.values.service_burst_filled;
++        values.service_epochs = self.values.service_epochs;
++        values.service_epoch_grants = self.values.service_epoch_grants;
++        values.service_epoch_grants_peak = self.values.service_epoch_grants_peak;
++        values.service_charged_peak = self.values.service_charged_peak;
++        values.service_window_insufficient = self.values.service_window_insufficient;
++        values.service_window_limited_grants = self.values.service_window_limited_grants;
++        values.service_owner_passes = self.values.service_owner_passes;
++        values.service_busy_passes = self.values.service_busy_passes;
++        values.service_busy_intervals = self.values.service_busy_intervals;
++        values.service_busy_interval_ns = self.values.service_busy_interval_ns;
++        values.service_busy_interval_max_ns = self.values.service_busy_interval_max_ns;
++        values.service_grant_intervals = self.values.service_grant_intervals;
++        values.service_grant_interval_ns = self.values.service_grant_interval_ns;
++        values.service_grant_interval_max_ns = self.values.service_grant_interval_max_ns;
++        values.service_owner_samples = self.values.service_owner_samples;
++        values.service_owner_sample_ns = self.values.service_owner_sample_ns;
++        values.service_owner_sample_max_ns = self.values.service_owner_sample_max_ns;
++        values.service_report_samples = self.values.service_report_samples;
++        values.service_reserve_report_ns = self.values.service_reserve_report_ns;
++        values.service_reserve_report_max_ns = self.values.service_reserve_report_max_ns;
++        values.service_send_samples = self.values.service_send_samples;
++        values.service_reserve_send_ns = self.values.service_reserve_send_ns;
++        values.service_send_report_ns = self.values.service_send_report_ns;
++        values.service_clock_anomalies = self.values.service_clock_anomalies;
++    }
++
++    pub(super) fn pass(&mut self, now: Duration, busy: bool) {
++        self.values.service_owner_passes += 1;
++        if busy {
++            self.values.service_busy_passes += 1;
++            if let Some(previous) = self.previous_busy {
++                if let Some(elapsed) = now.checked_sub(previous) {
++                    let ns = nanos(elapsed);
++                    self.values.service_busy_intervals += 1;
++                    self.values.service_busy_interval_ns += ns;
++                    self.values.service_busy_interval_max_ns =
++                        self.values.service_busy_interval_max_ns.max(ns);
++                } else {
++                    self.values.service_clock_anomalies += 1;
++                }
++            }
++        }
++        self.previous_busy = busy.then_some(now);
++    }
++
++    pub(super) fn sample_pass(&self) -> bool {
++        self.values.service_owner_passes & 63 == 0
++    }
++
++    pub(super) fn pass_finished(&mut self, start: Duration, end: Duration) {
++        if let Some(elapsed) = end.checked_sub(start) {
++            let ns = nanos(elapsed);
++            self.values.service_owner_samples += 1;
++            self.values.service_owner_sample_ns += ns;
++            self.values.service_owner_sample_max_ns =
++                self.values.service_owner_sample_max_ns.max(ns);
++        } else {
++            self.values.service_clock_anomalies += 1;
++        }
++    }
++
++    pub(super) fn occupancy(&mut self, charged: u64) {
++        self.values.service_charged_peak = self.values.service_charged_peak.max(charged);
++    }
++
++    pub(super) fn window_limited_grant(&mut self) {
++        self.values.service_window_limited_grants += 1;
++    }
++
++    pub(super) fn window_insufficient(&mut self) {
++        self.values.service_window_insufficient += 1;
++    }
++
++    pub(super) fn granted(
++        &mut self,
++        worker: usize,
++        bytes: u32,
++        packets: usize,
++        filled: bool,
++        now: Duration,
++        previous: Option<Duration>,
++    ) {
++        self.values.service_grants += 1;
++        self.values.service_reserved_bytes += u64::from(bytes);
++        self.values.service_planned_packets += packets as u64;
++        self.values.service_burst_filled += u64::from(filled);
++        if let Some(previous) = previous {
++            if let Some(elapsed) = now.checked_sub(previous) {
++                let ns = nanos(elapsed);
++                self.values.service_grant_intervals += 1;
++                self.values.service_grant_interval_ns += ns;
++                self.values.service_grant_interval_max_ns =
++                    self.values.service_grant_interval_max_ns.max(ns);
++            } else {
++                self.values.service_clock_anomalies += 1;
++            }
++        }
++        let sample = &mut self.samples[worker];
++        sample.issued = (sample.sequence & 63 == 0).then_some(now);
++        sample.sequence = sample.sequence.wrapping_add(1);
++    }
++
++    pub(super) fn sample_completion(&self, worker: usize) -> bool {
++        self.samples.get(worker).is_some_and(|s| s.issued.is_some())
++    }
++
++    pub(super) fn completed(
++        &mut self,
++        worker: usize,
++        reserved: u32,
++        submitted: u64,
++        started: Option<Duration>,
++        observed: Option<Duration>,
++    ) {
++        self.values.service_completions += 1;
++        self.values.service_submitted_bytes += submitted;
++        self.values.service_zero_completions += u64::from(submitted == 0);
++        self.values.service_partial_completions +=
++            u64::from(submitted != 0 && submitted < u64::from(reserved));
++        let issued = self.samples[worker].issued.take();
++        if let (Some(issued), Some(observed)) = (issued, observed) {
++            if let Some(elapsed) = observed.checked_sub(issued) {
++                let ns = nanos(elapsed);
++                self.values.service_report_samples += 1;
++                self.values.service_reserve_report_ns += ns;
++                self.values.service_reserve_report_max_ns =
++                    self.values.service_reserve_report_max_ns.max(ns);
++            } else {
++                self.values.service_clock_anomalies += 1;
++                return;
++            }
++            if let Some(started) = started {
++                if let (Some(before), Some(after)) =
++                    (started.checked_sub(issued), observed.checked_sub(started))
++                {
++                    self.values.service_send_samples += 1;
++                    self.values.service_reserve_send_ns += nanos(before);
++                    self.values.service_send_report_ns += nanos(after);
++                } else {
++                    self.values.service_clock_anomalies += 1;
++                }
++            }
++        }
++    }
++
++    pub(super) fn reopened(&mut self, grants: u64) {
++        if grants != 0 {
++            self.values.service_epochs += 1;
++            self.values.service_epoch_grants += grants;
++            self.values.service_epoch_grants_peak =
++                self.values.service_epoch_grants_peak.max(grants);
++        }
++    }
++}
++
++fn nanos(elapsed: Duration) -> u64 {
++    elapsed.as_nanos().min(u128::from(u64::MAX)) as u64
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn us(value: u64) -> Duration {
++        Duration::from_micros(value)
++    }
++
++    #[test]
++    fn accounting_and_samples_include_zero_partial_and_separate_workers() {
++        let mut diag = Diagnostic::new();
++        diag.granted(0, 3000, 2, true, us(10), None);
++        diag.granted(1, 1500, 1, false, us(12), Some(us(10)));
++        assert!(diag.sample_completion(0));
++        assert!(diag.sample_completion(1));
++        diag.completed(0, 3000, 1500, Some(us(20)), Some(us(40)));
++        diag.completed(1, 1500, 0, None, Some(us(50)));
++        diag.reopened(2);
++        assert_eq!(diag.values.service_reserved_bytes, 4500);
++        assert_eq!(diag.values.service_submitted_bytes, 1500);
++        assert_eq!(diag.values.service_zero_completions, 1);
++        assert_eq!(diag.values.service_partial_completions, 1);
++        assert_eq!(diag.values.service_report_samples, 2);
++        assert_eq!(diag.values.service_reserve_report_ns, 68_000);
++        assert_eq!(diag.values.service_reserve_send_ns, 10_000);
++        assert_eq!(diag.values.service_send_report_ns, 20_000);
++        assert_eq!(diag.values.service_send_samples, 1);
++        assert_eq!(diag.values.service_epoch_grants, 2);
++        assert!(!diag.sample_completion(0));
++        for sequence in 1..=64 {
++            diag.granted(0, 1500, 1, false, us(60 + sequence), None);
++            assert_eq!(diag.sample_completion(0), sequence == 64);
++            diag.completed(0, 1500, 1500, None, None);
++        }
++    }
++
++    #[test]
++    fn busy_intervals_exclude_idle_and_clock_anomalies_do_not_wrap() {
++        let mut diag = Diagnostic::new();
++        diag.pass(us(10), true);
++        diag.pass(us(30), true);
++        diag.pass(us(100), false);
++        diag.pass(us(200), true);
++        diag.pass(us(190), true);
++        diag.pass_finished(us(10), us(15));
++        diag.pass_finished(us(20), us(19));
++        diag.granted(0, 1500, 1, false, us(40), Some(us(50)));
++        diag.completed(0, 1500, 0, None, Some(us(39)));
++        diag.reopened(0);
++        assert_eq!(diag.values.service_busy_intervals, 1);
++        assert_eq!(diag.values.service_busy_interval_ns, 20_000);
++        assert_eq!(diag.values.service_owner_samples, 1);
++        assert_eq!(diag.values.service_owner_sample_ns, 5_000);
++        assert_eq!(diag.values.service_clock_anomalies, 4);
++        assert_eq!(diag.values.service_report_samples, 0);
++        assert_eq!(diag.values.service_epochs, 0);
++        let mut snapshot = Snapshot::default();
++        diag.publish(&mut snapshot);
++        diag.publish(&mut snapshot);
++        assert_eq!(snapshot.service_busy_passes, 4);
++    }
++}
+diff --git a/src/worker/sender/owner.rs b/src/worker/sender/owner.rs
+index 0029301..356323e 100644
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -29,6 +29,8 @@ struct LossBarrier {
+ 
+ struct Group {
+     controller: Controller,
++    diagnostic_grants: u64,
++    diagnostic_last_grant: Option<Duration>,
+     rtt: Rtt,
+     pto: ProbeTimeout,
+     epoch: u64,
+@@ -40,8 +42,40 @@ struct Group {
+     probe: Option<(Option<PacketId>, u8)>,
+ }
+ 
++// Isolated causal experiment; absent at compile time leaves controller outputs unchanged.
++const DIAGNOSTIC_MODE: u8 = match option_env!("UNQUIC_CONTROLLER_DIAGNOSTIC") {
++    None => 0,
++    Some(value) => match value.as_bytes() {
++        [b'r', b'a', b't', b'e'] => 1,
++        [b'w', b'i', b'n', b'd', b'o', b'w'] => 2,
++        [b'b', b'o', b't', b'h'] => 3,
++        _ => panic!("invalid UNQUIC_CONTROLLER_DIAGNOSTIC"),
++    },
++};
++
++fn diagnostic_limits(mut limits: pacing::Limits, mode: u8, probe_rtt: bool) -> pacing::Limits {
++    if mode & 1 != 0 {
++        limits.rate = 4_000_000_000;
++    }
++    if mode & 2 != 0 && !probe_rtt {
++        limits.window = 8 * 1024 * 1024;
++    }
++    limits
++}
++
++impl Group {
++    fn effective_limits(&self) -> pacing::Limits {
++        diagnostic_limits(
++            self.controller.limits(),
++            DIAGNOSTIC_MODE,
++            self.controller.state() == crate::bbr::State::ProbeRtt,
++        )
++    }
++}
++
+ pub(in crate::worker) struct Owner {
+     sender: Sender,
++    pub(super) diagnostic: diagnostic::Diagnostic,
+     pub(super) timers: timers::Timers,
+     groups: Vec<Group>,
+     requests: Vec<Option<Request>>,
+@@ -71,6 +105,8 @@ impl Owner {
+         states.try_reserve_exact(groups).map_err(io::Error::other)?;
+         for group in 0..groups {
+             states.push(Group {
++                diagnostic_grants: 0,
++                diagnostic_last_grant: None,
+                 controller: Controller::new(1280, None, now, group as u64 + 1)
+                     .map_err(io::Error::other)?,
+                 rtt: Rtt::new(),
+@@ -96,6 +132,7 @@ impl Owner {
+         Ok((
+             Self {
+                 sender,
++                diagnostic: diagnostic::Diagnostic::new(),
+                 timers: timers::Timers::new(groups, descriptors)?,
+                 groups: states,
+                 requests,
+@@ -144,9 +181,26 @@ impl Owner {
+         Ok(())
+     }
+ 
++    #[cfg(test)]
+     pub(super) fn complete(&mut self, flight: Box<Flight>) -> io::Result<()> {
++        self.complete_observed(flight, None)
++    }
++
++    pub(super) fn complete_observed(
++        &mut self,
++        flight: Box<Flight>,
++        observed: Option<Duration>,
++    ) -> io::Result<()> {
++        let worker = flight.worker();
++        let reserved = flight.grant().ok_or(io::ErrorKind::InvalidData)?.bytes();
++        let started = flight.completion().and_then(|(_, at, _)| at);
+         let sent = flight.completion().is_some_and(|(count, _, _)| count != 0);
+         let group = flight.group().ok_or(io::ErrorKind::InvalidInput)?;
++        let before = self
++            .sender
++            .flight_bytes(group)
++            .ok_or(io::ErrorKind::InvalidData)?
++            .1;
+         self.sender
+             .reported(flight)
+             .map_err(|(error, _)| io::Error::other(format!("sender completion: {error}")))?;
+@@ -154,8 +208,10 @@ impl Owner {
+             .sender
+             .flight_bytes(group)
+             .ok_or(io::ErrorKind::InvalidData)?;
++        self.diagnostic
++            .completed(worker, reserved, inflight - before, started, observed);
+         let state = &mut self.groups[group];
+-        let limits = state.controller.limits();
++        let limits = state.effective_limits();
+         state.cwnd_limited |= sent
+             && inflight != 0
+             && limits.window.saturating_sub(inflight) < u64::from(limits.max_datagram);
+@@ -185,7 +241,7 @@ impl Owner {
+             rtt_ns: state.rtt.minimum().map_or(0, |_| {
+                 state.rtt.smoothed().as_nanos().min(u64::MAX as u128) as u64
+             }),
+-            pacing_bytes_per_second: state.controller.limits().rate,
++            pacing_bytes_per_second: state.effective_limits().rate,
+             bytes_in_flight: self.sender.flight_bytes(group)?.1,
+             ..Snapshot::default()
+         })
+@@ -391,6 +447,8 @@ impl Owner {
+         now: Duration,
+         outgoing: &mut VecDeque<(usize, Message)>,
+     ) -> io::Result<bool> {
++        self.diagnostic
++            .pass(now, self.requests.iter().any(Option::is_some));
+         let mut more = false;
+         let mut work = BATCH_SIZE;
+         let visits = (self.groups.len() - self.cursor).min(BATCH_SIZE);
+@@ -453,6 +511,8 @@ impl Owner {
+                     && !self.reports.iter().any(|r| r.group == group)
+                 {
+                     self.sender.reopen(group).map_err(io::Error::other)?;
++                    self.diagnostic
++                        .reopened(std::mem::take(&mut self.groups[group].diagnostic_grants));
+                 } else {
+                     more |= self.groups[group].ack.is_none()
+                         && self.reports.iter().any(|r| r.group == group);
+@@ -530,7 +590,7 @@ impl Owner {
+                 .controller
+                 .on_transmit(now, inflight, app_limited)
+                 .map_err(io::Error::other)?;
+-            let mut limits = state.controller.limits();
++            let mut limits = state.effective_limits();
+             if state.pto.stalled() {
+                 limits.window = 0;
+             }
+@@ -563,15 +623,27 @@ impl Owner {
+                 .window
+                 .saturating_sub(inflight)
+                 .saturating_sub(reserved);
++            self.diagnostic.occupancy(inflight + reserved);
++            if request.probe.is_none()
++                && request
++                    .flight
++                    .packets()
++                    .next()
++                    .is_some_and(|p| u64::from(p.bytes) > available)
++            {
++                self.diagnostic.window_insufficient();
++            }
+             let mut budget = u64::from(limits.quantum.min(64 * u32::from(limits.max_datagram)))
+                 .saturating_sub(reserved);
+             if request.probe.is_none() {
+                 budget = budget.min(available);
+             }
+             let mut bytes = 0;
++            let mut window_limited = false;
+             for packet in request.flight.packets().take(self.sender.available()) {
+                 let next = bytes + u32::from(packet.bytes);
+                 if u64::from(next) > budget {
++                    window_limited = request.probe.is_none() && u64::from(next) > available;
+                     break;
+                 }
+                 bytes = next;
+@@ -586,6 +658,22 @@ impl Owner {
+             );
+             match result {
+                 Ok(()) => {
++                    if window_limited {
++                        self.diagnostic.window_limited_grant();
++                    }
++                    self.diagnostic.granted(
++                        worker,
++                        bytes,
++                        request.flight.packets().len(),
++                        u64::from(burst).saturating_sub(reserved + u64::from(bytes))
++                            < u64::from(limits.max_datagram),
++                        now,
++                        state.diagnostic_last_grant,
++                    );
++                    self.diagnostic
++                        .occupancy(inflight + reserved + u64::from(bytes));
++                    state.diagnostic_last_grant = Some(now);
++                    state.diagnostic_grants += 1;
+                     outgoing.push_back((worker, Message::Permit(request.flight)));
+                     granted_next.get_or_insert(self.request_cursor);
+                     more = true;
+@@ -783,6 +871,52 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn diagnostic_counts_only_accepted_accounting_and_reopened_epochs() {
++        let (mut owner, flights) =
++            Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)], Duration::ZERO).unwrap();
++        owner.timers.install(0, 1).unwrap();
++        let mut flights = flights.into_vec().into_iter();
++        let mut outgoing = VecDeque::with_capacity(16);
++        owner
++            .request(request(flights.next().unwrap(), 1, 2))
++            .unwrap();
++        owner.advance(Duration::ZERO, &mut outgoing).unwrap();
++        let (_, Message::Permit(mut flight)) = outgoing.pop_front().unwrap() else {
++            panic!()
++        };
++        assert!(
++            owner
++                .complete_observed(flights.next().unwrap(), Some(Duration::ZERO))
++                .is_err()
++        );
++        let mut snapshot = Snapshot::default();
++        owner.diagnostic.publish(&mut snapshot);
++        assert_eq!(snapshot.service_grants, 1);
++        assert_eq!(snapshot.service_reserved_bytes, 2560);
++        assert_eq!(snapshot.service_completions, 0);
++        assert_eq!(snapshot.service_epochs, 0);
++        flight
++            .complete(1, Some(Duration::from_micros(10)), false)
++            .unwrap();
++        owner
++            .complete_observed(flight, Some(Duration::from_micros(30)))
++            .unwrap();
++        owner.diagnostic.publish(&mut snapshot);
++        assert_eq!(snapshot.service_submitted_bytes, 1280);
++        assert_eq!(snapshot.service_partial_completions, 1);
++        assert_eq!(snapshot.service_reserve_report_ns, 30_000);
++        assert_eq!(snapshot.service_epochs, 0);
++        owner
++            .advance(Duration::from_micros(40), &mut outgoing)
++            .unwrap();
++        owner.diagnostic.publish(&mut snapshot);
++        assert_eq!(snapshot.service_epochs, 1);
++        assert_eq!(snapshot.service_epoch_grants, 1);
++        assert_eq!(snapshot.service_charged_peak, 2560);
++        assert_eq!(owner.sender.flight_bytes(0), Some((0, 1280)));
++    }
++
+     #[test]
+     fn whole_prefix_window_pressure_keeps_deadline_and_recycles_expired_request() {
+         let (mut owner, flights) =
+@@ -798,6 +932,9 @@ mod tests {
+             panic!()
+         };
+         assert_eq!(flight.packets().len(), 10);
++        let mut diagnostic = Snapshot::default();
++        owner.diagnostic.publish(&mut diagnostic);
++        assert_eq!(diagnostic.service_window_limited_grants, 1);
+         assert!(
+             !owner.groups[0].cwnd_limited,
+             "reservations are not successful window use"
+@@ -1788,3 +1925,90 @@ mod window_evidence_tests {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod diagnostic_tests {
++    use super::*;
++
++    #[test]
++    fn factorial_changes_only_selected_limits_and_preserves_probe_rtt_drain() {
++        for probe_rtt in [false, true] {
++            for mode in 0..=3 {
++                let raw = pacing::Limits {
++                    window: 5120,
++                    rate: 12_345_678,
++                    quantum: 2560,
++                    max_datagram: 1280,
++                };
++                let limits = diagnostic_limits(raw, mode, probe_rtt);
++                assert_eq!(
++                    limits.rate,
++                    if mode & 1 != 0 {
++                        4_000_000_000
++                    } else {
++                        raw.rate
++                    }
++                );
++                assert_eq!(
++                    limits.window,
++                    if mode & 2 != 0 && !probe_rtt {
++                        8 * 1024 * 1024
++                    } else {
++                        raw.window
++                    }
++                );
++                assert_eq!(limits.quantum, raw.quantum);
++                assert_eq!(limits.max_datagram, raw.max_datagram);
++            }
++        }
++    }
++
++    #[test]
++    fn every_mode_preserves_expiry_accounting_burst_and_stalled_pto_bounds() {
++        for mode in 0..=3 {
++            let raw = pacing::Limits {
++                window: 5120,
++                rate: 128_000_000,
++                quantum: 2560,
++                max_datagram: 1280,
++            };
++            let limits = diagnostic_limits(raw, mode, false);
++            let mut grants = crate::pacing::Grants::new(2).unwrap();
++            let first = grants
++                .reserve(0, 2560, false, limits, Duration::ZERO)
++                .unwrap();
++            assert_eq!(first.expires(), Duration::from_micros(100));
++            assert_eq!(
++                grants.reserve(1, 1280, false, limits, Duration::from_secs(1)),
++                Err(GrantError::Blocked)
++            );
++            assert_eq!(grants.reserved(), 2560);
++            grants.reported(first, 1280, Some(Duration::ZERO)).unwrap();
++            assert_eq!((grants.reserved(), grants.in_flight()), (0, 1280));
++            assert_eq!(grants.reported(first, 0, None), Err(GrantError::Stale));
++            let stalled = pacing::Limits {
++                window: 0,
++                ..limits
++            };
++            assert_eq!(
++                grants.reserve(0, 1280, false, stalled, Duration::from_secs(1)),
++                Err(GrantError::Blocked)
++            );
++            grants.probe_allowance(1).unwrap();
++            let probe = grants
++                .reserve(0, 1280, true, stalled, Duration::from_secs(1))
++                .unwrap();
++            assert!(probe.is_probe());
++            grants
++                .reported(probe, 1280, Some(Duration::from_secs(1)))
++                .unwrap();
++            assert_eq!(grants.in_flight(), 2560);
++            assert_eq!(
++                grants.reserve(1, 1280, true, stalled, Duration::from_secs(2)),
++                Err(GrantError::Blocked)
++            );
++            grants.settled(2560).unwrap();
++            assert_eq!(grants.in_flight(), 0);
++        }
++    }
++}
