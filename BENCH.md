@@ -27,6 +27,9 @@ The preceding ACK-pruning sweep delivered 1.12 to 1.22 Gbit/s. These remain
 severe integration regressions, far below earlier forwarding rates.
 General application-limited detection remains open. The rates above predate
 runtime payload retention and repair; they are not recovery-build measurements.
+The recovery build regresses further: the matched sixty-second unlimited run
+falls from 2.38 / 2.50 to 2.16 / 1.79 Gbit/s and introduces admission pressure.
+Its ascending sweep falls 21.9 / 14.4% from peak to unlimited.
 PMTU discovery is active in the latest rate sweeps and
 passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
 Missing recovery or congestion control does not explain away the remaining
@@ -36,6 +39,8 @@ scheduling and admission problems.
 
 The sender integration passes forwarding/restart and allocation checks,
 plus control-pressure, stale-feedback and bounded transmit-expiry regressions.
+The recovery build adds successful two-repair delivery checks, but its latest
+rate sweeps reveal a new regression and nonzero reassembly admission pressure.
 Its first paced/unlimited sweep is much slower than the earlier runtime. Low CPU
 use, zero outer socket overflow and zero admission pressure point away from the
 previous receive-capacity explanation; grant/feedback scheduling needs profiling.
@@ -56,8 +61,8 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Latest sixty-second QinQ sweep: 2.63 / 2.55 Gbit/s paced, 2.56 / 2.61 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 87.32 / 87.69%. The ascending twenty-second sweep stays under 1% missing in both directions only through 2G offered. Five successful 20G repeats remain unmet. |
-| Goodput must plateau under excess traffic | The latest sixty-second sweep falls 2.8% forward and rises 2.3% reverse under unlimited load, using about 2.2–2.4 cores per daemon. The wider ascending sweep falls 17.2% forward from its 4G peak and 5.4% reverse from its 8G peak | The low sender throughput is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Recovery-build sixty-second QinQ sweep: 1.96 / 1.75 Gbit/s paced, 2.16 / 1.79 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe integration regression; paced missing fractions are 90.50 / 91.55%. The recovery ascending sweep stays under 1% missing in both directions only at 0.5G offered. Five successful 20G repeats remain unmet. |
+| Goodput must plateau under excess traffic | The recovery ascending sweep falls 21.9 / 14.4% from its 21G peak under unlimited load. Its sixty-second repeat rises under unlimited load, but remains slower than the matched baseline and uses only about 2.1–2.3 cores per daemon | No stable plateau or CPU ceiling is established. Source-expiry work, incomplete reassembly and grant/feedback scheduling require separate attribution. |
 | Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Final sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
@@ -104,13 +109,78 @@ configurations require an explicit ceiling.
 
 The release daemon SHA-256 is
 `d142c0b4d699c0c1f0d13e8cd99e4057c972c631ac5e68bd888d7f289a058f2b`.
-No throughput claim follows from these correctness checks. The new build's rate
-sweeps, sustained independent/burst-loss tests, long routed-PMTU test and Linux 7.0
-matrix remain to be run. Fresh-data journal pressure can still request an unusable
-grant before yielding it; profiling must determine its cost.
+The rate sweeps below expose a regression. Sustained independent/burst-loss
+tests, the long routed-PMTU test and the Linux 7.0 matrix remain to be rerun on
+this build. Fresh-data journal pressure can still request an unusable grant
+before yielding it; profiling must determine its cost.
 The `repairs` counter now counts successfully submitted repair DATA records.
 Sender expiry can occur after peer TAP delivery if feedback is lost, so expiry
 counts cannot be treated as an exact count of missing inner frames.
+
+## Recovery-build overload regression (November 7)
+
+[Fifteen release observations](benches/tap-runtime-recovery.json) compare
+`d9867fa` with the preceding production binary. The profile remains eight
+workers, sixteen flows each way, QinQ, 1522-byte frames, 44-segment input batches,
+500-entry TAP queues and active discovery capped at 1452-byte outer UDP payloads.
+No compilation or other tests overlapped measurement. CPU 100% means one core;
+goodput excludes drain, while missing fractions and counter deltas include it.
+
+| Requested Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| 0.5 | 0.49 / 0.49 | 0.01 / 0.08 | 50.89 / 47.77 |
+| 1 | 0.99 / 0.97 | 0.04 / 1.81 | 97.48 / 94.06 |
+| 2 | 1.91 / 1.88 | 3.05 / 4.26 | 195.10 / 181.63 |
+| 3 | 1.81 / 1.71 | 38.91 / 42.59 | 213.86 / 199.02 |
+| 4 | 1.85 / 1.71 | 52.84 / 56.56 | 219.59 / 211.15 |
+| 8 | 2.13 / 1.72 | 72.48 / 77.82 | 220.54 / 212.09 |
+| 16 | 1.89 / 1.74 | 87.65 / 88.63 | 214.88 / 206.51 |
+| 21 | 2.33 / 1.93 | 88.72 / 90.69 | 232.44 / 222.52 |
+| Unlimited | 1.82 / 1.65 | 96.81 / 96.91 | 213.99 / 208.85 |
+
+Unlimited goodput falls 21.9% forward and 14.4% reverse from the 21G point.
+Only the 0.5G point keeps both missing fractions below 1%.
+
+The matched sixty-second sequences use the same generator and harness, with
+baseline first and recovery second. Each sequence keeps its daemons and sockets
+through 21G, unlimited, then 21G again.
+
+| Build / requested Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % | Admission pressure L/R |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline / 21 | 2.40 / 2.61 | 88.40 / 87.41 | 229.45 / 220.63 | 0 / 0 |
+| Baseline / Unlimited | 2.38 / 2.50 | 95.76 / 95.41 | 220.81 / 214.47 | 0 / 0 |
+| Baseline / 21 return | 2.38 / 2.65 | 88.60 / 87.31 | 228.32 / 220.83 | 0 / 0 |
+| Recovery / 21 | 1.96 / 1.75 | 90.50 / 91.55 | 223.67 / 214.07 | 43,608 / 12,128 |
+| Recovery / Unlimited | 2.16 / 1.79 | 96.18 / 96.79 | 229.63 / 218.57 | 42,265 / 9,850 |
+| Recovery / 21 return | 2.13 / 1.82 | 89.77 / 91.28 | 232.66 / 220.00 | 44,909 / 10,695 |
+
+The longer recovery sequence does not fall under unlimited load, but its
+unlimited goodput is 9.1 / 28.6% below the matched baseline. This does not
+establish an overload plateau.
+
+At the recovery sixty-second unlimited point, endpoint L/R reports
+6,255,453 / 6,062,004 TAP ingress SKB drops, 4,100 / 72,212 worker queue drops
+(including 79 / 55 ACK-buffer drops), 2,368,700 / 4,811,904 expired frames and
+42,265 / 9,850 admission-pressure events. Only 472 / 162 repair DATA records
+were submitted. All fifteen observations have zero outer socket overflow,
+inner UDP receive errors, corrupt or duplicate inner frames and outer IPv6
+fragmentation. Some recovery observations reorder complete frames; the JSON
+retains these counts.
+
+Two mechanisms are verified from code. The sender shortens each materialized
+frame's deadline using RTT, while its queued source still lives for 100 ms.
+It can therefore expand and checksum GSO children already past their shorter
+deadline. Also, sender expiry frees local payloads without emitting
+FRAME_ABANDON; a partially transmitted frame can retain a receiver slot until
+the receiver's independent 100 ms deadline. The amount each mechanism contributes
+to measured loss and pressure is not yet isolated. Duplicate-piece counts
+include local retries of packed datagrams after pressure relief, so they cannot
+be attributed wholesale to network repair.
+
+The first ascending attempt exited with ConnectionRefused before producing a
+complete dataset. Its failure logs were not retained, leaving the cause
+unconfirmed. The table reports the complete retry; subsequent wrappers retain
+artifacts on failure before deleting their containers.
 
 ## Sender integration verification (November 7)
 
