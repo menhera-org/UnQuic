@@ -524,7 +524,8 @@ impl Worker {
         if descriptors.is_empty() {
             return Ok(());
         }
-        let (owner, flights) = Owner::new(groups, workers.len(), &descriptors)?;
+        let now = first.io_clock(Duration::ZERO)()?;
+        let (owner, flights) = Owner::new(groups, workers.len(), &descriptors, now)?;
         for (worker, flight) in workers.iter_mut().zip(flights.into_vec()) {
             worker.sender.flight = Some(flight);
         }

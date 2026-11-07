@@ -167,7 +167,9 @@ steady feedback, a pacing-held request, and a permit behind a full bounded
 message turn. Further tests cover trimmed grants with actual ACK accounting,
 probe reply identity, pressure retry, validation before mutation and packet-number
 exhaustion. The build passes 332 release tests, default-feature tests, Clippy,
-Rust 1.89 and 56 container tests. Routed PMTU reduction/recovery is being rerun.
+Rust 1.89 and 58 container tests. Routed PMTU confirms every lane through
+9000→1500→1280→9000 in 650.77 seconds, including returned and filtered PTB,
+the normal 600-second upward retry and zero outer fragmentation.
 Foreign-move reconnect ACK readiness takes 22.59 seconds; this delay remains open.
 
 | Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
@@ -190,6 +192,90 @@ out-of-window/wrong-run records and outer fragments. Counts have different units
 and cannot be added into an exact loss total. Placement, duration, load-generator
 binary and release options match the fairness sweep; no builds or tests overlap
 measurement. Grant scheduling and controller limitation still need attribution.
+
+## Larger burst after identity refresh: still an experiment (November 7)
+
+[The normal-release cap64 candidate](benches/tap-sender-refresh-cap64.json)
+changes only the three DATA burst limits from 16 to 64 maximum datagrams.
+BBR's runtime quantum still caps the combined outstanding allowance at 64 KiB.
+Packet MTUs, congestion windows, grant lifetimes and buffer sizes are unchanged.
+The candidate passes 332 release tests, Clippy and 57 short container/probe tests.
+
+| Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | 15.99 / 15.90 | 1.60 / 1.49 | 89.81 / 90.46 | 184.17 / 173.08 |
+| 21 | 20.99 / 20.73 | 1.37 / 1.56 | 93.34 / 92.32 | 195.89 / 162.43 |
+| Unlimited | 59.42 / 52.31 | 1.09 / 1.58 | 98.14 / 96.93 | 201.68 / 162.67 |
+| 16 return | 15.97 / 15.90 | 1.55 / 1.52 | 90.14 / 90.30 | 191.00 / 174.63 |
+
+At 21G, goodput rises from the cap16 build's 0.83 / 0.80 Gbit/s to
+1.37 / 1.56. Forward unlimited goodput then falls 20.7% to 1.09 Gbit/s,
+while reverse remains 1.58; the return point recovers. This does not satisfy
+the overload requirement. The larger cap is not adopted.
+
+At 21G, TAP TX drops are 748,870 / 722,772, frame expiries 58,425 / 14,648,
+and worker queue drops 3,174 / 14,541. Unlimited frame expiries rise to
+119,500 / 30,647. All points have zero admission pressure, outer socket overflow,
+inner UDP errors, invalid/duplicate/out-of-window/wrong-run records, reordering
+and outer fragments. Left worker 2 rises from 39.6% to 65.5% CPU under unlimited
+load while its successful outer bytes fall from 826 MB to 426 MB. Its expired
+grants rise from 1,670 of 23,090 to 1,764 of 11,187. This motivates checking
+deadline and loss-scan work; it does not establish their contribution.
+
+## Controller timing diagnostic (November 7)
+
+[Two instrumented 60-second 21G points](benches/tap-sender-controller-diagnostic.json)
+deliver 1.60 / 1.54 and 1.53 / 1.48 Gbit/s, using 188 / 180 and 189 / 180%
+daemon CPU. They use cap64 and temporary fixed counters, clock reads and 1Hz
+monitor snapshots. The [reproduction patch](benches/sender-controller-diagnostic.patch)
+applies to `13cdebd`; these are not normal-release acceptance results.
+
+Across the load intervals, issuance is open 81–86% of the time, closing takes
+10–15%, committing takes under 0.5%, and feedback takes 3–4%. Open time includes
+pacing and congestion-window waits. Attempt counters identify both, with no
+sampling-pool blockage; they are not duration measurements. Successful grants
+take 17–18 microseconds to reach the pre-send timestamp, then 36–42 microseconds
+to reach owner completion observation, including the send syscall. ACK arrival
+to owner application averages 68–92 microseconds. Raw sample send/ACK intervals
+average 445–457 / 476–492 microseconds; these intervals are not RTT.
+Sampled model bandwidth ranges from 1.29 to 8.60 Gbit/s of outer IPv6 traffic, and
+median sampled congestion windows are about 100–114 KiB. Neither the controller
+rate nor these timings identify a CPU ceiling.
+
+The diagnostic exposes a separate startup bug: `Owner::new` initialized BBR
+at time zero, so the first real-clock ACK could enter ProbeRTT immediately.
+The first transition occurs after only 3,840 / 2,560 delivered outer bytes.
+Both controllers return to Startup before DATA begins, with the full-bandwidth
+flag clear. This contradicts the proposed pre-load plateau explanation for
+these runs. The constructor now uses the runtime's monotonic clock; a regression
+at zero and one-day uptime fails before that fix and passes after it. No
+throughput gain is attributed to the clock correction. The fix passes 333
+release tests, Clippy and 56 short container tests.
+
+## Sparse loss-scan diagnostic (November 7)
+
+A completed ACK schedules a fresh loss pass from the retained history floor.
+Even one outstanding tail packet can require walking roughly 1,024 bitmap words
+over 16 worker turns. [A separate instrumented sweep](benches/tap-sender-loss-scan-diagnostic.json)
+counts that work using the controller diagnostic plus
+[fixed scan counters](benches/sender-loss-scan-diagnostic.patch).
+
+| Requested Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % | Bitmap reads, millions | Empty reads % | Scan continuations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 1.61 / 1.50 | 89.54 / 90.17 | 191.83 / 178.96 | 40.35 / 33.48 | 98.58 / 98.64 | 608,624 / 503,589 |
+| 21 | 1.24 / 1.27 | 93.97 / 93.84 | 162.48 / 164.99 | 31.20 / 28.26 | 98.57 / 98.34 | 470,298 / 423,124 |
+| Unlimited | 1.20 / 1.43 | 97.98 / 97.48 | 196.73 / 168.02 | 45.01 / 38.58 | 98.49 / 98.62 | 682,577 / 581,146 |
+| 16 return | 1.58 / 1.49 | 89.91 / 90.48 | 193.07 / 179.60 | 38.67 / 38.68 | 98.60 / 98.68 | 583,677 / 583,396 |
+
+These twenty-second points confirm redundant scan work. They do not isolate its
+throughput cost. Left worker 2 alone reads 15.01 million words under unlimited
+load, of which 14.84 million are empty, and yields 229,560 times mid-scan.
+The next experiment skips empty ranges without retiring late-ACK history.
+At 21G, TAP TX drops are 754,258 / 744,165, frame expiries 170,482 / 58,296,
+and queue drops 736 / 10,653. Admission pressure, socket overflow, inner UDP
+errors, invalid/duplicate/out-of-window/wrong-run records, reordering and outer
+fragmentation remain zero at every point. These are diagnostic results, not a
+normal-release acceptance sweep.
 
 ## Request fairness and burst-size experiments (November 7)
 
@@ -222,8 +308,8 @@ Every point has zero admission pressure, socket overflow, inner UDP errors,
 invalid/duplicate/out-of-window/wrong-run records, reordering and outer fragments.
 The fairness change passes 330 release tests, default-feature tests, Clippy
 and 51 short kernel tests. One reconnect takes 19.19 seconds; the existing
-service-delay gap remains. Full routed discovery will be rerun with the
-control-overtaking fix.
+service-delay gap remains. Full routed discovery subsequently passes with the
+control-overtaking fix, as recorded above.
 
 [Increasing only the DATA cap from 16 to 64 maximum datagrams](benches/tap-sender-current-cap64.json)
 uses the original request priority. It includes the current loss-before-PTO

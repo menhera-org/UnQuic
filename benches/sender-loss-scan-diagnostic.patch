@@ -1,0 +1,202 @@
+--- a/src/ack/sent.rs
++++ b/src/ack/sent.rs
+@@ -118,9 +118,17 @@
+ pub struct OutstandingScan {
+     next: Option<u64>,
+     end: u64,
++    reads: u64,
++    empty: u64,
++    span: u64,
+ }
+ 
+ impl OutstandingScan {
++    /// Temporary diagnostic: bitmap reads, empty reads, and initial retained number span.
++    pub const fn diagnostic(&self) -> (u64, u64, u64) {
++        (self.reads, self.empty, self.span)
++    }
++
+     /// Whether this pass has finished, including an empty history.
+     pub const fn is_complete(&self) -> bool {
+         self.next.is_none()
+@@ -142,6 +150,8 @@
+             let end = self.end.min(start | 63);
+             let mask = (u64::MAX << (start % 64)) & (u64::MAX >> (63 - end % 64));
+             let bits = history.inflight[(start >> 6) as usize & (WORDS - 1)] & mask;
++            self.reads += 1;
++            self.empty += u64::from(bits == 0);
+             let number = if bits == 0 {
+                 end
+             } else {
+@@ -567,6 +577,13 @@
+                 Some(self.floor)
+             },
+             end: self.allocated,
++            reads: 0,
++            empty: 0,
++            span: if self.final_retired || self.allocated < self.floor {
++                0
++            } else {
++                self.allocated - self.floor + 1
++            },
+         }
+     }
+ 
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -138,6 +138,12 @@
+     pub(super) rtt: Rtt,
+     pub(super) largest_ack: u64,
+     pub(super) scan: Option<OutstandingScan>,
++    loss_scan_starts: u64,
++    loss_scan_span: u64,
++    loss_scan_reads: u64,
++    loss_scan_empty: u64,
++    loss_scan_completed: u64,
++    loss_scan_continuations: u64,
+     pub(super) loss_due: Option<Duration>,
+     pub(super) scan_due: Option<Duration>,
+     pub(super) forced_before: Option<Duration>,
+@@ -159,6 +165,12 @@
+             rtt: Rtt::new(),
+             largest_ack: 0,
+             scan: None,
++            loss_scan_starts: 0,
++            loss_scan_span: 0,
++            loss_scan_reads: 0,
++            loss_scan_empty: 0,
++            loss_scan_completed: 0,
++            loss_scan_continuations: 0,
+             loss_due: None,
+             scan_due: None,
+             forced_before: None,
+@@ -1542,6 +1554,12 @@
+ impl Worker {
+     pub(super) fn publish_sender(&mut self) {
+         self.counters.rtt_ns = 0;
++        self.counters.loss_scan_starts = 0;
++        self.counters.loss_scan_span = 0;
++        self.counters.loss_scan_reads = 0;
++        self.counters.loss_scan_empty = 0;
++        self.counters.loss_scan_completed = 0;
++        self.counters.loss_scan_continuations = 0;
+         self.counters.bytes_in_flight = 0;
+         self.counters.pacing_bytes_per_second = 0;
+         for local in &mut self.sessions {
+@@ -1549,6 +1567,12 @@
+             local.totals.rtt_ns = 0;
+         }
+         for lane in &self.sender.lanes {
++            self.counters.loss_scan_starts += lane.loss_scan_starts;
++            self.counters.loss_scan_span += lane.loss_scan_span;
++            self.counters.loss_scan_reads += lane.loss_scan_reads;
++            self.counters.loss_scan_empty += lane.loss_scan_empty;
++            self.counters.loss_scan_completed += lane.loss_scan_completed;
++            self.counters.loss_scan_continuations += lane.loss_scan_continuations;
+             let local = &mut self.sessions[lane.session];
+             let totals = &mut local.tx_totals[usize::from(lane.lane) - 1];
+             totals.bytes_in_flight = lane.history.inflight_bytes();
+--- a/src/worker/sender/history.rs
++++ b/src/worker/sender/history.rs
+@@ -73,12 +73,19 @@
+         submitted
+     }
+ 
++    fn start_loss_scan(&mut self) {
++        let scan = self.history.outstanding_scan();
++        self.loss_scan_starts += 1;
++        self.loss_scan_span += scan.diagnostic().2;
++        self.scan = Some(scan);
++    }
++
+     /// Starts a fresh barrier pass only after the preceding pass/report has finished.
+     pub(super) fn begin_loss_check(&mut self, before: Duration, force: bool) -> io::Result<()> {
+         if self.ack.is_some() || self.report_pending || self.scan.is_some() {
+             return Err(io::ErrorKind::WouldBlock.into());
+         }
+-        self.scan = Some(self.history.outstanding_scan());
++        self.start_loss_scan();
+         self.scan_cutoff = self.forced_before.take();
+         if force {
+             self.scan_cutoff = Some(self.scan_cutoff.map_or(before, |old| old.max(before)));
+@@ -176,7 +183,7 @@
+             if self.forced_before.is_none() && self.loss_due.is_none_or(|due| due > now) {
+                 return Ok(false);
+             }
+-            self.scan = Some(self.history.outstanding_scan());
++            self.start_loss_scan();
+             self.scan_cutoff = self.forced_before.take();
+             self.scan_due = None;
+             self.loss_due = None;
+@@ -184,6 +191,7 @@
+         self.prepare_report(report, ReportKind::Loss);
+         let mut remaining = allowance;
+         let scan = self.scan.as_mut().ok_or(io::ErrorKind::InvalidData)?;
++        let prior_work = scan.diagnostic();
+         while let Some(packet) = scan.advance(&self.history, &mut remaining) {
+             let due = self
+                 .rtt
+@@ -206,7 +214,12 @@
+             }
+         }
+         *budget -= allowance - remaining;
++        let work = scan.diagnostic();
++        self.loss_scan_reads += work.0 - prior_work.0;
++        self.loss_scan_empty += work.1 - prior_work.1;
++        self.loss_scan_continuations += u64::from(remaining == 0 && !scan.is_complete());
+         if scan.is_complete() {
++            self.loss_scan_completed += 1;
+             self.scan = None;
+             self.scan_cutoff = None;
+             self.loss_due = match (self.loss_due, self.scan_due.take()) {
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -130,6 +130,18 @@
+     sender_feedback_ns: sum,
+     /// Temporary sender diagnostic.
+     ack_samples: sum,
++    /// Temporary loss-scan diagnostic.
++    loss_scan_starts: sum,
++    /// Temporary loss-scan diagnostic.
++    loss_scan_span: sum,
++    /// Temporary loss-scan diagnostic.
++    loss_scan_reads: sum,
++    /// Temporary loss-scan diagnostic.
++    loss_scan_empty: sum,
++    /// Temporary loss-scan diagnostic.
++    loss_scan_completed: sum,
++    /// Temporary loss-scan diagnostic.
++    loss_scan_continuations: sum,
+     /// Temporary sender diagnostic.
+     ack_app_limited: sum,
+     /// Temporary sender diagnostic.
+--- a/tests/sent.rs
++++ b/tests/sent.rs
+@@ -1184,3 +1184,28 @@
+         assert_eq!(progress.rtt_sent_at, Some(Duration::from_micros(end)));
+     }
+ }
++
++#[test]
++fn loss_scan_diagnostics_count_sparse_prefix_and_zero_inflight_fast_path() {
++    let mut history = History::new().unwrap();
++    sent(&mut history, 65_535, true);
++    let mut scan = history.outstanding_scan();
++    assert_eq!(scan.diagnostic(), (0, 0, 65_535));
++    let mut budget = 64;
++    assert_eq!(scan.advance(&history, &mut budget), None);
++    assert_eq!(budget, 0);
++    assert!(!scan.is_complete());
++    assert_eq!(scan.diagnostic(), (64, 64, 65_535));
++    let mut budget = 2_000;
++    assert_eq!(scan.advance(&history, &mut budget).unwrap().number, 65_535);
++    assert!(scan.is_complete());
++    assert_eq!(scan.diagnostic(), (1_024, 1_023, 65_535));
++
++    assert!(history.lose(65_535).is_some());
++    let mut scan = history.outstanding_scan();
++    let mut budget = 64;
++    assert_eq!(scan.advance(&history, &mut budget), None);
++    assert_eq!(budget, 64);
++    assert!(scan.is_complete());
++    assert_eq!(scan.diagnostic(), (0, 0, 65_535));
++}

@@ -1,0 +1,631 @@
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -92,6 +92,79 @@
+ }
+ 
+ metrics! {
++    /// Temporary snapshot clock for matching benchmark intervals.
++    snapshot_mono_ns: sum,
++    /// Temporary sender diagnostic.
++    bbr_state: sum,
++    /// Temporary sender diagnostic.
++    bbr_full_bw_reached: sum,
++    /// Temporary sender diagnostic.
++    bbr_startup_exit_ns: sum,
++    /// Temporary sender diagnostic.
++    bbr_startup_exit_delivered: sum,
++    /// Temporary sender diagnostic.
++    bbr_max_bw: sum,
++    /// Temporary sender diagnostic.
++    bbr_window: sum,
++    /// Temporary sender diagnostic.
++    bbr_min_rtt_ns: sum,
++    /// Temporary sender diagnostic.
++    bbr_quantum: sum,
++    /// Temporary sender diagnostic.
++    sender_group_inflight: sum,
++    /// Temporary sender diagnostic.
++    sender_group_reserved: sum,
++    /// Temporary sender diagnostic.
++    sample_rate_last: sum,
++    /// Temporary sender diagnostic.
++    sample_send_last_ns: sum,
++    /// Temporary sender diagnostic.
++    sample_ack_last_ns: sum,
++    /// Temporary sender diagnostic.
++    sender_open_ns: sum,
++    /// Temporary sender diagnostic.
++    sender_closing_ns: sum,
++    /// Temporary sender diagnostic.
++    sender_commit_ns: sum,
++    /// Temporary sender diagnostic.
++    sender_feedback_ns: sum,
++    /// Temporary sender diagnostic.
++    ack_samples: sum,
++    /// Temporary sender diagnostic.
++    ack_app_limited: sum,
++    /// Temporary sender diagnostic.
++    ack_host_limited: sum,
++    /// Temporary sender diagnostic.
++    sample_send_ns: sum,
++    /// Temporary sender diagnostic.
++    sample_ack_ns: sum,
++    /// Temporary sender diagnostic.
++    ack_owner_delay_ns: sum,
++    /// Temporary sender diagnostic.
++    ack_owner_count: sum,
++    /// Temporary sender diagnostic.
++    request_epoch_blocked: sum,
++    /// Temporary sender diagnostic.
++    request_pacer_blocked: sum,
++    /// Temporary sender diagnostic.
++    request_window_blocked: sum,
++    /// Temporary sender diagnostic.
++    request_pool_blocked: sum,
++    /// Temporary sender diagnostic.
++    request_other_blocked: sum,
++    /// Temporary sender diagnostic.
++    request_granted: sum,
++    /// Temporary sender diagnostic.
++    successful_grants: sum,
++    /// Temporary sender diagnostic.
++    grant_to_send_ns: sum,
++    /// Temporary sender diagnostic.
++    send_to_report_ns: sum,
++    /// Temporary sender diagnostic.
++    loss_checks: sum,
++    /// Temporary sender diagnostic.
++    loss_check_ns: sum,
++
+     /// Ethernet bytes successfully written as complete frames to TAP.
+     delivered_frame_bytes: sum,
+     /// Successfully submitted outer IPv6 bytes, including IPv6 and UDP headers.
+--- a/src/bin/unquic.rs
++++ b/src/bin/unquic.rs
+@@ -111,8 +111,10 @@
+         .spawn(move || runtime::run(loaded.config, worker_control))?;
+     let mut lookups = Some(loaded.lookups);
+     let mut helper_error = None;
++    let mut report_due = Instant::now();
+     while !transport.is_finished() {
+-        if REPORT.swap(false, Ordering::Relaxed) {
++        if REPORT.swap(false, Ordering::Relaxed) || Instant::now() >= report_due {
++            report_due = Instant::now() + Duration::from_secs(1);
+             let mut worker = 0;
+             while let Some(snapshot) = control.worker_counters(worker) {
+                 eprintln!("unquic: worker {worker} {snapshot:?}");
+--- a/src/bbr/controller.rs
++++ b/src/bbr/controller.rs
+@@ -126,6 +126,7 @@
+     full_bw_count: u8,
+     full_bw_now: bool,
+     full_bw_reached: bool,
++    startup_exit: Option<(Duration, u64)>,
+ 
+     cycle_stamp: Duration,
+     probe_wait: Duration,
+@@ -211,6 +212,7 @@
+             full_bw_count: 0,
+             full_bw_now: false,
+             full_bw_reached: false,
++            startup_exit: None,
+             cycle_stamp: now,
+             probe_wait: Duration::ZERO,
+             rounds_since_probe: 0,
+@@ -241,6 +243,19 @@
+         self.state
+     }
+ 
++    pub(crate) fn diagnostic(&self) -> (u64, u64, u64, bool, u64, u64) {
++        (
++            self.state as u64,
++            self.max_bw,
++            self.min_rtt
++                .map_or(0, |d| d.as_nanos().min(u64::MAX as u128) as u64),
++            self.full_bw_reached,
++            self.startup_exit
++                .map_or(0, |(at, _)| at.as_nanos().min(u64::MAX as u128) as u64),
++            self.startup_exit.map_or(0, |(_, bytes)| bytes),
++        )
++    }
++
+     /// Shared window, pacing rate and send quantum in outer bytes.
+     pub const fn limits(&self) -> Limits {
+         Limits {
+@@ -328,6 +343,9 @@
+         self.update_aggregation(sample.newly_acked);
+         self.check_full_bw(&sample);
+         self.check_startup(&sample);
++        if self.state != State::Startup && self.startup_exit.is_none() {
++            self.startup_exit = Some((now, self.delivered));
++        }
+         if self.state == State::Drain && (in_flight <= self.inflight(100) || self.drain_rounds > 3)
+         {
+             self.start_down();
+--- a/src/bbr/delivery.rs
++++ b/src/bbr/delivery.rs
+@@ -119,6 +119,7 @@
+     next_id: u64,
+     app_limited: Option<u64>,
+     pending: Option<Pending>,
++    sample_intervals: (Duration, Duration),
+ }
+ 
+ impl Default for Delivery {
+@@ -139,9 +140,14 @@
+             next_id: 1,
+             app_limited: None,
+             pending: None,
++            sample_intervals: (Duration::ZERO, Duration::ZERO),
+         }
+     }
+ 
++    pub(crate) const fn sample_intervals(&self) -> (Duration, Duration) {
++        self.sample_intervals
++    }
++
+     /// Remaining representable successful transmission identities.
+     /// Reserve capacity for every outstanding grant before permitting socket I/O.
+     pub const fn remaining_packets(&self) -> u64 {
+@@ -305,7 +311,11 @@
+         let Some(packet) = ack.newest else {
+             return Ok(None);
+         };
+-        let interval = (packet.sent_at - packet.first_sent_at).max(ack.at - packet.delivered_at);
++        self.sample_intervals = (
++            packet.sent_at - packet.first_sent_at,
++            ack.at - packet.delivered_at,
++        );
++        let interval = self.sample_intervals.0.max(self.sample_intervals.1);
+         let delivered = self.delivered - packet.delivered;
+         let rate = if interval.is_zero() || interval < min_rtt {
+             None
+--- a/src/pacing/grants.rs
++++ b/src/pacing/grants.rs
+@@ -22,7 +22,7 @@
+             return Err(GrantError::Invalid);
+         }
+         Ok(u64::from(
+-            self.quantum.min(16 * u32::from(self.max_datagram)),
++            self.quantum.min(64 * u32::from(self.max_datagram)),
+         ))
+     }
+ }
+@@ -42,6 +42,10 @@
+ }
+ 
+ impl Grant {
++    pub(crate) const fn issued(&self) -> Duration {
++        self.issued
++    }
++
+     /// Maximum successful physical transmission bytes, including IP/UDP headers.
+     pub const fn bytes(self) -> u32 {
+         self.bytes
+--- a/src/pacing/sender.rs
++++ b/src/pacing/sender.rs
+@@ -1,7 +1,13 @@
+ //! Ordered send accounting and shared delivery metadata for the control owner.
+ use super::{Grant, GrantError, Grants, Limits};
+ use crate::bbr::{Delivery, DeliveryError, DeliveryPacket, LossSample, RateSample};
+-use std::{cmp::Reverse, io, mem::size_of, num::NonZeroU16, time::Duration};
++use std::{
++    cmp::Reverse,
++    io,
++    mem::size_of,
++    num::NonZeroU16,
++    time::{Duration, Instant},
++};
+ 
+ const BATCH: usize = 64;
+ 
+@@ -233,6 +239,8 @@
+     #[allow(clippy::vec_box)]
+     reports: Vec<Box<Flight>>,
+     phase: Phase,
++    phase_clock: Instant,
++    phase_totals: [u64; 4],
+     sample_flight: u64,
+     planned: usize,
+     sent_bytes: u64,
+@@ -240,6 +248,31 @@
+     ack: bool,
+ }
+ 
++impl Group {
++    fn transition(&mut self, phase: Phase) {
++        if self.phase == phase {
++            return;
++        }
++        let now = Instant::now();
++        let index = self.phase as usize;
++        self.phase_totals[index] = self.phase_totals[index].saturating_add(
++            now.duration_since(self.phase_clock)
++                .as_nanos()
++                .min(u64::MAX as u128) as u64,
++        );
++        self.phase_clock = now;
++        self.phase = phase;
++    }
++
++    fn phase_times(&self) -> [u64; 4] {
++        let mut totals = self.phase_totals;
++        let index = self.phase as usize;
++        totals[index] = totals[index]
++            .saturating_add(self.phase_clock.elapsed().as_nanos().min(u64::MAX as u128) as u64);
++        totals
++    }
++}
++
+ /// Control-owner accounting for every sending path group in one daemon.
+ ///
+ /// A shared slab retains at most 65,535 complete delivery snapshots. Each group
+@@ -260,6 +293,20 @@
+ }
+ 
+ impl Sender {
++    pub(crate) fn phase_times(&self, group: usize) -> Option<[u64; 4]> {
++        Some(self.groups.get(group)?.phase_times())
++    }
++
++    pub(crate) fn open(&self, group: usize) -> bool {
++        self.groups
++            .get(group)
++            .is_some_and(|g| g.phase == Phase::Open)
++    }
++
++    pub(crate) fn sample_intervals(&self, group: usize) -> Option<(Duration, Duration)> {
++        Some(self.groups.get(group)?.delivery.sample_intervals())
++    }
++
+     /// Allocates the shared slab, group ledgers and one movable flight per worker.
+     /// Charge storage_bytes against the daemon ceiling before calling this.
+     #[allow(clippy::type_complexity)]
+@@ -283,6 +330,8 @@
+                 delivery: Delivery::new(),
+                 reports,
+                 phase: Phase::Open,
++                phase_clock: Instant::now(),
++                phase_totals: [0; 4],
+                 sample_flight: 0,
+                 planned: 0,
+                 sent_bytes: 0,
+@@ -537,7 +586,7 @@
+     pub fn close(&mut self, group: usize) -> Result<(), GrantError> {
+         let state = self.groups.get_mut(group).ok_or(GrantError::Invalid)?;
+         if state.phase == Phase::Open {
+-            state.phase = Phase::Closing;
++            state.transition(Phase::Closing);
+         }
+         Ok(())
+     }
+@@ -594,7 +643,7 @@
+         }
+         state.grants.reported(grant, bytes, flight.started)?;
+         state.sent_bytes += u64::from(bytes);
+-        state.phase = Phase::Closing;
++        state.transition(Phase::Closing);
+         for record in records.iter().skip(flight.successful) {
+             Self::release(
+                 &mut self.slots,
+@@ -628,13 +677,13 @@
+                     report.grant.map_or(0, |grant| grant.id),
+                 ))
+             });
+-            state.phase = Phase::Commit;
++            state.transition(Phase::Commit);
+         }
+         if state.phase != Phase::Commit {
+             return Ok(None);
+         }
+         let Some(report) = state.reports.last_mut() else {
+-            state.phase = Phase::Feedback;
++            state.transition(Phase::Feedback);
+             return Ok(None);
+         };
+         let stop = report.successful.min(report.cursor.saturating_add(budget));
+@@ -677,7 +726,7 @@
+         report.grant = None;
+         report.count = 0;
+         if state.reports.is_empty() {
+-            state.phase = Phase::Feedback;
++            state.transition(Phase::Feedback);
+         }
+         Ok(Some(report))
+     }
+@@ -699,7 +748,7 @@
+     /// Starts a new issuance epoch after the caller's bounded feedback pass.
+     pub fn reopen(&mut self, group: usize) -> Result<(), GrantError> {
+         let state = self.feedback(group, false)?;
+-        state.phase = Phase::Open;
++        state.transition(Phase::Open);
+         state.planned = 0;
+         Ok(())
+     }
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -27,7 +27,37 @@
+     dirty: bool,
+ }
+ 
++#[derive(Default)]
++struct Diagnostic {
++    ack_samples: u64,
++    ack_app_limited: u64,
++    ack_host_limited: u64,
++    sample_send_ns: u64,
++    sample_ack_ns: u64,
++    ack_owner_delay_ns: u64,
++    ack_owner_count: u64,
++    request_epoch_blocked: u64,
++    request_pacer_blocked: u64,
++    request_window_blocked: u64,
++    request_pool_blocked: u64,
++    request_other_blocked: u64,
++    request_granted: u64,
++    successful_grants: u64,
++    grant_to_send_ns: u64,
++    send_to_report_ns: u64,
++    loss_checks: u64,
++    loss_check_ns: u64,
++    sample_rate_last: u64,
++    sample_send_last_ns: u64,
++    sample_ack_last_ns: u64,
++}
++
++fn diagnostic_ns(value: Duration) -> u64 {
++    value.as_nanos().min(u64::MAX as u128) as u64
++}
++
+ struct Group {
++    diagnostic: Diagnostic,
+     controller: Controller,
+     rtt: Rtt,
+     pto: ProbeTimeout,
+@@ -70,6 +100,7 @@
+         states.try_reserve_exact(groups).map_err(io::Error::other)?;
+         for group in 0..groups {
+             states.push(Group {
++                diagnostic: Diagnostic::default(),
+                 controller: Controller::new(1280, None, Duration::ZERO, group as u64 + 1)
+                     .map_err(io::Error::other)?,
+                 rtt: Rtt::new(),
+@@ -145,6 +176,20 @@
+ 
+     pub(super) fn complete(&mut self, flight: Box<Flight>) -> io::Result<()> {
+         let group = flight.group().ok_or(io::ErrorKind::InvalidInput)?;
++        if let Some((count, Some(started), _)) = flight.completion()
++            && count != 0
++            && let Some(grant) = flight.grant()
++        {
++            let observed = monotonic_now()?;
++            let d = &mut self.groups[group].diagnostic;
++            d.successful_grants += 1;
++            d.grant_to_send_ns = d
++                .grant_to_send_ns
++                .saturating_add(diagnostic_ns(started.saturating_sub(grant.issued())));
++            d.send_to_report_ns = d
++                .send_to_report_ns
++                .saturating_add(diagnostic_ns(observed.saturating_sub(started)));
++        }
+         self.sender
+             .reported(flight)
+             .map_err(|(error, _)| io::Error::other(format!("sender completion: {error}")))?;
+@@ -170,7 +215,47 @@
+ 
+     pub(super) fn snapshot(&self, group: usize) -> Option<Snapshot> {
+         let state = self.groups.get(group)?;
++        let (phase, max_bw, min_rtt, full, exit, exit_bytes) = state.controller.diagnostic();
++        let limits = state.controller.limits();
++        let phases = self.sender.phase_times(group)?;
++        let (reserved, inflight) = self.sender.flight_bytes(group)?;
+         Some(Snapshot {
++            snapshot_mono_ns: monotonic_now().map_or(0, diagnostic_ns),
++            bbr_state: phase,
++            bbr_max_bw: max_bw,
++            bbr_min_rtt_ns: min_rtt,
++            bbr_full_bw_reached: u64::from(full),
++            bbr_startup_exit_ns: exit,
++            bbr_startup_exit_delivered: exit_bytes,
++            bbr_window: limits.window,
++            bbr_quantum: u64::from(limits.quantum),
++            sender_group_inflight: inflight,
++            sender_group_reserved: reserved,
++            sender_open_ns: phases[0],
++            sender_closing_ns: phases[1],
++            sender_commit_ns: phases[2],
++            sender_feedback_ns: phases[3],
++            sample_rate_last: state.diagnostic.sample_rate_last,
++            sample_send_last_ns: state.diagnostic.sample_send_last_ns,
++            sample_ack_last_ns: state.diagnostic.sample_ack_last_ns,
++            ack_samples: state.diagnostic.ack_samples,
++            ack_app_limited: state.diagnostic.ack_app_limited,
++            ack_host_limited: state.diagnostic.ack_host_limited,
++            sample_send_ns: state.diagnostic.sample_send_ns,
++            sample_ack_ns: state.diagnostic.sample_ack_ns,
++            ack_owner_delay_ns: state.diagnostic.ack_owner_delay_ns,
++            ack_owner_count: state.diagnostic.ack_owner_count,
++            request_epoch_blocked: state.diagnostic.request_epoch_blocked,
++            request_pacer_blocked: state.diagnostic.request_pacer_blocked,
++            request_window_blocked: state.diagnostic.request_window_blocked,
++            request_pool_blocked: state.diagnostic.request_pool_blocked,
++            request_other_blocked: state.diagnostic.request_other_blocked,
++            request_granted: state.diagnostic.request_granted,
++            successful_grants: state.diagnostic.successful_grants,
++            grant_to_send_ns: state.diagnostic.grant_to_send_ns,
++            send_to_report_ns: state.diagnostic.send_to_report_ns,
++            loss_checks: state.diagnostic.loss_checks,
++            loss_check_ns: state.diagnostic.loss_check_ns,
+             rtt_ns: state.rtt.minimum().map_or(0, |_| {
+                 state.rtt.smoothed().as_nanos().min(u64::MAX as u128) as u64
+             }),
+@@ -281,6 +366,12 @@
+         {
+             let force = check.force;
+             let repeat = check.dirty || check.next_due.is_some_and(|at| at <= now);
++            let elapsed = diagnostic_ns(now.saturating_sub(check.before));
++            self.groups[group].diagnostic.loss_checks += 1;
++            self.groups[group].diagnostic.loss_check_ns = self.groups[group]
++                .diagnostic
++                .loss_check_ns
++                .saturating_add(elapsed);
+             self.groups[group].check = None;
+             if !force && due.is_some_and(|at| at <= now) {
+                 if repeat {
+@@ -523,7 +614,7 @@
+             if state.pto.stalled() {
+                 limits.window = 0;
+             }
+-            let burst = limits.quantum.min(16 * u32::from(limits.max_datagram));
++            let burst = limits.quantum.min(64 * u32::from(limits.max_datagram));
+             // A probe must fit the whole window, not just the pacing burst.
+             // A stalled zero window is temporary and cannot constrain path discovery.
+             let probe_budget = if limits.window == 0 {
+@@ -553,7 +644,7 @@
+                 .saturating_sub(inflight)
+                 .saturating_sub(reserved);
+             state.cwnd_limited |= available < u64::from(limits.max_datagram);
+-            let mut budget = u64::from(limits.quantum.min(16 * u32::from(limits.max_datagram)))
++            let mut budget = u64::from(limits.quantum.min(64 * u32::from(limits.max_datagram)))
+                 .saturating_sub(reserved);
+             if request.probe.is_none() {
+                 budget = budget.min(available);
+@@ -574,8 +665,29 @@
+                 limits,
+                 now,
+             );
++            if matches!(result, Err(GrantError::Blocked)) {
++                let d = &mut state.diagnostic;
++                if !self.sender.open(request.group) {
++                    d.request_epoch_blocked += 1;
++                } else if self.sender.deadline(request.group, now).is_some() {
++                    d.request_pacer_blocked += 1;
++                } else if request.probe.is_none()
++                    && request
++                        .flight
++                        .packets()
++                        .next()
++                        .is_some_and(|p| available < u64::from(p.bytes))
++                {
++                    d.request_window_blocked += 1;
++                } else if self.sender.available() == 0 {
++                    d.request_pool_blocked += 1;
++                } else {
++                    d.request_other_blocked += 1;
++                }
++            }
+             match result {
+                 Ok(()) => {
++                    state.diagnostic.request_granted += 1;
+                     outgoing.push_back((worker, Message::Permit(request.flight)));
+                     granted_next.get_or_insert(self.request_cursor);
+                     more = true;
+@@ -612,7 +724,17 @@
+             .groups
+             .get_mut(group)
+             .ok_or(io::ErrorKind::InvalidInput)?;
+-        if let ReportKind::Ack { first: true, .. } = report.kind {
++        if let ReportKind::Ack {
++            first: true,
++            received,
++            ..
++        } = report.kind
++        {
++            state.diagnostic.ack_owner_count += 1;
++            state.diagnostic.ack_owner_delay_ns = state
++                .diagnostic
++                .ack_owner_delay_ns
++                .saturating_add(diagnostic_ns(now.saturating_sub(received)));
+             if state.ack.is_some() {
+                 return Err(io::ErrorKind::InvalidData.into());
+             }
+@@ -701,6 +823,19 @@
+                 .finish_ack(group, state.rtt.minimum().unwrap_or(Duration::ZERO))
+                 .map_err(io::Error::other)?
+             {
++                let intervals = self
++                    .sender
++                    .sample_intervals(group)
++                    .ok_or(io::ErrorKind::InvalidData)?;
++                let d = &mut state.diagnostic;
++                d.ack_samples += 1;
++                d.ack_app_limited += u64::from(sample.app_limited);
++                d.ack_host_limited += u64::from(sample.host_limited);
++                d.sample_send_last_ns = diagnostic_ns(intervals.0);
++                d.sample_ack_last_ns = diagnostic_ns(intervals.1);
++                d.sample_send_ns = d.sample_send_ns.saturating_add(d.sample_send_last_ns);
++                d.sample_ack_ns = d.sample_ack_ns.saturating_add(d.sample_ack_last_ns);
++                d.sample_rate_last = sample.rate.unwrap_or(0);
+                 let (_, inflight) = self
+                     .sender
+                     .flight_bytes(group)
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -1564,6 +1564,46 @@
+         if let Some(owner) = &self.sender.owner {
+             for group in 0..self.shared.config.path_groups() {
+                 if let Some(snapshot) = owner.snapshot(group) {
++                    // Diagnostic workload uses one group; preserve per-group values rather than summing phases.
++                    if group == 0 {
++                        self.counters.snapshot_mono_ns = snapshot.snapshot_mono_ns;
++                        self.counters.bbr_state = snapshot.bbr_state;
++                        self.counters.bbr_full_bw_reached = snapshot.bbr_full_bw_reached;
++                        self.counters.bbr_startup_exit_ns = snapshot.bbr_startup_exit_ns;
++                        self.counters.bbr_startup_exit_delivered =
++                            snapshot.bbr_startup_exit_delivered;
++                        self.counters.bbr_max_bw = snapshot.bbr_max_bw;
++                        self.counters.bbr_window = snapshot.bbr_window;
++                        self.counters.bbr_min_rtt_ns = snapshot.bbr_min_rtt_ns;
++                        self.counters.bbr_quantum = snapshot.bbr_quantum;
++                        self.counters.sender_group_inflight = snapshot.sender_group_inflight;
++                        self.counters.sender_group_reserved = snapshot.sender_group_reserved;
++                        self.counters.sample_rate_last = snapshot.sample_rate_last;
++                        self.counters.sample_send_last_ns = snapshot.sample_send_last_ns;
++                        self.counters.sample_ack_last_ns = snapshot.sample_ack_last_ns;
++                        self.counters.sender_open_ns = snapshot.sender_open_ns;
++                        self.counters.sender_closing_ns = snapshot.sender_closing_ns;
++                        self.counters.sender_commit_ns = snapshot.sender_commit_ns;
++                        self.counters.sender_feedback_ns = snapshot.sender_feedback_ns;
++                        self.counters.ack_samples = snapshot.ack_samples;
++                        self.counters.ack_app_limited = snapshot.ack_app_limited;
++                        self.counters.ack_host_limited = snapshot.ack_host_limited;
++                        self.counters.sample_send_ns = snapshot.sample_send_ns;
++                        self.counters.sample_ack_ns = snapshot.sample_ack_ns;
++                        self.counters.ack_owner_delay_ns = snapshot.ack_owner_delay_ns;
++                        self.counters.ack_owner_count = snapshot.ack_owner_count;
++                        self.counters.request_epoch_blocked = snapshot.request_epoch_blocked;
++                        self.counters.request_pacer_blocked = snapshot.request_pacer_blocked;
++                        self.counters.request_window_blocked = snapshot.request_window_blocked;
++                        self.counters.request_pool_blocked = snapshot.request_pool_blocked;
++                        self.counters.request_other_blocked = snapshot.request_other_blocked;
++                        self.counters.request_granted = snapshot.request_granted;
++                        self.counters.successful_grants = snapshot.successful_grants;
++                        self.counters.grant_to_send_ns = snapshot.grant_to_send_ns;
++                        self.counters.send_to_report_ns = snapshot.send_to_report_ns;
++                        self.counters.loss_checks = snapshot.loss_checks;
++                        self.counters.loss_check_ns = snapshot.loss_check_ns;
++                    }
+                     self.counters.pacing_bytes_per_second = self
+                         .counters
+                         .pacing_bytes_per_second
+--- a/tests/pacing.rs
++++ b/tests/pacing.rs
+@@ -66,15 +66,15 @@
+ }
+ 
+ #[test]
+-fn workers_share_quantum_and_sixteen_datagram_cap_without_idle_catchup() {
+-    for quantum in [10_240, u32::MAX] {
++fn workers_share_quantum_and_sixty_four_datagram_cap_without_idle_catchup() {
++    for quantum in [10_240, 65_536, u32::MAX] {
+         let mut grants = Grants::new(3).unwrap();
+         let limits = Limits {
+             window: u64::MAX,
+             quantum,
+             ..limits()
+         };
+-        let cap = quantum.min(16 * 1280);
++        let cap = quantum.min(64 * 1280);
+         let a = grants.reserve(0, cap - 1280, false, limits, us(0)).unwrap();
+         let at = grants.deadline(us(0)).unwrap();
+         let b = grants.reserve(1, 1280, false, limits, at).unwrap();

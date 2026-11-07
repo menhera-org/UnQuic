@@ -64,13 +64,14 @@ impl Owner {
         groups: usize,
         workers: usize,
         descriptors: &[(usize, u16, usize)],
+        now: Duration,
     ) -> io::Result<(Self, Box<[Box<Flight>]>)> {
         let (sender, flights) = Sender::new(groups, workers, SAMPLE_SLOTS)?;
         let mut states = Vec::new();
         states.try_reserve_exact(groups).map_err(io::Error::other)?;
         for group in 0..groups {
             states.push(Group {
-                controller: Controller::new(1280, None, Duration::ZERO, group as u64 + 1)
+                controller: Controller::new(1280, None, now, group as u64 + 1)
                     .map_err(io::Error::other)?,
                 rtt: Rtt::new(),
                 pto: ProbeTimeout::new(),
@@ -729,6 +730,26 @@ impl Owner {
 mod tests {
     use super::*;
 
+    #[test]
+    fn first_ack_uses_controller_creation_time_at_any_uptime() {
+        for start in [Duration::ZERO, Duration::from_secs(86_400)] {
+            let (mut owner, _) = Owner::new(1, 1, &[(0, 1, 0)], start).unwrap();
+            let mut delivery = crate::bbr::Delivery::new();
+            let mut packet = delivery.sent(start, 1280, 0, false).unwrap();
+            let rtt = Duration::from_millis(1);
+            delivery.begin_ack(start + rtt, false).unwrap();
+            delivery.acknowledged(&mut packet).unwrap();
+            let sample = delivery.finish_ack(rtt).unwrap().unwrap();
+            let controller = &mut owner.groups[0].controller;
+            assert!(
+                !controller
+                    .on_ack(sample, Some(rtt), 0, false, start + rtt)
+                    .unwrap()
+            );
+            assert_eq!(controller.state(), crate::bbr::State::Startup);
+        }
+    }
+
     fn request(flight: Box<Flight>, lane: u16, count: usize) -> Request {
         let mut flight = flight;
         let packets: Vec<_> = (1..=count)
@@ -755,7 +776,8 @@ mod tests {
 
     #[test]
     fn whole_prefix_window_pressure_keeps_deadline_and_recycles_expired_request() {
-        let (mut owner, flights) = Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)]).unwrap();
+        let (mut owner, flights) =
+            Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)], Duration::ZERO).unwrap();
         owner.timers.install(0, 1).unwrap();
         let mut flights = flights.into_vec().into_iter();
         let mut outgoing = VecDeque::with_capacity(16);
@@ -797,7 +819,8 @@ mod tests {
 
     #[test]
     fn feedback_waits_for_commits_and_partial_ack_excludes_other_reports() {
-        let (mut owner, flights) = Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)]).unwrap();
+        let (mut owner, flights) =
+            Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)], Duration::ZERO).unwrap();
         owner.timers.install(0, 1).unwrap();
         let flight = flights.into_vec().remove(0);
         let mut outgoing = VecDeque::with_capacity(16);
@@ -928,7 +951,7 @@ mod scheduling_tests {
 
     #[test]
     fn group_sweeps_preserve_earliest_deadline_then_remove_stale_minimum() {
-        let (mut owner, _) = Owner::new(65, 1, &[(0, 1, 0), (1, 1, 64)]).unwrap();
+        let (mut owner, _) = Owner::new(65, 1, &[(0, 1, 0), (1, 1, 64)], Duration::ZERO).unwrap();
         owner.timers.install(0, 1).unwrap();
         owner.timers.install(1, 1).unwrap();
         owner.timers.submitted(0, 1, 1, 1, Duration::ZERO).unwrap();
@@ -954,7 +977,7 @@ mod scheduling_tests {
 
     #[test]
     fn completed_flight_behind_group_cursor_forces_another_sweep() {
-        let (mut owner, flights) = Owner::new(65, 1, &[(0, 1, 0)]).unwrap();
+        let (mut owner, flights) = Owner::new(65, 1, &[(0, 1, 0)], Duration::ZERO).unwrap();
         owner.timers.install(0, 1).unwrap();
         owner
             .request(request(
@@ -984,7 +1007,7 @@ mod scheduling_tests {
 
     #[test]
     fn pending_pto_without_target_survives_install_and_preempts_ordinary_request() {
-        let (mut owner, flights) = Owner::new(1, 1, &[(0, 1, 0)]).unwrap();
+        let (mut owner, flights) = Owner::new(1, 1, &[(0, 1, 0)], Duration::ZERO).unwrap();
         let now = stalled(&mut owner.groups[0]);
         owner.groups[0].epoch = 7;
         owner.groups[0].probe = Some((None, 2));
@@ -1030,7 +1053,7 @@ mod scheduling_tests {
 
     #[test]
     fn upward_probe_fits_total_window_without_raising_confirmed_mtu() {
-        let (mut owner, flights) = Owner::new(1, 1, &[(0, 1, 0)]).unwrap();
+        let (mut owner, flights) = Owner::new(1, 1, &[(0, 1, 0)], Duration::ZERO).unwrap();
         owner.timers.install(0, 1).unwrap();
         owner.groups[0]
             .controller
@@ -1113,7 +1136,7 @@ mod scheduling_tests {
     #[test]
     fn blocked_pmtu_recycles_but_stalled_data_waits_for_a_probe_event() {
         for pmtu in [false, true] {
-            let (mut owner, flights) = Owner::new(1, 1, &[(0, 1, 0)]).unwrap();
+            let (mut owner, flights) = Owner::new(1, 1, &[(0, 1, 0)], Duration::ZERO).unwrap();
             owner.timers.install(0, 1).unwrap();
             let now = stalled(&mut owner.groups[0]);
             owner
@@ -1145,7 +1168,7 @@ mod returned_probe_tests {
 
     #[test]
     fn returned_probe_retargets_replacement_without_resetting_epoch_or_backoff() {
-        let (mut owner, _) = Owner::new(1, 1, &[(0, 1, 0)]).unwrap();
+        let (mut owner, _) = Owner::new(1, 1, &[(0, 1, 0)], Duration::ZERO).unwrap();
         owner.timers.install(0, 1).unwrap();
         let state = &mut owner.groups[0];
         let mut now = Duration::ZERO;
@@ -1203,7 +1226,7 @@ mod returned_probe_tests {
 
     #[test]
     fn returned_probe_counts_merge_within_one_epoch_and_reject_overflow_atomically() {
-        let (mut owner, _) = Owner::new(1, 1, &[(0, 1, 0)]).unwrap();
+        let (mut owner, _) = Owner::new(1, 1, &[(0, 1, 0)], Duration::ZERO).unwrap();
         owner.groups[0].epoch = 3;
         for count in [0, 3, u8::MAX] {
             assert!(owner.return_probe(0, 3, count).is_err());
@@ -1224,7 +1247,7 @@ mod loss_barrier_tests {
     use super::*;
 
     fn setup() -> (Owner, VecDeque<(usize, Message)>) {
-        let (mut owner, _) = Owner::new(1, 1, &[(0, 1, 0)]).unwrap();
+        let (mut owner, _) = Owner::new(1, 1, &[(0, 1, 0)], Duration::ZERO).unwrap();
         owner.timers.install(0, 1).unwrap();
         owner.timers.submitted(0, 1, 1, 1, Duration::ZERO).unwrap();
         (owner, VecDeque::with_capacity(8))
@@ -1347,7 +1370,7 @@ mod loss_barrier_tests {
 
     #[test]
     fn existing_grant_must_commit_before_worker_snapshot_is_requested() {
-        let (mut owner, flights) = Owner::new(1, 1, &[(0, 1, 0)]).unwrap();
+        let (mut owner, flights) = Owner::new(1, 1, &[(0, 1, 0)], Duration::ZERO).unwrap();
         owner.timers.install(0, 1).unwrap();
         owner.timers.submitted(0, 1, 1, 1, Duration::ZERO).unwrap();
         let mut flight = flights.into_vec().pop().unwrap();
@@ -1401,7 +1424,7 @@ mod blocked_prefix_regression {
     use super::*;
     #[test]
     fn blocked_grant_keeps_the_full_prepared_request() {
-        let (mut owner, flights) = Owner::new(1, 1, &[(0, 1, 0)]).unwrap();
+        let (mut owner, flights) = Owner::new(1, 1, &[(0, 1, 0)], Duration::ZERO).unwrap();
         owner.timers.install(0, 1).unwrap();
         let mut flight = flights.into_vec().pop().unwrap();
         let packets = std::array::from_fn::<_, 16, _>(|index| pacing::Planned {
@@ -1454,7 +1477,8 @@ mod drain_tests {
     use crate::ack::AckProgress;
 
     fn ready(count: usize) -> Owner {
-        let (mut owner, flights) = Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)]).unwrap();
+        let (mut owner, flights) =
+            Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)], Duration::ZERO).unwrap();
         owner.timers.install(0, 1).unwrap();
         let limits = pacing::Limits {
             window: 1_000_000,
@@ -1594,7 +1618,8 @@ mod fairness_regression {
 
     #[test]
     fn continuously_ready_workers_alternate_across_pacer_deadlines() {
-        let (mut owner, flights) = Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)]).unwrap();
+        let (mut owner, flights) =
+            Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)], Duration::ZERO).unwrap();
         owner.timers.install(0, 1).unwrap();
         for flight in flights.into_vec() {
             owner.request(request(flight, 1, 0)).unwrap();
@@ -1628,7 +1653,8 @@ mod fairness_regression {
 
     #[test]
     fn later_group_grants_do_not_starve_another_workers_group() {
-        let (mut owner, flights) = Owner::new(2, 3, &[(0, 1, 0), (0, 2, 0), (1, 1, 1)]).unwrap();
+        let (mut owner, flights) =
+            Owner::new(2, 3, &[(0, 1, 0), (0, 2, 0), (1, 1, 1)], Duration::ZERO).unwrap();
         for session in 0..2 {
             owner.timers.install(session, 1).unwrap();
         }

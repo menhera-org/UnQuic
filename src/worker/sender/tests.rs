@@ -33,7 +33,7 @@ fn workers() -> ([Worker; 2], ReceiveSocket) {
             )
             .unwrap();
         worker.unpaced_fixture = false;
-        worker.io_time = Some(|_| Ok(Duration::from_millis(1)));
+        worker.io_time = Some(Ok);
     }
     for from in 0..2 {
         let to = 1 - from;
@@ -44,6 +44,7 @@ fn workers() -> ([Worker; 2], ReceiveSocket) {
     Worker::init_senders(&mut workers).unwrap();
     let rx = ReceiveSocket::bind("[::1]:40005".parse().unwrap(), None).unwrap();
     for (index, worker) in workers.iter_mut().enumerate() {
+        worker.io_time = Some(|_| Ok(Duration::from_millis(1)));
         worker.install_sender(0, 1, true).unwrap();
         worker.transmit[0].paths[0].lanes[index].socket =
             Some(TransmitSocket::connect(&rx, rx.local_addr()).unwrap());
@@ -434,7 +435,7 @@ fn partial_batches_with_feedback(feedback: bool) {
 fn crossed_group_acks_finish_before_loss_checks_use_the_only_report() {
     let (mut workers, _rx) = workers();
     let descriptors = [(0, 1, 0), (0, 2, 0), (1, 1, 1), (1, 2, 1)];
-    let (mut owner, flights) = Owner::new(2, 2, &descriptors).unwrap();
+    let (mut owner, flights) = Owner::new(2, 2, &descriptors, Duration::ZERO).unwrap();
     for session in 0..2 {
         owner.timers.install(session, 1).unwrap();
     }

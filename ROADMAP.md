@@ -506,7 +506,9 @@ Sampler/controller/grant tests cover partial submissions and late originals.
 Steady-state sampling and model updates allocate nothing. Pseudocode/prose
 differences and integer rounding are recorded in tests/vectors/bbr-07/README.md.
 Runtime feedback ordering, controller ownership and worker enforcement are
-connected. General application-limited detection and payload recovery remain
+connected. Controller creation uses the runtime clock; a one-day-uptime regression
+prevents the first ACK from spuriously entering ProbeRTT.
+General application-limited detection and payload recovery remain
 unfinished; congestion-control integration is not complete.
 Reserve sampling metadata against the startup memory ceiling; a full sampling
 record in every lane's 65,536 history slots would exceed that ceiling. Use bounded
