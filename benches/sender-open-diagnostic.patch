@@ -1,0 +1,501 @@
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -42,6 +42,11 @@
+     request_pool_blocked: u64,
+     request_other_blocked: u64,
+     request_granted: u64,
++    granted_outer_bytes: u64,
++    submitted_outer_bytes: u64,
++    grant_pacer_pending: u64,
++    grant_eligible_late_ns: u64,
++    grant_request_wait_ns: u64,
+     successful_grants: u64,
+     grant_to_send_ns: u64,
+     send_to_report_ns: u64,
+@@ -56,6 +61,39 @@
+     value.as_nanos().min(u64::MAX as u128) as u64
+ }
+ 
++#[derive(Clone, Copy)]
++struct OpenClock {
++    at: Duration,
++    open: bool,
++    reason: usize,
++    paced_until: Option<Duration>,
++    expires: Option<Duration>,
++    totals: [u64; 7],
++}
++
++impl OpenClock {
++    fn account(&mut self, now: Duration) {
++        let end = now.max(self.at);
++        if self.open {
++            let valid_end = self.expires.unwrap_or(end).min(end).max(self.at);
++            if self.reason == 0 {
++                self.totals[0] = self.totals[0].saturating_add(diagnostic_ns(end - self.at));
++            } else {
++                let paced_end = self
++                    .paced_until
++                    .unwrap_or(self.at)
++                    .min(valid_end)
++                    .max(self.at);
++                self.totals[1] = self.totals[1].saturating_add(diagnostic_ns(paced_end - self.at));
++                self.totals[self.reason] =
++                    self.totals[self.reason].saturating_add(diagnostic_ns(valid_end - paced_end));
++                self.totals[5] = self.totals[5].saturating_add(diagnostic_ns(end - valid_end));
++            }
++        }
++        self.at = end;
++    }
++}
++
+ struct Group {
+     diagnostic: Diagnostic,
+     controller: Controller,
+@@ -72,6 +110,8 @@
+ 
+ pub(in crate::worker) struct Owner {
+     sender: Sender,
++    open_clock: OpenClock,
++    request_arrived: [Duration; 64],
+     pub(super) timers: timers::Timers,
+     groups: Vec<Group>,
+     requests: Vec<Option<Request>>,
+@@ -86,6 +126,147 @@
+ }
+ 
+ impl Owner {
++    // Only group zero is instrumented; the diagnostic workload uses one path group.
++    fn diagnostic_begin(&mut self) -> io::Result<u64> {
++        self.open_clock.account(monotonic_now()?);
++        Ok(self
++            .sender
++            .phase_times(0)
++            .ok_or(io::ErrorKind::InvalidData)?[0])
++    }
++
++    fn diagnostic_end(&mut self, before: u64) -> io::Result<()> {
++        let now = monotonic_now()?;
++        let state = &self.groups[0];
++        let limits = state.controller.limits();
++        let (reserved, inflight) = self
++            .sender
++            .flight_bytes(0)
++            .ok_or(io::ErrorKind::InvalidData)?;
++        let mut reason = 0;
++        let mut expires: Option<Duration> = None;
++        let mut bypass_pacer = false;
++        for request in self.requests.iter().flatten().filter(|r| r.group == 0) {
++            expires = Some(expires.map_or(request.deadline, |old| old.min(request.deadline)));
++            let Some(packet) = request.flight.packets().next() else {
++                continue;
++            };
++            if now >= request.deadline
++                || !self.timers.matches(packet.id)
++                || request.probe.is_some_and(|epoch| epoch != state.epoch)
++            {
++                reason = 5;
++                bypass_pacer = true;
++                break;
++            }
++            let bytes = u64::from(packet.bytes);
++            let window = if state.pto.stalled() {
++                0
++            } else {
++                limits.window
++            };
++            let available = window.saturating_sub(inflight).saturating_sub(reserved);
++            let burst =
++                u64::from(limits.quantum.min(64 * u32::from(request.mtu))).saturating_sub(reserved);
++            let candidate = if request.probe.is_none() && bytes > available {
++                2
++            } else if bytes > burst || limits.rate == 0 {
++                3
++            } else if self.sender.available() == 0 {
++                4
++            } else {
++                5
++            };
++            // Any ready request wins; otherwise use window, burst, then pool precedence.
++            reason = if reason == 5 || candidate == 5 {
++                5
++            } else if reason == 0 {
++                candidate
++            } else {
++                reason.min(candidate)
++            };
++        }
++        self.open_clock.open = self.sender.open(0);
++        self.open_clock.reason = reason;
++        self.open_clock.paced_until = if bypass_pacer || reason == 0 {
++            None
++        } else {
++            self.sender.pacing_time(0)
++        };
++        self.open_clock.expires = expires;
++        self.open_clock.at = monotonic_now()?;
++        let after = self
++            .sender
++            .phase_times(0)
++            .ok_or(io::ErrorKind::InvalidData)?[0];
++        self.open_clock.totals[6] =
++            self.open_clock.totals[6].saturating_add(after.saturating_sub(before));
++        Ok(())
++    }
++
++    pub(super) fn request(&mut self, request: Request) -> io::Result<()> {
++        let before = self.diagnostic_begin()?;
++        *self
++            .request_arrived
++            .get_mut(request.flight.worker())
++            .ok_or(io::ErrorKind::InvalidInput)? = monotonic_now()?;
++        let result = self.request_inner(request);
++        self.diagnostic_end(before)?;
++        result
++    }
++
++    pub(super) fn complete(&mut self, flight: Box<Flight>) -> io::Result<()> {
++        let before = self.diagnostic_begin()?;
++        let result = self.complete_inner(flight);
++        self.diagnostic_end(before)?;
++        result
++    }
++
++    pub(super) fn report(&mut self, report: Box<Report>) -> io::Result<()> {
++        let before = self.diagnostic_begin()?;
++        let result = self.report_inner(report);
++        self.diagnostic_end(before)?;
++        result
++    }
++
++    pub(super) fn probe_replied(&mut self, group: usize) -> io::Result<()> {
++        let before = self.diagnostic_begin()?;
++        let result = self.probe_replied_inner(group);
++        self.diagnostic_end(before)?;
++        result
++    }
++
++    pub(super) fn return_probe(&mut self, group: usize, epoch: u64, count: u8) -> io::Result<()> {
++        let before = self.diagnostic_begin()?;
++        let result = self.return_probe_inner(group, epoch, count);
++        self.diagnostic_end(before)?;
++        result
++    }
++
++    pub(super) fn loss_checked(
++        &mut self,
++        group: usize,
++        token: u64,
++        worker: usize,
++        next_due: Option<Duration>,
++    ) -> io::Result<()> {
++        let before = self.diagnostic_begin()?;
++        let result = self.loss_checked_inner(group, token, worker, next_due);
++        self.diagnostic_end(before)?;
++        result
++    }
++
++    pub(super) fn advance(
++        &mut self,
++        now: Duration,
++        outgoing: &mut VecDeque<(usize, Message)>,
++    ) -> io::Result<bool> {
++        let before = self.diagnostic_begin()?;
++        let result = self.advance_inner(now, outgoing);
++        self.diagnostic_end(before)?;
++        result
++    }
++
+     pub(super) fn reidentify(&mut self, flight: &mut Flight, first: u64) -> Result<(), GrantError> {
+         self.sender.reidentify(flight, first)
+     }
+@@ -126,6 +307,15 @@
+         Ok((
+             Self {
+                 sender,
++                open_clock: OpenClock {
++                    at: monotonic_now()?,
++                    open: true,
++                    reason: 0,
++                    paced_until: None,
++                    expires: None,
++                    totals: [0; 7],
++                },
++                request_arrived: [Duration::ZERO; 64],
+                 timers: timers::Timers::new(groups, descriptors)?,
+                 groups: states,
+                 requests,
+@@ -162,7 +352,7 @@
+             )
+     }
+ 
+-    pub(super) fn request(&mut self, request: Request) -> io::Result<()> {
++    fn request_inner(&mut self, request: Request) -> io::Result<()> {
+         let slot = self
+             .requests
+             .get_mut(request.flight.worker())
+@@ -174,7 +364,7 @@
+         Ok(())
+     }
+ 
+-    pub(super) fn complete(&mut self, flight: Box<Flight>) -> io::Result<()> {
++    fn complete_inner(&mut self, flight: Box<Flight>) -> io::Result<()> {
+         let group = flight.group().ok_or(io::ErrorKind::InvalidInput)?;
+         if let Some((count, Some(started), _)) = flight.completion()
+             && count != 0
+@@ -190,6 +380,13 @@
+                 .send_to_report_ns
+                 .saturating_add(diagnostic_ns(observed.saturating_sub(started)));
+         }
++        if let Some((count, _, _)) = flight.completion() {
++            self.groups[group].diagnostic.submitted_outer_bytes += flight
++                .packets()
++                .take(count)
++                .map(|p| u64::from(p.bytes))
++                .sum::<u64>();
++        }
+         self.sender
+             .reported(flight)
+             .map_err(|(error, _)| io::Error::other(format!("sender completion: {error}")))?;
+@@ -197,7 +394,7 @@
+         Ok(())
+     }
+ 
+-    pub(super) fn report(&mut self, report: Box<Report>) -> io::Result<()> {
++    fn report_inner(&mut self, report: Box<Report>) -> io::Result<()> {
+         if self.reports.len() == self.reports.capacity() {
+             return Err(io::Error::other("duplicate sender feedback"));
+         }
+@@ -219,7 +416,21 @@
+         let limits = state.controller.limits();
+         let phases = self.sender.phase_times(group)?;
+         let (reserved, inflight) = self.sender.flight_bytes(group)?;
++        let mut open = self.open_clock;
++        open.account(monotonic_now().ok()?);
+         Some(Snapshot {
++            open_no_request_ns: open.totals[0],
++            open_pacer_ns: open.totals[1],
++            open_window_ns: open.totals[2],
++            open_burst_ns: open.totals[3],
++            open_pool_ns: open.totals[4],
++            open_ready_ns: open.totals[5],
++            open_owner_ns: open.totals[6],
++            granted_outer_bytes: state.diagnostic.granted_outer_bytes,
++            submitted_outer_bytes: state.diagnostic.submitted_outer_bytes,
++            grant_pacer_pending: state.diagnostic.grant_pacer_pending,
++            grant_eligible_late_ns: state.diagnostic.grant_eligible_late_ns,
++            grant_request_wait_ns: state.diagnostic.grant_request_wait_ns,
+             snapshot_mono_ns: monotonic_now().map_or(0, diagnostic_ns),
+             bbr_state: phase,
+             bbr_max_bw: max_bw,
+@@ -265,7 +476,7 @@
+         })
+     }
+ 
+-    pub(super) fn probe_replied(&mut self, group: usize) -> io::Result<()> {
++    fn probe_replied_inner(&mut self, group: usize) -> io::Result<()> {
+         self.groups
+             .get_mut(group)
+             .ok_or(io::ErrorKind::InvalidInput)?
+@@ -275,7 +486,7 @@
+     }
+ 
+     /// Returns an unrequested part of one locally owned PTO command.
+-    pub(super) fn return_probe(&mut self, group: usize, epoch: u64, count: u8) -> io::Result<()> {
++    fn return_probe_inner(&mut self, group: usize, epoch: u64, count: u8) -> io::Result<()> {
+         let state = self
+             .groups
+             .get_mut(group)
+@@ -313,7 +524,7 @@
+         Ok(())
+     }
+ 
+-    pub(super) fn loss_checked(
++    fn loss_checked_inner(
+         &mut self,
+         group: usize,
+         token: u64,
+@@ -466,7 +677,7 @@
+     }
+ 
+     // All producers retain their pooled message when the handoff queue is full.
+-    pub(super) fn advance(
++    fn advance_inner(
+         &mut self,
+         now: Duration,
+         outgoing: &mut VecDeque<(usize, Message)>,
+@@ -657,6 +868,11 @@
+                 }
+                 bytes = next;
+             }
++            let prior_pacing = self
++                .sender
++                .pacing_time(request.group)
++                .unwrap_or(Duration::ZERO);
++            let arrival = self.request_arrived[worker];
+             let result = self.sender.reserve_prefix(
+                 request.group,
+                 &mut request.flight,
+@@ -688,6 +904,18 @@
+             match result {
+                 Ok(()) => {
+                     state.diagnostic.request_granted += 1;
++                    state.diagnostic.granted_outer_bytes += u64::from(
++                        request
++                            .flight
++                            .grant()
++                            .ok_or(io::ErrorKind::InvalidData)?
++                            .bytes(),
++                    );
++                    state.diagnostic.grant_pacer_pending += u64::from(arrival < prior_pacing);
++                    state.diagnostic.grant_eligible_late_ns +=
++                        diagnostic_ns(now.saturating_sub(prior_pacing.max(arrival)));
++                    state.diagnostic.grant_request_wait_ns +=
++                        diagnostic_ns(now.saturating_sub(arrival));
+                     outgoing.push_back((worker, Message::Permit(request.flight)));
+                     granted_next.get_or_insert(self.request_cursor);
+                     more = true;
+@@ -1808,3 +2036,61 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod open_clock_tests {
++    use super::*;
++    fn ns(value: u64) -> Duration {
++        Duration::from_nanos(value)
++    }
++    fn clock(reason: usize) -> OpenClock {
++        OpenClock {
++            at: ns(10),
++            open: true,
++            reason,
++            paced_until: Some(ns(20)),
++            expires: None,
++            totals: [0; 7],
++        }
++    }
++
++    #[test]
++    fn waiting_splits_at_pacer_and_expiry_without_double_counting() {
++        let mut c = clock(2);
++        c.expires = Some(ns(30));
++        c.account(ns(15));
++        assert_eq!(c.totals, [0, 5, 0, 0, 0, 0, 0]);
++        c.account(ns(25));
++        assert_eq!(c.totals, [0, 10, 5, 0, 0, 0, 0]);
++        let mut snapshot = c;
++        snapshot.account(ns(40));
++        assert_eq!(snapshot.totals, [0, 10, 10, 0, 0, 10, 0]);
++        assert_eq!(c.totals, [0, 10, 5, 0, 0, 0, 0]);
++        c.account(ns(40));
++        assert_eq!(c.totals, snapshot.totals);
++        c.account(ns(39));
++        assert_eq!(c.totals, snapshot.totals);
++    }
++
++    #[test]
++    fn expired_request_is_actionable_even_before_pacer_opens() {
++        let mut c = clock(2);
++        c.expires = Some(ns(15));
++        c.account(ns(25));
++        assert_eq!(c.totals, [0, 5, 0, 0, 0, 10, 0]);
++    }
++
++    #[test]
++    fn no_request_and_closed_intervals_do_not_count_pacing() {
++        let mut c = clock(0);
++        c.account(ns(100));
++        assert_eq!(c.totals, [90, 0, 0, 0, 0, 0, 0]);
++        c.open = false;
++        c.account(ns(200));
++        assert_eq!(c.totals, [90, 0, 0, 0, 0, 0, 0]);
++        c.open = true;
++        c.reason = 5;
++        c.account(ns(210));
++        assert_eq!(c.totals, [90, 0, 0, 0, 0, 10, 0]);
++    }
++}
+--- a/src/pacing/grants.rs
++++ b/src/pacing/grants.rs
+@@ -156,6 +156,11 @@
+     ///
+     /// The owner arms this only while work is waiting. Other blocked requests
+     /// require a worker report, ACK/loss settlement or new controller limits.
++    pub(super) const fn pacing_time(&self) -> Duration {
++        self.next_send
++    }
++
++    /// Earliest pacing retry when pacing currently blocks a new grant.
+     pub fn deadline(&self, now: Duration) -> Option<Duration> {
+         (now < self.next_send).then_some(self.next_send)
+     }
+--- a/src/pacing/sender.rs
++++ b/src/pacing/sender.rs
+@@ -425,6 +425,11 @@
+     }
+ 
+     /// Pacing deadline, independent of report and sampler backpressure.
++    pub(crate) fn pacing_time(&self, group: usize) -> Option<Duration> {
++        Some(self.groups.get(group)?.grants.pacing_time())
++    }
++
++    /// Earliest pacing retry when pacing currently blocks a new grant.
+     pub fn deadline(&self, group: usize, now: Duration) -> Option<Duration> {
+         self.groups.get(group)?.grants.deadline(now)
+     }
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -122,6 +122,30 @@
+     sample_ack_last_ns: sum,
+     /// Temporary sender diagnostic.
+     sender_open_ns: sum,
++    /// Temporary Open-state diagnostic.
++    open_no_request_ns: sum,
++    /// Temporary Open-state diagnostic.
++    open_pacer_ns: sum,
++    /// Temporary Open-state diagnostic.
++    open_window_ns: sum,
++    /// Temporary Open-state diagnostic.
++    open_burst_ns: sum,
++    /// Temporary Open-state diagnostic.
++    open_pool_ns: sum,
++    /// Temporary Open-state diagnostic.
++    open_ready_ns: sum,
++    /// Temporary Open-state diagnostic.
++    open_owner_ns: sum,
++    /// Temporary Open-state diagnostic.
++    granted_outer_bytes: sum,
++    /// Temporary Open-state diagnostic.
++    submitted_outer_bytes: sum,
++    /// Temporary Open-state diagnostic.
++    grant_pacer_pending: sum,
++    /// Temporary Open-state diagnostic.
++    grant_eligible_late_ns: sum,
++    /// Temporary Open-state diagnostic.
++    grant_request_wait_ns: sum,
+     /// Temporary sender diagnostic.
+     sender_closing_ns: sum,
+     /// Temporary sender diagnostic.
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -1610,6 +1610,18 @@
+                         self.counters.sample_send_last_ns = snapshot.sample_send_last_ns;
+                         self.counters.sample_ack_last_ns = snapshot.sample_ack_last_ns;
+                         self.counters.sender_open_ns = snapshot.sender_open_ns;
++                        self.counters.open_no_request_ns = snapshot.open_no_request_ns;
++                        self.counters.open_pacer_ns = snapshot.open_pacer_ns;
++                        self.counters.open_window_ns = snapshot.open_window_ns;
++                        self.counters.open_burst_ns = snapshot.open_burst_ns;
++                        self.counters.open_pool_ns = snapshot.open_pool_ns;
++                        self.counters.open_ready_ns = snapshot.open_ready_ns;
++                        self.counters.open_owner_ns = snapshot.open_owner_ns;
++                        self.counters.granted_outer_bytes = snapshot.granted_outer_bytes;
++                        self.counters.submitted_outer_bytes = snapshot.submitted_outer_bytes;
++                        self.counters.grant_pacer_pending = snapshot.grant_pacer_pending;
++                        self.counters.grant_eligible_late_ns = snapshot.grant_eligible_late_ns;
++                        self.counters.grant_request_wait_ns = snapshot.grant_request_wait_ns;
+                         self.counters.sender_closing_ns = snapshot.sender_closing_ns;
+                         self.counters.sender_commit_ns = snapshot.sender_commit_ns;
+                         self.counters.sender_feedback_ns = snapshot.sender_feedback_ns;

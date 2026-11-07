@@ -534,7 +534,7 @@ impl Owner {
             if state.pto.stalled() {
                 limits.window = 0;
             }
-            let burst = limits.quantum.min(16 * u32::from(limits.max_datagram));
+            let burst = limits.quantum.min(64 * u32::from(limits.max_datagram));
             // A probe must fit the whole window, not just the pacing burst.
             // A stalled zero window is temporary and cannot constrain path discovery.
             let probe_budget = if limits.window == 0 {
@@ -563,7 +563,7 @@ impl Owner {
                 .window
                 .saturating_sub(inflight)
                 .saturating_sub(reserved);
-            let mut budget = u64::from(limits.quantum.min(16 * u32::from(limits.max_datagram)))
+            let mut budget = u64::from(limits.quantum.min(64 * u32::from(limits.max_datagram)))
                 .saturating_sub(reserved);
             if request.probe.is_none() {
                 budget = budget.min(available);

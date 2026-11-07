@@ -508,6 +508,8 @@ discovery, while obeying the aggregate burst cap. Discovery candidates also fit
 within the total congestion window; resizing never confirms a larger DATA MTU.
 Workers now request grants
 for DATA, PMTU and liveness probes from worker zero's per-group controller.
+Combined outstanding grants share the smaller of BBR's send quantum and
+64 maximum-size datagrams. The current controller caps that quantum at 64 KiB.
 ACK-only and PROBE_REPLY traffic retain their separate control ceiling.
 Controllers start from the runtime's monotonic clock, so host uptime does not
 make the first ACK trigger an expired ProbeRTT timer.

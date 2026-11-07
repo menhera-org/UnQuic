@@ -446,7 +446,7 @@ regression tests pass.
 The pure shared grant ledger now reserves credit before handoff, keeps it through
 100-microsecond expiry, and consumes each sent/unused report once. Partial
 submissions convert only successful outer bytes to inflight charges. Workers
-share the send quantum and sixteen-maximum-datagram byte cap; PTO rounds share
+share the send quantum and sixty-four-maximum-datagram byte cap; PTO rounds share
 at most two one-datagram grants, with epoch checks on unused reports.
 Exact pacing deadlines, delayed completion, duplicate reports, limit reductions,
 late ACK/loss settlement and allocation-free transitions have regression coverage.

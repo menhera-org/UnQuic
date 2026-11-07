@@ -22,7 +22,7 @@ impl Limits {
             return Err(GrantError::Invalid);
         }
         Ok(u64::from(
-            self.quantum.min(16 * u32::from(self.max_datagram)),
+            self.quantum.min(64 * u32::from(self.max_datagram)),
         ))
     }
 }
@@ -176,7 +176,7 @@ impl Grants {
 
     /// Reserves an exact byte budget before handing it to a worker.
     ///
-    /// Requests share min(send quantum, 16 maximum datagrams), even across
+    /// Requests share min(send quantum, 64 maximum datagrams), even across
     /// workers. Probes bypass only the congestion window: they still consume
     /// pacing/burst credit and become charged inflight bytes on submission.
     /// A probe grant describes one complete datagram, up to the 9000-byte

@@ -66,15 +66,15 @@ fn expired_grants_hold_credit_until_one_partial_or_unused_report() {
 }
 
 #[test]
-fn workers_share_quantum_and_sixteen_datagram_cap_without_idle_catchup() {
-    for quantum in [10_240, u32::MAX] {
+fn workers_share_quantum_and_sixty_four_datagram_cap_without_idle_catchup() {
+    for quantum in [10_240, 65_536, u32::MAX] {
         let mut grants = Grants::new(3).unwrap();
         let limits = Limits {
             window: u64::MAX,
             quantum,
             ..limits()
         };
-        let cap = quantum.min(16 * 1280);
+        let cap = quantum.min(64 * 1280);
         let a = grants.reserve(0, cap - 1280, false, limits, us(0)).unwrap();
         let at = grants.deadline(us(0)).unwrap();
         let b = grants.reserve(1, 1280, false, limits, at).unwrap();

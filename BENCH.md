@@ -18,8 +18,8 @@ Neither the local **20 Gbit/s in each direction** gate nor the real
 remain unfinished. Workers now use the shared draft-07 controller and grant
 accounting. Refreshing overtaken packet numbers removes repeated coordinator
 DATA cancellations. Skipping empty loss-history ranges reduces CPU cost, but the
-latest 20-second QinQ sweep still delivers only 0.72 to 0.85 Gbit/s per direction
-using about 1.4 to 1.5 CPUs per daemon.
+larger bounded DATA burst raises the latest 20-second QinQ sweep to
+1.43–1.62 Gbit/s per direction using about 1.6–1.7 CPUs per daemon.
 The preceding ACK-pruning sweep delivered 1.12 to 1.22 Gbit/s. These remain
 severe integration regressions, far below the CPU ceiling.
 General application-limited detection and payload repair remain open.
@@ -52,8 +52,8 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Latest sender QinQ sweep: 0.85 / 0.83 Gbit/s paced, 0.84 / 0.81 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 95.86 / 95.95%. Five successful repeats and the under-1% gate remain unmet. |
-| Goodput must plateau under excess traffic | Latest sender sweep spans 0.72 to 0.85 Gbit/s through paced, unlimited and return points; daemon CPU stays near 1.4–1.5 cores. The earlier expiry sweep declined 2.7% forward under unlimited load | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Latest sender QinQ sweep: 1.59 / 1.49 Gbit/s paced, 1.62 / 1.50 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 92.30 / 92.75%. Five successful repeats and the under-1% gate remain unmet. |
+| Goodput must plateau under excess traffic | Latest sender sweep spans 1.43 to 1.62 Gbit/s through paced, unlimited and return points; daemon CPU stays near 1.6–1.7 cores. The earlier expiry sweep declined 2.7% forward under unlimited load | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
 | Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Current QinQ reports zero reordering; single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
@@ -212,7 +212,8 @@ The candidate passes 332 release tests, Clippy and 57 short container/probe test
 At 21G, goodput rises from the cap16 build's 0.83 / 0.80 Gbit/s to
 1.37 / 1.56. Forward unlimited goodput then falls 20.7% to 1.09 Gbit/s,
 while reverse remains 1.58; the return point recovers. This does not satisfy
-the overload requirement. The larger cap is not adopted.
+the overload requirement. The larger cap was not adopted at this point;
+the later indexed-loss-scan comparisons below support adopting it.
 
 At 21G, TAP TX drops are 748,870 / 722,772, frame expiries 58,425 / 14,648,
 and worker queue drops 3,174 / 14,541. Unlimited frame expiries rise to
@@ -348,6 +349,94 @@ restarts. The precise tracking interpretation is documented with the
 to this correctness fix before measurement. The fix passes 338 release tests,
 Clippy and 56 short container tests; foreign-move reconnect takes 1.00 second
 in this observation.
+
+## Larger burst with indexed loss scans (November 7)
+
+[Two independent ordinary-release sweeps](benches/tap-sender-summary-cap64.json)
+repeat the cap64 candidate on `0894c5d`, after the clock and sparse-scan fixes
+but before the packet-round correction. Each retains its own daemon pair across
+four twenty-second points. The candidate changes only the three DATA burst caps;
+BBR's 64 KiB quantum still bounds combined outstanding permission. It passes
+335 release tests, Clippy and 56 short container tests.
+
+| Run / requested Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| 1 / 16 | 1.19 / 1.56 | 92.40 / 89.99 | 158.46 / 152.87 |
+| 1 / 21 | 1.62 / 1.56 | 92.09 / 92.28 | 165.09 / 157.33 |
+| 1 / unlimited | 1.77 / 1.65 | 96.90 / 96.78 | 161.85 / 158.29 |
+| 1 / 16 return | 1.65 / 1.56 | 89.49 / 90.02 | 163.55 / 160.34 |
+| 2 / 16 | 1.64 / 1.33 | 89.52 / 91.47 | 161.16 / 156.74 |
+| 2 / 21 | 1.65 / 1.57 | 92.01 / 92.30 | 165.93 / 161.63 |
+| 2 / unlimited | 1.76 / 1.62 | 96.97 / 96.84 | 164.30 / 161.15 |
+| 2 / 16 return | 1.59 / 1.54 | 89.82 / 90.08 | 162.50 / 161.91 |
+
+Both 21G points improve substantially over the indexed cap16 build's
+0.85 / 0.83 Gbit/s, and neither shows an unlimited-load decline. First-point
+variation remains. Both builds remain far below the CPU and goodput targets.
+At 21G, frame expiries are 8,339 / 9,765 in run 1 and 3,432 / 9,233 in run 2;
+queue drops are 2,418 / 14,193 and 2,687 / 14,277. The JSON preserves TAP TX
+drops separately. Admission pressure, socket overflow, inner UDP errors, invalid
+records, duplicates, reordering and outer fragmentation remain zero.
+
+## Adopted bounded DATA burst (November 7)
+
+The [combined normal-release sweep](benches/tap-sender-window-cap64.json)
+adds the packet-round window-use correction to the indexed cap64 build.
+The production DATA cap is now 64 maximum datagrams, still bounded by the
+controller's 64 KiB quantum across all workers. Control traffic keeps its
+separate sixteen-datagram cap. No queue, buffer, MTU or deadline changes.
+
+| Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | 15.98 / 15.94 | 1.49 / 1.45 | 90.28 / 90.53 | 167.71 / 158.70 |
+| 21 | 20.98 / 20.93 | 1.59 / 1.49 | 92.30 / 92.75 | 170.84 / 161.58 |
+| Unlimited | 58.82 / 57.48 | 1.62 / 1.50 | 97.20 / 97.35 | 168.94 / 159.48 |
+| 16 return | 15.98 / 15.97 | 1.54 / 1.43 | 90.21 / 90.85 | 163.14 / 158.83 |
+
+Unlimited goodput rises by 2.0 / 0.4% from the 21G point. These results support
+the larger burst; they do not establish a CPU ceiling or isolate the effect of
+the packet-round correction. Goodput remains below both original targets.
+At 21G, endpoint counters report 745,518 / 733,256 TAP TX drops,
+7,280 / 5,526 frame expiries and 760 / 12,255 worker queue drops.
+All four points have zero admission pressure, socket overflow, inner UDP errors,
+invalid/duplicate/out-of-window/wrong-run records, reordering and outer fragments.
+The combined build passes 338 release tests, Clippy and 56 short container
+tests. Full routed PMTU validation of this combined build remains pending.
+
+## Grant-wait attribution (November 7)
+
+The [Open-phase diagnostic](benches/tap-sender-open-diagnostic.json) separates
+pacing, window, burst, sampling-pool and ready waits from absence of queued
+requests and work inside owner operations. Its
+[patch](benches/sender-open-diagnostic.patch) builds on the earlier diagnostic
+patches; the clock and packet-round corrections remain absent for comparison.
+It adds counters, clocks and bounded request scans, so it is not an acceptance
+build. The load-only timing summaries use before/sent monitor snapshots;
+the seven categories account for about 99.8% of the existing Open timer.
+
+At 21G, delivered goodput is 1.59 / 1.51 Gbit/s using 174.95 / 165.54% CPU.
+Issuance is Open for 81.85 / 84.46% of the load interval. Within that time:
+
+| Open-state category | Left % | Right % |
+| --- | ---: | ---: |
+| Pacing deadline pending | 44.57 | 43.45 |
+| Window blocks after pacing is eligible | 45.41 | 45.42 |
+| No queued owner request | 1.63 | 1.95 |
+| Burst/reservation limit | 0.65 | 0.09 |
+| Sampling pool | 0 | 0 |
+| Ready for service or cleanup | 3.40 | 4.13 |
+| Inside owner operations, including instrumentation | 4.15 | 4.74 |
+
+Average grant budgets are 33.75 / 32.61 KB, with about 1.3% unused.
+Requests wait 530 / 602 microseconds for permission. Issuance follows the later
+of request arrival and the previous pacing deadline by 71 / 72 microseconds;
+that includes epoch/window/host waits and is not timer-only latency. Sampled
+median pacing rates are 3.18 / 4.27 Gbit/s, windows 108.7 / 113.5 KB and minimum
+RTTs about 32 microseconds. These measurements direct the next investigation
+toward feedback timing and window use; they do not prove that ACK batching is
+the cause. A per-lane sixteen-packet/1-ms ACK threshold can delay a shared
+window, but packet-number gaps can trigger earlier ACKs. Their actual frequency
+and ACK queue residence need measurement.
 
 ## Request fairness and burst-size experiments (November 7)
 
