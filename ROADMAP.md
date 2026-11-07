@@ -550,6 +550,13 @@ now refresh unsent headers and accounting identities without copying payloads or
 extending permission. Regressions cover steady feedback, pacing-held requests,
 queued permits, trimmed grants, probe identity and history-pressure retry. The
 first three fail on the previous send path and pass with refresh.
+Fully successful trimmed grants now retain the never-attempted DATA suffix,
+avoiding packet-number gaps and repeated packet preparation. Partial sends,
+expiry, PMTU shrink, retirement and overtaking controls still discard or refresh
+the affected plans and cancel their reservations. The contiguous-number
+regression fails on the previous path; split-frame, partial-send and reservation
+cleanup tests pass. The normal release sweep improves to 2.41 / 2.09 Gbit/s
+paced and 2.53 / 2.23 unlimited, still far below the performance gates.
 
 The pure RTT estimator, loss-deadline calculation, PTO-period backoff and frame
 lifetime now live in `loss.rs`, with exact-value and boundary tests. ACK-driven

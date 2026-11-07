@@ -308,6 +308,7 @@ pub struct Batch {
     prefixes: [[u8; RECORD_PREFIX_LEN]; BATCH_CAPACITY * 2],
     pieces: [PieceRange; BATCH_CAPACITY * 2],
     count: usize,
+    head: usize,
 }
 
 impl Default for Batch {
@@ -336,37 +337,52 @@ impl Batch {
                 end: 0,
             }; BATCH_CAPACITY * 2],
             count: 0,
+            head: 0,
         }
     }
 
     /// Forgets prepared packets without reusing their allocated packet numbers.
     pub const fn clear(&mut self) {
         self.count = 0;
+        self.head = 0;
     }
 
     /// Number of prepared logical UDP datagrams.
     pub const fn len(&self) -> usize {
-        self.count
+        self.count - self.head
     }
 
     /// Whether there are no prepared datagrams.
     pub const fn is_empty(&self) -> bool {
-        self.count == 0
+        self.head == self.count
     }
 
     /// Prepared identity and payload length, or None past the batch.
     pub const fn packet(&self, index: usize) -> Option<Packet> {
-        if index < self.count {
-            Some(self.packets[index].packet)
+        if index < self.len() {
+            Some(self.packets[self.head + index].packet)
         } else {
             None
         }
     }
 
+    /// Consumes a fully successful attempted prefix, retaining never-attempted packets.
+    /// Frame slots must remain stable until all remaining packets are discarded or consumed.
+    pub(crate) fn consume(&mut self, count: usize) -> Result<(), PackError> {
+        if count > self.len() {
+            return Err(PackError::Frame);
+        }
+        self.head += count;
+        if self.is_empty() {
+            self.clear();
+        }
+        Ok(())
+    }
+
     /// Replaces unsent packet identities without changing payload spans or sizes.
     pub(crate) fn renumber(&mut self, lane: &mut Lane) -> Result<u64, PackError> {
-        let first = lane.allocate_packets(self.count)?;
-        for (offset, plan) in self.packets[..self.count].iter_mut().enumerate() {
+        let first = lane.allocate_packets(self.len())?;
+        for (offset, plan) in self.packets[self.head..self.count].iter_mut().enumerate() {
             plan.packet.number = first + offset as u64;
             let mut header = lane.header;
             header.packet_number = plan.packet.number;
@@ -380,15 +396,16 @@ impl Batch {
     ///
     /// Advance frame offsets only after successful socket submission. A partial
     /// socket batch consumes exactly the returned packet prefix. After each
-    /// attempted send, re-prepare the remaining ranges with fresh packet numbers.
+    /// partial or failed attempt, discard the remaining plan and use fresh numbers.
+    /// A never-attempted suffix may retain its original numbers.
     pub fn pieces(
         &self,
         packet: usize,
     ) -> Option<impl Iterator<Item = (usize, std::ops::Range<usize>)> + '_> {
-        if packet >= self.count {
+        if packet >= self.len() {
             return None;
         }
-        let plan = &self.packets[packet];
+        let plan = &self.packets[self.head + packet];
         let first = usize::from(plan.first);
         Some(
             self.pieces[first..first + usize::from(plan.count)]
@@ -414,8 +431,8 @@ impl Batch {
     ) -> Result<&'out [&'a [u8]], PackError> {
         let plan = self
             .packets
-            .get(packet)
-            .filter(|_| packet < self.count)
+            .get(self.head.saturating_add(packet))
+            .filter(|_| packet < self.len())
             .ok_or(PackError::Frame)?;
         if output.len() < 1 + usize::from(plan.count) * 2 {
             return Err(PackError::Wire(WireError::BufferTooSmall));
@@ -890,5 +907,62 @@ mod renumber_tests {
         assert_eq!(lane.header.packet_number, u64::MAX);
         assert_eq!(lane.allocate_packets(1), Ok(u64::MAX));
         assert_eq!(lane.allocate_packets(1), Err(PackError::Exhausted));
+    }
+}
+
+#[cfg(test)]
+mod retained_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn consumed_prefix_keeps_suffix_numbers_slots_and_bytes() {
+        let mut lane = super::tests::lane();
+        let payload = [7; BASE_UDP_PAYLOAD - DATA_PREFIX_LEN];
+        let mut frames: Vec<_> = (0..64)
+            .map(|_| FrameInput {
+                id: lane.start_frame(payload.len()).unwrap(),
+                header: &[],
+                bytes: &payload,
+                offset: 0,
+                end: payload.len(),
+            })
+            .collect();
+        let mut batch = Batch::new();
+        batch.prepare(&mut lane, &frames, BASE_UDP_PAYLOAD).unwrap();
+        let count = batch.len();
+        assert!(count > 16);
+        let original: Vec<_> = (0..count).map(|i| batch.packet(i).unwrap()).collect();
+        assert_eq!(batch.consume(count + 1), Err(PackError::Frame));
+        assert_eq!(batch.len(), count);
+        batch.consume(16).unwrap();
+        for frame in &mut frames[..16] {
+            frame.bytes = &[];
+            frame.end = 0;
+        }
+        for index in 0..batch.len() {
+            assert_eq!(batch.packet(index), Some(original[index + 16]));
+            assert_eq!(batch.pieces(index).unwrap().next().unwrap().0, index + 16);
+            let mut slices = [&[][..]; 4];
+            let packet: Vec<_> = batch
+                .slices(index, &frames, &mut slices)
+                .unwrap()
+                .iter()
+                .flat_map(|part| part.iter().copied())
+                .collect();
+            let datagram = crate::wire::Datagram::decode(&packet).unwrap();
+            assert_eq!(datagram.header().packet_number, original[index + 16].number);
+            assert!(
+                matches!(datagram.records().next(), Some(Record::Data {bytes, ..}) if bytes == payload)
+            );
+        }
+        let first = batch.renumber(&mut lane).unwrap();
+        assert_eq!(batch.packet(0).unwrap().number, first);
+        assert_eq!(batch.pieces(0).unwrap().next().unwrap().0, 16);
+        batch.consume(batch.len()).unwrap();
+        assert!(batch.is_empty());
+        batch
+            .prepare(&mut lane, &frames[count..], BASE_UDP_PAYLOAD)
+            .unwrap();
+        assert_eq!(batch.pieces(0).unwrap().next().unwrap().0, 0);
     }
 }

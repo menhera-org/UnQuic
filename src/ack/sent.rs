@@ -343,6 +343,15 @@ impl History {
         }))
     }
 
+    pub(crate) const fn highest_allocated(&self) -> u64 {
+        self.allocated
+    }
+
+    pub(crate) fn is_reserved(&self, number: u64) -> bool {
+        let (word, bit) = location(number);
+        self.contains(number) && self.reserved[word] & bit != 0
+    }
+
     /// Cancels an unsent reservation without permitting reuse of its number.
     pub fn cancel(&mut self, number: u64) -> bool {
         if !self.contains(number) {

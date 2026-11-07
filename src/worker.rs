@@ -500,7 +500,14 @@ impl TxBatch {
         self.plan.prepare(lane, &inputs[..self.len], limit)
     }
 
-    fn compact(&mut self) {
+    fn discard(&mut self, history: Option<&mut crate::ack::History>) {
+        if let Some(history) = history {
+            for index in 0..self.plan.len() {
+                if let Some(packet) = self.plan.packet(index) {
+                    history.cancel(packet.number);
+                }
+            }
+        }
         let mut len = 0;
         for index in 0..self.len {
             if self.frames[index].is_some() {
@@ -2502,13 +2509,18 @@ impl Worker {
         }
     }
 
-    fn clear_batch(&mut self, batch: &mut TxBatch) {
+    fn discard_batch(&mut self, session: usize, lane: usize, batch: &mut TxBatch) {
+        let index = self.sender_index(session, lane).ok();
+        batch.discard(index.map(|index| &mut self.sender.lanes[index].history));
+    }
+
+    fn clear_batch(&mut self, session: usize, lane: usize, batch: &mut TxBatch) {
         for frame in &mut batch.frames[..batch.len] {
             if let Some(buffer) = frame.take() {
                 self.release_frame(buffer);
             }
         }
-        batch.compact();
+        self.discard_batch(session, lane, batch);
     }
 
     fn expire_frames(&mut self, now: Duration) -> io::Result<bool> {
@@ -2528,11 +2540,11 @@ impl Worker {
             if !self.frame_expired(index, now) {
                 return Err(io::Error::other("early transmit expiry"));
             }
-            let batch = self
+            let mut batch = self
                 .sessions
                 .get_mut(session)
                 .and_then(|session| session.batches.get_mut(lane))
-                .and_then(Option::as_mut)
+                .and_then(Option::take)
                 .ok_or_else(|| io::Error::other("missing expiring transmit batch"))?;
             if !self.frames.unqueue(&mut batch.pending, index)? {
                 let slot = batch.frames[..batch.len]
@@ -2540,8 +2552,9 @@ impl Worker {
                     .find(|slot| **slot == Some(index))
                     .ok_or_else(|| io::Error::other("unowned expiring transmit frame"))?;
                 *slot = None;
-                batch.compact();
+                self.discard_batch(session, lane, &mut batch);
             }
+            self.sessions[session].batches[lane] = Some(batch);
             self.release_frame(index);
         }
         Ok(self
@@ -2620,7 +2633,7 @@ impl Worker {
             .ok_or_else(|| io::Error::other("missing transmit batch source"))?
             .tag;
         if !self.matches(session, tag) {
-            self.clear_batch(batch);
+            self.clear_batch(session, lane, batch);
             return Ok(());
         }
         // Cleanup belongs to the bounded expiry pass; never submit a stale plan.
@@ -2647,7 +2660,7 @@ impl Worker {
         let tx = &self.transmit[peer].paths[path].lanes[lane];
         let limit = tx.mtu.payload_limit();
         if tx.socket.is_none() {
-            self.clear_batch(batch);
+            self.clear_batch(session, lane, batch);
             return Ok(());
         }
         if tx.blocked || limit == 0 {
@@ -2663,6 +2676,14 @@ impl Worker {
         {
             return Ok(());
         }
+        if self.sender_enabled() && !self.sender.permitted {
+            let index = self.sender_index(session, lane)?;
+            if batch.plan.packet(0).is_some_and(|packet| {
+                packet.number <= self.sender.lanes[index].history.highest_sent()
+            }) {
+                self.discard_batch(session, lane, batch);
+            }
+        }
         if batch.plan.is_empty()
             && batch
                 .prepare(
@@ -2672,7 +2693,7 @@ impl Worker {
                 )
                 .is_err()
         {
-            self.clear_batch(batch);
+            self.clear_batch(session, lane, batch);
             return Ok(());
         }
         let grant = if self.sender_enabled() {
@@ -2684,7 +2705,7 @@ impl Worker {
             {
                 self.request_batch(session, lane, batch, deadline, limit)?;
                 if self.sender.job.is_none() {
-                    batch.compact();
+                    self.discard_batch(session, lane, batch);
                 }
                 return Ok(());
             }
@@ -2697,6 +2718,16 @@ impl Worker {
             )
         } else {
             None
+        };
+        let count = if grant.is_some() {
+            self.sender
+                .flight
+                .as_ref()
+                .ok_or(io::ErrorKind::InvalidData)?
+                .packets()
+                .len()
+        } else {
+            batch.plan.len()
         };
         let result = {
             let frames = std::array::from_fn::<_, { pack::BATCH_CAPACITY }, _>(|index| {
@@ -2712,16 +2743,7 @@ impl Worker {
             });
             let mut slices = [&[][..]; pack::BATCH_SLICES];
             let mut starts = [0; BATCH_SIZE + 1];
-            let count = if grant.is_some() {
-                self.sender
-                    .flight
-                    .as_ref()
-                    .ok_or(io::ErrorKind::InvalidData)?
-                    .packets()
-                    .len()
-            } else {
-                batch.plan.len()
-            };
+
             for index in 0..count {
                 let length = batch
                     .plan
@@ -2766,12 +2788,14 @@ impl Worker {
         if expired {
             if grant.is_some() {
                 self.rejected_sender_grant(session, lane, grant_expired);
-                batch.compact();
+                self.discard_batch(session, lane, batch);
             }
             return Ok(());
         }
         match result {
-            Ok((sent, _)) => self.submitted_batch(session, lane, batch, sent),
+            Ok((sent, _)) => {
+                self.submitted_batch(session, lane, batch, sent, grant.is_some() && sent == count)?
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 let tx = &mut self.transmit[peer].paths[path].lanes[lane];
                 let token = TX_TOKEN | ((peer as u64) << 7) | ((path as u64) << 6) | lane as u64;
@@ -2781,16 +2805,18 @@ impl Worker {
                     libc::EPOLLOUT as u32,
                 )?;
                 tx.blocked = true;
-                batch.compact();
+                self.discard_batch(session, lane, batch);
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => batch.compact(),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                self.discard_batch(session, lane, batch)
+            }
             Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => {
                 let attempted = (0..batch.plan.len())
                     .map(|index| batch.plan.packet(index).unwrap().length)
                     .max()
                     .unwrap();
                 self.mtu_send_error(peer, path, lane, attempted, now)?;
-                batch.compact();
+                self.discard_batch(session, lane, batch);
             }
             Err(_) => {
                 self.counters.socket_errors = self.counters.socket_errors.wrapping_add(1);
@@ -2799,13 +2825,20 @@ impl Worker {
                 local.tx_totals[lane].socket_errors =
                     local.tx_totals[lane].socket_errors.wrapping_add(1);
                 local.tx_dirty |= 1_u64 << lane;
-                self.clear_batch(batch);
+                self.clear_batch(session, lane, batch);
             }
         }
         Ok(())
     }
 
-    fn submitted_batch(&mut self, session: usize, lane: usize, batch: &mut TxBatch, sent: usize) {
+    fn submitted_batch(
+        &mut self,
+        session: usize,
+        lane: usize,
+        batch: &mut TxBatch,
+        sent: usize,
+        retain_suffix: bool,
+    ) -> io::Result<()> {
         let mut bytes = 0;
         for packet in 0..sent {
             bytes += (batch.plan.packet(packet).unwrap().length + 48) as u64;
@@ -2830,8 +2863,13 @@ impl Worker {
                 self.release_frame(index);
             }
         }
-        // Every retry gets new packet numbers; retain only unsent frame byte ranges.
-        batch.compact();
+        if retain_suffix {
+            batch.plan.consume(sent).map_err(io::Error::other)?;
+        }
+        if !retain_suffix || batch.plan.is_empty() {
+            self.discard_batch(session, lane, batch);
+        }
+        Ok(())
     }
 
     fn return_lane(&mut self, session: usize, mut lane: Box<reassembly::Lane>) {
@@ -3191,6 +3229,7 @@ impl Worker {
             return;
         }
         for session in 0..self.sessions.len() {
+            let history = self.sender_index(session, lane).ok();
             let local = &mut self.sessions[session];
             if self.shared.config.peer_for_session(session) != Some(peer)
                 || local.path != path
@@ -3201,7 +3240,7 @@ impl Worker {
             if limit < before.0
                 && let Some(batch) = &mut local.batches[lane]
             {
-                batch.compact();
+                batch.discard(history.map(|index| &mut self.sender.lanes[index].history));
             }
             local.tx_totals[lane].path_mtu_bytes = if limit == 0 { 0 } else { (limit + 48) as u64 };
             local.tx_totals[lane].path_mtu_state = state as u64;
@@ -5748,7 +5787,9 @@ mod tests {
                 )
                 .unwrap();
             let last = batch.plan.packet(batch.plan.len() - 1).unwrap().number;
-            worker.submitted_batch(session, 0, &mut batch, 1);
+            worker
+                .submitted_batch(session, 0, &mut batch, 1, false)
+                .unwrap();
             let frame = worker.frames.frame(batch.frames[0].unwrap()).unwrap();
             *expected = (frame.id, frame.offset, last);
             worker.sessions[session].batches[0] = Some(batch);
@@ -6158,7 +6199,9 @@ mod tests {
         assert!(batch.plan.len() > 1);
         let mut last_packet = batch.plan.packet(batch.plan.len() - 1).unwrap().number;
         // Feed a successful one-packet prefix, then hold the socket unwritable.
-        workers[0].submitted_batch(0, 0, &mut batch, 1);
+        workers[0]
+            .submitted_batch(0, 0, &mut batch, 1, false)
+            .unwrap();
         assert_eq!(
             workers[0]
                 .frames
@@ -6268,7 +6311,9 @@ mod tests {
             )
             .unwrap();
         let tail = batch.plan.packet(2).unwrap();
-        workers[0].submitted_batch(0, 0, &mut batch, 2);
+        workers[0]
+            .submitted_batch(0, 0, &mut batch, 2, false)
+            .unwrap();
         assert_eq!(batch.len, 1);
         assert_eq!(
             workers[0]
@@ -6289,7 +6334,9 @@ mod tests {
         let unused = batch.plan.packet(0).unwrap().number;
         assert!(unused > tail.number);
         let charged = workers[0].sessions[0].totals.tx_outer_bytes;
-        workers[0].submitted_batch(0, 0, &mut batch, 0);
+        workers[0]
+            .submitted_batch(0, 0, &mut batch, 0, false)
+            .unwrap();
         assert!(batch.plan.is_empty());
         assert_eq!(
             workers[0]

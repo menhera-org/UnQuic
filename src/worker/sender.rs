@@ -630,7 +630,7 @@ impl Worker {
                             .mtu
                             .defer(now);
                     }
-                    // A rejected request still owns the packet-number reservations.
+                    // Completed prefixes no longer own a retained plan's unattempted suffix.
                     let index = self.sender_index(job.session, job.lane)?;
                     for offset in 0..job.count {
                         self.sender.lanes[index]
@@ -640,7 +640,7 @@ impl Worker {
                     if let Some(batch) = self.sessions[job.session].batches[job.lane].as_mut()
                         && batch.plan.packet(0).is_some_and(|p| p.number == job.first)
                     {
-                        batch.compact();
+                        batch.discard(Some(&mut self.sender.lanes[index].history));
                     }
                 }
                 self.sender.flight = Some(flight);
@@ -1087,12 +1087,17 @@ impl Worker {
                 .plan
                 .packet(ordinal)
                 .ok_or(io::ErrorKind::InvalidData)?;
-            match self.sender.lanes[index].history.reserve(
-                packet.number,
-                (packet.length + 48) as u16,
-                true,
-                true,
-            ) {
+            let history = &mut self.sender.lanes[index].history;
+            if packet.number <= history.highest_allocated() && !history.is_reserved(packet.number) {
+                // A canceled higher reservation can overtake a never-reserved plan suffix.
+                // Earlier entries in this increasing plan are only existing reservations.
+                return Ok(());
+            }
+            match if history.is_reserved(packet.number) {
+                Ok(())
+            } else {
+                history.reserve(packet.number, (packet.length + 48) as u16, true, true)
+            } {
                 Ok(()) => {}
                 Err(crate::ack::HistoryError::Full) => {
                     self.sender.reclaim = Some(self.sender.lanes.len());
@@ -1250,7 +1255,9 @@ impl Worker {
             .flight
             .take()
             .ok_or(io::ErrorKind::InvalidData)?;
-        for offset in 0..job.count {
+        let retain_suffix =
+            matches!(job.kind, JobKind::Data) && count != 0 && count == flight.packets().len();
+        for offset in 0..if retain_suffix { count } else { job.count } {
             let number = job.first + offset as u64;
             if offset < count {
                 if !self.sender.lanes[index].submitted(
@@ -1260,13 +1267,16 @@ impl Worker {
                 ) {
                     return Err(io::Error::other("submitted packet has no reservation"));
                 }
-            } else {
+            } else if !retain_suffix {
                 self.sender.lanes[index].history.cancel(number);
             }
         }
         flight
             .complete(count, at, host_limited || count < flight.packets().len())
             .map_err(io::Error::other)?;
+        if retain_suffix {
+            self.sender.job = Some(Job { count, ..job });
+        }
         self.sender.permitted = false;
         self.sender.queue(0, Message::Complete(flight))
     }
@@ -1303,6 +1313,7 @@ impl Worker {
         let tx = local.tx[job.lane]
             .as_mut()
             .ok_or(io::ErrorKind::InvalidData)?;
+        let mut old_count = job.count;
         let first = match job.kind {
             JobKind::Data => {
                 let batch = local.batches[job.lane]
@@ -1315,12 +1326,17 @@ impl Worker {
                 {
                     return Ok(false);
                 }
+                old_count = old_count.max(batch.plan.len());
                 batch.plan.renumber(tx)
             }
             JobKind::Probe { .. } => tx.allocate_packets(1),
         };
         let Ok(first) = first else { return Ok(false) };
         let history = &mut self.sender.lanes[index].history;
+        // The old plan has been replaced, including any retained ungranted reservations.
+        for offset in 0..old_count {
+            history.cancel(job.first + offset as u64);
+        }
         let mut reserved = 0;
         for packet in flight.packets() {
             match history.reserve(first + reserved as u64, packet.bytes, true, true) {
@@ -1342,9 +1358,6 @@ impl Worker {
                 history.cancel(first + offset as u64);
             }
             return Err(io::Error::other(error));
-        }
-        for offset in 0..job.count {
-            history.cancel(job.first + offset as u64);
         }
         self.sender.job = Some(Job {
             first,
@@ -1379,7 +1392,7 @@ impl Worker {
             self.rejected_sender_grant(job.session, job.lane, !grant.valid_at(now));
             self.finish_sender_send(0, None, false)?;
             if let Some(batch) = self.sessions[job.session].batches[job.lane].as_mut() {
-                batch.compact();
+                batch.discard(Some(&mut self.sender.lanes[index].history));
             }
             return Ok(());
         }
@@ -1389,7 +1402,7 @@ impl Worker {
             self.rejected_sender_grant(job.session, job.lane, false);
             self.finish_sender_send(0, None, false)?;
             if let Some(batch) = self.sessions[job.session].batches[job.lane].as_mut() {
-                batch.compact();
+                batch.discard(Some(&mut self.sender.lanes[index].history));
             }
             return Ok(());
         }
@@ -1411,7 +1424,7 @@ impl Worker {
                     if self.sender.permitted {
                         self.rejected_sender_grant(job.session, job.lane, false);
                         self.finish_sender_send(0, None, false)?;
-                        batch.compact();
+                        batch.discard(Some(&mut self.sender.lanes[index].history));
                     }
                 }
                 self.sessions[job.session].batches[job.lane] = Some(batch);

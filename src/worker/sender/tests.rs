@@ -52,18 +52,22 @@ fn workers() -> ([Worker; 2], ReceiveSocket) {
     (workers, rx)
 }
 
-fn frame(worker: &mut Worker) {
+fn queue_frame(worker: &mut Worker, length: usize) {
     let mut frame = worker.free.pop().unwrap();
     frame.session = 0;
     frame.lane = worker.id;
     frame.tag = 1;
-    frame.length = 60;
-    frame.bytes[..60].fill(0xa5);
+    frame.length = length;
+    frame.bytes[..length].fill(0xa5);
     frame.deadline = Duration::from_millis(100);
     frame.tx_reserved = true;
     worker.sessions[0].tx_retained += 1;
     worker.sessions[0].tx_bytes += frame.length;
     worker.input_frame(frame, Duration::ZERO).unwrap();
+}
+
+fn frame(worker: &mut Worker) {
+    queue_frame(worker, 60);
     worker.flush_frames(Duration::ZERO).unwrap();
 }
 
@@ -331,20 +335,15 @@ fn partial_batches_with_feedback(feedback: bool) {
     for worker in &mut workers {
         worker.io_time = Some(Ok);
         for _ in 0..32 {
-            let mut frame = worker.free.pop().unwrap();
-            frame.session = 0;
-            frame.lane = worker.id;
-            frame.tag = 1;
-            frame.length = 1514;
-            frame.bytes[..1514].fill(0xa5);
-            frame.deadline = Duration::from_millis(100);
-            frame.tx_reserved = true;
-            worker.sessions[0].tx_retained += 1;
-            worker.sessions[0].tx_bytes += frame.length;
-            worker.input_frame(frame, Duration::ZERO).unwrap();
+            queue_frame(worker, 1514);
         }
     }
     let mut received = [[0usize; 32]; 2];
+    let mut next_packet = [1_u64; 2];
+    let mut receiver = [
+        reassembly::Lane::new(1, 9022).unwrap(),
+        reassembly::Lane::new(2, 9022).unwrap(),
+    ];
     let mut complete = 0;
     let mut storage = [0; BASE_UDP_PAYLOAD];
     for tick in 0..100 {
@@ -376,6 +375,14 @@ fn partial_batches_with_feedback(feedback: bool) {
             let datagram = Datagram::decode(&storage[..length]).unwrap();
             let header = datagram.header();
             let owner = usize::from(header.lane - 1);
+            if !feedback {
+                assert_eq!(
+                    header.packet_number, next_packet[owner],
+                    "never-attempted suffix must retain its original identity"
+                );
+                next_packet[owner] += 1;
+                assert_eq!(receiver[owner].admit(&datagram, now), Admission::Fresh);
+            }
             for record in datagram.records() {
                 if let Record::Data {
                     frame_id,
@@ -422,6 +429,19 @@ fn partial_batches_with_feedback(feedback: bool) {
         }
     }
     assert_eq!(complete, 64, "received {received:?}");
+    if !feedback {
+        for (index, lane) in receiver.iter_mut().enumerate() {
+            let mut output = [AckRange { start: 0, end: 0 }; wire::MAX_ACK_RANGES];
+            let Some(Record::Ack { ranges, .. }) =
+                lane.take_ack(Duration::from_millis(100), &mut output)
+            else {
+                panic!()
+            };
+            assert_eq!(ranges.len(), 1);
+            let range = ranges.iter().next().unwrap();
+            assert_eq!((range.start, range.end), (1, next_packet[index] - 1));
+        }
+    }
     assert_eq!(workers[0].counters.cancelled_grants, 0);
     for worker in &workers {
         assert_eq!(worker.sessions[0].tx_retained, 0);
@@ -773,11 +793,20 @@ fn overtaken_probe_refreshes_its_history_and_reply_identity() {
 #[ignore = "kernel descriptor test; run in a disposable container"]
 fn refresh_history_pressure_reports_unused_and_preserves_frame() {
     let (mut workers, rx) = workers();
+    let index = workers[0].sender_index(0, 0).unwrap();
+    let pinned = workers[0].sessions[0].tx[0]
+        .as_mut()
+        .unwrap()
+        .allocate_packets(1)
+        .unwrap();
+    let history = &mut workers[0].sender.lanes[index].history;
+    history.reserve(pinned, 100, true, true).unwrap();
+    assert!(history.submit(pinned, Duration::ZERO));
     frame(&mut workers[0]);
     let retained = workers[0].sessions[0].tx_retained;
     let old = workers[0].sender.job.unwrap().first;
     let tx = workers[0].sessions[0].tx[0].as_mut().unwrap();
-    let mut skip = 65536 - 2;
+    let mut skip = 65536 - 3;
     while skip != 0 {
         let count = skip.min(BATCH_SIZE);
         tx.allocate_packets(count).unwrap();
@@ -802,7 +831,7 @@ fn refresh_history_pressure_reports_unused_and_preserves_frame() {
     }
     let index = workers[0].sender_index(0, 0).unwrap();
     assert!(workers[0].sender.lanes[index].history.packet(old).is_none());
-    assert_eq!(workers[0].sender.lanes[index].history.inflight_bytes(), 0);
+    assert_eq!(workers[0].sender.lanes[index].history.inflight_bytes(), 100);
     assert!(workers[0].sender.job.is_none());
     assert_eq!(workers[0].sessions[0].tx_retained, retained);
     assert_eq!(workers[0].counters.cancelled_grants, 1);
@@ -811,6 +840,12 @@ fn refresh_history_pressure_reports_unused_and_preserves_frame() {
     assert_eq!(
         rx.recv(&mut bytes).unwrap_err().kind(),
         io::ErrorKind::WouldBlock
+    );
+    assert!(
+        workers[0].sender.lanes[index]
+            .history
+            .lose(pinned)
+            .is_some()
     );
     for worker in &mut workers {
         worker.io_time = Some(Ok);
@@ -831,4 +866,217 @@ fn refresh_history_pressure_reports_unused_and_preserves_frame() {
             .any(|r| matches!(r, Record::Data { .. }))
     );
     assert_eq!(workers[0].sessions[0].tx_retained, 0);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn retained_suffix_reservations_survive_recycle_and_leave_on_discard() {
+    for cause in 0..3 {
+        let (mut workers, _rx) = workers();
+        let worker = &mut workers[1];
+        for _ in 0..32 {
+            queue_frame(worker, 1514);
+        }
+        worker.flush_frames(Duration::ZERO).unwrap();
+        let job = worker.sender.job.unwrap();
+        assert!(job.count > 10);
+        for _ in 0..8 {
+            service(&mut workers);
+        }
+        let worker = &mut workers[1];
+        assert!(worker.sender.job.is_none());
+        let index = worker.sender_index(0, 1).unwrap();
+        let batch = worker.sessions[0].batches[1].as_ref().unwrap();
+        let first = batch.plan.packet(0).expect("ungranted suffix").number;
+        assert!(first > job.first && first < job.first + job.count as u64);
+        for number in first..job.first + job.count as u64 {
+            assert!(worker.sender.lanes[index].history.is_reserved(number));
+        }
+        match cause {
+            0 => {
+                worker.expire_frames(Duration::from_millis(100)).unwrap();
+            }
+            1 => {
+                let state = worker.transmit[0].paths[0].lanes[1].mtu.state();
+                worker.mtu_changed(
+                    0,
+                    0,
+                    1,
+                    (BASE_UDP_PAYLOAD + 1, state),
+                    Duration::from_millis(1),
+                );
+            }
+            _ => {
+                worker
+                    .command(
+                        0,
+                        Command {
+                            generation: 2,
+                            phase: Phase::Quiesce,
+                            connection: worker.sessions[0].connection,
+                        },
+                        0,
+                    )
+                    .unwrap();
+                worker.progress_barriers(Duration::from_millis(1)).unwrap();
+                assert!(worker.sessions[0].command.is_some());
+                assert!(!worker.sender_idle(0));
+                worker.flush_frames(Duration::from_millis(1)).unwrap();
+            }
+        }
+        for number in job.first..job.first + job.count as u64 {
+            assert!(
+                !worker.sender.lanes[index].history.is_reserved(number),
+                "discard cause {cause} stranded packet {number}"
+            );
+        }
+        assert!(
+            worker.sessions[0].batches[1]
+                .as_ref()
+                .unwrap()
+                .plan
+                .is_empty()
+        );
+        if cause == 2 {
+            for _ in 0..16 {
+                for worker in &mut workers {
+                    worker.io_time = Some(Ok);
+                    worker.drain_queues(Duration::from_millis(2)).unwrap();
+                    worker.service_sender(Duration::from_millis(2)).unwrap();
+                }
+            }
+            assert!(workers[1].sender_idle(0));
+            workers[1]
+                .progress_barriers(Duration::from_millis(2))
+                .unwrap();
+            assert!(workers[1].sessions[0].command.is_none());
+        }
+    }
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn partial_attempt_discards_all_unsent_reservations_and_retries_fresh_numbers() {
+    let (mut workers, rx) = workers();
+    let worker = &mut workers[1];
+    queue_frame(worker, 9022);
+    worker.flush_frames(Duration::ZERO).unwrap();
+    let job = worker.sender.job.unwrap();
+    let (_, Message::Request(request)) = worker.sender.outgoing.pop_front().unwrap() else {
+        panic!()
+    };
+    workers[0]
+        .sender
+        .owner
+        .as_mut()
+        .unwrap()
+        .request(request)
+        .unwrap();
+    let mut outgoing = VecDeque::with_capacity(16);
+    let now = Duration::from_millis(1);
+    workers[0]
+        .sender
+        .owner
+        .as_mut()
+        .unwrap()
+        .advance(now, &mut outgoing)
+        .unwrap();
+    let (_, Message::Permit(flight)) = outgoing.pop_front().unwrap() else {
+        panic!()
+    };
+    assert!(flight.packets().len() > 1);
+    let worker = &mut workers[1];
+    worker.sender_message(Message::Permit(flight), now).unwrap();
+    let mut batch = worker.sessions[0].batches[1].take().unwrap();
+    let input = worker.frames.input(batch.frames[0].unwrap()).unwrap();
+    let mut parts = [&[][..]; 4];
+    let bytes: Vec<_> = batch
+        .plan
+        .slices(0, &[input], &mut parts)
+        .unwrap()
+        .iter()
+        .flat_map(|part| part.iter().copied())
+        .collect();
+    worker.transmit[0].paths[0].lanes[1]
+        .socket
+        .as_ref()
+        .unwrap()
+        .send(&bytes, BASE_UDP_PAYLOAD)
+        .unwrap();
+    worker.finish_sender_send(1, Some(now), false).unwrap();
+    worker.submitted_batch(0, 1, &mut batch, 1, false).unwrap();
+    assert!(batch.plan.is_empty());
+    let index = worker.sender_index(0, 1).unwrap();
+    assert!(
+        worker.sender.lanes[index]
+            .history
+            .packet(job.first)
+            .unwrap()
+            .sample_slot
+            .is_some()
+    );
+    for number in job.first + 1..job.first + job.count as u64 {
+        assert!(!worker.sender.lanes[index].history.is_reserved(number));
+    }
+    let frame = worker.frames.frame(batch.frames[0].unwrap()).unwrap();
+    assert_eq!(
+        (frame.offset, frame.deadline),
+        (1164, Duration::from_millis(100))
+    );
+    batch
+        .prepare(
+            worker.sessions[0].tx[1].as_mut().unwrap(),
+            &worker.frames,
+            BASE_UDP_PAYLOAD,
+        )
+        .unwrap();
+    assert!(batch.plan.packet(0).unwrap().number >= job.first + job.count as u64);
+    worker.sessions[0].batches[1] = Some(batch);
+    let mut received = [0; BASE_UDP_PAYLOAD];
+    let length = rx.recv(&mut received).unwrap().0;
+    assert_eq!(&received[..length], bytes);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn canceled_higher_reservation_discards_an_unreserved_old_plan_suffix() {
+    let (mut workers, _rx) = workers();
+    let worker = &mut workers[1];
+    queue_frame(worker, 9022);
+    let mut batch = worker.sessions[0].batches[1].take().unwrap();
+    batch.frames[0] = batch.pending.pop_front(&mut worker.frames).unwrap();
+    batch.len = 1;
+    batch
+        .prepare(
+            worker.sessions[0].tx[1].as_mut().unwrap(),
+            &worker.frames,
+            BASE_UDP_PAYLOAD,
+        )
+        .unwrap();
+    assert!(batch.plan.len() > 1);
+    let first = batch.plan.packet(0).unwrap();
+    let overtaker = worker.sessions[0].tx[1]
+        .as_mut()
+        .unwrap()
+        .allocate_packets(1)
+        .unwrap();
+    let index = worker.sender_index(0, 1).unwrap();
+    let history = &mut worker.sender.lanes[index].history;
+    history
+        .reserve(first.number, (first.length + 48) as u16, true, true)
+        .unwrap();
+    history.reserve(overtaker, 100, false, false).unwrap();
+    assert!(history.cancel(overtaker));
+    assert_eq!(history.highest_sent(), 0);
+    worker
+        .flush_batch(0, 1, &mut batch, Duration::from_millis(1))
+        .unwrap();
+    assert!(batch.plan.is_empty());
+    assert!(worker.sender.job.is_none());
+    assert!(!worker.sender.lanes[index].history.is_reserved(first.number));
+    worker
+        .flush_batch(0, 1, &mut batch, Duration::from_millis(1))
+        .unwrap();
+    assert!(worker.sender.job.unwrap().first > overtaker);
+    worker.sessions[0].batches[1] = Some(batch);
 }

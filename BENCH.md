@@ -18,8 +18,9 @@ Neither the local **20 Gbit/s in each direction** gate nor the real
 remain unfinished. Workers now use the shared draft-07 controller and grant
 accounting. Refreshing overtaken packet numbers removes repeated coordinator
 DATA cancellations. Skipping empty loss-history ranges reduces CPU cost, but the
-larger bounded DATA burst raises the latest 20-second QinQ sweep to
-1.43–1.62 Gbit/s per direction using about 1.6–1.7 CPUs per daemon.
+larger bounded DATA burst and retained never-attempted packet plans raise the
+latest 20-second QinQ sweep to 2.03–2.74 Gbit/s per direction using about
+2.1–2.3 CPUs per daemon.
 The preceding ACK-pruning sweep delivered 1.12 to 1.22 Gbit/s. These remain
 severe integration regressions, far below the CPU ceiling.
 General application-limited detection and payload repair remain open.
@@ -52,8 +53,8 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Latest sender QinQ sweep: 1.59 / 1.49 Gbit/s paced, 1.62 / 1.50 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 92.30 / 92.75%. Five successful repeats and the under-1% gate remain unmet. |
-| Goodput must plateau under excess traffic | Latest sender sweep spans 1.43 to 1.62 Gbit/s through paced, unlimited and return points; daemon CPU stays near 1.6–1.7 cores. The earlier expiry sweep declined 2.7% forward under unlimited load | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Latest sender QinQ sweep: 2.41 / 2.09 Gbit/s paced, 2.53 / 2.23 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 88.36 / 89.88%. Five successful repeats and the under-1% gate remain unmet. |
+| Goodput must plateau under excess traffic | Latest sender sweep spans 2.03 to 2.74 Gbit/s through paced, unlimited and return points; daemon CPU stays near 2.1–2.3 cores. The earlier expiry sweep declined 2.7% forward under unlimited load | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
 | Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Current QinQ reports zero reordering; single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
@@ -500,12 +501,64 @@ With 16 MiB/s they report 680,446 / 663,332, 3,889 / 4,878 and
 socket overflow, inner UDP errors, invalid/duplicate/out-of-window/wrong-run
 records, reordering and outer fragmentation.
 
-The production ceiling remains 4 MiB/s. Source inspection finds that after a grant sends only part of a prepared batch,
-the worker discards its never-attempted suffix, leaving packet-number holes. Receive history retains those holes and emits its newest 32 ranges;
-sender-side ACK pruning cannot reduce those wire bytes. Retaining never-attempted
-suffixes is the next candidate. Reducing the ACK timer is not supported by these
+The production ceiling remains 4 MiB/s. Before the change below, a grant that sent
+only part of a prepared batch discarded its never-attempted suffix, leaving
+packet-number holes. Receive history retains those holes and emits its newest
+32 ranges; sender-side ACK pruning cannot reduce those wire bytes.
+Reducing the ACK timer is not supported by these
 measurements, and dropping older ACK ranges without delivery evidence would
 change recovery behavior.
+
+## Retain never-attempted DATA plans (November 7)
+
+A fully successful granted prefix now advances the batch head while preserving
+the never-attempted suffix's packet numbers, metadata and history reservations.
+Its source slots stay fixed, so retention adds neither payload copies nor
+allocations. Partial socket sends still discard the remaining plan and retry
+unsent frame ranges with fresh numbers. A shared discard path cancels retained
+reservations on expiry, MTU reduction, rejected grants and connection retirement.
+Overtaking controls refresh the plan without reusing canceled identities.
+
+The regression adds a contiguous-number assertion to the existing split-frame
+fixture. Unchanged production code sends packet 44 where 11 is expected; the
+new path passes and produces one ACK range when no controls intervene.
+Other regressions cover reservation survival through grant recycling, physical
+partial sends, canceled higher reservations, expiry, MTU shrink and quiescence.
+Controls and discarded plans can still create gaps in production.
+
+The [normal release sweep](benches/tap-sender-retained-suffix.json) uses the same
+controller, control ceiling, memory limits, PMTU discovery and harness as the
+cap64 baseline. Four twenty-second points share retained daemons; builds and
+other tests do not overlap load. L→R / R→L pairs are simultaneous, and 100% CPU
+means one core.
+
+| Requested Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| 16 | 2.59 / 2.03 | 83.49 / 87.04 | 224.84 / 210.89 |
+| 21 | 2.41 / 2.09 | 88.36 / 89.88 | 218.09 / 207.07 |
+| Unlimited | 2.53 / 2.23 | 95.63 / 96.10 | 222.53 / 213.71 |
+| 16 return | 2.74 / 2.03 | 82.63 / 87.10 | 230.00 / 211.22 |
+
+At 21G, goodput improves 52 / 40% over the baseline's 1.59 / 1.49 Gbit/s.
+Unlimited load improves 57 / 49% over its 1.62 / 1.50 result and does not decline
+from this treatment's 21G point. CPU use rises with delivered work. These results
+remain far below both the target and the earlier runtime; they do not establish
+a CPU ceiling or a universal overload plateau.
+
+At 21G, counters report 711,854 / 700,220 TAP TX drops, 18,445 / 13,072 frame
+expiries and 1,030 / 19,060 worker queue drops. Unlimited load reports
+2,169,877 / 2,130,616, 5,140 / 6,347 and 912 / 20,730 respectively. All four
+points report zero admission pressure, socket overflow, inner UDP errors,
+invalid/duplicate/out-of-window/wrong-run records, reordering and outer
+fragmentation. TAP drops count source SKBs, so these counters cannot be summed
+as exact frame loss. ACK-range and control-wait measurements are still needed
+to attribute the remaining limit after retention.
+
+The change passes 339 ordinary release tests, 60 kernel/integration tests,
+Clippy and formatting. The kernel checks include allocation instrumentation,
+TAP rename/namespace movement, daemon restart and short MTU tests. The full
+routed test also passes 9000 → 1500 → 1280 → 9000 with returned and filtered
+ICMPv6 PTB, the normal upward retry and zero outer fragmentation.
 
 ## Request fairness and burst-size experiments (November 7)
 

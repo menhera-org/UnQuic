@@ -402,6 +402,8 @@ still limit a skewed flow below the full session allowance; shared credits
 remain necessary before the retained-data recovery gate.
 
 Transmit DATA gathers rewritten headers and payload ranges from retained sources.
+When a grant sends its entire permitted prefix, the never-attempted suffix keeps
+its packet numbers, wire metadata and reservations in the same bounded batch.
 Partial or failed sends retain the unsent frame ranges and rebuild packet
 headers with fresh numbers on retry. Only successful submissions advance frame
 offsets or charge transmitted bytes; an intervening control packet cannot leave
