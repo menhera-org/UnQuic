@@ -740,8 +740,11 @@ packet-to-frame journal now supports reservation before I/O, late-ACK mappings
 after loss and direct cleanup by packet or frame. Shared PTO backoff and the
 three-expiry stop/settlement transition now use indexed group timers and shared
 probe allowances. Worker messages preserve unused pending probe commands across
-connection replacement without resetting backoff. Payload retention, selective
-repair and complete congestion-control integration remain unfinished.
+connection replacement without resetting backoff. Due liveness probes retain
+their deadline while a DATA flight is busy, rotate across sessions before fresh
+DATA, and retry history pressure after 1 ms. PTO probes retain priority.
+Payload retention and selective repair are connected; complete congestion-control
+integration and the performance gates remain unfinished.
 Per-lane MTU discovery now starts DATA at 1232 bytes
 and probes up to the configured ceiling, defaulting to 8952 bytes. Limits and
 gauges reflect confirmation rather than operator assertions. Release routed

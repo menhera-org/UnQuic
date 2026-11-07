@@ -2289,3 +2289,217 @@ fn data_quoted_ptb_reduces_only_after_successful_send() {
         }
     }
 }
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn busy_data_flight_preserves_due_liveness_for_each_session() {
+    let (mut workers, rx) = workers();
+    let connection = workers[0].sessions[0].connection.unwrap();
+    for worker in &mut workers {
+        worker.io_time = Some(Ok);
+        worker
+            .command(
+                1,
+                Command {
+                    generation: 1,
+                    phase: Phase::Install,
+                    connection: Some(connection),
+                },
+                0,
+            )
+            .unwrap();
+        for control in &mut worker.controls {
+            control.retry = Duration::MAX;
+            control.probe_due = Duration::ZERO;
+        }
+    }
+    for control in &mut workers[0].controls {
+        activate_liveness(control, connection);
+    }
+
+    workers[0].shared.bound[0].store(3, Ordering::Release);
+    frame(&mut workers[0]);
+    assert!(workers[0].sender.job.is_some());
+    workers[0].timers(Duration::ZERO).unwrap();
+    workers[0].setup_due = Duration::MAX;
+    workers[0].mtu_due = Duration::MAX;
+    assert!(
+        workers[0]
+            .deadline(Duration::ZERO)
+            .is_none_or(|due| due > Duration::ZERO),
+        "a held Flight must not spin on overdue liveness"
+    );
+
+    let mut probes = [false; 2];
+
+    let mut packets = 0;
+    let mut bytes = [0; BASE_UDP_PAYLOAD];
+    for turn in 1..=32 {
+        let now = Duration::from_millis(turn);
+        for worker in &mut workers {
+            worker.drain_queues(now).unwrap();
+            worker.service_sender(now).unwrap();
+        }
+        queue_frame(&mut workers[0], 60);
+        workers[0].flush_frames(now).unwrap();
+        workers[0].timers(now).unwrap();
+        while let Ok((length, _)) = rx.recv(&mut bytes) {
+            packets += 1;
+            let packet = Datagram::decode(&bytes[..length]).unwrap();
+            if packet
+                .records()
+                .any(|record| matches!(record, Record::Probe))
+            {
+                let session = workers[0]
+                    .shared
+                    .config
+                    .session_for_cookie(packet.header().cookie)
+                    .unwrap();
+                assert!(
+                    !probes[session],
+                    "one overdue session must not overtake another"
+                );
+                probes[session] = true;
+            }
+        }
+        if probes == [true; 2] {
+            break;
+        }
+    }
+    assert_eq!(
+        probes, [true; 2],
+        "busy DATA must not erase due liveness probes"
+    );
+    assert!(
+        packets <= 6,
+        "due probes must precede a continuing fresh backlog"
+    );
+    assert_eq!(workers[0].counters.expired_frames, 0);
+    assert!(
+        workers[0]
+            .sessions
+            .iter()
+            .all(|s| s.totals.expired_frames == 0)
+    );
+}
+
+fn activate_liveness(control: &mut SessionControl, connection: Connection) {
+    control
+        .state
+        .reconnect(Duration::ZERO, Tag::new(1))
+        .unwrap();
+    control
+        .state
+        .on_record(
+            Record::Challenge {
+                initiator: 1,
+                responder: 2,
+                params: connection.peer,
+            },
+            Duration::ZERO,
+            None,
+        )
+        .unwrap();
+    control
+        .state
+        .on_record(
+            Record::Ready {
+                initiator: 1,
+                responder: 2,
+            },
+            Duration::ZERO,
+            None,
+        )
+        .unwrap();
+    assert!(control.state.connection().is_some());
+    control.retry = Duration::MAX;
+    control.probe_due = Duration::ZERO;
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn liveness_history_pressure_retries_without_spinning_or_losing_turn() {
+    let (mut workers, _rx) = workers();
+    let worker = &mut workers[0];
+    for control in &mut worker.controls {
+        control.retry = Duration::MAX;
+    }
+    let connection = worker.sessions[0].connection.unwrap();
+    activate_liveness(&mut worker.controls[0], connection);
+    worker.shared.bound[0].store(3, Ordering::Release);
+    worker.setup_due = Duration::MAX;
+    worker.mtu_due = Duration::MAX;
+    worker.io_time = Some(Ok);
+    let index = worker.sender_index(0, 0).unwrap();
+    let tx = worker.sessions[0].tx[0].as_mut().unwrap();
+    let pinned = tx.allocate_packets(1).unwrap();
+    let mut remaining = 65535;
+    while remaining != 0 {
+        let count = remaining.min(BATCH_SIZE);
+        tx.allocate_packets(count).unwrap();
+        remaining -= count;
+    }
+    let history = &mut worker.sender.lanes[index].history;
+    history.reserve(pinned, 100, true, true).unwrap();
+    assert!(history.submit(pinned, Duration::ZERO));
+    let report = worker.sender.report.take();
+    worker.service_sender(Duration::ZERO).unwrap();
+    assert!(worker.sender.job.is_none());
+    assert!(worker.sender.flight.is_some());
+    assert!(worker.sender.reclaim.is_some());
+    assert_eq!(worker.controls[0].probe_due, RETRY);
+    assert_eq!(worker.deadline(Duration::ZERO), Some(RETRY));
+    worker.service_sender(RETRY / 2).unwrap();
+    assert_eq!(worker.controls[0].probe_due, RETRY);
+    assert!(worker.sender.job.is_none());
+
+    assert!(worker.sender.lanes[index].history.lose(pinned).is_some());
+    worker.sender.report = report;
+    worker.service_sender(RETRY).unwrap();
+    assert!(worker.sender.job.is_some_and(|job| job.session == 0));
+    assert_eq!(worker.controls[0].probe_due, RETRY + Duration::from_secs(1));
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn liveness_waits_for_barrier_socket_and_returned_flight() {
+    let (mut workers, _rx) = workers();
+    let worker = &mut workers[0];
+    for control in &mut worker.controls {
+        control.retry = Duration::MAX;
+    }
+
+    let connection = worker.sessions[0].connection.unwrap();
+    activate_liveness(&mut worker.controls[0], connection);
+    worker.shared.bound[0].store(3, Ordering::Release);
+    worker.setup_due = Duration::MAX;
+    worker.mtu_due = Duration::MAX;
+    worker.io_time = Some(Ok);
+    worker.controls[0].barrier.begin(Some(connection)).unwrap();
+    worker.service_sender(Duration::ZERO).unwrap();
+    assert!(worker.sender.job.is_none());
+    assert!(
+        worker
+            .deadline(Duration::ZERO)
+            .is_none_or(|due| due > Duration::ZERO)
+    );
+    worker.controls[0].barrier = Barrier::new(2).unwrap();
+    let socket = worker.transmit[0].paths[0].lanes[0].socket.take();
+    worker.service_sender(Duration::ZERO).unwrap();
+    assert!(worker.sender.job.is_none());
+    assert_eq!(worker.controls[0].probe_due, RETRY);
+    assert!(
+        worker
+            .deadline(Duration::ZERO)
+            .is_none_or(|due| due > Duration::ZERO)
+    );
+    worker.transmit[0].paths[0].lanes[0].socket = socket;
+    let flight = worker.sender.flight.take();
+    worker.service_sender(RETRY).unwrap();
+    assert!(worker.sender.job.is_none());
+    assert_eq!(worker.controls[0].probe_due, RETRY);
+    assert!(worker.deadline(RETRY).is_none_or(|due| due > RETRY));
+    worker.sender.flight = flight;
+    worker.service_sender(RETRY).unwrap();
+    assert!(worker.sender.job.is_some_and(|job| job.session == 0));
+}

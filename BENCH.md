@@ -83,6 +83,30 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Liveness probes under DATA pressure (November 7)
+
+A deterministic kernel regression reproduced a scheduling defect: the timer
+advanced a due liveness probe by one second even when a busy DATA flight
+prevented creating the probe request. Repeated visits also favored the first
+session. The fix preserves due work while the flight is busy and rotates
+sessions when it returns, before fresh DATA. History pressure retries after
+1 ms; unavailable flights do not force a busy timer loop. PTO probes retain
+priority and all congestion accounting remains active.
+
+The regression fails on the preceding implementation and passes with the fix.
+Two additional cases cover pinned history, barriers, missing sockets and delayed
+flight return. The combined tree passes 346 all-feature and 337 default release
+tests, Clippy, formatting and all 73 kernel library checks on Linux 6.8.
+The combined Linux 6.8 runtime sequence also passes all three tests. The isolated
+liveness candidate passes all 30 sender kernel checks on Linux 7.0.
+
+The Linux 7.0 full runtime sequence passed twice, then failed again at the
+original single-frame post-address-migration assertion. Its two-second frame
+deadline and five-second generation wait were unchanged. The liveness defect
+is independently verified; it does not fully explain the migration failure.
+No throughput gain is claimed for this fix. Further diagnostics must distinguish
+unsent frames from successfully submitted frames missing before receive admission.
+
 ## Bounded pacing-credit experiment (November 7)
 
 A diagnostic candidate retains elapsed pacing credit up to one existing send

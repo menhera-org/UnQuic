@@ -591,6 +591,10 @@ overflow and allocation-free transitions. Runtime grants now enforce the allowan
 workers run bounded loss passes and gate liveness/PMTU probes. Blocked PMTU requests
 release their flight buffer; PTO dispatch preempts an ungranted ordinary request.
 Pending probe commands survive generation changes without resetting backoff.
+Due liveness probes survive a busy DATA flight and rotate among sessions before
+fresh DATA. Bounded visits and 1 ms history-pressure retries prevent monopolizing
+a turn or spinning; the next one-second interval follows successful submission.
+Kernel regressions cover busy DATA, history pressure, barriers and socket loss.
 The coordinator now closes grants before each PTO loss check and waits for
 physical send commits, bounded worker scans and final report returns. The third
 unanswered expiry waits for forced settlement before probes. Stable per-worker

@@ -226,6 +226,7 @@ pub(super) struct State {
     outgoing_cursor: usize,
     outgoing_left: usize,
     outgoing_blocked: u64,
+    liveness_cursor: usize,
 }
 
 impl State {
@@ -323,6 +324,7 @@ impl State {
             outgoing_cursor: 0,
             outgoing_left: 0,
             outgoing_blocked: 0,
+            liveness_cursor: 0,
         })
     }
 
@@ -1044,6 +1046,52 @@ impl Worker {
                     } else {
                         more = true;
                     }
+                    break;
+                }
+            }
+        }
+        if self.sender.job.is_none() && self.sender.flight.is_some() {
+            for _ in 0..self.controls.len().min(BATCH_SIZE) {
+                let session = self.sender.liveness_cursor;
+                self.sender.liveness_cursor = (session + 1) % self.controls.len();
+                let control = &self.controls[session];
+                if now < control.probe_due
+                    || control.barrier.is_active()
+                    || control.state.connection().is_none()
+                    || self.sessions[session].connection.is_none()
+                {
+                    continue;
+                }
+                let peer = self
+                    .shared
+                    .config
+                    .peer_for_session(session)
+                    .ok_or(io::ErrorKind::InvalidData)?;
+                if !self.shared.peer_bound(peer) {
+                    continue;
+                }
+                let path = self
+                    .sessions
+                    .get(session)
+                    .ok_or(io::ErrorKind::InvalidData)?
+                    .path;
+                let socket = &self
+                    .transmit
+                    .get(peer)
+                    .and_then(|peer| peer.paths.get(path))
+                    .and_then(|path| path.lanes.first())
+                    .ok_or(io::ErrorKind::InvalidData)?
+                    .socket;
+                // History pressure or an unavailable path must not spin on an overdue probe.
+                self.controls[session].probe_due = now.saturating_add(RETRY);
+                if socket.is_none() {
+                    continue;
+                }
+                self.request_probe(session, 0, BASE_UDP_PAYLOAD, false, None, now)?;
+                if self.sender.job.is_some() {
+                    self.controls[session].probe_due = now.saturating_add(Duration::from_secs(1));
+
+                    more = true;
                     break;
                 }
             }

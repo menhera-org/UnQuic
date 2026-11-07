@@ -4031,7 +4031,8 @@ impl Worker {
                 }
                 self.effects(session, effects, now)?;
             }
-            if self.sessions[session].connection.is_some()
+            if !self.sender_enabled()
+                && self.sessions[session].connection.is_some()
                 && now >= self.controls[session].probe_due
             {
                 self.controls[session].probe_due = now + Duration::from_secs(1);
@@ -4077,7 +4078,10 @@ impl Worker {
                 if let Some(deadline) = control.state.deadline() {
                     due = due.min(deadline.max(control.retry));
                 }
-                if control.state.connection().is_some() {
+                if control.state.connection().is_some()
+                    && (!self.sender_enabled()
+                        || (self.sender.job.is_none() && self.sender.flight.is_some()))
+                {
                     due = due.min(control.probe_due);
                 }
             }

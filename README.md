@@ -536,6 +536,10 @@ discovery, while obeying the aggregate burst cap. Discovery candidates also fit
 within the total congestion window; resizing never confirms a larger DATA MTU.
 Workers now request grants
 for DATA, PMTU and liveness probes from worker zero's per-group controller.
+Due liveness probes wait for a free flight buffer and rotate among sessions
+before fresh DATA. A busy flight preserves the deadline; history pressure
+retries after 1 ms without spinning. Successful submission starts the next
+one-second interval. PTO probes retain priority.
 Combined outstanding grants share the smaller of BBR's send quantum and
 64 maximum-size datagrams. The current controller caps that quantum at 64 KiB.
 ACK-only and PROBE_REPLY traffic retain their separate control ceiling.
