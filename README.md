@@ -404,6 +404,11 @@ remain necessary before the retained-data recovery gate.
 Transmit DATA gathers rewritten headers and payload ranges from retained sources.
 When a grant sends its entire permitted prefix, the never-attempted suffix keeps
 its packet numbers, wire metadata and reservations in the same bounded batch.
+After the flight buffer returns, the worker compacts consumed metadata and adds
+waiting frames under the existing turn and batch limits. Payloads stay in place;
+new datagrams follow the unchanged suffix, including its short final packet.
+Refill waits across packet-number gaps left by canceled probes or controls,
+because submission accounting requires consecutive numbers.
 Partial or failed sends retain the unsent frame ranges and rebuild packet
 headers with fresh numbers on retry. Only successful submissions advance frame
 offsets or charge transmitted bytes; an intervening control packet cannot leave

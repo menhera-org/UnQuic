@@ -497,7 +497,27 @@ impl TxBatch {
                 .and_then(|id| storage.input(id))
                 .ok_or(pack::PackError::Frame)?;
         }
-        self.plan.prepare(lane, &inputs[..self.len], limit)
+        if self.plan.is_empty() {
+            self.plan.prepare(lane, &inputs[..self.len], limit)
+        } else {
+            self.plan.append(lane, &inputs[..self.len], limit)
+        }
+    }
+
+    fn compact(&mut self) -> Result<(), pack::PackError> {
+        let removed = self.frames[..self.len]
+            .iter()
+            .position(Option::is_some)
+            .unwrap_or(self.len);
+        // FIFO submission releases a prefix; expiry discards the plan before removing holes.
+        if self.frames[removed..self.len].iter().any(Option::is_none) {
+            return Err(pack::PackError::Frame);
+        }
+        self.plan.compact(removed)?;
+        self.frames.copy_within(removed..self.len, 0);
+        self.frames[self.len - removed..self.len].fill(None);
+        self.len -= removed;
+        Ok(())
     }
 
     fn discard(&mut self, history: Option<&mut crate::ack::History>) {
@@ -2570,6 +2590,11 @@ impl Worker {
         for _ in 0..self.ready.len().min(BATCH_SIZE) {
             let (session, lane) = self.ready.pop_front().unwrap();
             let mut batch = self.sessions[session].batches[lane].take().unwrap();
+            let refill =
+                self.sender_enabled() && self.sender.job.is_none() && self.sender.flight.is_some();
+            if refill && !batch.plan.is_empty() {
+                batch.compact().map_err(io::Error::other)?;
+            }
             while visited < BATCH_SIZE {
                 let Some(index) = batch.pending.front() else {
                     break;
@@ -2586,7 +2611,7 @@ impl Worker {
                     visited += 1;
                     continue;
                 }
-                if !batch.plan.is_empty()
+                if (!batch.plan.is_empty() && !refill)
                     || batch.len == pack::BATCH_CAPACITY
                     || self
                         .frames
@@ -2679,13 +2704,17 @@ impl Worker {
         }
         if self.sender_enabled() && !self.sender.permitted {
             let index = self.sender_index(session, lane)?;
-            if batch.plan.packet(0).is_some_and(|packet| {
-                packet.number <= self.sender.lanes[index].history.highest_sent()
+            let history = &self.sender.lanes[index].history;
+            if (0..batch.plan.len()).any(|ordinal| {
+                batch.plan.packet(ordinal).is_some_and(|packet| {
+                    packet.number <= history.highest_allocated()
+                        && !history.is_reserved(packet.number)
+                })
             }) {
                 self.discard_batch(session, lane, batch);
             }
         }
-        if batch.plan.is_empty()
+        if (batch.plan.is_empty() || (self.sender_enabled() && !self.sender.permitted))
             && batch
                 .prepare(
                     self.sessions[session].tx[lane].as_mut().unwrap(),

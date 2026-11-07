@@ -18,9 +18,9 @@ Neither the local **20 Gbit/s in each direction** gate nor the real
 remain unfinished. Workers now use the shared draft-07 controller and grant
 accounting. Refreshing overtaken packet numbers removes repeated coordinator
 DATA cancellations. Skipping empty loss-history ranges reduces CPU cost, but the
-larger bounded DATA burst and retained never-attempted packet plans raise the
-normal 20-second QinQ sweeps to 1.95–2.74 Gbit/s per direction using about
-2.0–2.3 CPUs per daemon.
+larger bounded DATA burst, retained never-attempted packet plans and bounded
+refill raise the final sixty-second QinQ sweep to 2.35–2.51 Gbit/s per direction
+using about 2.1–2.3 CPUs per daemon.
 The preceding ACK-pruning sweep delivered 1.12 to 1.22 Gbit/s. These remain
 severe integration regressions, far below the CPU ceiling.
 General application-limited detection and payload repair remain open.
@@ -53,10 +53,10 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Latest production-policy QinQ sweep with ACK-drop counters: 2.15 / 1.96 Gbit/s paced, 2.24 / 1.99 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 89.57 / 90.50%. Five successful repeats and the under-1% gate remain unmet. |
-| Goodput must plateau under excess traffic | Recent production-policy sender sweeps span 1.95 to 2.74 Gbit/s through paced, unlimited and return points; daemon CPU stays near 2.0–2.3 cores. The earlier expiry sweep declined 2.7% forward under unlimited load | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Final sixty-second QinQ sweep: 2.41 / 2.44 Gbit/s paced, 2.47 / 2.35 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 88.41 / 88.27%. Five successful repeats and the under-1% gate remain unmet. |
+| Goodput must plateau under excess traffic | The final sixty-second sweep rises 2.4% forward and falls 3.4% reverse under unlimited load, using about 2.1–2.3 cores per daemon. One earlier short sweep declines 18.1% forward; its repeat rises 13.9% | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
 | Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
-| VLAN-heavy deployment | Single- and double-tag output coalescing works. Current QinQ reports zero reordering; single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
+| VLAN-heavy deployment | Single- and double-tag output coalescing works. Final sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | Frame-aligned GSO, receive pressure drain/retry and compact borrowed payload storage have regression coverage | Runtime bounded selective repair is not implemented. Split frames can still be lost after one outer-packet loss. |
 | Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Throughput sweeps currently cap outer packets at 1500 bytes. Larger-MTU throughput, real routed-path validation and DATA-quoted PTB processing remain open. |
@@ -732,9 +732,9 @@ byte totals include outer headers.
 At 21G, 51% of requests use a retained plan. Fresh requests average
 37.9 / 36.6 datagrams, retained requests 16.1 / 16.5, and grants 18.3 / 17.7.
 The small retained tails above pay a separate request/permission/completion
-exchange while the lane has more queued work. The current flush path refuses
+exchange while the lane has more queued work. At that revision, the flush path refuses
 to add frames until the retained plan empties. This verifies the mechanism and
-its frequency; a refill experiment must still establish a goodput gain.
+its frequency; the following refill experiment measures the goodput effect.
 Window-trimmed prefixes also contribute to small grants, so filling tails
 cannot remove all their overhead.
 
@@ -755,6 +755,112 @@ diagnostic build is running. The identical binary passes alone in 43.60 seconds.
 Build contention is a hypothesis; the failure is not attributed or fixed.
 Keep builds separate from timing-sensitive runtime tests as well as throughput
 measurements. No build or other test overlaps the diagnostic load intervals.
+
+## Refilling retained DATA plans (November 7)
+
+The worker now adds waiting frames before requesting another grant for a retained
+tail. It compacts consumed packet/piece metadata and frame handles, then uses
+the existing packer to append new datagrams. Payloads stay in their source
+buffers. Retained packet numbers, bytes and lengths stay unchanged, including
+the final short datagram. The existing frame, packet, byte and turn limits apply;
+no persistent storage or syscall is added.
+
+[Two matched release sweeps per build](benches/tap-sender-retained-refill.json)
+compare the production four-ACK-buffer build with refill, in baseline/refill/
+refill/baseline order. Each sweep retains its daemons through twenty-second
+16G, 21G, unlimited and 16G-return points. Workload, CPU placement, active PMTU
+discovery and the 1452-byte outer UDP ceiling are unchanged. Builds and other
+tests do not overlap measurement.
+
+| Build / sweep / requested Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| Baseline / first / 21 | 1.95 / 1.83 | 90.53 / 91.01 | 196.49 / 184.72 |
+| Baseline / first / unlimited | 1.90 / 1.85 | 96.69 / 96.51 | 188.32 / 181.99 |
+| Refill / first / 21 | 2.85 / 2.54 | 86.20 / 87.73 | 237.88 / 225.17 |
+| Refill / first / unlimited | 2.34 / 2.88 | 95.88 / 95.05 | 230.83 / 227.56 |
+| Refill / repeat / 21 | 2.25 / 2.35 | 89.10 / 88.59 | 218.79 / 208.90 |
+| Refill / repeat / unlimited | 2.56 / 2.69 | 95.52 / 94.87 | 233.83 / 222.60 |
+| Baseline / repeat / 21 | 2.17 / 2.02 | 89.48 / 90.18 | 212.96 / 201.09 |
+| Baseline / repeat / unlimited | 2.26 / 1.88 | 96.10 / 96.68 | 210.93 / 197.23 |
+
+The two-sweep means improve 23.9 / 26.9% at 21G and 17.7 / 49.5% unlimited.
+This supports refilling tails as a useful batching change, but does not establish
+a plateau: the first refill sweep falls 18.1% forward under unlimited load,
+while the repeat rises 13.9%. Directional variation and the low throughput
+ceiling remain unresolved. The 20 Gbit/s and under-1% loss gates remain open.
+
+| Build / sweep, unlimited | TAP TX drops (SKBs) | Expired frames | Queue drops | ACK-buffer drops (included in queue drops) |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline / first | 2176472 / 1988384 | 4942 / 46 | 2735 / 18032 | 653 / 440 |
+| Refill / first | 2127025 / 2133866 | 18854 / 6363 | 850 / 23912 | 64 / 64 |
+| Refill / repeat | 2130329 / 1918907 | 9548 / 12496 | 1629 / 22795 | 60 / 86 |
+| Baseline / repeat | 2182134 / 2132660 | 4898 / 13294 | 782 / 17298 | 84 / 114 |
+
+All sixteen points have zero admission pressure, outer socket overflow,
+inner UDP errors, malformed/invalid/duplicate/out-of-window/wrong-run records
+and outer IPv6 fragmentation. The first refill sweep has thirteen reordered
+frames in one flow at 16G, or 0.0003125% of that direction's delivered frames.
+All other points have zero reordering. Its cause is unverified; source review
+alone does not attribute it to either refill or the kernel.
+
+The initial candidate failed the runtime storm with a missing send reservation.
+A focused regression reproduced retained packet numbers 11–22 followed by 24
+after probe 23 was canceled. Completion accounting expects consecutive numbers.
+Refill now defers across that gap, drains the valid suffix, then prepares fresh
+packets. The regression verifies actual submission and ACK settlement to zero
+inflight. Canceled identities are never reused.
+
+The final tree, including the registration fix below, passes 341 ordinary
+release tests, 332 default-feature tests, 64 short kernel/integration tests,
+Clippy and formatting. Tests cover unchanged retained wire bytes, split offsets,
+bounded metadata, MTU changes, packet-number exhaustion, partial sends, expiry,
+retirement and progress across two workers/lanes. Both runtime tests pass without
+concurrent compilation. The full routed test passes in 650.20 seconds:
+9000 → 1500 → 1280 → 9000, with returned and filtered PTB, the normal upward
+retry interval and no outer fragmentation.
+
+## Receive registration ordering (November 7)
+
+A separate regression reproduces an initial lane-registration inversion on the
+pre-refill code. The destination worker can queue a newer direct receive while
+the older packet is still traveling through registration. Installing the lane
+then appended that older buffer behind the newer one, delivering frame 2 before
+frame 1.
+
+Registration now places its first retained buffer at the front of the receive
+queue. The usual GRO, datagram, record and byte budgets still apply. The test
+uses both worker handoffs, verifies frame IDs and all bytes in order, and fails
+on the former enqueue path. This fixes the demonstrated initial-buffer race;
+it does not add a general reorder queue for packets arriving through different
+routes. It is not established attribution for the thirteen reordered frames
+in the refill sweep.
+
+## Sixty-second refill follow-up (November 7)
+
+[Three sixty-second points](benches/tap-sender-refill-register-long.json)
+measure the final tree with both refill and registration ordering. The daemons
+remain running through paced, unlimited and paced-return points, with the same
+QinQ workload and CPU placement as the shorter sweeps. No builds, other tests
+or Git packing overlap load.
+
+| Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| 21 | 20.97 / 20.94 | 2.41 / 2.44 | 88.41 / 88.27 | 223.86 / 215.96 |
+| Unlimited | 61.37 / 56.08 | 2.47 / 2.35 | 95.95 / 95.78 | 222.99 / 213.47 |
+| 21 return | 20.97 / 20.94 | 2.51 / 2.37 | 87.95 / 88.61 | 225.96 / 216.40 |
+
+Unlimited goodput rises 2.4% forward and falls 3.4% reverse. The larger
+forward decline from the first short sweep does not recur, but these three
+points do not prove a repeatable plateau or a CPU ceiling. Delivery remains
+far below 20 Gbit/s each way, with severe loss.
+
+At unlimited load, endpoint L/R counters report 6806774 / 6157168 TAP TX
+drops, 12803 / 26991 expired frames and 6486 / 59713 queue drops.
+The queue totals include 376 / 145 ACK-buffer drops. All three points have
+zero admission pressure, outer socket overflow, inner UDP errors, malformed
+or invalid records, duplicates, reordering and outer fragmentation.
+The earlier thirteen reordered frames remain unattributed. This follow-up
+does not isolate the registration fix's performance effect.
 
 ## Request fairness and burst-size experiments (November 7)
 

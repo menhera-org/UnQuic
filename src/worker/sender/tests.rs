@@ -334,12 +334,13 @@ fn partial_batches_with_feedback(feedback: bool) {
     let (mut workers, rx) = workers();
     for worker in &mut workers {
         worker.io_time = Some(Ok);
-        for _ in 0..32 {
+        for _ in 0..96 {
             queue_frame(worker, 1514);
         }
     }
-    let mut received = [[0usize; 32]; 2];
+    let mut received = [[0usize; 96]; 2];
     let mut next_packet = [1_u64; 2];
+    let mut delivered = [0_u64; 2];
     let mut receiver = [
         reassembly::Lane::new(1, 9022).unwrap(),
         reassembly::Lane::new(2, 9022).unwrap(),
@@ -382,6 +383,13 @@ fn partial_batches_with_feedback(feedback: bool) {
                 );
                 next_packet[owner] += 1;
                 assert_eq!(receiver[owner].admit(&datagram, now), Admission::Fresh);
+                while let Some(frame) = receiver[owner].front(now) {
+                    delivered[owner] += 1;
+                    assert_eq!(frame.id, ((owner as u64 + 1) << 48) | delivered[owner]);
+                    assert_eq!(frame.bytes.len(), 1514);
+                    assert!(frame.bytes.iter().all(|&byte| byte == 0xa5));
+                    assert!(receiver[owner].finish_front());
+                }
             }
             for record in datagram.records() {
                 if let Record::Data {
@@ -398,6 +406,12 @@ fn partial_batches_with_feedback(feedback: bool) {
                     *position += bytes.len();
                     if *position == total_len as usize {
                         complete += 1;
+                    }
+                    if sequence == 96 {
+                        assert!(
+                            received[1 - owner][0] != 0,
+                            "one lane drained before the other progressed"
+                        );
                     }
                 }
             }
@@ -424,12 +438,13 @@ fn partial_batches_with_feedback(feedback: bool) {
                 }
             }
         }
-        if complete == 64 {
+        if complete == 192 {
             break;
         }
     }
-    assert_eq!(complete, 64, "received {received:?}");
+    assert_eq!(complete, 192, "received {received:?}");
     if !feedback {
+        assert_eq!(delivered, [96; 2]);
         for (index, lane) in receiver.iter_mut().enumerate() {
             let mut output = [AckRange { start: 0, end: 0 }; wire::MAX_ACK_RANGES];
             let Some(Record::Ack { ranges, .. }) =
@@ -872,23 +887,13 @@ fn refresh_history_pressure_reports_unused_and_preserves_frame() {
 #[ignore = "kernel descriptor test; run in a disposable container"]
 fn retained_suffix_reservations_survive_recycle_and_leave_on_discard() {
     for cause in 0..3 {
-        let (mut workers, _rx) = workers();
+        let (mut workers, _rx) = refilled_request();
         let worker = &mut workers[1];
-        for _ in 0..32 {
-            queue_frame(worker, 1514);
-        }
-        worker.flush_frames(Duration::ZERO).unwrap();
         let job = worker.sender.job.unwrap();
-        assert!(job.count > 10);
-        for _ in 0..8 {
-            service(&mut workers);
-        }
-        let worker = &mut workers[1];
-        assert!(worker.sender.job.is_none());
         let index = worker.sender_index(0, 1).unwrap();
         let batch = worker.sessions[0].batches[1].as_ref().unwrap();
         let first = batch.plan.packet(0).expect("ungranted suffix").number;
-        assert!(first > job.first && first < job.first + job.count as u64);
+        assert_eq!(first, job.first);
         for number in first..job.first + job.count as u64 {
             assert!(worker.sender.lanes[index].history.is_reserved(number));
         }
@@ -957,10 +962,8 @@ fn retained_suffix_reservations_survive_recycle_and_leave_on_discard() {
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
 fn partial_attempt_discards_all_unsent_reservations_and_retries_fresh_numbers() {
-    let (mut workers, rx) = workers();
+    let (mut workers, rx) = refilled_request();
     let worker = &mut workers[1];
-    queue_frame(worker, 9022);
-    worker.flush_frames(Duration::ZERO).unwrap();
     let job = worker.sender.job.unwrap();
     let (_, Message::Request(request)) = worker.sender.outgoing.pop_front().unwrap() else {
         panic!()
@@ -973,7 +976,7 @@ fn partial_attempt_discards_all_unsent_reservations_and_retries_fresh_numbers() 
         .request(request)
         .unwrap();
     let mut outgoing = VecDeque::with_capacity(16);
-    let now = Duration::from_millis(1);
+    let now = Duration::from_millis(2);
     workers[0]
         .sender
         .owner
@@ -988,11 +991,20 @@ fn partial_attempt_discards_all_unsent_reservations_and_retries_fresh_numbers() 
     let worker = &mut workers[1];
     worker.sender_message(Message::Permit(flight), now).unwrap();
     let mut batch = worker.sessions[0].batches[1].take().unwrap();
-    let input = worker.frames.input(batch.frames[0].unwrap()).unwrap();
-    let mut parts = [&[][..]; 4];
+    let inputs: Vec<_> = batch.frames[..batch.len]
+        .iter()
+        .map(|id| worker.frames.input(id.unwrap()).unwrap())
+        .collect();
+    let submitted: Vec<_> = batch
+        .plan
+        .pieces(0)
+        .unwrap()
+        .map(|(slot, range)| (batch.frames[slot].unwrap(), range.end))
+        .collect();
+    let mut parts = [&[][..]; pack::BATCH_SLICES];
     let bytes: Vec<_> = batch
         .plan
-        .slices(0, &[input], &mut parts)
+        .slices(0, &inputs, &mut parts)
         .unwrap()
         .iter()
         .flat_map(|part| part.iter().copied())
@@ -1018,11 +1030,14 @@ fn partial_attempt_discards_all_unsent_reservations_and_retries_fresh_numbers() 
     for number in job.first + 1..job.first + job.count as u64 {
         assert!(!worker.sender.lanes[index].history.is_reserved(number));
     }
-    let frame = worker.frames.frame(batch.frames[0].unwrap()).unwrap();
-    assert_eq!(
-        (frame.offset, frame.deadline),
-        (1164, Duration::from_millis(100))
-    );
+    for (id, end) in submitted {
+        if let Some(frame) = worker.frames.frame(id) {
+            assert_eq!(
+                (frame.offset, frame.deadline),
+                (end, Duration::from_millis(100))
+            );
+        }
+    }
     batch
         .prepare(
             worker.sessions[0].tx[1].as_mut().unwrap(),
@@ -1071,12 +1086,7 @@ fn canceled_higher_reservation_discards_an_unreserved_old_plan_suffix() {
     worker
         .flush_batch(0, 1, &mut batch, Duration::from_millis(1))
         .unwrap();
-    assert!(batch.plan.is_empty());
-    assert!(worker.sender.job.is_none());
     assert!(!worker.sender.lanes[index].history.is_reserved(first.number));
-    worker
-        .flush_batch(0, 1, &mut batch, Duration::from_millis(1))
-        .unwrap();
     assert!(worker.sender.job.unwrap().first > overtaker);
     worker.sessions[0].batches[1] = Some(batch);
 }
@@ -1141,4 +1151,139 @@ fn ack_buffer_pressure_counts_only_excess_and_reuses_returned_storage() {
     assert_eq!(workers[0].sender.ack_free.len(), ACK_BUFFERS);
     assert_eq!(workers[0].counters.ack_buffer_drops, 2);
     assert_eq!(workers[0].counters.queue_drops, 2);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn retained_plan_refills_before_requesting_another_grant() {
+    refilled_request();
+}
+
+fn refilled_request() -> ([Worker; 2], ReceiveSocket) {
+    refilled_request_with_gap(false)
+}
+
+fn refilled_request_with_gap(gap: bool) -> ([Worker; 2], ReceiveSocket) {
+    let (mut workers, rx) = workers();
+    for _ in 0..16 {
+        queue_frame(&mut workers[1], 1514);
+    }
+    workers[1].flush_frames(Duration::ZERO).unwrap();
+    for _ in 0..8 {
+        service(&mut workers);
+    }
+    let worker = &mut workers[1];
+    assert!(worker.sender.job.is_none());
+    assert!(worker.sender.flight.is_some());
+    let batch = worker.sessions[0].batches[1].as_ref().unwrap();
+    let retained: Vec<_> = (0..batch.plan.len())
+        .map(|i| batch.plan.packet(i).unwrap())
+        .collect();
+    assert!(!retained.is_empty() && retained.len() <= 16);
+    let mut bytes = [0; BASE_UDP_PAYLOAD];
+    let mut number = 1;
+    while let Ok((length, _)) = rx.recv(&mut bytes) {
+        let packet = Datagram::decode(&bytes[..length]).unwrap();
+        assert_eq!(packet.header().packet_number, number);
+        number += 1;
+    }
+    assert_eq!(number, retained[0].number);
+    let now = Duration::from_millis(2);
+    let ack = [AckRange {
+        start: 1,
+        end: number - 1,
+    }];
+    worker
+        .incoming_ack(0, 1, 2, 0, AckRanges::new(&ack).unwrap(), now)
+        .unwrap();
+    for _ in 0..8 {
+        for worker in &mut workers {
+            worker.io_time = Some(Ok);
+            worker.drain_queues(now).unwrap();
+            worker.service_sender(now).unwrap();
+        }
+    }
+    let worker = &mut workers[1];
+    if gap {
+        let number = worker.sessions[0].tx[1]
+            .as_mut()
+            .unwrap()
+            .allocate_packets(1)
+            .unwrap();
+        let index = worker.sender_index(0, 1).unwrap();
+        let history = &mut worker.sender.lanes[index].history;
+        history.reserve(number, 100, false, false).unwrap();
+        assert!(history.cancel(number));
+    }
+    for _ in 0..16 {
+        queue_frame(worker, 1514);
+    }
+    worker.flush_frames(now).unwrap();
+    let job = worker.sender.job.unwrap();
+    if !gap {
+        assert!(
+            job.count > retained.len(),
+            "retained {}, requested {}",
+            retained.len(),
+            job.count
+        );
+    }
+    let batch = worker.sessions[0].batches[1].as_ref().unwrap();
+    for (index, packet) in retained.iter().enumerate() {
+        assert_eq!(batch.plan.packet(index), Some(*packet));
+    }
+    (workers, rx)
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn canceled_probe_defers_refill_until_reserved_suffix_drains() {
+    let (mut workers, rx) = refilled_request_with_gap(true);
+    let job = workers[1].sender.job.unwrap();
+    let batch = workers[1].sessions[0].batches[1].as_ref().unwrap();
+    for index in 0..job.count {
+        assert_eq!(
+            batch.plan.packet(index).unwrap().number,
+            job.first + index as u64,
+            "a retained suffix cannot share a Flight with packets beyond a canceled probe"
+        );
+    }
+    let now = Duration::from_millis(2);
+    for _ in 0..8 {
+        for worker in &mut workers {
+            worker.drain_queues(now).unwrap();
+            worker.service_sender(now).unwrap();
+        }
+    }
+    let mut bytes = [0; BASE_UDP_PAYLOAD];
+    let mut count = 0;
+    while let Ok((length, _)) = rx.recv(&mut bytes) {
+        assert_eq!(
+            Datagram::decode(&bytes[..length])
+                .unwrap()
+                .header()
+                .packet_number,
+            job.first + count
+        );
+        count += 1;
+    }
+    assert_eq!(count as usize, job.count);
+    let ranges = [AckRange {
+        start: job.first,
+        end: job.first + count - 1,
+    }];
+    let observed = now + Duration::from_micros(100);
+    workers[1]
+        .incoming_ack(0, 1, 2, 0, AckRanges::new(&ranges).unwrap(), observed)
+        .unwrap();
+    for _ in 0..8 {
+        for worker in &mut workers {
+            worker.drain_queues(observed).unwrap();
+            worker.service_sender(observed).unwrap();
+        }
+    }
+    let index = workers[1].sender_index(0, 1).unwrap();
+    assert_eq!(workers[1].sender.lanes[index].history.inflight_bytes(), 0);
+    workers[1].flush_frames(observed).unwrap();
+    assert!(workers[1].sender.job.unwrap().first > job.first + count);
 }

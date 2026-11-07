@@ -379,6 +379,34 @@ impl Batch {
         Ok(())
     }
 
+    /// Compacts retained metadata after the caller releases a completed frame prefix.
+    pub(crate) fn compact(&mut self, frames: usize) -> Result<(), PackError> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        let first = usize::from(self.packets[self.head].first);
+        let last = self.packets[self.count - 1];
+        let end = usize::from(last.first) + usize::from(last.count);
+        if self.pieces[first..end]
+            .iter()
+            .any(|piece| usize::from(piece.frame) < frames)
+        {
+            return Err(PackError::Frame);
+        }
+        self.packets.copy_within(self.head..self.count, 0);
+        self.count -= self.head;
+        self.head = 0;
+        self.pieces.copy_within(first..end, 0);
+        self.prefixes.copy_within(first..end, 0);
+        for packet in &mut self.packets[..self.count] {
+            packet.first -= first as u16;
+        }
+        for piece in &mut self.pieces[..end - first] {
+            piece.frame -= frames as u8;
+        }
+        Ok(())
+    }
+
     /// Replaces unsent packet identities without changing payload spans or sizes.
     pub(crate) fn renumber(&mut self, lane: &mut Lane) -> Result<u64, PackError> {
         let first = lane.allocate_packets(self.len())?;
@@ -483,6 +511,15 @@ impl Batch {
         frames: &[FrameInput<'_>],
         limit: usize,
     ) -> Result<(), PackError> {
+        Self::validate(lane, frames, limit)?;
+        if !frames.is_empty() && lane.header.packet_number == 0 {
+            return Err(PackError::Exhausted);
+        }
+        self.clear();
+        self.fill(lane, frames, limit, 0)
+    }
+
+    fn validate(lane: &Lane, frames: &[FrameInput<'_>], limit: usize) -> Result<(), PackError> {
         if !(BASE_UDP_PAYLOAD..=MAX_UDP_PAYLOAD).contains(&limit) {
             return Err(PackError::Limit);
         }
@@ -499,13 +536,67 @@ impl Batch {
         {
             return Err(PackError::Frame);
         }
-        if !frames.is_empty() && lane.header.packet_number == 0 {
-            return Err(PackError::Exhausted);
+        Ok(())
+    }
+
+    /// Adds fresh datagrams after a compacted suffix; reserved bytes remain unchanged.
+    pub(crate) fn append(
+        &mut self,
+        lane: &mut Lane,
+        frames: &[FrameInput<'_>],
+        limit: usize,
+    ) -> Result<(), PackError> {
+        Self::validate(lane, frames, limit)?;
+        if self.head != 0 {
+            return Err(PackError::Frame);
         }
-        self.clear();
-        let mut frame = 0;
-        let mut offset = frames.first().map_or(0, |frame| frame.offset);
-        let mut pieces = 0;
+        let packet_limit = BATCH_CAPACITY.min(GSO_MAX_BYTES / limit);
+        if self.packets[..self.count]
+            .iter()
+            .any(|p| p.packet.length > limit)
+        {
+            return Err(PackError::Limit);
+        }
+        // Exhaustion must not discard an already prepared final packet or its split range.
+        if lane.header.packet_number == 0 || self.count >= packet_limit {
+            return Ok(());
+        }
+        // A Flight's submission accounting requires consecutive identities. A canceled
+        // control/probe can advance the allocator without invalidating this suffix.
+        if self.packets[..self.count].last().is_some_and(|packet| {
+            packet.packet.number.checked_add(1) != Some(lane.header.packet_number)
+        }) {
+            return Ok(());
+        }
+        let frame = if self.count == 0 {
+            0
+        } else {
+            let packet = self.packets[self.count - 1];
+            let piece = self.pieces[usize::from(packet.first + packet.count) - 1];
+            let index = usize::from(piece.frame);
+            // Prepared ranges finish within the plan except at packet-number exhaustion.
+            if frames
+                .get(index)
+                .is_none_or(|frame| frame.end != usize::from(piece.end))
+            {
+                return Err(PackError::Frame);
+            }
+            index + 1
+        };
+        self.fill(lane, frames, limit, frame)
+    }
+
+    fn fill(
+        &mut self,
+        lane: &mut Lane,
+        frames: &[FrameInput<'_>],
+        limit: usize,
+        mut frame: usize,
+    ) -> Result<(), PackError> {
+        let mut offset = frames.get(frame).map_or(0, |frame| frame.offset);
+        let mut pieces = self.packets[..self.count]
+            .last()
+            .map_or(0, |p| usize::from(p.first + p.count));
         let packet_limit = BATCH_CAPACITY.min(GSO_MAX_BYTES / limit);
         while frame < frames.len() && self.count < packet_limit && lane.header.packet_number != 0 {
             let first = pieces;
@@ -964,5 +1055,158 @@ mod retained_prefix_tests {
             .prepare(&mut lane, &frames[count..], BASE_UDP_PAYLOAD)
             .unwrap();
         assert_eq!(batch.pieces(0).unwrap().next().unwrap().0, 0);
+    }
+}
+
+#[cfg(test)]
+mod refill_tests {
+    use super::*;
+
+    fn encoded(batch: &Batch, index: usize, inputs: &[FrameInput<'_>]) -> Vec<u8> {
+        let mut spans = [&[][..]; MAX_RECORDS * 3 + 1];
+        batch
+            .slices(index, inputs, &mut spans)
+            .unwrap()
+            .iter()
+            .flat_map(|span| span.iter().copied())
+            .collect()
+    }
+
+    #[test]
+    fn refill_preserves_reserved_bytes_split_offsets_and_bounded_metadata() {
+        let mut lane = tests::lane();
+        let data = [0x5a; 1514];
+        let mut inputs = Vec::new();
+        let mut lengths = Vec::new();
+        let mut accepted = Vec::new();
+        let mut batch = Batch::new();
+        let mut next = 1;
+        let mut max_pieces = 0;
+        for turn in 0..128 {
+            if turn < 16 {
+                while inputs.len() < BATCH_CAPACITY {
+                    let length = if lengths.len() % 2 == 0 { 1514 } else { 60 };
+                    inputs.push(FrameInput {
+                        id: lane.start_frame(length).unwrap(),
+                        header: &data[..30],
+                        bytes: &data[30..length],
+                        offset: 0,
+                        end: length,
+                    });
+                    lengths.push(length);
+                    accepted.push(0);
+                }
+            }
+            batch.append(&mut lane, &inputs, BASE_UDP_PAYLOAD).unwrap();
+            if inputs.is_empty() {
+                break;
+            }
+            assert!(!batch.is_empty());
+            assert!(batch.len() <= BATCH_CAPACITY.min(GSO_MAX_BYTES / BASE_UDP_PAYLOAD));
+            assert!(
+                (0..batch.len())
+                    .map(|i| batch.packet(i).unwrap().length)
+                    .sum::<usize>()
+                    <= GSO_MAX_BYTES
+            );
+            let last = batch.packets[batch.count - 1];
+            let pieces = usize::from(last.first + last.count);
+            max_pieces = max_pieces.max(pieces);
+            assert!(pieces <= batch.pieces.len());
+            let sent = batch.len().min(1 + turn % 16);
+            for index in 0..sent {
+                let bytes = encoded(&batch, index, &inputs);
+                let packet = crate::wire::Datagram::decode(&bytes).unwrap();
+                assert_eq!(packet.header().packet_number, next);
+                next += 1;
+                for record in packet.records() {
+                    let Record::Data {
+                        frame_id,
+                        total_len,
+                        offset,
+                        bytes,
+                    } = record
+                    else {
+                        panic!()
+                    };
+                    let frame = (frame_id & MAX_SEQUENCE) as usize - 1;
+                    assert_eq!(accepted[frame], offset as usize);
+                    assert_eq!(lengths[frame], total_len as usize);
+                    assert!(bytes.iter().all(|&b| b == 0x5a));
+                    accepted[frame] += bytes.len();
+                }
+                for (frame, range) in batch.pieces(index).unwrap() {
+                    inputs[frame].offset = range.end;
+                }
+            }
+            batch.consume(sent).unwrap();
+            let saved: Vec<_> = (0..batch.len())
+                .map(|i| encoded(&batch, i, &inputs))
+                .collect();
+            let removed = inputs.iter().take_while(|f| f.offset == f.end).count();
+            batch.compact(removed).unwrap();
+            inputs.drain(..removed);
+            for (index, bytes) in saved.iter().enumerate() {
+                assert_eq!(&encoded(&batch, index, &inputs), bytes);
+            }
+            // Append must leave every reserved packet, including the final short one, unchanged.
+            batch.append(&mut lane, &inputs, BASE_UDP_PAYLOAD).unwrap();
+            for (index, bytes) in saved.iter().enumerate() {
+                assert_eq!(&encoded(&batch, index, &inputs), bytes);
+            }
+        }
+        assert!(inputs.is_empty());
+        assert_eq!(accepted, lengths);
+        assert!(max_pieces >= 90, "{max_pieces}");
+    }
+
+    #[test]
+    fn refill_limits_and_exhaustion_preserve_valid_retained_packets() {
+        let mut lane = tests::lane();
+        let data = [1; 1514];
+        let inputs: Vec<_> = (0..64)
+            .map(|_| FrameInput {
+                id: lane.start_frame(data.len()).unwrap(),
+                header: &[],
+                bytes: &data,
+                offset: 0,
+                end: data.len(),
+            })
+            .collect();
+        let mut batch = Batch::new();
+        batch.prepare(&mut lane, &inputs, BASE_UDP_PAYLOAD).unwrap();
+        let before: Vec<_> = (0..batch.len())
+            .map(|i| encoded(&batch, i, &inputs))
+            .collect();
+        let next = lane.header.packet_number;
+        batch.append(&mut lane, &inputs, MAX_UDP_PAYLOAD).unwrap();
+        assert_eq!(lane.header.packet_number, next);
+        assert_eq!(batch.len(), before.len());
+        for (index, bytes) in before.iter().enumerate() {
+            assert_eq!(&encoded(&batch, index, &inputs), bytes);
+        }
+        batch.prepare(&mut lane, &inputs, MAX_UDP_PAYLOAD).unwrap();
+        let first = encoded(&batch, 0, &inputs);
+        let next = lane.header.packet_number;
+        assert_eq!(
+            batch.append(&mut lane, &inputs, BASE_UDP_PAYLOAD),
+            Err(PackError::Limit)
+        );
+        assert_eq!(lane.header.packet_number, next);
+        assert_eq!(encoded(&batch, 0, &inputs), first);
+        lane.header.packet_number = u64::MAX - 1;
+        batch.prepare(&mut lane, &inputs, BASE_UDP_PAYLOAD).unwrap();
+        batch.consume(1).unwrap();
+        batch.compact(0).unwrap();
+        let last = encoded(&batch, 0, &inputs);
+        assert_eq!(batch.packet(0).unwrap().number, u64::MAX);
+        batch.append(&mut lane, &inputs, BASE_UDP_PAYLOAD).unwrap();
+        assert_eq!(encoded(&batch, 0, &inputs), last);
+        assert_eq!(lane.header.packet_number, 0);
+        batch.consume(1).unwrap();
+        assert_eq!(
+            batch.prepare(&mut lane, &inputs, BASE_UDP_PAYLOAD),
+            Err(PackError::Exhausted)
+        );
     }
 }
