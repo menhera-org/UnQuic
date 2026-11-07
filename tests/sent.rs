@@ -424,7 +424,7 @@ fn bounded_ack_yields_without_losing_callbacks_or_credit() {
     assert!(!history.ack_pending());
     assert_eq!(history.advance_ack(64, |_| panic!("no pending ACK")), None);
 
-    // An all-duplicate ACK still spends its budget scanning the bitmap.
+    // Validation removes fully duplicate ranges before bounded application.
     history
         .begin_ack(ranges(&[AckRange { start: 1, end }]))
         .unwrap();
@@ -437,8 +437,7 @@ fn bounded_ack_yields_without_losing_callbacks_or_credit() {
         }
         assert!(turns <= SENT_CAPACITY / 64 + 2);
     }
-    // Packet numbers 1..=65536 straddle 1025 words, followed by one transition.
-    assert_eq!(turns, SENT_CAPACITY / 64 + 2);
+    assert_eq!(turns, 1);
 }
 
 #[test]
@@ -1064,4 +1063,124 @@ fn maximum_sample_can_retire_and_reset_but_canceled_maximum_stays_unsent() {
         }])),
         Err(HistoryError::Future)
     );
+}
+
+#[test]
+fn pruned_duplicate_and_new_tail_finish_without_rewalking_old_words() {
+    let mut history = History::new().unwrap();
+    for number in 1..=4096 {
+        sent(&mut history, number, true);
+    }
+    let all = [AckRange {
+        start: 1,
+        end: 4096,
+    }];
+    history.acknowledge(ranges(&all), |_| {}).unwrap();
+    history.begin_ack(ranges(&all)).unwrap();
+    assert_eq!(history.advance_ack(0, |_| panic!("duplicate")), None);
+    assert!(history.ack_pending());
+    assert_eq!(
+        history.advance_ack(1, |_| panic!("duplicate")),
+        Some(AckProgress::default())
+    );
+    sent(&mut history, 4097, true);
+    history
+        .begin_ack(ranges(&[AckRange {
+            start: 1,
+            end: 4097,
+        }]))
+        .unwrap();
+    let mut accepted = Vec::new();
+    let progress = history
+        .advance_ack(3, |packet| accepted.push(packet.packet.number))
+        .unwrap();
+    assert_eq!(accepted, [4097]);
+    assert_eq!(progress.released_bytes, 1500);
+    assert_eq!(progress.rtt_sent_at, Some(Duration::from_micros(4097)));
+}
+
+#[test]
+fn pruned_boundaries_keep_lost_original_and_original_duplicate_rtt_reference() {
+    let mut history = History::new().unwrap();
+    for number in 1..=130 {
+        sent(&mut history, number, true);
+    }
+    history
+        .acknowledge(ranges(&[AckRange { start: 2, end: 130 }]), |_| {})
+        .unwrap();
+    assert!(history.lose(1).is_some());
+    sent(&mut history, 131, true);
+    let mut accepted = Vec::new();
+    let progress = history
+        .acknowledge(ranges(&[AckRange { start: 1, end: 131 }]), |packet| {
+            accepted.push((packet.packet.number, packet.was_in_flight));
+        })
+        .unwrap();
+    assert_eq!(accepted, [(1, false), (131, true)]);
+    assert_eq!(progress.released_bytes, 1500);
+    assert_eq!(progress.rtt_sent_at, Some(Duration::from_micros(131)));
+
+    let mut history = History::new().unwrap();
+    for number in 1..=3 {
+        sent(&mut history, number, true);
+    }
+    history
+        .acknowledge(ranges(&[AckRange { start: 3, end: 3 }]), |_| {})
+        .unwrap();
+    let progress = history
+        .acknowledge(ranges(&[AckRange { start: 1, end: 3 }]), |_| {})
+        .unwrap();
+    assert_eq!(progress.packets, 2);
+    assert_eq!(progress.rtt_sent_at, None);
+}
+
+#[test]
+fn pruning_validates_original_holes_and_future_before_installing_partial_work() {
+    let mut history = History::new().unwrap();
+    sent(&mut history, 1, true);
+    sent(&mut history, 3, true);
+    history
+        .acknowledge(ranges(&[AckRange { start: 3, end: 3 }]), |_| {})
+        .unwrap();
+    for (values, error) in [
+        (vec![AckRange { start: 1, end: 3 }], HistoryError::Unsent),
+        (
+            vec![AckRange { start: 4, end: 4 }, AckRange { start: 1, end: 1 }],
+            HistoryError::Future,
+        ),
+    ] {
+        assert_eq!(history.begin_ack(ranges(&values)), Err(error));
+        assert!(!history.ack_pending());
+        assert_eq!(history.inflight_bytes(), 1500);
+    }
+}
+
+#[test]
+fn pruned_ranges_handle_ring_wrap_and_maximum_identity() {
+    for end in [SENT_CAPACITY as u64 + 130, u64::MAX] {
+        let mut history = History::new().unwrap();
+        let start = end - 129;
+        for number in start..=end {
+            sent(&mut history, number, true);
+        }
+        history
+            .acknowledge(
+                ranges(&[AckRange {
+                    start,
+                    end: end - 1,
+                }]),
+                |_| {},
+            )
+            .unwrap();
+        history
+            .begin_ack(ranges(&[AckRange { start, end }]))
+            .unwrap();
+        let mut accepted = Vec::new();
+        let progress = history
+            .advance_ack(3, |packet| accepted.push(packet.packet.number))
+            .unwrap();
+        assert_eq!(accepted, [end]);
+        assert_eq!(progress.released_bytes, 1500);
+        assert_eq!(progress.rtt_sent_at, Some(Duration::from_micros(end)));
+    }
 }

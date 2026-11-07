@@ -475,7 +475,9 @@ whole ACKs before mutation, and preserves unresolved charges under window pressu
 Tests cover late ACKs, feedback-only eviction, ring wrap, maximum identities and
 allocation-free transitions. ACK application can now yield after a caller-supplied
 budget of bitmap scans, range transitions and callbacks. Whole-record validation
-precedes application; pending ACKs pin their history window and protect covered
+precedes application and trims already-acknowledged range boundaries without
+discarding late-loss delivery or changing the original-largest RTT reference.
+Pending ACKs pin their history window and protect covered
 packets from interleaved loss. Tests cover a full-window ACK, duplicate-only
 scans, floor pressure, competing ACKs, late loss and RTT sampling across yields.
 Outstanding-charge scans now yield on a bitmap-read budget, including empty

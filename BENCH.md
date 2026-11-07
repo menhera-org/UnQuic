@@ -17,7 +17,7 @@ Neither the local **20 Gbit/s in each direction** gate nor the real
 **5 Gbit/s under loss** gate has passed. Runtime recovery and congestion control
 remain unfinished. Workers now use the shared draft-07 controller and grant
 accounting. After sender scheduling fixes, the latest 20-second QinQ sweep
-delivers 1.10 to 1.18 Gbit/s per direction using about 1.9 to 2.0 CPUs per daemon.
+delivers 1.12 to 1.22 Gbit/s per direction using about 1.9 to 2.0 CPUs per daemon.
 This improves on the first paced sweep's roughly 0.7 Gbit/s but remains a severe
 integration regression, far below the CPU ceiling.
 General application-limited detection and payload repair remain open.
@@ -50,8 +50,8 @@ earlier tables retain their original builds and test conditions.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Latest sender QinQ sweep: 1.10 / 1.14 Gbit/s paced, 1.12 / 1.17 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 94.64 / 94.39%. Five successful repeats and the under-1% gate remain unmet. |
-| Goodput must plateau under excess traffic | Latest sender sweep holds 1.10 to 1.18 Gbit/s through paced, unlimited and return points; daemon CPU stays near two cores. The earlier expiry sweep declined 2.7% forward under unlimited load | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Latest sender QinQ sweep: 1.18 / 1.20 Gbit/s paced, 1.16 / 1.22 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe sender-integration regression; paced missing fractions are 94.27 / 94.20%. Five successful repeats and the under-1% gate remain unmet. |
+| Goodput must plateau under excess traffic | Latest sender sweep holds 1.12 to 1.22 Gbit/s through paced, unlimited and return points; daemon CPU stays near two cores. The earlier expiry sweep declined 2.7% forward under unlimited load | The low sender plateau is a severe regression, not evidence of a CPU ceiling. Grant/feedback scheduling needs attribution. |
 | Small-frame overload must remain efficient | Current tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Current QinQ reports zero reordering; single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
@@ -153,6 +153,36 @@ Of 164,797 / 167,474 received send grants, 1,047 / 865 expired and
 an exact frame-loss total. Final pacing gauges were sampled after draining and
 must not be used as steady-load controller rates.
 
+## ACK-pruning normal release sweep (November 7)
+
+[Four normal release observations](benches/tap-ack-prune.json) measure the
+ACK-boundary change on `2692895`, retaining the production 16-datagram burst
+cap. The profile and twenty-second points match the preceding sweep.
+
+| Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | 15.96 / 15.95 | 1.17 / 1.14 | 92.41 / 92.60 | 191.58 / 187.77 |
+| 21 | 20.96 / 20.94 | 1.18 / 1.20 | 94.27 / 94.20 | 194.74 / 190.37 |
+| Unlimited | 58.69 / 55.17 | 1.16 / 1.22 | 97.99 / 97.76 | 195.89 / 193.02 |
+| 16 return | 15.96 / 15.78 | 1.12 / 1.15 | 92.83 / 92.59 | 186.94 / 188.18 |
+
+This confirms no large throughput gain from pruning: delivery remains
+1.12–1.22 Gbit/s with roughly two CPUs per daemon. Unlimited load does not
+collapse in this sweep, but the low plateau remains an integration regression.
+
+All points have zero admission pressure, socket overflow, inner UDP receive
+errors, invalid/duplicate/out-of-window/wrong-run records and outer fragments.
+Maximum reordering is 0.00075%. At 21G, L/R counters report
+721,802 / 684,420 TAP TX drops, 337,813 / 362,143 frame expiries and
+22,101 / 54,549 worker queue drops. These units cannot be summed.
+Of 186,192 / 193,691 grants, 927 / 443 expired and 4,130 / 8,706 were canceled.
+
+The change passes 328 release tests, default-feature tests, Clippy, Rust 1.89
+and 53 kernel tests, including foreign rename, namespace move and reconnect.
+The routed test confirms 9000 → 1500 → 1280 → 9000 in 652.67 seconds with
+returned/filtered PTB and no outer fragments. One reconnect took 19.99 seconds;
+that service delay remains unresolved.
+
 ## Sender scheduling release sweep (November 7)
 
 [Four normal release observations](benches/tap-sender-turn.json) measure
@@ -233,6 +263,26 @@ Admission pressure and outer socket overflow stayed zero. Main retains the
 sixteen-datagram policy: this experiment identifies batching sensitivity but
 does not establish an acceptable burst policy or meet the performance target.
 The linked diagnostic file includes its hash and counters.
+
+### ACK application work
+
+[ACK scan diagnostics](benches/tap-ack-scan-diagnostic.json) use the experimental
+cap64 build with counters for admitted ACKs, bitmap reads, application calls and
+new callbacks. Each ACK averaged 47.6 to 49.0 application bitmap reads and
+31.6 to 33.6 newly acknowledged packets, requiring 2.04 to 2.11 bounded calls.
+This workload does not establish that ACKs scan the entire retained window.
+
+Pruning already-acknowledged range boundaries during full validation reduced
+application reads to 2.01 to 2.10 and calls to 1.04 to 1.06 per ACK. New callbacks
+remained near 32. Original range validation still visits about 47 words per ACK;
+lost originals remain eligible for late delivery accounting, and the original
+largest packet still determines RTT eligibility. Tests cover duplicate/new-tail
+ACKs, late lost originals, invalid holes, ring wrap and maximum packet numbers.
+
+Baseline diagnostic goodput was 2.00 / 1.96 and 1.80 / 1.81 Gbit/s; pruning
+delivered 1.90 / 2.06 and 1.93 / 1.98. CPU stayed near 1.8 to 1.9 cores per
+daemon. The reduction in repeated application work is verified; these short
+runs do not establish a throughput gain beyond run variation.
 
 The verified facts are low delivered throughput, low CPU utilization and heavy
 upstream dropping/expiry. Grant and feedback serialization, congestion-window

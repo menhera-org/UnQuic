@@ -240,6 +240,8 @@ The pure sender history supports bounded ACK application after whole-record
 validation. It preserves callback progress and RTT accounting across yields,
 pins retained metadata, and prevents covered packets from being declared lost
 while their ACK is pending.
+Validation trims already-acknowledged range boundaries before application,
+while preserving late-loss delivery and the original largest number for RTT.
 Outstanding-packet scans also yield after a bitmap-work budget and stop at a
 fixed packet number, including across sparse histories and concurrent sends.
 The pure piece journal reserves mappings before I/O and keeps packet charges

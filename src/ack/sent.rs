@@ -376,6 +376,20 @@ impl History {
 
     /// Checks the whole ACK without mutation, bounded by the retained bitmap span.
     pub fn validate(&self, ranges: AckRanges<'_>) -> Result<(), HistoryError> {
+        self.checked_ack(ranges).map(|_| ())
+    }
+
+    fn checked_ack(&self, ranges: AckRanges<'_>) -> Result<PendingAck, HistoryError> {
+        let mut pending = PendingAck {
+            ranges: [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES],
+            len: 0,
+            range: 0,
+            next_word: 0,
+            word: 0,
+            bits: 0,
+            largest: ranges.iter().next().map_or(0, |range| range.end),
+            progress: AckProgress::default(),
+        };
         for range in ranges.iter() {
             if range.end > self.highest_sent {
                 return Err(HistoryError::Future);
@@ -383,13 +397,27 @@ impl History {
             if self.final_retired {
                 continue;
             }
+            let mut remaining: Option<AckRange> = None;
             for (word, mask) in words(range.start.max(self.floor), range.end) {
-                if self.submitted[word as usize & (WORDS - 1)] & mask != mask {
+                let index = word as usize & (WORDS - 1);
+                if self.submitted[index] & mask != mask {
                     return Err(HistoryError::Unsent);
                 }
+                let bits = mask & !self.acknowledged[index];
+                if bits != 0 {
+                    let start = (word << 6) | u64::from(bits.trailing_zeros());
+                    let end = (word << 6) | u64::from(63 - bits.leading_zeros());
+                    remaining.get_or_insert(AckRange { start, end }).end = end;
+                }
+            }
+            if let Some(range) = remaining {
+                pending.ranges[pending.len] = range;
+                pending.len += 1;
             }
         }
-        Ok(())
+        // Preserve the original largest number: a duplicate largest is not an RTT sample.
+        pending.next_word = pending.ranges[0].start >> 6;
+        Ok(pending)
     }
 
     /// Whether a validated ACK still has bounded work to apply.
@@ -397,7 +425,7 @@ impl History {
         self.pending.is_some()
     }
 
-    /// Validates a whole ACK and retains its ranges without applying callbacks.
+    /// Validates a whole ACK and retains unacknowledged range boundaries.
     ///
     /// Validation visits at most 1025 bitmap words plus 31 repeated boundary-word
     /// visits. Application is separately budgeted by advance_ack. Until it
@@ -410,23 +438,7 @@ impl History {
         if self.pending.is_some() {
             return Err(HistoryError::Busy);
         }
-        self.validate(ranges)?;
-        let mut pending = PendingAck {
-            ranges: [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES],
-            len: ranges.len(),
-            range: 0,
-            next_word: 0,
-            word: 0,
-            bits: 0,
-            largest: 0,
-            progress: AckProgress::default(),
-        };
-        for (slot, range) in pending.ranges.iter_mut().zip(ranges.iter()) {
-            *slot = range;
-        }
-        pending.largest = pending.ranges[0].end;
-        pending.next_word = pending.ranges[0].start.max(self.floor) >> 6;
-        self.pending = Some(pending);
+        self.pending = Some(self.checked_ack(ranges)?);
         Ok(())
     }
 
@@ -442,6 +454,9 @@ impl History {
         budget: usize,
         mut accepted: impl FnMut(Acknowledged),
     ) -> Option<AckProgress> {
+        if budget == 0 {
+            return None;
+        }
         let mut pending = self.pending.take()?;
         for _ in 0..budget {
             if pending.bits != 0 {
