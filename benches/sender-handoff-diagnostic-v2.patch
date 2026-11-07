@@ -1,0 +1,528 @@
+diff --git a/src/counters.rs b/src/counters.rs
+index ed40aba..3073539 100644
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -92,6 +92,60 @@ macro_rules! metrics {
+ }
+ 
+ metrics! {
++    /// Diagnostic successful foreign permit SPSC handoffs.
++    permit_enqueued: sum,
++    /// Diagnostic summed outgoing insertion to successful foreign pre-push nanoseconds.
++    permit_queue_ns: sum,
++    /// Diagnostic handoffs with a valid notification-call timestamp.
++    permit_notified: sum,
++    /// Diagnostic summed pre-push-to-notification-call nanoseconds.
++    permit_notify_ns: sum,
++    /// Diagnostic handoffs with a valid consumer observation timestamp.
++    permit_observed: sum,
++    /// Diagnostic summed pre-push-to-consumer-observation nanoseconds.
++    permit_observe_ns: sum,
++    /// Diagnostic failed pushes excluded from latency totals.
++    permit_enqueue_retries: sum,
++    /// Diagnostic timestamps omitted for clock or representation errors.
++    permit_censored: sum,
++    /// Diagnostic successfully enqueued messages still awaiting notification.
++    permit_notify_pending: sum,
++    /// Diagnostic successful foreign complete SPSC handoffs.
++    complete_enqueued: sum,
++    /// Diagnostic summed outgoing insertion to successful foreign pre-push nanoseconds.
++    complete_queue_ns: sum,
++    /// Diagnostic handoffs with a valid notification-call timestamp.
++    complete_notified: sum,
++    /// Diagnostic summed pre-push-to-notification-call nanoseconds.
++    complete_notify_ns: sum,
++    /// Diagnostic handoffs with a valid consumer observation timestamp.
++    complete_observed: sum,
++    /// Diagnostic summed pre-push-to-consumer-observation nanoseconds.
++    complete_observe_ns: sum,
++    /// Diagnostic failed pushes excluded from latency totals.
++    complete_enqueue_retries: sum,
++    /// Diagnostic timestamps omitted for clock or representation errors.
++    complete_censored: sum,
++    /// Diagnostic successfully enqueued messages still awaiting notification.
++    complete_notify_pending: sum,
++    /// Diagnostic successful foreign report SPSC handoffs.
++    report_enqueued: sum,
++    /// Diagnostic summed outgoing insertion to successful foreign pre-push nanoseconds.
++    report_queue_ns: sum,
++    /// Diagnostic handoffs with a valid notification-call timestamp.
++    report_notified: sum,
++    /// Diagnostic summed pre-push-to-notification-call nanoseconds.
++    report_notify_ns: sum,
++    /// Diagnostic handoffs with a valid consumer observation timestamp.
++    report_observed: sum,
++    /// Diagnostic summed pre-push-to-consumer-observation nanoseconds.
++    report_observe_ns: sum,
++    /// Diagnostic failed pushes excluded from latency totals.
++    report_enqueue_retries: sum,
++    /// Diagnostic timestamps omitted for clock or representation errors.
++    report_censored: sum,
++    /// Diagnostic successfully enqueued messages still awaiting notification.
++    report_notify_pending: sum,
+     /// Ethernet bytes successfully written as complete frames to TAP.
+     delivered_frame_bytes: sum,
+     /// Successfully submitted outer IPv6 bytes, including IPv6 and UDP headers.
+diff --git a/src/pacing/sender.rs b/src/pacing/sender.rs
+index 27b892d..0fba1f1 100644
+--- a/src/pacing/sender.rs
++++ b/src/pacing/sender.rs
+@@ -42,6 +42,8 @@ struct Record {
+ /// sampling finishes; outgoing ACK buffers cannot replace this storage.
+ #[derive(Debug)]
+ pub struct Flight {
++    pub(crate) diagnostic_handoff: Option<std::time::Instant>,
++    pub(crate) diagnostic_queued: Option<std::time::Instant>,
+     worker: usize,
+     group: Option<usize>,
+     grant: Option<Grant>,
+@@ -313,6 +315,8 @@ impl Sender {
+             let mut one = Vec::new();
+             one.try_reserve_exact(1).map_err(io::Error::other)?;
+             one.push(Flight {
++                diagnostic_handoff: None,
++                diagnostic_queued: None,
+                 worker,
+                 group: None,
+                 grant: None,
+diff --git a/tmp/unquic-handoff-diagnostic-v2/src/worker/sender/handoff.rs b/src/worker/sender/handoff.rs
+new file mode 100644
+index 0000000..f005352
+--- /dev/null
++++ b/src/worker/sender/handoff.rs
+@@ -0,0 +1,201 @@
++//! Temporary handoff diagnostics; timestamps never affect transport decisions.
++use super::*;
++use std::time::Instant;
++
++#[derive(Clone, Copy, Default)]
++pub(super) struct Pending {
++    first: Option<Instant>,
++    count: u64,
++    offsets: u128,
++    invalid: bool,
++}
++
++impl Pending {
++    pub(super) fn push(&mut self, at: Instant) {
++        let first = *self.first.get_or_insert(at);
++        self.count += 1;
++        if let Some(age) = at.checked_duration_since(first) {
++            self.offsets += age.as_nanos();
++        } else {
++            self.invalid = true;
++        }
++    }
++
++    fn take(&mut self, at: Instant) -> (u64, Option<u64>) {
++        let pending = std::mem::take(self);
++        let sum = pending
++            .first
++            .filter(|_| !pending.invalid)
++            .and_then(|first| at.checked_duration_since(first))
++            .and_then(|age| {
++                (age.as_nanos() * u128::from(pending.count)).checked_sub(pending.offsets)
++            })
++            .and_then(|sum| u64::try_from(sum).ok());
++        (pending.count, sum)
++    }
++}
++
++#[derive(Clone, Copy, Default)]
++pub(super) struct Totals {
++    pub(super) queued: u64,
++    pub(super) retries: u64,
++    notified: u64,
++    pub(super) queue_ns: u64,
++    notify_ns: u64,
++    observed: u64,
++    observe_ns: u64,
++    pub(super) censored: u64,
++}
++
++impl Message {
++    pub(super) fn stamp_queued(&mut self) {
++        let stamp = match self {
++            Self::Permit(flight) | Self::Complete(flight) => &mut flight.diagnostic_queued,
++            Self::Report(report) => &mut report.diagnostic_queued,
++            _ => return,
++        };
++        *stamp = Some(Instant::now());
++    }
++
++    pub(super) fn handoff_stamp(
++        &mut self,
++    ) -> Option<(usize, &mut Option<Instant>, Option<Instant>)> {
++        match self {
++            Self::Permit(flight) => {
++                Some((0, &mut flight.diagnostic_handoff, flight.diagnostic_queued))
++            }
++            Self::Complete(flight) => {
++                Some((1, &mut flight.diagnostic_handoff, flight.diagnostic_queued))
++            }
++            Self::Report(report) => {
++                Some((2, &mut report.diagnostic_handoff, report.diagnostic_queued))
++            }
++            _ => None,
++        }
++    }
++}
++
++impl Worker {
++    pub(in crate::worker) fn observe_sender_handoff(&mut self, message: &mut Message) {
++        let Some((kind, stamp, _)) = message.handoff_stamp() else {
++            return;
++        };
++        let Some(queued) = stamp.take() else { return }; // Local messages have no SPSC stamp.
++        let totals = &mut self.sender.handoff_totals[kind];
++        match Instant::now()
++            .checked_duration_since(queued)
++            .and_then(|age| u64::try_from(age.as_nanos()).ok())
++        {
++            Some(age) => {
++                totals.observed = totals.observed.wrapping_add(1);
++                totals.observe_ns = totals.observe_ns.wrapping_add(age);
++            }
++            None => totals.censored = totals.censored.wrapping_add(1),
++        }
++    }
++
++    pub(in crate::worker) fn sender_notification_clock(&self, worker: usize) -> Option<Instant> {
++        self.sender.handoff_pending[worker]
++            .iter()
++            .any(|p| p.count != 0)
++            .then(Instant::now)
++    }
++
++    pub(in crate::worker) fn record_sender_notification(&mut self, worker: usize, at: Instant) {
++        for (pending, totals) in self.sender.handoff_pending[worker]
++            .iter_mut()
++            .zip(&mut self.sender.handoff_totals)
++        {
++            let (count, sum) = pending.take(at);
++            if count == 0 {
++                continue;
++            }
++            if let Some(sum) = sum {
++                totals.notified = totals.notified.wrapping_add(count);
++                totals.notify_ns = totals.notify_ns.wrapping_add(sum);
++            } else {
++                totals.censored = totals.censored.wrapping_add(count);
++            }
++        }
++    }
++
++    pub(in crate::worker) fn publish_sender_handoffs(&mut self) {
++        macro_rules! publish {
++            ($kind:expr, $queued:ident, $queue_ns:ident, $notified:ident, $notify_ns:ident,
++             $observed:ident, $observe_ns:ident, $retry:ident, $censored:ident, $pending:ident) => {
++                let totals = &self.sender.handoff_totals[$kind];
++                self.counters.$queued = totals.queued;
++                self.counters.$queue_ns = totals.queue_ns;
++                self.counters.$notified = totals.notified;
++                self.counters.$notify_ns = totals.notify_ns;
++                self.counters.$observed = totals.observed;
++                self.counters.$observe_ns = totals.observe_ns;
++                self.counters.$retry = totals.retries;
++                self.counters.$censored = totals.censored;
++                self.counters.$pending = self
++                    .sender
++                    .handoff_pending
++                    .iter()
++                    .map(|p| p[$kind].count)
++                    .sum();
++            };
++        }
++        publish!(
++            0,
++            permit_enqueued,
++            permit_queue_ns,
++            permit_notified,
++            permit_notify_ns,
++            permit_observed,
++            permit_observe_ns,
++            permit_enqueue_retries,
++            permit_censored,
++            permit_notify_pending
++        );
++        publish!(
++            1,
++            complete_enqueued,
++            complete_queue_ns,
++            complete_notified,
++            complete_notify_ns,
++            complete_observed,
++            complete_observe_ns,
++            complete_enqueue_retries,
++            complete_censored,
++            complete_notify_pending
++        );
++        publish!(
++            2,
++            report_enqueued,
++            report_queue_ns,
++            report_notified,
++            report_notify_ns,
++            report_observed,
++            report_observe_ns,
++            report_enqueue_retries,
++            report_censored,
++            report_notify_pending
++        );
++    }
++}
++
++#[cfg(test)]
++#[test]
++fn notification_offsets_preserve_each_enqueue_age_and_reset() {
++    let start = Instant::now();
++    let mut pending = Pending::default();
++    pending.push(start);
++    pending.push(start + Duration::from_micros(3));
++    assert_eq!(
++        pending.take(start + Duration::from_micros(10)),
++        (2, Some(17_000))
++    );
++    assert_eq!(pending.take(start + Duration::from_micros(20)), (0, None));
++    pending.push(start + Duration::from_micros(30));
++    assert_eq!(
++        pending.take(start + Duration::from_micros(31)),
++        (1, Some(1_000))
++    );
++    pending.push(start + Duration::from_micros(40));
++    assert_eq!(pending.take(start), (1, None));
++}
+diff --git a/src/worker/sender/owner.rs b/src/worker/sender/owner.rs
+index 0029301..496298f 100644
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -586,6 +586,7 @@ impl Owner {
+             );
+             match result {
+                 Ok(()) => {
++                    request.flight.diagnostic_queued = Some(std::time::Instant::now());
+                     outgoing.push_back((worker, Message::Permit(request.flight)));
+                     granted_next.get_or_insert(self.request_cursor);
+                     more = true;
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index e178520..6af09e8 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -106,6 +106,17 @@ fn fresh_grant_clock_survives_older_worker_turn_through_handoff() {
+     assert!(packet.sample_slot.is_some());
+     assert!(workers[1].sender.job.is_none());
+     assert_eq!(workers[1].sessions[0].tx_retained, 0);
++    for worker in &mut workers {
++        worker.publish_sender_handoffs();
++    }
++    assert_eq!(workers[0].counters.permit_enqueued, 1);
++    assert_eq!(workers[1].counters.complete_enqueued, 1);
++    assert!(workers[0].counters.permit_queue_ns > 0);
++    assert!(workers[1].counters.complete_queue_ns > 0);
++    assert_eq!(workers[0].counters.permit_censored, 0);
++    assert_eq!(workers[1].counters.complete_censored, 0);
++    assert_eq!(workers[0].counters.complete_enqueued, 0);
++    assert_eq!(workers[1].counters.permit_enqueued, 0);
+ }
+ 
+ #[test]
+@@ -1355,3 +1366,58 @@ fn canceled_probe_defers_refill_until_reserved_suffix_drains() {
+     workers[1].flush_frames(observed).unwrap();
+     assert!(workers[1].sender.job.unwrap().first > job.first + count);
+ }
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn handoff_diagnostic_excludes_failed_pushes_and_preserves_early_observation() {
++    let (mut workers, _rx) = workers();
++    let [consumer, producer] = &mut workers;
++    while producer
++        .push(0, Event::Sender(Message::ProbeReplied { group: 0 }))
++        .is_ok()
++    {}
++    let report = producer.sender.report.take().unwrap();
++    producer.sender.queue(0, Message::Report(report)).unwrap();
++    let (_, Message::Report(report)) = producer.sender.outgoing.back_mut().unwrap() else {
++        panic!("missing queued report");
++    };
++    let queued = std::time::Instant::now() - Duration::from_millis(1);
++    report.diagnostic_queued = Some(queued);
++    producer.flush_sender_messages(Duration::ZERO).unwrap();
++    producer.publish_sender_handoffs();
++    assert_eq!(producer.counters.report_enqueue_retries, 1);
++    assert_eq!(producer.counters.report_enqueued, 0);
++    assert_eq!(producer.counters.report_queue_ns, 0);
++    let (_, Message::Report(report)) = producer.sender.outgoing.back().unwrap() else {
++        panic!("missing retried report");
++    };
++    assert_eq!(report.diagnostic_queued, Some(queued));
++    assert_eq!(producer.counters.report_notify_pending, 0);
++    while consumer.incoming[1].as_mut().unwrap().try_pop().is_some() {}
++    producer.flush_sender_messages(Duration::ZERO).unwrap();
++    let Some(Event::Sender(mut message)) = consumer.incoming[1].as_mut().unwrap().try_pop() else {
++        panic!("missing report");
++    };
++    consumer.observe_sender_handoff(&mut message);
++    producer.flush_notifications().unwrap();
++    producer.publish_sender_handoffs();
++    consumer.publish_sender_handoffs();
++    assert_eq!(producer.counters.report_enqueued, 1);
++    assert!(producer.counters.report_queue_ns >= 1_000_000);
++    assert_eq!(consumer.counters.report_queue_ns, 0);
++    assert_eq!(producer.counters.report_notified, 1);
++    assert_eq!(producer.counters.report_notify_pending, 0);
++    assert_eq!(consumer.counters.report_observed, 1);
++    assert_eq!(
++        producer.counters.report_censored + consumer.counters.report_censored,
++        0
++    );
++    // A running consumer can observe before the notification; the residual may be negative.
++    assert!(consumer.counters.report_observe_ns <= producer.counters.report_notify_ns);
++    consumer.observe_sender_handoff(&mut message);
++    consumer.publish_sender_handoffs();
++    assert_eq!(
++        consumer.counters.report_observed, 1,
++        "an unstamped local handoff is excluded"
++    );
++}
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 3abd0dc..0c50e23 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -8,6 +8,7 @@ use crate::{
+ };
+ use std::num::NonZeroU16;
+ 
++mod handoff;
+ mod history;
+ mod owner;
+ #[cfg(test)]
+@@ -64,6 +65,8 @@ pub(super) enum ReportKind {
+ 
+ /// Independent of send completions: frozen feedback cannot consume their storage.
+ pub(crate) struct Report {
++    diagnostic_handoff: Option<std::time::Instant>,
++    diagnostic_queued: Option<std::time::Instant>,
+     origin: usize,
+     group: usize,
+     id: PacketId,
+@@ -75,6 +78,8 @@ pub(crate) struct Report {
+ impl Report {
+     fn new(origin: usize) -> Self {
+         Self {
++            diagnostic_handoff: None,
++            diagnostic_queued: None,
+             origin,
+             group: 0,
+             id: PacketId::default(),
+@@ -219,6 +224,8 @@ pub(super) struct State {
+     pub(super) ack_free: Vec<Box<Ack>>,
+     pub(super) incoming: VecDeque<Box<Ack>>,
+     pub(super) outgoing: VecDeque<(usize, Message)>,
++    handoff_pending: [[handoff::Pending; 3]; 64],
++    handoff_totals: [handoff::Totals; 3],
+     outgoing_cursor: usize,
+     outgoing_left: usize,
+     outgoing_blocked: u64,
+@@ -315,6 +322,8 @@ impl State {
+             ack_free,
+             incoming,
+             outgoing,
++            handoff_pending: [[handoff::Pending::default(); 3]; 64],
++            handoff_totals: [handoff::Totals::default(); 3],
+             outgoing_cursor: 0,
+             outgoing_left: 0,
+             outgoing_blocked: 0,
+@@ -341,10 +350,11 @@ impl State {
+             .min()
+     }
+ 
+-    fn queue(&mut self, worker: usize, message: Message) -> io::Result<()> {
++    fn queue(&mut self, worker: usize, mut message: Message) -> io::Result<()> {
+         if self.outgoing.len() == self.outgoing.capacity() {
+             return Err(io::Error::other("sender message storage exhausted"));
+         }
++        message.stamp_queued();
+         self.outgoing.push_back((worker, message));
+         Ok(())
+     }
+@@ -556,7 +566,8 @@ impl Worker {
+             .ok_or_else(|| io::Error::other("transmit history on the wrong worker"))
+     }
+ 
+-    pub(super) fn sender_message(&mut self, message: Message, now: Duration) -> io::Result<()> {
++    pub(super) fn sender_message(&mut self, mut message: Message, now: Duration) -> io::Result<()> {
++        self.observe_sender_handoff(&mut message);
+         match message {
+             Message::Ack(ack) => {
+                 if self.sender.incoming.len() == self.sender.incoming.capacity() {
+@@ -770,7 +781,7 @@ impl Worker {
+                 self.sender.outgoing_cursor += 1;
+                 continue;
+             }
+-            let (_, message) = self
++            let (_, mut message) = self
+                 .sender
+                 .outgoing
+                 .remove(index)
+@@ -779,9 +790,34 @@ impl Worker {
+                 self.sender_message(message, now)?;
+                 progress = true;
+             } else {
++                let timing = message.handoff_stamp().map(|(kind, stamp, queued)| {
++                    let at = std::time::Instant::now();
++                    *stamp = Some(at);
++                    let age = queued
++                        .and_then(|queued| at.checked_duration_since(queued))
++                        .and_then(|age| u64::try_from(age.as_nanos()).ok());
++                    (kind, at, age)
++                });
+                 match self.push(worker, Event::Sender(message)) {
+-                    Ok(()) => progress = true,
+-                    Err(Event::Sender(message)) => {
++                    Ok(()) => {
++                        if let Some((kind, at, age)) = timing {
++                            self.sender.handoff_pending[worker][kind].push(at);
++                            let totals = &mut self.sender.handoff_totals[kind];
++                            totals.queued = totals.queued.wrapping_add(1);
++                            if let Some(age) = age {
++                                totals.queue_ns = totals.queue_ns.wrapping_add(age);
++                            } else {
++                                totals.censored = totals.censored.wrapping_add(1);
++                            }
++                        }
++                        progress = true;
++                    }
++                    Err(Event::Sender(mut message)) => {
++                        if let Some((kind, stamp, _)) = message.handoff_stamp() {
++                            *stamp = None;
++                            let totals = &mut self.sender.handoff_totals[kind];
++                            totals.retries = totals.retries.wrapping_add(1);
++                        }
+                         // Keep destination FIFO across partial sweeps and mid-sweep queue relief.
+                         self.sender.outgoing.insert(index, (worker, message));
+                         self.sender.outgoing_cursor += 1;
+diff --git a/src/worker.rs b/src/worker.rs
+index 441e256..82fe85e 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -1068,6 +1068,7 @@ impl Worker {
+     }
+ 
+     fn publish_counters(&mut self) {
++        self.publish_sender_handoffs();
+         self.publish_sender();
+         self.counters.reassembly_frames = self
+             .sessions
+@@ -1199,7 +1200,11 @@ impl Worker {
+         while mask != 0 {
+             let worker = mask.trailing_zeros() as usize;
+             mask &= mask - 1;
++            let timing = self.sender_notification_clock(worker);
+             self.shared.wakes[worker].notify()?;
++            if let Some(at) = timing {
++                self.record_sender_notification(worker, at);
++            }
+         }
+         Ok(())
+     }

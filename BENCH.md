@@ -1014,6 +1014,49 @@ Clippy and formatting. Tests cover timing sums, failed pushes, local-message
 exclusion and a consumer observing before notification. The production source
 is unchanged.
 
+## Outgoing sender queue timing (November 7)
+
+The [second diagnostic](benches/sender-handoff-diagnostic-v2.patch) adds the
+missing outgoing-queue boundary. Its first timestamp survives failed pushes;
+only successful foreign handoffs contribute to the queue mean. Local messages
+are excluded. The existing notification and consumer timestamps are unchanged.
+[All nine release observations](benches/tap-sender-handoff-diagnostic-v2.json)
+retain the same ascending rates, twenty-second duration and placement as above.
+
+| Requested Gbit/s each way / message | Queue insertion → pre-push, mean µs (L / R) | Pre-push → notification, mean µs (L / R) | Pre-push → consumer, mean µs (L / R) |
+| --- | ---: | ---: | ---: |
+| 21 / Permit | 0.46 / 0.54 | 4.42 / 6.18 | 18.29 / 15.62 |
+| 21 / Complete | 11.87 / 9.41 | 0.162 / 0.116 | 11.52 / 11.02 |
+| 21 / Report | 0.12 / 0.09 | 6.81 / 3.32 | 13.78 / 11.63 |
+| Unlimited / Permit | 0.45 / 0.60 | 4.34 / 7.05 | 18.85 / 16.12 |
+| Unlimited / Complete | 11.98 / 9.61 | 0.154 / 0.115 | 11.85 / 12.19 |
+| Unlimited / Report | 0.12 / 0.09 | 6.70 / 3.37 | 13.87 / 12.87 |
+
+Completions wait materially longer than permits and reports before publication.
+The worker creates them during sender service and defers their handoff until
+after receive/TAP work. This establishes a scheduling delay, not its causal
+throughput cost. The earlier notification experiment on an older sender was
+inconclusive; the current sender needs a matched comparison.
+
+Instrumented delivery is 2.24 / 2.57 Gbit/s at 4G, 2.75 / 2.68 at 8G and
+2.51 / 2.64 unlimited. Extra clock reads and run variation prevent treating
+differences against v1 or normal release as gains. Unlimited loss is
+95.56 / 94.79%, with 226.9 / 221.3% daemon CPU. TAP TX drops are
+2,105,080 / 1,851,524 SKBs, expiries 4,031 / 6,672 frames and queue drops
+2,539 / 23,362; ACK-buffer drops account for 128 / 130 of the queue drops.
+
+All retry, censor and pending counts are zero, and enqueued equals notified.
+Consumer-count skew reaches 329 messages (0.137%) across snapshot boundaries.
+Queue and observation means use separate intervals; adding them does not
+produce a per-message latency distribution. All nine observations have zero
+admission pressure, socket overflow, inner UDP errors, invalid/duplicate/
+out-of-window/wrong-run/reordered records and outer fragmentation.
+
+The diagnostic passes 176 pure tests, 59 kernel library tests, Clippy and
+formatting. Tests cover retention of the first timestamp across retry and
+exclusion of failed pushes and local messages. The compiled musl timing test
+again makes zero clock syscalls on this host. Production source is unchanged.
+
 ## Request fairness and burst-size experiments (November 7)
 
 Two normal-release sweeps use the ACK-pruning baseline, twenty-second points,
