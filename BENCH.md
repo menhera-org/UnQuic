@@ -1057,6 +1057,66 @@ formatting. Tests cover retention of the first timestamp across retry and
 exclusion of failed pushes and local messages. The compiled musl timing test
 again makes zero clock syscalls on this host. Production source is unchanged.
 
+## Earlier completion handoff: normal release comparison (November 7)
+
+A [two-line experiment](benches/sender-early-handoff.patch) flushes sender
+messages and notifications at the end of sender service, before receive/TAP
+work. The existing turn-tail flush, bounded message sweep, destination FIFO,
+pacing and queue limits remain unchanged. It adds no hot allocation or lock,
+but can cause more notification syscalls.
+
+[Twenty-two normal-release observations](benches/tap-sender-early-handoff.json)
+compare this with `0c4b5ac`, without diagnostic timestamps. Four fresh-daemon
+sweeps run in baseline/candidate/candidate/baseline order, each at 4G, 8G, 21G
+and unlimited for twenty seconds per point. The same daemons persist within
+each sweep. No builds or other tests overlap load.
+
+| Requested Gbit/s each way | Baseline mean delivered Gbit/s | Candidate mean delivered Gbit/s | Baseline mean CPU % | Candidate mean CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| 4 | 2.67 / 2.64 | 2.75 / 2.92 | 236.3 / 228.7 | 245.1 / 236.7 |
+| 8 | 2.64 / 2.54 | 2.67 / 2.90 | 231.4 / 223.3 | 242.3 / 234.0 |
+| 21 | 2.72 / 2.38 | 2.79 / 2.96 | 231.9 / 219.0 | 247.0 / 238.4 |
+| Unlimited | 2.58 / 2.47 | 2.61 / 2.82 | 224.7 / 216.8 | 239.4 / 229.6 |
+
+Reverse means improve 10.4–24.4%; forward means improve only 1.0–3.1%.
+Between-run variation remains large. A longer baseline/candidate pair uses
+sixty-second points at 21G, unlimited and 21G again:
+
+| Build / requested Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: |
+| Baseline / 21 | 2.752 / 2.575 | 86.81 / 87.64 | 235.6 / 223.9 |
+| Candidate / 21 | 2.809 / 3.249 | 86.53 / 84.43 | 257.4 / 249.3 |
+| Baseline / unlimited | 2.848 / 2.836 | 95.05 / 94.86 | 241.6 / 232.7 |
+| Candidate / unlimited | 2.758 / 3.195 | 95.31 / 94.45 | 255.0 / 247.3 |
+| Baseline / 21 return | 3.020 / 2.848 | 85.50 / 86.36 | 253.4 / 240.5 |
+| Candidate / 21 return | 3.039 / 3.325 | 85.44 / 84.06 | 270.1 / 256.6 |
+
+The longer pair confirms higher reverse delivery, but forward unlimited
+goodput falls 3.2% and CPU rises. This does not establish a general
+bidirectional win. The extra flush remains outside production. Its separate
+notification-syscall cost is unmeasured. A shorter queue wait alone is not
+enough to adopt the scheduling change.
+
+Drop attribution for the sixty-second unlimited points:
+
+| Build | TAP TX drops (SKBs) | Expired frames | Queue drops | ACK-buffer drops (subset) |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline | 6337246 / 5997588 | 29101 / 28095 | 6461 / 69545 | 511 / 398 |
+| Candidate | 6508178 / 6227400 | 23374 / 21895 | 4465 / 78435 | 660 / 315 |
+
+All twenty-two points have zero admission pressure, socket overflow,
+inner UDP errors, invalid/duplicate/out-of-window/wrong-run/reordered records
+and outer fragmentation. Raw observations retain actual offered load,
+per-worker CPU and every drop counter.
+
+The experiment passes 341 ordinary release tests, Clippy, formatting and
+66 short kernel/integration checks. Its regression fails on the baseline
+because a completion remains queued when sender service returns; the candidate
+publishes it and wakes its owner before other worker work. Reconnect ACK
+readiness takes 20.813 seconds in the foreign-namespace test; the existing
+service-delay gap remains. Full routed PMTU and default-feature checks were
+not repeated for this unadopted experiment.
+
 ## Request fairness and burst-size experiments (November 7)
 
 Two normal-release sweeps use the ACK-pruning baseline, twenty-second points,

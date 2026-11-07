@@ -1,0 +1,47 @@
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 3abd0dc..8bcaacc 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -1024,6 +1024,9 @@ impl Worker {
+                 }
+             }
+         }
++        // Do not hold completions behind receive and TAP work.
++        more |= self.flush_sender_messages(now)?;
++        self.flush_notifications()?;
+         Ok(more)
+     }
+ 
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index e178520..717cba1 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -1355,3 +1355,28 @@ fn canceled_probe_defers_refill_until_reserved_suffix_drains() {
+     workers[1].flush_frames(observed).unwrap();
+     assert!(workers[1].sender.job.unwrap().first > job.first + count);
+ }
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn completion_reaches_owner_before_other_worker_work() {
++    let (mut workers, _rx) = workers();
++    frame(&mut workers[1]);
++    workers[1].flush_sender_messages(Duration::ZERO).unwrap();
++    workers[0].drain_queues(Duration::ZERO).unwrap();
++    workers[0].service_sender(Duration::ZERO).unwrap();
++    workers[1].drain_queues(Duration::ZERO).unwrap();
++    assert!(workers[1].sender.permitted);
++    workers[0].reactor.drain(WAKE_TOKEN).unwrap();
++
++    workers[1].service_sender(Duration::ZERO).unwrap();
++
++    assert!(workers[1].sender.outgoing.is_empty());
++    assert_eq!(workers[1].notifications, 0);
++    assert!(matches!(
++        workers[0].incoming[1].as_mut().unwrap().try_pop(),
++        Some(Event::Sender(Message::Complete(_)))
++    ));
++    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
++    let count = workers[0].reactor.wait(&mut events, 0).unwrap();
++    assert!(events[..count].iter().any(|event| event.u64 == WAKE_TOKEN));
++}
