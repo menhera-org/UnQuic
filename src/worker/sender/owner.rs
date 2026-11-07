@@ -473,6 +473,7 @@ impl Owner {
                     .map_or(self.reclaim_due, |due| due.min(self.reclaim_due)),
             );
         }
+        let mut granted_next = None;
         for _ in 0..self.requests.len().min(BATCH_SIZE) {
             if work == 0 || outgoing.len() == outgoing.capacity() {
                 break;
@@ -572,6 +573,7 @@ impl Owner {
             match result {
                 Ok(()) => {
                     outgoing.push_back((worker, Message::Permit(request.flight)));
+                    granted_next.get_or_insert(self.request_cursor);
                     more = true;
                 }
                 Err(GrantError::Blocked) if request.pmtu => {
@@ -592,6 +594,10 @@ impl Owner {
                     return Err(io::Error::other(error));
                 }
             }
+        }
+        // A full scan must not give the same ready worker first refusal again.
+        if let Some(next) = granted_next {
+            self.request_cursor = next;
         }
         Ok(more)
     }
@@ -1549,5 +1555,117 @@ mod drain_tests {
         );
         assert_eq!(owner.sender.flight_bytes(0), Some((0, 0)));
         assert!(!owner.sender.feedback_ready(0));
+    }
+}
+
+#[cfg(test)]
+mod fairness_regression {
+    use super::*;
+
+    fn request(mut flight: Box<Flight>, number: u64, group: usize) -> Request {
+        flight
+            .prepare(&[pacing::Planned {
+                id: PacketId {
+                    session: group,
+                    generation: 1,
+                    lane: if group == 0 {
+                        flight.worker() as u16 + 1
+                    } else {
+                        1
+                    },
+                    number,
+                },
+                bytes: 1280,
+            }])
+            .unwrap();
+        Request {
+            flight,
+            group,
+            deadline: Duration::from_secs(1),
+            probe: None,
+            mtu: 1280,
+            pmtu: false,
+        }
+    }
+
+    #[test]
+    fn continuously_ready_workers_alternate_across_pacer_deadlines() {
+        let (mut owner, flights) = Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)]).unwrap();
+        owner.timers.install(0, 1).unwrap();
+        for flight in flights.into_vec() {
+            owner.request(request(flight, 1, 0)).unwrap();
+        }
+        let mut outgoing = VecDeque::with_capacity(16);
+        let mut next = [2, 2];
+        let mut selected = Vec::new();
+        let mut now = Duration::ZERO;
+        for _ in 0..6 {
+            owner.advance(now, &mut outgoing).unwrap();
+            let (worker, Message::Permit(mut flight)) = outgoing.pop_front().unwrap() else {
+                panic!()
+            };
+            assert!(outgoing.is_empty());
+            selected.push(worker);
+            flight.complete(0, None, false).unwrap();
+            owner.complete(flight).unwrap();
+            // Commit/recycle while pacing still blocks the other continuously queued worker.
+            owner.advance(now, &mut outgoing).unwrap();
+            let (origin, Message::Recycle(flight)) = outgoing.pop_front().unwrap() else {
+                panic!()
+            };
+            assert_eq!(origin, worker);
+            assert!(outgoing.is_empty());
+            owner.request(request(flight, next[worker], 0)).unwrap();
+            next[worker] += 1;
+            now = owner.sender.deadline(0, now).unwrap();
+        }
+        assert_eq!(selected, [0, 1, 0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn later_group_grants_do_not_starve_another_workers_group() {
+        let (mut owner, flights) = Owner::new(2, 3, &[(0, 1, 0), (0, 2, 0), (1, 1, 1)]).unwrap();
+        for session in 0..2 {
+            owner.timers.install(session, 1).unwrap();
+        }
+        for flight in flights.into_vec() {
+            let group = usize::from(flight.worker() == 2);
+            owner.request(request(flight, 1, group)).unwrap();
+        }
+        let mut outgoing = VecDeque::with_capacity(16);
+        let mut next = [2; 3];
+        let mut seen = 0;
+        let mut now = Duration::ZERO;
+        for round in 0..6 {
+            owner.advance(now, &mut outgoing).unwrap();
+            assert_eq!(outgoing.len(), 2);
+            while let Some((worker, message)) = outgoing.pop_front() {
+                let Message::Permit(mut flight) = message else {
+                    panic!()
+                };
+                seen |= 1 << worker;
+                flight.complete(0, None, false).unwrap();
+                owner.complete(flight).unwrap();
+            }
+            owner.advance(now, &mut outgoing).unwrap();
+            assert_eq!(outgoing.len(), 2);
+            while let Some((worker, message)) = outgoing.pop_front() {
+                let Message::Recycle(flight) = message else {
+                    panic!()
+                };
+                owner
+                    .request(request(flight, next[worker], usize::from(worker == 2)))
+                    .unwrap();
+                next[worker] += 1;
+            }
+            now = (0..2)
+                .filter_map(|group| owner.sender.deadline(group, now))
+                .max()
+                .unwrap();
+            if round % 3 == 2 {
+                assert_eq!(seen, 0b111);
+                seen = 0;
+            }
+        }
     }
 }

@@ -153,6 +153,89 @@ Of 164,797 / 167,474 received send grants, 1,047 / 865 expired and
 an exact frame-loss total. Final pacing gauges were sampled after draining and
 must not be used as steady-load controller rates.
 
+## Request fairness and burst-size experiments (November 7)
+
+Two normal-release sweeps use the ACK-pruning baseline, twenty-second points,
+retained daemons and the same placement as above. Neither uses temporary
+instrumentation, and no builds or tests overlap measurement.
+
+[Advancing priority after the first grant](benches/tap-sender-fairness.json)
+fixes deterministic worker starvation. The single-group regression previously
+selected worker 0 six times while worker 1 remained ready; it now alternates.
+A second regression checks three ready workers across two path groups.
+
+| Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | 15.99 / 15.97 | 0.88 / 0.77 | 94.34 / 95.05 | 159.33 / 157.21 |
+| 21 | 20.98 / 20.89 | 0.86 / 0.83 | 95.80 / 95.92 | 159.13 / 148.59 |
+| Unlimited | 59.96 / 57.05 | 0.88 / 0.84 | 98.49 / 98.49 | 161.30 / 151.48 |
+| 16 return | 15.98 / 15.97 | 0.87 / 0.83 | 94.40 / 94.64 | 162.23 / 149.11 |
+
+This intermediate change reduces goodput. At 21G, worker 0 receives
+34,439 / 31,060 grants and cancels 33,305 / 30,204, with zero grant expiry.
+Other workers have almost no cancellations. Inspection identifies repeated
+control overtaking: the loop prepares lane-0 DATA, then sends ACKs with larger
+packet numbers before its grant arrives. The stale DATA grant is rejected.
+Fairer access gives this path more grants, exposing more wasted pacing credit.
+
+At 21G, total endpoint counters report 756,926 / 747,544 TAP TX drops,
+103,783 / 137,480 frame expiries and 163 / 9,085 worker queue drops.
+Every point has zero admission pressure, socket overflow, inner UDP errors,
+invalid/duplicate/out-of-window/wrong-run records, reordering and outer fragments.
+The fairness change passes 330 release tests, default-feature tests, Clippy
+and 51 short kernel tests. One reconnect takes 19.19 seconds; the existing
+service-delay gap remains. Full routed discovery will be rerun with the
+control-overtaking fix.
+
+[Increasing only the DATA cap from 16 to 64 maximum datagrams](benches/tap-sender-current-cap64.json)
+uses the original request priority. It includes the current loss-before-PTO
+barrier, unlike the earlier instrumented cap experiment. BBR's quantum remains
+at most 64 KiB; the larger cap does not change the congestion window or packet MTU.
+
+| Requested Gbit/s each way | Actual offered Gbit/s | Delivered Gbit/s | Missing after drain % | Daemon CPU % |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | 15.98 / 15.99 | 1.81 / 1.90 | 88.50 / 87.90 | 182.25 / 178.19 |
+| 21 | 20.94 / 20.92 | 1.78 / 1.90 | 91.34 / 90.77 | 180.56 / 182.68 |
+| Unlimited | 61.51 / 55.08 | 1.88 / 1.84 | 96.90 / 96.60 | 186.05 / 183.87 |
+| 16 return | 15.59 / 15.76 | 1.89 / 1.88 | 87.66 / 87.89 | 187.09 / 181.00 |
+
+The larger burst raises 21G goodput from 1.18 / 1.20 to 1.78 / 1.90 Gbit/s
+while using slightly less CPU. This is a measured gain, still far below target.
+At 21G, endpoint counters report 715,178 / 677,696 TAP TX drops,
+41,777 / 62,350 frame expiries, 15,968 / 45,415 worker queue drops and
+23,036 / 23,000 canceled grants. There are eight inner UDP receive errors on
+the right at that point; other points have none. All points have zero admission
+pressure, outer socket overflow, invalid/duplicate/out-of-window/wrong-run records
+and outer fragmentation. Reordering stays below 0.0013%.
+
+## Exact sender timing and notification experiment (November 7)
+
+[Two instrumented pairs](benches/tap-sender-notify-diagnostic.json) measure
+phase transitions and successful-grant transit directly. The isolated build
+includes the experimental 64-datagram cap and ACK pruning, but predates the
+production loss-before-PTO barrier. Each point requests 21 Gbit/s each way
+for ten seconds. No builds or tests overlap measurement.
+
+Exact phase totals put 87–88% of baseline time in Open, 7–9% in Closing,
+about 0.4% in Commit and 3–4% in Feedback. These totals include the drain
+interval. Open includes pacing waits and flight/request transit; it does not
+mean sending was unconstrained. Older sampled-state phase counters cannot
+attribute the interval preceding a sample reliably.
+
+| Build / point | Delivered Gbit/s | Daemon CPU % | Grant to pre-send µs | Pre-send to owner receipt µs |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline / 1 | 1.89 / 1.76 | 185.31 / 181.23 | 17.68 / 18.41 | 39.79 / 39.30 |
+| Baseline / 2 | 1.90 / 1.88 | 189.52 / 186.29 | 17.85 / 18.44 | 40.40 / 39.64 |
+| Earlier notifications / 1 | 1.87 / 1.91 | 187.34 / 180.23 | 16.77 / 15.98 | 41.35 / 34.91 |
+| Earlier notifications / 2 | 1.85 / 2.17 | 196.76 / 194.12 | 16.22 / 15.79 | 37.40 / 35.26 |
+
+The treatment flushes sender messages and worker notifications before the
+remaining receive/TAP work, retaining the turn-tail flush. Timing means count
+successful-prefix completions; the second interval includes both the syscall
+and completion handoff. There is no consistent bidirectional throughput gain,
+and additional notification syscall cost was not isolated. The change remains
+outside production. The JSON retains loss, per-worker CPU and drop attribution.
+
 ## ACK-pruning normal release sweep (November 7)
 
 [Four normal release observations](benches/tap-ack-prune.json) measure the

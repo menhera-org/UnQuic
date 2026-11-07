@@ -528,6 +528,8 @@ includes these histories, the shared sampler and all reserved message buffers.
 The coordinator drains ready completions and feedback within one shared
 64-unit work budget. Workers hand off newly queued requests and completions
 before the end-of-turn notification flush.
+Request priority advances after the first granted worker, so a full scan or
+another path group's later grant cannot repeatedly favor the same worker.
 
 A rejected grant preserves the complete prepared packet plan, so temporary
 window or pacing pressure cannot permanently shrink subsequent batches.
