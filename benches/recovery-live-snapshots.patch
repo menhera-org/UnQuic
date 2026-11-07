@@ -1,0 +1,33 @@
+diff --git a/benches/tap_transport.sh b/benches/tap_transport.sh
+index e2c2f67..25566bf 100644
+--- a/benches/tap_transport.sh
++++ b/benches/tap_transport.sh
+@@ -151,7 +151,7 @@ for side in left right; do
+ done
+ snapshot() {
+     kill -USR1 "$left" "$right"
+-    if [ -n "${UDP_LOAD:-}" ] && [ "$1" != after ]; then
++    if [ -n "${UDP_LOAD:-}" ] && { [ "$1" = before ] || [ "$1" = sent ]; }; then
+         kill -USR1 "$server" "$reverse_server"
+     fi
+     sleep 0.1
+@@ -159,6 +159,8 @@ snapshot() {
+     cp "$base/right.log" "$out/$1.right-log"
+     cat /proc/uptime > "$out/$1.uptime"
+     cat /proc/stat > "$out/$1.cpu"
++    cat /sys/fs/cgroup/cpu.stat > "$out/$1.cgroup-cpu"
++    cat /sys/fs/cgroup/cpu.max > "$out/$1.cgroup-limit"
+     cat /proc/"$left"/stat /proc/"$right"/stat > "$out/$1.process"
+     cat /proc/"$left"/task/*/stat /proc/"$right"/task/*/stat > "$out/$1.threads"
+     cat /proc/net/snmp6 > "$out/$1.outer"
+@@ -231,6 +233,10 @@ for rate in ${BITRATE:-0}; do
+             --connect-timeout 3000 > "$out/reverse-client.json" &
+         reverse_client=$!
+     fi
++    for sample in 1 2 3 4 5; do
++        sleep 10
++        snapshot "live-$sample"
++    done
+     wait "$client"
+     client=
+     wait "$reverse_client"

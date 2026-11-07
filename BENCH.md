@@ -94,24 +94,84 @@ and mapping-capacity versus changed-selection rejection. Updates add no clocks,
 allocations, syscalls or scans. Tests verify exact classification, publication,
 reset and repeated-cleanup behavior. The diagnostic build passes 345 all-feature
 and 336 default release tests, Clippy, 30 targeted kernel checks and the
-two-loss relay. Throughput measurements with these counters are pending.
+two-loss relay. Three sixty-second QinQ points with five live daemon snapshots
+per point still deliver only 1.57–1.89 Gbit/s. These are diagnostic observations;
+snapshot formatting may affect scheduling. No local compilation, kernel tests
+or Git packing overlapped measurement. Separate-machine migration tests did.
+
+| Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | Daemon CPU % L / R |
+| --- | --- | --- | --- |
+| 21 Gbit/s | 1.785 / 1.571 | 91.426 / 92.363 | 210.24 / 204.41 |
+| Unlimited | 1.775 / 1.612 | 96.967 / 96.974 | 207.04 / 202.38 |
+| 21 Gbit/s return | 1.888 / 1.670 | 90.948 / 91.895 | 215.37 / 209.50 |
+
+The unlimited point attributes expiry as follows. These are daemon-side counts,
+not direction-specific application loss totals; a daemon both transmits and
+receives.
+
+| Expiry class | Left | Right |
+| --- | ---: | ---: |
+| Unmaterialized source children | 312 | 176 |
+| Materialized, never submitted | 3,137,519 | 4,822,323 |
+| Partially submitted | 58,979 | 78,272 |
+| Fully submitted, ACK incomplete | 553,012 | 738,639 |
+| Incomplete receive frame | 76,855 | 58,647 |
+| Complete frame awaiting TAP | 0 | 0 |
+| Total | 3,826,677 | 5,698,057 |
+
+All six subsets sum exactly to the total in all three runs. Unsent transmit
+frames dominate expiry. Fully submitted expiry can occur after successful TAP
+delivery; partial expiry is only an upper bound on orphaned receive frames.
+This establishes where retention ends, not why the sender fails to drain it.
+
+Cleanup yields 837 / 833 times in the unlimited run, with lifetime peak depths
+186 / 183. Across all three runs the largest worker peak is 186. Mapping-capacity
+and changed-selection rejections remain zero. Those observations do not support
+an unbounded cleanup backlog or exhausted recovery mappings as the bottleneck.
+Staging yields 69,527 / 36,937 times for 635,174 / 659,458 reports. Its scheduling
+cost remains a candidate, not a measured cause.
+
+Unlimited admission pressure is 37,605 / 4,427, queue drops 6,004 / 72,632
+(including 1,298 / 488 ACK-buffer drops), and TAP ingress drops
+6,525,183 / 5,821,140 source SKBs. Repairs number 219 / 0. Live samples show
+persistent receive occupancy on some workers, including up to 64 retained
+frames, while others remain nearly empty. No completed receive frame expires.
+Receiver pressure remains relevant, but cannot explain the millions of unsent
+transmit expiries on its own.
+
+All three runs have zero outer socket overflow, outer UDP errors, inner UDP
+errors, outer fragments, corrupt records and duplicate inner delivery. Complete
+frame reordering reaches 0.00202%. The container cgroup reports no CPU quota
+and zero throttling; ancestor restrictions were not inspected.
+[Raw measurements](benches/tap-recovery-counters.json) retain worker deltas,
+live gauges and cgroup readings; [the diagnostic patch](benches/recovery-live-snapshots.patch)
+reproduces the sampling. An excluded pilot signaled receivers during load and
+exhausted their two-sample storage, truncating its goodput interval to ten
+seconds. The corrected runs signal receivers only at the interval boundaries.
 
 The broader recheck found a post-address-migration forwarding timeout at
 `tests/linux_runtime.rs:637` on both Linux 6.8 and Linux 7.0. The affected test
 sends one frame after both peers publish newer generations; that frame did not
 arrive within two seconds. A focused Linux 7.0 repeat passes, so the cause is
-not yet established. Do not treat the full runtime matrix as passed. Published
-generations prove installation-barrier completion but do not reset the shared
-path group's congestion state or backed-off PTO. Whether that gate caused the
-loss still needs evidence.
+not yet established. Do not treat the full runtime matrix as passed. A quiet
+failure snapshot shows the target on lane 2: its 176-byte DATA datagram and
+21 baseline probes were submitted, but their bytes did not appear in receiver
+worker totals. A separate lane's unsent expiry was unrelated background traffic.
+The target therefore was not held behind the shared path group's backed-off
+PTO. Receiver totals increment before protocol admission, so tag checks alone
+cannot explain the missing bytes. Destination/socket selection, kernel drops
+and unread socket queues remain under investigation. Two runs with early
+transport tracing passed; that tracing may perturb the race.
 
 The corrected Linux 7.0 fixture passes 66 library checks, foundation, short
 PMTU, external rename/move, two-loss recovery, CLI and generator tests. The
 first fixture attempt omitted loopback setup inside its private namespace;
 its address-binding failures were harness errors. The diagnostic Linux 6.8
 build passes 68 library checks, foundation, short PMTU, rename/move and two-loss
-recovery before the same migration timeout. Long routed PMTU checks are
-running independently on both kernels.
+recovery before the same migration timeout. Both long routed PMTU checks pass: 649.92 seconds on Linux 7.0 and 653.57
+seconds on Linux 6.8. Each confirms 9000→1500→1280→9000 with returned PTB,
+filtered PTB and the real upward-retry interval, without outer fragments or
+capture drops. This does not clear the separate migration failure.
 
 ## ACK admission and ordinary loss fairness (November 7)
 
