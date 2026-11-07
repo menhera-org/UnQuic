@@ -377,8 +377,13 @@ impl Worker {
         }
         let Some(mut ack) = self.sender.ack_free.pop() else {
             self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
+            self.counters.ack_buffer_drops = self.counters.ack_buffer_drops.wrapping_add(1);
             self.sessions[session].totals.queue_drops =
                 self.sessions[session].totals.queue_drops.wrapping_add(1);
+            self.sessions[session].totals.ack_buffer_drops = self.sessions[session]
+                .totals
+                .ack_buffer_drops
+                .wrapping_add(1);
             return Ok(());
         };
         ack.session = session;

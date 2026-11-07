@@ -673,6 +673,47 @@ Worker queue drops remain substantial and are not yet attributed by cause.
 The JSON files retain every point's per-worker counters and CPU use.
 No builds or other tests ran during the load intervals.
 
+## Incoming ACK storage pressure (November 7)
+
+The new `ack_buffer_drops` counter isolates ACK records rejected when all
+reserved incoming ACK buffers are busy. It remains included in `queue_drops`.
+The [matched four-versus-sixteen-buffer sweep](benches/tap-sender-ack-pool.json)
+uses `aa1ca3d` plus that counter, with retained DATA suffixes and the production
+window/control policy. Existing dependent queue capacities and memory accounting
+follow the buffer constant; the treatment changes no processing budget.
+
+| Buffers / requested Gbit/s each way | Delivered Gbit/s | Missing after drain % | Daemon CPU % | ACK-buffer drops | Other queue drops |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4 / 16 | 2.28 / 2.16 | 85.45 / 86.17 | 219.21 / 211.86 | 67 / 90 | 942 / 22571 |
+| 4 / 21 | 2.15 / 1.96 | 89.57 / 90.50 | 213.51 / 200.74 | 65 / 68 | 880 / 18146 |
+| 4 / unlimited | 2.24 / 1.99 | 96.10 / 96.33 | 216.02 / 202.51 | 54 / 56 | 655 / 18566 |
+| 4 / 16 return | 2.26 / 1.95 | 85.58 / 87.55 | 217.92 / 202.87 | 39 / 43 | 738 / 17885 |
+| 16 / 16 | 2.32 / 2.17 | 85.25 / 86.21 | 220.99 / 211.72 | 0 / 0 | 784 / 20287 |
+| 16 / 21 | 2.35 / 2.01 | 88.58 / 90.19 | 220.36 / 206.51 | 0 / 0 | 466 / 18859 |
+| 16 / unlimited | 2.29 / 2.06 | 95.98 / 96.15 | 219.35 / 207.47 | 0 / 0 | 667 / 19059 |
+| 16 / 16 return | 2.22 / 1.92 | 85.79 / 87.71 | 209.17 / 193.10 | 0 / 0 | 794 / 18050 |
+
+Incoming ACK exhaustion explains only 0.37% of the right endpoint's queue
+drops at 21G with four buffers. Sixteen removes that loss, but its return
+point is slower and the paced gain is within the spread of preceding normal
+release sweeps. Production keeps four buffers. The new counter and pressure
+regression are retained.
+
+Code inspection attributes the right transmit-only worker's remaining drops
+to foreign source admission, which checks its free buffers, source queue and
+frame/byte quotas before exchanging ownership. These drops are consistent
+with ingress far exceeding paced output; their presence does not establish
+a cause of the low sender ceiling. Enlarging those queues has not been justified.
+
+Both builds pass 339 ordinary release tests, all sixteen sender kernel tests,
+Clippy and formatting. The regression fills the exact ACK capacity, rejects
+and counts two excess records, completes real ACK/report handoffs, then
+verifies returned buffers accept another ACK and sampled inflight bytes settle.
+All eight observations have zero admission pressure, outer socket overflow,
+inner UDP errors, outer fragments and receiver corruption, duplicates or
+reordering. The full JSON includes expiry, TAP drops and per-worker CPU.
+No build or other test overlapped a load interval.
+
 ## Request fairness and burst-size experiments (November 7)
 
 Two normal-release sweeps use the ACK-pruning baseline, twenty-second points,

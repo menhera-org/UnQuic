@@ -108,6 +108,8 @@ metrics! {
     expired_frames: sum,
     /// Entries rejected because a bounded queue was full.
     queue_drops: sum,
+    /// ACK records dropped for lack of a reserved receive buffer; a subset of queue_drops, not additive.
+    ack_buffer_drops: sum,
     /// Datagrams not fully admitted because receive frame storage was full.
     admission_pressure: sum,
     /// Socket receive drops reported by SO_RXQ_OVFL, in kernel skb units.

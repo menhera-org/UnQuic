@@ -710,8 +710,10 @@ frames waiting for TAP.
 Pressure is attributed where detected. `admission_pressure` counts datagrams
 still not fully admitted after the drain/retry attempt; useful existing pieces
 may have been retained, but that packet is not ACK-eligible. `queue_drops`
-counts bounded handoff/retention queue failures separately. Drops before lane
-admission appear only in worker/session totals. `socket_overflow` counts
+counts bounded handoff/retention queue failures separately. Its
+`ack_buffer_drops` subset counts incoming ACK records rejected because all
+reserved ACK buffers are busy; do not add it to `queue_drops`. Both appear
+in worker/session totals. Drops before lane admission have no lane total. `socket_overflow` counts
 SO_RXQ_OVFL increments per receive socket, in kernel skb units, at worker scope.
 GRO means these are not necessarily logical datagrams. The kernel reports a
 cumulative 32-bit count on subsequent receives. Modular forward deltas below

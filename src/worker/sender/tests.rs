@@ -1080,3 +1080,65 @@ fn canceled_higher_reservation_discards_an_unreserved_old_plan_suffix() {
     assert!(worker.sender.job.unwrap().first > overtaker);
     worker.sessions[0].batches[1] = Some(batch);
 }
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn ack_buffer_pressure_counts_only_excess_and_reuses_returned_storage() {
+    let (mut workers, _rx) = workers();
+    frame(&mut workers[1]);
+    let number = workers[1].sender.job.unwrap().first;
+    for _ in 0..8 {
+        service(&mut workers);
+    }
+    let index = workers[1].sender_index(0, 1).unwrap();
+    assert!(workers[1].sender.lanes[index].history.inflight_bytes() != 0);
+    let ranges = [AckRange {
+        start: number,
+        end: number,
+    }];
+    let now = Duration::from_millis(2);
+    for worker in &mut workers {
+        worker.io_time = Some(Ok);
+    }
+    assert_eq!(workers[0].sender.ack_free.len(), ACK_BUFFERS);
+    for _ in 0..ACK_BUFFERS {
+        workers[0]
+            .incoming_ack(0, 1, 2, 0, AckRanges::new(&ranges).unwrap(), now)
+            .unwrap();
+    }
+    assert!(workers[0].sender.ack_free.is_empty());
+    assert_eq!(workers[0].sender.outgoing.len(), ACK_BUFFERS);
+    assert_eq!(workers[0].counters.ack_buffer_drops, 0);
+    for _ in 0..2 {
+        workers[0]
+            .incoming_ack(0, 1, 2, 0, AckRanges::new(&ranges).unwrap(), now)
+            .unwrap();
+    }
+    assert_eq!(workers[0].sender.outgoing.len(), ACK_BUFFERS);
+    assert_eq!(workers[0].counters.ack_buffer_drops, 2);
+    assert_eq!(workers[0].counters.queue_drops, 2);
+    assert_eq!(workers[0].sessions[0].totals.ack_buffer_drops, 2);
+    assert_eq!(workers[0].sessions[0].totals.queue_drops, 2);
+    for _ in 0..8 * ACK_BUFFERS {
+        for worker in &mut workers {
+            worker.drain_queues(now).unwrap();
+            worker.service_sender(now).unwrap();
+        }
+    }
+    assert_eq!(workers[0].sender.ack_free.len(), ACK_BUFFERS);
+    assert_eq!(workers[1].sender.lanes[index].history.inflight_bytes(), 0);
+    assert!(workers[1].sender.lanes[index].ack.is_none());
+    workers[0]
+        .incoming_ack(0, 1, 2, 0, AckRanges::new(&ranges).unwrap(), now)
+        .unwrap();
+    assert_eq!(workers[0].sender.ack_free.len(), ACK_BUFFERS - 1);
+    for _ in 0..8 {
+        for worker in &mut workers {
+            worker.drain_queues(now).unwrap();
+            worker.service_sender(now).unwrap();
+        }
+    }
+    assert_eq!(workers[0].sender.ack_free.len(), ACK_BUFFERS);
+    assert_eq!(workers[0].counters.ack_buffer_drops, 2);
+    assert_eq!(workers[0].counters.queue_drops, 2);
+}
