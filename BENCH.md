@@ -962,6 +962,58 @@ inner UDP errors, malformed/invalid/duplicate/out-of-window/wrong-run/reordered
 records and outer IPv6 fragmentation. Runtime selective repair remains open;
 that does not explain away the sender's overload decline.
 
+## Foreign sender handoff timing (November 7)
+
+A [temporary diagnostic](benches/sender-handoff-diagnostic-v1.patch) measures
+foreign Permit, Complete and Report handoffs without changing notification
+placement, pacing or transport timestamps.
+[The release sweep](benches/tap-sender-handoff-diagnostic-v1.json) repeats the
+same nine offered rates as the normal build above. It uses pooled timestamp
+fields and fixed worker-local counters; no hot allocation or lock is added.
+The compiled musl timing test makes no `clock_gettime` syscall on the tested
+host. Other deployment kernels may use a different clock path.
+
+Each timing starts immediately before the successful SPSC push, then ends
+either immediately before the existing eventfd notification call or at the
+consumer handler. The start can include producer preemption before publication.
+Local synchronous messages and failed pushes are excluded. These are load-only
+before/sent snapshots, separate from post-drain throughput counters.
+
+| Requested Gbit/s each way / message | Pre-push → notification, mean µs (L / R) | Pre-push → consumer observation, mean µs (L / R) |
+| --- | ---: | ---: |
+| 21 / Permit | 4.30 / 6.56 | 17.40 / 14.26 |
+| 21 / Complete | 0.147 / 0.104 | 9.76 / 11.69 |
+| 21 / Report | 7.08 / 3.31 | 11.40 / 12.75 |
+| Unlimited / Permit | 4.41 / 6.87 | 18.84 / 14.93 |
+| Unlimited / Complete | 0.146 / 0.104 | 11.03 / 12.02 |
+| Unlimited / Report | 6.86 / 3.20 | 13.74 / 13.01 |
+
+Notification delays are measurable, but these intervals do not establish the
+throughput bottleneck. In particular, Complete's short notification interval
+starts after it leaves the producer's outgoing queue. Its earlier wait until
+the end-of-turn handoff is unmeasured here. The next diagnostic includes that
+boundary.
+
+All failed-push, censored-timestamp and pending-notification counts are zero;
+each producer's enqueued and notified totals agree. Consumer counts differ
+by up to 442 messages, or 0.181%, because snapshots and in-flight messages
+cross interval boundaries. Raw counts and signed residuals are retained.
+Observation minus notification is not direct wakeup latency: a running
+consumer can handle a message before notification.
+
+Instrumented delivery is 2.58 / 2.72 Gbit/s at 3G offered, 2.79 / 2.36 at
+4G and 2.20 / 2.48 unlimited. The normal build gave 2.33 / 2.42,
+2.68 / 2.70 and 2.22 / 2.57 respectively. Instrumentation and run variation
+prevent treating these differences as gains. The overload decline remains.
+All nine points have zero admission pressure, outer socket overflow,
+inner UDP errors, malformed/invalid/duplicate/out-of-window/wrong-run/reordered
+records and outer fragmentation.
+
+The diagnostic passes 176 pure tests, 59 ignored kernel library regressions,
+Clippy and formatting. Tests cover timing sums, failed pushes, local-message
+exclusion and a consumer observing before notification. The production source
+is unchanged.
+
 ## Request fairness and burst-size experiments (November 7)
 
 Two normal-release sweeps use the ACK-pruning baseline, twenty-second points,
