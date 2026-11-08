@@ -807,6 +807,20 @@ full expired batches sharing the cleanup budget.
 - Audit production panic paths, including implicit bounds/overflow failures and
   thread startup/join errors. Add malformed-input and fault-injection tests that
   verify error handling preserves published TAPs; keep assertions in tests only.
+  The November 8 library-only check at `bed89aa` reports 96 `unwrap`/`expect`
+  sites: 73 in `worker.rs`, nine in `wire.rs`, five in `handshake.rs`,
+  three in worker feedback, two each in runtime and reassembly, and one
+  each in packing and sockets. This identifies panic-capable operations;
+  it does not prove their preconditions can fail. It excludes the daemon,
+  implicit indexing, arithmetic overflow, allocation failure and other
+  library calls that can panic. A passing ordinary Clippy run does not
+  close this requirement.
+
+  ```sh
+  cargo clippy --release --target x86_64-unknown-linux-musl --lib --all-features -- \
+    -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic
+  ```
+
 - Container tests for Linux bridge, OVS system port where OVS is available,
   VLAN and QinQ uppers, macvlan, multiple MACs, multicast, broadcast and LLC
   frames, as section 14.1 V04 lists. Each test creates and deletes its own
