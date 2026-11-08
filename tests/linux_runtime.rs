@@ -695,6 +695,8 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
     assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
     assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
     assert!(left.control.session_counters(2).unwrap().tx_outer_bytes - before >= 9000);
+    // A remote pending pair can survive local cancellation for ten seconds plus a retry.
+    let migration_wait = Duration::from_secs(12);
     let old_generation = left.control.session(0).unwrap().generation;
     let old_remote_generation = right.control.session(0).unwrap().generation;
     left.control
@@ -719,7 +721,7 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
             }
         }
     });
-    until(Duration::from_secs(5), || {
+    until(migration_wait, || {
         left.control.session(0).unwrap().generation > old_generation
             && right.control.session(0).unwrap().generation > old_remote_generation
     });
@@ -741,7 +743,7 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
     left.control
         .supply_peer_address(0, Ipv6Addr::LOCALHOST, 0)
         .unwrap();
-    until(Duration::from_secs(5), || {
+    until(migration_wait, || {
         left.control.session(0).unwrap().generation > migrated
     });
     let restored = left.control.session(0).unwrap().generation;

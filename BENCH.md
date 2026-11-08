@@ -89,6 +89,25 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Address-replacement test deadline (November 8)
+
+The existing cancellation regression now proves that local cancellation does
+not revoke a responder's pending pair. A new HELLO at t=12 remains ignored
+through t=20; after the old attempt expires at t=21, the replacement completes
+and both endpoints install the same new pair. The active connection survives
+throughout. This follows section 5.2's ten-second pending lifetime and
+one-second retry interval.
+
+The runtime fixture's two five-second generation waits were shorter than that
+valid sequence. They now allow twelve seconds for old-attempt expiry, a retry
+and scheduling. Production timing is unchanged, and the separate two-second
+post-migration frame-delivery checks remain intact. All 31 handshake tests and
+the forwarding/restart allocation test pass on Linux 6.8 and 7.0.
+
+This fixes an invalid fixture deadline. The earlier intermittent generation
+timeout did not capture pending state, so it is not attributed to this sequence.
+It also does not explain the separately recorded post-generation delivery failure.
+
 ## TCP output coalescing from the November 6 review (November 8)
 
 Compatible TCP frames now share a bounded TSO write using borrowed reassembly

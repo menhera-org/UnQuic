@@ -1114,6 +1114,28 @@ fn cancelling_an_old_path_preserves_active_state_and_rejects_its_pending_flights
     let new_hello = a.reconnect(time(12), tag(20)).unwrap().send.unwrap();
     assert_ne!(encoded(hello), encoded(new_hello));
     assert_eq!(a.connection(), Some(active));
+
+    // Local cancellation cannot revoke the remote's ten-second pending pair.
+    for now in [12, 17, 20] {
+        let reply = receive(&mut b, new_hello, now, 21);
+        assert!(reply.send.is_none());
+        assert!(reply.commit.is_none());
+        assert!(b.is_pending());
+        same_pair(a.connection().unwrap(), b.connection().unwrap());
+    }
+    let retry = a.on_timer(time(21), None).unwrap().send.unwrap();
+    assert_eq!(encoded(retry), encoded(new_hello));
+    let challenge = receive(&mut b, retry, 21, 21).send.unwrap();
+    let confirm = receive(&mut a, challenge, 21, 22).send.unwrap();
+    let effects = receive(&mut b, confirm, 21, 23);
+    assert!(effects.commit.is_some());
+    assert!(
+        receive(&mut a, effects.send.unwrap(), 21, 24)
+            .commit
+            .is_some()
+    );
+    same_pair(a.connection().unwrap(), b.connection().unwrap());
+    assert_ne!(a.connection(), Some(active));
 }
 
 #[test]
