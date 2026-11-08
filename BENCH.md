@@ -89,6 +89,76 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Incremental audit candidates (November 8)
+
+[Thirty release observations](benches/tap-audit-candidates.json) compare production
+with [cumulative experimental changes](benches/audit-candidates.patch): exact ACK pruning plus rolling commits (`rolling`),
+then at most four ACK records per datagram (`packed`), a local return for wholly
+duplicate ACK reports (`empty`), and a per-grant quantum (`quantum`). The final
+`after` phase repeats production. Each phase uses fresh daemons and ascending
+twenty-second rates, with a two-second receiver drain. The workload and CPU
+placement match the earlier eight-worker pruning sweep. The routed path adds
+4.5 ms RTT without injected loss.
+
+| Path | Build | Requested each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- | --- |
+| delayed | production | 0.5G | 0.460 / 0.455 | 6.91 / 7.99 | 90.2 / 88.7 |
+| delayed | production | 5G | 0.484 / 0.489 | 90.16 / 90.09 | 206.9 / 249.7 |
+| delayed | production | unlimited | 0.611 / 0.498 | 98.93 / 99.04 | 152.7 / 263.6 |
+| delayed | rolling | 0.5G | 0.423 / 0.448 | 13.81 / 9.06 | 87.2 / 85.7 |
+| delayed | rolling | 5G | 0.470 / 0.710 | 90.40 / 85.56 | 175.0 / 170.3 |
+| delayed | rolling | unlimited | 0.471 / 0.740 | 99.19 / 98.62 | 157.2 / 170.6 |
+| delayed | packed | 0.5G | 0.416 / 0.377 | 15.74 / 23.74 | 81.9 / 148.2 |
+| delayed | packed | 5G | 0.501 / 0.747 | 89.81 / 84.82 | 212.0 / 172.3 |
+| delayed | packed | unlimited | 0.496 / 0.518 | 99.15 / 99.06 | 211.4 / 259.1 |
+| delayed | empty | 0.5G | 0.453 / 0.454 | 8.34 / 8.09 | 92.3 / 87.0 |
+| delayed | empty | 5G | 0.626 / 0.704 | 87.25 / 85.70 | 206.4 / 194.6 |
+| delayed | empty | unlimited | 0.544 / 0.499 | 99.08 / 99.10 | 212.9 / 265.8 |
+| delayed | quantum | 0.5G | 0.396 / 0.458 | 19.92 / 7.27 | 125.5 / 81.9 |
+| delayed | quantum | 5G | 0.472 / 0.639 | 90.39 / 87.02 | 245.5 / 230.7 |
+| delayed | quantum | unlimited | 0.681 / 0.465 | 98.80 / 99.17 | 160.3 / 256.1 |
+| delayed | after | 0.5G | 0.475 / 0.466 | 3.86 / 5.65 | 91.8 / 88.8 |
+| delayed | after | 5G | 0.725 / 0.805 | 85.28 / 83.60 | 213.2 / 188.9 |
+| delayed | after | unlimited | 0.516 / 0.602 | 99.09 / 98.94 | 231.8 / 246.0 |
+| loopback | production | unlimited | 1.730 / 1.573 | 96.88 / 97.07 | 216.6 / 206.2 |
+| loopback | rolling | unlimited | 2.370 / 2.273 | 95.75 / 96.28 | 256.7 / 242.9 |
+| loopback | packed | unlimited | 2.478 / 2.442 | 95.89 / 95.48 | 254.7 / 243.7 |
+| loopback | empty | unlimited | 2.698 / 2.279 | 95.22 / 95.94 | 256.9 / 246.8 |
+| loopback | quantum | unlimited | 2.006 / 2.150 | 96.41 / 96.10 | 226.7 / 219.2 |
+| loopback | after | unlimited | 1.774 / 1.579 | 96.90 / 97.20 | 214.7 / 206.4 |
+
+None of the additional candidates establishes a consistent gain. Packing
+averages only 1.02 to 1.06 ACK records per datagram; the due snapshots rarely
+coincide. The empty-report bypass runs zero times on loopback and only 1 to 13
+times per endpoint in each delayed observation. It cannot explain those
+throughput differences. Allowing each grant a quantum lowers loopback
+unlimited delivery to 2.006 / 2.150 Gbit/s from 2.698 / 2.279 in the preceding
+phase and also regresses delayed forward light-load delivery. These changes
+remain experimental; the aggregate burst contract stays unchanged.
+
+All delayed observations have zero receive-admission pressure and zero netem
+drops. One `empty` 5G point has 18 outer socket-overflow SKBs; the other
+twenty-nine points have none. All have zero inner UDP receive errors, invalid,
+duplicate, out-of-window or wrong-run receiver records, and outer fragmentation.
+Loopback still reports admission pressure: unlimited production has
+15407 / 4341 rejected datagrams in the closing control, versus 555 / 0 with
+packing. Lower pressure alone does not establish the CPU ceiling.
+
+Unsent expiry remains substantial even at 0.5G offered. Production controls
+expire 32212 to 66915 unsent frames per endpoint; the per-grant candidate
+expires 167644 / 60980. High-rate TAP drops and expiry dominate missing data,
+but those counters have different units and cannot be summed. The JSON retains
+offered rates, every drop counter, per-worker CPU and context-switch deltas.
+Controller state and queued-ACK timing need direct measurement before attributing
+the delayed-path limit.
+
+The full candidate passes 367 ordinary release-musl all-feature tests, strict
+Clippy, and 88 library plus three runtime kernel tests on both Linux 6.8 and
+7.0. Tests cover exact ACK snapshot accounting, chronological sender commits,
+packed-ACK budgets and failure returns, duplicate-ACK loss fairness, and
+aggregate window accounting with concurrent grants. Correctness checks do not
+make this a performance acceptance result.
+
 ## Rolling ordered sender commits (November 8)
 
 [Twenty-four release comparisons](benches/tap-rolling-sender.json) isolate

@@ -1,0 +1,2235 @@
+diff --git a/src/counters.rs b/src/counters.rs
+index f3a6ae0..90e5ee9 100644
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -96,6 +96,12 @@ metrics! {
+     delivered_frame_bytes: sum,
+     /// Successfully submitted outer IPv6 bytes, including IPv6 and UDP headers.
+     tx_outer_bytes: sum,
++    /// Physical datagrams carrying ACK records successfully submitted; worker and session totals.
++    tx_ack_datagrams: sum,
++    /// ACK records successfully submitted; worker and session totals.
++    tx_ack_records: sum,
++    /// Sum of ranges in successfully submitted ACK records; worker and session totals.
++    tx_ack_ranges: sum,
+     /// Received outer IPv6 bytes, including IPv6 and UDP headers.
+     rx_outer_bytes: sum,
+     /// Repair DATA records successfully submitted.
+@@ -126,6 +132,8 @@ metrics! {
+     recovery_staged_reports: sum,
+     /// Staging calls exhausting their budget before report dispatch; worker totals only.
+     recovery_staging_yields: sum,
++    /// Wholly duplicate validated ACKs completed without shared accounting; worker totals only.
++    ack_owner_skips: sum,
+     /// Granted DATA prefixes rejected for insufficient journal capacity; worker totals only.
+     recovery_mapping_pressure: sum,
+     /// Granted DATA prefixes rejected after selected coverage changed; worker totals only.
+diff --git a/src/pacing/grants.rs b/src/pacing/grants.rs
+index 425ced0..d7599b5 100644
+--- a/src/pacing/grants.rs
++++ b/src/pacing/grants.rs
+@@ -10,7 +10,7 @@ pub struct Limits {
+     pub window: u64,
+     /// Pacing rate in bytes per second. Zero stops all grants, including probes.
+     pub rate: u64,
+-    /// BBR's send quantum; outstanding grants share this byte budget.
++    /// BBR's send quantum; each grant is bounded by this byte budget.
+     pub quantum: u32,
+     /// Effective maximum outer datagram size, from 1280 through 9000 bytes.
+     pub max_datagram: u16,
+@@ -143,6 +143,15 @@ impl Grants {
+         self.reserved
+     }
+ 
++    /// Earliest possible send key among grants still awaiting a report.
++    pub(super) fn earliest(&self) -> Option<(Duration, u64)> {
++        self.workers
++            .iter()
++            .flatten()
++            .map(|grant| (grant.issued, grant.id))
++            .min()
++    }
++
+     /// Submitted outer bytes not yet settled by an ACK or loss report.
+     pub const fn in_flight(&self) -> u64 {
+         self.in_flight
+@@ -176,16 +185,17 @@ impl Grants {
+ 
+     /// Reserves an exact byte budget before handing it to a worker.
+     ///
+-    /// Requests share min(send quantum, 64 maximum datagrams), even across
+-    /// workers. Probes bypass only the congestion window: they still consume
+-    /// pacing/burst credit and become charged inflight bytes on submission.
++    /// Each request fits min(send quantum, 64 maximum datagrams). Workers share
++    /// pacing and congestion-window credit. Probes bypass only the window:
++    /// they remain paced and become charged inflight bytes on submission.
+     /// A probe grant describes one complete datagram, up to the 9000-byte
+     /// protocol ceiling. PMTU probes may exceed the current maximum datagram
+-    /// estimate, but must fit the shared burst budget; do not inflate that
++    /// estimate, but must fit the per-grant budget; do not inflate that
+     /// estimate to authorize an unconfirmed probe.
+     ///
+     /// Pacing charges reserved bytes conservatively; unused reports do not
+     /// rewind the schedule or create a catch-up burst after a delayed worker.
++    /// New limits do not revoke old permissions or release their reservations.
+     pub fn reserve(
+         &mut self,
+         worker: usize,
+@@ -210,7 +220,7 @@ impl Grants {
+         if slot.is_some()
+             || limits.rate == 0
+             || now < self.next_send
+-            || reserved > burst
++            || u64::from(bytes) > burst
+             || (probe && self.probes == 0)
+             || (!probe && charged > limits.window)
+         {
+diff --git a/src/pacing/sender.rs b/src/pacing/sender.rs
+index 27b892d..0781cf3 100644
+--- a/src/pacing/sender.rs
++++ b/src/pacing/sender.rs
+@@ -1,7 +1,7 @@
+ //! Ordered send accounting and shared delivery metadata for the control owner.
+ use super::{Grant, GrantError, Grants, Limits};
+ use crate::bbr::{Delivery, DeliveryError, DeliveryPacket, LossSample, RateSample};
+-use std::{cmp::Reverse, io, mem::size_of, num::NonZeroU16, time::Duration};
++use std::{io, mem::size_of, num::NonZeroU16, time::Duration};
+ 
+ const BATCH: usize = 64;
+ 
+@@ -56,6 +56,10 @@ pub struct Flight {
+ }
+ 
+ impl Flight {
++    fn order(&self) -> (Option<Duration>, u64) {
++        (self.started, self.grant.map_or(0, |grant| grant.id))
++    }
++
+     /// Worker to which the buffer must return.
+     pub const fn worker(&self) -> usize {
+         self.worker
+@@ -222,7 +226,6 @@ struct Slot {
+ enum Phase {
+     Open,
+     Closing,
+-    Commit,
+     Feedback,
+ }
+ 
+@@ -240,12 +243,26 @@ struct Group {
+     ack: bool,
+ }
+ 
++impl Group {
++    fn commit_pending(&self) -> bool {
++        if self.phase == Phase::Feedback {
++            return false;
++        }
++        let Some(report) = self.reports.last() else {
++            return self.phase == Phase::Closing && self.grants.reserved() == 0;
++        };
++        self.grants
++            .earliest()
++            .is_none_or(|(at, id)| report.order() < (Some(at), id))
++    }
++}
++
+ /// Control-owner accounting for every sending path group in one daemon.
+ ///
+ /// A shared slab retains at most 65,535 complete delivery snapshots. Each group
+-/// closes issuance on its first completion or explicit close, awaits all grant
+-/// reports, then commits runs in timestamp/grant order before applying feedback.
+-/// Before closure, outstanding reserved bytes also bound cumulative epoch bytes.
++/// commits completed runs in timestamp/grant order once outstanding grants cannot
++/// precede them. Issuance may continue until explicit closure for feedback;
++/// feedback waits for every grant report and ordered commit.
+ ///
+ /// The caller supplies controller limits and consumes rate/loss samples in group
+ /// order. Runtime report routing, timers and controller activation are separate.
+@@ -445,9 +462,6 @@ impl Sender {
+             .grants
+             .reserve(flight.worker, bytes, probe, limits, now)?;
+         state.planned += flight.count;
+-        if state.grants.reserved() == u64::from(bytes) {
+-            state.sample_flight = state.grants.in_flight();
+-        }
+         for record in records {
+             let handle = self.free.ok_or(GrantError::Invalid)?;
+             let slot = self
+@@ -547,7 +561,10 @@ impl Sender {
+         match self.accept_report(&flight) {
+             Ok(group) => {
+                 if let Some(state) = self.groups.get_mut(group) {
+-                    state.reports.push(flight);
++                    let index = state
++                        .reports
++                        .partition_point(|report| report.order() > flight.order());
++                    state.reports.insert(index, flight);
+                     return Ok(());
+                 }
+                 Err((GrantError::Invalid, flight))
+@@ -594,7 +611,7 @@ impl Sender {
+         }
+         state.grants.reported(grant, bytes, flight.started)?;
+         state.sent_bytes += u64::from(bytes);
+-        state.phase = Phase::Closing;
++        state.planned -= flight.count - flight.successful;
+         for record in records.iter().skip(flight.successful) {
+             Self::release(
+                 &mut self.slots,
+@@ -608,29 +625,17 @@ impl Sender {
+ 
+     /// Commits at most budget physical packets and returns at most one reusable flight.
+     ///
+-    /// No send can commit until every issued grant reports. Ordering sorts at
+-    /// most 64 completion descriptors once; each returned flight's samples are
+-    /// installed before its worker can reuse the buffer. Poll feedback_ready
+-    /// after servicing returns. A zero budget makes no progress.
++    /// Commit only runs preceding every unreported grant's earliest possible send.
++    /// Returned flights have all successful samples installed before worker reuse.
++    /// Explicit closure or a naturally drained group enters feedback only after
++    /// every send commits. A zero budget makes no progress.
+     pub fn advance(
+         &mut self,
+         group: usize,
+         budget: usize,
+     ) -> Result<Option<Box<Flight>>, GrantError> {
+         let state = self.groups.get_mut(group).ok_or(GrantError::Invalid)?;
+-        if budget == 0 || state.grants.reserved() != 0 {
+-            return Ok(None);
+-        }
+-        if state.phase == Phase::Closing {
+-            state.reports.sort_unstable_by_key(|report| {
+-                Reverse((
+-                    report.started.unwrap_or(Duration::ZERO),
+-                    report.grant.map_or(0, |grant| grant.id),
+-                ))
+-            });
+-            state.phase = Phase::Commit;
+-        }
+-        if state.phase != Phase::Commit {
++        if budget == 0 || !state.commit_pending() {
+             return Ok(None);
+         }
+         let Some(report) = state.reports.last_mut() else {
+@@ -666,6 +671,7 @@ impl Sender {
+                 charged: true,
+             };
+             state.sample_flight += u64::from(slot.bytes);
++            state.planned -= 1;
+             report.cursor += 1;
+         }
+         if report.cursor != report.successful {
+@@ -676,7 +682,7 @@ impl Sender {
+         report.group = None;
+         report.grant = None;
+         report.count = 0;
+-        if state.reports.is_empty() {
++        if state.reports.is_empty() && state.grants.reserved() == 0 {
+             state.phase = Phase::Feedback;
+         }
+         Ok(Some(report))
+@@ -684,23 +690,21 @@ impl Sender {
+ 
+     /// Whether a bounded commit pass can continue without another worker report.
+     pub(crate) fn commit_pending(&self, group: usize) -> bool {
+-        self.groups.get(group).is_some_and(|state| {
+-            state.grants.reserved() == 0 && matches!(state.phase, Phase::Closing | Phase::Commit)
+-        })
++        self.groups.get(group).is_some_and(Group::commit_pending)
+     }
+ 
+-    /// Whether all epoch sends have committed and feedback may be consumed.
++    /// Whether all issued sends have committed and feedback may be consumed.
+     pub fn feedback_ready(&self, group: usize) -> bool {
+         self.groups
+             .get(group)
+             .is_some_and(|state| state.phase == Phase::Feedback)
+     }
+ 
+-    /// Starts a new issuance epoch after the caller's bounded feedback pass.
++    /// Reopens issuance after the caller's bounded feedback pass.
+     pub fn reopen(&mut self, group: usize) -> Result<(), GrantError> {
+         let state = self.feedback(group, false)?;
+         state.phase = Phase::Open;
+-        state.planned = 0;
++        state.sample_flight = state.grants.in_flight();
+         Ok(())
+     }
+ 
+@@ -910,6 +914,92 @@ mod tests {
+         assert!(!sender.commit_pending(1));
+     }
+ 
++    #[test]
++    fn rolling_identity_and_lifetime_reservations_release_only_unused_packets() {
++        for packet_limit in [true, false] {
++            let (mut sender, flights) = Sender::new(1, 2, 3).unwrap();
++            let mut flights = flights.into_vec();
++            let mut b = flights.pop().unwrap();
++            let mut a = flights.pop().unwrap();
++            let packet = Planned {
++                id: PacketId {
++                    number: 1,
++                    ..PacketId::default()
++                },
++                bytes: 100,
++            };
++            let limits = Limits {
++                window: 1280,
++                rate: 1_000_000_000,
++                quantum: 1280,
++                max_datagram: 1280,
++            };
++            if packet_limit {
++                sender.groups[0].delivery.limit_packets_for_test(2);
++            } else {
++                sender.groups[0].sent_bytes = u64::MAX - 200;
++            }
++            a.prepare(&[packet]).unwrap();
++            b.prepare(&[Planned {
++                id: PacketId {
++                    lane: 1,
++                    ..packet.id
++                },
++                ..packet
++            }])
++            .unwrap();
++            sender
++                .reserve(0, &mut a, false, limits, Duration::ZERO)
++                .unwrap();
++            sender
++                .reserve(0, &mut b, false, limits, Duration::from_micros(10))
++                .unwrap();
++            a.complete(1, Some(Duration::from_micros(1)), false)
++                .unwrap();
++            sender.reported(a).unwrap();
++            let mut a = sender.advance(0, 1).unwrap().unwrap();
++            assert_eq!(sender.groups[0].planned, 1);
++            a.prepare(&[Planned {
++                id: PacketId {
++                    number: 2,
++                    ..packet.id
++                },
++                ..packet
++            }])
++            .unwrap();
++            assert_eq!(
++                sender.reserve(0, &mut a, false, limits, Duration::from_micros(20)),
++                Err(GrantError::Exhausted)
++            );
++            b.complete(0, None, false).unwrap();
++            sender.reported(b).unwrap();
++            assert_eq!(sender.groups[0].planned, 0);
++            sender
++                .reserve(0, &mut a, false, limits, Duration::from_micros(21))
++                .unwrap();
++            let _b = sender.advance(0, 1).unwrap().unwrap();
++            a.complete(1, Some(Duration::from_micros(22)), false)
++                .unwrap();
++            sender.reported(a).unwrap();
++            let mut a = sender.advance(0, 1).unwrap().unwrap();
++            assert_eq!(sender.groups[0].planned, 0);
++            assert_eq!(sender.groups[0].sample_flight, 200);
++            sender.reopen(0).unwrap();
++            a.prepare(&[Planned {
++                id: PacketId {
++                    number: 3,
++                    ..packet.id
++                },
++                ..packet
++            }])
++            .unwrap();
++            assert_eq!(
++                sender.reserve(0, &mut a, false, limits, Duration::from_micros(23)),
++                Err(GrantError::Exhausted)
++            );
++        }
++    }
++
+     #[test]
+     fn identity_and_lifetime_byte_exhaustion_precede_permission_to_send() {
+         for packet_limit in [true, false] {
+@@ -1030,7 +1120,7 @@ mod reidentify_tests {
+         assert_eq!(flight.packets().next().unwrap().id.number, 1);
+         assert_eq!(sender.slots[usize::from(handles[0].get()) - 1].id.number, 1);
+         sender.slots[second].bytes = 1280;
+-        sender.close(0).unwrap(); // Another completion may already have closed the epoch.
++        sender.close(0).unwrap(); // Feedback may already have closed issuance.
+         sender.reidentify(&mut flight, 20).unwrap();
+         assert_eq!(flight.grant().unwrap().id, grant.id);
+         assert_eq!(sender.flight_bytes(0), reserved);
+diff --git a/src/pack.rs b/src/pack.rs
+index 370e97d..dbd2f1a 100644
+--- a/src/pack.rs
++++ b/src/pack.rs
+@@ -137,16 +137,24 @@ impl Lane {
+     /// the record's content and re-encode with a fresh number before retrying.
+     /// Handshake records cannot use this established-lane encoder.
+     pub fn record(&mut self, record: Record<'_>, output: &mut [u8]) -> Result<Packet, PackError> {
++        self.records(&[record], output)
++    }
++
++    pub(crate) fn records(
++        &mut self,
++        records: &[Record<'_>],
++        output: &mut [u8],
++    ) -> Result<Packet, PackError> {
+         if self.header.packet_number == 0 {
+             return Err(PackError::Exhausted);
+         }
+-        if matches!(record, Record::Data { total_len, .. } if total_len > u32::from(self.frame_limit))
++        if records.iter().any(|record| matches!(record, Record::Data { total_len, .. } if *total_len > u32::from(self.frame_limit)))
+         {
+             return Err(PackError::Frame);
+         }
+         let limit = output.len().min(BASE_UDP_PAYLOAD);
+-        let length = encode_datagram(self.header, &[record], &mut output[..limit])
+-            .map_err(PackError::Wire)?;
++        let length =
++            encode_datagram(self.header, records, &mut output[..limit]).map_err(PackError::Wire)?;
+         let number = self.header.packet_number;
+         self.header.packet_number = number.checked_add(1).unwrap_or(0);
+         Ok(Packet { number, length })
+diff --git a/src/reassembly.rs b/src/reassembly.rs
+index ff08545..17fa711 100644
+--- a/src/reassembly.rs
++++ b/src/reassembly.rs
+@@ -107,17 +107,25 @@ impl Window {
+         self.bits[(number as usize / 64) % WORDS] |= 1 << (number % 64);
+     }
+ 
+-    fn ranges(&self, highest: u64, output: &mut [AckRange; MAX_ACK_RANGES]) -> usize {
++    fn ranges(
++        &self,
++        highest: u64,
++        output: &mut [AckRange; MAX_ACK_RANGES],
++        counts: Option<&[Window; 2]>,
++        lower: u64,
++    ) -> usize {
+         let mut cursor = highest;
+         let mut count = 0;
+         while count < output.len() {
+-            let Some(end) = self.last_bit(cursor, true) else {
++            let Some(end) = self.last_bit(cursor, true, highest, counts, lower) else {
+                 break;
+             };
+-            let start = self.last_bit(end, false).map_or(self.lower, |gap| gap + 1);
++            let start = self
++                .last_bit(end, false, highest, counts, lower)
++                .map_or(lower, |gap| gap + 1);
+             output[count] = AckRange { start, end };
+             count += 1;
+-            if start == self.lower {
++            if start == lower {
+                 break;
+             }
+             cursor = start - 1;
+@@ -125,21 +133,36 @@ impl Window {
+         count
+     }
+ 
+-    fn last_bit(&self, mut number: u64, set: bool) -> Option<u64> {
+-        while number >= self.lower {
++    fn last_bit(
++        &self,
++        mut number: u64,
++        set: bool,
++        highest: u64,
++        counts: Option<&[Window; 2]>,
++        lower: u64,
++    ) -> Option<u64> {
++        while number >= lower {
+             let base = number & !63;
+-            let mut bits = self.bits[(number as usize / 64) % WORDS];
++            let index = (number as usize / 64) % WORDS;
++            let mut bits = self.bits[index];
++            if let Some(counts) = counts {
++                bits &= !(counts[0].bits[index] & counts[1].bits[index]);
++                // Keep the highest packet as the duplicate-feedback and delay anchor.
++                if base == (highest & !63) {
++                    bits |= 1 << (highest % 64);
++                }
++            }
+             if !set {
+                 bits = !bits;
+             }
+             bits &= u64::MAX >> (63 - number % 64);
+-            if base <= self.lower {
+-                bits &= u64::MAX << (self.lower % 64);
++            if base <= lower {
++                bits &= u64::MAX << (lower % 64);
+             }
+             if bits != 0 {
+                 return Some(base + 63 - u64::from(bits.leading_zeros()));
+             }
+-            if base <= self.lower {
++            if base <= lower {
+                 break;
+             }
+             number = base - 1;
+@@ -235,6 +258,8 @@ pub struct Lane {
+     retired: bool,
+     packets: Window,
+     ack: Schedule,
++    ack_counts: [Window; 2],
++    ack_lower: u64,
+     terminal: Window,
+     frames: Box<[Frame]>,
+     index: [u8; INDEX_LEN],
+@@ -257,6 +282,8 @@ impl Lane {
+             retired: false,
+             packets: Window::new(),
+             ack: Schedule::new(),
++            ack_counts: [Window::new(), Window::new()],
++            ack_lower: 1,
+             terminal: Window::new(),
+             frames: (0..FRAME_CAPACITY).map(|_| Frame::empty()).collect(),
+             index: [EMPTY; INDEX_LEN],
+@@ -327,7 +354,8 @@ impl Lane {
+         self.ack.deadline
+     }
+ 
+-    /// Constructs due feedback using at most the newest 32 receive-window ranges.
++    /// Constructs at most 32 ranges from packets reported fewer than three times.
++    /// The highest accepted packet remains an anchor for duplicate feedback.
+     ///
+     /// Reserve feedback-queue space before calling: this consumes the pending
+     /// schedule. The caller supplies a fresh local transmit packet number and
+@@ -338,7 +366,12 @@ impl Lane {
+         output: &'a mut [AckRange; MAX_ACK_RANGES],
+     ) -> Option<Record<'a>> {
+         let delay_us = self.ack.take(now)?;
+-        let count = self.packets.ranges(self.ack.highest, output);
++        let count = self.packets.ranges(
++            self.ack.highest,
++            output,
++            Some(&self.ack_counts),
++            self.ack_lower,
++        );
+         Some(Record::Ack {
+             lane: self.id,
+             delay_us,
+@@ -346,9 +379,45 @@ impl Lane {
+         })
+     }
+ 
+-    /// Records successful ACK submission after queueing, preserving duplicate spacing.
+-    pub fn ack_transmitted(&mut self, sent_at: Duration) {
++    /// Records the actual successfully submitted ranges, preserving duplicate spacing.
++    ///
++    /// Call exactly once per successful transmission; failed or cancelled sends do
++    /// not count. Delayed reports cannot affect recycled receive-window positions.
++    pub fn ack_transmitted(&mut self, sent_at: Duration, ranges: AckRanges<'_>) {
+         self.ack.transmitted(sent_at);
++        for range in ranges.iter() {
++            let mut start = range.start.max(self.packets.lower);
++            let end = range.end.min(self.ack.highest);
++            while start <= end {
++                let offset = start % 64;
++                let count = (end - start).min(63 - offset) + 1;
++                let mask = (u64::MAX >> (64 - count)) << offset;
++                let index = (start as usize / 64) % WORDS;
++                let [low, high] = &mut self.ack_counts;
++                let active =
++                    mask & self.packets.bits[index] & !(low.bits[index] & high.bits[index]);
++                high.bits[index] |= low.bits[index] & active;
++                low.bits[index] ^= active;
++                if end - start < count {
++                    break;
++                }
++                start += count;
++            }
++        }
++        // Pruned history is scanned once, then only a fresh late arrival can reopen it.
++        while self.ack_lower < self.ack.highest {
++            let index = (self.ack_lower as usize / 64) % WORDS;
++            let bits = self.packets.bits[index]
++                & !(self.ack_counts[0].bits[index] & self.ack_counts[1].bits[index])
++                & (u64::MAX << (self.ack_lower % 64));
++            if bits != 0 {
++                self.ack_lower = (self.ack_lower & !63) + u64::from(bits.trailing_zeros());
++                break;
++            }
++            self.ack_lower = (self.ack_lower & !63)
++                .saturating_add(64)
++                .min(self.ack.highest);
++        }
+     }
+ 
+     /// Recycles storage for a new connection or a never-used remote lane ID.
+@@ -365,6 +434,10 @@ impl Lane {
+         self.duplicate_pieces = 0;
+         self.packets.reset();
+         self.ack = Schedule::new();
++        self.ack_lower = 1;
++        for counts in &mut self.ack_counts {
++            counts.reset();
++        }
+         self.terminal.reset();
+         self.clear_frames();
+         Ok(())
+@@ -509,6 +582,13 @@ impl Lane {
+             return Admission::Pressure;
+         }
+         self.packets.mark(header.packet_number);
++        self.ack_lower = self
++            .ack_lower
++            .max(self.packets.lower)
++            .min(header.packet_number);
++        for counts in &mut self.ack_counts {
++            counts.advance(header.packet_number);
++        }
+         self.ack.accepted(header.packet_number, eliciting, now);
+         Admission::Fresh
+     }
+@@ -703,6 +783,64 @@ fn validate(id: u16, frame_limit: u16) -> Result<(), LaneError> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn ack_search_floor_skips_pruned_history_and_reopens_only_for_fresh_packets() {
++        fn probe(lane: &mut Lane, number: u64) -> Admission {
++            let mut bytes = [0; 64];
++            let length = crate::wire::encode_datagram(
++                crate::wire::Header {
++                    cookie: crate::UnquicUuid::from_bytes([1; 16]),
++                    receive_tag: 1,
++                    lane: 1,
++                    packet_number: number,
++                    record_area_len: 0,
++                },
++                &[Record::Probe],
++                &mut bytes,
++            )
++            .unwrap();
++            lane.admit(&Datagram::decode(&bytes[..length]).unwrap(), Duration::ZERO)
++        }
++        let mut lane = Lane::new(1, 1514).unwrap();
++        let highest = WINDOW_LEN as u64 - 1;
++        assert_eq!(probe(&mut lane, 1), Admission::Fresh);
++        assert_eq!(probe(&mut lane, highest), Admission::Fresh);
++        let ranges = [
++            AckRange {
++                start: highest,
++                end: highest,
++            },
++            AckRange { start: 1, end: 1 },
++        ];
++        for _ in 0..3 {
++            lane.ack_transmitted(Duration::ZERO, AckRanges::new(&ranges).unwrap());
++        }
++        assert_eq!(lane.ack_lower, highest);
++        assert_eq!(lane.packets.lower, 1);
++        assert_eq!(probe(&mut lane, 1), Admission::Duplicate);
++        assert_eq!(lane.ack_lower, highest);
++        assert_eq!(probe(&mut lane, 2), Admission::Fresh);
++        assert_eq!(lane.ack_lower, 2);
++        let ranges = [
++            AckRange {
++                start: highest,
++                end: highest,
++            },
++            AckRange { start: 2, end: 2 },
++        ];
++        for _ in 0..3 {
++            lane.ack_transmitted(Duration::ZERO, AckRanges::new(&ranges).unwrap());
++        }
++        assert_eq!(lane.ack_lower, highest);
++        assert_eq!(
++            probe(&mut lane, highest + WINDOW_LEN as u64),
++            Admission::Fresh
++        );
++        assert_eq!(lane.ack_lower, lane.packets.lower);
++        lane.reset(1, 1514).unwrap();
++        assert_eq!(lane.ack_lower, 1);
++    }
++
+     #[test]
+     fn batch_completion_releases_only_selected_slots_and_preserves_other_frames() {
+         let mut lane = Lane::new(1, 9022).unwrap();
+@@ -865,7 +1003,7 @@ mod tests {
+             seen = seen.split_off(&lower);
+             assert_eq!(window.lower, lower);
+             let mut actual = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
+-            let count = window.ranges(highest, &mut actual);
++            let count = window.ranges(highest, &mut actual, None, window.lower);
+             let mut expected: Vec<AckRange> = Vec::new();
+             for &number in seen.iter().rev() {
+                 if let Some(last) = expected.last_mut()
+@@ -902,11 +1040,14 @@ mod tests {
+     fn ack_ranges_cross_words_and_wrap_without_including_old_aliases() {
+         let mut window = Window::new();
+         let mut output = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
+-        assert_eq!(window.ranges(0, &mut output), 0);
++        assert_eq!(window.ranges(0, &mut output, None, window.lower), 0);
+         for number in 1..=WINDOW_LEN as u64 + 1 {
+             window.mark(number);
+         }
+-        assert_eq!(window.ranges(WINDOW_LEN as u64 + 1, &mut output), 1);
++        assert_eq!(
++            window.ranges(WINDOW_LEN as u64 + 1, &mut output, None, window.lower),
++            1
++        );
+         assert_eq!(
+             output[0],
+             AckRange {
+@@ -915,7 +1056,7 @@ mod tests {
+             }
+         );
+         window.mark(u64::MAX);
+-        assert_eq!(window.ranges(u64::MAX, &mut output), 1);
++        assert_eq!(window.ranges(u64::MAX, &mut output, None, window.lower), 1);
+         assert_eq!(
+             output[0],
+             AckRange {
+@@ -926,7 +1067,7 @@ mod tests {
+         for n in 1..=130 {
+             window.mark(u64::MAX - n);
+         }
+-        assert_eq!(window.ranges(u64::MAX, &mut output), 1);
++        assert_eq!(window.ranges(u64::MAX, &mut output, None, window.lower), 1);
+         assert_eq!(
+             output[0],
+             AckRange {
+diff --git a/src/worker/feedback.rs b/src/worker/feedback.rs
+index a684558..c46b975 100644
+--- a/src/worker/feedback.rs
++++ b/src/worker/feedback.rs
+@@ -14,7 +14,7 @@ pub(crate) struct Feedback {
+     count: usize,
+     delay_us: u32,
+     created: Duration,
+-    sent: Option<Duration>,
++    sent: Option<(Duration, usize)>,
+     due: Duration,
+     ranges: [AckRange; MAX_ACK_RANGES],
+ }
+@@ -96,8 +96,10 @@ impl Worker {
+                     && lane.id() == feedback.lane
+                 {
+                     local.ack_inflight &= !(1 << feedback.slot);
+-                    if let Some(sent) = feedback.sent {
+-                        lane.ack_transmitted(sent);
++                    if let Some((sent, count)) = feedback.sent {
++                        let ranges =
++                            AckRanges::new(&feedback.ranges[..count]).map_err(io::Error::other)?;
++                        lane.ack_transmitted(sent, ranges);
+                     }
+                 }
+             }
+@@ -193,8 +195,18 @@ impl Worker {
+             .max(now)
+     }
+ 
++    fn feedback_valid(&self, feedback: &Feedback) -> bool {
++        feedback.count != 0
++            && self.matches(feedback.session, feedback.tag)
++            && self.shared.owners[feedback.session][usize::from(feedback.lane)]
++                .load(Ordering::Acquire)
++                == feedback.origin as u8 + 1
++    }
++
+     pub(super) fn flush_control(&mut self, now: Duration) -> io::Result<()> {
+-        for _ in 0..self.pending_control.len().min(BATCH_SIZE) {
++        let mut work = self.pending_control.len().min(BATCH_SIZE);
++        while work != 0 {
++            work -= 1;
+             let now = self.io_clock(now)()?;
+             let Some(job) = self.pending_control.pop_front() else {
+                 break;
+@@ -256,35 +268,74 @@ impl Worker {
+                     self.control_replies -= 1;
+                 }
+                 Pending::Ack(mut feedback) => {
+-                    if feedback.count != 0
+-                        && self.matches(feedback.session, feedback.tag)
+-                        && self.shared.owners[feedback.session][usize::from(feedback.lane)]
+-                            .load(Ordering::Acquire)
+-                            == feedback.origin as u8 + 1
+-                    {
+-                        let due = self.control_due(feedback.session, now);
+-                        if due > now {
+-                            feedback.due = due;
+-                            self.pending_control.push_back(Pending::Ack(feedback));
+-                            continue;
++                    if !self.feedback_valid(&feedback) {
++                        self.return_feedback(feedback, now)?;
++                        continue;
++                    }
++                    let due = self.control_due(feedback.session, now);
++                    if due > now {
++                        feedback.due = due;
++                        self.pending_control.push_back(Pending::Ack(feedback));
++                        continue;
++                    }
++                    let (session, tag) = (feedback.session, feedback.tag);
++                    let mut bytes = wire::HEADER_LEN + 12 + 16 * feedback.count;
++                    // Match the peer worker's four reserved incoming ACK buffers.
++                    let mut batch = [Some(feedback), None, None, None];
++                    let mut count = 1;
++                    for slot in &mut batch[1..] {
++                        let Some(Pending::Ack(next)) = self.pending_control.front() else {
++                            break;
++                        };
++                        let length = 12 + 16 * next.count;
++                        if work == 0
++                            || next.session != session
++                            || next.tag != tag
++                            || next.due > now
++                            || !self.feedback_valid(next)
++                            || bytes + length > BASE_UDP_PAYLOAD
++                        {
++                            break;
+                         }
++                        let Some(Pending::Ack(next)) = self.pending_control.pop_front() else {
++                            return Err(io::Error::other("queued ACK disappeared"));
++                        };
++                        *slot = Some(next);
++                        count += 1;
++                        work -= 1;
++                        bytes += length;
++                    }
++                    let mut records = [Record::Padding { length: 0 }; 4];
++                    let mut ranges_sent = 0;
++                    for (record, feedback) in records.iter_mut().zip(batch.iter().flatten()) {
++                        ranges_sent += feedback.count as u64;
+                         let queued =
+                             now.saturating_sub(feedback.created).as_micros().min(1000) as u32;
+-                        let ranges = AckRanges::new(&feedback.ranges[..feedback.count])
+-                            .map_err(io::Error::other)?;
+-                        if let Some((_, _, started)) = self.send_record(
+-                            feedback.session,
+-                            Record::Ack {
+-                                lane: feedback.lane,
+-                                delay_us: (feedback.delay_us + queued).min(1000),
+-                                ranges,
+-                            },
+-                            now,
+-                        )? {
+-                            feedback.sent = Some(started);
++                        *record = Record::Ack {
++                            lane: feedback.lane,
++                            delay_us: (feedback.delay_us + queued).min(1000),
++                            ranges: AckRanges::new(&feedback.ranges[..feedback.count])
++                                .map_err(io::Error::other)?,
++                        };
++                    }
++                    let result = self.send_records(session, &records[..count], now);
++                    let sent = result
++                        .as_ref()
++                        .ok()
++                        .and_then(|packet| packet.map(|(_, _, at)| at));
++                    if sent.is_some() {
++                        for totals in [&mut self.counters, &mut self.sessions[session].totals] {
++                            totals.tx_ack_datagrams = totals.tx_ack_datagrams.wrapping_add(1);
++                            totals.tx_ack_records =
++                                totals.tx_ack_records.wrapping_add(count as u64);
++                            totals.tx_ack_ranges = totals.tx_ack_ranges.wrapping_add(ranges_sent);
+                         }
+                     }
+-                    self.return_feedback(feedback, now)?;
++                    for mut feedback in batch.into_iter().flatten() {
++                        feedback.sent = sent.map(|at| (at, feedback.count));
++                        self.return_feedback(feedback, now)?;
++                    }
++                    result?;
+                 }
+             }
+         }
+@@ -315,6 +366,75 @@ mod tests {
+         rx
+     }
+ 
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn ack_returns_count_only_successful_snapshot_ranges() {
++        let (mut worker, _tap) = receive_worker();
++        let mut bytes = [0; BASE_UDP_PAYLOAD];
++        for number in [1, 3] {
++            let length = receive_bytes(number, &[Record::Probe], &mut bytes);
++            assert_eq!(
++                worker.sessions[0].rx[0]
++                    .as_mut()
++                    .unwrap()
++                    .admit(&Datagram::decode(&bytes[..length]).unwrap(), Duration::ZERO,),
++                Admission::Fresh,
++            );
++        }
++        let mut rx = None;
++        for attempt in 0..6 {
++            let now = Duration::from_millis(10 * (attempt + 1));
++            if attempt == 1 {
++                rx = Some(socket(&mut worker));
++            }
++            let length = receive_bytes(3, &[Record::Probe], &mut bytes);
++            assert_eq!(
++                worker.sessions[0].rx[0]
++                    .as_mut()
++                    .unwrap()
++                    .admit(&Datagram::decode(&bytes[..length]).unwrap(), now - RETRY,),
++                Admission::Duplicate,
++            );
++            for _ in 0..(worker.sessions.len() * LANES).div_ceil(BATCH_SIZE) {
++                worker.collect_acks(now).unwrap();
++            }
++            assert_eq!(worker.sessions[0].ack_inflight, 1);
++            if attempt == 1 {
++                let length = receive_bytes(2, &[Record::Probe], &mut bytes);
++                assert_eq!(
++                    worker.sessions[0].rx[0]
++                        .as_mut()
++                        .unwrap()
++                        .admit(&Datagram::decode(&bytes[..length]).unwrap(), now,),
++                    Admission::Fresh,
++                );
++            }
++            worker.flush_control(now).unwrap();
++            assert_eq!(worker.feedback_free.len(), BUFFERS);
++            assert_eq!(worker.sessions[0].ack_inflight, 0);
++            for totals in [&worker.counters, &worker.sessions[0].totals] {
++                assert_eq!(totals.tx_ack_datagrams, attempt);
++                assert_eq!(totals.tx_ack_records, attempt);
++                assert_eq!(totals.tx_ack_ranges, attempt + u64::from(attempt != 0));
++            }
++            let Some(rx) = &rx else {
++                continue; // No socket: the first submission was cancelled.
++            };
++            let length = rx.recv(&mut bytes).unwrap().0;
++            let packet = Datagram::decode(&bytes[..length]).unwrap();
++            let Some(Record::Ack { ranges, .. }) = packet.records().next() else {
++                panic!("missing ACK");
++            };
++            let expected = match attempt {
++                1 => vec![AckRange { start: 3, end: 3 }, AckRange { start: 1, end: 1 }],
++                2 | 3 => vec![AckRange { start: 1, end: 3 }],
++                4 => vec![AckRange { start: 2, end: 3 }],
++                _ => vec![AckRange { start: 3, end: 3 }],
++            };
++            assert_eq!(ranges.iter().collect::<Vec<_>>(), expected);
++        }
++    }
++
+     #[test]
+     #[ignore = "kernel descriptor test; run in a disposable container"]
+     fn emitted_ack_excludes_pressure_rejection_even_when_its_tail_was_retained() {
+@@ -589,4 +709,313 @@ mod tests {
+             io::ErrorKind::WouldBlock
+         );
+     }
++    fn queue_snapshot(worker: &mut Worker, session: usize, lane: u16, count: usize, age: u64) {
++        let mut feedback = worker.feedback_free.pop().unwrap();
++        feedback.session = session;
++        feedback.tag = 1;
++        feedback.lane = lane;
++        feedback.slot = 0;
++        feedback.count = count;
++        feedback.created = Duration::from_micros(age);
++        feedback.delay_us = age as u32 / 10;
++        feedback.due = Duration::ZERO;
++        feedback.sent = None;
++        for (index, range) in feedback.ranges[..count].iter_mut().enumerate() {
++            let number = ((count - index) * 2) as u64;
++            *range = AckRange {
++                start: number,
++                end: number,
++            };
++        }
++        worker.shared.owners[session][usize::from(lane)].store(1, Ordering::Release);
++        worker.pending_control.push_back(Pending::Ack(feedback));
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn packed_acks_fit_baseline_and_charge_one_physical_packet() {
++        for profile in [[1; 4], [MAX_ACK_RANGES; 4], [1, 2, 3, 4]] {
++            let (mut worker, _) = receive_worker();
++            let rx = socket(&mut worker);
++            worker.unpaced_fixture = false;
++            worker.io_time = Some(|_| Ok(Duration::from_micros(700)));
++            for (index, ranges) in profile.into_iter().enumerate() {
++                queue_snapshot(&mut worker, 0, index as u16 + 7, ranges, index as u64 * 100);
++            }
++            worker.flush_control(Duration::from_micros(300)).unwrap();
++            assert_eq!(worker.feedback_free.len(), BUFFERS);
++            assert!(worker.pending_control.is_empty());
++            let packets = if profile[0] == MAX_ACK_RANGES { 2 } else { 1 };
++            let per_packet = 4 / packets;
++            let mut bytes = [0; BASE_UDP_PAYLOAD];
++            let mut outer = 0;
++            for number in 1..=packets {
++                let length = rx.recv(&mut bytes).unwrap().0;
++                let expected = wire::HEADER_LEN
++                    + profile[(number - 1) * per_packet..number * per_packet]
++                        .iter()
++                        .map(|ranges| 12 + 16 * ranges)
++                        .sum::<usize>();
++                assert_eq!(length, expected);
++                let datagram = Datagram::decode(&bytes[..length]).unwrap();
++                assert_eq!(datagram.header().packet_number, number as u64);
++                assert_eq!(datagram.records().count(), per_packet);
++                for (offset, record) in datagram.records().enumerate() {
++                    let index = (number - 1) * per_packet + offset;
++                    let Record::Ack {
++                        lane,
++                        delay_us,
++                        ranges: received,
++                    } = record
++                    else {
++                        panic!()
++                    };
++                    assert_eq!(lane, index as u16 + 7);
++                    assert_eq!(delay_us, 700 - 90 * index as u32);
++                    assert_eq!(received.len(), profile[index]);
++                    assert_eq!(
++                        received.iter().next().unwrap().end,
++                        (profile[index] * 2) as u64
++                    );
++                }
++                outer += length + 48;
++                let index = worker.sender_index(0, 0).unwrap();
++                let sent = worker.sender.lanes[index]
++                    .history
++                    .packet(number as u64)
++                    .unwrap();
++                assert_eq!(usize::from(sent.outer_bytes), length + 48);
++                assert!(!sent.charged && !sent.eliciting);
++            }
++            assert_eq!(worker.counters.tx_outer_bytes, outer as u64);
++            for totals in [&worker.counters, &worker.sessions[0].totals] {
++                assert_eq!(totals.tx_ack_datagrams, packets as u64);
++                assert_eq!(totals.tx_ack_records, 4);
++                assert_eq!(
++                    totals.tx_ack_ranges,
++                    profile.into_iter().sum::<usize>() as u64
++                );
++            }
++            assert_eq!(
++                rx.recv(&mut bytes).unwrap_err().kind(),
++                io::ErrorKind::WouldBlock
++            );
++            let reply = Record::ProbeReply {
++                lane: 7,
++                packet_number: 1,
++                payload_len: 52,
++            };
++            for _ in packets..16 {
++                assert!(
++                    worker
++                        .send_record(0, reply, Duration::from_micros(700))
++                        .unwrap()
++                        .is_some()
++                );
++            }
++            assert!(
++                worker
++                    .send_record(0, reply, Duration::from_micros(700))
++                    .unwrap()
++                    .is_none()
++            );
++        }
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn packed_acks_keep_snapshot_budget_and_session_order() {
++        let (mut worker, _) = receive_worker();
++        let rx = socket(&mut worker);
++        worker.io_time = Some(Ok);
++        for _ in 0..BATCH_SIZE - 2 {
++            worker.pending_control.push_back(Pending::Reply {
++                session: 0,
++                tag: 1,
++                lane: 7,
++                packet: 1,
++                length: 52,
++                due: Duration::from_secs(1),
++            });
++        }
++        for lane in 7..11 {
++            queue_snapshot(&mut worker, 0, lane, 1, 0);
++        }
++        worker.flush_control(Duration::ZERO).unwrap();
++        let mut bytes = [0; BASE_UDP_PAYLOAD];
++        let length = rx.recv(&mut bytes).unwrap().0;
++        assert_eq!(
++            Datagram::decode(&bytes[..length])
++                .unwrap()
++                .records()
++                .count(),
++            2
++        );
++        assert_eq!(worker.feedback_free.len(), 2);
++        assert_eq!(worker.pending_control.len(), BATCH_SIZE);
++        worker.flush_control(Duration::ZERO).unwrap();
++        let length = rx.recv(&mut bytes).unwrap().0;
++        assert_eq!(
++            Datagram::decode(&bytes[..length])
++                .unwrap()
++                .records()
++                .count(),
++            2
++        );
++        assert_eq!(worker.feedback_free.len(), BUFFERS);
++        worker.pending_control.clear();
++        worker
++            .command(1, worker.sessions[0].installed.unwrap(), 0)
++            .unwrap();
++        for (lane, session) in [(7, 0), (8, 1), (9, 0), (10, 1)] {
++            queue_snapshot(&mut worker, session, lane, 1, 0);
++        }
++        worker.flush_control(Duration::ZERO).unwrap();
++        for session in [0, 1, 0, 1] {
++            let length = rx.recv(&mut bytes).unwrap().0;
++            let datagram = Datagram::decode(&bytes[..length]).unwrap();
++            assert_eq!(datagram.records().count(), 1);
++            assert_eq!(
++                datagram.header().cookie,
++                worker.shared.config.config().sessions[session].cookie
++            );
++        }
++        assert_eq!(
++            rx.recv(&mut bytes).unwrap_err().kind(),
++            io::ErrorKind::WouldBlock
++        );
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn packed_ack_send_failure_returns_all_snapshots_and_cancels_history() {
++        let (mut worker, _) = receive_worker();
++        let rx = socket(&mut worker);
++        worker.unpaced_fixture = false;
++        std::thread_local! { static STEP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
++        STEP.set(0);
++        worker.io_time = Some(|_| {
++            if STEP.replace(STEP.get() + 1) == 2 {
++                Err(io::ErrorKind::WouldBlock.into())
++            } else {
++                Ok(Duration::ZERO)
++            }
++        });
++        for lane in 7..11 {
++            queue_snapshot(&mut worker, 0, lane, 1, 0);
++        }
++        worker.flush_control(Duration::ZERO).unwrap();
++        assert_eq!(worker.feedback_free.len(), BUFFERS);
++        assert!(
++            worker
++                .feedback_free
++                .iter()
++                .all(|feedback| feedback.sent.is_none())
++        );
++        assert!(worker.pending_control.is_empty());
++        assert_eq!(worker.counters.tx_outer_bytes, 0);
++        for totals in [&worker.counters, &worker.sessions[0].totals] {
++            assert_eq!(totals.tx_ack_datagrams, 0);
++            assert_eq!(totals.tx_ack_records, 0);
++            assert_eq!(totals.tx_ack_ranges, 0);
++        }
++        assert_eq!(worker.control_budgets[0].deadline(), None);
++        let index = worker.sender_index(0, 0).unwrap();
++        assert_eq!(worker.sender.lanes[index].history.highest_sent(), 0);
++        assert!(!worker.sender.lanes[index].history.is_reserved(1));
++        let mut bytes = [0; BASE_UDP_PAYLOAD];
++        assert_eq!(
++            rx.recv(&mut bytes).unwrap_err().kind(),
++            io::ErrorKind::WouldBlock
++        );
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn packed_ack_admission_dispatches_every_record_once() {
++        let (mut worker, _) = receive_worker();
++        let rx = socket(&mut worker);
++        worker.unpaced_fixture = false;
++        worker.io_time = Some(Ok);
++        for lane in [1, 2, 1, 2] {
++            queue_snapshot(&mut worker, 0, lane, 1, 0);
++        }
++        worker.flush_control(Duration::ZERO).unwrap();
++        let mut buffer = worker.free.pop().unwrap();
++        buffer.length = rx.recv(&mut buffer.bytes).unwrap().0;
++        let mut header = Datagram::decode(&buffer.bytes[..buffer.length])
++            .unwrap()
++            .header();
++        header.receive_tag = 1;
++        header.lane = 7;
++        header.encode((&mut buffer.bytes[..wire::HEADER_LEN]).try_into().unwrap());
++        let copy = buffer.bytes[..buffer.length].to_vec();
++        let mut budget = ReceiveBudget::default();
++        let buffer = worker
++            .packet_one(buffer, Duration::ZERO, &mut budget)
++            .unwrap()
++            .unwrap();
++        assert_eq!(budget.datagrams, 1);
++        assert_eq!(budget.records, 4);
++        assert_eq!(worker.sender.ack_free.len(), 0);
++        assert_eq!(worker.sender.incoming.len(), 2);
++        assert_eq!(worker.sender.outgoing.len(), 2);
++        assert_eq!(worker.counters.queue_drops, 0);
++        worker.free.push(buffer);
++        let mut duplicate = worker.free.pop().unwrap();
++        duplicate.length = copy.len();
++        duplicate.bytes[..copy.len()].copy_from_slice(&copy);
++        worker
++            .packet_one(duplicate, Duration::ZERO, &mut ReceiveBudget::default())
++            .unwrap();
++        assert_eq!(worker.counters.duplicate_packets, 1);
++        assert_eq!(worker.counters.queue_drops, 0);
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn ack_packing_stops_at_future_or_stale_front_snapshot() {
++        for stale in [false, true] {
++            let (mut worker, _) = receive_worker();
++            let rx = socket(&mut worker);
++            worker.io_time = Some(Ok);
++            for lane in 7..11 {
++                queue_snapshot(&mut worker, 0, lane, 1, 0);
++            }
++            let Pending::Ack(next) = &mut worker.pending_control[1] else {
++                panic!()
++            };
++            if stale {
++                next.tag = 9;
++            } else {
++                next.due = Duration::from_millis(1);
++            }
++            worker.flush_control(Duration::ZERO).unwrap();
++            let mut bytes = [0; BASE_UDP_PAYLOAD];
++            for count in [1, 2] {
++                let length = rx.recv(&mut bytes).unwrap().0;
++                assert_eq!(
++                    Datagram::decode(&bytes[..length])
++                        .unwrap()
++                        .records()
++                        .count(),
++                    count
++                );
++            }
++            assert_eq!(
++                rx.recv(&mut bytes).unwrap_err().kind(),
++                io::ErrorKind::WouldBlock
++            );
++            assert_eq!(worker.pending_control.len(), usize::from(!stale));
++            if !stale {
++                worker.flush_control(Duration::from_millis(1)).unwrap();
++                let length = rx.recv(&mut bytes).unwrap().0;
++                assert!(matches!(
++                    Datagram::decode(&bytes[..length]).unwrap().records().next(),
++                    Some(Record::Ack { lane: 8, .. })
++                ));
++            }
++            assert_eq!(worker.feedback_free.len(), BUFFERS);
++        }
++    }
+ }
+diff --git a/src/worker/sender/owner.rs b/src/worker/sender/owner.rs
+index 4d16d65..7f1c507 100644
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -570,8 +570,7 @@ impl Owner {
+                 .window
+                 .saturating_sub(inflight)
+                 .saturating_sub(reserved);
+-            let mut budget = u64::from(limits.quantum.min(64 * u32::from(limits.max_datagram)))
+-                .saturating_sub(reserved);
++            let mut budget = u64::from(burst);
+             if request.probe.is_none() {
+                 budget = budget.min(available);
+             }
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index 21265e5..5d03f1e 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -1926,7 +1926,15 @@ fn admitted_acks_finish_then_loss_progresses_under_continuous_ack_input() {
+                     .incoming_ack(0, 1, 2, 0, AckRanges::new(&duplicate).unwrap(), now)
+                     .unwrap();
+             }
++            let skipped = worker.counters.ack_owner_skips;
+             worker.service_sender(now).unwrap();
++            if worker.counters.ack_owner_skips != skipped {
++                assert!(
++                    accepted_done && other_done && lost && checked_done,
++                    "duplicate ACK admission overtook the finite loss pass"
++                );
++                resumed = true;
++            }
+             if let Some(report) = held.take() {
+                 assert!(peer.incoming[1].as_mut().unwrap().try_pop().is_none());
+                 worker
+@@ -2779,3 +2787,220 @@ fn fresh_admission_preserves_sixteen_flow_qinq_gso_burst_before_bounding_excess(
+     assert_eq!(worker.counters.tx_backlog_drops, 1);
+     assert_eq!(worker.counters.queue_drops, 1);
+ }
++
++#[test]
++fn duplicate_ack_local_return_requires_the_complete_empty_transaction() {
++    let mut lane = Lane::new(0, 1, 0).unwrap();
++    for number in 1..=130 {
++        lane.history.reserve(number, 1280, true, true).unwrap();
++        assert!(lane.submitted(number, Duration::ZERO, None));
++    }
++    let make_ack = || {
++        let mut ack = Box::new(Ack::new(0));
++        ack.lane = 1;
++        ack.count = 1;
++        ack.ranges[0] = AckRange { start: 1, end: 130 };
++        ack.received = Duration::from_millis(1);
++        ack
++    };
++    let mut report = Report::new(0);
++    let mut empty_final = false;
++    let mut empty_intermediate = false;
++    lane.begin_ack(make_ack()).ok().unwrap();
++    for _ in 0..256 {
++        let produced = lane
++            .advance_report(&mut report, Duration::from_millis(1), &mut 1)
++            .unwrap();
++        assert!(!report.empty_ack());
++        if !produced && report.count == 0 {
++            empty_intermediate = true;
++        }
++        if produced {
++            empty_final |=
++                report.count == 0 && matches!(report.kind, ReportKind::Ack { end: Some(_), .. });
++            lane.report_completed(&report).unwrap();
++        }
++        if lane.ack.is_none() {
++            break;
++        }
++    }
++    assert!(empty_final);
++    assert!(lane.ack.is_none());
++    lane.begin_ack(make_ack()).ok().unwrap();
++    lane.loss_passes = 1;
++    assert!(
++        lane.advance_report(&mut report, Duration::from_millis(2), &mut 1)
++            .unwrap()
++    );
++    assert!(report.empty_ack());
++    let ReportKind::Ack {
++        end: Some(progress),
++        ..
++    } = report.kind
++    else {
++        panic!("complete duplicate ACK");
++    };
++    assert_eq!(progress, AckProgress::default());
++    assert!(lane.report_completed(&report).unwrap().is_some());
++    assert!(empty_intermediate);
++    assert!(lane.ack.is_none());
++    assert_eq!(lane.loss_passes, 1);
++    assert_eq!(lane.loss_due, Some(Duration::from_millis(2)));
++}
++
++#[test]
++fn duplicate_ack_fast_path_does_not_bypass_whole_ack_validation() {
++    let mut lane = Lane::new(0, 1, 0).unwrap();
++    for number in 1..=3 {
++        lane.history.reserve(number, 1280, true, true).unwrap();
++        if number != 2 {
++            assert!(lane.submitted(number, Duration::ZERO, None));
++        }
++    }
++    for range in [
++        AckRange { start: 3, end: 1 },
++        AckRange { start: 4, end: 4 },
++        AckRange { start: 1, end: 3 },
++    ] {
++        let mut ack = Box::new(Ack::new(0));
++        ack.lane = 1;
++        ack.count = 1;
++        ack.ranges[0] = range;
++        assert!(lane.begin_ack(ack).is_err());
++        assert!(lane.ack.is_none());
++        assert!(!lane.report_pending);
++        assert_eq!(lane.largest_ack, 0);
++        assert_eq!(lane.history.inflight_bytes(), 2560);
++    }
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn duplicate_ack_returns_locally_without_skipping_its_loss_fence() {
++    let (mut workers, _rx) = workers();
++    frame(&mut workers[1]);
++    let number = workers[1].sender.job.unwrap().first;
++    for _ in 0..8 {
++        service(&mut workers);
++    }
++    for worker in &mut workers {
++        worker.io_time = Some(Ok);
++    }
++    let ranges = [AckRange {
++        start: number,
++        end: number,
++    }];
++    let now = Duration::from_millis(2);
++    workers[1]
++        .incoming_ack(0, 1, 2, 0, AckRanges::new(&ranges).unwrap(), now)
++        .unwrap();
++    for _ in 0..8 {
++        for worker in &mut workers {
++            worker.drain_queues(now).unwrap();
++            worker.service_sender(now).unwrap();
++        }
++    }
++    let before = workers[0]
++        .sender
++        .owner
++        .as_ref()
++        .unwrap()
++        .snapshot(0)
++        .unwrap();
++    assert_eq!(before.bytes_in_flight, 0);
++    let worker = &mut workers[1];
++    let index = worker.sender_index(0, 1).unwrap();
++    assert_eq!(worker.sender.loss_fences, 0);
++    let staged = worker.counters.recovery_staged_reports;
++    let now = Duration::from_millis(3);
++    worker
++        .incoming_ack(0, 1, 2, 0, AckRanges::new(&ranges).unwrap(), now)
++        .unwrap();
++    worker.begin_sender_ack().unwrap();
++    assert_eq!(worker.sender.loss_fences, 1);
++    worker.service_sender(now).unwrap();
++    assert_eq!(worker.counters.ack_owner_skips, 1);
++    assert_eq!(worker.counters.recovery_staged_reports, staged);
++    assert_eq!(worker.sender.acks_pending, 0);
++    assert_eq!(worker.sender.ack_free.len(), ACK_BUFFERS);
++    assert!(worker.sender.report.is_some());
++    assert!(worker.recovery.staged.is_none());
++    assert!(
++        worker
++            .sender
++            .outgoing
++            .iter()
++            .all(|(_, message)| !matches!(message, Message::Report(_)))
++    );
++    assert_eq!(worker.sender.loss_fences, 1);
++    assert_eq!(worker.sender.lanes[index].loss_passes, 1);
++    assert_eq!(worker.sender.lanes[index].loss_due, Some(now));
++    worker.service_sender(now).unwrap();
++    assert_eq!(worker.sender.loss_fences, 0);
++    assert_eq!(
++        workers[0]
++            .sender
++            .owner
++            .as_ref()
++            .unwrap()
++            .snapshot(0)
++            .unwrap(),
++        before
++    );
++}
++
++#[test]
++fn duplicate_and_retired_feedback_cannot_update_rtt_or_reset_pto() {
++    for number in [1, u64::MAX] {
++        for eliciting in [false, true] {
++            for retire in [false, true] {
++                let mut history = History::new().unwrap();
++                history.reserve(number, 1280, eliciting, eliciting).unwrap();
++                assert!(history.submit(number, Duration::from_millis(1)));
++                let ranges = [AckRange {
++                    start: number,
++                    end: number,
++                }];
++                let ranges = AckRanges::new(&ranges).unwrap();
++                let first = history.acknowledge(ranges, |_| {}).unwrap();
++                assert_eq!(first.packets, 1);
++                assert_eq!(first.eliciting, eliciting);
++                assert_eq!(first.rtt_sent_at.is_some(), eliciting);
++                if retire {
++                    while history.retire_oldest_resolved().unwrap().is_some() {}
++                    assert!(history.is_retired());
++                }
++                let duplicate = history
++                    .acknowledge(ranges, |_| panic!("duplicate delivery"))
++                    .unwrap();
++                assert_eq!(duplicate, AckProgress::default());
++            }
++        }
++    }
++    let mut lane = Lane::new(0, 1, 0).unwrap();
++    lane.history.reserve(1, 1280, true, true).unwrap();
++    assert!(lane.submitted(1, Duration::ZERO, None));
++    assert!(lane.history.lose(1).is_some());
++    assert!(lane.history.retire_oldest_resolved().unwrap().is_some());
++    let mut ack = Box::new(Ack::new(0));
++    ack.lane = 1;
++    ack.count = 1;
++    ack.ranges[0] = AckRange { start: 1, end: 1 };
++    lane.begin_ack(ack).ok().unwrap();
++    assert_eq!(lane.largest_ack, 1);
++    assert!(lane.history.outstanding().next().is_none());
++    let mut report = Report::new(0);
++    assert!(
++        lane.advance_report(&mut report, Duration::from_millis(2), &mut 1)
++            .unwrap()
++    );
++    assert!(report.empty_ack());
++    let ReportKind::Ack {
++        end: Some(progress),
++        ..
++    } = report.kind
++    else {
++        panic!("complete retired ACK");
++    };
++    assert_eq!(progress, AckProgress::default());
++}
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 7457ab9..0dfe735 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -73,6 +73,18 @@ pub(crate) struct Report {
+ }
+ 
+ impl Report {
++    fn empty_ack(&self) -> bool {
++        self.count == 0
++            && matches!(
++                self.kind,
++                ReportKind::Ack {
++                    first: true,
++                    end: Some(AckProgress { packets: 0, .. }),
++                    ..
++                }
++            )
++    }
++
+     fn new(origin: usize) -> Self {
+         Self {
+             origin,
+@@ -986,7 +998,12 @@ impl Worker {
+                     .and_then(|left| left.checked_sub(1).filter(|&n| n != 0));
+             }
+             if produced {
+-                self.recovery.staged = Some(report);
++                if report.empty_ack() {
++                    self.sender_message(Message::ReportReturn(report), now)?;
++                    self.counters.ack_owner_skips = self.counters.ack_owner_skips.wrapping_add(1);
++                } else {
++                    self.recovery.staged = Some(report);
++                }
+                 more = true;
+             } else {
+                 budget = budget.saturating_sub(1);
+diff --git a/src/worker.rs b/src/worker.rs
+index b52bcff..88a7018 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -3660,6 +3660,23 @@ impl Worker {
+         record: Record<'_>,
+         now: Duration,
+     ) -> io::Result<Option<(u64, u16, Duration)>> {
++        self.send_records(session, &[record], now)
++    }
++
++    fn send_records(
++        &mut self,
++        session: usize,
++        records: &[Record<'_>],
++        now: Duration,
++    ) -> io::Result<Option<(u64, u16, Duration)>> {
++        let record = *records.first().ok_or(io::ErrorKind::InvalidInput)?;
++        if records.len() > 1
++            && records
++                .iter()
++                .any(|record| !matches!(record, Record::Ack { .. }))
++        {
++            return Err(io::ErrorKind::InvalidInput.into());
++        }
+         if self.sender_enabled() && matches!(record, Record::Probe) {
+             self.request_probe(session, 0, BASE_UDP_PAYLOAD, false, None, now)?;
+             return Ok(None);
+@@ -3698,7 +3715,7 @@ impl Worker {
+         } else {
+             self.sessions[session].tx[0]
+                 .as_mut()
+-                .and_then(|lane| lane.record(record, bytes).ok())
++                .and_then(|lane| lane.records(records, bytes).ok())
+         };
+         let Some(packet) = packet else {
+             return Ok(None);
+@@ -3725,22 +3742,26 @@ impl Worker {
+             {
+                 return Err(io::ErrorKind::WouldBlock.into());
+             }
+-            if let Record::Ack {
+-                lane,
+-                delay_us,
+-                ranges,
+-            } = record
+-            {
+-                // Finalize queue delay using the same clock as successful-send bookkeeping.
+-                Record::Ack {
++            let mut offset = wire::HEADER_LEN;
++            for record in records {
++                if let Record::Ack {
+                     lane,
++                    delay_us,
+                     ranges,
+-                    delay_us: delay_us
+-                        .saturating_add(at.saturating_sub(now).as_micros().min(1000) as u32)
+-                        .min(1000),
++                } = *record
++                {
++                    // Every snapshot gets its own final delay at the physical send boundary.
++                    Record::Ack {
++                        lane,
++                        ranges,
++                        delay_us: delay_us
++                            .saturating_add(at.saturating_sub(now).as_micros().min(1000) as u32)
++                            .min(1000),
++                    }
++                    .encode(&mut bytes[offset..offset + record.encoded_len()])
++                    .map_err(io::Error::other)?;
+                 }
+-                .encode(&mut bytes[wire::HEADER_LEN..packet.length])
+-                .map_err(io::Error::other)?;
++                offset += record.encoded_len();
+             }
+             socket.send(&bytes[..packet.length], limit)?;
+             Ok(at)
+diff --git a/tests/pacing.rs b/tests/pacing.rs
+index a83767c..46d28d1 100644
+--- a/tests/pacing.rs
++++ b/tests/pacing.rs
+@@ -66,26 +66,36 @@ fn expired_grants_hold_credit_until_one_partial_or_unused_report() {
+ }
+ 
+ #[test]
+-fn workers_share_quantum_and_sixty_four_datagram_cap_without_idle_catchup() {
++fn each_grant_fits_quantum_and_datagram_cap_with_shared_pacing() {
+     for quantum in [10_240, 65_536, u32::MAX] {
+         let mut grants = Grants::new(3).unwrap();
+         let limits = Limits {
+             window: u64::MAX,
++            rate: 1_280_000_000,
+             quantum,
+             ..limits()
+         };
+         let cap = quantum.min(64 * 1280);
+-        let a = grants.reserve(0, cap - 1280, false, limits, us(0)).unwrap();
++        let a = grants.reserve(0, cap, false, limits, us(0)).unwrap();
+         let at = grants.deadline(us(0)).unwrap();
+-        let b = grants.reserve(1, 1280, false, limits, at).unwrap();
+-        assert_eq!(grants.reserved(), u64::from(cap));
+         assert_eq!(
+-            grants.reserve(2, 100, false, limits, us(10_000)),
++            grants.reserve(1, cap, false, limits, at - Duration::from_nanos(1)),
+             Err(Error::Blocked)
+         );
++        let b = grants.reserve(1, cap, false, limits, at).unwrap();
++        assert_eq!(grants.reserved(), 2 * u64::from(cap));
++        assert_eq!(
++            grants.reserve(2, cap + 1, false, limits, us(10_000)),
++            Err(Error::Blocked)
++        );
++        assert_eq!(
++            grants.reserve(0, 100, false, limits, us(10_000)),
++            Err(Error::Blocked)
++        );
++        let c = grants.reserve(2, cap, false, limits, us(10_000)).unwrap();
++        assert_eq!(grants.reserved(), 3 * u64::from(cap));
+         grants.reported(a, 0, None).unwrap();
+         grants.reported(b, 0, None).unwrap();
+-        let c = grants.reserve(2, cap, false, limits, us(10_000)).unwrap();
+         grants.reported(c, cap, Some(us(10_000))).unwrap();
+         assert_eq!(
+             grants.reserve(0, 100, false, limits, us(10_000)),
+@@ -93,11 +103,59 @@ fn workers_share_quantum_and_sixty_four_datagram_cap_without_idle_catchup() {
+         );
+         assert_eq!(
+             grants.deadline(us(10_000)),
+-            Some(us(10_000) + Duration::from_nanos(u64::from(cap) * 1_000_000_000 / limits.rate))
++            Some(
++                us(10_000)
++                    + Duration::from_nanos((u64::from(cap) * 1_000_000_000).div_ceil(limits.rate))
++            )
+         );
+     }
+ }
+ 
++#[test]
++fn overlapping_limit_reductions_keep_old_permissions_and_charge_delayed_reports() {
++    let mut grants = Grants::new(4).unwrap();
++    let fast = Limits {
++        window: 5120,
++        quantum: 2560,
++        rate: 256_000_000,
++        ..limits()
++    };
++    let a = grants.reserve(0, 2560, false, fast, us(0)).unwrap();
++    let slow = Limits {
++        quantum: 1280,
++        rate: 1_280_000,
++        ..fast
++    };
++    assert_eq!(
++        grants.reserve(1, 1280, false, slow, us(9)),
++        Err(Error::Blocked)
++    );
++    assert_eq!(
++        grants.reserve(1, 2560, false, slow, us(10)),
++        Err(Error::Blocked)
++    );
++    let b = grants.reserve(1, 1280, false, slow, us(10)).unwrap();
++    assert_eq!(grants.deadline(us(10)), Some(us(1010)));
++    assert!(a.valid_at(us(99)) && b.valid_at(us(109)));
++    assert!(!a.valid_at(us(100)) && !b.valid_at(us(110)));
++    let c = grants.reserve(2, 1280, false, slow, us(1010)).unwrap();
++    assert_eq!(grants.reserved(), 5120);
++    assert_eq!(
++        grants.reserve(3, 100, false, slow, us(2010)),
++        Err(Error::Blocked)
++    );
++    assert_eq!(grants.reported(b, 1280, Some(us(110))), Err(Error::Invalid));
++    assert_eq!(grants.reserved(), 5120);
++    grants.reported(a, 1280, Some(us(99))).unwrap();
++    assert_eq!((grants.reserved(), grants.in_flight()), (2560, 1280));
++    let d = grants.reserve(3, 1280, false, slow, us(2010)).unwrap();
++    for grant in [b, c, d] {
++        grants.reported(grant, 0, None).unwrap();
++    }
++    grants.settled(1280).unwrap();
++    assert_eq!((grants.reserved(), grants.in_flight()), (0, 0));
++}
++
+ #[test]
+ fn probes_bypass_only_window_and_share_two_permissions_across_workers() {
+     let mut grants = Grants::new(3).unwrap();
+@@ -327,7 +385,7 @@ fn pmtu_probes_can_exceed_confirmed_size_without_inflating_burst_or_window() {
+     grants.probe_allowance(2).unwrap();
+     let probe = grants.reserve(0, 9000, true, limits, us(0)).unwrap();
+     assert_eq!(
+-        grants.reserve(1, 1280, true, limits, us(100)),
++        grants.reserve(1, 1280, true, limits, us(70)),
+         Err(Error::Blocked)
+     );
+     grants.reported(probe, 9000, Some(us(0))).unwrap();
+diff --git a/tests/pack.rs b/tests/pack.rs
+index 6694966..5d1672d 100644
+--- a/tests/pack.rs
++++ b/tests/pack.rs
+@@ -1107,7 +1107,7 @@ fn apply_tracked_ack(
+         panic!("expected ACK");
+     };
+     history.begin_ack(ranges).unwrap();
+-    receiver.ack_transmitted(now);
++    receiver.ack_transmitted(now, ranges);
+     for _ in 0..256 {
+         if let Some(progress) = history.advance_ack(1, |acked| {
+             while let Some(piece) = journal.pop_packet(acked.packet.number as usize) {
+diff --git a/tests/reassembly.rs b/tests/reassembly.rs
+index 30e2da4..d94e370 100644
+--- a/tests/reassembly.rs
++++ b/tests/reassembly.rs
+@@ -740,3 +740,237 @@ fn expiry_distinguishes_incomplete_and_ready_frames_once() {
+     assert_eq!(lane.expired_frames(), 0);
+     assert_eq!(lane.expired_incomplete_frames(), 0);
+ }
++
++fn repeated_ack(
++    lane: &mut Lane,
++    highest: u64,
++    millis: u64,
++    transmitted: bool,
++) -> Vec<unquic::wire::AckRange> {
++    use unquic::wire::{AckRange, MAX_ACK_RANGES};
++    let now = Duration::from_millis(millis);
++    assert_eq!(
++        admit(lane, highest, &[Record::Probe], now),
++        Admission::Duplicate
++    );
++    let mut output = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
++    let Some(Record::Ack { ranges, .. }) =
++        lane.take_ack(now + Duration::from_millis(1), &mut output)
++    else {
++        panic!("missing repeated ACK");
++    };
++    if transmitted {
++        lane.ack_transmitted(now + Duration::from_millis(1), ranges);
++    }
++    ranges.iter().collect()
++}
++
++#[test]
++fn ack_pruning_counts_only_successful_snapshots_and_preserves_late_arrivals() {
++    use unquic::wire::{AckRange, MAX_ACK_RANGES};
++    let mut lane = Lane::new(1, 1514).unwrap();
++    for number in [1, 3] {
++        assert_eq!(
++            admit(&mut lane, number, &[Record::Probe], Duration::ZERO),
++            Admission::Fresh
++        );
++    }
++    let mut output = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
++    let Some(Record::Ack { ranges, .. }) = lane.take_ack(Duration::ZERO, &mut output) else {
++        panic!("missing initial ACK");
++    };
++    assert_eq!(
++        admit(&mut lane, 2, &[Record::Probe], Duration::from_micros(1)),
++        Admission::Fresh
++    );
++    lane.ack_transmitted(Duration::from_micros(2), ranges);
++    let all = [AckRange { start: 1, end: 3 }];
++    // A cancelled/failed submission contributes no repetition.
++    assert_eq!(repeated_ack(&mut lane, 3, 10, false), all);
++    assert_eq!(repeated_ack(&mut lane, 3, 20, true), all);
++    assert_eq!(repeated_ack(&mut lane, 3, 30, true), all);
++    // Packet 2 was absent from the delayed first snapshot and needs one more ACK.
++    assert_eq!(
++        repeated_ack(&mut lane, 3, 40, true),
++        [AckRange { start: 2, end: 3 }]
++    );
++    assert_eq!(
++        repeated_ack(&mut lane, 3, 50, true),
++        [AckRange { start: 3, end: 3 }]
++    );
++    assert_eq!(lane.lower_bounds().0, 1);
++    assert_eq!(
++        admit(&mut lane, 1, &[Record::Probe], Duration::from_millis(60)),
++        Admission::Duplicate
++    );
++
++    assert_eq!(
++        admit(&mut lane, 5, &[Record::Probe], Duration::from_millis(60)),
++        Admission::Fresh
++    );
++    for millis in [70, 80, 90] {
++        repeated_ack(&mut lane, 5, millis, true);
++    }
++    // A late fresh packet remains ACK-eligible below pruned packet numbers.
++    assert_eq!(
++        admit(&mut lane, 4, &[Record::Probe], Duration::from_millis(100)),
++        Admission::Fresh
++    );
++    for millis in [110, 120, 130] {
++        assert_eq!(
++            repeated_ack(&mut lane, 5, millis, true),
++            [AckRange { start: 4, end: 5 }]
++        );
++    }
++    assert_eq!(
++        repeated_ack(&mut lane, 5, 140, true),
++        [AckRange { start: 5, end: 5 }]
++    );
++}
++
++#[test]
++fn ack_pruning_retains_unreported_old_ranges_and_resets_with_the_lane() {
++    use unquic::wire::AckRange;
++    let mut lane = Lane::new(1, 1514).unwrap();
++    for number in (1..=67).step_by(2) {
++        admit(&mut lane, number, &[Record::Probe], Duration::ZERO);
++    }
++    for millis in [10, 20, 30] {
++        let ranges = repeated_ack(&mut lane, 67, millis, true);
++        assert_eq!(ranges.len(), 32);
++        assert_eq!(ranges.last(), Some(&AckRange { start: 5, end: 5 }));
++    }
++    assert_eq!(
++        repeated_ack(&mut lane, 67, 40, true),
++        [
++            AckRange { start: 67, end: 67 },
++            AckRange { start: 3, end: 3 },
++            AckRange { start: 1, end: 1 },
++        ]
++    );
++    lane.reset(1, 1514).unwrap();
++    for number in [1, 3] {
++        admit(&mut lane, number, &[Record::Probe], Duration::ZERO);
++    }
++    assert_eq!(
++        repeated_ack(&mut lane, 3, 10, true),
++        [AckRange { start: 3, end: 3 }, AckRange { start: 1, end: 1 },]
++    );
++}
++
++#[test]
++fn delayed_ack_reports_do_not_charge_recycled_window_bits() {
++    use unquic::wire::{AckRange, MAX_ACK_RANGES};
++    let mut lane = Lane::new(1, 1514).unwrap();
++    for number in 1..=130 {
++        admit(&mut lane, number, &[Record::Probe], Duration::ZERO);
++    }
++    let mut output = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
++    let Some(Record::Ack { ranges, .. }) = lane.take_ack(Duration::ZERO, &mut output) else {
++        panic!("missing initial ACK");
++    };
++    let high = WINDOW_LEN as u64 + 130;
++    for number in high - 129..=high {
++        admit(
++            &mut lane,
++            number,
++            &[Record::Probe],
++            Duration::from_millis(1),
++        );
++    }
++    lane.ack_transmitted(Duration::from_millis(2), ranges);
++    for millis in [10, 20, 30] {
++        assert_eq!(
++            repeated_ack(&mut lane, high, millis, true),
++            [AckRange {
++                start: high - 129,
++                end: high
++            },]
++        );
++    }
++    assert_eq!(
++        repeated_ack(&mut lane, high, 40, true),
++        [AckRange {
++            start: high,
++            end: high
++        }]
++    );
++    for number in u64::MAX - 129..=u64::MAX {
++        admit(
++            &mut lane,
++            number,
++            &[Record::Probe],
++            Duration::from_millis(50),
++        );
++    }
++    for millis in [60, 70, 80] {
++        assert_eq!(
++            repeated_ack(&mut lane, u64::MAX, millis, true),
++            [AckRange {
++                start: u64::MAX - 129,
++                end: u64::MAX
++            },]
++        );
++    }
++    assert_eq!(
++        repeated_ack(&mut lane, u64::MAX, 90, true),
++        [AckRange {
++            start: u64::MAX,
++            end: u64::MAX
++        },]
++    );
++}
++
++#[test]
++fn delayed_ack_report_counts_only_the_surviving_part_of_its_snapshot() {
++    use unquic::wire::{AckRange, MAX_ACK_RANGES};
++    let mut lane = Lane::new(1, 1514).unwrap();
++    for number in 1..=130 {
++        admit(&mut lane, number, &[Record::Probe], Duration::ZERO);
++    }
++    let mut output = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
++    let Some(Record::Ack { ranges, .. }) = lane.take_ack(Duration::ZERO, &mut output) else {
++        panic!("missing initial ACK");
++    };
++    let alias = WINDOW_LEN as u64 + 1;
++    let highest = WINDOW_LEN as u64 + 64;
++    for number in [alias, highest] {
++        assert_eq!(
++            admit(
++                &mut lane,
++                number,
++                &[Record::Probe],
++                Duration::from_millis(1),
++            ),
++            Admission::Fresh,
++        );
++    }
++    assert_eq!(lane.lower_bounds().0, 65);
++    lane.ack_transmitted(Duration::from_millis(2), ranges);
++    let newer = [
++        AckRange {
++            start: highest,
++            end: highest,
++        },
++        AckRange {
++            start: alias,
++            end: alias,
++        },
++    ];
++    for millis in [10, 20] {
++        assert_eq!(
++            repeated_ack(&mut lane, highest, millis, true),
++            [
++                newer[0],
++                newer[1],
++                AckRange {
++                    start: 65,
++                    end: 130
++                }
++            ],
++        );
++    }
++    // Surviving old packets have three reports; recycled aliases have only two.
++    assert_eq!(repeated_ack(&mut lane, highest, 30, true), newer);
++    assert_eq!(repeated_ack(&mut lane, highest, 40, true), [newer[0]],);
++}
+diff --git a/tests/sender.rs b/tests/sender.rs
+index a8abb61..3599ab8 100644
+--- a/tests/sender.rs
++++ b/tests/sender.rs
+@@ -285,7 +285,7 @@ fn stale_handles_and_every_identity_component_are_rejected_after_reuse() {
+ }
+ 
+ #[test]
+-fn first_unused_report_closes_issuance_without_recycling_its_credit() {
++fn unused_reports_return_credit_but_expired_unreported_grants_keep_their_share() {
+     let (mut sender, flights) = Sender::new(1, 3, 3).unwrap();
+     let mut flights = buffers(flights);
+     let mut c = flights.pop().unwrap();
+@@ -295,7 +295,8 @@ fn first_unused_report_closes_issuance_without_recycling_its_credit() {
+         flight.prepare(&[packet(lane as u16, 1, 100)]).unwrap();
+     }
+     let limits = Limits {
+-        quantum: 200,
++        window: 200,
++        quantum: 100,
+         ..limits()
+     };
+     sender.reserve(0, &mut a, false, limits, us(0)).unwrap();
+@@ -307,25 +308,235 @@ fn first_unused_report_closes_issuance_without_recycling_its_credit() {
+     a.complete(0, None, false).unwrap();
+     assert_eq!(a.complete(0, None, false), Err(Error::Stale));
+     sender.reported(a).unwrap();
++    let mut a = commit(&mut sender, 0);
++    assert!(!sender.feedback_ready(0));
+     assert_eq!(sender.flight_bytes(0), Some((100, 0)));
++    sender.reserve(0, &mut c, false, limits, us(200)).unwrap();
++    a.prepare(&[packet(0, 2, 100)]).unwrap();
+     assert_eq!(
+-        sender.reserve(0, &mut c, false, limits, us(200)),
++        sender.reserve(0, &mut a, false, limits, us(201)),
+         Err(Error::Blocked)
+     );
+-    assert!(sender.advance(0, 64).unwrap().is_none());
++    sender.close(0).unwrap();
+     b.complete(0, None, false).unwrap();
+     sender.reported(b).unwrap();
+-    let _a = commit(&mut sender, 0);
+     let _b = commit(&mut sender, 0);
+     assert_eq!(
+-        sender.reserve(0, &mut c, false, limits, us(201)),
++        sender.reserve(0, &mut a, false, limits, us(202)),
+         Err(Error::Blocked)
+     );
+-    sender.reopen(0).unwrap();
+-    sender.reserve(0, &mut c, false, limits, us(201)).unwrap();
+     c.complete(0, None, false).unwrap();
+     sender.reported(c).unwrap();
+     let _c = commit(&mut sender, 0);
++    sender.reopen(0).unwrap();
++    sender.reserve(0, &mut a, false, limits, us(203)).unwrap();
++}
++
++#[test]
++fn safe_prefix_recycles_before_later_grants_and_feedback_closes_rolling_issuance() {
++    let (mut sender, flights) = Sender::new(1, 3, 6).unwrap();
++    let mut flights = buffers(flights);
++    let mut spare = flights.pop().unwrap();
++    let mut b = flights.pop().unwrap();
++    let mut a = flights.pop().unwrap();
++    let first = packet(0, 1, 100);
++    let later = packet(1, 1, 200);
++    let middle = packet(0, 2, 300);
++    a.prepare(&[first]).unwrap();
++    b.prepare(&[later]).unwrap();
++    spare.prepare(&[packet(2, 1, 100)]).unwrap();
++    sender.reserve(0, &mut a, false, limits(), us(0)).unwrap();
++    let first_handle = a.handle(0).unwrap();
++    sender.reserve(0, &mut b, false, limits(), us(10)).unwrap();
++    let later_handle = b.handle(0).unwrap();
++    a.complete(1, Some(us(1)), false).unwrap();
++    sender.reported(a).unwrap();
++    let mut a = commit(&mut sender, 0);
++    assert_eq!(sender.flight_bytes(0), Some((200, 100)));
++    assert!(!sender.feedback_ready(0));
++    a.prepare(&[middle]).unwrap();
++    sender.reserve(0, &mut a, false, limits(), us(20)).unwrap();
++    let middle_handle = a.handle(0).unwrap();
++    b.complete(1, Some(us(30)), false).unwrap();
++    sender.reported(b).unwrap();
++    assert!(sender.advance(0, 64).unwrap().is_none());
++    sender.close(0).unwrap();
++    assert_eq!(
++        sender.reserve(0, &mut spare, false, limits(), us(31)),
++        Err(Error::Blocked)
++    );
++    assert_eq!(sender.begin_ack(0, us(100), false), Err(Error::Blocked));
++    a.complete(1, Some(us(21)), false).unwrap();
++    sender.reported(a).unwrap();
++    let a = commit(&mut sender, 0);
++    assert_eq!(a.worker(), 0);
++    let b = commit(&mut sender, 0);
++    assert_eq!(b.worker(), 1);
++    assert!(sender.feedback_ready(0));
++    for (index, (packet, handle, flight)) in [
++        (first, first_handle, 100),
++        (middle, middle_handle, 400),
++        (later, later_handle, 600),
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        let sample = acknowledge(&mut sender, 0, packet, handle, 100 + index as u64);
++        assert_eq!(
++            (sample.last_packet, sample.tx_in_flight),
++            (index as u64 + 1, flight)
++        );
++    }
++    assert_eq!(sender.flight_bytes(0), Some((0, 0)));
++    sender.reopen(0).unwrap();
++    sender
++        .reserve(0, &mut spare, false, limits(), us(103))
++        .unwrap();
++}
++
++#[test]
++fn replacement_grants_do_not_charge_uncommitted_reports_twice() {
++    let (mut sender, flights) = Sender::new(1, 3, 3).unwrap();
++    let mut flights = buffers(flights);
++    let mut c = flights.pop().unwrap();
++    let mut b = flights.pop().unwrap();
++    let mut a = flights.pop().unwrap();
++    let plans = [packet(0, 1, 100), packet(1, 1, 200), packet(2, 1, 300)];
++    let mut handles = [None; 3];
++    for (worker, flight) in [&mut a, &mut b].into_iter().enumerate() {
++        flight.prepare(&plans[worker..worker + 1]).unwrap();
++        sender
++            .reserve(0, flight, false, limits(), us(worker as u64 * 10))
++            .unwrap();
++        handles[worker] = flight.handle(0);
++    }
++    a.complete(1, Some(us(30)), false).unwrap();
++    b.complete(1, Some(us(20)), false).unwrap();
++    sender.reported(a).unwrap();
++    sender.reported(b).unwrap();
++    c.prepare(&plans[2..]).unwrap();
++    sender.reserve(0, &mut c, false, limits(), us(40)).unwrap();
++    handles[2] = c.handle(0);
++    let _b = commit(&mut sender, 0);
++    let _a = commit(&mut sender, 0);
++    c.complete(1, Some(us(41)), false).unwrap();
++    sender.reported(c).unwrap();
++    let _c = commit(&mut sender, 0);
++    for (index, (worker, flight)) in [(1, 200), (0, 300), (2, 600)].into_iter().enumerate() {
++        let sample = acknowledge(
++            &mut sender,
++            0,
++            plans[worker],
++            handles[worker].unwrap(),
++            100 + index as u64,
++        );
++        assert_eq!(
++            (sample.last_packet, sample.tx_in_flight),
++            (index as u64 + 1, flight)
++        );
++    }
++}
++
++#[test]
++fn rolling_commits_match_chronological_sampler_for_all_short_orders_and_prefixes() {
++    use unquic::bbr::Delivery;
++    let permutations = [
++        [0, 1, 2],
++        [0, 2, 1],
++        [1, 0, 2],
++        [1, 2, 0],
++        [2, 0, 1],
++        [2, 1, 0],
++    ];
++    for counts in 0..27 {
++        for times in 0..27 {
++            for order in permutations {
++                let (mut sender, flights) = Sender::new(1, 3, 6).unwrap();
++                let flights: [Box<Flight>; 3] = flights.into_vec().try_into().unwrap();
++                let mut flights = flights.map(Some);
++                let plans: [[Planned; 2]; 3] = std::array::from_fn(|worker| {
++                    std::array::from_fn(|ordinal| {
++                        packet(
++                            worker as u16,
++                            ordinal as u64 + 1,
++                            100 + worker as u16 * 50 + ordinal as u16 * 25,
++                        )
++                    })
++                });
++                let successful: [usize; 3] =
++                    std::array::from_fn(|worker| counts / 3_usize.pow(worker as u32) % 3);
++                let starts: [Duration; 3] = std::array::from_fn(|worker| {
++                    us((worker * 10 + times / 3_usize.pow(worker as u32) % 3 * 10) as u64)
++                });
++                let mut handles = [[None; 2]; 3];
++                for (worker, slot) in flights.iter_mut().enumerate() {
++                    let flight = slot.as_mut().unwrap();
++                    flight.prepare(&plans[worker]).unwrap();
++                    sender
++                        .reserve(0, flight, false, limits(), us(worker as u64 * 10))
++                        .unwrap();
++                    handles[worker] = [flight.handle(0), flight.handle(1)];
++                    flight
++                        .complete(
++                            successful[worker],
++                            (successful[worker] != 0).then_some(starts[worker]),
++                            worker == 1,
++                        )
++                        .unwrap();
++                }
++                for (arrival, worker) in order.into_iter().enumerate() {
++                    sender.reported(flights[worker].take().unwrap()).unwrap();
++                    for _ in 0..6 {
++                        if let Some(flight) = sender.advance(0, 1).unwrap() {
++                            let worker = flight.worker();
++                            assert!(flights[worker].is_none());
++                            flights[worker] = Some(flight);
++                        }
++                    }
++                    assert_eq!(sender.feedback_ready(0), arrival == 2);
++                }
++                let mut chronology = Vec::new();
++                for (worker, &count) in successful.iter().enumerate() {
++                    for ordinal in 0..count {
++                        chronology.push((starts[worker], worker, ordinal));
++                    }
++                }
++                chronology.sort_unstable();
++                let mut reference = Delivery::new();
++                let mut inflight = 0;
++                let mut expected = Vec::new();
++                for (at, worker, ordinal) in chronology {
++                    let plan = plans[worker][ordinal];
++                    let sample = reference
++                        .sent(at, plan.bytes, inflight, worker == 1)
++                        .unwrap();
++                    inflight += u64::from(plan.bytes);
++                    expected.push((worker, ordinal, sample));
++                }
++                assert_eq!(sender.flight_bytes(0), Some((0, inflight)));
++                for (index, (worker, ordinal, mut packet)) in expected.into_iter().rev().enumerate()
++                {
++                    let at = 100 + index as u64;
++                    reference.begin_ack(us(at), false).unwrap();
++                    reference.acknowledged(&mut packet).unwrap();
++                    let sample = acknowledge(
++                        &mut sender,
++                        0,
++                        plans[worker][ordinal],
++                        handles[worker][ordinal].unwrap(),
++                        at,
++                    );
++                    assert_eq!(
++                        Some(sample),
++                        reference.finish_ack(Duration::ZERO).unwrap(),
++                        "counts={counts}, times={times}, order={order:?}"
++                    );
++                }
++                assert_eq!(sender.flight_bytes(0), Some((0, 0)));
++                assert_eq!(sender.available(), 6);
++            }
++        }
++    }
+ }
+ 
+ #[test]
