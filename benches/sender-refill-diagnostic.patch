@@ -1,0 +1,487 @@
+diff --git a/src/pacing.rs b/src/pacing.rs
+index b2beda2..921247e 100644
+--- a/src/pacing.rs
++++ b/src/pacing.rs
+@@ -6,6 +6,7 @@
+ mod grants;
+ mod sender;
+ pub use grants::{Grant, GrantError, Grants, Limits};
++pub(crate) use sender::RefillTrace;
+ pub use sender::{Flight, PacketId, Planned, Sender};
+ use std::{io, time::Duration};
+ 
+diff --git a/src/pacing/sender.rs b/src/pacing/sender.rs
+index 2be7f92..0a1f21b 100644
+--- a/src/pacing/sender.rs
++++ b/src/pacing/sender.rs
+@@ -34,6 +34,16 @@ struct Record {
+     slot: Option<NonZeroU16>,
+ }
+ 
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct RefillTrace {
++    pub completed: Duration,
++    pub expires: Duration,
++    pub recycled: Option<Duration>,
++    pub requested: Option<Duration>,
++    pub group: usize,
++    pub backlog: bool,
++}
++
+ /// A reusable worker-owned request, permission and completion buffer.
+ ///
+ /// Startup creates exactly one per worker. Move its box through the handoff
+@@ -42,6 +52,8 @@ struct Record {
+ /// sampling finishes; outgoing ACK buffers cannot replace this storage.
+ #[derive(Debug)]
+ pub struct Flight {
++    pub(crate) refill_trace: Option<RefillTrace>,
++    pub(crate) refill_backlog_until: Option<Duration>,
+     worker: usize,
+     group: Option<usize>,
+     grant: Option<Grant>,
+@@ -163,6 +175,8 @@ impl Flight {
+         }
+         self.origin = first.id;
+         self.origin.number = 0;
++        self.refill_trace = None;
++        self.refill_backlog_until = None;
+         self.count = packets.len();
+         self.successful = 0;
+         self.started = None;
+@@ -315,6 +329,8 @@ impl Sender {
+             let mut one = Vec::new();
+             one.try_reserve_exact(1).map_err(io::Error::other)?;
+             one.push(Flight {
++                refill_trace: None,
++                refill_backlog_until: None,
+                 worker,
+                 group: None,
+                 grant: None,
+@@ -693,6 +709,12 @@ impl Sender {
+         })
+     }
+ 
++    pub(crate) fn diagnostic_open(&self, group: usize) -> bool {
++        self.groups
++            .get(group)
++            .is_some_and(|state| state.phase == Phase::Open)
++    }
++
+     /// Whether all epoch sends have committed and feedback may be consumed.
+     pub fn feedback_ready(&self, group: usize) -> bool {
+         self.groups
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 9f8e9c8..42051e2 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -213,6 +213,7 @@ struct LossCheck {
+ 
+ pub(super) struct State {
+     pub(super) owner: Option<Owner>,
++    refill_ready: Option<pacing::RefillTrace>,
+     pub(super) fresh: Vec<bool>,
+     reclaim: Option<usize>,
+     pub(super) permitted: bool,
+@@ -314,6 +315,7 @@ impl State {
+             },
+             reclaim: None,
+             owner: None,
++            refill_ready: None,
+             permitted: false,
+             probes,
+             losses,
+@@ -612,12 +614,27 @@ impl Worker {
+                 }
+                 self.sender.ack_free.push(ack);
+             }
+-            Message::Request(request) => self
+-                .sender
+-                .owner
+-                .as_mut()
+-                .ok_or(io::ErrorKind::InvalidData)?
+-                .request(request)?,
++            Message::Request(mut request) => {
++                if let Some(trace) = request.flight.refill_trace.take()
++                    && let Some(requested) = trace.requested
++                {
++                    let at = monotonic_now()?;
++                    if let (Some(wait), Some(total)) =
++                        (at.checked_sub(requested), at.checked_sub(trace.completed))
++                    {
++                        self.counters.refill_owner_samples += 1;
++                        self.counters.refill_request_owner_ns += wait.as_nanos() as u64;
++                        self.counters.refill_complete_owner_ns += total.as_nanos() as u64;
++                    } else {
++                        self.counters.refill_clock_anomalies += 1;
++                    }
++                }
++                self.sender
++                    .owner
++                    .as_mut()
++                    .ok_or(io::ErrorKind::InvalidData)?
++                    .request(request)?;
++            }
+             Message::Complete(flight) => self
+                 .sender
+                 .owner
+@@ -660,7 +677,28 @@ impl Worker {
+                 }
+                 self.sender_message(Message::Recycle(flight), now)?;
+             }
+-            Message::Recycle(flight) => {
++            Message::Recycle(mut flight) => {
++                if let Some(mut trace) = flight.refill_trace.take() {
++                    let at = monotonic_now()?;
++                    if let Some(elapsed) = at.checked_sub(trace.completed) {
++                        self.counters.refill_recycles += 1;
++                        self.counters.refill_complete_recycle_ns += elapsed.as_nanos() as u64;
++                        trace.recycled = Some(at);
++                        trace.backlog =
++                            at < trace.expires
++                                && self.sender.lanes.iter().any(|lane| {
++                                    lane.group == trace.group && lane.unsent_bytes != 0
++                                });
++                        if trace.backlog {
++                            self.counters.refill_ready_recycles += 1;
++                            self.sender.refill_ready = Some(trace);
++                        } else {
++                            self.counters.refill_censored += 1;
++                        }
++                    } else {
++                        self.counters.refill_clock_anomalies += 1;
++                    }
++                }
+                 if self.sender.flight.is_some() {
+                     return Err(io::ErrorKind::InvalidData.into());
+                 }
+@@ -811,11 +849,24 @@ impl Worker {
+                 self.sender.outgoing_cursor += 1;
+                 continue;
+             }
+-            let (_, message) = self
++            let (_, mut message) = self
+                 .sender
+                 .outgoing
+                 .remove(index)
+                 .ok_or(io::ErrorKind::InvalidData)?;
++            if let Message::Complete(flight) = &mut message {
++                // Publication follows flush_batch's unsent-byte and suffix accounting.
++                // A retry refreshes only this backlog snapshot, never the timing origin.
++                flight.refill_backlog_until = self.sender.job.and_then(|job| {
++                    if !matches!(job.kind, JobKind::Data) {
++                        return None;
++                    }
++                    let lane = self.sender_index(job.session, job.lane).ok()?;
++                    (self.sender.lanes[lane].unsent_bytes
++                        > self.sessions[job.session].unexpanded_bytes[job.lane])
++                        .then_some(job.deadline)
++                });
++            }
+             if worker == self.id {
+                 self.sender_message(message, now)?;
+                 progress = true;
+@@ -1261,6 +1312,25 @@ impl Worker {
+         flight
+             .prepare(&packets[..count])
+             .map_err(io::Error::other)?;
++        if let Some(mut trace) = self.sender.refill_ready.take() {
++            let at = monotonic_now()?;
++            if trace.group == self.sender.lanes[index].group && at < trace.expires {
++                if let (Some(wait), Some(total)) = (
++                    trace.recycled.and_then(|recycled| at.checked_sub(recycled)),
++                    at.checked_sub(trace.completed),
++                ) {
++                    self.counters.refill_request_samples += 1;
++                    self.counters.refill_recycle_request_ns += wait.as_nanos() as u64;
++                    self.counters.refill_complete_request_ns += total.as_nanos() as u64;
++                    trace.requested = Some(at);
++                    flight.refill_trace = Some(trace);
++                } else {
++                    self.counters.refill_clock_anomalies += 1;
++                }
++            } else {
++                self.counters.refill_censored += 1;
++            }
++        }
+         self.sender.job = Some(Job {
+             session,
+             generation,
+@@ -1331,6 +1401,9 @@ impl Worker {
+             .flight
+             .take()
+             .ok_or(io::ErrorKind::InvalidData)?;
++        if self.sender.refill_ready.take().is_some() {
++            self.counters.refill_censored += 1;
++        }
+         flight
+             .prepare(&[pacing::Planned {
+                 id: PacketId {
+@@ -1413,6 +1486,20 @@ impl Worker {
+         if retain_suffix {
+             self.sender.job = Some(Job { count, ..job });
+         }
++        if matches!(job.kind, JobKind::Data) {
++            self.counters.refill_completions += 1;
++            if self.counters.refill_completions & 63 == 1 {
++                self.counters.refill_samples += 1;
++                flight.refill_trace = Some(pacing::RefillTrace {
++                    completed: monotonic_now()?,
++                    expires: job.deadline,
++                    recycled: None,
++                    requested: None,
++                    group: self.sender.lanes[index].group,
++                    backlog: false,
++                });
++            }
++        }
+         self.sender.permitted = false;
+         self.sender.queue(0, Message::Complete(flight))
+     }
+@@ -1712,6 +1799,7 @@ impl Worker {
+             self.counters.rtt_ns = self.counters.rtt_ns.max(totals.rtt_ns);
+         }
+         if let Some(owner) = &self.sender.owner {
++            owner.publish_refill(&mut self.counters);
+             for group in 0..self.shared.config.path_groups() {
+                 if let Some(snapshot) = owner.snapshot(group) {
+                     self.counters.pacing_bytes_per_second = self
+diff --git a/src/worker/sender/owner.rs b/src/worker/sender/owner.rs
+index b7cced9..dabae30 100644
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -43,6 +43,10 @@ struct Group {
+ 
+ pub(in crate::worker) struct Owner {
+     sender: Sender,
++    refill_previous: Option<(Duration, bool, Option<Duration>)>,
++    refill_changed: bool,
++    refill_backlog: [Option<Duration>; 64],
++    refill_intervals: [u64; 4],
+     pub(super) timers: timers::Timers,
+     groups: Vec<Group>,
+     requests: Vec<Option<Request>>,
+@@ -98,6 +102,10 @@ impl Owner {
+         Ok((
+             Self {
+                 sender,
++                refill_previous: None,
++                refill_changed: false,
++                refill_backlog: [None; 64],
++                refill_intervals: [0; 4],
+                 timers: timers::Timers::new(groups, descriptors)?,
+                 groups: states,
+                 requests,
+@@ -135,6 +143,10 @@ impl Owner {
+     }
+ 
+     pub(super) fn request(&mut self, request: Request) -> io::Result<()> {
++        self.refill_changed = true;
++        if let Some(backlog) = self.refill_backlog.get_mut(request.flight.worker()) {
++            *backlog = None;
++        }
+         let slot = self
+             .requests
+             .get_mut(request.flight.worker())
+@@ -147,6 +159,14 @@ impl Owner {
+     }
+ 
+     pub(super) fn complete(&mut self, flight: Box<Flight>) -> io::Result<()> {
++        self.refill_changed = true;
++        if let Some(backlog) = self.refill_backlog.get_mut(flight.worker()) {
++            *backlog = if flight.group() == Some(0) {
++                flight.refill_backlog_until
++            } else {
++                None
++            };
++        }
+         let sent = flight.completion().is_some_and(|(count, _, _)| count != 0);
+         let group = flight.group().ok_or(io::ErrorKind::InvalidInput)?;
+         self.sender
+@@ -166,6 +186,7 @@ impl Owner {
+     }
+ 
+     pub(super) fn report(&mut self, report: Box<Report>) -> io::Result<()> {
++        self.refill_changed = true;
+         if self.reports.len() == self.reports.capacity() {
+             return Err(io::Error::other("duplicate sender feedback"));
+         }
+@@ -181,6 +202,13 @@ impl Owner {
+         Ok(())
+     }
+ 
++    pub(super) fn publish_refill(&self, snapshot: &mut Snapshot) {
++        snapshot.refill_owner_interval_ns = self.refill_intervals[0];
++        snapshot.refill_owner_censored_ns = self.refill_intervals[1];
++        snapshot.refill_owner_open_empty_ns = self.refill_intervals[2];
++        snapshot.refill_owner_open_empty_backlog_ns = self.refill_intervals[3];
++    }
++
+     pub(super) fn snapshot(&self, group: usize) -> Option<Snapshot> {
+         let state = self.groups.get(group)?;
+         Some(Snapshot {
+@@ -398,6 +426,21 @@ impl Owner {
+         now: Duration,
+         outgoing: &mut VecDeque<(usize, Message)>,
+     ) -> io::Result<bool> {
++        if let Some((at, open_empty, backlog_until)) = self.refill_previous.take()
++            && let Some(elapsed) = now.checked_sub(at)
++        {
++            let ns = elapsed.as_nanos() as u64;
++            self.refill_intervals[0] += ns;
++            if self.refill_changed {
++                self.refill_intervals[1] += ns;
++            } else if open_empty {
++                self.refill_intervals[2] += ns;
++                self.refill_intervals[3] += backlog_until.map_or(0, |until| {
++                    now.min(until).saturating_sub(at).as_nanos() as u64
++                });
++            }
++        }
++        self.refill_changed = false;
+         let mut more = false;
+         let mut work = BATCH_SIZE;
+         let visits = (self.groups.len() - self.cursor).min(BATCH_SIZE);
+@@ -621,6 +664,17 @@ impl Owner {
+         if let Some(next) = granted_next {
+             self.request_cursor = next;
+         }
++        let open_empty = self.sender.diagnostic_open(0)
++            && !self
++                .requests
++                .iter()
++                .flatten()
++                .any(|request| request.group == 0);
++        self.refill_previous = Some((
++            monotonic_now()?,
++            open_empty,
++            self.refill_backlog.iter().flatten().copied().max(),
++        ));
+         Ok(more)
+     }
+ 
+diff --git a/src/counters.rs b/src/counters.rs
+index 2d83dcd..f68f77d 100644
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -157,6 +157,40 @@ metrics! {
+     feedback_delay_ns: max,
+     /// Current pacing rate in outer IP bytes per second.
+     pacing_bytes_per_second: sum,
++    /// Diagnostic: All DATA completions, including partial and zero-success attempts.
++    refill_completions: sum,
++    /// Diagnostic: Every 64th DATA completion selected for refill timing.
++    refill_samples: sum,
++    /// Diagnostic: Selected completed flights returned to their worker.
++    refill_recycles: sum,
++    /// Diagnostic: Completion queue insertion to worker Recycle observation; divide by refill_recycles.
++    refill_complete_recycle_ns: sum,
++    /// Diagnostic: Selected Recycles with same-group admitted unsent bytes at observation.
++    refill_ready_recycles: sum,
++    /// Diagnostic: Ready sampled Recycles followed by a same-group DATA request.
++    refill_request_samples: sum,
++    /// Diagnostic: Worker Recycle to successor Request queue insertion; divide by refill_request_samples.
++    refill_recycle_request_ns: sum,
++    /// Diagnostic: Completion to successor Request queue insertion; same sample set as refill_request_samples.
++    refill_complete_request_ns: sum,
++    /// Diagnostic: Traced successor DATA requests observed at the control owner.
++    refill_owner_samples: sum,
++    /// Diagnostic: Successor Request queue insertion to owner observation; divide by refill_owner_samples.
++    refill_request_owner_ns: sum,
++    /// Diagnostic: Completion to successor Request owner observation; divide by refill_owner_samples.
++    refill_complete_owner_ns: sum,
++    /// Diagnostic: Selected traces interrupted by a probe, group change, or absent backlog.
++    refill_censored: sum,
++    /// Diagnostic: Sample endpoints out of order; excluded from timing sums.
++    refill_clock_anomalies: sum,
++    /// Diagnostic: Between-owner-call observation time, excluding owner.advance execution.
++    refill_owner_interval_ns: sum,
++    /// Diagnostic: Observed interval time containing request/completion/report mutation; excluded from occupancy.
++    refill_owner_censored_ns: sum,
++    /// Diagnostic: Uncensored group-zero Open time with no owner-pending group-zero request.
++    refill_owner_open_empty_ns: sum,
++    /// Diagnostic: Subset with a retained worker-reported materialized-backlog deadline; not proof of current eligibility.
++    refill_owner_open_empty_backlog_ns: sum,
+     /// Issued send permissions received by transmit workers.
+     send_grants: sum,
+     /// Send permissions rejected after their submission interval elapsed.
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index ed83bae..b437baf 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -3258,3 +3258,75 @@ fn ack_transfer_returns_before_final_report_and_reuses_without_changing_fences()
+     assert!(workers[1].sender.incoming.is_empty());
+     assert_eq!(workers[0].counters.ack_buffer_drops, 0);
+ }
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn refill_backlog_snapshot_follows_submitted_byte_accounting() {
++    for remaining in [false, true] {
++        let (mut workers, _rx) = workers();
++        frame(&mut workers[1]);
++        if remaining {
++            queue_frame(&mut workers[1], 60);
++        }
++        let (_, Message::Request(request)) = workers[1].sender.outgoing.pop_front().unwrap() else {
++            panic!()
++        };
++        let owner = workers[0].sender.owner.as_mut().unwrap();
++        owner.request(request).unwrap();
++        let now = Duration::from_millis(1);
++        let mut outgoing = VecDeque::with_capacity(16);
++        owner.advance(now, &mut outgoing).unwrap();
++        let (_, Message::Permit(flight)) = outgoing.pop_front().unwrap() else {
++            panic!()
++        };
++        assert_eq!(flight.packets().len(), 1);
++        let worker = &mut workers[1];
++        worker.sender_message(Message::Permit(flight), now).unwrap();
++        let deadline = worker.sender.job.unwrap().deadline;
++        let index = worker.sender_index(0, 1).unwrap();
++        let mut batch = worker.sessions[0].batches[1].take().unwrap();
++        let inputs: Vec<_> = batch.frames[..batch.len]
++            .iter()
++            .map(|id| worker.frames.input(id.unwrap()).unwrap())
++            .collect();
++        let mut parts = [&[][..]; pack::BATCH_SLICES];
++        let bytes: Vec<_> = batch
++            .plan
++            .slices(0, &inputs, &mut parts)
++            .unwrap()
++            .iter()
++            .flat_map(|part| part.iter().copied())
++            .collect();
++        assert!(worker.reserve_pieces(&batch, 1).unwrap());
++        worker.transmit[0].paths[0].lanes[1]
++            .socket
++            .as_ref()
++            .unwrap()
++            .send(&bytes, BASE_UDP_PAYLOAD)
++            .unwrap();
++        worker.finish_sender_send(1, Some(now), false).unwrap();
++        assert_eq!(
++            worker.sender.lanes[index].unsent_bytes,
++            if remaining { 120 } else { 60 }
++        );
++        let (_, Message::Complete(flight)) = worker.sender.outgoing.front().unwrap() else {
++            panic!()
++        };
++        let completed = flight.refill_trace.unwrap().completed;
++        worker.submitted_batch(0, 1, &mut batch, 1, true).unwrap();
++        worker.sessions[0].batches[1] = Some(batch);
++        assert_eq!(
++            worker.sender.lanes[index].unsent_bytes,
++            if remaining { 60 } else { 0 }
++        );
++        assert_eq!(worker.sessions[0].unexpanded_bytes[1], 0);
++        worker.flush_sender_messages(now).unwrap();
++        let Event::Sender(Message::Complete(flight)) =
++            workers[0].incoming[1].as_mut().unwrap().try_pop().unwrap()
++        else {
++            panic!()
++        };
++        assert_eq!(flight.refill_backlog_until, remaining.then_some(deadline));
++        assert_eq!(flight.refill_trace.unwrap().completed, completed);
++    }
++}

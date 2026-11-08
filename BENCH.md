@@ -100,6 +100,54 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Measure sender refill before changing its ownership (November 8)
+
+[A diagnostic-only release sweep](benches/tap-sender-refill.json) measures
+completion→Recycle, Recycle→next DATA Request and Request→owner receipt.
+[The archived patch](benches/sender-refill-diagnostic.patch) samples one in
+64 DATA completions, including zero and partial sends. It changes no grant,
+congestion-control or queue policy and is not compiled into production.
+Successor samples require same-group admitted unsent bytes at Recycle; probes,
+group changes and expired samples are censored. Separate sample populations
+have separate denominators.
+
+The six twenty-second points use the corrected routed harness, 4.5 ms RTT,
+no injected loss, QinQ and active PMTU capped at 1,500 outer IPv6 bytes.
+GSO uses eight workers/sixteen flows; bridge uses four workers/four flows.
+The test image refreshed to Ubuntu 24.04's November 8 image before this run.
+These are timing observations, not a matched performance comparison.
+
+Mean timing in microseconds, left/right; goodput is L→R / R→L:
+
+| Input | Requested Gbit/s each way | Delivered Gbit/s | Completion→Recycle | Recycle→Request | Request→owner |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| gso | 0.5 | 0.494 / 0.485 | 82.7 / 54.4 | 7.5 / 6.0 | 19.0 / 10.8 |
+| gso | 5 | 0.238 / 0.351 | 88.7 / 53.2 | 44.8 / 6.4 | 13.7 / 13.3 |
+| gso | unlimited | 0.279 / 1.032 | 68.2 / 48.1 | 11.9 / 6.9 | 19.8 / 11.9 |
+| bridge | 0.5 | 0.490 / 0.491 | 30.8 / 29.1 | 4.7 / 2.8 | 13.4 / 12.3 |
+| bridge | 5 | 0.855 / 0.725 | 87.1 / 75.5 | 63.1 / 12.6 | 21.7 / 22.7 |
+| bridge | unlimited | 0.911 / 0.737 | 96.9 / 73.1 | 43.5 / 12.5 | 22.4 / 19.3 |
+
+At the two overloaded bridge points, the left owner is Open with no pending
+request and previously reported materialized backlog for 15.4% and 19.0% of
+uncensored observation time. Coverage is 75.1% and 70.3%, respectively; owner
+execution and intervals containing Request, Complete or Report events are
+excluded. Right-side fractions are 0.14% and 0.08%, with about 46% coverage.
+This motivates a bounded successor-request experiment, not an assertion that
+handoffs explain all collapse.
+
+The backlog observation is taken only after submitted-byte accounting.
+A regression reproduces the earlier diagnostic bias where the just-submitted
+batch looked like remaining work, and verifies both empty and nonempty
+remaining backlog. Even the corrected observation excludes source frames
+not yet expanded and can become stale after publication. The GSO fractions
+below 0.3% therefore do not establish that a worker could prepare no more work.
+
+All six points have zero clock anomalies. The JSON preserves sample counts,
+censor counts, coverage, CPU, loss and per-worker snapshots. All 360 ordinary
+release-musl tests and the focused kernel regression pass. The trace supplies
+no evidence for removing the sender's ordered sampling or ACK barriers.
+
 ## ACK pruning on the corrected routed path (November 8)
 
 [An eighteen-point release comparison](benches/tap-ack-pruning-napi.json)
