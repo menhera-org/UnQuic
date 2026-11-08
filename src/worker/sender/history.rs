@@ -37,31 +37,34 @@ impl Lane {
         Ok(())
     }
 
-    /// Rejecting an ACK retains its buffer for return to its origin.
-    pub(in crate::worker) fn begin_ack(&mut self, ack: Box<Ack>) -> Result<(), Box<Ack>> {
+    /// Copies accepted ranges and timing; the caller can immediately recycle its buffer.
+    pub(in crate::worker) fn begin_ack(&mut self, ack: &Ack) -> bool {
         if self.ack.is_some()
             || self.report_pending
             || ack.session != self.session
             || ack.lane != self.lane
         {
-            return Err(ack);
+            return false;
         }
         let Some(ranges) = ack
             .ranges
             .get(..ack.count)
             .and_then(|r| AckRanges::new(r).ok())
         else {
-            return Err(ack);
+            return false;
         };
         if self.history.begin_ack(ranges).is_err() {
-            return Err(ack);
+            return false;
         }
         self.largest_ack = self
             .largest_ack
             .max(ranges.iter().map(|r| r.end).max().unwrap_or(0));
         self.ack_first = true;
-        self.ack = Some(ack);
-        Ok(())
+        self.ack = Some(AckTiming {
+            received: ack.received,
+            delay_us: ack.delay_us,
+        });
+        true
     }
 
     /// Reserve/cancel directly in history; attach a sampled handle only after success.
@@ -290,7 +293,7 @@ impl Lane {
     pub(in crate::worker) fn report_completed(
         &mut self,
         report: &Report,
-    ) -> io::Result<Option<Box<Ack>>> {
+    ) -> io::Result<Option<AckTiming>> {
         if !self.report_pending
             || report.group != self.group
             || report.id.session != self.session
@@ -338,12 +341,15 @@ mod tests {
     }
 
     #[test]
-    fn ack_chunks_preserve_handles_and_final_buffer_until_report_return() {
+    fn ack_chunks_preserve_timing_after_transfer_buffer_reuse() {
         let mut lane = lane();
         for number in 1..=130 {
             send(&mut lane, number, 1);
         }
-        assert!(lane.begin_ack(ack(1, 130)).is_ok());
+        let mut transfer = ack(1, 130);
+        transfer.delay_us = 17;
+        assert!(lane.begin_ack(&transfer));
+        *transfer = Ack::new(99); // Recycling must not alter copied ranges or timing.
         let mut report = Report::new(0);
         let mut entries = Vec::new();
         let mut reports = 0;
@@ -356,9 +362,17 @@ mod tests {
                 continue;
             }
             assert!(report.count <= 7);
-            let ReportKind::Ack { first, end, .. } = report.kind else {
+            let ReportKind::Ack {
+                received,
+                delay_us,
+                first,
+                end,
+            } = report.kind
+            else {
                 panic!()
             };
+            assert_eq!(received, Duration::from_millis(100));
+            assert_eq!(delay_us, 17);
             assert_eq!(first, reports == 0);
             reports += 1;
             assert!(lane.install(8).is_err());
@@ -408,9 +422,9 @@ mod tests {
             lane.history.packet(1).unwrap().sample_slot,
             report.entries[0].sample
         );
-        assert!(lane.begin_ack(ack(1, 2)).is_err());
+        assert!(!lane.begin_ack(&ack(1, 2)));
         assert!(lane.report_completed(&report).unwrap().is_none());
-        assert!(lane.begin_ack(ack(1, 2)).is_ok());
+        assert!(lane.begin_ack(&ack(1, 2)));
         assert!(
             lane.advance_report(&mut report, Duration::from_millis(100), &mut 64)
                 .unwrap()
@@ -422,7 +436,7 @@ mod tests {
         }
         assert!(lane.report_completed(&report).unwrap().is_some());
         assert!(lane.history.packet(1).unwrap().sample_slot.is_none());
-        assert!(lane.begin_ack(ack(1, 2)).is_ok());
+        assert!(lane.begin_ack(&ack(1, 2)));
         assert!(
             lane.advance_report(&mut report, Duration::from_millis(101), &mut 64)
                 .unwrap()
@@ -525,7 +539,7 @@ mod tests {
             for number in 1..=5 {
                 send(&mut lane, number, 1);
             }
-            lane.begin_ack(ack(5, 5)).ok().unwrap();
+            assert!(lane.begin_ack(&ack(5, 5)));
             let mut report = Report::new(0);
             assert!(
                 lane.advance_report(&mut report, Duration::from_millis(100), &mut 64)
@@ -563,7 +577,7 @@ mod tests {
             assert_eq!(lost, [2, 3, 4]);
             assert_eq!(lane.loss_passes, 0);
             assert_eq!(lane.history.inflight_bytes(), 1500);
-            lane.begin_ack(queued.pop_front().unwrap()).ok().unwrap();
+            assert!(lane.begin_ack(&queued.pop_front().unwrap()));
             assert!(lane.advance_report(&mut report, now, &mut 64).unwrap());
             assert_eq!(report.count, 1);
             assert_eq!(report.entries[0].number, 1);
@@ -598,18 +612,16 @@ mod tests {
     }
 
     #[test]
-    fn invalid_ack_returns_original_buffer_and_changes_no_lane_state() {
+    fn invalid_ack_changes_no_lane_state() {
         let mut lane = lane();
         send(&mut lane, 1, 1);
         send(&mut lane, 3, 1);
         let invalid = ack(1, 3);
-        let ptr = std::ptr::from_ref(invalid.as_ref());
-        let returned = lane.begin_ack(invalid).err().unwrap();
-        assert_eq!(ptr, std::ptr::from_ref(returned.as_ref()));
+        assert!(!lane.begin_ack(&invalid));
         assert_eq!(lane.largest_ack, 0);
         assert!(!lane.history.ack_pending());
         assert_eq!(lane.history.inflight_bytes(), 3000);
-        assert!(lane.begin_ack(ack(3, 3)).is_ok());
+        assert!(lane.begin_ack(&ack(3, 3)));
         let mut report = Report::new(0);
         assert!(
             lane.advance_report(&mut report, Duration::from_millis(100), &mut 64)
@@ -653,7 +665,7 @@ mod progress_tests {
                 start: 513,
                 end: 513,
             };
-            assert!(lane.begin_ack(ack).is_ok());
+            assert!(lane.begin_ack(&ack));
             assert!(lane.advance_report(&mut report, now, &mut 64).unwrap());
             lane.report_completed(&report).unwrap();
             let mut budget = 1;

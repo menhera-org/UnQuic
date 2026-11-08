@@ -3146,3 +3146,115 @@ fn successful_pmtu_probe_overtakes_retained_suffix_without_reordering_data() {
     }
     assert!(data != 0, "DATA must resume after the PMTU probe");
 }
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn ack_transfer_returns_before_final_report_and_reuses_without_changing_fences() {
+    let (mut workers, _rx) = workers();
+    frame(&mut workers[1]);
+    let number = workers[1].sender.job.unwrap().first;
+    for _ in 0..8 {
+        service(&mut workers);
+    }
+    let index = workers[1].sender_index(0, 1).unwrap();
+    let ranges = [AckRange {
+        start: number,
+        end: number,
+    }];
+    let now = Duration::from_millis(2);
+    workers[0]
+        .incoming_ack(0, 1, 2, 17, AckRanges::new(&ranges).unwrap(), now)
+        .unwrap();
+    workers[0].flush_sender_messages(now).unwrap();
+    workers[1].drain_queues(now).unwrap();
+    workers[1].begin_sender_ack().unwrap();
+    workers[1].flush_sender_messages(now).unwrap();
+    workers[0].drain_queues(now).unwrap();
+    assert_eq!(workers[0].sender.ack_free.len(), ACK_BUFFERS);
+    assert_eq!(workers[1].sender.acks_pending, 1);
+    assert_eq!(workers[1].sender.loss_fences, 1);
+    assert!(workers[1].sender.lanes[index].install(2).is_err());
+
+    let mut report = workers[1].sender.report.take().unwrap();
+    assert!(
+        workers[1].sender.lanes[index]
+            .advance_report(&mut report, now, &mut 64)
+            .unwrap()
+    );
+    assert!(
+        matches!(report.kind, ReportKind::Ack { received, delay_us: 17, end: Some(_), .. } if received == now)
+    );
+    assert_eq!(report.count, 1);
+    report.id.generation += 1;
+    assert!(
+        workers[1].sender.lanes[index]
+            .report_completed(&report)
+            .is_err()
+    );
+    assert!(workers[1].sender.lanes[index].report_pending);
+    report.id.generation -= 1;
+
+    // Reuse every transfer box while the coordinator's final report is held.
+    let later = now + Duration::from_millis(1);
+    for _ in 0..ACK_BUFFERS {
+        workers[0]
+            .incoming_ack(0, 1, 2, 99, AckRanges::new(&ranges).unwrap(), later)
+            .unwrap();
+    }
+    workers[0].flush_sender_messages(later).unwrap();
+    workers[1].drain_queues(later).unwrap();
+    workers[1].begin_sender_ack().unwrap();
+    assert_eq!(workers[1].sender.incoming.len(), ACK_BUFFERS);
+    assert_eq!(workers[1].sender.acks_pending, 1);
+    assert_eq!(workers[1].sender.loss_fences, 1);
+    let timing = workers[1].sender.lanes[index].ack.as_ref().unwrap();
+    assert_eq!(timing.received, now);
+    assert_eq!(timing.delay_us, 17);
+    assert_eq!(workers[0].counters.ack_buffer_drops, 0);
+
+    workers[0]
+        .sender
+        .owner
+        .as_mut()
+        .unwrap()
+        .report(report)
+        .unwrap();
+    for _ in 0..32 {
+        for worker in &mut workers {
+            worker.drain_queues(later).unwrap();
+            worker.service_sender(later).unwrap();
+        }
+    }
+    assert_eq!(workers[0].sender.ack_free.len(), ACK_BUFFERS);
+    assert_eq!(workers[1].sender.acks_pending, 0);
+    assert_eq!(workers[1].sender.loss_fences, 0);
+    assert!(workers[1].sender.lanes[index].ack.is_none());
+    assert!(!workers[1].sender.lanes[index].report_pending);
+    assert_eq!(workers[1].sender.lanes[index].history.inflight_bytes(), 0);
+
+    // Invalid future coverage and a stale tag still return their recycled boxes.
+    let future = workers[1].sender.lanes[index].history.highest_sent() + 1;
+    for (tag, number) in [(1, future), (99, number)] {
+        workers[0]
+            .incoming_ack(
+                0,
+                tag,
+                2,
+                0,
+                AckRanges::new(&[AckRange {
+                    start: number,
+                    end: number,
+                }])
+                .unwrap(),
+                later,
+            )
+            .unwrap();
+    }
+    workers[0].flush_sender_messages(later).unwrap();
+    workers[1].drain_queues(later).unwrap();
+    workers[1].flush_sender_messages(later).unwrap();
+    workers[0].drain_queues(later).unwrap();
+    assert_eq!(workers[0].sender.ack_free.len(), ACK_BUFFERS);
+    assert!(workers[1].sender.incoming.is_empty());
+    assert_eq!(workers[0].counters.ack_buffer_drops, 0);
+}

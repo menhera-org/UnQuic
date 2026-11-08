@@ -44,7 +44,12 @@ passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
 Missing recovery or congestion control does not explain away the remaining
 scheduling and admission problems.
 
-The latest focused fixes protect already-queued ACKs from premature loss and
+The latest delayed-path comparison bounds fresh frame expansion and corrects
+unintended veth reordering in the benchmark. Bridged unlimited delivery improves
+to 0.763 / 0.785 Gbit/s, but GSO reverse delivery still collapses to 0.247 Gbit/s.
+These results do not establish a throughput plateau.
+
+The preceding focused fixes protect already-queued ACKs from premature loss and
 prevent PMTU-only samples from declaring a bandwidth plateau. They pass both
 kernel test matrices but do not restore throughput: the latest production
 unlimited loopback result is 1.725 / 1.572 Gbit/s. See the November 8 feedback
@@ -94,6 +99,115 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## Return incoming ACK transfer buffers after validation (November 8)
+
+The sender history already copies validated ACK ranges into fixed pending
+storage. Retaining the transfer box until the final coordinator report therefore
+held scarce receive capacity unnecessarily. The TX lane now retains only ACK
+timing; the box returns immediately after validation. Pending-ACK accounting,
+loss protection, generation barriers and final report completion are unchanged.
+No pool grows, and no hot allocation, lock or syscall is added.
+
+[Eighteen release observations](benches/tap-ack-early-recycle.json) compare
+`6010f94`, early recycling, then the repeated control on the corrected routed
+harness. They use the same twenty-second ascending loads, two-second drain,
+4.5 ms RTT and no configured loss. No local build, kernel test or Git packing
+overlaps load; separate-machine kernel checks do not share these CPUs.
+
+| Input | Build | Requested each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R | ACK-buffer drops L / R |
+| --- | --- | --- | --- | --- | --- | --- |
+| gso | baseline | 0.5G | 0.494 / 0.494 | 0.02 / 0.04 | 77.9 / 74.5 | 736 / 379 |
+| gso | baseline | 5G | 0.914 / 0.334 | 81.32 / 93.11 | 251.4 / 260.2 | 1035 / 232 |
+| gso | baseline | unlimited | 0.169 / 0.282 | 99.71 / 99.51 | 134.9 / 140.9 | 123 / 394 |
+| bridge | baseline | 0.5G | 0.492 / 0.491 | 0.54 / 0.60 | 197.1 / 217.9 | 88 / 95 |
+| bridge | baseline | 5G | 0.817 / 0.698 | 65.06 / 71.29 | 223.7 / 244.5 | 35057 / 936 |
+| bridge | baseline | unlimited | 0.780 / 0.735 | 68.93 / 70.61 | 215.8 / 245.5 | 30565 / 2098 |
+| gso | recycle | 0.5G | 0.494 / 0.494 | 0.00 / 0.01 | 77.0 / 73.6 | 144 / 124 |
+| gso | recycle | 5G | 0.939 / 0.389 | 80.80 / 91.92 | 252.0 / 179.1 | 262 / 184 |
+| gso | recycle | unlimited | 0.902 / 0.765 | 98.41 / 98.63 | 260.1 / 231.0 | 395 / 578 |
+| bridge | recycle | 0.5G | 0.475 / 0.491 | 3.90 / 0.65 | 191.3 / 215.0 | 35 / 39 |
+| bridge | recycle | 5G | 0.768 / 0.700 | 67.37 / 70.96 | 212.7 / 252.5 | 28815 / 1549 |
+| bridge | recycle | unlimited | 0.855 / 0.742 | 66.40 / 70.89 | 223.7 / 243.7 | 34012 / 1573 |
+| gso | baseline_repeat | 0.5G | 0.494 / 0.494 | 0.02 / 0.03 | 78.0 / 73.2 | 283 / 272 |
+| gso | baseline_repeat | 5G | 0.913 / 1.077 | 81.32 / 78.02 | 269.2 / 268.4 | 987 / 1631 |
+| gso | baseline_repeat | unlimited | 0.964 / 0.922 | 98.31 / 98.23 | 278.1 / 279.6 | 825 / 423 |
+| bridge | baseline_repeat | 0.5G | 0.491 / 0.491 | 0.70 / 0.62 | 197.1 / 213.9 | 49 / 56 |
+| bridge | baseline_repeat | 5G | 0.835 / 0.700 | 64.88 / 73.45 | 222.2 / 248.9 | 35632 / 1805 |
+| bridge | baseline_repeat | unlimited | 0.856 / 0.724 | 64.17 / 70.90 | 222.7 / 251.1 | 36792 / 1458 |
+
+At light GSO load, ACK-buffer drops fall to 144 / 124 from 736 / 379 before
+and 283 / 272 after, with the same delivered goodput. High-rate bridged ACK
+pressure remains: unlimited recycling still drops 34,012 / 1,573 incoming
+ACK records. Its 0.855 / 0.742 Gbit/s goodput overlaps the controls.
+GSO results remain unstable: the opening control collapses to 0.169 / 0.282
+unlimited, while the repeated control reaches 0.964 / 0.922. Recycling reaches
+0.902 / 0.765. This comparison does not establish a consistent throughput gain
+or identify the remaining collapse's cause.
+
+One recycled light-bridge observation has 31 receive-admission rejections on
+the right; the other seventeen observations have none. The JSON retains expiry,
+queue, socket-overflow and TAP-drop counters separately. The change passes
+360 ordinary release tests, strict Clippy, and 89 kernel library plus three
+runtime tests on each of Linux 6.8 and 7.0. A regression holds the final report
+while reusing every transfer buffer and verifies unchanged timing, loss fences,
+duplicate completion and invalid/stale rejection.
+
+## Corrected-path gate comparison still exposes GSO collapse (November 8)
+
+[Eighteen production release observations](benches/tap-materialization-napi.json)
+repeat the source-expansion comparison with the corrected NAPI harness.
+The baseline includes outgoing ACK retry (`d50d748`); the candidate is the
+daemon code in `6010f94`. Each phase starts fresh daemons, then runs ascending
+twenty-second loads with a two-second drain. Frames, workers, flows and the
+4.5 ms routed RTT match the preceding comparison. No loss is configured.
+Bridged high-rate trials actually offer 2.33–2.57 Gbit/s per direction.
+No local build, kernel test, capture or Git packing overlaps these runs.
+
+| Input | Build | Requested each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- | --- |
+| gso | baseline | 0.5G | 0.407 / 0.479 | 17.52 / 2.89 | 131.5 / 68.9 |
+| gso | baseline | 5G | 0.786 / 0.972 | 83.97 / 80.18 | 347.8 / 273.2 |
+| gso | baseline | unlimited | 0.794 / 0.933 | 98.59 / 98.02 | 266.1 / 291.4 |
+| bridge | baseline | 0.5G | 0.491 / 0.464 | 0.66 / 6.11 | 194.1 / 220.0 |
+| bridge | baseline | 5G | 0.350 / 0.631 | 86.06 / 73.91 | 277.3 / 370.2 |
+| bridge | baseline | unlimited | 0.501 / 0.627 | 79.73 / 74.95 | 270.9 / 319.5 |
+| gso | gate | 0.5G | 0.494 / 0.494 | 0.00 / 0.01 | 75.7 / 72.8 |
+| gso | gate | 5G | 0.934 / 0.960 | 80.89 / 80.38 | 283.8 / 278.4 |
+| gso | gate | unlimited | 0.982 / 0.247 | 98.28 / 99.55 | 258.3 / 174.6 |
+| bridge | gate | 0.5G | 0.491 / 0.483 | 0.56 / 2.23 | 197.0 / 216.1 |
+| bridge | gate | 5G | 0.846 / 0.685 | 63.90 / 73.06 | 230.3 / 251.2 |
+| bridge | gate | unlimited | 0.763 / 0.785 | 69.09 / 68.41 | 212.5 / 252.4 |
+| gso | baseline_repeat | 0.5G | 0.493 / 0.494 | 0.21 / 0.13 | 77.1 / 72.6 |
+| gso | baseline_repeat | 5G | 0.837 / 1.077 | 82.95 / 78.10 | 296.1 / 285.5 |
+| gso | baseline_repeat | unlimited | 0.861 / 1.014 | 98.52 / 98.08 | 290.4 / 273.1 |
+| bridge | baseline_repeat | 0.5G | 0.459 / 0.462 | 7.12 / 6.43 | 196.0 / 215.7 |
+| bridge | baseline_repeat | 5G | 0.442 / 0.379 | 80.83 / 83.95 | 272.1 / 348.7 |
+| bridge | baseline_repeat | unlimited | 0.406 / 0.613 | 82.89 / 74.49 | 268.8 / 297.7 |
+
+The candidate preserves the bridged improvement: unlimited delivery reaches
+0.763 / 0.785 Gbit/s at 213 / 252% CPU, above both controls and with zero
+receive admission pressure. Unsent expiry is 5,401 / 149,173 frames, versus
+1,893,266 / 2,490,022 before and 2,039,298 / 2,355,405 after. Earlier pressure
+still drops input: TAP ingress drops are 921,192 / 1,784,166 and worker queue
+drops 2,030,875 / 988,538. ACK-buffer drops are 30,753 / 3,427, socket overflow
+102 / 58, and incomplete receive expiry 22 / 33. These units cannot be summed.
+
+GSO reverse unlimited delivery instead falls to 0.247 Gbit/s from its 0.960
+paced point, despite zero admission pressure and socket overflow. It records
+220 incoming ACK-buffer drops on the right, 96,449 unsent frame expiries and
+20,280 sent frame expiries there. That is a remaining collapse, not a plateau.
+Forward unlimited delivery reaches 0.982 Gbit/s. Placement and controller-state
+variation remain unresolved; the counters do not identify one sufficient cause.
+
+All eighteen runs have zero netem and endpoint veth queue drops, zero inner UDP
+receive-buffer errors and zero outer fragmentation. Increasing veth NAPI packet
+counters verifies that the corrected path is in use. A separate
+[Linux 7.0 diagnostic check](benches/tap-veth-order-linux7.json), with two workers
+per daemon and four flows each way, also reports zero raw reordering, ordinary
+loss declarations, socket overflow and veth queue drops in both ten-second
+0.5G profiles. These are local namespace checks, not real-access measurements.
+Both performance targets and the general overload requirement remain open.
 
 ## Remove unintended veth reordering from routed trials (November 8)
 

@@ -301,7 +301,9 @@ the daemon. Store transmission identity with each slot and check session
 generation, lane and packet number on feedback. A two-byte handle alone cannot
 distinguish a stale report from a reused slot. Separate reserved send-report
 buffers from feedback buffers so frozen ACK work cannot prevent an outstanding
-grant from reporting. Preserve worker report order within each path group.
+grant from reporting. Return an incoming ACK's transfer buffer after validated
+ranges enter fixed history storage; retain its timing and completion fence until
+the final coordinator report returns. Preserve worker report order within each path group.
 Quiescence must drain reservations, pending ACK work, reports and old sampling
 handles, not merely queued transmit frames.
 

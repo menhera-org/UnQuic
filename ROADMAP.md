@@ -449,6 +449,11 @@ queues, stale identities, control-class fairness and actual-send duplicate
 spacing. Failed ACK submission retains the reserved snapshot for a 1 ms retry;
 stale connection/owner snapshots return to their pool. The `ack_send_deferred`
 counter records these attempts separately from incoming ACK-buffer drops.
+Incoming ACK transfer buffers now return once history copies their validated
+ranges, while timing, pending-ACK accounting and loss fences survive the final
+coordinator report. Tests hold that report while reusing every origin buffer,
+then check duplicate completion and invalid/stale rejection. Both kernel matrices
+pass; reduced light-load buffer drops do not establish a throughput gain.
 Incoming ACKs now reach TX-owned histories; DATA and probes use shared
 controller grants. Release forwarding, reconnect, allocation and routed-MTU
 regression tests pass.

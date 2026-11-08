@@ -232,6 +232,8 @@ using that send timestamp; control service starts no earlier than submission,
 so a delayed worker cannot accumulate a catch-up burst. Connection tags and
 lane identity are rechecked before sends and buffer returns. Incoming ACKs now
 reach TX-owned histories, bounded loss scans and selective payload recovery.
+Once history copies validated ranges, the transfer buffer returns immediately;
+ACK timing and loss protection remain until the final coordinator report returns.
 UDP receive batches retain a timestamp taken after the receive call, including
 across GRO expansion and worker handoff. Data sends recheck frame deadlines
 immediately before each syscall and GSO fallback. Expired plans return to bounded

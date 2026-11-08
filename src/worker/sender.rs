@@ -28,6 +28,13 @@ pub(crate) struct Ack {
     ranges: [AckRange; MAX_ACK_RANGES],
 }
 
+// History owns the copied ranges once an ACK begins; only its timing must
+// survive until the coordinator returns the final report.
+pub(super) struct AckTiming {
+    received: Duration,
+    delay_us: u32,
+}
+
 impl Ack {
     fn new(origin: usize) -> Self {
         Self {
@@ -143,7 +150,7 @@ pub(super) struct Lane {
     pub(super) scan_due: Option<Duration>,
     pub(super) forced_before: Option<Duration>,
     pub(super) scan_cutoff: Option<Duration>,
-    pub(super) ack: Option<Box<Ack>>,
+    pub(super) ack: Option<AckTiming>,
     pub(super) ack_first: bool,
     pub(super) report_pending: bool,
     // Complete an older scan, if any, then one pass using the admitted ACK.
@@ -477,9 +484,7 @@ impl Worker {
                 self.sender.incoming.push_back(ack);
                 continue;
             }
-            if let Err(ack) = lane.begin_ack(ack) {
-                self.return_ack(ack)?;
-            } else {
+            if lane.begin_ack(&ack) {
                 self.sender.acks_pending += 1;
                 lane.loss_passes = 1 + u8::from(lane.scan.is_some());
                 self.sender.loss_fences = self
@@ -488,6 +493,7 @@ impl Worker {
                     .checked_add(1)
                     .ok_or(io::ErrorKind::InvalidData)?;
             }
+            self.return_ack(ack)?;
         }
         Ok(())
     }
@@ -697,9 +703,8 @@ impl Worker {
                 if matches!(report.kind, ReportKind::Ack { end: None, .. }) {
                     self.sender.cursor = index;
                 }
-                if let Some(ack) = ack {
+                if ack.is_some() {
                     self.sender.acks_pending -= 1;
-                    self.return_ack(ack)?;
                 }
                 self.sender.report = Some(report);
             }
