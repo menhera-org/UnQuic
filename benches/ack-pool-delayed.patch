@@ -1,0 +1,6 @@
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -18 +18 @@
+-const ACK_BUFFERS: usize = 4;
++const ACK_BUFFERS: usize = 16;

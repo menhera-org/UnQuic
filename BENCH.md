@@ -89,6 +89,45 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## More incoming ACK storage under delay (November 8)
+
+The earlier four-versus-sixteen ACK-buffer experiment removed drops on
+loopback without a convincing delivery gain. [This new comparison](benches/tap-ack-pool-delayed.json)
+repeats that [one-constant change](benches/ack-pool-delayed.patch) on the routed
+4.5 ms delay-only setup above. It uses production/candidate/production phases,
+twenty-second points, eight workers/lanes and sixteen QinQ flows. There is
+no injected loss, overlapping local build or kernel test.
+
+| Build | Requested each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| before | 0.5G | 0.442 / 0.458 | 10.83 / 7.47 | 92.1 / 86.7 |
+| before | 5G | 0.356 / 0.500 | 92.67 / 89.77 | 218.2 / 225.2 |
+| before | unlimited | 0.361 / 0.835 | 99.37 / 98.37 | 177.1 / 196.5 |
+| candidate | 0.5G | 0.424 / 0.472 | 14.29 / 4.80 | 92.2 / 87.5 |
+| candidate | 5G | 0.654 / 0.849 | 86.72 / 82.77 | 184.6 / 188.0 |
+| candidate | unlimited | 0.533 / 0.888 | 99.05 / 98.25 | 171.0 / 191.3 |
+| after | 0.5G | 0.448 / 0.465 | 9.39 / 6.08 | 91.8 / 87.7 |
+| after | 5G | 0.521 / 0.564 | 89.41 / 88.56 | 166.5 / 246.0 |
+| after | unlimited | 0.581 / 0.715 | 98.96 / 98.73 | 164.7 / 216.9 |
+
+Sixteen buffers reduce incoming ACK drops at 0.5G to 7 / 15 from
+1466–1762 / 772–778. At 5G, both directions deliver more than both controls.
+That does not establish a general gain: forward 0.5G delivery falls 3.9–5.3%
+below the controls, and forward unlimited lies between them. Candidate
+never-submitted expiry at 0.5G rises to 119315 frames forward, versus
+78447–90267 in the controls; reverse expiry improves to 40093 from
+50745–62443. **The larger pool is not adopted.** Delay exposes a different
+tradeoff from the earlier loopback trial; more repetitions would be needed
+before changing the default.
+
+All nine points have zero qdisc drops, admission pressure, inner receive
+errors, corrupt/duplicate/wrong-run/out-of-window frames and outer
+fragmentation. The opening production unlimited point has twenty outer
+socket-overflow SKBs; the others have zero. Reordering and expiry remain
+substantial. Full per-worker counters and CPU are in the JSON.
+Ordinary all-feature release-musl tests pass. The candidate changes only the
+existing accounted pool bound and is retained as an experiment.
+
 ## Routed delay and independent-loss baseline (November 8)
 
 The harness now supports a private IPv6 router with separate endpoint
