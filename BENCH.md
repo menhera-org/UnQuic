@@ -89,6 +89,75 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Remaining-lifetime admission removes pressure but costs more CPU (November 8)
+
+The [candidate](benches/fresh-lifetime.patch) rejects a new source when an
+unfinished original in its lane approaches its deadline. It checks the current
+fresh batch and pending queue against half the owner's current retention
+lifetime. This is a remaining-lifetime heuristic, not exact oldest-frame age:
+accepted deadlines were frozen using potentially different RTT estimates.
+The existing 2 MiB byte limit, memory quotas, accepted frames, repairs and
+deadlines remain unchanged. No clock, allocation or lock is added.
+
+Unlike dividing the byte cap by lane count, this preserves a synchronized
+sixteen-source, 44-child burst even when every source hashes to one lane.
+[The release comparison](benches/tap-fresh-lifetime.json) runs production,
+candidate, then production, retaining daemons through four thirty-second
+rates. It uses eight workers/lanes, sixteen QinQ flows, inner MTU 1500,
+500-entry TAP queues and active PMTU capped at 1452 UDP bytes. No local build,
+kernel test or Git packing overlaps load.
+
+| Build | Requested each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| Production before | 1G | 0.982 / 0.979 | 0.66 / 0.63 | 102.29 / 95.59 |
+| Production before | 4G | 1.728 / 1.533 | 56.34 / 61.29 | 221.47 / 207.75 |
+| Production before | 21G | 1.771 / 1.581 | 91.47 / 92.38 | 216.17 / 210.57 |
+| Production before | unlimited | 1.693 / 1.543 | 97.06 / 97.20 | 217.96 / 203.57 |
+| Candidate | 1G | 0.987 / 0.985 | 0.69 / 0.82 | 102.42 / 94.37 |
+| Candidate | 4G | 1.762 / 1.694 | 55.69 / 57.40 | 211.30 / 200.00 |
+| Candidate | 21G | 1.748 / 1.611 | 91.61 / 92.25 | 278.76 / 278.53 |
+| Candidate | unlimited | 1.805 / 1.628 | 95.75 / 95.76 | 278.44 / 289.19 |
+| Production after | 1G | 0.988 / 0.982 | 0.57 / 1.18 | 100.89 / 95.33 |
+| Production after | 4G | 1.770 / 1.545 | 55.32 / 61.02 | 219.22 / 210.67 |
+| Production after | 21G | 1.719 / 1.559 | 91.72 / 92.50 | 219.52 / 206.89 |
+| Production after | unlimited | 1.746 / 1.569 | 96.93 / 97.14 | 214.18 / 205.13 |
+
+At unlimited load, the candidate improves goodput by 3.4–6.6 / 3.8–5.5%
+against the controls, but CPU rises 27.7–30.0 / 41.0–42.1%. Never-submitted
+expiry rises to 3.24 / 4.76 million frames from 1.60–1.73 / 2.50–2.57 million.
+The fixed 21G point also has sharply higher CPU and expiry, so differing
+unlimited generator rates do not explain the cost. **The candidate is rejected.**
+
+Receive admission pressure is zero at every candidate rate. The guard therefore
+removes that measured symptom without resolving the throughput ceiling.
+At unlimited load it checks 699390 / 801113 sources and rejects
+526089 / 604760. Only 1291 / 752 checks lack a materialized fresh head.
+Combined queue drops reach 851762 / 1081201 sources or control records,
+including the guard rejections; those counters are not independent losses.
+
+The candidate reads 1.03 / 1.28 million GSO sources, versus about
+0.142 / 0.186 million in either unlimited control. TAP read calls rise from
+about 75.7k / 88.7k to 294.4k / 359.3k. Expanded children rise much less:
+7.90 / 8.96 million versus 6.14 / 6.60 million. These counters support
+repeated read/reject work under excess load, rather than attributing the CPU
+increase to the bounded head scan alone. At 4G, the candidate instead expands
+fewer children, expires fewer unsent frames and improves reverse goodput at
+lower CPU. Its useful operating range does not justify the overload cost.
+
+All twelve points have zero socket overflow, inner UDP errors, corrupt or
+duplicate application records, reordering and outer fragmentation. Candidate
+unlimited TAP ingress drops are 1449091 / 954752 SKBs; total expiry is
+3521287 / 5101791 frames. The JSON preserves each expiry class, queue category,
+worker CPU and actual offered rate. Different counter units prevent an exact
+loss sum. Neither original performance target nor a universal plateau is met.
+
+Validation passes 355 ordinary release-musl tests, strict Clippy and formatting.
+All 84 library kernel tests and the forwarding/restart allocation test pass on
+Linux 6.8 and 7.0. Regressions cover the concentrated burst, threshold boundary,
+partially submitted originals, independent lanes, repair-only work, consumed
+batch prefixes and resumed admission after submission. The other two runtime
+tests and full routed PMTU test were not repeated for this rejected candidate.
+
 ## Credit available at first send completion (November 8)
 
 The [isolated diagnostic](benches/completion-opportunity.patch) samples one in

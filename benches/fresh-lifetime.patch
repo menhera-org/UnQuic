@@ -1,0 +1,322 @@
+diff --git a/src/counters.rs b/src/counters.rs
+index f3a6ae0..f5ef451 100644
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -132,9 +132,16 @@ metrics! {
+     recovery_selection_changed: sum,
+     /// Entries rejected because a bounded queue was full.
+     queue_drops: sum,
+-    /// TAP sources rejected by fresh-unsent byte admission; a subset of queue_drops.
++    /// TAP sources rejected by fresh-unsent byte or remaining-lifetime admission.
++    /// A subset of queue_drops.
+     /// One GSO source can represent many Ethernet frames.
+     tx_backlog_drops: sum,
++    /// Experimental: new sources checked while their lane has unsent original bytes.
++    tx_fresh_guard_checks: sum,
++    /// Experimental: checked sources with no materialized fresh queue head.
++    tx_fresh_guard_no_head: sum,
++    /// Experimental: sources rejected because an admitted original is near its deadline.
++    tx_fresh_guard_drops: sum,
+     /// ACK records dropped for lack of a reserved receive buffer; a subset of queue_drops, not additive.
+     ack_buffer_drops: sum,
+     /// Datagrams not fully admitted because receive frame storage was full.
+diff --git a/src/worker.rs b/src/worker.rs
+index b52bcff..df301f3 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -506,6 +506,27 @@ impl TxBatch {
+         }
+     }
+ 
++    fn fresh_deadline(&self, storage: &frames::Store) -> Option<Duration> {
++        let head = if self.repair {
++            None
++        } else {
++            self.frames[..self.len].iter().flatten().find_map(|&id| {
++                storage
++                    .frame(id)
++                    .filter(|frame| frame.offset < frame.length())
++                    .map(|frame| frame.deadline)
++            })
++        };
++        head.into_iter()
++            .chain(self.pending.front().and_then(|id| {
++                storage
++                    .frame(id)
++                    .filter(|frame| frame.offset < frame.length())
++                    .map(|frame| frame.deadline)
++            }))
++            .min()
++    }
++
+     fn prepare(
+         &mut self,
+         lane: &mut pack::Lane,
+@@ -2311,7 +2332,24 @@ impl Worker {
+         let index = if self.sender_enabled() {
+             let index = self.sender_index(session, buffer.lane)?;
+             let queued = self.sender.lanes[index].unsent_bytes;
+-            if queued != 0 && fresh > FRESH_BYTES.saturating_sub(queued) {
++            let head = self.sessions[session].batches[buffer.lane]
++                .as_ref()
++                .and_then(|batch| batch.fresh_deadline(&self.frames));
++            // Preserve deadline budget for admitted originals and their repairs.
++            let late =
++                queued != 0 && head.is_some_and(|due| due <= now.saturating_add(lifetime / 2));
++            let local = &mut self.sessions[session];
++            for totals in [
++                &mut self.counters,
++                &mut local.totals,
++                &mut local.tx_totals[buffer.lane],
++            ] {
++                totals.tx_fresh_guard_checks += u64::from(queued != 0);
++                totals.tx_fresh_guard_no_head += u64::from(queued != 0 && head.is_none());
++                totals.tx_fresh_guard_drops += u64::from(late);
++            }
++            local.tx_dirty |= 1_u64 << buffer.lane;
++            if late || (queued != 0 && fresh > FRESH_BYTES.saturating_sub(queued)) {
+                 let local = &mut self.sessions[session];
+                 for totals in [
+                     &mut self.counters,
+diff --git a/src/worker/frames.rs b/src/worker/frames.rs
+index 0ceec77..651432e 100644
+--- a/src/worker/frames.rs
++++ b/src/worker/frames.rs
+@@ -517,6 +517,38 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn fresh_head_deadline_skips_consumed_prefix_and_repair_batch() {
++        let mut store = Store::new(3).unwrap();
++        let source = store.insert_source(buffer(60)).ok().unwrap();
++        let full = store.insert_frame(frame(source, 0..60, 1)).unwrap();
++        let partial = store.insert_frame(frame(source, 0..60, 2)).unwrap();
++        let pending = store.insert_frame(frame(source, 0..60, 3)).unwrap();
++        store.frame_mut(full).unwrap().offset = 60;
++        store.frame_mut(partial).unwrap().offset = 30;
++        let mut batch = super::super::TxBatch::new();
++        batch.len = 4;
++        batch.frames[1] = Some(full);
++        batch.frames[3] = Some(partial);
++        batch.pending.push_back(&mut store, pending).unwrap();
++        assert_eq!(batch.fresh_deadline(&store), Some(Duration::from_millis(2)));
++        batch.repair = true;
++        assert_eq!(batch.fresh_deadline(&store), Some(Duration::from_millis(3)));
++        batch.pending.pop_front(&mut store).unwrap();
++        assert_eq!(batch.fresh_deadline(&store), None);
++        batch.repair = false;
++        assert_eq!(batch.fresh_deadline(&store), Some(Duration::from_millis(2)));
++        store.frame_mut(partial).unwrap().offset = 60;
++        assert_eq!(batch.fresh_deadline(&store), None);
++        store.frame_mut(partial).unwrap().offset = 30;
++        store.frame_mut(pending).unwrap().deadline = Duration::from_millis(1);
++        batch.pending.push_back(&mut store, pending).unwrap();
++        assert_eq!(batch.fresh_deadline(&store), Some(Duration::from_millis(1)));
++        assert_eq!(batch.pending.front(), Some(pending));
++        assert_eq!(store.frame(partial).unwrap().offset, 30);
++        assert_eq!(batch.frames[3], Some(partial));
++    }
++
+     #[test]
+     fn empty_store_and_oversized_reservation_do_not_create_frame_slots() {
+         assert!(Store::new(CAPACITY + 1).is_err());
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index 21265e5..cb592c3 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -53,17 +53,21 @@ fn workers() -> ([Worker; 2], ReceiveSocket) {
+ }
+ 
+ fn queue_frame(worker: &mut Worker, length: usize) {
++    queue_frame_at(worker, length, Duration::ZERO);
++}
++
++fn queue_frame_at(worker: &mut Worker, length: usize, now: Duration) {
+     let mut frame = worker.free.pop().unwrap();
+     frame.session = 0;
+     frame.lane = worker.id;
+     frame.tag = 1;
+     frame.length = length;
+     frame.bytes[..length].fill(0xa5);
+-    frame.deadline = Duration::from_millis(100);
++    frame.deadline = now + Duration::from_millis(100);
+     frame.tx_reserved = true;
+     worker.sessions[0].tx_retained += 1;
+     worker.sessions[0].tx_bytes += frame.length;
+-    worker.input_frame(frame, Duration::ZERO).unwrap();
++    worker.input_frame(frame, now).unwrap();
+ }
+ 
+ fn submit_original(worker: &mut Worker, slot: usize, range: std::ops::Range<usize>) {
+@@ -2779,3 +2783,170 @@ fn fresh_admission_preserves_sixteen_flow_qinq_gso_burst_before_bounding_excess(
+     assert_eq!(worker.counters.tx_backlog_drops, 1);
+     assert_eq!(worker.counters.queue_drops, 1);
+ }
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn fresh_lifetime_guard_preserves_burst_with_a_materialized_plain_head() {
++    let (mut workers, _rx) = workers();
++    let worker = &mut workers[0];
++    queue_frame(worker, 60);
++    for _ in 0..16 {
++        let buffer = gso_input_with_qinq(worker, 44, 1472, true);
++        worker.input_frame(buffer, Duration::ZERO).unwrap();
++    }
++    let index = worker.sender_index(0, 0).unwrap();
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, 60 + 1_071_488);
++    assert_eq!(worker.sessions[0].tap_inputs.len(), 16);
++    assert_eq!(worker.counters.tx_fresh_guard_checks, 16);
++    assert_eq!(worker.counters.tx_fresh_guard_no_head, 0);
++    assert_eq!(worker.counters.tx_fresh_guard_drops, 0);
++    assert_eq!(worker.counters.tx_backlog_drops, 0);
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn fresh_lifetime_guard_boundary_preserves_partial_original_and_resumes_after_it() {
++    let (mut workers, _rx) = workers();
++    let worker = &mut workers[0];
++    queue_frame(worker, 60);
++    let slot = worker.sessions[0].batches[0]
++        .as_mut()
++        .unwrap()
++        .pending
++        .pop_front(&mut worker.frames)
++        .unwrap()
++        .unwrap();
++    submit_original(worker, slot, 0..30);
++    worker.frames.frame_mut(slot).unwrap().offset = 30;
++    worker.recovery.set(slot, recovery::Place::Batch).unwrap();
++    let batch = worker.sessions[0].batches[0].as_mut().unwrap();
++    batch.len = 3;
++    batch.frames[2] = Some(slot);
++    let boundary = Duration::from_millis(50);
++    queue_frame_at(worker, 60, boundary - Duration::from_nanos(1));
++    let retained = worker.sessions[0].tx_retained;
++    let bytes = worker.sessions[0].tx_bytes;
++    let free = worker.free.len();
++    queue_frame_at(worker, 60, boundary);
++    assert_eq!(worker.counters.tx_fresh_guard_drops, 1);
++    assert_eq!(worker.counters.tx_backlog_drops, 1);
++    assert_eq!(worker.sessions[0].tx_retained, retained);
++    assert_eq!(worker.sessions[0].tx_bytes, bytes);
++    assert_eq!(worker.free.len(), free);
++    assert_eq!(worker.frames.frame(slot).unwrap().offset, 30);
++    assert_eq!(
++        worker.frames.frame(slot).unwrap().deadline,
++        Duration::from_millis(100)
++    );
++    assert_eq!(worker.frames.recovery(slot).unwrap().sent(), 30);
++    assert_eq!(
++        worker.sessions[0].batches[0].as_ref().unwrap().frames[2],
++        Some(slot)
++    );
++    assert_eq!(
++        worker.sessions[0].batches[0]
++            .as_ref()
++            .unwrap()
++            .pending
++            .len(),
++        1
++    );
++
++    submit_original(worker, slot, 30..60);
++    worker.frames.frame_mut(slot).unwrap().offset = 60;
++    // Even an un-compacted completed prefix awaiting ACK cannot trigger the guard.
++    queue_frame_at(worker, 60, boundary);
++    assert_eq!(worker.counters.tx_fresh_guard_drops, 1);
++    assert_eq!(
++        worker.sessions[0].batches[0]
++            .as_ref()
++            .unwrap()
++            .pending
++            .len(),
++        2
++    );
++    assert_eq!(worker.frames.recovery(slot).unwrap().sent(), 60);
++    assert!(worker.frames.recovery(slot).unwrap().remaining() != 0);
++
++    queue_frame_at(&mut workers[1], 60, boundary);
++    assert_eq!(workers[1].counters.tx_backlog_drops, 0);
++    let index = workers[1].sender_index(0, 1).unwrap();
++    assert_eq!(workers[1].sender.lanes[index].unsent_bytes, 60);
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn fresh_lifetime_guard_ignores_repair_batch_but_checks_pending_originals() {
++    let (mut workers, _rx) = workers();
++    let worker = &mut workers[0];
++    queue_frame(worker, 60);
++    queue_frame(worker, 60);
++    let repair = worker.sessions[0].batches[0]
++        .as_mut()
++        .unwrap()
++        .pending
++        .pop_front(&mut worker.frames)
++        .unwrap()
++        .unwrap();
++    let fresh = worker.sessions[0].batches[0]
++        .as_ref()
++        .unwrap()
++        .pending
++        .front()
++        .unwrap();
++    submit_original(worker, repair, 0..60);
++    worker.frames.frame_mut(repair).unwrap().offset = 60;
++    assert!(worker.frames.recovery_mut(repair).unwrap().lost(0..60, 0));
++    worker.recovery.set(repair, recovery::Place::Batch).unwrap();
++    let batch = worker.sessions[0].batches[0].as_mut().unwrap();
++    batch.repair = true;
++    batch.len = 1;
++    batch.frames[0] = Some(repair);
++    batch.selection[0] = Selection {
++        start: 0,
++        end: 60,
++        attempt: 1,
++    };
++    let now = Duration::from_millis(50);
++    queue_frame_at(worker, 60, now);
++    assert_eq!(worker.counters.tx_fresh_guard_drops, 1);
++    assert_eq!(
++        worker.frames.recovery(repair).unwrap().next_repair(60),
++        Some((0..60, 1))
++    );
++    assert_eq!(
++        worker.sessions[0].batches[0].as_ref().unwrap().frames[0],
++        Some(repair)
++    );
++
++    worker.sessions[0].batches[0]
++        .as_mut()
++        .unwrap()
++        .pending
++        .pop_front(&mut worker.frames)
++        .unwrap();
++    submit_original(worker, fresh, 0..60);
++    worker.frames.frame_mut(fresh).unwrap().offset = 60;
++    worker
++        .recovery
++        .set(fresh, recovery::Place::Retained)
++        .unwrap();
++    queue_frame_at(worker, 60, now);
++    assert_eq!(worker.counters.tx_fresh_guard_drops, 1);
++    assert_eq!(
++        worker.sessions[0].batches[0]
++            .as_ref()
++            .unwrap()
++            .pending
++            .len(),
++        1
++    );
++    assert_eq!(
++        worker.frames.recovery(repair).unwrap().next_repair(60),
++        Some((0..60, 1))
++    );
++    assert_eq!(
++        worker.frames.frame(repair).unwrap().deadline,
++        Duration::from_millis(100)
++    );
++}
