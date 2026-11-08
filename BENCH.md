@@ -103,8 +103,60 @@ regression fails before the fix and passes afterward, covering startup,
 reinstallation, idle epoll and preserved setup, feedback and active-MTU
 deadlines. Validation passes 349 all-feature and 340 default ordinary release
 tests, Clippy, formatting and all 74 library kernel tests on Linux 6.8.
-Matched throughput validation follows; this fix does not close the overload,
-migration or throughput gates.
+The matched twenty-second release-musl sweeps confirm the CPU fix. They use the
+same diagnostic binary source, eight workers and TAP queues, sixteen QinQ flows
+per direction, 1522-byte frames and active PMTU capped at 1452-byte UDP payloads.
+Only the empty-schedule deadline guard differs between binaries. The original
+binary is measured again after the fixed build; no local builds, kernel tests
+or Git packing overlap load. [Raw observations](benches/tap-receive-only-timer.json)
+include exact hashes and the source delta.
+
+| One wire lane | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| Original before | 1 Gbit/s | 0.937 / 0.949 | 5.33 / 4.17 | 714.87 / 728.54 |
+| Original before | 4 Gbit/s | 1.906 / 1.772 | 51.85 / 55.27 | 765.92 / 775.98 |
+| Original before | 21 Gbit/s | 1.068 / 0.983 | 94.84 / 95.26 | 766.53 / 769.06 |
+| Original before | Unlimited | 0.661 / 0.565 | 97.98 / 98.25 | 756.47 / 766.09 |
+| Fixed | 1 Gbit/s | 0.981 / 0.981 | 0.99 / 1.06 | 68.22 / 69.16 |
+| Fixed | 4 Gbit/s | 2.017 / 1.971 | 49.14 / 50.29 | 148.64 / 147.89 |
+| Fixed | 21 Gbit/s | 1.102 / 0.906 | 94.69 / 95.64 | 185.67 / 184.33 |
+| Fixed | Unlimited | 0.483 / 0.380 | 98.60 / 98.89 | 194.70 / 204.16 |
+| Original repeat | 1 Gbit/s | 0.981 / 0.980 | 0.98 / 1.10 | 727.62 / 735.85 |
+| Original repeat | 4 Gbit/s | 1.892 / 1.891 | 52.16 / 52.27 | 752.50 / 773.57 |
+| Original repeat | 21 Gbit/s | 1.211 / 0.866 | 93.97 / 95.80 | 755.08 / 761.97 |
+| Original repeat | Unlimited | 0.712 / 0.602 | 97.96 / 98.12 | 759.59 / 769.51 |
+
+At 1 Gbit/s, the fix removes roughly 6.5–6.7 cores of idle work per daemon.
+At 4 Gbit/s, delivery improves modestly while CPU use falls by about 80%.
+This does not establish an overload improvement: fixed unlimited goodput is
+lower than both original runs, falling 76.1 / 80.7% from its own 4 Gbit/s peak.
+Actual unlimited offered load is 32.95 / 32.52, 34.68 / 34.38 and
+35.19 / 32.33 Gbit/s respectively. Different offered rates do not by themselves
+explain the decline.
+
+Unlimited drop attribution, by daemon:
+
+| One wire lane | Admission pressure L / R | Expired frames L / R | Queue drops L / R | TAP TX drops L / R |
+| --- | --- | --- | --- | --- |
+| Original before | 160847 / 164388 | 4541052 / 4665398 | 1141679 / 1122426 | 11600 / 14527 |
+| Fixed | 187411 / 202879 | 4814013 / 4973349 | 1219566 / 1208006 | 0 / 0 |
+| Original repeat | 168946 / 172050 | 4465839 / 4621583 | 1203335 / 1126604 | 36117 / 2966 |
+
+Every point has zero outer socket overflow, outer fragmentation, invalid frames
+and duplicate delivery. The fixed sweep has no inner UDP receive errors;
+the first original sweep has ten at 21 Gbit/s and four at unlimited, while
+the original repeat has none. Reordering remains below 0.008%. Counter units
+differ and must not be summed into an exact frame-loss count.
+
+With the fix, the busiest TAP reader reaches about 97–98% CPU under unlimited
+load; the transmit owner uses 75–82%, and the receive owner uses 20–22%.
+These are thread CPU measurements, not a profile of the remaining delay.
+The fix removes a proven idle spin. It does not attribute or resolve the
+single-lane collapse. The one-lane configuration also concentrates receive
+processing and reassembly capacity, so it cannot isolate congestion-owner
+colocation. An eight-wire-lane control after the first run still delivers
+1.683 / 1.553 Gbit/s unlimited at 232 / 222% CPU. Keep eight receive lanes
+in the next ownership experiment.
 
 ## Stalled PTO target fairness (November 8)
 
@@ -132,6 +184,12 @@ barrier. The migrated lane had no grant or transmission and one unsent expiry.
 Equal session transmit/receive byte totals establish receive accounting, not
 protocol admission. The cause of the unrelated missing feedback remains unknown;
 rotation also cannot guarantee a new frame's deadline at an already long backoff.
+
+A separate failure-triggered diagnostic preserves the original deadlines and
+captures owner, history and receive-rejection state only after failure. Five
+full Linux 7 sequences pass without producing a capture. Those passes do not
+supersede the original uninstrumented failure; instrumentation may perturb
+scheduling or layout. Missing-feedback attribution remains open.
 
 ## Owner accounting budget experiment (November 8)
 
