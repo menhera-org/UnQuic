@@ -1,13 +1,14 @@
 # Release transport overload investigation
 
-The November 8 wrap-up keeps production at `35ed011`. A 24-point routed
-release comparison rejects both early successor requests and ACK-record
+The November 8 comparison uses production `35ed011` as its control across
+24 routed release points. It rejects early successor requests and ACK-record
 retention: the first retains GSO collapse; the second improves GSO but regresses
 bridged input. Repeated production controls deliver 0.602–1.059 / 0.670–0.696
 Gbit/s unlimited with GSO and 0.770–0.876 / 0.729–0.761 through the bridge.
 The patches and complete measurements are archived below. No performance gate
 has passed; the current experiments are finished, while the broader
-performance work remains open.
+performance work remains open. Later ancillary-parser hardening changes no
+performance policy; this comparison predates that safety cleanup.
 
 The original receive-admission collapse and TAP readiness busy loop are fixed.
 Compact transmit storage now keeps payloads in bounded source buffers and

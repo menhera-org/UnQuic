@@ -718,7 +718,7 @@ fn receive_control(message: &libc::msghdr, controls: &[Ancillary]) -> Option<(us
         if remaining < expected || control.header.cmsg_len as usize != expected {
             return None;
         }
-        let value = u32::from_ne_bytes(control.data[..4].try_into().unwrap());
+        let value = u32::from_ne_bytes(*control.data.first_chunk::<4>()?);
         match (control.header.cmsg_level, control.header.cmsg_type) {
             (libc::IPPROTO_UDP, libc::UDP_GRO) if segment == 0 && (1..=65535).contains(&value) => {
                 segment = value as usize;

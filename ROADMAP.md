@@ -9,10 +9,14 @@ section 15 of the design and the "Implementation status" section of
 
 ## November 8 checkpoint
 
-Production transport remains at `35ed011`: bounded fresh expansion, corrected
-routed benchmark ordering, failed-ACK retry and early ACK-buffer recycling are
-retained. The latest completed comparison rejects early successor requests
-and receive-side ACK retention. Both pass their documented correctness suites,
+Performance policies remain those of `35ed011`: bounded fresh expansion,
+corrected routed benchmark ordering, failed-ACK retry and early ACK-buffer
+recycling are retained. Subsequent parser hardening replaces the ancillary
+metadata conversion's `unwrap` with a checked four-byte slice operation.
+That cleanup passes 360 ordinary release-musl tests, strict Clippy, formatting
+and all 98 ignored tests on each of Linux 6.8 and 7.0, including the full
+returned/filtered-PTB and upward-retry checks. The latest completed performance
+comparison rejects early successor requests and receive-side ACK retention. Both pass their documented correctness suites,
 but the first still collapses under GSO overload and the second regresses
 bridged input. [BENCH.md](BENCH.md#successor-requests-and-ack-retention-do-not-fix-both-input-paths-november-8)
 contains the patches, all 24 measurements, drop attribution and test limits.
@@ -814,7 +818,8 @@ full expired batches sharing the cleanup budget.
   it does not prove their preconditions can fail. It excludes the daemon,
   implicit indexing, arithmetic overflow, allocation failure and other
   library calls that can panic. A passing ordinary Clippy run does not
-  close this requirement.
+  close this requirement. The subsequent ancillary-parser cleanup replaces
+  its four-byte conversion with `first_chunk`, reducing the count to 95.
 
   ```sh
   cargo clippy --release --target x86_64-unknown-linux-musl --lib --all-features -- \
