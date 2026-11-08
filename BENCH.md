@@ -83,6 +83,33 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Stalled PTO target fairness (November 8)
+
+A deterministic regression reproduces target starvation: once a group stalls,
+new unanswered probes keep one lane at the head of its outstanding-send heap.
+Every subsequent PTO selects that lane, while a healthy installed session has
+neither an ordinary grant nor a PTO probe.
+
+Stalled PTO now rotates across installed sessions, then each session's lanes.
+Selection reuses the installed-session links in constant time, with one bounded
+cursor per group and session. Backoff, the aggregate two-probe allowance,
+loss-settlement barriers and fresh-feedback requirements are unchanged.
+A handshake replacement still cannot reset congestion state.
+
+The regression fails before the fix and passes afterward. The candidate passes
+349 ordinary all-feature release tests, Clippy, formatting and all 73 library
+kernel checks on Linux 7.0.0-43-generic. The original runtime suite passes twice
+(84.30 and 84.40 seconds), then fails at its unchanged two-second post-migration
+frame deadline on the third run. This is a target-fairness fix, not closure of
+the migration failure.
+
+An earlier failure capture found a stalled group at backoff nine, with 17,920
+bytes outstanding outside the migrating session and no reservation or feedback
+barrier. The migrated lane had no grant or transmission and one unsent expiry.
+Equal session transmit/receive byte totals establish receive accounting, not
+protocol admission. The cause of the unrelated missing feedback remains unknown;
+rotation also cannot guarantee a new frame's deadline at an already long backoff.
+
 ## Snapshot startup delay (November 8)
 
 A fresh release pilot failed before completing its first point: a receiver

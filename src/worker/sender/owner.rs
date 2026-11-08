@@ -38,6 +38,7 @@ struct Group {
     loss_serial: u64,
     check: Option<LossBarrier>,
     probe: Option<(Option<PacketId>, u8)>,
+    probe_cursor: Option<usize>,
 }
 
 pub(in crate::worker) struct Owner {
@@ -82,6 +83,7 @@ impl Owner {
                 loss_serial: 0,
                 check: None,
                 probe: None,
+                probe_cursor: None,
             });
         }
         let mut requests = Vec::new();
@@ -302,12 +304,17 @@ impl Owner {
                         state.pto.expire(now, &state.rtt, latest.map(|(_, at)| at))
                     {
                         state.epoch = state.epoch.checked_add(1).ok_or(io::ErrorKind::Other)?;
-                        state.probe = Some((
+                        let target = if state.pto.stalled() {
+                            // An unanswered lane must not hide working sessions in this group.
+                            let target = self.timers.next_probe(group, state.probe_cursor);
+                            state.probe_cursor = target.map(|id| id.session);
+                            target
+                        } else {
                             latest
                                 .map(|(id, _)| id)
-                                .or_else(|| self.timers.installed(group)),
-                            expiry.probe_limit,
-                        ));
+                                .or_else(|| self.timers.installed(group))
+                        };
+                        state.probe = Some((target, expiry.probe_limit));
                         if expiry.declare_lost {
                             self.start_loss_check(group, now, true)?;
                         } else {
@@ -1305,6 +1312,53 @@ mod loss_barrier_tests {
             outgoing.pop_front().unwrap().1,
             Message::ReportReturn(_)
         ));
+    }
+
+    #[test]
+    fn stalled_pto_reaches_an_idle_session_beside_an_unanswered_lane() {
+        let (mut owner, _) = Owner::new(1, 1, &[(0, 1, 0), (1, 1, 0)], Duration::ZERO).unwrap();
+        owner.timers.install(0, 1).unwrap();
+        owner.timers.install(1, 1).unwrap();
+        let mut now = Duration::ZERO;
+        for _ in 0..3 {
+            let state = &mut owner.groups[0];
+            now = state.pto.deadline(&state.rtt, Some(now)).unwrap();
+            state
+                .pto
+                .expire(now, &state.rtt, Some(Duration::ZERO))
+                .unwrap();
+        }
+        // A probe sent after the forced settlement remains unanswered.
+        owner.timers.submitted(0, 1, 1, 2, now).unwrap();
+        let mut outgoing = VecDeque::with_capacity(8);
+        let mut reached = 0;
+        for _ in 0..2 {
+            let (_, sent) = owner.timers.earliest(0).unwrap();
+            let state = &owner.groups[0];
+            now = state.pto.deadline(&state.rtt, Some(sent)).unwrap();
+            let (token, force) = check(&mut owner, &mut outgoing, now);
+            assert!(!force);
+            owner.loss_checked(0, token, 0, None).unwrap();
+            owner.advance(now, &mut outgoing).unwrap();
+            let (_, Message::Probe { session, count, .. }) = outgoing.pop_front().unwrap() else {
+                panic!("missing bounded PTO allowance")
+            };
+            assert_eq!(count, 2);
+            assert!(outgoing.is_empty());
+            reached |= 1 << session;
+            owner
+                .timers
+                .submitted(session, 1, 1, u32::from(count), now)
+                .unwrap();
+        }
+        assert_ne!(
+            reached & 2,
+            0,
+            "an unanswered lane monopolized all PTO probes"
+        );
+        assert!(owner.groups[0].pto.stalled());
+        owner.probe_replied(0).unwrap();
+        assert!(!owner.groups[0].pto.stalled());
     }
 
     #[test]

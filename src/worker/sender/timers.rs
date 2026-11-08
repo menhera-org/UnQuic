@@ -9,6 +9,7 @@ struct Session {
     count: usize,
     generation: Option<u64>,
     installed: bool,
+    probe_lane: usize,
     previous: usize,
     next: usize,
 }
@@ -51,6 +52,7 @@ impl Timers {
                     count: 0,
                     generation: None,
                     installed: false,
+                    probe_lane: 0,
                     previous: ABSENT,
                     next: ABSENT,
                 });
@@ -132,6 +134,7 @@ impl Timers {
             self.sessions[session].next = next;
             self.installed[group] = session;
         }
+        self.sessions[session].probe_lane = 0;
         self.sessions[session].generation = Some(generation);
         self.sessions[session].installed = true;
         Ok(())
@@ -177,6 +180,30 @@ impl Timers {
             session,
             generation: state.generation?,
             lane: 1,
+            number: 0,
+        })
+    }
+
+    /// Rotate sessions before lanes so one unanswered peer cannot monopolize stalled PTO.
+    pub(super) fn next_probe(&mut self, group: usize, previous: Option<usize>) -> Option<PacketId> {
+        let head = *self.installed.get(group)?;
+        let session = previous
+            .and_then(|index| self.sessions.get(index))
+            .filter(|state| state.installed && self.lanes[state.first].group == group)
+            .map_or(head, |state| {
+                if state.next == ABSENT {
+                    head
+                } else {
+                    state.next
+                }
+            });
+        let state = self.sessions.get_mut(session)?;
+        let lane = state.probe_lane;
+        state.probe_lane = (lane + 1) % state.count;
+        Some(PacketId {
+            session,
+            generation: state.generation?,
+            lane: lane as u16 + 1,
             number: 0,
         })
     }
@@ -501,6 +528,44 @@ mod tests {
         timers.quiesce(1, 3).unwrap();
         assert_eq!(timers.installed(0), None);
         assert_eq!(timers.earliest(0), None);
+    }
+
+    #[test]
+    fn stalled_probe_rotation_visits_sessions_before_their_other_lanes() {
+        let descriptors = [(0, 1, 0), (0, 2, 0), (0, 3, 0), (1, 1, 0), (2, 1, 1)];
+        let mut timers = Timers::new(2, &descriptors).unwrap();
+        assert!(timers.next_probe(0, None).is_none());
+        for session in 0..3 {
+            timers.install(session, 1).unwrap();
+        }
+        let mut previous = None;
+        for (session, lane) in [
+            (1, 1),
+            (0, 1),
+            (1, 1),
+            (0, 2),
+            (1, 1),
+            (0, 3),
+            (1, 1),
+            (0, 1),
+        ] {
+            let probe = timers.next_probe(0, previous).unwrap();
+            assert_eq!((probe.session, probe.lane), (session, lane));
+            previous = Some(probe.session);
+        }
+        assert_eq!(timers.next_probe(1, previous).unwrap().session, 2);
+        timers.quiesce(0, 1).unwrap();
+        assert_eq!(timers.next_probe(0, previous).unwrap().session, 1);
+        timers.quiesce(1, 1).unwrap();
+        assert!(timers.next_probe(0, previous).is_none());
+        timers.install(0, 2).unwrap();
+        assert_eq!(
+            timers.next_probe(0, Some(usize::MAX)).unwrap(),
+            PacketId {
+                number: 0,
+                ..id(0, 1, 2)
+            }
+        );
     }
 
     #[test]

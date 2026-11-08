@@ -591,6 +591,10 @@ overflow and allocation-free transitions. Runtime grants now enforce the allowan
 workers run bounded loss passes and gate liveness/PMTU probes. Blocked PMTU requests
 release their flight buffer; PTO dispatch preempts an ungranted ordinary request.
 Pending probe commands survive generation changes without resetting backoff.
+Once a group stalls, PTO targets rotate across installed sessions, then their
+lanes, so an unanswered lane cannot exclude a working peer. Selection uses the
+existing session links in constant time. The two-probe allowance and backoff
+remain shared; a replacement handshake does not reset them.
 Due liveness probes survive a busy DATA flight and rotate among sessions before
 fresh DATA. Bounded visits and 1 ms history-pressure retries prevent monopolizing
 a turn or spinning; the next one-second interval follows successful submission.

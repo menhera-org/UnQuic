@@ -743,6 +743,9 @@ probe allowances. Worker messages preserve unused pending probe commands across
 connection replacement without resetting backoff. Due liveness probes retain
 their deadline while a DATA flight is busy, rotate across sessions before fresh
 DATA, and retry history pressure after 1 ms. PTO probes retain priority.
+Stalled PTO rounds rotate installed sessions before lanes, preventing an
+unanswered lane from monopolizing the group's probes. Selection is constant
+time and preserves the aggregate two-probe allowance and existing backoff.
 Payload retention and selective repair are connected; complete congestion-control
 integration and the performance gates remain unfinished.
 Per-lane MTU discovery now starts DATA at 1232 bytes
