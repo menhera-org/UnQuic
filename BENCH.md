@@ -83,6 +83,55 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Shorter transmit-handoff batches (November 8)
+
+Reducing each producer's handoff quota from 64 to 8 events yields no goodput
+gain in this matched A/B/A comparison. Production keeps the 64-event quota.
+Every producer still receives a turn, FIFO order is unchanged, and a full
+quota requests another immediate worker turn. With eight workers, the maximum
+foreign events per pass falls from 448 to 56; the expansion budget remains
+64 frames / 64 KiB. Control messages behind DATA require more turns to reach.
+
+These twenty-second bidirectional release-musl sweeps use the same timer-fixed,
+instrumented baseline and placement as the colocation comparison below.
+They retain eight distributed transmit lanes, normal controller settings,
+sixteen QinQ flows, 1522-byte frames, active PMTU capped at 1452-byte UDP
+payloads, and 500-entry TAP queues. No local builds, kernel tests or Git
+packing overlap load. [Raw observations](benches/tap-sender-handoff-budget.json)
+record binaries, source chain, CPU, counter intervals and all twelve points.
+
+| Build | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| Baseline before | 1 Gbit/s | 0.982 / 0.983 | 0.88 / 0.80 | 103.07 / 95.59 |
+| Baseline before | 4 Gbit/s | 1.697 / 1.507 | 56.92 / 61.76 | 213.33 / 205.85 |
+| Baseline before | 21 Gbit/s | 1.753 / 1.564 | 91.50 / 92.41 | 217.55 / 208.87 |
+| Baseline before | Unlimited | 1.749 / 1.583 | 97.04 / 96.92 | 215.37 / 206.45 |
+| Quota 8 | 1 Gbit/s | 0.981 / 0.988 | 1.02 / 0.25 | 103.67 / 96.09 |
+| Quota 8 | 4 Gbit/s | 1.702 / 1.559 | 56.84 / 60.53 | 218.59 / 207.73 |
+| Quota 8 | 21 Gbit/s | 1.753 / 1.569 | 91.51 / 92.40 | 218.79 / 209.02 |
+| Quota 8 | Unlimited | 1.737 / 1.558 | 96.95 / 96.91 | 217.75 / 206.74 |
+| Baseline after | 1 Gbit/s | 0.981 / 0.990 | 1.02 / 0.18 | 101.39 / 95.93 |
+| Baseline after | 4 Gbit/s | 1.698 / 1.530 | 56.94 / 61.20 | 218.10 / 207.24 |
+| Baseline after | 21 Gbit/s | 1.731 / 1.594 | 91.63 / 92.28 | 220.81 / 209.42 |
+| Baseline after | Unlimited | 1.738 / 1.595 | 96.95 / 96.83 | 218.54 / 208.08 |
+
+At unlimited load, quota 8 records 15,525 / 4,458 admission-pressure events,
+1,344,250 / 1,962,693 expired frames and 1,472 / 24,205 worker queue drops.
+The baseline repeats bracket these at 14,737–17,336 / 3,338–4,388 pressure
+events, 1,318,186–1,344,204 / 1,904,412–1,927,996 expiries and
+1,436–1,495 / 24,228–24,252 queue drops. These counts have different units
+and cannot be summed into an exact missing-frame total. All twelve points
+have zero socket overflow, inner UDP errors, corruption, duplicates,
+reordering and outer fragmentation.
+
+The candidate passes 351 ordinary release tests, Clippy, formatting, the
+focused coalesced-wakeup/control-order regression and all three original runtime
+tests with unchanged deadlines and allocation assertions. The original kernel
+suite has 71 passes and three failures: those fixtures allow 32 drain turns for
+a 1024-event backlog, insufficient with quota 8. This is not a passing full
+kernel suite. The [candidate patch](benches/sender-handoff-budget.patch)
+preserves the experiment; it is not applied to production.
+
 ## Eight-lane transmit-owner colocation (November 8)
 
 Moving every transmit lane to the congestion owner does not fix the throughput

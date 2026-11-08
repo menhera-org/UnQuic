@@ -1,0 +1,169 @@
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -1567,10 +1567,10 @@
+     fn drain_queues(&mut self, now: Duration) -> io::Result<bool> {
+         let mut more = false;
+         for from in 0..self.incoming.len() {
+-            for index in 0..BATCH_SIZE {
++            for index in 0..8 {
+                 let event = self.incoming[from].as_mut().and_then(Consumer::try_pop);
+                 let Some(event) = event else { break };
+-                more |= index + 1 == BATCH_SIZE;
++                more |= index + 1 == 8;
+                 match event {
+                     Event::Receive { endpoint, socket } => {
+                         self.install_receiver(endpoint, socket)?;
+@@ -6952,6 +6952,14 @@
+     }
+ 
+     pub(super) fn test_workers() -> (Arc<Shared>, [Worker; 2]) {
++        let (shared, workers) = test_workers_with_layout(2, 2);
++        (shared, workers.try_into().ok().unwrap())
++    }
++
++    pub(super) fn test_workers_with_layout(
++        worker_count: usize,
++        lane_count: usize,
++    ) -> (Arc<Shared>, Vec<Worker>) {
+         use crate::config::{Config, Daemon, Endpoint, Peer, Session as ConfigSession};
+         use std::{
+             net::Ipv6Addr,
+@@ -6972,7 +6980,7 @@
+                 address: Some(Ipv6Addr::LOCALHOST),
+                 peer_port: 40001,
+                 scope_id: 0,
+-                tx_lanes: 2,
++                tx_lanes: lane_count,
+                 outer_payload_limit: BASE_UDP_PAYLOAD,
+                 path_group: None,
+             }],
+@@ -6983,7 +6991,7 @@
+                 tap_name: None,
+                 inner_mtu: 1500,
+                 mac: None,
+-                queue_count: 2,
++                queue_count: worker_count,
+             }],
+         };
+         let mut second = config.sessions[0].clone();
+@@ -6993,21 +7001,29 @@
+         let config = config.validate().unwrap();
+         let shared = Arc::new(Shared {
+             config,
+-            wakes: (0..2).map(|_| Arc::new(Wake::new().unwrap())).collect(),
++            wakes: (0..worker_count)
++                .map(|_| Arc::new(Wake::new().unwrap()))
++                .collect(),
+             owners: (0..2)
+                 .map(|_| (0..65_536).map(|_| AtomicU8::new(0)).collect())
+                 .collect(),
+             status: (0..2).map(|_| AtomicU8::new(0)).collect(),
+             generations: (0..2).map(|_| AtomicU64::new(0)).collect(),
+-            counters: (0..2).map(|_| crate::counters::Counters::new()).collect(),
+-            session_counters: (0..4).map(|_| crate::counters::Counters::new()).collect(),
+-            peer_counters: (0..2).map(|_| crate::counters::Counters::new()).collect(),
+-            receive_counters: (0..4 * LANES)
++            counters: (0..worker_count)
++                .map(|_| crate::counters::Counters::new())
++                .collect(),
++            session_counters: (0..2 * worker_count)
++                .map(|_| crate::counters::Counters::new())
++                .collect(),
++            peer_counters: (0..worker_count)
++                .map(|_| crate::counters::Counters::new())
++                .collect(),
++            receive_counters: (0..2 * worker_count * LANES)
+                 .map(|_| crate::counters::LaneCounters::new())
+                 .collect(),
+             transmit_counters: (0..2)
+                 .map(|_| {
+-                    (0..2)
++                    (0..lane_count)
+                         .map(|_| crate::counters::LaneCounters::new())
+                         .collect()
+                 })
+@@ -7015,19 +7031,77 @@
+             bound: vec![AtomicU64::new(0)],
+             requests: std::sync::Mutex::new(crate::spsc::channel().0),
+             address_pending: vec![std::sync::atomic::AtomicBool::new(false)],
+-            address_ready: (0..2).map(|_| AtomicU64::new(0)).collect(),
+-        });
+-        let workers: [Worker; 2] = std::array::from_fn(|id| {
+-            let mut worker = Worker::new(id, Arc::clone(&shared), Control::new()).unwrap();
+-            worker.io_time = Some(Ok);
+-            worker.unpaced_fixture = true;
+-            worker
++            address_ready: (0..worker_count).map(|_| AtomicU64::new(0)).collect(),
+         });
++        let workers = (0..worker_count)
++            .map(|id| {
++                let mut worker = Worker::new(id, Arc::clone(&shared), Control::new()).unwrap();
++                worker.io_time = Some(Ok);
++                worker.unpaced_fixture = true;
++                worker
++            })
++            .collect();
+ 
+         (shared, workers)
+     }
+ 
+     #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn handoff_quota_yields_and_continues_after_coalesced_wakes() {
++        let (shared, mut workers) = test_workers_with_layout(3, 3);
++        let params = wire::Params {
++            port: 40000,
++            max_frame_len: 9022,
++            mandatory_features: 0,
++            optional_features: 0,
++        };
++        workers[0].sessions[0].connection = Some(Connection {
++            role: handshake::Role::Initiator,
++            initiator: Tag::new(1).unwrap(),
++            responder: Tag::new(2).unwrap(),
++            local: params,
++            peer: params,
++            max_frame_len: 9022,
++        });
++        for from in 1..3 {
++            let (tx, rx) = crate::spsc::channel();
++            workers[from].outgoing[0] = Some(tx);
++            workers[0].incoming[from] = Some(rx);
++            for index in 0..17 {
++                let event = if index == 8 {
++                    Event::Retire {
++                        session: 0,
++                        tag: 1,
++                        lane: from as u16,
++                    }
++                } else {
++                    Event::Packet(workers[from].free.pop().unwrap())
++                };
++                assert!(workers[from].push(0, event).is_ok());
++            }
++            workers[from].flush_notifications().unwrap();
++        }
++        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
++        assert_ne!(workers[0].reactor.wait(&mut events, 0).unwrap(), 0);
++        workers[0].reactor.drain(0).unwrap();
++        assert!(workers[0].drain_queues(Duration::ZERO).unwrap());
++        assert_eq!(workers[0].received.len(), 16);
++        for lane in 1..3 {
++            assert_eq!(shared.owners[0][lane].load(Ordering::Acquire), 0);
++        }
++        // Both wake writes were consumed; only bounded-work continuation remains.
++        assert_eq!(workers[0].reactor.wait(&mut events, 0).unwrap(), 0);
++        assert!(workers[0].drain_queues(Duration::ZERO).unwrap());
++        assert_eq!(workers[0].received.len(), 30);
++        for lane in 1..3 {
++            assert_eq!(shared.owners[0][lane].load(Ordering::Acquire), 255);
++        }
++        assert!(!workers[0].drain_queues(Duration::ZERO).unwrap());
++        assert_eq!(workers[0].received.len(), 32);
++        assert!(!workers[0].drain_queues(Duration::ZERO).unwrap());
++    }
++
++    #[test]
+     #[ignore = "kernel descriptor test; run in a disposable container"]
+     fn full_handoff_rings_return_buffers_and_finish_connection_barriers() {
+         let (shared, mut workers) = test_workers();
