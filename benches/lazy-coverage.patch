@@ -1,0 +1,121 @@
+diff --git a/src/loss/repair.rs b/src/loss/repair.rs
+index e8445b6..e55ec09 100644
+--- a/src/loss/repair.rs
++++ b/src/loss/repair.rs
+@@ -61,7 +61,7 @@ impl FrameRecovery {
+         })
+     }
+ 
+-    /// Reuses a retired frame's storage, clearing only words needed by the new length.
++    /// Reuses a retired frame's storage; fresh submission initializes its coverage.
+     ///
+     /// The caller must invalidate the old frame identity in packet mappings first.
+     /// Packet congestion charges remain independent of this payload-slot reuse.
+@@ -69,9 +69,6 @@ impl FrameRecovery {
+         if !(14..=MAX_FRAME_LEN).contains(&length) {
+             return false;
+         }
+-        for word in self.words.iter_mut().take(length.div_ceil(64)) {
+-            *word = Word::default();
+-        }
+         self.length = length as u16;
+         self.sent = 0;
+         self.unacked = length as u16;
+@@ -114,7 +111,12 @@ impl FrameRecovery {
+             return false;
+         }
+         for (word, mask) in self.selected_mut(&range) {
+-            if attempt == 1 {
++            if attempt == 0 {
++                // Readers exclude unsubmitted bytes. Initialize only the fresh
++                // suffix, preserving ACK/repair state earlier in the same word.
++                word.low &= !mask;
++                word.high &= !mask;
++            } else if attempt == 1 {
+                 word.low |= mask;
+             } else if attempt == 2 {
+                 word.low &= !mask;
+diff --git a/tests/repair.rs b/tests/repair.rs
+index 80ab9e6..0a972d3 100644
+--- a/tests/repair.rs
++++ b/tests/repair.rs
+@@ -131,9 +131,10 @@ fn word_masks_match_a_byte_model_through_reordered_partial_transmissions() {
+         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+         (seed >> 32) as usize
+     };
+-    for length in [14, 63, 64, 65, 1514, MAX_FRAME_LEN] {
++    let mut frame = FrameRecovery::new(MAX_FRAME_LEN).unwrap();
++    for length in [14, 63, 64, 65, 1514, MAX_FRAME_LEN, 65, 14] {
+         for _ in 0..16 {
+-            let mut frame = FrameRecovery::new(length).unwrap();
++            assert!(frame.reset(length));
+             let mut model = Model {
+                 generation: vec![0; length],
+                 pending: vec![false; length],
+@@ -228,3 +229,66 @@ fn slot_reuse_clears_new_length_and_invalid_reset_preserves_live_state() {
+         assert_eq!(frame.acknowledge(0..length, 0), Some(length));
+     }
+ }
++
++#[test]
++fn recycled_coverage_preserves_repairs_and_acks_across_fresh_word_boundaries() {
++    let mut frame = FrameRecovery::new(MAX_FRAME_LEN).unwrap();
++    for length in [14, 63, 64, 65, 127, 128, 129, 1514, MAX_FRAME_LEN, 14] {
++        for prefix in [1, 13, 63, 64, 65, 127, 128, length - 1] {
++            if prefix >= length {
++                continue;
++            }
++            for old in 0..4 {
++                // Reuse both ACKed and outstanding/lost repair bits from a larger frame.
++                assert!(frame.reset(MAX_FRAME_LEN));
++                assert!(frame.submitted(0..MAX_FRAME_LEN, 0));
++                for attempt in 0..old.min(2) {
++                    assert!(frame.lost(0..MAX_FRAME_LEN, attempt));
++                    assert!(frame.submitted(0..MAX_FRAME_LEN, attempt + 1));
++                }
++                if old == 3 {
++                    assert_eq!(frame.acknowledge(0..MAX_FRAME_LEN, 0), Some(MAX_FRAME_LEN));
++                }
++                assert!(frame.reset(length));
++                assert_eq!(frame.sent(), 0);
++                assert_eq!(frame.remaining(), length);
++                assert_eq!(frame.next_repair(usize::MAX), None);
++                for attempt in 0..=2 {
++                    assert!(!frame.lost(0..1, attempt));
++                    assert_eq!(frame.acknowledge(0..1, attempt), None);
++                }
++                assert!(!frame.submitted(0..0, 0));
++                assert!(!frame.submitted(1..length, 0));
++                assert!(frame.submitted(0..prefix, 0));
++                assert!(!frame.lost(0..prefix, 1));
++                assert_eq!(frame.acknowledge(0..prefix, 1), None);
++                assert_eq!(frame.next_repair(usize::MAX), None);
++
++                assert!(frame.lost(0..prefix, 0));
++                assert!(frame.submitted(0..prefix, 1));
++                let acked = prefix / 2;
++                if acked != 0 {
++                    assert_eq!(frame.acknowledge(0..acked, 0), Some(acked));
++                }
++                assert!(frame.lost(0..prefix, 1));
++                assert_eq!(frame.next_repair(usize::MAX), Some((acked..prefix, 2)));
++
++                // Fresh continuation can share a word with repaired and ACKed bytes.
++                assert!(frame.submitted(prefix..length, 0));
++                assert_eq!(frame.remaining(), length - acked);
++                assert_eq!(frame.next_repair(usize::MAX), Some((acked..prefix, 2)));
++                assert!(frame.submitted(acked..prefix, 2));
++                assert!(frame.lost(0..prefix, 0));
++                assert_eq!(frame.next_repair(usize::MAX), None);
++                assert!(frame.lost(prefix..length, 0));
++                assert_eq!(frame.next_repair(usize::MAX), Some((prefix..length, 1)));
++                assert_eq!(frame.acknowledge(0..prefix, 0), Some(prefix - acked));
++                assert!(!frame.can_submit(acked..prefix, 2));
++                assert!(frame.submitted(prefix..length, 1));
++                assert_eq!(frame.acknowledge(0..length, 0), Some(length - prefix));
++                assert_eq!(frame.remaining(), 0);
++                assert_eq!(frame.next_repair(usize::MAX), None);
++            }
++        }
++    }
++}

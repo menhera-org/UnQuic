@@ -83,6 +83,64 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Deferring recovery initialization leaves the collapse intact (November 8)
+
+A small isolated candidate makes recovery-slot reset constant work. Instead
+of clearing the new frame's coverage words on admission, it initializes each
+original byte range when successfully submitted. Readers already exclude
+bytes beyond the contiguous submission cursor. Recycled slots, partial-word
+boundaries, mixed repair generations and continued original submissions have
+targeted tests. Unsent frames avoid the coverage clear; this alone does not
+establish a transport speedup.
+
+Two twenty-second release-musl A/B/A sequences repeat the same QinQ workload,
+with eight TX lanes and then one. Both retain eight workers/TAP queues.
+[All 24 observations](benches/tap-lazy-coverage.json) include the 1 and
+21 Gbit/s points omitted here. The [patch](benches/lazy-coverage.patch)
+applies to the ordinary baseline, without abandonment or timing instrumentation.
+
+| TX lanes | Build | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- | --- |
+| 8 | Baseline before | 4 Gbit/s | 1.647 / 1.521 | 58.06 / 61.36 | 209.07 / 199.41 |
+| 8 | Baseline before | Unlimited | 1.727 / 1.562 | 96.86 / 96.95 | 216.11 / 203.32 |
+| 8 | Lazy coverage | 4 Gbit/s | 1.770 / 1.535 | 55.12 / 61.11 | 211.35 / 203.62 |
+| 8 | Lazy coverage | Unlimited | 1.744 / 1.571 | 96.97 / 97.01 | 206.35 / 199.80 |
+| 8 | Baseline after | 4 Gbit/s | 1.700 / 1.556 | 56.89 / 60.58 | 216.36 / 204.51 |
+| 8 | Baseline after | Unlimited | 1.701 / 1.570 | 97.24 / 97.12 | 204.96 / 200.35 |
+| 1 | Baseline before | 4 Gbit/s | 1.944 / 1.862 | 50.89 / 53.00 | 146.65 / 147.10 |
+| 1 | Baseline before | Unlimited | 0.497 / 0.423 | 98.51 / 98.68 | 196.09 / 201.14 |
+| 1 | Lazy coverage | 4 Gbit/s | 1.899 / 1.923 | 52.01 / 51.42 | 148.69 / 145.22 |
+| 1 | Lazy coverage | Unlimited | 0.548 / 0.439 | 98.40 / 98.74 | 196.23 / 201.93 |
+| 1 | Baseline after | 4 Gbit/s | 1.985 / 1.907 | 49.89 / 51.84 | 147.69 / 148.09 |
+| 1 | Baseline after | Unlimited | 0.490 / 0.518 | 98.54 / 98.39 | 200.10 / 195.74 |
+
+Eight-lane unlimited goodput is slightly above both baseline repeats. Left
+CPU lies between them; right CPU is 0.3–1.7% lower. Single-lane unlimited forward delivery improves,
+but reverse delivery remains within baseline variation and the candidate
+still falls 71.1 / 77.1% from its 4 Gbit/s point. These runs establish neither
+a broad throughput gain nor a stable overload plateau.
+
+Candidate eight-lane unlimited admission pressure is 9,737 / 1,697;
+worker queue drops are 1,927 / 24,260; total frame expiries are
+1,317,904 / 1,955,243. With one lane, pressure is 196,830 / 200,756,
+queue drops 1,216,280 / 1,233,537, and expiries 4,729,188 / 4,875,499.
+These counters have different units and cannot be summed into frame loss.
+
+Every point has zero outer socket overflow, corruption, duplicates and outer
+fragmentation. The single-lane candidate has three left-side inner UDP errors
+at 21 Gbit/s; all other inner-error counts are zero. Eight-lane reordering
+is zero. Single-lane reordering reaches 0.00868% across controls; the candidate
+reorders 0.00228 / 0.00658% at 21 Gbit/s and 0.00213 / 0.00465% unlimited.
+
+The candidate passes 350 ordinary release tests, strict Clippy, formatting
+and all 74 library kernel tests on Linux 7. The original runtime suite
+**fails one of three tests** at the unchanged two-second delivery wait after
+address migration, `tests/linux_runtime.rs:637`. That phase has failed in
+earlier baseline runs, so attribution to this candidate remains unresolved.
+Failure artifacts and exact binary identities are retained. Production stays
+unchanged; the next diagnostic captures public runtime state only after
+that original wait fails.
+
 ## Overload leaves little time after final original submission (November 8)
 
 An isolated diagnostic measures the remaining lifetime when a frame's final
