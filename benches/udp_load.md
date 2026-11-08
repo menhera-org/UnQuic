@@ -96,6 +96,21 @@ Check actual offered rates: kernel encapsulation can saturate a generator
 before it reaches the requested rate. Compare `SEGMENTS=1` with aggregates
 to distinguish burst losses from sustained capacity.
 
+Use `WORKERS=2`, `4` or `8` to test the deployment core budget as well as
+the local gate. Snapshots include per-thread voluntary and involuntary context
+switches beside CPU ticks.
+
+`INNER_BRIDGE=1` moves the load generator into another namespace and forwards
+its frames over a veth and bridge to the TAP. VLAN devices sit on the generator's
+veth instead of the TAP. With `UDP_LOAD` and `SEGMENTS=1`, the harness disables
+source checksum/segmentation offloads and bridge-port GRO. This completes UDP
+checksums before ingress, as an ordinary NIC would, instead of carrying veth's
+partial-checksum metadata through the bridge. Offload flags are recorded and
+checksum completion is checked. Other rows retain their existing offloads;
+TCP segmentation remains available for reactive tests. The default keeps the original direct-TAP
+topology. Record per-worker input counts: a bridge alone does not guarantee
+that QinQ reaches several TAP readers.
+
 `OUTER_ROUTED=1` puts the daemons in separate network namespaces, joined
 through a private IPv6 router and 1500-byte veth links. The harness disables
 UDP segmentation on the endpoint links and GRO on the router links, so netem
@@ -121,13 +136,14 @@ also include both endpoint IPv6 counters and both router qdiscs.
 `SESSION_COOKIE` overrides the session UUID for queue-placement controls;
 record it when comparing runs because it affects receive-worker assignment.
 
-`WORKERS=4` is the default; `WORKERS=8` also changes the lane and queue
+`WORKERS=4` is the default; `WORKERS=2` and `WORKERS=8` also change the lane and queue
 counts. `DAEMON_LEFT_CPUS` and `DAEMON_RIGHT_CPUS` override daemon placement.
 The existing `GENERATOR_*_CPUS` and `RECEIVER_*_CPUS` variables select the
 four load-process CPU sets. Explicitly choose non-overlapping physical cores
 on one socket. The four-worker defaults use daemon CPUs 0-7 and load CPUs 8-19.
+The two-worker defaults use daemon CPUs 0–3 and load CPUs 4–7.
 The eight-worker defaults use daemon CPUs 0-15 and one load process on each of
-CPUs 16-19. Verify the host's topology before using either layout.
+CPUs 16-19. Verify the host's topology before using any layout.
 
 `TAP_TXQUEUELEN` sets the test TAP queue length (1–10,000; default 10,000).
 With USO input, each entry can hold a whole super-frame, so record this value

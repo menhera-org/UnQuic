@@ -18,11 +18,12 @@ for number in "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}"; do
 done
 [ "${OUTER_DELAY_US:-0}" -le 1000000 ] && [ "${OUTER_LOSS_PERMILLE:-0}" -le 1000 ] || exit 2
 case "${OUTER_ROUTED:-0}" in 0|1) ;; *) exit 2;; esac
+case "${INNER_BRIDGE:-0}" in 0|1) ;; *) exit 2;; esac
 case "${VLAN_DEPTH:-0}" in 0|1|2) ;; *) echo "VLAN_DEPTH must be 0, 1 or 2" >&2; exit 2;; esac
 case "${SRV6:-0}" in 0|1) ;; *) echo "SRV6 must be 0 or 1" >&2; exit 2;; esac
 [ "${SRV6:-0}" = 0 ] || [ -n "${UDP_LOAD:-}" ] || { echo "SRV6 requires UDP_LOAD" >&2; exit 2; }
 [ "$2" -le "$((1514 + 4 * ${VLAN_DEPTH:-0}))" ] || exit 2
-case "${WORKERS:-4}" in 4|8) ;; *) echo "WORKERS must be 4 or 8" >&2; exit 2;; esac
+case "${WORKERS:-4}" in 2|4|8) ;; *) echo "WORKERS must be 2, 4 or 8" >&2; exit 2;; esac
 case "${UDP_LOAD:-}" in ''|/*) ;; *) echo "UDP_LOAD must be an absolute path" >&2; exit 2;; esac
 case "${IPERF_PROTOCOL:-udp}" in udp|tcp) ;; *) echo "IPERF_PROTOCOL must be udp or tcp" >&2; exit 2;; esac
 [ "${IPERF_PROTOCOL:-udp}" = udp ] || [ -z "${UDP_LOAD:-}" ] || { echo "TCP requires iperf3, not UDP_LOAD" >&2; exit 2; }
@@ -47,6 +48,12 @@ seconds=$4
 out=$(cd "$5" && pwd)
 workers=${WORKERS:-4}
 case "$workers" in
+    2)
+        GENERATOR_LEFT_CPUS=${GENERATOR_LEFT_CPUS:-4}
+        RECEIVER_LEFT_CPUS=${RECEIVER_LEFT_CPUS:-5}
+        GENERATOR_RIGHT_CPUS=${GENERATOR_RIGHT_CPUS:-6}
+        RECEIVER_RIGHT_CPUS=${RECEIVER_RIGHT_CPUS:-7}
+        ;;
     4)
         GENERATOR_LEFT_CPUS=${GENERATOR_LEFT_CPUS:-8-11}
         RECEIVER_LEFT_CPUS=${RECEIVER_LEFT_CPUS:-12-13}
@@ -73,6 +80,8 @@ cleanup() {
     wait || :
     ip netns del uq-left 2>/dev/null || :
     ip netns del uq-right 2>/dev/null || :
+    ip netns del uq-gen-left 2>/dev/null || :
+    ip netns del uq-gen-right 2>/dev/null || :
     ip netns del uq-out-left 2>/dev/null || :
     ip netns del uq-out-right 2>/dev/null || :
 }
@@ -82,6 +91,13 @@ netip() {
     namespace=$1
     shift
     nsenter --net="/run/netns/$namespace" ip "$@"
+}
+left_inner=/run/netns/uq-left
+right_inner=/run/netns/uq-right
+inner() {
+    case "$1" in left) namespace=$left_inner;; right) namespace=$right_inner;; esac
+    shift
+    nsenter --net="$namespace" "$@"
 }
 left_netns=/proc/self/ns/net
 right_netns=/proc/self/ns/net
@@ -133,6 +149,8 @@ for side in left right; do
     if [ "${OUTER_ROUTED:-0}" = 1 ]; then
         if [ "$side" = left ]; then listen=fd77:ff:1::1; host=fd77:ff:2::1; else listen=fd77:ff:2::1; host=fd77:ff:1::1; fi
     fi
+    mac_prefix=00
+    [ "${INNER_BRIDGE:-0}" = 0 ] || mac_prefix=01
     cat > "$out/$side.toml" <<CONFIG
 [[endpoints]]
 name = "rx"
@@ -150,7 +168,7 @@ name = "uq-$side"
 peer = "peer"
 cookie = "${SESSION_COOKIE:-00112233-4455-4677-8899-aabbccddeeff}"
 inner_mtu = 1500
-mac = "02:00:00:00:00:$mac"
+mac = "02:00:00:00:$mac_prefix:$mac"
 queue_count = $workers
 CONFIG
 done
@@ -171,27 +189,50 @@ for side in left right; do
     netip "uq-$side" link set "uq-$side" txqueuelen "${TAP_TXQUEUELEN:-10000}"
     netip "uq-$side" link set "uq-$side" up
     data="uq-$side"
+    data_ns="uq-$side"
+    if [ "${INNER_BRIDGE:-0}" = 1 ]; then
+        if [ "$side" = left ]; then n=1; else n=2; fi
+        data_ns="uq-gen-$side"
+        ip netns add "$data_ns"
+        netip "$data_ns" link set lo up
+        netip "uq-$side" link add uq-port type veth peer name uq-input netns "$data_ns"
+        netip "uq-$side" link add uq-bridge address "02:00:00:00:02:0$n" type bridge
+        netip "uq-$side" link set uq-port address "02:00:00:00:03:0$n" master uq-bridge up
+        netip "uq-$side" link set "uq-$side" master uq-bridge
+        netip "uq-$side" link set uq-bridge up
+        netip "$data_ns" link set uq-input address "02:00:00:00:00:0$n" up
+        if [ -n "${UDP_LOAD:-}" ] && [ "${SEGMENTS:-64}" = 1 ]; then
+            nsenter --net="/run/netns/$data_ns" ethtool -K uq-input tx off gso off tso off tx-udp-segmentation off
+            nsenter --net="/run/netns/uq-$side" ethtool -K uq-port gro off
+        fi
+        nsenter --net="/run/netns/$data_ns" ethtool -k uq-input > "$out/$side.inner-offloads"
+        if [ -n "${UDP_LOAD:-}" ] && [ "${SEGMENTS:-64}" = 1 ]; then
+            grep -q '^tx-checksumming: off' "$out/$side.inner-offloads"
+        fi
+        data=uq-input
+        if [ "$side" = left ]; then left_inner="/run/netns/$data_ns"; else right_inner="/run/netns/$data_ns"; fi
+    fi
     if [ "${VLAN_DEPTH:-0}" = 2 ]; then
-        netip "uq-$side" link add link "$data" name uq-outer type vlan protocol 802.1ad id 42
-        netip "uq-$side" link set uq-outer up
+        netip "$data_ns" link add link "$data" name uq-outer type vlan protocol 802.1ad id 42
+        netip "$data_ns" link set uq-outer up
         data=uq-outer
     fi
     if [ "${VLAN_DEPTH:-0}" != 0 ]; then
-        netip "uq-$side" link add link "$data" name uq-data type vlan id 7
-        netip "uq-$side" link set uq-data mtu 1500 up
+        netip "$data_ns" link add link "$data" name uq-data type vlan id 7
+        netip "$data_ns" link set uq-data mtu 1500 up
         data=uq-data
     fi
     if [ "$side" = left ]; then local=1; remote=2; else local=2; remote=1; fi
-    netip "uq-$side" addr add "10.77.0.$local/24" dev "$data"
-    netip "uq-$side" neigh add "10.77.0.$remote" lladdr "02:00:00:00:00:0$remote" nud permanent dev "$data"
+    netip "$data_ns" addr add "10.77.0.$local/24" dev "$data"
+    netip "$data_ns" neigh add "10.77.0.$remote" lladdr "02:00:00:00:00:0$remote" nud permanent dev "$data"
     if [ "${SRV6:-0}" = 1 ]; then
-        netip "uq-$side" -6 addr add "fd77:3::$local/64" dev "$data" nodad
-        netip "uq-$side" -6 addr add "fd77:1::$local/128" dev lo nodad
-        netip "uq-$side" -6 neigh add "fd77:3::$remote" lladdr "02:00:00:00:00:0$remote" nud permanent dev "$data"
-        nsenter --net="/run/netns/uq-$side" sysctl -qw net.ipv6.conf.all.seg6_enabled=1 net.ipv6.conf.all.forwarding=1
-        netip "uq-$side" -6 route add "fd77:2::$local/128" encap seg6local action End.DT6 table 255 count dev "$data"
-        netip "uq-$side" -6 route add "fd77:2::$remote/128" via "fd77:3::$remote" dev "$data"
-        netip "uq-$side" -6 route add "fd77:1::$remote/128" encap seg6 mode encap segs "fd77:2::$remote" via "fd77:3::$remote" dev "$data"
+        netip "$data_ns" -6 addr add "fd77:3::$local/64" dev "$data" nodad
+        netip "$data_ns" -6 addr add "fd77:1::$local/128" dev lo nodad
+        netip "$data_ns" -6 neigh add "fd77:3::$remote" lladdr "02:00:00:00:00:0$remote" nud permanent dev "$data"
+        nsenter --net="/run/netns/$data_ns" sysctl -qw net.ipv6.conf.all.seg6_enabled=1 net.ipv6.conf.all.forwarding=1
+        netip "$data_ns" -6 route add "fd77:2::$local/128" encap seg6local action End.DT6 table 255 count dev "$data"
+        netip "$data_ns" -6 route add "fd77:2::$remote/128" via "fd77:3::$remote" dev "$data"
+        netip "$data_ns" -6 route add "fd77:1::$remote/128" encap seg6 mode encap segs "fd77:2::$remote" via "fd77:3::$remote" dev "$data"
     fi
 done
 for side in left right; do
@@ -227,6 +268,12 @@ snapshot() {
     cat /proc/stat > "$out/$1.cpu"
     cat /proc/"$left"/stat /proc/"$right"/stat > "$out/$1.process"
     cat /proc/"$left"/task/*/stat /proc/"$right"/task/*/stat > "$out/$1.threads"
+    for process in "$left" "$right"; do
+        for status in /proc/"$process"/task/*/status; do
+            printf '%s\n' "$status"
+            sed -n '/^Name:/p; /^Pid:/p; /^voluntary_ctxt_switches:/p; /^nonvoluntary_ctxt_switches:/p' "$status"
+        done
+    done > "$out/$1.switches"
     cat /proc/net/snmp6 > "$out/$1.outer"
     if [ "${OUTER_ROUTED:-0}" = 1 ]; then
         outer left cat /proc/net/snmp6 > "$out/$1.outer-left"
@@ -237,9 +284,9 @@ snapshot() {
         tc -s -d qdisc show dev lo > "$out/$1.qdisc"
     fi
     for side in left right; do
-        nsenter --net="/run/netns/uq-$side" cat /proc/net/snmp > "$out/$1.$side-ipv4"
-        nsenter --net="/run/netns/uq-$side" cat /proc/net/snmp6 > "$out/$1.$side-ipv6"
-        netip "uq-$side" -s -6 route show > "$out/$1.$side-routes"
+        inner "$side" cat /proc/net/snmp > "$out/$1.$side-ipv4"
+        inner "$side" cat /proc/net/snmp6 > "$out/$1.$side-ipv6"
+        inner "$side" ip -s -6 route show > "$out/$1.$side-routes"
     done
     netip uq-left -s link show uq-left > "$out/$1.left-link"
     netip uq-right -s link show uq-right > "$out/$1.right-link"
@@ -259,6 +306,7 @@ printf '%s\n' "$GENERATOR_LEFT_CPUS" "$RECEIVER_LEFT_CPUS" \
     "$GENERATOR_RIGHT_CPUS" "$RECEIVER_RIGHT_CPUS" > "$out/generator-cpus"
 printf '%s\n' "${VLAN_DEPTH:-0}" > "$out/vlan-depth"
 printf '%s\n' "${SRV6:-0}" > "$out/srv6"
+printf '%s\n' "${INNER_BRIDGE:-0}" > "$out/inner-bridge"
 printf '%s\n' "$frame" > "$out/frame-bytes"
 printf 'routed=%s\none_way_delay_us=%s\nloss_permille=%s\n' "${OUTER_ROUTED:-0}" "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" > "$out/outer-path"
 base=$out
@@ -276,25 +324,25 @@ for rate in ${BITRATE:-0}; do
     if [ -n "${UDP_LOAD:-}" ]; then
         case "$rate" in *[!0-9]*) echo "UDP_LOAD rates must be integer bits/s per flow" >&2; exit 2;; esac
         run=$((index + 1))
-        nsenter --net=/run/netns/uq-right taskset -c "$RECEIVER_RIGHT_CPUS" "$UDP_LOAD" recv \
+        nsenter --net="$right_inner" taskset -c "$RECEIVER_RIGHT_CPUS" "$UDP_LOAD" recv \
             "$right_address" "$left_address" 52000 51000 "$flows" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/server.json" &
         server=$!
-        nsenter --net=/run/netns/uq-left taskset -c "$RECEIVER_LEFT_CPUS" "$UDP_LOAD" recv \
+        nsenter --net="$left_inner" taskset -c "$RECEIVER_LEFT_CPUS" "$UDP_LOAD" recv \
             "$left_address" "$right_address" 52000 51000 "$flows" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/reverse-server.json" &
         reverse_server=$!
         sleep 0.2
         kill -0 "$server" && kill -0 "$reverse_server" || exit 1
         snapshot before
-        nsenter --net=/run/netns/uq-left taskset -c "$GENERATOR_LEFT_CPUS" "$UDP_LOAD" send \
+        nsenter --net="$left_inner" taskset -c "$GENERATOR_LEFT_CPUS" "$UDP_LOAD" send \
             "$left_address" "$right_address" 51000 52000 "$flows" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/client.json" &
         client=$!
-        nsenter --net=/run/netns/uq-right taskset -c "$GENERATOR_RIGHT_CPUS" "$UDP_LOAD" send \
+        nsenter --net="$right_inner" taskset -c "$GENERATOR_RIGHT_CPUS" "$UDP_LOAD" send \
             "$right_address" "$left_address" 51000 52000 "$flows" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/reverse-client.json" &
         reverse_client=$!
     else
-        nsenter --net=/run/netns/uq-right taskset -c "$RECEIVER_RIGHT_CPUS" iperf3 -s -1 -J > "$out/server.json" &
+        nsenter --net="$right_inner" taskset -c "$RECEIVER_RIGHT_CPUS" iperf3 -s -1 -J > "$out/server.json" &
         server=$!
-        nsenter --net=/run/netns/uq-left taskset -c "$RECEIVER_LEFT_CPUS" iperf3 -s -1 -J > "$out/reverse-server.json" &
+        nsenter --net="$left_inner" taskset -c "$RECEIVER_LEFT_CPUS" iperf3 -s -1 -J > "$out/reverse-server.json" &
         reverse_server=$!
         sleep 0.2
         snapshot before
@@ -303,10 +351,10 @@ for rate in ${BITRATE:-0}; do
         else
             set -- -u --dont-fragment -l "$payload"
         fi
-        nsenter --net=/run/netns/uq-left taskset -c "$GENERATOR_LEFT_CPUS" iperf3 -c 10.77.0.2 -b "$rate" "$@" -P "$flows" --cport 51000 -t "$seconds" -J \
+        nsenter --net="$left_inner" taskset -c "$GENERATOR_LEFT_CPUS" iperf3 -c 10.77.0.2 -b "$rate" "$@" -P "$flows" --cport 51000 -t "$seconds" -J \
             --connect-timeout 3000 > "$out/client.json" &
         client=$!
-        nsenter --net=/run/netns/uq-right taskset -c "$GENERATOR_RIGHT_CPUS" iperf3 -c 10.77.0.1 -b "$rate" "$@" -P "$flows" --cport 51000 -t "$seconds" -J \
+        nsenter --net="$right_inner" taskset -c "$GENERATOR_RIGHT_CPUS" iperf3 -c 10.77.0.1 -b "$rate" "$@" -P "$flows" --cport 51000 -t "$seconds" -J \
             --connect-timeout 3000 > "$out/reverse-client.json" &
         reverse_client=$!
     fi

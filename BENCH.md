@@ -89,6 +89,60 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## November 8 audit: ingress calibration and sender accounting
+
+[The new audit](20261108-perf-audit.md) is preserved as a read-only review of
+`926c664`. Its recommendations require separate correctness and performance
+checks. Routed delay/loss controls are now available above; the next harness
+change adds bridged input, two-worker runs, and per-thread context-switch
+snapshots.
+
+[Ten functional observations](benches/tap-bridge-validation.json) test the
+new modes with the unchanged production daemon. Simply adding a veth and bridge
+does **not** spread QinQ UDP input: on Linux 7.0, all sixteen individual-frame
+flows still enter worker 3. Default veth carries partial-checksum metadata.
+For `INNER_BRIDGE=1`, `UDP_LOAD` and `SEGMENTS=1`, the harness now disables
+source checksum/segmentation offloads and receiving bridge-port GRO. Checksums
+are completed before ingress, and all four TAP readers receive traffic.
+
+| Kernel / input | Left reader frame counts, workers 0–3 | Right reader frame counts, workers 0–3 |
+| --- | --- | --- |
+| 7.0 / direct TAP, individual UDP | 1 / 1 / 8 / 424564 | 4 / 6 / 2 / 424214 |
+| 7.0 / bridge, default veth metadata | 4 / 1 / 17 / 424576 | 5 / 7 / 1 / 424486 |
+| 7.0 / bridge, completed checksums | 54654 / 27026 / 210342 / 132542 | 80643 / 132179 / 183400 / 28057 |
+| 6.8 / direct TAP, individual UDP | 1 / 9 / 0 / 423990 | 6 / 6 / 0 / 423780 |
+| 6.8 / bridge, completed checksums | 53956 / 27935 / 211235 / 130910 | 79508 / 132053 / 185603 / 27130 |
+
+Both kernels retain concentration for bridged 44-segment UDP sources. TCP
+offload rows remain separate; a bridge does not guarantee flow distribution
+for every checksum/GRO state. The two-worker individual-frame control also
+uses both readers. This validates a needed ingress control, not a transport
+throughput fix.
+
+Four Linux 6.8 captures inspect 200 TAP packets each with zero capture
+overflow. The bridged individual-frame capture has 200 QinQ frames of 1522
+bytes and 200 valid UDP checksums, checked using the generator's known payload.
+The two-worker capture has 198 such UDP frames, all checksum-valid. The
+super-frame capture reaches 64818 bytes, confirming that it is a different
+input workload. Linux 7.0 smoke checks cover individual/GSO UDP and one/four
+paced TCP streams. These ten-second checks use different CPU layouts across
+kernels and include capture overhead locally; their rates are not acceptance
+or matched performance results.
+
+The audit's A1 reservation-time sampling proposal is not exact. The existing
+reversed-send test reserves A before B but sends B first; partial and unused
+grants make reservation-time inflight differ from actual send-time inflight.
+Holding only the named packet's ACK does not repair that error. A bounded
+ordered-commit candidate instead uses outstanding grants' earliest possible
+send times, retaining actual timestamps and closing issuance for feedback.
+It remains under test. No approximate delivery snapshots are adopted.
+
+Three-success ACK pruning is also under comparison, with exact transmitted
+ranges, late-arrival handling and unchanged duplicate history. Scaling control
+credit, sharing retention, lossy single-flow capacity and the final performance
+gates remain open. None of the audit's arithmetic estimates is a measured
+throughput guarantee.
+
 ## More incoming ACK storage under delay (November 8)
 
 The earlier four-versus-sixteen ACK-buffer experiment removed drops on
