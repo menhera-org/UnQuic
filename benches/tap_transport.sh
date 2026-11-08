@@ -150,11 +150,23 @@ for side in left right; do
     done
 done
 snapshot() {
+    left_count=$(grep -c '^unquic: worker [0-9][0-9]* Snapshot {.* }$' "$base/left.log" || :)
+    right_count=$(grep -c '^unquic: worker [0-9][0-9]* Snapshot {.* }$' "$base/right.log" || :)
+    left_count=$((left_count + workers))
+    right_count=$((right_count + workers))
     kill -USR1 "$left" "$right"
     if [ -n "${UDP_LOAD:-}" ] && [ "$1" != after ]; then
         kill -USR1 "$server" "$reverse_server"
     fi
     sleep 0.1
+    attempts=0
+    while [ "$(grep -c '^unquic: worker [0-9][0-9]* Snapshot {.* }$' "$base/left.log" || :)" -lt "$left_count" ] ||
+          [ "$(grep -c '^unquic: worker [0-9][0-9]* Snapshot {.* }$' "$base/right.log" || :)" -lt "$right_count" ]; do
+        kill -0 "$left" && kill -0 "$right" || exit 1
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 500 ] || { echo "counter snapshot timeout" >&2; exit 1; }
+        sleep 0.01
+    done
     cat "$base/left.log" > "$out/$1.left-log"
     cat "$base/right.log" > "$out/$1.right-log"
     cat /proc/uptime > "$out/$1.uptime"

@@ -3,7 +3,8 @@ use super::*;
 
 impl Lane {
     pub(in crate::worker) fn idle(&self) -> bool {
-        self.ack.is_none()
+        self.unsent_bytes == 0
+            && self.ack.is_none()
             && !self.report_pending
             && self.loss_passes == 0
             && self.history.is_retired()
@@ -16,7 +17,11 @@ impl Lane {
         if generation == self.generation {
             return Ok(());
         }
-        if self.ack.is_some() || self.report_pending || self.loss_passes != 0 {
+        if self.unsent_bytes != 0
+            || self.ack.is_some()
+            || self.report_pending
+            || self.loss_passes != 0
+        {
             return Err(io::ErrorKind::WouldBlock.into());
         }
         self.history.reset().map_err(io::Error::other)?;

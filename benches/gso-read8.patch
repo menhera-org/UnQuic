@@ -1,0 +1,122 @@
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -2112,7 +2112,7 @@
+             let limit = &mut self.sessions[session].tap_read_limit;
+             // A full read limited by pool availability says nothing about TAP occupancy.
+             let maximum = if batch.segments.iter().any(Option::is_some) {
+-                4
++                8
+             } else {
+                 BATCH_SIZE
+             };
+@@ -2140,7 +2140,7 @@
+                 buffer.segments = segments;
+                 self.read_tap_result(session, now, buffer, result)?;
+             }
+-            if maximum == 4 && !self.sessions[session].tap_inputs.is_empty() {
++            if maximum == 8 && !self.sessions[session].tap_inputs.is_empty() {
+                 self.sessions[session].tap_read_limit = 1;
+             }
+         } else {
+@@ -5759,15 +5759,14 @@
+         worker
+             .attach_tap(0, TapQueue::test_fd(fd.into(), true))
+             .unwrap();
+-        let mut sources = Vec::new();
+-        for source in 0..11 {
+-            let mut input = udp::frame(false, source * 70, &[7; 7000]);
++        let source = |source: usize, owner| {
++            let mut input = udp::frame(false, (source * 70) as u16, &[7; 7000]);
+             let mut header = udp::partial(&mut input, false);
+             input.splice(12..12, [0x88, 0xa8, 0, 7, 0x81, 0, 0, 42]);
+             input[11] = (0..=255)
+                 .find(|&mac| {
+                     input[11] = mac;
+-                    pack::flow_hash(&input) % 2 == 1
++                    pack::flow_hash(&input) % 2 == owner
+                 })
+                 .unwrap();
+             header[1] = 5;
+@@ -5776,31 +5775,64 @@
+             sender
+                 .send(&[header.as_slice(), input.as_slice()].concat())
+                 .unwrap();
+-            sources.push(input);
+-        }
++            input
++        };
+         let mut seen = 0;
+         let mut reads = 0;
+-        for (count, next) in [(1, 2), (2, 4), (4, 4), (4, 4)] {
++        for (count, next) in [(1, 2), (2, 4), (4, 8), (8, 8), (8, 8)] {
++            let sources: Vec<_> = (0..count).map(|i| source(seen + i, 1)).collect();
+             worker.read_tap(0, Duration::ZERO).unwrap();
+-            reads += count;
++            reads += count as u64;
+             assert_eq!(worker.sessions[0].tap_read_limit, next);
+             assert_eq!(worker.counters.tap_read_requests, reads);
+             assert!(worker.sessions[0].tap_inputs.is_empty());
+-            for _ in 0..count {
++            for expected in sources {
+                 let Some(Event::Frame(source)) = incoming.try_pop() else {
+                     panic!("missing source");
+                 };
+                 assert_eq!(source.lane, 1);
+-                assert_eq!(&source.bytes[..source.length], sources[seen]);
++                assert_eq!(&source.bytes[..source.length], expected);
+                 seen += 1;
+                 worker.release(source);
+             }
+             assert!(incoming.try_pop().is_none());
+         }
+-        assert_eq!(seen, 11);
++        assert_eq!(seen, 23);
+         assert_eq!(worker.counters.tap_gso_frames, 0);
+         assert_eq!(worker.free.len(), BUFFERS);
+         assert_eq!(worker.counters.queue_drops, 0);
++
++        // A mixed batch hands off foreign sources but defers all local expansion.
++        let local = source(seen, 0);
++        let foreign: Vec<_> = (1..8).map(|i| source(seen + i, 1)).collect();
++        worker.read_tap(0, Duration::ZERO).unwrap();
++        assert_eq!(worker.sessions[0].tap_read_limit, 1);
++        assert_eq!(worker.sessions[0].tap_inputs.len(), 1);
++        assert_eq!(worker.tap_capacity(0), 0);
++        assert_eq!(worker.counters.tap_gso_frames, 0);
++        assert_eq!(worker.counters.tap_read_requests, reads + 8);
++        for expected in foreign {
++            let Some(Event::Frame(source)) = incoming.try_pop() else {
++                panic!("missing foreign source");
++            };
++            assert_eq!(&source.bytes[..source.length], expected);
++            worker.release(source);
++        }
++        assert!(incoming.try_pop().is_none());
++        let input = worker.sessions[0].tap_inputs[0];
++        assert_eq!(
++            &worker.frames.source(input).unwrap().bytes[..local.len()],
++            local
++        );
++        worker.read_tap(0, Duration::ZERO).unwrap();
++        assert_eq!(worker.counters.tap_read_requests, reads + 8);
++        assert!(worker.drain_tap_inputs(Duration::ZERO).unwrap());
++        assert_eq!(worker.counters.tap_gso_frames, BATCH_SIZE as u64);
++        assert_eq!(worker.tap_capacity(0), 0);
++        assert!(!worker.drain_tap_inputs(Duration::ZERO).unwrap());
++        assert_eq!(worker.counters.tap_gso_frames, 70);
++        assert!(worker.tap_capacity(0) != 0);
++        assert_eq!(worker.counters.queue_drops, 0);
+     }
+ 
+     #[test]
+--- a/README.md
++++ b/README.md
+@@ -641,7 +641,7 @@
+ without computing their headers or checksums.
+ Expansion yields after 64 frames or 64 KiB per worker turn; the last frame
+ may cross the byte target. Sessions take turns, and each session preserves
+-input order. Adaptive ring reads allow up to four GSO sources per batch after
++input order. Adaptive ring reads allow up to eight GSO sources per batch after
+ recognizing GSO input; a preceding ordinary batch may discover more. If a
+ source needs local expansion, the next read limit returns to one. Pending
+ local expansion stops further reads. Expansion normally rewrites only the header and borrows the

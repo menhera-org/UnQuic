@@ -1,0 +1,253 @@
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -952,6 +952,10 @@
+             };
+             let index = self.sender.cursor;
+             self.sender.cursor = (index + 1) % self.sender.lanes.len();
++            let reclaim = self
++                .sender
++                .reclaim
++                .is_some_and(|left| index == self.sender.lanes.len() - left);
+             let lane = &mut self.sender.lanes[index];
+             if lane.ack.is_none()
+                 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0)
+@@ -964,7 +968,7 @@
+                 lane.force_loss(now);
+             }
+             let quiescing = self.sessions[lane.session].connection.is_none();
+-            let retire = quiescing || self.sender.reclaim.is_some();
++            let retire = quiescing || reclaim;
+             let fenced = lane.loss_passes != 0;
+             let produced = lane.advance_report(&mut report, now, &mut budget)?
+                 || (retire && lane.retire_report(&mut report, &mut budget)?);
+@@ -978,10 +982,14 @@
+             }
+             more |= lane.work_pending(now) || (quiescing && !lane.idle());
+             if retire && !lane.report_pending {
+-                self.sender.reclaim = self
+-                    .sender
+-                    .reclaim
+-                    .and_then(|left| left.checked_sub(1).filter(|&n| n != 0));
++                if budget == 0 {
++                    more = true;
++                } else if reclaim {
++                    self.sender.reclaim = self
++                        .sender
++                        .reclaim
++                        .and_then(|left| left.checked_sub(1).filter(|&n| n != 0));
++                }
+             }
+             if produced {
+                 self.recovery.staged = Some(report);
+@@ -991,6 +999,7 @@
+                 self.sender.report = Some(report);
+             }
+         }
++        more |= self.sender.reclaim.is_some_and(|left| left != 0) && self.sender.report.is_some();
+         more |= budget == 0 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0);
+         more |= self.stage_recovery()?;
+         if self.sender.owner.is_some() {
+--- a/src/worker/sender/history.rs
++++ b/src/worker/sender/history.rs
+@@ -241,9 +241,12 @@
+             else {
+                 break;
+             };
++            let Some(sample) = entry.sample_slot else {
++                continue;
++            };
+             report.entries[report.count] = Entry {
+                 number: entry.number,
+-                sample: entry.sample_slot,
++                sample: Some(sample),
+                 settled: false,
+             };
+             report.count += 1;
+@@ -464,14 +467,11 @@
+                 .unwrap()
+         );
+         lane.report_completed(&report).unwrap();
+-        assert!(lane.retire_report(&mut report, &mut 2).unwrap());
+-        assert_eq!(report.count, 2);
+-        assert!(
+-            report.entries[..2]
+-                .iter()
+-                .all(|entry| entry.sample.is_none())
+-        );
+-        lane.report_completed(&report).unwrap();
++        let mut budget = 2;
++        assert!(!lane.retire_report(&mut report, &mut budget).unwrap());
++        assert_eq!(budget, 0);
++        assert_eq!(report.count, 0);
++        assert!(!lane.report_pending);
+         assert!(!lane.idle());
+         assert!(lane.retire_report(&mut report, &mut 2).unwrap());
+         assert_eq!(report.count, 1);
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -2503,3 +2503,151 @@
+     worker.service_sender(RETRY).unwrap();
+     assert!(worker.sender.job.is_some_and(|job| job.session == 0));
+ }
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn retirement_skips_unowned_holes_without_losing_its_lane_or_spinning_on_pins() {
++    let (mut workers, _rx) = workers();
++    let [peer, worker] = &mut workers;
++    let connection = worker.sessions[0].connection;
++    worker
++        .command(
++            1,
++            Command {
++                generation: 1,
++                phase: Phase::Install,
++                connection,
++            },
++            0,
++        )
++        .unwrap();
++    worker.install_sender(1, 1, true).unwrap();
++    let index = worker.sender_index(0, 1).unwrap();
++    let other = worker.sender_index(1, 1).unwrap();
++    for number in 1..=129 {
++        let history = &mut worker.sender.lanes[index].history;
++        history.reserve(number, 100, false, false).unwrap();
++        if number == 65 {
++            assert!(history.submit(number, Duration::ZERO));
++            let ranges = [AckRange {
++                start: number,
++                end: number,
++            }];
++            history
++                .acknowledge(AckRanges::new(&ranges).unwrap(), |_| {})
++                .unwrap();
++        } else {
++            assert!(history.cancel(number));
++        }
++    }
++    let lane = &mut worker.sender.lanes[index];
++    lane.history.reserve(130, 100, true, true).unwrap();
++    assert!(lane.submitted(130, Duration::ZERO, NonZeroU16::new(1)));
++    assert!(lane.history.lose(130).is_some());
++    lane.history.reserve(131, 100, false, false).unwrap();
++    worker.sender.lanes[other]
++        .history
++        .reserve(1, 100, false, false)
++        .unwrap();
++    worker.sender.reclaim = Some(worker.sender.lanes.len());
++    worker.sender.cursor = index;
++    for _ in 0..2 {
++        assert!(worker.service_sender(Duration::ZERO).unwrap());
++        assert_eq!(worker.sender.reclaim, Some(2));
++        assert!(peer.incoming[1].as_mut().unwrap().try_pop().is_none());
++    }
++    worker.service_sender(Duration::ZERO).unwrap();
++    let Some(Event::Sender(Message::Report(report))) = peer.incoming[1].as_mut().unwrap().try_pop()
++    else {
++        panic!("missing sampled retirement");
++    };
++    assert!(matches!(report.kind, ReportKind::Retire));
++    assert_eq!(report.id.session, 0);
++    assert_eq!(report.count, 1);
++    assert_eq!(report.entries[0].number, 130);
++    assert_eq!(report.entries[0].sample, NonZeroU16::new(1));
++    assert_eq!(worker.sender.reclaim, Some(2));
++    worker
++        .sender_message(Message::ReportReturn(report), Duration::ZERO)
++        .unwrap();
++    assert!(worker.service_sender(Duration::ZERO).unwrap());
++    assert_eq!(worker.sender.reclaim, Some(1));
++    worker.service_sender(Duration::ZERO).unwrap();
++    assert_eq!(worker.sender.reclaim, None);
++    assert!(worker.sender.lanes[index].history.is_reserved(131));
++    assert!(worker.sender.lanes[other].history.is_reserved(1));
++    assert!(peer.incoming[1].as_mut().unwrap().try_pop().is_none());
++
++    // Independent quiescence drains sample-free histories across bounded turns.
++    for (session, lane, first) in [(0, index, 131), (1, other, 1)] {
++        assert!(worker.sender.lanes[lane].history.cancel(first));
++        for number in first + 1..=first + 130 {
++            let history = &mut worker.sender.lanes[lane].history;
++            history.reserve(number, 100, false, false).unwrap();
++            assert!(history.cancel(number));
++        }
++        worker
++            .command(
++                session,
++                Command {
++                    generation: 2,
++                    phase: Phase::Quiesce,
++                    connection: None,
++                },
++                0,
++            )
++            .unwrap();
++    }
++    for _ in 0..16 {
++        let more = worker.service_sender(Duration::ZERO).unwrap();
++        if worker.sender_idle(0) && worker.sender_idle(1) {
++            break;
++        }
++        assert!(more, "quiescence must continue without a report wakeup");
++    }
++    assert!(worker.sender_idle(0));
++    assert!(worker.sender_idle(1));
++    assert!(peer.incoming[1].as_mut().unwrap().try_pop().is_none());
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn retirement_continues_beyond_lane_visit_budget_without_spinning_on_owned_reports() {
++    let (mut workers, _rx) = workers();
++    let worker = &mut workers[1];
++    // Empty histories isolate the scheduler's lane-visit budget from packet work.
++    worker.sender.lanes.clear();
++    for lane in 1..=65 {
++        worker.sender.lanes.push(Lane::new(0, lane, 0).unwrap());
++    }
++    worker.sender.cursor = 1;
++    worker
++        .sender_message(Message::Reclaim, Duration::ZERO)
++        .unwrap();
++    assert!(worker.service_sender(Duration::ZERO).unwrap());
++    assert_eq!(worker.sender.cursor, 0);
++    assert_eq!(worker.sender.reclaim, Some(65));
++
++    let report = worker.sender.report.take();
++    assert!(!worker.service_sender(Duration::ZERO).unwrap());
++    assert_eq!(worker.sender.cursor, 0);
++    assert_eq!(worker.sender.reclaim, Some(65));
++    worker.sender.report = report;
++
++    assert!(worker.service_sender(Duration::ZERO).unwrap());
++    assert_eq!(worker.sender.cursor, 32);
++    assert_eq!(worker.sender.reclaim, Some(33));
++    assert!(worker.service_sender(Duration::ZERO).unwrap());
++    assert_eq!(worker.sender.cursor, 64);
++    assert_eq!(worker.sender.reclaim, Some(1));
++    worker.service_sender(Duration::ZERO).unwrap();
++    assert_eq!(worker.sender.reclaim, None);
++    assert!(!worker.service_sender(Duration::ZERO).unwrap());
++
++    worker.sender.lanes.clear();
++    worker.sender.cursor = 0;
++    worker
++        .sender_message(Message::Reclaim, Duration::ZERO)
++        .unwrap();
++    assert!(!worker.service_sender(Duration::ZERO).unwrap());
++}
+--- a/README.md
++++ b/README.md
+@@ -564,7 +564,10 @@
+ reversed completions, partial sends, metadata pressure and allocation-free reuse.
+ TX owners now retain sent histories and route ACKs by the acknowledged lane,
+ independently of the lane carrying the ACK. Bounded ACK, loss and retirement
+-reports use storage separate from send completions. Startup memory accounting
++reports use storage separate from send completions. Retirement advances past
++already-settled entries locally; only retained sampler handles need an owner
++report. Budget exhaustion preserves the current reclaim lane while ordinary
++ACK/loss service continues to rotate. Startup memory accounting
+ includes these histories, the shared sampler and all reserved message buffers.
+ The coordinator drains ready completions and feedback within one shared
+ 64-unit work budget. Workers hand off newly queued requests and completions

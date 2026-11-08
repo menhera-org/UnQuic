@@ -278,6 +278,8 @@ const TAP_TOKEN: u64 = 1 << 32;
 const TX_TOKEN: u64 = 2 << 32;
 const RETRY: Duration = Duration::from_millis(1);
 const RECEIVE_BYTES: usize = 65_536;
+// Absorb a synchronized GSO burst before bounding fresh work; an oversized source needs an empty lane.
+const FRESH_BYTES: usize = 2 * 1024 * 1024;
 // A bounded GRO backlog must not consume the transmit pool (or vice versa).
 const RECEIVE_BUFFERS: usize = 8;
 const _: () = assert!(RECEIVE_BUFFERS <= BATCH_SIZE && RECEIVE_BUFFERS < BUFFERS);
@@ -352,6 +354,14 @@ pub(crate) struct Buffer {
 }
 
 impl Buffer {
+    fn fresh_bytes(&self) -> io::Result<usize> {
+        self.segments
+            .map_or(Some(self.length), |segments| {
+                segments.remaining_bytes(self.length)
+            })
+            .ok_or(io::ErrorKind::InvalidData.into())
+    }
+
     fn advance(&mut self) -> bool {
         self.offset = if self.segment_size == 0 {
             self.length
@@ -2297,6 +2307,28 @@ impl Worker {
             self.release(buffer);
             return Ok(());
         }
+        let fresh = buffer.fresh_bytes()?;
+        let index = if self.sender_enabled() {
+            let index = self.sender_index(session, buffer.lane)?;
+            let queued = self.sender.lanes[index].unsent_bytes;
+            if queued != 0 && fresh > FRESH_BYTES.saturating_sub(queued) {
+                let local = &mut self.sessions[session];
+                for totals in [
+                    &mut self.counters,
+                    &mut local.totals,
+                    &mut local.tx_totals[buffer.lane],
+                ] {
+                    totals.queue_drops = totals.queue_drops.wrapping_add(1);
+                    totals.tx_backlog_drops = totals.tx_backlog_drops.wrapping_add(1);
+                }
+                local.tx_dirty |= 1_u64 << buffer.lane;
+                self.release(buffer);
+                return Ok(());
+            }
+            Some(index)
+        } else {
+            None
+        };
         if foreign {
             let mut replacement = self
                 .free
@@ -2322,6 +2354,12 @@ impl Worker {
                 return Err(io::Error::other("transmit source capacity exhausted"));
             }
         };
+        if let Some(index) = index {
+            self.sender.lanes[index].unsent_bytes = self.sender.lanes[index]
+                .unsent_bytes
+                .checked_add(fresh)
+                .ok_or(io::ErrorKind::InvalidData)?;
+        }
         if plain
             && self.sessions[session].tap_inputs.is_empty()
             && self.materialize(source)?.is_some()
@@ -2373,6 +2411,27 @@ impl Worker {
         if let Some(buffer) = self.frames.unpin(source) {
             self.release(buffer);
         }
+    }
+
+    fn release_unsent(&mut self, session: usize, lane: usize, bytes: usize) -> io::Result<()> {
+        if self.sender_enabled() {
+            let index = self.sender_index(session, lane)?;
+            let balance = &mut self.sender.lanes[index].unsent_bytes;
+            *balance = balance
+                .checked_sub(bytes)
+                .ok_or(io::ErrorKind::InvalidData)?;
+        }
+        Ok(())
+    }
+
+    fn discard_input(&mut self, source: usize) -> io::Result<()> {
+        let input = self
+            .frames
+            .source(source)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        self.release_unsent(input.session, input.lane, input.fresh_bytes()?)?;
+        self.close_source(source);
+        Ok(())
     }
 
     fn close_slab(&mut self, session: usize) {
@@ -2427,11 +2486,11 @@ impl Worker {
         );
         let length = segments.map_or(input_length, |s| s.next_len(input_length));
         let Some(sender) = self.sessions[session].tx[lane].as_mut() else {
-            self.close_source(source);
+            self.discard_input(source)?;
             return Ok(Some(0));
         };
         let Ok(id) = sender.start_frame(length) else {
-            self.close_source(source);
+            self.discard_input(source)?;
             return Ok(Some(0));
         };
 
@@ -2532,7 +2591,7 @@ impl Worker {
                 if !self.matches(session, tag)
                     || self.expired_at(session, lane, deadline, remaining, now)
                 {
-                    self.close_source(source);
+                    self.discard_input(source)?;
                     frames += 1;
                     continue;
                 }
@@ -3053,6 +3112,7 @@ impl Worker {
         retain_suffix: bool,
     ) -> io::Result<()> {
         let mut bytes = 0;
+        let mut fresh = 0;
         let mut repairs = 0;
         for packet in 0..sent {
             bytes += (batch.plan.packet(packet).unwrap().length + 48) as u64;
@@ -3063,10 +3123,12 @@ impl Worker {
                 } else if let Some(frame) =
                     batch.frames[slot].and_then(|id| self.frames.frame_mut(id))
                 {
+                    fresh += range.len();
                     frame.offset = range.end;
                 }
             }
         }
+        self.release_unsent(session, lane, fresh)?;
         self.counters.tx_outer_bytes = self.counters.tx_outer_bytes.wrapping_add(bytes);
         self.counters.repairs = self.counters.repairs.wrapping_add(repairs);
         let local = &mut self.sessions[session];

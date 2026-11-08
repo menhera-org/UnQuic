@@ -642,7 +642,18 @@ suffixes drain before the normal class alternation.
 Sender deadlines use four smoothed RTTs, clamped to 20–100 ms, without extending
 the original read deadline. The transmit owner sets that deadline once before
 source admission; all expanded children inherit it. Overdue GSO sources discard
-remaining children in bulk before expansion or checksum work. Worker regressions
+remaining children in bulk before expansion or checksum work.
+Fresh logical work is now bounded separately at 2 MiB per TX lane, including
+unexpanded GSO headers and unsent materialized ranges. One oversized legal
+source requires an empty balance. Excess input is rejected before ownership
+exchange; successful original submissions and cleanup release exact bytes.
+This leaves physical quotas and deadlines unchanged. Tests cover synchronized
+QinQ bursts, oversized sources, foreign credits, partial expansion/submission,
+repair, cleanup and generation replacement. The matched single-lane release
+sweep preserves about 1.9 Gbit/s through overload, instead of falling below
+0.6 Gbit/s; eight-lane throughput remains about 1.6–1.8 Gbit/s. Neither original
+performance target is met. See BENCH.md for CPU, loss and pressure attribution.
+Worker regressions
 cover mapping pressure, bounded report processing, partial sends and late-ACK
 cancellation. A bidirectional release runtime test drops the original prefix and first repair, verifies
 second-repair delivery, then replays late originals without duplication or

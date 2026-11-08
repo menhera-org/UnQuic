@@ -158,6 +158,12 @@ impl Segments {
         (length - self.next).div_ceil(self.size)
     }
 
+    /// Logical Ethernet bytes still represented by this source, including repeated headers.
+    pub(crate) fn remaining_bytes(&self, length: usize) -> Option<usize> {
+        let payload = length.checked_sub(self.next)?;
+        payload.checked_add(self.header_len().checked_mul(payload.div_ceil(self.size))?)
+    }
+
     pub(crate) fn done(&self, length: usize) -> bool {
         self.next == length
     }
@@ -188,7 +194,13 @@ mod tests {
                         let payload = if v6 { 62 } else { 42 };
                         let mut segments = Segments::parse(&header, &input, 1514 + 20).unwrap();
                         let mut output = [0u8; crate::MAX_FRAME_LEN];
+                        let mut remaining = input[payload..]
+                            .chunks(size)
+                            .map(|data| payload + data.len())
+                            .sum::<usize>();
+                        assert_eq!(segments.remaining_bytes(payload - 1), None);
                         for (i, data) in input[payload..].chunks(size).enumerate() {
+                            assert_eq!(segments.remaining_bytes(input.len()), Some(remaining));
                             let expected = udp::frame(v6, 65534u16.wrapping_add(i as u16), data);
                             let mut borrowed = segments;
                             let mut prefix = [0xa5; 128];
@@ -203,12 +215,15 @@ mod tests {
                             assert_eq!(&input[range], &expected[payload..]);
                             let n = segments.write(&input, &mut output);
                             assert_eq!(&output[..n], expected);
+                            remaining -= n;
+                            assert_eq!(segments.remaining_bytes(input.len()), Some(remaining));
                             assert_eq!(
                                 crate::pack::flow_hash(&input),
                                 crate::pack::flow_hash(&output[..n])
                             );
                         }
                         assert!(segments.done(input.len()));
+                        assert_eq!(remaining, 0);
                     }
                 }
             }

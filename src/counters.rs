@@ -132,6 +132,9 @@ metrics! {
     recovery_selection_changed: sum,
     /// Entries rejected because a bounded queue was full.
     queue_drops: sum,
+    /// TAP sources rejected by fresh-unsent byte admission; a subset of queue_drops.
+    /// One GSO source can represent many Ethernet frames.
+    tx_backlog_drops: sum,
     /// ACK records dropped for lack of a reserved receive buffer; a subset of queue_drops, not additive.
     ack_buffer_drops: sum,
     /// Datagrams not fully admitted because receive frame storage was full.

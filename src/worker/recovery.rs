@@ -117,6 +117,18 @@ impl Worker {
         if !self.sender_enabled() {
             self.release_frame_storage(index);
         } else if self.recovery.place(index)? != Place::Cleanup {
+            let (session, lane) = self.frame_owner(index)?;
+            let frame = self.frames.frame(index).ok_or(io::ErrorKind::InvalidData)?;
+            let sent = self
+                .frames
+                .recovery(index)
+                .ok_or(io::ErrorKind::InvalidData)?
+                .sent();
+            let unsent = frame
+                .length()
+                .checked_sub(sent)
+                .ok_or(io::ErrorKind::InvalidData)?;
+            self.release_unsent(session, lane, unsent)?;
             self.recovery.set(index, Place::Cleanup)?;
             if self.recovery.cleanup.len() == self.recovery.cleanup.capacity() {
                 return Err(io::ErrorKind::InvalidData.into());

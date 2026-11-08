@@ -1,0 +1,319 @@
+diff --git a/src/counters.rs b/src/counters.rs
+index 71cc2bf..569b35b 100644
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -130,6 +130,34 @@ metrics! {
+     recovery_mapping_pressure: sum,
+     /// Granted DATA prefixes rejected after selected coverage changed; worker totals only.
+     recovery_selection_changed: sum,
++    /// Diagnostic final fresh-submission deadline margin, 0..=100 us; exclusive bucket, worker total only.
++    tx_final_margin_100us: sum,
++    /// Diagnostic final fresh-submission deadline margin, >100us..=250us; exclusive bucket, worker total only.
++    tx_final_margin_250us: sum,
++    /// Diagnostic final fresh-submission deadline margin, >250us..=1ms; exclusive bucket, worker total only.
++    tx_final_margin_1ms: sum,
++    /// Diagnostic final fresh-submission deadline margin, >1ms..=5ms; exclusive bucket, worker total only.
++    tx_final_margin_5ms: sum,
++    /// Diagnostic final fresh-submission deadline margin, >5ms..=10ms; exclusive bucket, worker total only.
++    tx_final_margin_10ms: sum,
++    /// Diagnostic final fresh-submission deadline margin, >10ms..=20ms; exclusive bucket, worker total only.
++    tx_final_margin_20ms: sum,
++    /// Diagnostic final fresh-submission deadline margin, >20 ms; exclusive bucket, worker total only.
++    tx_final_margin_over20ms: sum,
++    /// Diagnostic ack receive-to-staging age, 0..=100 us; exclusive bucket, worker total only.
++    ack_apply_age_100us: sum,
++    /// Diagnostic ack receive-to-staging age, >100us..=250us; exclusive bucket, worker total only.
++    ack_apply_age_250us: sum,
++    /// Diagnostic ack receive-to-staging age, >250us..=1ms; exclusive bucket, worker total only.
++    ack_apply_age_1ms: sum,
++    /// Diagnostic ack receive-to-staging age, >1ms..=5ms; exclusive bucket, worker total only.
++    ack_apply_age_5ms: sum,
++    /// Diagnostic ack receive-to-staging age, >5ms..=10ms; exclusive bucket, worker total only.
++    ack_apply_age_10ms: sum,
++    /// Diagnostic ack receive-to-staging age, >10ms..=20ms; exclusive bucket, worker total only.
++    ack_apply_age_20ms: sum,
++    /// Diagnostic ack receive-to-staging age, >20 ms; exclusive bucket, worker total only.
++    ack_apply_age_over20ms: sum,
+     /// Entries rejected because a bounded queue was full.
+     queue_drops: sum,
+     /// TAP sources rejected by fresh-unsent byte admission; a subset of queue_drops.
+@@ -203,6 +231,33 @@ metrics! {
+     tap_errors: sum,
+ }
+ 
++impl Snapshot {
++    pub(crate) fn record_tx_final_margin(&mut self, elapsed: std::time::Duration) {
++        let counter = match elapsed.as_nanos() {
++            0..=100000 => &mut self.tx_final_margin_100us,
++            100001..=250000 => &mut self.tx_final_margin_250us,
++            250001..=1000000 => &mut self.tx_final_margin_1ms,
++            1000001..=5000000 => &mut self.tx_final_margin_5ms,
++            5000001..=10000000 => &mut self.tx_final_margin_10ms,
++            10000001..=20000000 => &mut self.tx_final_margin_20ms,
++            _ => &mut self.tx_final_margin_over20ms,
++        };
++        *counter = counter.wrapping_add(1);
++    }
++    pub(crate) fn record_ack_apply_age(&mut self, elapsed: std::time::Duration) {
++        let counter = match elapsed.as_nanos() {
++            0..=100000 => &mut self.ack_apply_age_100us,
++            100001..=250000 => &mut self.ack_apply_age_250us,
++            250001..=1000000 => &mut self.ack_apply_age_1ms,
++            1000001..=5000000 => &mut self.ack_apply_age_5ms,
++            5000001..=10000000 => &mut self.ack_apply_age_10ms,
++            10000001..=20000000 => &mut self.ack_apply_age_20ms,
++            _ => &mut self.ack_apply_age_over20ms,
++        };
++        *counter = counter.wrapping_add(1);
++    }
++}
++
+ fn sum(a: u64, b: u64) -> u64 {
+     a.wrapping_add(b)
+ }
+@@ -291,6 +346,46 @@ mod tests {
+     use super::*;
+     use std::sync::Arc;
+ 
++    #[test]
++    fn timing_histograms_use_exclusive_nanosecond_boundaries() {
++        let mut values = Snapshot::default();
++        for ns in [
++            0, 100_000, 100_001, 250_000, 250_001, 1_000_000, 1_000_001, 5_000_000, 5_000_001,
++            10_000_000, 10_000_001, 20_000_000, 20_000_001,
++        ] {
++            let time = std::time::Duration::from_nanos(ns);
++            values.record_tx_final_margin(time);
++            values.record_ack_apply_age(time);
++        }
++        let published = Counters::new();
++        published.publish(&values);
++        let actual = published.snapshot();
++        assert_eq!(
++            [
++                actual.tx_final_margin_100us,
++                actual.tx_final_margin_250us,
++                actual.tx_final_margin_1ms,
++                actual.tx_final_margin_5ms,
++                actual.tx_final_margin_10ms,
++                actual.tx_final_margin_20ms,
++                actual.tx_final_margin_over20ms
++            ],
++            [2, 2, 2, 2, 2, 2, 1]
++        );
++        assert_eq!(
++            [
++                actual.ack_apply_age_100us,
++                actual.ack_apply_age_250us,
++                actual.ack_apply_age_1ms,
++                actual.ack_apply_age_5ms,
++                actual.ack_apply_age_10ms,
++                actual.ack_apply_age_20ms,
++                actual.ack_apply_age_over20ms
++            ],
++            [2, 2, 2, 2, 2, 2, 1]
++        );
++    }
++
+     #[test]
+     fn aggregation_preserves_units_and_mtu_precedence() {
+         let mut total = Snapshot {
+diff --git a/src/worker/recovery.rs b/src/worker/recovery.rs
+index a133530..bde1998 100644
+--- a/src/worker/recovery.rs
++++ b/src/worker/recovery.rs
+@@ -305,10 +305,15 @@ impl Worker {
+     }
+ 
+     // A packet is handled atomically: no cursor can be invalidated by frame expiry.
+-    pub(super) fn stage_recovery(&mut self) -> io::Result<bool> {
++    pub(super) fn stage_recovery(&mut self, now: Duration) -> io::Result<bool> {
+         let Some(report) = self.recovery.staged.take() else {
+             return Ok(false);
+         };
++        if let sender::ReportKind::Ack { received, .. } = report.kind {
++            let applied = self.io_clock(now)()?;
++            self.counters
++                .record_ack_apply_age(applied.saturating_sub(received));
++        }
+         let mut pieces = 128;
+         let mut bytes = 64 * 1024;
+         while self.recovery.cursor < report.count && pieces >= 64 && bytes >= 9000 {
+@@ -540,6 +545,7 @@ impl Worker {
+         &mut self,
+         flight: &pacing::Flight,
+         sent: usize,
++        at: Option<Duration>,
+     ) -> io::Result<()> {
+         for ordinal in 0..flight.packets().len() {
+             let Some(sample) = flight.handle(ordinal) else {
+@@ -548,13 +554,12 @@ impl Worker {
+             let packet = usize::from(sample.get()) - 1;
+             if ordinal < sent {
+                 for piece in self.recovery.journal.packet(packet) {
+-                    if self
++                    let frame = self
+                         .frames
+                         .frame(usize::from(piece.frame_slot))
+-                        .is_none_or(|f| f.id != piece.frame_id)
+-                    {
+-                        return Err(io::Error::other("stale submitted frame mapping"));
+-                    }
++                        .filter(|frame| frame.id == piece.frame_id)
++                        .ok_or_else(|| io::Error::other("stale submitted frame mapping"))?;
++                    let (length, deadline) = (frame.length(), frame.deadline);
+                     let state = self
+                         .frames
+                         .recovery_mut(usize::from(piece.frame_slot))
+@@ -565,6 +570,11 @@ impl Worker {
+                     ) {
+                         return Err(io::Error::other("invalid submitted DATA coverage"));
+                     }
++                    if piece.attempt == 0 && state.sent() == length {
++                        self.counters.record_tx_final_margin(
++                            deadline.saturating_sub(at.ok_or(io::ErrorKind::InvalidData)?),
++                        );
++                    }
+                 }
+             } else {
+                 while self.recovery.journal.pop_packet(packet).is_some() {}
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index 21265e5..4651cf6 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -95,6 +95,10 @@ fn service(workers: &mut [Worker; 2]) {
+ fn fresh_grant_clock_survives_older_worker_turn_through_handoff() {
+     let (mut workers, rx) = workers();
+     frame(&mut workers[1]);
++    let frame = workers[1].sessions[0].batches[1].as_ref().unwrap().frames[0].unwrap();
++    workers[1]
++        .frames
++        .set_deadline(frame, Duration::from_micros(1050));
+     let number = workers[1].sender.job.unwrap().first;
+     for _ in 0..8 {
+         service(&mut workers);
+@@ -115,6 +119,8 @@ fn fresh_grant_clock_survives_older_worker_turn_through_handoff() {
+         .packet(number)
+         .unwrap();
+     assert_eq!(packet.sent_at, Duration::from_millis(1));
++    assert_eq!(workers[1].counters.tx_final_margin_100us, 1);
++    assert_eq!(workers[1].counters.tx_final_margin_5ms, 0);
+     assert!(packet.sample_slot.is_some());
+     assert!(workers[1].sender.job.is_none());
+     assert!(workers[1].sessions[0].tx_retained != 0);
+@@ -684,7 +690,7 @@ fn loss_check_waits_for_final_report_return_and_survives_replacement_and_queue_p
+         )
+         .unwrap();
+     assert!(worker.advance_loss_checks(Duration::ZERO, &mut 64).unwrap());
+-    assert!(!worker.stage_recovery().unwrap());
++    assert!(!worker.stage_recovery(Duration::ZERO).unwrap());
+     let (_, Message::Report(report)) = worker.sender.outgoing.pop_front().unwrap() else {
+         panic!()
+     };
+@@ -704,7 +710,7 @@ fn loss_check_waits_for_final_report_return_and_survives_replacement_and_queue_p
+         .unwrap();
+     for _ in 0..4 {
+         worker.advance_loss_checks(Duration::ZERO, &mut 64).unwrap();
+-        worker.stage_recovery().unwrap();
++        worker.stage_recovery(Duration::ZERO).unwrap();
+         if let Some((_, Message::Report(report))) = worker.sender.outgoing.pop_front() {
+             worker
+                 .sender_message(Message::ReportReturn(report), Duration::ZERO)
+@@ -1388,6 +1394,7 @@ fn canceled_probe_defers_refill_until_reserved_suffix_drains() {
+ fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
+     let (mut workers, _rx) = workers();
+     let worker = &mut workers[1];
++    worker.io_time = Some(Ok);
+     for _ in 0..64 {
+         queue_frame(worker, 60);
+     }
+@@ -1442,7 +1449,8 @@ fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
+         };
+     }
+     worker.recovery.staged = Some(report);
+-    assert!(worker.stage_recovery().unwrap());
++    assert!(worker.stage_recovery(Duration::from_millis(3)).unwrap());
++    assert_eq!(worker.counters.ack_apply_age_1ms, 1);
+     assert_eq!(worker.recovery.cursor, 2);
+     assert_eq!(worker.counters.recovery_staging_yields, 1);
+     assert_eq!(worker.counters.recovery_staged_reports, 0);
+@@ -1469,10 +1477,11 @@ fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
+     assert_eq!(worker.sessions[0].tx_retained, 0);
+     assert!(worker.recovery.journal.packet_empty(2));
+     assert!(worker.recovery.journal.packet_empty(3));
+-    assert!(!worker.stage_recovery().unwrap());
++    assert!(!worker.stage_recovery(Duration::from_millis(24)).unwrap());
++    assert_eq!(worker.counters.ack_apply_age_over20ms, 1);
+     assert_eq!(worker.counters.recovery_staged_reports, 1);
+     assert_eq!(worker.counters.recovery_staging_yields, 1);
+-    assert!(!worker.stage_recovery().unwrap());
++    assert!(!worker.stage_recovery(Duration::ZERO).unwrap());
+     assert_eq!(worker.counters.recovery_staged_reports, 1);
+     assert!(
+         worker
+@@ -1538,6 +1547,8 @@ fn lost_original_repairs_only_missing_bytes_and_late_ack_cancels_prepared_repair
+     let slot = usize::from(piece.frame_slot);
+     assert_eq!(workers[1].frames.frame(slot).unwrap().id, frame_id);
+     assert_eq!(workers[1].frames.frame(slot).unwrap().offset, 1514);
++    assert_eq!(workers[1].counters.tx_final_margin_over20ms, 1);
++    assert_eq!(final_margin_samples(&workers[1].counters), 1);
+     assert!(workers[1].sessions[0].tx_retained != 0);
+     let ranges = [AckRange {
+         start: tail,
+@@ -1606,7 +1617,7 @@ fn lost_original_repairs_only_missing_bytes_and_late_ack_cancels_prepared_repair
+             .unwrap()
+     );
+     workers[1].recovery.staged = Some(report);
+-    workers[1].stage_recovery().unwrap();
++    workers[1].stage_recovery(Duration::ZERO).unwrap();
+     assert!(
+         workers[1].sessions[0].batches[1]
+             .as_ref()
+@@ -1697,6 +1708,7 @@ fn mapping_pressure_preserves_fresh_fifo_and_leaves_reserved_space_for_repair()
+     assert!(packet.records().any(|record| matches!(record,
+         Record::Data { frame_id, offset: 0, bytes, .. } if frame_id == id && bytes.len() == 100)));
+     assert_eq!(workers[1].counters.repairs, 1);
++    assert_eq!(final_margin_samples(&workers[1].counters), 0);
+     assert_eq!(
+         workers[1].frames.recovery(old).unwrap().next_repair(9022),
+         None
+@@ -2779,3 +2791,17 @@ fn fresh_admission_preserves_sixteen_flow_qinq_gso_burst_before_bounding_excess(
+     assert_eq!(worker.counters.tx_backlog_drops, 1);
+     assert_eq!(worker.counters.queue_drops, 1);
+ }
++
++fn final_margin_samples(counters: &crate::counters::Snapshot) -> u64 {
++    [
++        counters.tx_final_margin_100us,
++        counters.tx_final_margin_250us,
++        counters.tx_final_margin_1ms,
++        counters.tx_final_margin_5ms,
++        counters.tx_final_margin_10ms,
++        counters.tx_final_margin_20ms,
++        counters.tx_final_margin_over20ms,
++    ]
++    .iter()
++    .sum()
++}
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 7457ab9..89e4578 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -994,7 +994,7 @@ impl Worker {
+             }
+         }
+         more |= budget == 0 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0);
+-        more |= self.stage_recovery()?;
++        more |= self.stage_recovery(now)?;
+         if self.sender.owner.is_some() {
+             // Apply local feedback before the shared owner considers fresh grants.
+             more |= self.flush_sender_messages(now)?;
+@@ -1339,7 +1339,7 @@ impl Worker {
+             .flight
+             .take()
+             .ok_or(io::ErrorKind::InvalidData)?;
+-        self.settle_sent_pieces(&flight, count)?;
++        self.settle_sent_pieces(&flight, count, at)?;
+         let retain_suffix =
+             matches!(job.kind, JobKind::Data) && count != 0 && count == flight.packets().len();
+ 

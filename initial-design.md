@@ -323,6 +323,15 @@ If a scan was already active, finish its fixed endpoint and run a fresh pass
 using the newer ACK evidence. Keep waiting ACKs in bounded input storage; a
 continuous stream must not postpone loss detection indefinitely.
 
+Bound fresh logical work separately from retained payload: at most 2 MiB per
+TX lane, counting repeated headers in unexpanded GSO input and unsent original
+ranges in materialized frames. Permit one larger legal source only when the
+lane's balance is zero. Reject excess sources before ownership exchange, so
+admitted tails retain service. Successful original submission and unsent
+cleanup release this budget exactly once; repair and ACK retirement do not.
+Keep physical quotas and original deadlines unchanged. Count these rejected
+sources in `tx_backlog_drops`, a subset of `queue_drops`.
+
 At transmit-owner source admission, set the sender deadline to the original TAP read time plus `clamp(4 * smoothed_rtt, 20 ms, 100 ms)`, capped by the original read deadline. All frames expanded from that source inherit this fixed deadline. Reject overdue sources before expansion; waiting for ownership or queue capacity never extends retention. The receiver deadline is 100 ms after the first retained piece and is not extended by repairs or duplicates. The two-repair limit and the deadline both apply. Deliver completed frames immediately in v1; do not add a per-flow reorder queue before measurements justify one. Pin each inner flow to a lane, with a fallback key of MAC addresses, VLAN stack, and EtherType for non-IP or unparseable traffic. Fragmented IP traffic uses a consistent address/protocol key without transport ports for all fragments. Strict flow pinning is the baseline. It may be relaxed where measurements show
 that cross-worker handoffs harm performance; retain it otherwise. Current
 measurements justify reader-local lanes for unfragmented UDP with at most one

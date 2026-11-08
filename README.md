@@ -418,6 +418,16 @@ No shared reservation lock or atomic is needed. Static per-worker quotas
 still limit a skewed flow below the full session allowance. This remains a
 performance limitation for the Stage 5 skewed-flow and lossy-path tests.
 
+With the shared sender enabled, each transmit lane admits at most 2 MiB of
+fresh logical bytes: unexpanded GSO children with their repeated headers, plus
+materialized original ranges not yet submitted. One larger legal source may
+enter only when that balance is zero. Excess sources are rejected before
+ownership exchange; admitted tails keep their original deadlines. Successful
+original submissions release their exact byte ranges, while source/frame
+cleanup releases the unsent remainder. Repairs and ACK retirement do not
+change this balance. This bounds queued work separately from retained payload
+without enlarging physical buffers or memory limits.
+
 Transmit DATA gathers rewritten headers and payload ranges from retained sources.
 When a grant sends its entire permitted prefix, the never-attempted suffix keeps
 its packet numbers, wire metadata and reservations in the same bounded batch.
@@ -774,6 +784,11 @@ cumulative 32-bit count on subsequent receives. Modular forward deltas below
 between observations is ambiguous and is not counted. A final drop burst
 without a later receive may not yet appear. Use namespace UDP receive-buffer
 error counters alongside it.
+
+`tx_backlog_drops` counts TAP sources rejected by the per-lane fresh-byte
+budget. It is a subset of `queue_drops`, published at worker, session and TX
+lane scope. A GSO source can represent many frames; this is not an additional
+frame-loss count.
 
 Each receive socket requests 8 MiB with `SO_RCVBUFFORCE`. On `EPERM` it falls
 back to `SO_RCVBUF`, subject to the kernel's configured limit. Worker counters

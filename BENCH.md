@@ -35,6 +35,10 @@ sixty-second unlimited point delivers 1.78 / 1.68 Gbit/s. The subsequent
 fresh/repair fairness fix reaches 2.07 / 1.70 unlimited. Preventing ordinary
 loss starvation under continuous ACK input then measures 1.82 / 1.64 unlimited;
 admission pressure and overload declines remain.
+The newer fresh-work bound fixes a separate severe single-lane collapse:
+sixty-second unlimited delivery reaches 1.87 / 1.87 Gbit/s, versus
+0.37–0.51 in matched controls, with zero admission pressure. Eight-lane
+throughput remains around 1.6–1.8 Gbit/s and below the original targets.
 PMTU discovery is active in the latest rate sweeps and
 passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
 Missing recovery or congestion control does not explain away the remaining
@@ -45,7 +49,9 @@ scheduling and admission problems.
 The sender integration passes forwarding/restart and allocation checks,
 plus control-pressure, stale-feedback and bounded transmit-expiry regressions.
 The recovery build adds successful two-repair delivery checks, but its latest
-rate sweeps reveal a new regression and nonzero reassembly admission pressure.
+rate sweeps still show low throughput and eight-lane reassembly admission
+pressure. The fresh-work bound removes measured single-lane pressure and
+preserves most paced goodput under unlimited load.
 The initial sender-integration sweep already showed low CPU use and poor
 throughput with zero admission pressure or outer socket overflow. Recovery then
 introduced admission pressure; that observation does not explain the earlier
@@ -67,7 +73,7 @@ earlier tables retain their original builds and test conditions.
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
 | At least 20 Gbit/s each way at inner MTU 1500 | After the ACK/loss fairness fix, sixty-second QinQ sweep: 1.82 / 1.58 Gbit/s paced, 1.82 / 1.64 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe integration regression; paced missing fractions are 91.26 / 92.28%. The recovery ascending sweep stays under 1% missing in both directions only at 0.5G offered. Five successful 20G repeats remain unmet. |
-| Goodput must plateau under excess traffic | Latest matched twenty-second baseline: eight-lane unlimited 1.63–1.74 / 1.56–1.59 Gbit/s; single-lane unlimited 0.47–0.54 / 0.42–0.44. Experimental coalesced abandonment raises the latter to 0.76 / 0.74 but still falls about 60% from peak | No stable plateau or CPU ceiling is established. Source-expiry work, incomplete reassembly and grant/feedback scheduling require separate attribution. |
+| Goodput must plateau under excess traffic | Bounded fresh work raises matched twenty-second single-lane unlimited delivery to 1.89 / 1.85 Gbit/s from 0.45–0.51, only 0.3 / 2.3% below its 4G point. Eight-lane delivery remains 1.77 / 1.55 with admission pressure | No universal plateau or CPU ceiling is established. The single-lane scheduling failure is reduced; the eight-lane ceiling and original targets remain open. |
 | Small-frame overload must remain efficient | Earlier pre-recovery tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
@@ -82,6 +88,130 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## Bounding fresh work preserves single-lane overload delivery (November 8)
+
+The selected change bounds fresh logical bytes at 2 MiB per TX lane. It
+counts unexpanded GSO children with their repeated headers, then transfers
+that charge to materialized original ranges. Successful original submissions
+and unsent cleanup release exact bytes; repairs and ACK retirement do not
+change the balance. Excess sources are rejected before ownership exchange.
+One larger legal source requires an empty balance. Physical storage, deadlines,
+receive admission and shared congestion accounting are unchanged.
+
+The earlier 128 KiB candidate rejected most of a legitimate synchronized
+sixteen-flow burst. Its 44-child QinQ sources represent 1,071,488 logical bytes
+per burst. The new bound admits that burst and rejects excess without enlarging
+any payload buffer. Seven kernel regressions cover this shape, ordinary and
+oversized sources, partial expansion, successful submission, repairs, foreign
+credits, cleanup and generation replacement.
+
+The twenty-second single-lane sequence uses ordinary release-musl builds,
+eight workers/TAP queues, 1522-byte double-tagged frames, sixteen simultaneous
+flows each way and the unchanged 1452-byte outer UDP cap with active discovery.
+[Raw observations](benches/tap-fresh-admission.json) include offered load,
+generator/receiver CPU, daemon/thread CPU, expiry classes and kernel counters.
+
+| Build | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| single lane before | 1 Gbit/s | 0.990 / 0.991 | 0.09 / 0.05 | 69.91 / 69.96 |
+| single lane before | 4 Gbit/s | 1.896 / 1.890 | 51.98 / 52.12 | 150.12 / 146.50 |
+| single lane before | Unlimited | 0.515 / 0.454 | 98.52 / 98.63 | 198.07 / 202.43 |
+| single lane candidate | 1 Gbit/s | 0.990 / 0.989 | 0.18 / 0.21 | 69.23 / 68.88 |
+| single lane candidate | 4 Gbit/s | 1.893 / 1.894 | 52.25 / 52.21 | 148.19 / 146.75 |
+| single lane candidate | Unlimited | 1.887 / 1.851 | 94.59 / 94.30 | 246.50 / 238.32 |
+| single lane after | 1 Gbit/s | 0.960 / 0.962 | 1.58 / 1.50 | 68.77 / 68.67 |
+| single lane after | 4 Gbit/s | 1.975 / 1.965 | 50.17 / 50.41 | 148.46 / 147.18 |
+| single lane after | Unlimited | 0.488 / 0.446 | 98.57 / 98.67 | 195.29 / 202.23 |
+
+The selected build falls only 0.3 / 2.3% from its 4 Gbit/s point to unlimited,
+versus roughly 73–77% in the controls. It has zero receive admission pressure
+at every rate. Unlimited `tx_backlog_drops` are 555,188 / 530,945, within
+1,284,966 / 1,191,303 total queue drops; these count sources, not frames.
+Expiry falls to 5,620 / 17,504: 3,820 / 15,565 unsent, 33 / 111 partially
+submitted, 1,656 / 1,795 fully submitted, and 111 / 33 incomplete received
+frames. A fully submitted expiry is not proof of lost inner traffic.
+Excess offered load is still dropped; preserving goodput does not make the
+94% unlimited missing fraction acceptable at the requested capacity.
+
+A separate [instrumented build](benches/fresh-admission-timing.patch) confirms
+the expected deadline effect. Under unlimited load, 91.34 / 91.34% of final
+original submissions retain more than 10 ms before expiry; only 0.042 / 0.063%
+have at most 250 µs. The earlier timing baseline had 58.87 / 50.63% in that
+last category. Instrumented goodput is 1.920 / 1.885 Gbit/s with zero admission
+pressure. These are separate diagnostic sequences, not matched per-frame
+latency records; ACK staging samples still exclude kernel receive backlog.
+
+All ordinary twenty-second admission observations have zero invalid,
+duplicate, wrong-run or too-old inner datagrams, outer overflow/UDP errors,
+inner UDP errors and outer fragments. Candidate reordering is zero;
+control reordering reaches 0.00393%. The source passes 349 ordinary release
+tests, strict all-target Clippy and formatting, plus 81 kernel tests and all
+three unchanged runtime tests on Linux 6.8 and 7.0, including allocation
+assertions. The timing variant passes 350 ordinary tests and 81 Linux 6.8
+kernel tests. No production timing instrumentation is added.
+
+### Sixty-second confirmation
+
+A second single-lane **baseline, candidate, baseline** sequence repeats the
+4 Gbit/s and unlimited points for sixty seconds each:
+
+| Build | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| before | 4 Gbit/s | 1.943 / 1.922 | 51.17 / 51.72 | 149.13 / 148.10 |
+| before | Unlimited | 0.499 / 0.483 | 98.54 / 98.53 | 199.87 / 201.41 |
+| candidate | 4 Gbit/s | 1.924 / 1.902 | 51.71 / 52.27 | 149.92 / 148.69 |
+| candidate | Unlimited | 1.868 / 1.872 | 94.60 / 94.22 | 244.38 / 238.43 |
+| after | 4 Gbit/s | 1.909 / 1.909 | 52.09 / 52.08 | 148.75 / 149.04 |
+| after | Unlimited | 0.510 / 0.370 | 98.51 / 98.91 | 195.01 / 205.60 |
+
+The candidate declines 2.9 / 1.6% from its paced point; controls decline about
+73–81%. Its unlimited admission pressure is zero, versus 572,114 / 617,086
+and 579,262 / 610,416 in the controls. All six points have zero corruption,
+duplicate delivery, socket overflow, inner UDP errors and outer fragmentation;
+candidate reordering is zero. These sustained observations support landing
+the admission fix. They still do not prove a universal plateau.
+
+### Eight-lane ceiling and two smaller candidates
+
+The eight-lane sequence is **baseline, fresh admission, read8, retirement,
+baseline**. The candidates share those controls; these are not three adjacent
+A/B/A runs. All four offered rates are in the JSON. Unlimited results:
+
+| Build | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R | Recovery reports L / R |
+| --- | --- | --- | --- | --- |
+| eight lane before | 1.720 / 1.600 | 97.01 / 97.00 | 219.14 / 207.54 | 215,786 / 220,452 |
+| eight lane fresh admission | 1.773 / 1.549 | 96.91 / 97.19 | 216.66 / 207.64 | 218,572 / 219,750 |
+| eight lane read8 | 1.767 / 1.635 | 97.14 / 97.04 | 220.67 / 208.63 | 219,845 / 221,617 |
+| eight lane retirement | 1.747 / 1.606 | 96.98 / 96.75 | 204.36 / 199.21 | 126,275 / 128,507 |
+| eight lane after | 1.782 / 1.560 | 96.77 / 96.87 | 208.08 / 204.07 | 213,887 / 217,192 |
+
+Fresh admission barely binds with eight lanes: only 7 / 14 source rejections
+at unlimited load. Admission pressure remains 16,204 / 2,904; it does not fix
+this separate ceiling. The measured rates overlap the controls closely,
+including a reverse result below both controls.
+
+The [read8 experiment](benches/gso-read8.patch) increases recognized-GSO read
+batches from four sources to eight, retaining local-input and expansion
+budgets. Its gains are modest and need repetition. The
+[sample-free retirement experiment](benches/sample-free-retirement.patch)
+omits owner reports with no sampler handles while preserving per-number
+retirement budgets, pinned histories, quiescence and continuation across
+more than 64 lanes. It reduces report traffic and CPU, with no substantial
+goodput gain. Neither experiment is enabled in production.
+
+Both isolated sources pass 349 ordinary release tests and strict Clippy;
+read8 passes 74 kernel tests, retirement 76, and each passes all three
+unchanged runtime tests on Linux 6.8 and 7.0. The retirement 1 Gbit/s point
+lacks a complete right pre-load worker snapshot, so its right daemon counter
+deltas are recorded as unavailable. Its goodput, CPU and namespace counters
+remain usable. The harness now waits, with a finite timeout, for a complete
+worker printout before copying counters.
+
+These results isolate excessive fresh work as one single-lane collapse
+mechanism. They do not establish the theoretical CPU ceiling, a universal
+plateau, or either original throughput target. Eight-lane scheduling,
+local-input gates and retained recovery work remain under investigation.
 
 ## Fresh-backlog admission helps overload but rejects legitimate bursts (November 8)
 
