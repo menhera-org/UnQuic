@@ -1,0 +1,93 @@
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -92,6 +92,22 @@
+ }
+ 
+ metrics! {
++    /// Temporary outer packet order experiment; successful fresh admission only.
++    diag_rx_data_fresh: sum,
++    /// Temporary outer packet order experiment; successful fresh admission only.
++    diag_rx_control_fresh: sum,
++    /// Temporary outer packet order experiment; successful fresh admission only.
++    diag_rx_data_reordered: sum,
++    /// Temporary outer packet order experiment; successful fresh admission only.
++    diag_rx_data_reorder_lag: sum,
++    /// Temporary outer packet order experiment; successful fresh admission only.
++    diag_rx_data_reorder_lag_max: max,
++    /// Temporary outer packet order experiment; successful fresh admission only.
++    diag_rx_control_reordered: sum,
++    /// Temporary outer packet order experiment; successful fresh admission only.
++    diag_rx_control_reorder_lag: sum,
++    /// Temporary outer packet order experiment; successful fresh admission only.
++    diag_rx_control_reorder_lag_max: max,
+     /// Temporary ACK/loss experiment; worker totals only.
+     diag_late_ack_stamp_match: sum,
+     /// Temporary ACK/loss experiment; worker totals only.
+--- a/src/reassembly.rs
++++ b/src/reassembly.rs
+@@ -278,6 +278,10 @@
+         size_of::<Self>() + FRAME_CAPACITY * (size_of::<Frame>() + 2 * size_of::<u8>())
+     }
+ 
++    pub(crate) const fn highest_accepted(&self) -> u64 {
++        self.ack.highest
++    }
++
+     /// Registered remote lane ID.
+     pub const fn id(&self) -> u16 {
+         self.id
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -1935,6 +1935,7 @@
+             .rx_outer_bytes
+             .wrapping_add((length + 48) as u64);
+         local.rx_dirty |= 1_u64 << slot;
++        let prior_highest = local.rx[slot].as_ref().unwrap().highest_accepted();
+         let mut admission = local.rx[slot].as_mut().unwrap().admit(&datagram, now);
+         if admission == Admission::Pressure {
+             let retained = local.rx[slot].as_ref().unwrap().retained_frames();
+@@ -1953,8 +1954,10 @@
+         }
+         match admission {
+             Admission::Fresh => {
++                let mut has_data = false;
+                 for record in datagram.records() {
+                     match record {
++                        Record::Data { .. } => has_data = true,
+                         Record::Probe => {
+                             let event = Event::Reply {
+                                 session,
+@@ -2029,6 +2032,33 @@
+                         _ => {}
+                     }
+                 }
++                let lag = prior_highest.saturating_sub(header.packet_number);
++                let local = &mut self.sessions[session];
++                for totals in [
++                    &mut self.counters,
++                    &mut local.totals,
++                    &mut local.rx_totals[slot],
++                ] {
++                    if has_data {
++                        totals.diag_rx_data_fresh = totals.diag_rx_data_fresh.wrapping_add(1);
++                        totals.diag_rx_data_reordered = totals
++                            .diag_rx_data_reordered
++                            .wrapping_add(u64::from(lag != 0));
++                        totals.diag_rx_data_reorder_lag =
++                            totals.diag_rx_data_reorder_lag.wrapping_add(lag);
++                        totals.diag_rx_data_reorder_lag_max =
++                            totals.diag_rx_data_reorder_lag_max.max(lag);
++                    } else {
++                        totals.diag_rx_control_fresh = totals.diag_rx_control_fresh.wrapping_add(1);
++                        totals.diag_rx_control_reordered = totals
++                            .diag_rx_control_reordered
++                            .wrapping_add(u64::from(lag != 0));
++                        totals.diag_rx_control_reorder_lag =
++                            totals.diag_rx_control_reorder_lag.wrapping_add(lag);
++                        totals.diag_rx_control_reorder_lag_max =
++                            totals.diag_rx_control_reorder_lag_max.max(lag);
++                    }
++                }
+             }
+             Admission::Duplicate => {
+                 self.counters.duplicate_packets = self.counters.duplicate_packets.wrapping_add(1);

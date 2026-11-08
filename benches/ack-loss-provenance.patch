@@ -1,0 +1,351 @@
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -92,6 +92,64 @@
+ }
+ 
+ metrics! {
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_late_ack_stamp_match: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_late_ack_stamp_miss: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_late_ack_before_loss: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_late_ack_before_loss_ns: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_late_ack_before_loss_max_ns: max,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_late_ack_after_loss: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_late_ack_after_loss_ns: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_late_ack_after_loss_max_ns: max,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_loss_packet: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_loss_time: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_loss_forced: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_loss_age_ns: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_loss_age_max_ns: max,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_loss_lag: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_loss_lag_max: max,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_loss_below_ack_floor: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_loss_full_ack: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_late_acks: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_late_ack_age_ns: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_late_ack_age_max_ns: max,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_ack_received: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_ack_received_ranges: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_ack_started: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_ack_wait_ns: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_ack_wait_max_ns: max,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_ack_completed: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_ack_apply_ns: sum,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_ack_apply_max_ns: max,
++    /// Temporary ACK/loss experiment; worker totals only.
++    diag_ack_invalid: sum,
+     /// Ethernet bytes successfully written as complete frames to TAP.
+     delivered_frame_bytes: sum,
+     /// Successfully submitted outer IPv6 bytes, including IPv6 and UDP headers.
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -149,6 +149,11 @@
+     // Complete an older scan, if any, then one pass using the admitted ACK.
+     pub(super) loss_passes: u8,
+     pub(super) probes: [Option<(u64, u16)>; 2],
++    diag: Snapshot,
++    diag_ack_started: Duration,
++    diag_ack_floor: u64,
++    diag_ack_full: bool,
++    diag_lost_at: [(u64, Duration); 256],
+ }
+ 
+ impl Lane {
+@@ -172,6 +177,11 @@
+             report_pending: false,
+             loss_passes: 0,
+             probes: [None; 2],
++            diag: Snapshot::default(),
++            diag_ack_started: Duration::ZERO,
++            diag_ack_floor: 0,
++            diag_ack_full: false,
++            diag_lost_at: [(0, Duration::ZERO); 256],
+         })
+     }
+ }
+@@ -229,6 +239,7 @@
+     outgoing_left: usize,
+     outgoing_blocked: u64,
+     liveness_cursor: usize,
++    diag_now: Duration,
+ }
+ 
+ impl State {
+@@ -327,6 +338,7 @@
+             outgoing_left: 0,
+             outgoing_blocked: 0,
+             liveness_cursor: 0,
++            diag_now: Duration::ZERO,
+         })
+     }
+ 
+@@ -384,6 +396,11 @@
+         if lane == 0 || usize::from(lane) > self.sessions[session].tx.len() {
+             return Ok(());
+         }
++        self.counters.diag_ack_received = self.counters.diag_ack_received.wrapping_add(1);
++        self.counters.diag_ack_received_ranges = self
++            .counters
++            .diag_ack_received_ranges
++            .wrapping_add(ranges.len() as u64);
+         let Some(mut ack) = self.sender.ack_free.pop() else {
+             self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
+             self.counters.ack_buffer_drops = self.counters.ack_buffer_drops.wrapping_add(1);
+@@ -439,6 +456,7 @@
+                     .is_some_and(|ranges| self.sender.lanes[index].history.validate(ranges).is_ok())
+             });
+         if !valid {
++            self.counters.diag_ack_invalid = self.counters.diag_ack_invalid.wrapping_add(1);
+             return self.return_ack(ack);
+         }
+         if self.sender.incoming.len() == self.sender.incoming.capacity() {
+@@ -480,6 +498,23 @@
+             if let Err(ack) = lane.begin_ack(ack) {
+                 self.return_ack(ack)?;
+             } else {
++                lane.diag_ack_started = self.sender.diag_now;
++                if let Some(ack) = &lane.ack {
++                    let wait = self
++                        .sender
++                        .diag_now
++                        .saturating_sub(ack.received)
++                        .as_nanos()
++                        .min(u64::MAX as u128) as u64;
++                    lane.diag.diag_ack_started = lane.diag.diag_ack_started.wrapping_add(1);
++                    lane.diag.diag_ack_wait_ns = lane.diag.diag_ack_wait_ns.wrapping_add(wait);
++                    lane.diag.diag_ack_wait_max_ns = lane.diag.diag_ack_wait_max_ns.max(wait);
++                    lane.diag_ack_floor = ack
++                        .ranges
++                        .get(ack.count.saturating_sub(1))
++                        .map_or(0, |r| r.start);
++                    lane.diag_ack_full = ack.count == MAX_ACK_RANGES;
++                }
+                 self.sender.acks_pending += 1;
+                 lane.loss_passes = 1 + u8::from(lane.scan.is_some());
+                 self.sender.loss_fences = self
+@@ -956,6 +991,7 @@
+             return Ok(false);
+         }
+         let mut more = self.flush_sender_messages(now)?;
++        self.sender.diag_now = now;
+         let ack_blocked = self.sender.checks_pending != 0 || self.sender.loss_fences != 0;
+         self.begin_sender_ack()?;
+         for group in 0..self.sender.fresh.len() {
+@@ -1693,7 +1729,8 @@
+             local.totals.bytes_in_flight = 0;
+             local.totals.rtt_ns = 0;
+         }
+-        for lane in &self.sender.lanes {
++        for lane in &mut self.sender.lanes {
++            self.counters.merge(std::mem::take(&mut lane.diag));
+             let local = &mut self.sessions[lane.session];
+             let totals = &mut local.tx_totals[usize::from(lane.lane) - 1];
+             totals.bytes_in_flight = lane.history.inflight_bytes();
+--- a/src/worker/sender/history.rs
++++ b/src/worker/sender/history.rs
+@@ -34,6 +34,7 @@
+         self.forced_before = None;
+         self.scan_cutoff = None;
+         self.probes = [None; 2];
++        self.diag_lost_at.fill((0, Duration::ZERO));
+         Ok(())
+     }
+ 
+@@ -164,7 +165,52 @@
+                 },
+             );
+             *budget -= allowance;
++            let received = ack.received;
+             let end = self.history.advance_ack(allowance, |ack| {
++                if ack.packet.charged && !ack.was_in_flight {
++                    let (number, lost_at) = self.diag_lost_at[ack.packet.number as usize & 255];
++                    if number != ack.packet.number {
++                        self.diag.diag_late_ack_stamp_miss =
++                            self.diag.diag_late_ack_stamp_miss.wrapping_add(1);
++                    } else {
++                        self.diag.diag_late_ack_stamp_match =
++                            self.diag.diag_late_ack_stamp_match.wrapping_add(1);
++                        if received <= lost_at {
++                            let elapsed = lost_at
++                                .saturating_sub(received)
++                                .as_nanos()
++                                .min(u64::MAX as u128)
++                                as u64;
++                            self.diag.diag_late_ack_before_loss =
++                                self.diag.diag_late_ack_before_loss.wrapping_add(1);
++                            self.diag.diag_late_ack_before_loss_ns =
++                                self.diag.diag_late_ack_before_loss_ns.wrapping_add(elapsed);
++                            self.diag.diag_late_ack_before_loss_max_ns =
++                                self.diag.diag_late_ack_before_loss_max_ns.max(elapsed);
++                        } else {
++                            let elapsed = received
++                                .saturating_sub(lost_at)
++                                .as_nanos()
++                                .min(u64::MAX as u128)
++                                as u64;
++                            self.diag.diag_late_ack_after_loss =
++                                self.diag.diag_late_ack_after_loss.wrapping_add(1);
++                            self.diag.diag_late_ack_after_loss_ns =
++                                self.diag.diag_late_ack_after_loss_ns.wrapping_add(elapsed);
++                            self.diag.diag_late_ack_after_loss_max_ns =
++                                self.diag.diag_late_ack_after_loss_max_ns.max(elapsed);
++                        }
++                    }
++                    let age = now
++                        .saturating_sub(ack.packet.sent_at)
++                        .as_nanos()
++                        .min(u64::MAX as u128) as u64;
++                    self.diag.diag_late_acks = self.diag.diag_late_acks.wrapping_add(1);
++                    self.diag.diag_late_ack_age_ns =
++                        self.diag.diag_late_ack_age_ns.wrapping_add(age);
++                    self.diag.diag_late_ack_age_max_ns =
++                        self.diag.diag_late_ack_age_max_ns.max(age);
++                }
+                 report.entries[report.count] = Entry {
+                     number: ack.packet.number,
+                     sample: ack.packet.sample_slot,
+@@ -173,6 +219,13 @@
+                 report.count += 1;
+             });
+             if let Some(progress) = end {
++                let elapsed = now
++                    .saturating_sub(self.diag_ack_started)
++                    .as_nanos()
++                    .min(u64::MAX as u128) as u64;
++                self.diag.diag_ack_completed = self.diag.diag_ack_completed.wrapping_add(1);
++                self.diag.diag_ack_apply_ns = self.diag.diag_ack_apply_ns.wrapping_add(elapsed);
++                self.diag.diag_ack_apply_max_ns = self.diag.diag_ack_apply_max_ns.max(elapsed);
+                 if let Some(sent) = progress.rtt_sent_at {
+                     self.rtt.sample(sent, ack.received, ack.delay_us);
+                 }
+@@ -231,6 +284,35 @@
+                         .is_some_and(|range| packet.number <= range.end)
+                 });
+                 if !covered && let Some(packet) = self.history.lose(packet.number) {
++                    self.diag_lost_at[packet.number as usize & 255] = (packet.number, now);
++                    let forced = self
++                        .scan_cutoff
++                        .is_some_and(|cutoff| packet.sent_at <= cutoff);
++                    let lag = self.largest_ack.saturating_sub(packet.number);
++                    let counter = if forced {
++                        &mut self.diag.diag_loss_forced
++                    } else if lag >= 3 {
++                        &mut self.diag.diag_loss_packet
++                    } else {
++                        &mut self.diag.diag_loss_time
++                    };
++                    *counter = counter.wrapping_add(1);
++                    let age = now
++                        .saturating_sub(packet.sent_at)
++                        .as_nanos()
++                        .min(u64::MAX as u128) as u64;
++                    self.diag.diag_loss_age_ns = self.diag.diag_loss_age_ns.wrapping_add(age);
++                    self.diag.diag_loss_age_max_ns = self.diag.diag_loss_age_max_ns.max(age);
++                    self.diag.diag_loss_lag = self.diag.diag_loss_lag.wrapping_add(lag);
++                    self.diag.diag_loss_lag_max = self.diag.diag_loss_lag_max.max(lag);
++                    self.diag.diag_loss_below_ack_floor = self
++                        .diag
++                        .diag_loss_below_ack_floor
++                        .wrapping_add(u64::from(packet.number < self.diag_ack_floor));
++                    self.diag.diag_loss_full_ack = self
++                        .diag
++                        .diag_loss_full_ack
++                        .wrapping_add(u64::from(self.diag_ack_full));
+                     report.entries[report.count] = Entry {
+                         number: packet.number,
+                         sample: packet.sample_slot,
+@@ -404,6 +486,9 @@
+         assert_eq!(report.count, 1);
+         assert_eq!(report.entries[0].number, 1);
+         assert!(report.entries[0].settled);
++        assert_eq!(lane.diag.diag_loss_forced, 1);
++        assert_eq!(lane.diag.diag_loss_packet + lane.diag.diag_loss_time, 0);
++        assert_eq!(lane.diag.diag_loss_age_ns, 2_000_000);
+         assert_eq!(
+             lane.history.packet(1).unwrap().sample_slot,
+             report.entries[0].sample
+@@ -416,6 +501,11 @@
+                 .unwrap()
+         );
+         assert_eq!(report.count, 2);
++        assert_eq!(lane.diag.diag_late_acks, 1);
++        assert_eq!(lane.diag.diag_late_ack_age_ns, 99_000_000);
++        assert_eq!(lane.diag.diag_late_ack_stamp_match, 1);
++        assert_eq!(lane.diag.diag_late_ack_after_loss, 1);
++        assert_eq!(lane.diag.diag_late_ack_after_loss_ns, 97_000_000);
+         for entry in &report.entries[..2] {
+             assert!(entry.sample.is_some());
+             assert_eq!(entry.settled, entry.number == 2);
+@@ -432,6 +522,44 @@
+     }
+ 
+     #[test]
++    fn diagnostic_loss_stamp_preserves_ack_arrival_order_and_detects_aliases() {
++        for received in [2, 3, 4] {
++            for alias in [false, true] {
++                let mut lane = lane();
++                send(&mut lane, 1, 1);
++                lane.force_loss(Duration::from_millis(2));
++                let mut report = Report::new(0);
++                assert!(
++                    lane.advance_report(&mut report, Duration::from_millis(3), &mut 64)
++                        .unwrap()
++                );
++                lane.report_completed(&report).unwrap();
++                if alias {
++                    lane.diag_lost_at[1] = (257, Duration::from_millis(3));
++                }
++                let mut ack = ack(1, 1);
++                ack.received = Duration::from_millis(received);
++                assert!(lane.begin_ack(ack).is_ok());
++                assert!(
++                    lane.advance_report(&mut report, Duration::from_millis(5), &mut 64)
++                        .unwrap()
++                );
++                assert_eq!(lane.diag.diag_late_ack_stamp_miss, u64::from(alias));
++                assert_eq!(lane.diag.diag_late_ack_stamp_match, u64::from(!alias));
++                assert_eq!(
++                    lane.diag.diag_late_ack_before_loss,
++                    u64::from(!alias && received <= 3)
++                );
++                assert_eq!(
++                    lane.diag.diag_late_ack_after_loss,
++                    u64::from(!alias && received > 3)
++                );
++                assert_eq!(lane.diag.diag_late_acks, 1);
++            }
++        }
++    }
++
++    #[test]
+     fn forced_sweep_is_bounded_and_does_not_consume_newer_sends() {
+         let mut lane = lane();
+         for number in 1..=130 {

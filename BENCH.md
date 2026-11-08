@@ -95,6 +95,57 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## False loss and ordinary-frame overload (November 8)
+
+[Six diagnostic observations](benches/tap-loss-provenance.json) add
+[bounded loss/ACK timestamp instrumentation](benches/ack-loss-provenance.patch)
+to `cff9b08` plus outgoing ACK retry. They retain the previous eight-worker GSO
+profile and add four-worker bridged individual frames. Both use QinQ, 1,522-byte
+frames, a routed 4.5 ms RTT, zero injected loss and fifteen-second ascending
+loads. These instrumented rates are diagnostic evidence, not production
+performance acceptance.
+
+| Input / requested each way | Delivered Gbit/s L→R / R→L | CPU % L / R | Ordinary loss declarations L / R | Late original ACKs L / R |
+| --- | --- | --- | --- | --- |
+| gso / 0.5G | 0.449 / 0.470 | 89.0 / 86.1 | 3771 / 4011 | 3771 / 4011 |
+| gso / 5G | 0.806 / 0.794 | 212.5 / 203.0 | 8768 / 8136 | 8768 / 8136 |
+| gso / unlimited | 0.750 / 0.776 | 178.4 / 232.2 | 7323 / 8303 | 7323 / 8303 |
+| bridge / 0.5G | 0.471 / 0.477 | 183.5 / 212.5 | 1952 / 1087 | 1952 / 1077 |
+| bridge / 5G | 0.286 / 0.428 | 265.8 / 372.9 | 1557 / 5780 | 923 / 221 |
+| bridge / unlimited | 0.198 / 0.406 | 260.2 / 366.6 | 2365 / 8814 | 540 / 314 |
+
+At the light GSO point, all 3,771 / 4,011 ordinary losses were later ACKed
+as the original packet numbers. Repairs use new numbers, so these are proven
+spurious loss declarations. None fell below the last processed ACK's oldest
+range. Only 103 / 55 of their ACKs had reached userspace before loss declaration;
+the rest arrived on average 0.508 / 0.614 ms afterwards. The fixed timestamp
+table had no identity misses. This narrows the explanation beyond local queued
+ACK processing, without attributing every loss to one cause.
+
+[A separate two-point receive-order run](benches/tap-rx-order.json), using the
+[additional receive-order patch](benches/rx-order-diagnostic.patch), counts
+only successful fresh admissions. GSO input produces 8,512 / 9,688 reordered
+outer DATA packets out of 688,022 / 693,732 accepted DATA packets; reordered
+control packets number 12 / 6. Bridged individual input produces 4,087 / 4,371
+reordered DATA packets and 0 / 4 reordered control packets. This locates
+reordering before ACK generation, but does not yet distinguish send ordering,
+kernel delivery and receive handoff. Inner application reordering is a separate
+measurement.
+
+The bridged overload is also CPU-bound on active workers. In the preceding
+production-fix lossy run, reverse goodput falls from 0.712 to 0.214 Gbit/s while
+daemon CPU rises from 231% to 368%. Individual workers reach 86–99% CPU.
+Two busy transmit workers' grants fall from 20,808 / 21,905 to 2,820 / 4,464;
+cancellations rise from 171 / 248 to 2,088 / 3,195. Unsent expiry and repeated
+fresh-input work need separate treatment from false congestion feedback.
+
+The outgoing ACK retry fixes a separate failure: consuming a due schedule
+before a failed send discarded its reserved snapshot. Failed submissions now
+retain that snapshot with a 1 ms retry, bounded by the existing feedback pool;
+stale connection or receive-owner identities release it. `ack_send_deferred`
+counts attempts that submitted no datagram. Diagnostic observations record
+such deferrals, but do not isolate their throughput effect.
+
 ## Queued ACKs and PMTU capacity evidence (November 8)
 
 Two correctness fixes follow the audit experiments. A TX owner previously
