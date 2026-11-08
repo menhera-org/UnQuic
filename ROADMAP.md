@@ -440,7 +440,10 @@ through the existing handoff rings. A shared control queue rotates blocked
 groups and returns, with at most 64 construction visits and 64 service visits
 per turn. Tests cover rejected packed tails/heads, full handoff and return
 queues, stale identities, control-class fairness and actual-send duplicate
-spacing. Incoming ACKs now reach TX-owned histories; DATA and probes use shared
+spacing. Failed ACK submission retains the reserved snapshot for a 1 ms retry;
+stale connection/owner snapshots return to their pool. The `ack_send_deferred`
+counter records these attempts separately from incoming ACK-buffer drops.
+Incoming ACKs now reach TX-owned histories; DATA and probes use shared
 controller grants. Release forwarding, reconnect, allocation and routed-MTU
 regression tests pass.
 The pure shared grant ledger now reserves credit before handoff, keeps it through

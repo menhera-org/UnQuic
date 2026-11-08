@@ -135,6 +135,8 @@ metrics! {
     /// TAP sources rejected by fresh-unsent byte admission; a subset of queue_drops.
     /// One GSO source can represent many Ethernet frames.
     tx_backlog_drops: sum,
+    /// ACK snapshots retained after a send attempt submitted no datagram.
+    ack_send_deferred: sum,
     /// ACK records dropped for lack of a reserved receive buffer; a subset of queue_drops, not additive.
     ack_buffer_drops: sum,
     /// Datagrams not fully admitted because receive frame storage was full.

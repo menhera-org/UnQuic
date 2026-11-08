@@ -224,6 +224,8 @@ packets coalesce in that lane's bitmap. A rotating queue shares control slots
 between ACKs, probe replies and handshakes. Construction visits at most 64 lane
 slots per turn; sending visits at most 64 queue entries. Blocked groups and
 buffer returns yield to other entries and wake at their next deadline.
+An unsuccessful ACK send retains its snapshot for a 1 ms retry; the
+`ack_send_deferred` counter is separate from incoming ACK-buffer drops.
 ACK delay includes queue residence, capped at 1 ms. Successful-send timestamps
 return to the receive owner to enforce duplicate spacing. ACK delay is finalized
 using that send timestamp; control service starts no earlier than submission,

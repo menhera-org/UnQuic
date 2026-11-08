@@ -282,6 +282,17 @@ impl Worker {
                             now,
                         )? {
                             feedback.sent = Some(started);
+                        } else {
+                            self.counters.ack_send_deferred =
+                                self.counters.ack_send_deferred.wrapping_add(1);
+                            let totals = &mut self.sessions[feedback.session].totals;
+                            totals.ack_send_deferred = totals.ack_send_deferred.wrapping_add(1);
+                            // take_ack consumed the schedule; retain its snapshot until submitted.
+                            feedback.due = self
+                                .control_due(feedback.session, now)
+                                .max(now.saturating_add(RETRY));
+                            self.pending_control.push_back(Pending::Ack(feedback));
+                            continue;
                         }
                     }
                     self.return_feedback(feedback, now)?;
@@ -313,6 +324,69 @@ mod tests {
         worker.transmit[0].paths[0].lanes[0].socket =
             Some(TransmitSocket::connect(&rx, rx.local_addr()).unwrap());
         rx
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn failed_ack_submission_keeps_snapshot_and_yields_until_retry() {
+        for stale in [false, true] {
+            let (mut worker, _tap) = receive_worker();
+            let mut bytes = [0; BASE_UDP_PAYLOAD];
+            let length = receive_bytes(2, &[receive_piece(1, 0, &[1; 60])], &mut bytes);
+            worker.sessions[0].rx[0]
+                .as_mut()
+                .unwrap()
+                .admit(&Datagram::decode(&bytes[..length]).unwrap(), Duration::ZERO);
+            worker.collect_acks(Duration::ZERO).unwrap();
+            // No transmit socket: the snapshot must outlive this unsuccessful attempt.
+            worker.flush_control(Duration::ZERO).unwrap();
+            assert_eq!(worker.counters.ack_send_deferred, 1);
+            assert_eq!(worker.sessions[0].totals.ack_send_deferred, 1);
+            assert_eq!(worker.feedback_deadline(), Some(RETRY));
+            assert_eq!(worker.feedback_free.len(), BUFFERS - 1);
+            assert_eq!(worker.sessions[0].ack_inflight, 1);
+            let rx = socket(&mut worker);
+            worker
+                .flush_control(RETRY - Duration::from_nanos(1))
+                .unwrap();
+            assert_eq!(worker.counters.ack_send_deferred, 1);
+            assert_eq!(
+                rx.recv(&mut bytes).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            if stale {
+                worker.shared.owners[0][7].store(255, Ordering::Release);
+            }
+            worker.flush_control(RETRY).unwrap();
+            assert!(worker.pending_control.is_empty());
+            assert_eq!(worker.feedback_free.len(), BUFFERS);
+            assert_eq!(worker.sessions[0].ack_inflight, 0);
+            if stale {
+                assert_eq!(
+                    rx.recv(&mut bytes).unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+            } else {
+                let length = rx.recv(&mut bytes).unwrap().0;
+                let packet = Datagram::decode(&bytes[..length]).unwrap();
+                let Some(Record::Ack {
+                    ranges, delay_us, ..
+                }) = packet.records().next()
+                else {
+                    panic!("missing retained ACK");
+                };
+                assert_eq!(
+                    ranges.iter().collect::<Vec<_>>(),
+                    [AckRange { start: 2, end: 2 }]
+                );
+                assert_eq!(delay_us, 1000);
+                worker.flush_control(RETRY * 2).unwrap();
+                assert_eq!(
+                    rx.recv(&mut bytes).unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+            }
+        }
     }
 
     #[test]
