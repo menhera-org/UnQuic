@@ -89,6 +89,63 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Occupied receive-slot scans do not establish a throughput gain (November 8)
+
+The November 6 review identifies fixed per-turn receive scans as a smaller
+CPU cost. An [isolated candidate](benches/rx-scan.patch) adds one occupied-slot
+bitmap per session. TAP flushing and deadline selection visit set bits,
+connection barriers test the mask, and reassembly gauges accumulate during
+flushing. Admission, ACK rules, budgets, deadlines and queue sizes are unchanged.
+
+[Two release comparisons](benches/tap-rx-scan.json) use production/candidate/
+production order, thirty-second points, eight workers/lanes and sixteen QinQ
+flows. Each phase retains its daemons across the rates. Inner MTU is 1500,
+TAP queues hold 500 entries, and active PMTU has a 1452-byte UDP ceiling.
+Local builds, kernel tests and Git packing do not overlap load.
+
+| Sweep | Build | Requested each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Production before | 4G | 1.575 / 1.592 | 60.23 / 59.82 | 219.95 / 208.08 |
+| 1 | Production before | 21G | 1.728 / 1.575 | 91.66 / 92.42 | 219.68 / 208.55 |
+| 1 | Production before | unlimited | 1.736 / 1.585 | 96.95 / 97.05 | 218.36 / 209.34 |
+| 1 | Bitmap | 4G | 1.743 / 1.470 | 55.96 / 62.89 | 211.96 / 207.22 |
+| 1 | Bitmap | 21G | 1.720 / 1.570 | 91.71 / 92.44 | 215.87 / 206.10 |
+| 1 | Bitmap | unlimited | 1.770 / 1.570 | 96.80 / 97.02 | 214.78 / 206.00 |
+| 1 | Production after | 4G | 1.551 / 1.593 | 60.82 / 59.80 | 220.24 / 210.30 |
+| 1 | Production after | 21G | 1.732 / 1.562 | 91.66 / 92.49 | 218.49 / 211.23 |
+| 1 | Production after | unlimited | 1.746 / 1.561 | 97.00 / 97.21 | 221.86 / 208.48 |
+| 2 | Production before | 4G | 1.733 / 1.581 | 56.19 / 60.06 | 219.42 / 211.63 |
+| 2 | Production before | unlimited | 1.709 / 1.555 | 97.11 / 97.13 | 212.16 / 206.49 |
+| 2 | Bitmap | 4G | 1.702 / 1.515 | 57.00 / 61.75 | 212.29 / 206.83 |
+| 2 | Bitmap | unlimited | 1.720 / 1.589 | 96.98 / 96.93 | 214.21 / 204.44 |
+| 2 | Production after | 4G | 1.641 / 1.595 | 58.43 / 59.64 | 222.39 / 211.39 |
+| 2 | Production after | unlimited | 1.777 / 1.593 | 96.82 / 96.92 | 220.71 / 210.67 |
+
+The bitmap's reverse 4G goodput is below both controls in both comparisons:
+7.7% in the first and 4.2–5.0% in the repeat. Unlimited forward goodput improves
+1.4–2.0% in the first comparison but falls between controls in the repeat.
+High-load CPU reductions therefore do not establish a consistent bidirectional
+gain. **The bitmap candidate is rejected.** Its scheduling effect remains
+unattributed; these measurements do not prove that fixed scans are free.
+A separate candidate will test gauge accumulation without the bitmap or
+session-layout change.
+
+All fifteen points have zero corrupt, duplicate, reordered, out-of-window or
+wrong-run application records, outer socket overflow, inner UDP errors and
+outer fragmentation. Bitmap admission pressure remains 24820 / 6968 at the
+first unlimited point and 23197 / 5606 in the repeat. Queue drops are
+2169 / 36235 and 2229 / 36305; frame expiry is 1948371 / 2917874 and
+2054260 / 2883578. The JSON retains each expiry class, per-worker CPU,
+TAP ingress drops and offered rates. These counters have different units;
+they cannot be summed into an exact frame-loss total.
+
+Validation passes 354 ordinary release-musl tests, strict Clippy and formatting,
+plus 82 library kernel tests and all three runtime tests on Linux 6.8 and 7.0.
+New coverage checks sparse slots 0 and 63, gauge totals, ACK/expiry deadlines,
+blocked lane returns into earlier slots and eventual connection-barrier
+completion. Runtime allocation checks pass. The full routed PMTU test and
+real-path throughput were not repeated.
+
 ## Remaining-lifetime admission removes pressure but costs more CPU (November 8)
 
 The [candidate](benches/fresh-lifetime.patch) rejects a new source when an
