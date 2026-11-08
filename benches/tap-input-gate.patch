@@ -1,0 +1,183 @@
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -430,6 +430,7 @@
+     tap_readable: bool,
+     tap_blocked: bool,
+     tap_read_limit: usize,
++    tap_gate_sample: Option<(Duration, bool, bool, bool)>,
+     tap_retry: Duration,
+     connection: Option<Connection>,
+     path: usize,
+@@ -823,6 +824,7 @@
+                 tap_readable: true,
+                 tap_blocked: false,
+                 tap_read_limit: 8,
++                tap_gate_sample: None,
+                 tap_retry: Duration::ZERO,
+                 connection: None,
+                 path: 0,
+@@ -2081,6 +2083,11 @@
+         if !local.tap_inputs.is_empty() {
+             return 0;
+         }
++        self.tap_physical_capacity(session)
++    }
++
++    fn tap_physical_capacity(&self, session: usize) -> usize {
++        let local = &self.sessions[session];
+         let workers = local.tx_workers;
+         // Leave a slab, a frame view and byte credit so queued inputs can progress.
+         self.free
+@@ -3181,7 +3188,47 @@
+ 
+     fn flush_taps(&mut self, now: Duration) -> io::Result<()> {
+         for session in 0..self.sessions.len() {
+-            let readable = self.tap_capacity(session) != 0;
++            let pending = !self.sessions[session].tap_inputs.is_empty();
++            let physical = self.tap_physical_capacity(session);
++            let readable = !pending && physical != 0;
++            let spare = pending && physical != 0;
++            let registered = self.sessions[session].tap_registered;
++            let stalled = registered && pending && !self.tap_can_expand(session);
++            let local = &mut self.sessions[session];
++            if registered {
++                let previous = local
++                    .tap_gate_sample
++                    .replace((now, pending, spare, stalled));
++                for totals in [&mut self.counters, &mut local.totals] {
++                    totals.tap_observed_turns = totals.tap_observed_turns.wrapping_add(1);
++                    totals.tap_input_gate_turns =
++                        totals.tap_input_gate_turns.wrapping_add(u64::from(pending));
++                    totals.tap_input_gate_spare_turns = totals
++                        .tap_input_gate_spare_turns
++                        .wrapping_add(u64::from(spare));
++                    totals.tap_input_gate_stalled_turns = totals
++                        .tap_input_gate_stalled_turns
++                        .wrapping_add(u64::from(stalled));
++                    if let Some((at, gated, had_spare, was_stalled)) = previous {
++                        let elapsed =
++                            now.saturating_sub(at).as_nanos().min(u128::from(u64::MAX)) as u64;
++                        if gated {
++                            totals.tap_input_gate_ns =
++                                totals.tap_input_gate_ns.wrapping_add(elapsed);
++                        }
++                        if had_spare {
++                            totals.tap_input_gate_spare_ns =
++                                totals.tap_input_gate_spare_ns.wrapping_add(elapsed);
++                        }
++                        if was_stalled {
++                            totals.tap_input_gate_stalled_ns =
++                                totals.tap_input_gate_stalled_ns.wrapping_add(elapsed);
++                        }
++                    }
++                }
++            } else {
++                local.tap_gate_sample = None;
++            }
+             let mut writable = false;
+             for slot in 0..LANES {
+                 let local = &mut self.sessions[session];
+@@ -3227,6 +3274,18 @@
+                     (if readable { libc::EPOLLIN } else { 0 }
+                         | if writable { libc::EPOLLOUT } else { 0 }) as u32,
+                 )?;
++                if local.tap_readable != readable {
++                    for totals in [&mut self.counters, &mut local.totals] {
++                        let changes = if readable {
++                            &mut totals.tap_read_interest_on
++                        } else if pending {
++                            &mut totals.tap_read_interest_gate_off
++                        } else {
++                            &mut totals.tap_read_interest_credit_off
++                        };
++                        *changes = changes.wrapping_add(1);
++                    }
++                }
+                 local.tap_writable = writable;
+                 local.tap_readable = readable;
+             }
+@@ -4341,6 +4400,55 @@
+     }
+ 
+     #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn tap_gate_diagnostic_distinguishes_pending_work_and_physical_pressure() {
++        let (mut worker, _tap) = receive_worker();
++        let source = deadline_input(&mut worker, true);
++        worker.input_frame(source, Duration::ZERO).unwrap();
++        assert!(worker.tap_physical_capacity(0) != 0);
++        assert!(worker.tap_can_expand(0));
++        for tick in [1, 3] {
++            worker.flush_taps(Duration::from_millis(tick)).unwrap();
++        }
++        let retained = worker.sessions[0].tx_retained;
++        worker.sessions[0].tx_retained = frame_quota(worker.sessions[0].tx_workers);
++        assert!(!worker.tap_can_expand(0));
++        for tick in [6, 10] {
++            worker.flush_taps(Duration::from_millis(tick)).unwrap();
++        }
++        worker.sessions[0].tx_retained = retained;
++        let source = worker.sessions[0].tap_inputs.pop_front().unwrap();
++        worker.close_source(source);
++        worker.flush_taps(Duration::from_millis(11)).unwrap();
++        let free = std::mem::take(&mut worker.free);
++        for tick in [12, 13] {
++            worker.flush_taps(Duration::from_millis(tick)).unwrap();
++        }
++        worker.free = free;
++        worker.flush_taps(Duration::from_millis(14)).unwrap();
++        worker.sessions[0].tap_registered = false;
++        worker.flush_taps(Duration::from_millis(20)).unwrap();
++        worker.flush_taps(Duration::from_millis(30)).unwrap();
++        worker.sessions[0].tap_registered = true;
++        worker.flush_taps(Duration::from_millis(40)).unwrap();
++        worker.flush_taps(Duration::from_millis(40)).unwrap();
++        for totals in [&worker.counters, &worker.sessions[0].totals] {
++            assert_eq!(totals.tap_observed_turns, 10);
++            assert_eq!(totals.tap_input_gate_turns, 4);
++            assert_eq!(totals.tap_input_gate_spare_turns, 2);
++            assert_eq!(totals.tap_input_gate_stalled_turns, 2);
++            assert_eq!(totals.tap_input_gate_ns, 10_000_000);
++            assert_eq!(totals.tap_input_gate_spare_ns, 5_000_000);
++            assert_eq!(totals.tap_input_gate_stalled_ns, 5_000_000);
++            assert_eq!(totals.tap_read_interest_gate_off, 1);
++            assert_eq!(totals.tap_read_interest_credit_off, 1);
++            assert_eq!(totals.tap_read_interest_on, 2);
++        }
++        assert_eq!(worker.free.len(), BUFFERS);
++        assert_eq!(worker.counters.queue_drops, 0);
++    }
++
++    #[test]
+     #[ignore = "kernel descriptor test; run in a disposable container"]
+     fn owner_rejects_overdue_plain_and_gso_sources_before_admission() {
+         for foreign in [false, true] {
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -181,6 +181,26 @@
+     tap_read_requests: sum,
+     /// Bounded io_uring TAP read batches attempted.
+     tap_read_batches: sum,
++    /// Registered-TAP observations in flush_taps; one per worker/session turn.
++    tap_observed_turns: sum,
++    /// Observations where pending local input prevents TAP reads.
++    tap_input_gate_turns: sum,
++    /// Pending-input gate observations with otherwise-spare physical read credits.
++    tap_input_gate_spare_turns: sum,
++    /// Pending-input gate observations whose first source cannot materialize.
++    tap_input_gate_stalled_turns: sum,
++    /// Sampled nanoseconds under the pending-input gate; summed across queues.
++    tap_input_gate_ns: sum,
++    /// Sampled pending-input gate nanoseconds with spare physical read credits.
++    tap_input_gate_spare_ns: sum,
++    /// Sampled pending-input gate nanoseconds with materialization blocked.
++    tap_input_gate_stalled_ns: sum,
++    /// Successful EPOLLIN enables from flush_taps.
++    tap_read_interest_on: sum,
++    /// Successful EPOLLIN disables with pending input, possibly also short of credits.
++    tap_read_interest_gate_off: sum,
++    /// Successful EPOLLIN disables without pending input, due to physical credits.
++    tap_read_interest_credit_off: sum,
+     /// Valid frames read through io_uring, before transmit admission.
+     tap_ring_frames: sum,
+     /// Partial Internet checksums completed before transmit admission.

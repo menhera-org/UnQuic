@@ -89,6 +89,59 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## TAP gating mostly reflects exhausted retention credits (November 8)
+
+A [temporary diagnostic](benches/tap-input-gate.patch) observes registered TAPs
+once per worker/session turn, reusing the existing clock value. It records
+pending-input gates, spare physical credits, blocked expansion, sampled
+durations and successful read-readiness changes. The original scheduling,
+deadlines, quotas and 2 MiB fresh-work cap remain unchanged. The
+[release-musl A/B/A observations](benches/tap-input-gate.json) use eight lanes
+and the same QinQ workload:
+
+| Build | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| before | 4 Gbit/s | 1.770 / 1.594 | 55.07 / 59.57 | 217.54 / 210.31 |
+| before | Unlimited | 1.739 / 1.576 | 96.98 / 97.11 | 213.88 / 208.13 |
+| candidate | 4 Gbit/s | 1.713 / 1.545 | 56.55 / 61.02 | 217.79 / 210.90 |
+| candidate | Unlimited | 1.740 / 1.526 | 96.94 / 96.94 | 216.79 / 206.44 |
+| after | 4 Gbit/s | 1.726 / 1.459 | 56.24 / 63.03 | 215.16 / 228.89 |
+| after | Unlimited | 1.692 / 1.564 | 96.96 / 97.02 | 216.20 / 205.75 |
+
+Worker 3 reads essentially all GSO input on each endpoint. At unlimited load,
+its pending-input gate lasts 17.00 / 17.06 seconds of the 21.84-second counter
+interval; expansion is blocked for 15.65 / 15.93 seconds. Only 1.32 / 1.11
+seconds have spare physical read credits. The reader disables read interest
+for pending input 20,280 / 21,693 times and for credit-only pressure
+1,056 / 1,152 times. These durations are sampled states, include scheduling
+delays, and cannot be added together: spare-credit and stalled intervals are
+independent subsets of gated time.
+
+Source inspection narrows the cause further. Compact QinQ GSO children borrow
+payload and need neither a new slab nor copy-byte credit. Expansion stops only
+when session frame credit or view slots run out. In this single-session setup,
+each worker has 1024 credits and 1024 view slots; live views, retained sources,
+slabs and outstanding reader reservations all consume session credits. A pending
+owned source therefore exhausts session credit before all view slots can be
+occupied. This deduction follows from the source's accounting invariant;
+the diagnostic did not separately count those two failure reasons.
+
+Simply allowing another read while the logical gate is closed cannot address
+most of the measured interval under unchanged physical credits. A bounded
+retention-quota increase is worth testing with the fresh-work cap kept intact:
+the current 1024-credit quota can bind before 2 MiB of fresh frame data.
+This is a hypothesis, not a measured improvement. More retained slots cost
+memory and may only postpone pressure; measure deadline margins and longer
+overload behavior before adopting a larger bound.
+
+The diagnostic passes 349 ordinary release tests, strict Clippy/formatting,
+82 Linux 6.8 kernel tests and all three unchanged runtime tests, including
+allocation assertions. All six load points report zero invalid, duplicate,
+wrong-run or too-old inner datagrams, reordering, socket overflow, inner UDP
+errors and outer fragments. Instrumented reverse unlimited goodput is below
+both controls; the added observation cost is a possible contributor.
+No production gate or quota change is included.
+
 ## Bounding fresh work preserves single-lane overload delivery (November 8)
 
 The selected change bounds fresh logical bytes at 2 MiB per TX lane. It
