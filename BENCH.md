@@ -89,13 +89,143 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Rolling ordered sender commits (November 8)
+
+[Twenty-four release comparisons](benches/tap-rolling-sender.json) isolate
+[rolling commits](benches/rolling-sender.patch) on top of the exact ACK-pruning candidate. The earlier
+production daemon is not this comparison's baseline. Path, rate, CPU placement
+and duration match the preceding twenty-second pruning sweep.
+
+A completed flight can now commit and return when its actual send keys precede
+every unreported grant's earliest possible send key. Later grants need not
+finish first. Feedback still closes issuance and waits for the outstanding
+sends, preserving the shared delivery sampler's ordering. This experiment
+retains the aggregate quantum limit and uses no reservation-time approximation.
+
+| Path | Build | Requested each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- | --- |
+| delayed | before | 0.5G | 0.443 / 0.463 | 10.42 / 6.39 | 88.0 / 85.4 |
+| delayed | before | 5G | 0.537 / 0.517 | 89.06 / 89.50 | 153.2 / 226.9 |
+| delayed | before | unlimited | 0.487 / 0.525 | 99.15 / 98.96 | 145.4 / 247.0 |
+| delayed | candidate | 0.5G | 0.411 / 0.459 | 16.79 / 7.04 | 86.5 / 84.1 |
+| delayed | candidate | 5G | 0.629 / 0.492 | 87.17 / 90.02 | 161.0 / 241.2 |
+| delayed | candidate | unlimited | 0.477 / 0.802 | 99.19 / 98.50 | 212.1 / 174.6 |
+| delayed | after | 0.5G | 0.460 / 0.457 | 6.98 / 7.42 | 90.8 / 86.1 |
+| delayed | after | 5G | 0.521 / 0.453 | 89.39 / 90.79 | 212.9 / 241.7 |
+| delayed | after | unlimited | 0.503 / 0.772 | 99.10 / 98.51 | 235.8 / 174.5 |
+| lossy | before | 0.5G | 0.455 / 0.446 | 7.26 / 9.66 | 88.2 / 90.3 |
+| lossy | before | 5G | 0.419 / 0.847 | 91.48 / 82.78 | 255.7 / 180.4 |
+| lossy | before | unlimited | 0.452 / 0.811 | 99.22 / 98.61 | 199.7 / 175.8 |
+| lossy | candidate | 0.5G | 0.423 / 0.432 | 14.43 / 12.67 | 87.6 / 85.3 |
+| lossy | candidate | 5G | 0.588 / 0.674 | 88.04 / 86.27 | 168.9 / 178.1 |
+| lossy | candidate | unlimited | 0.631 / 0.687 | 98.89 / 98.76 | 171.0 / 175.9 |
+| lossy | after | 0.5G | 0.451 / 0.426 | 8.63 / 13.77 | 90.4 / 86.3 |
+| lossy | after | 5G | 0.660 / 0.655 | 86.53 / 86.68 | 175.4 / 177.1 |
+| lossy | after | unlimited | 0.743 / 0.588 | 98.72 / 98.96 | 179.9 / 174.5 |
+| loopback | before | 4G | 2.542 / 2.301 | 35.38 / 41.55 | 262.0 / 244.5 |
+| loopback | before | unlimited | 2.349 / 2.225 | 96.08 / 95.93 | 249.8 / 238.4 |
+| loopback | candidate | 4G | 2.338 / 2.301 | 40.58 / 41.63 | 252.7 / 242.2 |
+| loopback | candidate | unlimited | 2.547 / 2.124 | 95.47 / 96.25 | 252.1 / 239.0 |
+| loopback | after | 4G | 2.179 / 2.310 | 44.73 / 41.36 | 249.6 / 237.5 |
+| loopback | after | unlimited | 2.589 / 2.233 | 95.46 / 95.77 | 260.3 / 242.8 |
+
+**Rolling commits alone are not accepted.** Routed gains are inconsistent,
+forward delay-only light-load delivery falls below both controls, and
+loopback unlimited reverse delivery falls to 2.124 Gbit/s from 2.225–2.233.
+The report-order barrier is real, but removing this part does not establish a
+throughput gain. Shared burst credit, real ACK transactions and worker queues
+still impose waits; these measurements do not apportion their costs.
+
+The combined candidate passes 363 ordinary release-musl all-feature tests,
+strict Clippy, and 82 library plus three runtime kernel tests on both
+Linux 6.8 and 7.0. A 4374-case chronological oracle covers report permutations,
+actual send times and successful prefixes. The next per-grant quantum
+experiment must be measured separately and would change the documented
+aggregate burst contract.
+
+## Exact ACK pruning on delayed and lossy paths (November 8)
+
+[Twenty-seven release observations](benches/tap-ack-pruning-exact.json) compare
+production, [exact three-success pruning](benches/ack-pruning-exact.patch), then production again. Each phase
+retains its daemons across twenty-second rates. The workload remains eight
+workers/lanes, sixteen QinQ flows and 44-segment source buffers; it is separate
+from the bridged individual-frame calibration below. The routed paths add
+4.5 ms RTT, with zero or 0.1% independent datagram loss. Loopback has neither.
+
+The candidate counts the exact ranges in each successfully submitted ACK.
+After three reports it omits those packet numbers, retaining the highest
+accepted packet as an anchor. Failed sends, late arrivals and recycled window
+positions cannot acquire false report counts. The duplicate window is unchanged.
+Two bounded bitmap planes and a search floor add 16408 bytes per receive lane;
+steady-state processing adds no allocation, lock or syscall.
+
+| Path | Build | Requested each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- | --- |
+| delayed | before | 0.5G | 0.447 / 0.429 | 9.47 / 13.13 | 89.6 / 87.4 |
+| delayed | before | 5G | 0.413 / 0.537 | 91.59 / 89.12 | 232.2 / 225.0 |
+| delayed | before | unlimited | 0.366 / 0.674 | 99.36 / 98.68 | 205.5 / 214.4 |
+| delayed | candidate | 0.5G | 0.424 / 0.442 | 14.25 / 10.67 | 87.5 / 84.9 |
+| delayed | candidate | 5G | 0.589 / 0.650 | 87.96 / 86.73 | 167.2 / 169.9 |
+| delayed | candidate | unlimited | 0.523 / 0.757 | 99.09 / 98.60 | 165.3 / 182.0 |
+| delayed | after | 0.5G | 0.471 / 0.462 | 4.61 / 6.44 | 92.7 / 88.1 |
+| delayed | after | 5G | 0.450 / 0.528 | 90.85 / 89.30 | 256.3 / 240.6 |
+| delayed | after | unlimited | 0.504 / 0.561 | 99.14 / 98.96 | 241.3 / 242.7 |
+| lossy | before | 0.5G | 0.436 / 0.456 | 11.80 / 7.73 | 92.7 / 89.3 |
+| lossy | before | 5G | 0.624 / 0.791 | 87.32 / 83.91 | 193.6 / 186.5 |
+| lossy | before | unlimited | 0.485 / 0.847 | 99.18 / 98.37 | 232.1 / 191.2 |
+| lossy | candidate | 0.5G | 0.443 / 0.435 | 10.43 / 11.89 | 87.4 / 85.5 |
+| lossy | candidate | 5G | 0.708 / 0.658 | 85.55 / 86.61 | 185.0 / 185.8 |
+| lossy | candidate | unlimited | 0.497 / 0.760 | 99.14 / 98.60 | 203.6 / 174.2 |
+| lossy | after | 0.5G | 0.459 / 0.451 | 7.09 / 8.69 | 93.6 / 88.9 |
+| lossy | after | 5G | 0.709 / 0.671 | 85.55 / 86.39 | 185.1 / 188.0 |
+| lossy | after | unlimited | 0.559 / 0.724 | 99.02 / 98.80 | 218.1 / 189.9 |
+| loopback | before | 4G | 1.771 / 1.518 | 55.00 / 61.43 | 219.3 / 211.7 |
+| loopback | before | unlimited | 1.743 / 1.559 | 97.16 / 97.18 | 219.4 / 208.7 |
+| loopback | candidate | 4G | 2.273 / 2.313 | 42.23 / 41.29 | 254.7 / 241.2 |
+| loopback | candidate | unlimited | 2.540 / 2.195 | 95.57 / 95.93 | 255.6 / 240.4 |
+| loopback | after | 4G | 1.809 / 1.528 | 54.02 / 61.22 | 226.5 / 213.1 |
+| loopback | after | unlimited | 1.731 / 1.575 | 96.92 / 97.12 | 216.1 / 208.0 |
+
+Loopback unlimited improves to 2.540 / 2.195 Gbit/s from controls of
+1.731–1.743 / 1.559–1.575. Admission-pressure events fall to 3028 / 0 from
+14429–16029 / 4232–4746. Candidate CPU rises to 255.6 / 240.4%, but delivered
+bytes per CPU improve. Routed 5G delay-only delivery also beats both controls,
+using less CPU. Lossy-path results overlap the controls, and delay-only 0.5G
+forward delivery falls below both. A sixty-second repeat confirms the light-load regression:
+
+| Build | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- |
+| before | 0.471 / 0.467 | 5.46 / 6.28 | 92.5 / 90.3 |
+| candidate | 0.454 / 0.463 | 8.75 / 7.00 | 90.1 / 89.0 |
+| after | 0.466 / 0.473 | 6.44 / 5.05 | 91.8 / 90.1 |
+
+**Pruning alone is not accepted yet.** The candidate remains available for
+separate sender and ACK-packing comparisons. Forward never-submitted expiry
+in the repeat is 218879 frames, versus 136314–160852 in the controls.
+The repeat has no qdisc drops, admission pressure or socket overflow.
+
+Candidate ACKs average 1.24–1.82 ranges across these points. These success-only
+record/range counters are new; the controls do not provide a matched old mean.
+The earlier 22–25-range diagnostic is a different measurement.
+All routed points have zero admission pressure. The delay-only points have
+zero qdisc drops; the opening production unlimited point has twelve socket
+overflow SKBs, and every other point has zero. Never-submitted expiry still
+dominates light-load missing frames. This is a measured loss category, not
+proof of which sender wait caused it.
+
+Release all-feature tests and strict Clippy pass. Both Linux 6.8 and 7.0 pass
+82 library kernel checks and three runtime checks, including allocation-free
+forwarding and recovery. Regressions cover exact sent snapshots, failed sends,
+late arrivals, full/partial window eviction, reset and packet-number exhaustion.
+No result here establishes a CPU ceiling, the 20G local gate, or the 5G
+real-access gate.
+
 ## November 8 audit: ingress calibration and sender accounting
 
 [The new audit](20261108-perf-audit.md) is preserved as a read-only review of
 `926c664`. Its recommendations require separate correctness and performance
-checks. Routed delay/loss controls are now available above; the next harness
-change adds bridged input, two-worker runs, and per-thread context-switch
-snapshots.
+checks. The harness now includes routed delay/loss, bridged input, two-worker runs,
+and per-thread context-switch snapshots.
 
 [Ten functional observations](benches/tap-bridge-validation.json) test the
 new modes with the unchanged production daemon. Simply adding a veth and bridge

@@ -1,0 +1,550 @@
+diff --git a/src/pacing/grants.rs b/src/pacing/grants.rs
+index 425ced0..360748e 100644
+--- a/src/pacing/grants.rs
++++ b/src/pacing/grants.rs
+@@ -143,6 +143,15 @@ impl Grants {
+         self.reserved
+     }
+ 
++    /// Earliest possible send key among grants still awaiting a report.
++    pub(super) fn earliest(&self) -> Option<(Duration, u64)> {
++        self.workers
++            .iter()
++            .flatten()
++            .map(|grant| (grant.issued, grant.id))
++            .min()
++    }
++
+     /// Submitted outer bytes not yet settled by an ACK or loss report.
+     pub const fn in_flight(&self) -> u64 {
+         self.in_flight
+diff --git a/src/pacing/sender.rs b/src/pacing/sender.rs
+index 27b892d..0781cf3 100644
+--- a/src/pacing/sender.rs
++++ b/src/pacing/sender.rs
+@@ -1,7 +1,7 @@
+ //! Ordered send accounting and shared delivery metadata for the control owner.
+ use super::{Grant, GrantError, Grants, Limits};
+ use crate::bbr::{Delivery, DeliveryError, DeliveryPacket, LossSample, RateSample};
+-use std::{cmp::Reverse, io, mem::size_of, num::NonZeroU16, time::Duration};
++use std::{io, mem::size_of, num::NonZeroU16, time::Duration};
+ 
+ const BATCH: usize = 64;
+ 
+@@ -56,6 +56,10 @@ pub struct Flight {
+ }
+ 
+ impl Flight {
++    fn order(&self) -> (Option<Duration>, u64) {
++        (self.started, self.grant.map_or(0, |grant| grant.id))
++    }
++
+     /// Worker to which the buffer must return.
+     pub const fn worker(&self) -> usize {
+         self.worker
+@@ -222,7 +226,6 @@ struct Slot {
+ enum Phase {
+     Open,
+     Closing,
+-    Commit,
+     Feedback,
+ }
+ 
+@@ -240,12 +243,26 @@ struct Group {
+     ack: bool,
+ }
+ 
++impl Group {
++    fn commit_pending(&self) -> bool {
++        if self.phase == Phase::Feedback {
++            return false;
++        }
++        let Some(report) = self.reports.last() else {
++            return self.phase == Phase::Closing && self.grants.reserved() == 0;
++        };
++        self.grants
++            .earliest()
++            .is_none_or(|(at, id)| report.order() < (Some(at), id))
++    }
++}
++
+ /// Control-owner accounting for every sending path group in one daemon.
+ ///
+ /// A shared slab retains at most 65,535 complete delivery snapshots. Each group
+-/// closes issuance on its first completion or explicit close, awaits all grant
+-/// reports, then commits runs in timestamp/grant order before applying feedback.
+-/// Before closure, outstanding reserved bytes also bound cumulative epoch bytes.
++/// commits completed runs in timestamp/grant order once outstanding grants cannot
++/// precede them. Issuance may continue until explicit closure for feedback;
++/// feedback waits for every grant report and ordered commit.
+ ///
+ /// The caller supplies controller limits and consumes rate/loss samples in group
+ /// order. Runtime report routing, timers and controller activation are separate.
+@@ -445,9 +462,6 @@ impl Sender {
+             .grants
+             .reserve(flight.worker, bytes, probe, limits, now)?;
+         state.planned += flight.count;
+-        if state.grants.reserved() == u64::from(bytes) {
+-            state.sample_flight = state.grants.in_flight();
+-        }
+         for record in records {
+             let handle = self.free.ok_or(GrantError::Invalid)?;
+             let slot = self
+@@ -547,7 +561,10 @@ impl Sender {
+         match self.accept_report(&flight) {
+             Ok(group) => {
+                 if let Some(state) = self.groups.get_mut(group) {
+-                    state.reports.push(flight);
++                    let index = state
++                        .reports
++                        .partition_point(|report| report.order() > flight.order());
++                    state.reports.insert(index, flight);
+                     return Ok(());
+                 }
+                 Err((GrantError::Invalid, flight))
+@@ -594,7 +611,7 @@ impl Sender {
+         }
+         state.grants.reported(grant, bytes, flight.started)?;
+         state.sent_bytes += u64::from(bytes);
+-        state.phase = Phase::Closing;
++        state.planned -= flight.count - flight.successful;
+         for record in records.iter().skip(flight.successful) {
+             Self::release(
+                 &mut self.slots,
+@@ -608,29 +625,17 @@ impl Sender {
+ 
+     /// Commits at most budget physical packets and returns at most one reusable flight.
+     ///
+-    /// No send can commit until every issued grant reports. Ordering sorts at
+-    /// most 64 completion descriptors once; each returned flight's samples are
+-    /// installed before its worker can reuse the buffer. Poll feedback_ready
+-    /// after servicing returns. A zero budget makes no progress.
++    /// Commit only runs preceding every unreported grant's earliest possible send.
++    /// Returned flights have all successful samples installed before worker reuse.
++    /// Explicit closure or a naturally drained group enters feedback only after
++    /// every send commits. A zero budget makes no progress.
+     pub fn advance(
+         &mut self,
+         group: usize,
+         budget: usize,
+     ) -> Result<Option<Box<Flight>>, GrantError> {
+         let state = self.groups.get_mut(group).ok_or(GrantError::Invalid)?;
+-        if budget == 0 || state.grants.reserved() != 0 {
+-            return Ok(None);
+-        }
+-        if state.phase == Phase::Closing {
+-            state.reports.sort_unstable_by_key(|report| {
+-                Reverse((
+-                    report.started.unwrap_or(Duration::ZERO),
+-                    report.grant.map_or(0, |grant| grant.id),
+-                ))
+-            });
+-            state.phase = Phase::Commit;
+-        }
+-        if state.phase != Phase::Commit {
++        if budget == 0 || !state.commit_pending() {
+             return Ok(None);
+         }
+         let Some(report) = state.reports.last_mut() else {
+@@ -666,6 +671,7 @@ impl Sender {
+                 charged: true,
+             };
+             state.sample_flight += u64::from(slot.bytes);
++            state.planned -= 1;
+             report.cursor += 1;
+         }
+         if report.cursor != report.successful {
+@@ -676,7 +682,7 @@ impl Sender {
+         report.group = None;
+         report.grant = None;
+         report.count = 0;
+-        if state.reports.is_empty() {
++        if state.reports.is_empty() && state.grants.reserved() == 0 {
+             state.phase = Phase::Feedback;
+         }
+         Ok(Some(report))
+@@ -684,23 +690,21 @@ impl Sender {
+ 
+     /// Whether a bounded commit pass can continue without another worker report.
+     pub(crate) fn commit_pending(&self, group: usize) -> bool {
+-        self.groups.get(group).is_some_and(|state| {
+-            state.grants.reserved() == 0 && matches!(state.phase, Phase::Closing | Phase::Commit)
+-        })
++        self.groups.get(group).is_some_and(Group::commit_pending)
+     }
+ 
+-    /// Whether all epoch sends have committed and feedback may be consumed.
++    /// Whether all issued sends have committed and feedback may be consumed.
+     pub fn feedback_ready(&self, group: usize) -> bool {
+         self.groups
+             .get(group)
+             .is_some_and(|state| state.phase == Phase::Feedback)
+     }
+ 
+-    /// Starts a new issuance epoch after the caller's bounded feedback pass.
++    /// Reopens issuance after the caller's bounded feedback pass.
+     pub fn reopen(&mut self, group: usize) -> Result<(), GrantError> {
+         let state = self.feedback(group, false)?;
+         state.phase = Phase::Open;
+-        state.planned = 0;
++        state.sample_flight = state.grants.in_flight();
+         Ok(())
+     }
+ 
+@@ -910,6 +914,92 @@ mod tests {
+         assert!(!sender.commit_pending(1));
+     }
+ 
++    #[test]
++    fn rolling_identity_and_lifetime_reservations_release_only_unused_packets() {
++        for packet_limit in [true, false] {
++            let (mut sender, flights) = Sender::new(1, 2, 3).unwrap();
++            let mut flights = flights.into_vec();
++            let mut b = flights.pop().unwrap();
++            let mut a = flights.pop().unwrap();
++            let packet = Planned {
++                id: PacketId {
++                    number: 1,
++                    ..PacketId::default()
++                },
++                bytes: 100,
++            };
++            let limits = Limits {
++                window: 1280,
++                rate: 1_000_000_000,
++                quantum: 1280,
++                max_datagram: 1280,
++            };
++            if packet_limit {
++                sender.groups[0].delivery.limit_packets_for_test(2);
++            } else {
++                sender.groups[0].sent_bytes = u64::MAX - 200;
++            }
++            a.prepare(&[packet]).unwrap();
++            b.prepare(&[Planned {
++                id: PacketId {
++                    lane: 1,
++                    ..packet.id
++                },
++                ..packet
++            }])
++            .unwrap();
++            sender
++                .reserve(0, &mut a, false, limits, Duration::ZERO)
++                .unwrap();
++            sender
++                .reserve(0, &mut b, false, limits, Duration::from_micros(10))
++                .unwrap();
++            a.complete(1, Some(Duration::from_micros(1)), false)
++                .unwrap();
++            sender.reported(a).unwrap();
++            let mut a = sender.advance(0, 1).unwrap().unwrap();
++            assert_eq!(sender.groups[0].planned, 1);
++            a.prepare(&[Planned {
++                id: PacketId {
++                    number: 2,
++                    ..packet.id
++                },
++                ..packet
++            }])
++            .unwrap();
++            assert_eq!(
++                sender.reserve(0, &mut a, false, limits, Duration::from_micros(20)),
++                Err(GrantError::Exhausted)
++            );
++            b.complete(0, None, false).unwrap();
++            sender.reported(b).unwrap();
++            assert_eq!(sender.groups[0].planned, 0);
++            sender
++                .reserve(0, &mut a, false, limits, Duration::from_micros(21))
++                .unwrap();
++            let _b = sender.advance(0, 1).unwrap().unwrap();
++            a.complete(1, Some(Duration::from_micros(22)), false)
++                .unwrap();
++            sender.reported(a).unwrap();
++            let mut a = sender.advance(0, 1).unwrap().unwrap();
++            assert_eq!(sender.groups[0].planned, 0);
++            assert_eq!(sender.groups[0].sample_flight, 200);
++            sender.reopen(0).unwrap();
++            a.prepare(&[Planned {
++                id: PacketId {
++                    number: 3,
++                    ..packet.id
++                },
++                ..packet
++            }])
++            .unwrap();
++            assert_eq!(
++                sender.reserve(0, &mut a, false, limits, Duration::from_micros(23)),
++                Err(GrantError::Exhausted)
++            );
++        }
++    }
++
+     #[test]
+     fn identity_and_lifetime_byte_exhaustion_precede_permission_to_send() {
+         for packet_limit in [true, false] {
+@@ -1030,7 +1120,7 @@ mod reidentify_tests {
+         assert_eq!(flight.packets().next().unwrap().id.number, 1);
+         assert_eq!(sender.slots[usize::from(handles[0].get()) - 1].id.number, 1);
+         sender.slots[second].bytes = 1280;
+-        sender.close(0).unwrap(); // Another completion may already have closed the epoch.
++        sender.close(0).unwrap(); // Feedback may already have closed issuance.
+         sender.reidentify(&mut flight, 20).unwrap();
+         assert_eq!(flight.grant().unwrap().id, grant.id);
+         assert_eq!(sender.flight_bytes(0), reserved);
+diff --git a/tests/sender.rs b/tests/sender.rs
+index a8abb61..b710461 100644
+--- a/tests/sender.rs
++++ b/tests/sender.rs
+@@ -285,7 +285,7 @@ fn stale_handles_and_every_identity_component_are_rejected_after_reuse() {
+ }
+ 
+ #[test]
+-fn first_unused_report_closes_issuance_without_recycling_its_credit() {
++fn unused_reports_return_credit_but_expired_unreported_grants_keep_their_share() {
+     let (mut sender, flights) = Sender::new(1, 3, 3).unwrap();
+     let mut flights = buffers(flights);
+     let mut c = flights.pop().unwrap();
+@@ -307,25 +307,235 @@ fn first_unused_report_closes_issuance_without_recycling_its_credit() {
+     a.complete(0, None, false).unwrap();
+     assert_eq!(a.complete(0, None, false), Err(Error::Stale));
+     sender.reported(a).unwrap();
++    let mut a = commit(&mut sender, 0);
++    assert!(!sender.feedback_ready(0));
+     assert_eq!(sender.flight_bytes(0), Some((100, 0)));
++    sender.reserve(0, &mut c, false, limits, us(200)).unwrap();
++    a.prepare(&[packet(0, 2, 100)]).unwrap();
+     assert_eq!(
+-        sender.reserve(0, &mut c, false, limits, us(200)),
++        sender.reserve(0, &mut a, false, limits, us(201)),
+         Err(Error::Blocked)
+     );
+-    assert!(sender.advance(0, 64).unwrap().is_none());
++    sender.close(0).unwrap();
+     b.complete(0, None, false).unwrap();
+     sender.reported(b).unwrap();
+-    let _a = commit(&mut sender, 0);
+     let _b = commit(&mut sender, 0);
+     assert_eq!(
+-        sender.reserve(0, &mut c, false, limits, us(201)),
++        sender.reserve(0, &mut a, false, limits, us(202)),
+         Err(Error::Blocked)
+     );
+-    sender.reopen(0).unwrap();
+-    sender.reserve(0, &mut c, false, limits, us(201)).unwrap();
+     c.complete(0, None, false).unwrap();
+     sender.reported(c).unwrap();
+     let _c = commit(&mut sender, 0);
++    sender.reopen(0).unwrap();
++    sender.reserve(0, &mut a, false, limits, us(203)).unwrap();
++}
++
++#[test]
++fn safe_prefix_recycles_before_later_grants_and_feedback_closes_rolling_issuance() {
++    let (mut sender, flights) = Sender::new(1, 3, 6).unwrap();
++    let mut flights = buffers(flights);
++    let mut spare = flights.pop().unwrap();
++    let mut b = flights.pop().unwrap();
++    let mut a = flights.pop().unwrap();
++    let first = packet(0, 1, 100);
++    let later = packet(1, 1, 200);
++    let middle = packet(0, 2, 300);
++    a.prepare(&[first]).unwrap();
++    b.prepare(&[later]).unwrap();
++    spare.prepare(&[packet(2, 1, 100)]).unwrap();
++    sender.reserve(0, &mut a, false, limits(), us(0)).unwrap();
++    let first_handle = a.handle(0).unwrap();
++    sender.reserve(0, &mut b, false, limits(), us(10)).unwrap();
++    let later_handle = b.handle(0).unwrap();
++    a.complete(1, Some(us(1)), false).unwrap();
++    sender.reported(a).unwrap();
++    let mut a = commit(&mut sender, 0);
++    assert_eq!(sender.flight_bytes(0), Some((200, 100)));
++    assert!(!sender.feedback_ready(0));
++    a.prepare(&[middle]).unwrap();
++    sender.reserve(0, &mut a, false, limits(), us(20)).unwrap();
++    let middle_handle = a.handle(0).unwrap();
++    b.complete(1, Some(us(30)), false).unwrap();
++    sender.reported(b).unwrap();
++    assert!(sender.advance(0, 64).unwrap().is_none());
++    sender.close(0).unwrap();
++    assert_eq!(
++        sender.reserve(0, &mut spare, false, limits(), us(31)),
++        Err(Error::Blocked)
++    );
++    assert_eq!(sender.begin_ack(0, us(100), false), Err(Error::Blocked));
++    a.complete(1, Some(us(21)), false).unwrap();
++    sender.reported(a).unwrap();
++    let a = commit(&mut sender, 0);
++    assert_eq!(a.worker(), 0);
++    let b = commit(&mut sender, 0);
++    assert_eq!(b.worker(), 1);
++    assert!(sender.feedback_ready(0));
++    for (index, (packet, handle, flight)) in [
++        (first, first_handle, 100),
++        (middle, middle_handle, 400),
++        (later, later_handle, 600),
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        let sample = acknowledge(&mut sender, 0, packet, handle, 100 + index as u64);
++        assert_eq!(
++            (sample.last_packet, sample.tx_in_flight),
++            (index as u64 + 1, flight)
++        );
++    }
++    assert_eq!(sender.flight_bytes(0), Some((0, 0)));
++    sender.reopen(0).unwrap();
++    sender
++        .reserve(0, &mut spare, false, limits(), us(103))
++        .unwrap();
++}
++
++#[test]
++fn replacement_grants_do_not_charge_uncommitted_reports_twice() {
++    let (mut sender, flights) = Sender::new(1, 3, 3).unwrap();
++    let mut flights = buffers(flights);
++    let mut c = flights.pop().unwrap();
++    let mut b = flights.pop().unwrap();
++    let mut a = flights.pop().unwrap();
++    let plans = [packet(0, 1, 100), packet(1, 1, 200), packet(2, 1, 300)];
++    let mut handles = [None; 3];
++    for (worker, flight) in [&mut a, &mut b].into_iter().enumerate() {
++        flight.prepare(&plans[worker..worker + 1]).unwrap();
++        sender
++            .reserve(0, flight, false, limits(), us(worker as u64 * 10))
++            .unwrap();
++        handles[worker] = flight.handle(0);
++    }
++    a.complete(1, Some(us(30)), false).unwrap();
++    b.complete(1, Some(us(20)), false).unwrap();
++    sender.reported(a).unwrap();
++    sender.reported(b).unwrap();
++    c.prepare(&plans[2..]).unwrap();
++    sender.reserve(0, &mut c, false, limits(), us(40)).unwrap();
++    handles[2] = c.handle(0);
++    let _b = commit(&mut sender, 0);
++    let _a = commit(&mut sender, 0);
++    c.complete(1, Some(us(41)), false).unwrap();
++    sender.reported(c).unwrap();
++    let _c = commit(&mut sender, 0);
++    for (index, (worker, flight)) in [(1, 200), (0, 300), (2, 600)].into_iter().enumerate() {
++        let sample = acknowledge(
++            &mut sender,
++            0,
++            plans[worker],
++            handles[worker].unwrap(),
++            100 + index as u64,
++        );
++        assert_eq!(
++            (sample.last_packet, sample.tx_in_flight),
++            (index as u64 + 1, flight)
++        );
++    }
++}
++
++#[test]
++fn rolling_commits_match_chronological_sampler_for_all_short_orders_and_prefixes() {
++    use unquic::bbr::Delivery;
++    let permutations = [
++        [0, 1, 2],
++        [0, 2, 1],
++        [1, 0, 2],
++        [1, 2, 0],
++        [2, 0, 1],
++        [2, 1, 0],
++    ];
++    for counts in 0..27 {
++        for times in 0..27 {
++            for order in permutations {
++                let (mut sender, flights) = Sender::new(1, 3, 6).unwrap();
++                let flights: [Box<Flight>; 3] = flights.into_vec().try_into().unwrap();
++                let mut flights = flights.map(Some);
++                let plans: [[Planned; 2]; 3] = std::array::from_fn(|worker| {
++                    std::array::from_fn(|ordinal| {
++                        packet(
++                            worker as u16,
++                            ordinal as u64 + 1,
++                            100 + worker as u16 * 50 + ordinal as u16 * 25,
++                        )
++                    })
++                });
++                let successful: [usize; 3] =
++                    std::array::from_fn(|worker| counts / 3_usize.pow(worker as u32) % 3);
++                let starts: [Duration; 3] = std::array::from_fn(|worker| {
++                    us((worker * 10 + times / 3_usize.pow(worker as u32) % 3 * 10) as u64)
++                });
++                let mut handles = [[None; 2]; 3];
++                for (worker, slot) in flights.iter_mut().enumerate() {
++                    let flight = slot.as_mut().unwrap();
++                    flight.prepare(&plans[worker]).unwrap();
++                    sender
++                        .reserve(0, flight, false, limits(), us(worker as u64 * 10))
++                        .unwrap();
++                    handles[worker] = [flight.handle(0), flight.handle(1)];
++                    flight
++                        .complete(
++                            successful[worker],
++                            (successful[worker] != 0).then_some(starts[worker]),
++                            worker == 1,
++                        )
++                        .unwrap();
++                }
++                for (arrival, worker) in order.into_iter().enumerate() {
++                    sender.reported(flights[worker].take().unwrap()).unwrap();
++                    for _ in 0..6 {
++                        if let Some(flight) = sender.advance(0, 1).unwrap() {
++                            let worker = flight.worker();
++                            assert!(flights[worker].is_none());
++                            flights[worker] = Some(flight);
++                        }
++                    }
++                    assert_eq!(sender.feedback_ready(0), arrival == 2);
++                }
++                let mut chronology = Vec::new();
++                for (worker, &count) in successful.iter().enumerate() {
++                    for ordinal in 0..count {
++                        chronology.push((starts[worker], worker, ordinal));
++                    }
++                }
++                chronology.sort_unstable();
++                let mut reference = Delivery::new();
++                let mut inflight = 0;
++                let mut expected = Vec::new();
++                for (at, worker, ordinal) in chronology {
++                    let plan = plans[worker][ordinal];
++                    let sample = reference
++                        .sent(at, plan.bytes, inflight, worker == 1)
++                        .unwrap();
++                    inflight += u64::from(plan.bytes);
++                    expected.push((worker, ordinal, sample));
++                }
++                assert_eq!(sender.flight_bytes(0), Some((0, inflight)));
++                for (index, (worker, ordinal, mut packet)) in expected.into_iter().rev().enumerate()
++                {
++                    let at = 100 + index as u64;
++                    reference.begin_ack(us(at), false).unwrap();
++                    reference.acknowledged(&mut packet).unwrap();
++                    let sample = acknowledge(
++                        &mut sender,
++                        0,
++                        plans[worker][ordinal],
++                        handles[worker][ordinal].unwrap(),
++                        at,
++                    );
++                    assert_eq!(
++                        Some(sample),
++                        reference.finish_ack(Duration::ZERO).unwrap(),
++                        "counts={counts}, times={times}, order={order:?}"
++                    );
++                }
++                assert_eq!(sender.flight_bytes(0), Some((0, 0)));
++                assert_eq!(sender.available(), 6);
++            }
++        }
++    }
+ }
+ 
+ #[test]
