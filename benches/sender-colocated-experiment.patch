@@ -1,0 +1,469 @@
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -309,8 +309,8 @@
+         return None;
+     }
+     config.sessions.iter().try_fold(0_usize, |slots, session| {
+-        let peer = config.peers.iter().find(|peer| peer.name == session.peer)?;
+-        let owners = session.queue_count.max(peer.tx_lanes.min(workers));
++        let _ = config.peers.iter().find(|peer| peer.name == session.peer)?;
++        let owners = session.queue_count;
+         let quota = frames::CAPACITY.checked_div(owners)?;
+         Some(if id < owners {
+             slots.saturating_add(quota).min(frames::CAPACITY)
+@@ -320,6 +320,11 @@
+     })
+ }
+ 
++// Isolated diagnostic: keep wire lanes and receive owners, colocate all transmit state.
++fn tx_owner(_lane: usize, _workers: usize) -> usize {
++    0
++}
++
+ fn tap_lane(frame: &[u8], worker: usize, workers: usize, queues: usize, lanes: usize) -> usize {
+     // A session with fewer TAP queues still needs its other transmit workers.
+     if queues < workers || worker >= lanes || !pack::prefer_local_lane(frame) {
+@@ -809,16 +814,14 @@
+                 retire_pending: 0,
+                 tx: (0..config.peers[peer].tx_lanes).map(|_| None).collect(),
+                 batches: (0..config.peers[peer].tx_lanes)
+-                    .map(|lane| (lane % count == id).then(|| Box::new(TxBatch::new())))
++                    .map(|lane| (tx_owner(lane, count) == id).then(|| Box::new(TxBatch::new())))
+                     .collect(),
+                 tx_ready: 0,
+                 command: None,
+                 acknowledged: None,
+                 installed: None,
+                 totals: Snapshot::default(),
+-                tx_workers: session
+-                    .queue_count
+-                    .max(config.peers[peer].tx_lanes.min(count)),
++                tx_workers: session.queue_count,
+                 tx_retained: 0,
+                 tx_bytes: 0,
+                 tap_inputs: VecDeque::with_capacity(BUFFERS),
+@@ -862,12 +865,16 @@
+             config
+                 .peers
+                 .iter()
+-                .map(|peer| 2 * (id..peer.tx_lanes).step_by(count).count())
++                .map(|peer| {
++                    2 * (0..peer.tx_lanes)
++                        .filter(|&lane| tx_owner(lane, count) == id)
++                        .count()
++                })
+                 .sum(),
+         );
+         for (peer, config) in config.peers.iter().enumerate() {
+             for path in 0..2 {
+-                for lane in (id..config.tx_lanes).step_by(count) {
++                for lane in (0..config.tx_lanes).filter(|&lane| tx_owner(lane, count) == id) {
+                     mtu_jobs.push((peer, path, lane));
+                 }
+             }
+@@ -1498,7 +1505,7 @@
+                     continue;
+                 };
+                 for (lane, tx) in path.lanes.iter_mut().enumerate() {
+-                    if lane % self.shared.workers() != self.id || tx.socket.is_some() {
++                    if tx_owner(lane, self.shared.workers()) != self.id || tx.socket.is_some() {
+                         continue;
+                     }
+                     // A dynamic port must differ from every configured fixed port.
+@@ -1537,7 +1544,7 @@
+                     .iter()
+                     .enumerate()
+                     .all(|(lane, tx)| {
+-                        lane % self.shared.workers() != self.id || tx.socket.is_some()
++                        tx_owner(lane, self.shared.workers()) != self.id || tx.socket.is_some()
+                     })
+             {
+                 self.shared.address_ready[index * self.shared.workers() + self.id]
+@@ -1961,7 +1968,7 @@
+                             packet_number,
+                             payload_len,
+                         } if lane != 0 && usize::from(lane) <= self.sessions[session].tx.len() => {
+-                            let owner = (usize::from(lane) - 1) % self.shared.workers();
++                            let owner = tx_owner(usize::from(lane) - 1, self.shared.workers());
+                             if self.id == owner {
+                                 self.feedback(session, lane, packet_number, payload_len, now);
+                             } else {
+@@ -2242,7 +2249,7 @@
+ 
+     fn dispatch_frame(&mut self, buffer: Box<Buffer>, now: Duration) -> io::Result<()> {
+         let session = buffer.session;
+-        let owner = buffer.lane % self.shared.workers();
++        let owner = tx_owner(buffer.lane, self.shared.workers());
+         if owner == self.id {
+             self.input_frame(buffer, now)?;
+         } else if let Err(Event::Frame(buffer)) = self.push(owner, Event::Frame(buffer)) {
+@@ -3236,7 +3243,7 @@
+     // shortcut: static worker slots waste idle shares; replace with control grants in pacing.rs.
+     fn probe_time(&self, now: Duration) -> Duration {
+         let slot = now.as_millis() / 3;
+-        let workers = self.shared.workers() as u128;
++        let workers = 1_u128;
+         let owner = slot % workers;
+         let mut distance = (self.id as u128 + workers - owner) % workers;
+         if distance == 0 && self.probe_slot != Some(slot) {
+@@ -3812,9 +3819,9 @@
+                 for (index, lane) in local.tx.iter_mut().enumerate() {
+                     *lane = command
+                         .connection
+-                        .filter(|_| index % self.shared.workers() == self.id)
++                        .filter(|_| tx_owner(index, self.shared.workers()) == self.id)
+                         .map(|c| pack::Lane::new(cookie, c, index as u16 + 1).unwrap());
+-                    if index % self.shared.workers() == self.id {
++                    if tx_owner(index, self.shared.workers()) == self.id {
+                         let mtu = &self.transmit[peer].paths[path].lanes[index].mtu;
+                         let limit = mtu.payload_limit();
+                         local.tx_totals[index] = Snapshot {
+@@ -6009,7 +6016,7 @@
+                 for lanes in [1, 3, 64] {
+                     config.peers[0].tx_lanes = lanes;
+                     config.sessions[0].queue_count = queues;
+-                    let owners = queues.max(lanes.min(workers));
++                    let owners = queues;
+                     let expected = frames::CAPACITY / owners;
+                     for id in 0..workers {
+                         assert_eq!(
+@@ -6952,6 +6959,14 @@
+     }
+ 
+     pub(super) fn test_workers() -> (Arc<Shared>, [Worker; 2]) {
++        let (shared, workers) = test_workers_with_layout(2, 2);
++        (shared, workers.try_into().ok().unwrap())
++    }
++
++    pub(super) fn test_workers_with_layout(
++        worker_count: usize,
++        lane_count: usize,
++    ) -> (Arc<Shared>, Vec<Worker>) {
+         use crate::config::{Config, Daemon, Endpoint, Peer, Session as ConfigSession};
+         use std::{
+             net::Ipv6Addr,
+@@ -6972,7 +6987,7 @@
+                 address: Some(Ipv6Addr::LOCALHOST),
+                 peer_port: 40001,
+                 scope_id: 0,
+-                tx_lanes: 2,
++                tx_lanes: lane_count,
+                 outer_payload_limit: BASE_UDP_PAYLOAD,
+                 path_group: None,
+             }],
+@@ -6983,7 +6998,7 @@
+                 tap_name: None,
+                 inner_mtu: 1500,
+                 mac: None,
+-                queue_count: 2,
++                queue_count: worker_count,
+             }],
+         };
+         let mut second = config.sessions[0].clone();
+@@ -6993,21 +7008,29 @@
+         let config = config.validate().unwrap();
+         let shared = Arc::new(Shared {
+             config,
+-            wakes: (0..2).map(|_| Arc::new(Wake::new().unwrap())).collect(),
++            wakes: (0..worker_count)
++                .map(|_| Arc::new(Wake::new().unwrap()))
++                .collect(),
+             owners: (0..2)
+                 .map(|_| (0..65_536).map(|_| AtomicU8::new(0)).collect())
+                 .collect(),
+             status: (0..2).map(|_| AtomicU8::new(0)).collect(),
+             generations: (0..2).map(|_| AtomicU64::new(0)).collect(),
+-            counters: (0..2).map(|_| crate::counters::Counters::new()).collect(),
+-            session_counters: (0..4).map(|_| crate::counters::Counters::new()).collect(),
+-            peer_counters: (0..2).map(|_| crate::counters::Counters::new()).collect(),
+-            receive_counters: (0..4 * LANES)
++            counters: (0..worker_count)
++                .map(|_| crate::counters::Counters::new())
++                .collect(),
++            session_counters: (0..2 * worker_count)
++                .map(|_| crate::counters::Counters::new())
++                .collect(),
++            peer_counters: (0..worker_count)
++                .map(|_| crate::counters::Counters::new())
++                .collect(),
++            receive_counters: (0..2 * worker_count * LANES)
+                 .map(|_| crate::counters::LaneCounters::new())
+                 .collect(),
+             transmit_counters: (0..2)
+                 .map(|_| {
+-                    (0..2)
++                    (0..lane_count)
+                         .map(|_| crate::counters::LaneCounters::new())
+                         .collect()
+                 })
+@@ -7015,14 +7038,16 @@
+             bound: vec![AtomicU64::new(0)],
+             requests: std::sync::Mutex::new(crate::spsc::channel().0),
+             address_pending: vec![std::sync::atomic::AtomicBool::new(false)],
+-            address_ready: (0..2).map(|_| AtomicU64::new(0)).collect(),
+-        });
+-        let workers: [Worker; 2] = std::array::from_fn(|id| {
+-            let mut worker = Worker::new(id, Arc::clone(&shared), Control::new()).unwrap();
+-            worker.io_time = Some(Ok);
+-            worker.unpaced_fixture = true;
+-            worker
++            address_ready: (0..worker_count).map(|_| AtomicU64::new(0)).collect(),
+         });
++        let workers = (0..worker_count)
++            .map(|id| {
++                let mut worker = Worker::new(id, Arc::clone(&shared), Control::new()).unwrap();
++                worker.io_time = Some(Ok);
++                worker.unpaced_fixture = true;
++                worker
++            })
++            .collect();
+ 
+         (shared, workers)
+     }
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -245,8 +245,8 @@
+             let peer = config
+                 .peer_for_session(session)
+                 .ok_or(io::ErrorKind::InvalidInput)?;
+-            let count = (id..config.config().peers[peer].tx_lanes)
+-                .step_by(workers)
++            let count = (0..config.config().peers[peer].tx_lanes)
++                .filter(|&lane| tx_owner(lane, workers) == id)
+                 .count();
+             let next = offsets
+                 .last()
+@@ -266,7 +266,9 @@
+             let group = config
+                 .path_group_for_peer(peer)
+                 .ok_or(io::ErrorKind::InvalidInput)?;
+-            for lane in (id..config.config().peers[peer].tx_lanes).step_by(workers) {
++            for lane in (0..config.config().peers[peer].tx_lanes)
++                .filter(|&lane| tx_owner(lane, workers) == id)
++            {
+                 lanes.push(Lane::new(session, lane as u16 + 1, group)?);
+             }
+         }
+@@ -330,10 +332,10 @@
+     }
+ 
+     fn lane_index(&self, session: usize, lane: usize, workers: usize, id: usize) -> Option<usize> {
+-        if lane % workers != id {
++        if tx_owner(lane, workers) != id {
+             return None;
+         }
+-        let index = self.offsets.get(session)?.checked_add(lane / workers)?;
++        let index = self.offsets.get(session)?.checked_add(lane)?;
+         (index < *self.offsets.get(session + 1)?).then_some(index)
+     }
+ 
+@@ -403,7 +405,7 @@
+         for (slot, range) in ack.ranges.iter_mut().zip(ranges.iter()) {
+             *slot = range;
+         }
+-        let owner = (usize::from(lane) - 1) % self.shared.workers();
++        let owner = tx_owner(usize::from(lane) - 1, self.shared.workers());
+         if owner == self.id {
+             self.sender.incoming.push_back(ack);
+         } else {
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -414,7 +414,7 @@
+                 .filter(|id| self.timers.matches(*id))
+                 .or_else(|| self.timers.installed(group))
+         {
+-            let worker = (usize::from(id.lane) - 1) % self.requests.len();
++            let worker = tx_owner(usize::from(id.lane) - 1, self.requests.len());
+             let preempt = self.requests[worker]
+                 .as_ref()
+                 .is_some_and(|r| r.probe.is_none());
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -1,4 +1,4 @@
+-use super::super::tests::test_workers;
++use super::super::tests::{test_workers, test_workers_with_layout};
+ use super::*;
+ 
+ fn workers() -> ([Worker; 2], ReceiveSocket) {
+@@ -2503,3 +2503,181 @@
+     worker.service_sender(RETRY).unwrap();
+     assert!(worker.sender.job.is_some_and(|job| job.session == 0));
+ }
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn colocated_transmit_ownership_keeps_eight_wire_lanes_and_bounded_storage() {
++    let (shared, mut workers) = test_workers_with_layout(8, 8);
++    let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
++    assert_eq!(shared.workers(), 8);
++    let params = wire::Params {
++        port: 40000,
++        max_frame_len: 9022,
++        mandatory_features: 0,
++        optional_features: 0,
++    };
++    let connection = Connection {
++        role: handshake::Role::Initiator,
++        initiator: Tag::new(1).unwrap(),
++        responder: Tag::new(2).unwrap(),
++        local: params,
++        peer: wire::Params {
++            port: 40001,
++            ..params
++        },
++        max_frame_len: 9022,
++    };
++    Worker::init_senders(&mut workers).unwrap();
++    for worker in &mut workers {
++        worker.unpaced_fixture = false;
++        let owns = worker.id == 0;
++        assert_eq!(worker.mtu_jobs.len(), if owns { 16 } else { 0 });
++        assert_eq!(worker.frames.available(), 2 * frame_quota(8));
++        assert_eq!(worker.sender.lanes.len(), if owns { 16 } else { 0 });
++        for session in 0..2 {
++            worker
++                .command(
++                    session,
++                    Command {
++                        generation: 1,
++                        phase: Phase::Install,
++                        connection: Some(connection),
++                    },
++                    0,
++                )
++                .unwrap();
++            let local = &worker.sessions[session];
++            assert_eq!(local.tx.len(), 8);
++            assert_eq!(local.tx_workers, 8);
++            for lane in 0..8 {
++                assert_eq!(local.batches[lane].is_some(), owns);
++                assert_eq!(local.tx[lane].is_some(), owns);
++                assert_eq!(
++                    worker.sender_index(session, lane).ok(),
++                    owns.then_some(session * 8 + lane)
++                );
++            }
++        }
++        worker.setup(Duration::from_secs(1)).unwrap();
++        assert_eq!(
++            worker.transmit[0].paths[0]
++                .lanes
++                .iter()
++                .filter(|lane| lane.socket.is_some())
++                .count(),
++            if owns { 8 } else { 0 },
++        );
++        if !owns {
++            let (tx, mut rx) = crate::spsc::channel();
++            worker.outgoing[0] = Some(tx);
++            worker
++                .sender_message(
++                    Message::CheckLoss {
++                        group: 0,
++                        token: 1,
++                        before: Duration::ZERO,
++                        force: false,
++                    },
++                    Duration::ZERO,
++                )
++                .unwrap();
++            worker.service_sender(Duration::ZERO).unwrap();
++            assert!(matches!(rx.try_pop(), Some(Event::Sender(
++                Message::LossChecked {
++                    worker: id, group: 0, token: 1, ..
++                }
++            )) if id == worker.id));
++            assert!(!worker.mtu_timers(Duration::ZERO).unwrap());
++            assert!(worker.deadline(Duration::ZERO).unwrap() > Duration::ZERO);
++        }
++    }
++    assert!(frame_quota(8) * workers.len() <= frames::CAPACITY);
++    assert_eq!(workers[0].pending_receive.len(), 7);
++    for from in 0..workers.len() {
++        for to in 0..workers.len() {
++            if from != to {
++                let (tx, rx) = crate::spsc::channel();
++                workers[from].outgoing[to] = Some(tx);
++                workers[to].incoming[from] = Some(rx);
++            }
++        }
++    }
++    for lane in 0..8 {
++        let worker = &mut workers[0];
++        let mut frame = worker.free.pop().unwrap();
++        frame.session = 0;
++        frame.lane = lane;
++        frame.tag = 1;
++        frame.length = 60;
++        frame.bytes[..60].fill(lane as u8);
++        frame.deadline = Duration::from_secs(1);
++        frame.tx_reserved = true;
++        worker.sessions[0].tx_retained += 1;
++        worker.sessions[0].tx_bytes += 60;
++        worker.input_frame(frame, Duration::ZERO).unwrap();
++    }
++    let mut seen = 0_u8;
++    let mut storage = [0; BASE_UDP_PAYLOAD];
++    for tick in 0..100 {
++        let now = Duration::from_micros(tick * 100);
++        for worker in &mut workers {
++            worker.drain_queues(now).unwrap();
++            worker.service_sender(now).unwrap();
++            worker.flush_frames(now).unwrap();
++        }
++        while let Ok((length, _)) = rx.recv(&mut storage) {
++            let datagram = Datagram::decode(&storage[..length]).unwrap();
++            let header = datagram.header();
++            assert!((1..=8).contains(&header.lane));
++            let lane = (header.lane - 1) as u8;
++            for record in datagram.records() {
++                if let Record::Data {
++                    offset,
++                    total_len,
++                    bytes,
++                    ..
++                } = record
++                {
++                    assert_eq!(offset, 0);
++                    assert_eq!(total_len, 60);
++                    assert_eq!(bytes, &[lane; 60]);
++                    assert_eq!(seen & (1 << lane), 0);
++                    seen |= 1 << lane;
++                }
++            }
++            let range = [crate::wire::AckRange {
++                start: header.packet_number,
++                end: header.packet_number,
++            }];
++            workers[0]
++                .incoming_ack(
++                    0,
++                    1,
++                    header.lane,
++                    0,
++                    crate::wire::AckRanges::new(&range).unwrap(),
++                    now,
++                )
++                .unwrap();
++        }
++    }
++    assert_eq!(seen, u8::MAX);
++    assert!(
++        workers[0]
++            .sender
++            .lanes
++            .iter()
++            .all(|lane| lane.history.inflight_bytes() == 0)
++    );
++    assert_eq!(
++        workers[0]
++            .sender
++            .owner
++            .as_ref()
++            .unwrap()
++            .snapshot(0)
++            .unwrap()
++            .bytes_in_flight,
++        0
++    );
++}

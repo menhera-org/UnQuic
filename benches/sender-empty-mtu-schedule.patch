@@ -1,0 +1,14 @@
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -4054,7 +4054,10 @@
+     }
+ 
+     fn deadline(&self, now: Duration) -> Option<Duration> {
+-        let mut due = self.setup_due.min(self.mtu_due);
++        let mut due = self.setup_due;
++        if !self.mtu_jobs.is_empty() {
++            due = due.min(self.mtu_due);
++        }
+         if let Some(at) = self.sender.owner.as_ref().and_then(|owner| owner.due) {
+             due = due.min(at);
+         }

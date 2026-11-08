@@ -83,6 +83,89 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Eight-lane transmit-owner colocation (November 8)
+
+Moving every transmit lane to the congestion owner does not fix the throughput
+limit and worsens overload behavior in this matched comparison. Production keeps
+distributed transmit ownership.
+
+The diagnostic retains eight wire lanes, receive owners, workers and TAP queues.
+Transmit packing, socket I/O, histories, ACK processing and congestion ownership
+all run on worker zero. The frame and byte bounds stay unchanged; all eight
+transmit lanes consequently share that worker's existing 1024-frame quota.
+Serial preparation and concentrated retention are confounders. This experiment
+does not rule out parallel preparation followed by owner-executed submission.
+
+Both builds include the empty-MTU-schedule fix and normal controller settings.
+The twenty-second bidirectional release-musl A/B/A sweeps use sixteen QinQ
+flows, 1522-byte frames, active PMTU capped at 1452-byte UDP payloads, fixed CPU
+placement and 500-entry TAP queues. Local builds, kernel tests and Git packing
+were stopped throughout load. [Raw observations](benches/tap-sender-colocated.json)
+include exact binaries, source chain, counters and separate CPU/counter intervals.
+
+| Build | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| Baseline before | 1 Gbit/s | 0.990 / 0.981 | 0.09 / 0.97 | 101.88 / 97.22 |
+| Baseline before | 4 Gbit/s | 1.664 / 1.537 | 57.71 / 61.00 | 217.15 / 207.53 |
+| Baseline before | 21 Gbit/s | 1.756 / 1.560 | 91.51 / 92.46 | 220.18 / 208.53 |
+| Baseline before | Unlimited | 1.732 / 1.563 | 97.08 / 97.03 | 216.31 / 206.94 |
+| Colocated | 1 Gbit/s | 0.980 / 0.979 | 1.02 / 1.11 | 78.84 / 80.28 |
+| Colocated | 4 Gbit/s | 1.934 / 1.619 | 51.17 / 59.13 | 157.56 / 155.28 |
+| Colocated | 21 Gbit/s | 1.668 / 1.471 | 91.98 / 92.92 | 212.39 / 207.68 |
+| Colocated | Unlimited | 1.523 / 1.250 | 95.38 / 95.83 | 225.63 / 221.91 |
+| Baseline repeat | 1 Gbit/s | 0.982 / 0.983 | 0.92 / 0.83 | 102.48 / 98.61 |
+| Baseline repeat | 4 Gbit/s | 1.696 / 1.558 | 56.91 / 60.47 | 215.57 / 207.54 |
+| Baseline repeat | 21 Gbit/s | 1.748 / 1.586 | 91.54 / 92.32 | 222.70 / 208.87 |
+| Baseline repeat | Unlimited | 1.744 / 1.585 | 96.96 / 96.91 | 216.41 / 207.88 |
+
+Colocation improves the 4 Gbit/s point, then loses 21.25 / 22.78% of its peak
+under unlimited load. Its unlimited goodput is below both baseline runs.
+Actual unlimited offered rates are 60.24 / 53.34, 33.26 / 30.26 and
+58.11 / 52.02 Gbit/s respectively; the candidate collapses despite receiving
+less offered traffic. This is not a verified CPU ceiling.
+
+| Unlimited build | Admission pressure L / R | Expired frames L / R | Queue drops L / R | TAP TX drops L / R |
+| --- | --- | --- | --- | --- |
+| Baseline before | 14648 / 3950 | 1351859 / 1957073 | 1526 / 24229 | 2230697 / 1934668 |
+| Colocated | 0 / 0 | 2932501 / 3287297 | 1149868 / 1042676 | 13198 / 7934 |
+| Baseline repeat | 13709 / 3785 | 1334166 / 1920727 | 1587 / 24287 | 2148268 / 1883554 |
+
+The candidate has no admission pressure at any point. Every run has zero outer
+socket overflow, outer fragmentation, invalid frames, duplicate delivery and
+reordering. Candidate reverse inner UDP receive errors are four at 21 Gbit/s
+and six at unlimited; all other inner error counts are zero. Drop counters use
+different units and cannot be summed into an exact frame-loss total.
+
+Under unlimited load, the candidate's transmit owner consumes 91 / 93% CPU and
+its busiest TAP reader 96 / 86%. Sampled reservation-to-report time changes to
+61 / 74 µs from the baselines' 83–92 / 71–73 µs; this neither removes the
+dependency between grant completion and the next grant nor measures the full
+critical path. Source expiry and queue drops rise sharply. A separate bounded
+handoff-work experiment is needed to distinguish offered-load processing from
+the remaining sender scheduling limit.
+
+The candidate's partial transmit expiries, 10348 / 11944, exactly match the
+opposite receivers' incomplete expiries, 10348 / 11944. This supports the
+sender-created orphan mechanism below, but matching totals do not prove frame
+identity. With zero admission pressure in this candidate, orphan-slot exhaustion
+alone cannot explain its overload decline.
+
+Validation preserves the unchanged runtime suite: three tests pass in 85.20 s,
+including restart, repair, foreign TAP rename/netns movement and allocation
+checks. Two focused kernel tests cover all eight transmit lanes, byte-exact
+delivery, per-lane history and shared inflight-credit retirement, distinct
+receive ownership and empty-worker scheduling. The ordinary release suite
+passed 351 tests before a final test-only move; afterward, all 163 ordinary
+library tests, formatting and Clippy pass. The unadapted full kernel suite
+records 50 passes and 24 failures in fixtures assuming distributed transmit
+ownership. This is a diagnostic, not a fully validated production alternative.
+
+Reproduce from `9747161`, applying the
+[service instrumentation](benches/sender-service-diagnostic.patch) and
+[empty-MTU guard](benches/sender-empty-mtu-schedule.patch) to both builds, then
+the [colocation patch](benches/sender-colocated-experiment.patch) to the candidate.
+Build release-musl with all features and `UNQUIC_CONTROLLER_DIAGNOSTIC` unset.
+
 ## Receive-only worker timer spin (November 8)
 
 A one-wire-lane diagnostic retained eight TAP queues and eight workers per
