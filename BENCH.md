@@ -95,6 +95,125 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Remove unintended veth reordering from routed trials (November 8)
+
+[Raw socket diagnostics](benches/tap-raw-rx-order.json) separate socket-read order
+from successful admission using a [bounded diagnostic patch](benches/raw-rx-order-diagnostic.patch).
+At 0.5G offered each way, the original routed harness receives thousands of
+out-of-order DATA datagrams before any userspace handoff. Every packet reaches
+the expected reuseport owner. Disabling receive UDP_GRO with the
+[comparison patch](benches/raw-rx-gro-off.patch) does not remove reordering;
+neither variant receives any GRO aggregates on that harness.
+
+[Simultaneous router and endpoint captures](benches/tap-veth-order.json) locate
+the change between router egress and endpoint ingress. In the five-second GSO
+trial, router ingress and egress have zero reordered packets; endpoint ingress
+has 1,764 / 2,339 reordered DATA packets. The bridged trial has 331 / 528.
+All captures report zero capture-buffer drops. Router traffic consists of
+individual IPv6 datagrams of at most 1500 bytes, with no outer fragments.
+
+The original veth path dispatches incoming packets through per-CPU backlogs.
+The corrected harness enables endpoint GRO/NAPI and disables router TSO, making
+forwarded packets eligible for the endpoint's single NAPI receive queue.
+Router GRO stays disabled and endpoint transmit segmentation stays disabled, so
+netem still sees individual outer datagrams. The
+[Linux veth implementation](https://github.com/torvalds/linux/blob/v6.8/drivers/net/veth.c)
+explains both the backlog path and NAPI eligibility; this is a harness
+correction, not a daemon dependency on this kernel version.
+
+With that change, raw socket and admission reordering fall to zero in both
+five-second profiles. Ordinary packet/time-threshold loss declarations fall
+from 958 / 862 to zero for GSO, and from 119 / 242 to zero for bridged input.
+Endpoint captures now contain GRO aggregates and expose only their first
+captured header; the raw socket counters cover every expanded datagram.
+The production harness records endpoint veth statistics and link drops so
+queue pressure can be separated from configured netem loss.
+
+This verifies an unintended reordering source in the delayed local harness.
+It does not establish that all earlier false losses had this cause, that real
+paths never reorder, or that throughput is fixed. These short instrumented
+trials are not acceptance measurements. Earlier delayed runs remain valid as
+measurements of their original, unintentionally reordered path.
+
+## Bound fresh expansion before frame materialization (November 8)
+
+[Thirty-six release observations](benches/tap-materialization-gate.json) compare the
+`cff9b08` baseline, outgoing ACK retry, bounded source expansion, and a rejected
+recovery-undo experiment. Each phase starts fresh daemons and runs ascending
+fifteen-second points with a two-second drain. The routed path adds 4.5 ms RTT
+and no deliberate loss; both profiles use QinQ and 1,522-byte frames. GSO uses
+eight workers and sixteen flows; bridged individual frames use four workers and
+four flows. The bridge generator actually offers only 2.34–2.77 Gbit/s at the
+requested 5G point and 2.35–2.58 Gbit/s unlimited. Requested rates are not
+measured ingress capacity.
+
+The candidate stops materializing fresh frames after 64 discovered UDP payloads
+per lane, with at most one frame of overshoot. Remaining GSO children stay in
+their bounded source queue. Foreign transmit replacement credits wait while
+that lane is full, so input backpressure reaches the TAP reader. Receive credits
+and stale-connection returns bypass the gate. Send completion or expiry reopens
+it, and a blocked lane does not stop other lanes. The existing 2 MiB fresh limit,
+frame deadlines and reassembly capacities remain in force.
+
+| Input | Build | Requested each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- | --- |
+| gso | baseline | 0.5G | 0.471 / 0.484 | 4.4 / 1.7 | 92.9 / 89.6 |
+| gso | baseline | 5G | 0.318 / 1.053 | 93.5 / 78.5 | 197.6 / 184.4 |
+| gso | baseline | unlimited | 0.557 / 0.990 | 99.0 / 98.0 | 224.4 / 192.6 |
+| bridge | baseline | 0.5G | 0.466 / 0.484 | 5.5 / 1.6 | 182.2 / 207.8 |
+| bridge | baseline | 5G | 0.201 / 0.170 | 91.3 / 92.9 | 264.9 / 359.6 |
+| bridge | baseline | unlimited | 0.301 / 0.147 | 87.7 / 93.9 | 270.0 / 358.3 |
+| gso | retry | 0.5G | 0.482 / 0.480 | 2.1 / 2.4 | 92.0 / 89.8 |
+| gso | retry | 5G | 0.530 / 1.023 | 89.2 / 79.1 | 259.4 / 193.0 |
+| gso | retry | unlimited | 0.626 / 0.612 | 98.9 / 98.9 | 176.0 / 243.7 |
+| bridge | retry | 0.5G | 0.444 / 0.427 | 9.6 / 13.0 | 181.8 / 207.1 |
+| bridge | retry | 5G | 0.222 / 0.378 | 90.7 / 83.8 | 252.1 / 376.9 |
+| bridge | retry | unlimited | 0.277 / 0.085 | 88.6 / 96.3 | 270.2 / 319.6 |
+| gso | gate | 0.5G | 0.491 / 0.488 | 0.3 / 0.9 | 96.7 / 93.2 |
+| gso | gate | 5G | 0.903 / 0.537 | 81.4 / 88.9 | 176.2 / 225.1 |
+| gso | gate | unlimited | 0.652 / 0.894 | 98.9 / 98.4 | 162.2 / 156.9 |
+| bridge | gate | 0.5G | 0.479 / 0.481 | 2.9 / 2.4 | 184.5 / 203.7 |
+| bridge | gate | 5G | 0.737 / 0.564 | 69.0 / 77.3 | 206.0 / 221.9 |
+| bridge | gate | unlimited | 0.855 / 0.606 | 65.7 / 76.2 | 220.7 / 242.2 |
+| gso | baseline_repeat | 0.5G | 0.491 / 0.476 | 0.1 / 3.2 | 91.0 / 88.7 |
+| gso | baseline_repeat | 5G | 0.630 / 0.897 | 87.1 / 81.7 | 234.7 / 216.3 |
+| gso | baseline_repeat | unlimited | 0.840 / 0.751 | 98.6 / 98.6 | 193.6 / 220.4 |
+| bridge | baseline_repeat | 0.5G | 0.404 / 0.483 | 18.1 / 2.0 | 189.5 / 207.2 |
+| bridge | baseline_repeat | 5G | 0.203 / 0.371 | 91.4 / 86.0 | 270.6 / 365.7 |
+| bridge | baseline_repeat | unlimited | 0.399 / 0.349 | 83.7 / 85.8 | 274.9 / 368.5 |
+
+At bridged unlimited load, the candidate delivers 0.855 / 0.606 Gbit/s using
+221 / 242% daemon CPU, versus 0.301 / 0.147 at 270 / 358% before and
+0.399 / 0.349 at 275 / 369% in the repeated control. Unsent frame expiry drops
+from 1,627,108 / 2,387,857 to 1,411 / 102,969; transmit-backlog drops fall from
+1,114,867 / 534,066 to zero. Receive admission pressure also falls to zero.
+This reduces work spent expanding frames that cannot be sent.
+
+Pressure moves earlier: TAP ingress drops rise to 610,428 / 1,823,399, while
+worker queue drops remain 1,540,605 / 575,414. ACK-buffer drops are
+42,662 / 3,095, socket overflow 1,193 / 263, and incomplete receive expiry
+21 / 8. Inner UDP receive-buffer errors stay zero. These are separate units;
+a TAP source can contain several frames, so they cannot be added into a frame
+loss total. GSO results vary across placements and do not prove a general gain.
+Neither a universal overload plateau nor either performance target is met.
+
+Release tests and strict Clippy pass. Kernel library tests pass 88 cases on
+each of Linux 6.8 and 7.0, and all three runtime tests pass on both. Four further
+6.8 migration/restart repeats pass. A separate repeated run exceeded the old
+12-second generation deadline; a deterministic handshake test demonstrates
+21.2-second convergence when fixed ten-second attempts overlap. The runtime
+test now allows 30 seconds, without changing production handshake deadlines.
+The earlier one-shot post-migration delivery timeout has not reproduced;
+failure diagnostics remain, and it is not attributed to the input gate.
+
+The recovery-undo variants are retained only as rejected experiments:
+[exact measured v0 patch](benches/spurious-recovery-undo-v0.patch) and
+[subsequent guard](benches/spurious-recovery-undo-guard.patch). V0 can restore
+congestion bounds while an older episode still has genuine loss awaiting
+adaptation. The guard has regression coverage but no throughput measurement.
+V0 also raises CPU without a consistent goodput gain; neither version is in
+production.
+
 ## False loss and ordinary-frame overload (November 8)
 
 [Six diagnostic observations](benches/tap-loss-provenance.json) add

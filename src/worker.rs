@@ -451,6 +451,7 @@ struct Session {
     tx_retained: usize,
     tx_bytes: usize,
     tap_inputs: VecDeque<usize>,
+    unexpanded_bytes: Vec<usize>,
     slab: Option<usize>,
     rx_totals: Vec<Snapshot>,
     tx_totals: Vec<Snapshot>,
@@ -736,7 +737,8 @@ impl Worker {
                 .checked_add(peer.tx_lanes.checked_mul(
                     size_of::<Option<pack::Lane>>()
                         + size_of::<Option<Box<TxBatch>>>()
-                        + size_of::<Snapshot>(),
+                        + size_of::<Snapshot>()
+                        + size_of::<usize>(),
                 )?)?;
         }
         let frame_storage = (0..workers).try_fold(0_usize, |bytes, id| {
@@ -847,6 +849,7 @@ impl Worker {
                 tx_retained: 0,
                 tx_bytes: 0,
                 tap_inputs: VecDeque::with_capacity(BUFFERS),
+                unexpanded_bytes: vec![0; config.peers[peer].tx_lanes],
                 slab: None,
                 rx_totals: vec![Snapshot::default(); LANES],
                 tx_totals: vec![Snapshot::default(); config.peers[peer].tx_lanes],
@@ -1034,7 +1037,6 @@ impl Worker {
         while !self.control.quitting() {
             let now = monotonic_now()?;
             let mut more = self.drain_queues(now)?;
-            self.flush_returns();
             if now >= self.setup_due {
                 self.setup(now)?;
             }
@@ -1045,8 +1047,10 @@ impl Worker {
             self.timers(now)?;
             more |= self.mtu_timers(now)?;
             more |= self.drain_packets(now)?;
-            more |= self.drain_tap_inputs(now)?;
+            self.drain_tap_inputs(now)?;
             more |= self.flush_frames(now)?;
+            self.flush_returns();
+            more |= (0..self.sessions.len()).any(|session| self.tap_can_expand(session));
             self.flush_taps(now)?;
             self.collect_acks(now)?;
             self.flush_control(now)?;
@@ -1251,6 +1255,9 @@ impl Worker {
             buffer.segment_size = 0;
             buffer.rx_counted = false;
             self.free.push(buffer);
+        } else if self.hold_tx_credit(&buffer) {
+            debug_assert!(self.returns[origin].len() < BUFFERS);
+            self.returns[origin].push(buffer);
         } else if let Err(Event::Free(buffer)) = self.push(origin, Event::Free(buffer)) {
             debug_assert!(self.returns[origin].len() < BUFFERS);
             self.returns[origin].push(buffer);
@@ -1259,7 +1266,11 @@ impl Worker {
 
     fn flush_returns(&mut self) {
         for origin in 0..self.returns.len() {
-            while let Some(buffer) = self.returns[origin].pop() {
+            for index in (0..self.returns[origin].len()).rev() {
+                if self.hold_tx_credit(&self.returns[origin][index]) {
+                    continue;
+                }
+                let buffer = self.returns[origin].swap_remove(index);
                 if let Err(Event::Free(buffer)) = self.push(origin, Event::Free(buffer)) {
                     self.returns[origin].push(buffer);
                     break;
@@ -1280,7 +1291,11 @@ impl Worker {
 
     fn has_backpressure(&self) -> bool {
         !self.sender.outgoing.is_empty()
-            || self.returns.iter().any(|v| !v.is_empty())
+            || self
+                .returns
+                .iter()
+                .flatten()
+                .any(|b| !self.hold_tx_credit(b))
             || self
                 .sessions
                 .iter()
@@ -2276,6 +2291,7 @@ impl Worker {
 
     fn input_frame(&mut self, mut buffer: Box<Buffer>, now: Duration) -> io::Result<()> {
         let session = buffer.session;
+        let lane = buffer.lane;
         let lifetime = self
             .sender_index(session, buffer.lane)
             .ok()
@@ -2337,6 +2353,8 @@ impl Worker {
             // Return the reader's buffer credit without moving the retained payload.
             std::mem::swap(&mut buffer.origin, &mut replacement.origin);
             replacement.session = session;
+            replacement.lane = buffer.lane;
+            replacement.tag = buffer.tag;
             replacement.length = buffer.length;
             replacement.tx_reserved = buffer.tx_reserved;
             replacement.rx_reserved = buffer.rx_reserved;
@@ -2357,6 +2375,10 @@ impl Worker {
         if let Some(index) = index {
             self.sender.lanes[index].unsent_bytes = self.sender.lanes[index]
                 .unsent_bytes
+                .checked_add(fresh)
+                .ok_or(io::ErrorKind::InvalidData)?;
+            self.sessions[session].unexpanded_bytes[lane] = self.sessions[session].unexpanded_bytes
+                [lane]
                 .checked_add(fresh)
                 .ok_or(io::ErrorKind::InvalidData)?;
         }
@@ -2383,7 +2405,10 @@ impl Worker {
         };
         let local = &self.sessions[input.session];
         let remaining = frame_quota(local.tx_workers).saturating_sub(local.tx_retained);
-        if remaining == 0 || self.frames.available() == 0 {
+        if remaining == 0
+            || self.frames.available() == 0
+            || self.fresh_full(input.session, input.lane)
+        {
             return false;
         }
         if input
@@ -2401,10 +2426,45 @@ impl Worker {
     }
 
     fn tap_can_expand(&self, session: usize) -> bool {
-        self.sessions[session]
-            .tap_inputs
-            .front()
-            .is_some_and(|&source| self.can_materialize(source))
+        let mut lanes = 0_u64;
+        self.sessions[session].tap_inputs.iter().any(|&source| {
+            let Some(input) = self.frames.source(source) else {
+                return false;
+            };
+            let bit = 1_u64 << input.lane;
+            if lanes & bit != 0 {
+                return false;
+            }
+            lanes |= bit;
+            self.can_materialize(source)
+        })
+    }
+
+    fn fresh_full(&self, session: usize, lane: usize) -> bool {
+        if !self.sender_enabled() {
+            return false;
+        }
+        let Ok(index) = self.sender_index(session, lane) else {
+            return false;
+        };
+        let local = &self.sessions[session];
+        let fresh = self.sender.lanes[index]
+            .unsent_bytes
+            .saturating_sub(local.unexpanded_bytes[lane]);
+        let Some(peer) = self.shared.config.peer_for_session(session) else {
+            return false;
+        };
+        let payload = self.transmit[peer].paths[local.path].lanes[lane]
+            .mtu
+            .payload_limit();
+        fresh != 0 && fresh >= BATCH_SIZE * payload
+    }
+
+    fn hold_tx_credit(&self, buffer: &Buffer) -> bool {
+        buffer.tx_reserved
+            && !buffer.rx_reserved
+            && self.matches(buffer.session, buffer.tag)
+            && self.fresh_full(buffer.session, buffer.lane)
     }
 
     fn close_source(&mut self, source: usize) {
@@ -2429,7 +2489,14 @@ impl Worker {
             .frames
             .source(source)
             .ok_or(io::ErrorKind::InvalidData)?;
-        self.release_unsent(input.session, input.lane, input.fresh_bytes()?)?;
+        let (session, lane, bytes) = (input.session, input.lane, input.fresh_bytes()?);
+        self.release_unsent(session, lane, bytes)?;
+        if self.sender_enabled() {
+            self.sessions[session].unexpanded_bytes[lane] = self.sessions[session].unexpanded_bytes
+                [lane]
+                .checked_sub(bytes)
+                .ok_or(io::ErrorKind::InvalidData)?;
+        }
         self.close_source(source);
         Ok(())
     }
@@ -2534,6 +2601,10 @@ impl Worker {
             .ok_or_else(|| io::Error::other("transmit frame capacity exhausted"))?;
         self.sessions[session].tx_retained += 1;
         if self.sender_enabled() {
+            self.sessions[session].unexpanded_bytes[lane] = self.sessions[session].unexpanded_bytes
+                [lane]
+                .checked_sub(length)
+                .ok_or(io::ErrorKind::InvalidData)?;
             self.recovery.bind(
                 frame,
                 self.frames.frame(frame).ok_or(io::ErrorKind::InvalidData)?,
@@ -2574,10 +2645,12 @@ impl Worker {
         self.tap_start = (start + 1) % count;
         for index in 0..count {
             let session = (start + index) % count;
-            while frames < BATCH_SIZE && bytes < 64 * 1024 {
-                let Some(source) = self.sessions[session].tap_inputs.pop_front() else {
-                    break;
-                };
+            let mut blocked = 0_u64;
+            for _ in 0..self.sessions[session].tap_inputs.len() {
+                let source = self.sessions[session]
+                    .tap_inputs
+                    .pop_front()
+                    .ok_or(io::ErrorKind::InvalidData)?;
                 let input = self
                     .frames
                     .source(source)
@@ -2588,6 +2661,11 @@ impl Worker {
                     input.deadline,
                     input.segments.map_or(1, |s| s.remaining(input.length)) as u64,
                 );
+                let bit = 1_u64 << lane;
+                if frames == BATCH_SIZE || bytes >= 64 * 1024 {
+                    self.sessions[session].tap_inputs.push_back(source);
+                    continue;
+                }
                 if !self.matches(session, tag)
                     || self.expired_at(session, lane, deadline, remaining, now)
                 {
@@ -2595,13 +2673,25 @@ impl Worker {
                     frames += 1;
                     continue;
                 }
-                let length = self.materialize(source)?;
-                if self.frames.producing(source) {
-                    self.sessions[session].tap_inputs.push_front(source);
+                if blocked & bit != 0 {
+                    self.sessions[session].tap_inputs.push_back(source);
+                    continue;
                 }
-                let Some(length) = length else { break };
-                frames += 1;
-                bytes += length;
+                while frames < BATCH_SIZE && bytes < 64 * 1024 {
+                    let Some(length) = self.materialize(source)? else {
+                        break;
+                    };
+                    frames += 1;
+                    bytes += length;
+                    if !self.frames.producing(source) {
+                        break;
+                    }
+                }
+                if self.frames.producing(source) {
+                    // Finish the pass so later sources in this lane cannot overtake it.
+                    self.sessions[session].tap_inputs.push_back(source);
+                    blocked |= bit;
+                }
             }
         }
         Ok((0..count).any(|session| self.tap_can_expand(session)))
@@ -4171,10 +4261,10 @@ impl Worker {
             }
         }
         for session in &self.sessions {
-            if let Some(input) = session.tap_inputs.front()
-                && let Some(input) = self.frames.source(*input)
-            {
-                due = due.min(input.deadline);
+            for &input in &session.tap_inputs {
+                if let Some(input) = self.frames.source(input) {
+                    due = due.min(input.deadline);
+                }
             }
             for (slot, lane) in session
                 .rx
@@ -7093,7 +7183,7 @@ mod tests {
         test_workers_with_lanes(2)
     }
 
-    fn test_workers_with_lanes(tx_lanes: usize) -> (Arc<Shared>, [Worker; 2]) {
+    pub(super) fn test_workers_with_lanes(tx_lanes: usize) -> (Arc<Shared>, [Worker; 2]) {
         use crate::config::{Config, Daemon, Endpoint, Peer, Session as ConfigSession};
         use std::{
             net::Ipv6Addr,

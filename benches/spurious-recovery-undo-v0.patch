@@ -1,0 +1,768 @@
+diff --git a/src/bbr/controller/tests.rs b/src/bbr/controller/tests.rs
+index e63459f..e30f8c9 100644
+--- a/src/bbr/controller/tests.rs
++++ b/src/bbr/controller/tests.rs
+@@ -550,3 +550,72 @@ fn sparse_pmtu_samples_do_not_end_startup_but_data_still_does() {
+     assert_eq!(c.state(), State::Drain);
+     assert_eq!(c.delivered, 30_000);
+ }
++
++#[test]
++fn recovery_checkpoint_survives_multiple_loss_rounds_and_late_proof() {
++    for finish_first in [false, true] {
++        let mut c = cruise();
++        let original = c.limits().window;
++        c.enter_recovery(c.now, 30_000, false).unwrap();
++        for round in 0..3 {
++            loss(&mut c, 1500, 1500, 30_000, false);
++            let s = sample(&c, 100_000, 1500);
++            c.on_ack(s, Some(ms(10)), 15_000, false, ms(60 + round * 10))
++                .unwrap();
++        }
++        assert!(c.bw_shortterm < INFINITY);
++        assert!(c.inflight_shortterm < INFINITY);
++        let counters = (c.delivered, c.lost);
++        if finish_first {
++            c.recovery_finished(c.now, false).unwrap();
++            // ProbeRTT has its own saved window; it must not replace the loss checkpoint.
++            c.prior_cwnd = 6000;
++            c.cwnd = 6000;
++            c.state = State::ProbeRtt;
++        }
++        c.undo_recovery(c.now).unwrap();
++        assert_eq!((c.bw_shortterm, c.inflight_shortterm), (INFINITY, INFINITY));
++        assert!(c.cwnd >= original);
++        assert_eq!((c.delivered, c.lost), counters);
++        assert!(!c.recovering);
++        assert!(!c.loss_in_round);
++        if finish_first {
++            assert_eq!(c.state(), State::ProbeRtt);
++        }
++        assert_eq!(c.undo_recovery(c.now), Err(ControllerError::Invalid));
++    }
++}
++
++#[test]
++fn a_new_recovery_replaces_the_previous_checkpoint() {
++    let mut c = cruise();
++    c.enter_recovery(c.now, 30_000, false).unwrap();
++    loss(&mut c, 1500, 1500, 30_000, false);
++    let s = sample(&c, 100_000, 1500);
++    c.on_ack(s, Some(ms(10)), 15_000, false, ms(60)).unwrap();
++    c.recovery_finished(c.now, false).unwrap();
++    let bounds = (c.bw_shortterm, c.inflight_shortterm);
++    c.enter_recovery(c.now, 15_000, false).unwrap();
++    loss(&mut c, 1500, 1500, 15_000, false);
++    let s = sample(&c, 10_000, 1500);
++    c.on_ack(s, Some(ms(10)), 7500, false, ms(70)).unwrap();
++    c.undo_recovery(c.now).unwrap();
++    assert_eq!((c.bw_shortterm, c.inflight_shortterm), bounds);
++}
++
++#[test]
++fn later_loss_rounds_do_not_forget_the_loss_caused_probe_departure() {
++    let mut c = cruise();
++    c.start_refill();
++    c.start_up(1_500_000);
++    c.check_probe_loss = true;
++    c.enter_recovery(c.now, 15000, false).unwrap();
++    loss(&mut c, 1500, 1500, 15000, false);
++    assert_eq!(c.state(), State::Down);
++    c.loss_in_round = false;
++    loss(&mut c, 1500, 1500, 15000, false);
++    c.recovery_finished(c.now, false).unwrap();
++    c.undo_recovery(c.now).unwrap();
++    assert_eq!(c.state(), State::Refill);
++    assert_eq!(c.inflight_longterm, INFINITY);
++}
+diff --git a/src/bbr/controller.rs b/src/bbr/controller.rs
+index ac1e107..de53d8c 100644
+--- a/src/bbr/controller.rs
++++ b/src/bbr/controller.rs
+@@ -145,6 +145,8 @@ pub struct Controller {
+     probe_rtt_cwnd: u64,
+     recovering: bool,
+     prior_cwnd: u64,
++    undo_valid: bool,
++    undo_cwnd: u64,
+     undo_state: Option<State>,
+     undo_bw: u64,
+     undo_shortterm: u64,
+@@ -229,6 +231,8 @@ impl Controller {
+             probe_rtt_cwnd: INFINITY,
+             recovering: false,
+             prior_cwnd: 0,
++            undo_valid: false,
++            undo_cwnd: 0,
+             undo_state: None,
+             undo_bw: 0,
+             undo_shortterm: 0,
+@@ -400,7 +404,11 @@ impl Controller {
+         self.lost = lost;
+         if !self.loss_in_round {
+             self.loss_round_delivered = self.delivered;
+-            self.save_loss_state();
++            if self.recovering {
++                self.save_cwnd();
++            } else {
++                self.save_loss_state();
++            }
+         }
+         self.loss_in_round = true;
+         self.loss_events = self.loss_events.saturating_add(1);
+@@ -436,26 +444,45 @@ impl Controller {
+         }
+         self.now = now;
+         self.cwnd = self.cwnd.max(self.prior_cwnd);
++        self.undo_cwnd = self.undo_cwnd.max(self.prior_cwnd);
+         if spurious {
+-            self.loss_in_round = false;
+-            self.loss_events = 0;
+-            self.reset_full_bw();
+-            self.bw_shortterm = self.bw_shortterm.max(self.undo_bw);
+-            self.inflight_shortterm = self.inflight_shortterm.max(self.undo_shortterm);
+-            self.inflight_longterm = self.inflight_longterm.max(self.undo_longterm);
+-            if self.undo_state == Some(State::Startup) && self.state != State::Startup {
+-                self.full_bw_reached = false;
+-                if self.state != State::ProbeRtt {
+-                    self.state = State::Startup;
+-                }
+-            } else if self.undo_state == Some(State::Up)
+-                && self.state != State::Up
+-                && self.state != State::ProbeRtt
+-            {
+-                self.start_refill();
++            return self.undo_recovery(now);
++        }
++        self.recovering = false;
++        Ok(())
++    }
++
++    /// Restore the newest episode only after transport proves every loss spurious.
++    /// Its checkpoint survives normal recovery completion, but not a later episode.
++    pub(crate) fn undo_recovery(&mut self, now: Duration) -> Result<(), ControllerError> {
++        self.check_time(now)?;
++        if !self.undo_valid {
++            return Err(ControllerError::Invalid);
++        }
++        self.now = now;
++        if self.recovering {
++            self.undo_cwnd = self.undo_cwnd.max(self.prior_cwnd);
++        }
++        self.cwnd = self.cwnd.max(self.undo_cwnd);
++        self.loss_in_round = false;
++        self.loss_events = 0;
++        self.reset_full_bw();
++        self.bw_shortterm = self.bw_shortterm.max(self.undo_bw);
++        self.inflight_shortterm = self.inflight_shortterm.max(self.undo_shortterm);
++        self.inflight_longterm = self.inflight_longterm.max(self.undo_longterm);
++        if self.undo_state == Some(State::Startup) && self.state != State::Startup {
++            self.full_bw_reached = false;
++            if self.state != State::ProbeRtt {
++                self.state = State::Startup;
+             }
+-            self.undo_state = None;
++        } else if self.undo_state == Some(State::Up)
++            && self.state != State::Up
++            && self.state != State::ProbeRtt
++        {
++            self.start_refill();
+         }
++        self.undo_state = None;
++        self.undo_valid = false;
+         self.recovering = false;
+         Ok(())
+     }
+@@ -763,6 +790,8 @@ impl Controller {
+ 
+     fn save_loss_state(&mut self) {
+         self.save_cwnd();
++        self.undo_valid = true;
++        self.undo_cwnd = self.prior_cwnd;
+         self.undo_state = None;
+         self.undo_bw = self.bw_shortterm;
+         self.undo_shortterm = self.inflight_shortterm;
+diff --git a/src/bbr/delivery.rs b/src/bbr/delivery.rs
+index 392bf9b..af469ea 100644
+--- a/src/bbr/delivery.rs
++++ b/src/bbr/delivery.rs
+@@ -1,6 +1,6 @@
+ //! Delivery sampling from draft-ietf-ccwg-bbr-07, sections 2.3 and 4.1.2.
+ //! Derived from the draft's code components; see LICENSE-BBR.
+-use std::time::Duration;
++use std::{num::NonZeroU64, time::Duration};
+ 
+ /// A successful physical transmission's retained sampling metadata.
+ /// Keep it through loss and payload expiry, until ACK or sent-history eviction.
+@@ -10,10 +10,17 @@ pub struct DeliveryPacket {
+     snapshot: Snapshot,
+     bytes: u16,
+     acknowledged: bool,
+-    declared_lost: bool,
++    declared_lost: Option<NonZeroU64>,
+     pub(crate) pmtu: bool,
+ }
+ 
++impl DeliveryPacket {
++    /// Cumulative loss-byte endpoint uniquely identifies this declaration.
++    pub(crate) fn loss_end(&self) -> Option<u64> {
++        self.declared_lost.map(NonZeroU64::get)
++    }
++}
++
+ /// Delivery observation from all newly acknowledged transmissions in one ACK.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub struct RateSample {
+@@ -236,7 +243,7 @@ impl Delivery {
+             snapshot,
+             bytes,
+             acknowledged: false,
+-            declared_lost: false,
++            declared_lost: None,
+             pmtu: false,
+         };
+         self.last_sent_at = at;
+@@ -344,7 +351,7 @@ impl Delivery {
+         if self.pending.is_some() {
+             return Err(DeliveryError::Busy);
+         }
+-        if packet.declared_lost || packet.acknowledged {
++        if packet.declared_lost.is_some() || packet.acknowledged {
+             return Ok(None);
+         }
+         if packet.snapshot.lost > self.lost || packet.snapshot.id >= self.next_id {
+@@ -355,7 +362,7 @@ impl Delivery {
+             .checked_add(u64::from(packet.bytes))
+             .ok_or(DeliveryError::Exhausted)?;
+         self.lost = lost;
+-        packet.declared_lost = true;
++        packet.declared_lost = NonZeroU64::new(lost);
+         Ok(Some(LossSample {
+             bytes: packet.bytes,
+             total_lost: lost,
+@@ -461,7 +468,7 @@ mod tests {
+             delivery.declared_lost(&mut packet),
+             Err(DeliveryError::Exhausted)
+         );
+-        assert!(!packet.declared_lost);
++        assert!(packet.declared_lost.is_none());
+         assert_eq!(delivery.lost(), u64::MAX - 99);
+         delivery.delivered = u64::MAX - 99;
+         delivery.begin_ack(Duration::from_nanos(1), false).unwrap();
+diff --git a/src/pacing/sender.rs b/src/pacing/sender.rs
+index 2be7f92..d8c61a8 100644
+--- a/src/pacing/sender.rs
++++ b/src/pacing/sender.rs
+@@ -228,7 +228,20 @@ enum Phase {
+     Feedback,
+ }
+ 
++struct RecoveryProof {
++    start: u64,
++    end: u64,
++    remaining: u64,
++}
++
++impl RecoveryProof {
++    fn contains(&self, endpoint: Option<u64>) -> bool {
++        endpoint.is_some_and(|end| self.start < end && end <= self.end)
++    }
++}
++
+ struct Group {
++    recovery: Option<RecoveryProof>,
+     grants: Grants,
+     delivery: Delivery,
+     // Boxes move through worker queues and return without copying packet records.
+@@ -281,6 +294,7 @@ impl Sender {
+                 .try_reserve_exact(workers)
+                 .map_err(io::Error::other)?;
+             state.push(Group {
++                recovery: None,
+                 grants: Grants::new(workers)?,
+                 delivery: Delivery::new(),
+                 reports,
+@@ -748,6 +762,14 @@ impl Sender {
+             .delivery
+             .acknowledged(packet)
+             .map_err(delivery_error)?;
++        if let Some(proof) = &mut state.recovery
++            && proof.contains(packet.loss_end())
++        {
++            proof.remaining = proof
++                .remaining
++                .checked_sub(u64::from(slot.bytes))
++                .ok_or(GrantError::Invalid)?;
++        }
+         if *charged {
+             state.grants.settled(u64::from(slot.bytes))?;
+         }
+@@ -789,6 +811,15 @@ impl Sender {
+             .delivery
+             .declared_lost(packet)
+             .map_err(delivery_error)?;
++        if let Some(loss) = loss
++            && let Some(proof) = &mut state.recovery
++        {
++            proof.end = loss.total_lost;
++            proof.remaining = proof
++                .remaining
++                .checked_add(u64::from(loss.bytes))
++                .ok_or(GrantError::Exhausted)?;
++        }
+         if loss.is_some() && *charged {
+             state.grants.settled(u64::from(slot.bytes))?;
+             *charged = false;
+@@ -805,12 +836,61 @@ impl Sender {
+     ) -> Result<(), GrantError> {
+         self.feedback(group, false)?;
+         let slot = Self::sample(&mut self.slots, group, id, handle)?;
+-        if !matches!(slot.state, SlotState::Sent { charged: false, .. }) {
++        let SlotState::Sent {
++            packet,
++            charged: false,
++        } = &slot.state
++        else {
+             return Err(GrantError::Blocked);
++        };
++        if self.groups[group]
++            .recovery
++            .as_ref()
++            .is_some_and(|proof| proof.contains(packet.loss_end()))
++        {
++            // Losing evidence cannot prove that the original transmission arrived.
++            self.groups[group].recovery = None;
+         }
+         Self::release(&mut self.slots, &mut self.free, &mut self.available, handle)
+     }
+ 
++    /// Retain proof for only the newest recovery, including its first declared loss.
++    pub(crate) fn recovery_started(
++        &mut self,
++        group: usize,
++        first: LossSample,
++    ) -> Result<(), GrantError> {
++        let state = self.feedback(group, false)?;
++        if first.total_lost != state.delivery.lost() {
++            return Err(GrantError::Invalid);
++        }
++        let bytes = u64::from(first.bytes);
++        let start = first
++            .total_lost
++            .checked_sub(bytes)
++            .ok_or(GrantError::Invalid)?;
++        state.recovery = Some(RecoveryProof {
++            start,
++            end: first.total_lost,
++            remaining: bytes,
++        });
++        Ok(())
++    }
++
++    /// Consume complete proof only after the whole ACK transaction finishes.
++    pub(crate) fn spurious_recovery(&mut self, group: usize) -> Result<bool, GrantError> {
++        let state = self.feedback(group, false)?;
++        if state
++            .recovery
++            .as_ref()
++            .is_some_and(|proof| proof.remaining == 0)
++        {
++            state.recovery = None;
++            return Ok(true);
++        }
++        Ok(false)
++    }
++
+     /// Marks a verified application-limited bubble; host backpressure is not sufficient.
+     pub fn application_limited(&mut self, group: usize) -> Result<(), GrantError> {
+         let state = self.feedback(group, false)?;
+@@ -1125,3 +1205,191 @@ mod reidentify_tests {
+         assert_eq!(sender.available(), 4);
+     }
+ }
++
++#[cfg(test)]
++mod recovery_tests {
++    use super::*;
++
++    fn fixture() -> (Sender, [PacketId; 4], [NonZeroU16; 4]) {
++        let (mut sender, flights) = Sender::new(1, 2, 4).unwrap();
++        let mut flights = flights.into_vec();
++        let mut b = flights.pop().unwrap();
++        let mut a = flights.pop().unwrap();
++        let ids = [0, 1, 2, 3].map(|index| PacketId {
++            session: 0,
++            generation: 1,
++            lane: index / 2 + 1,
++            number: u64::from(index % 2 + 1),
++        });
++        let packets = ids.map(|id| Planned { id, bytes: 1280 });
++        a.prepare(&packets[..2]).unwrap();
++        b.prepare(&packets[2..]).unwrap();
++        let limits = Limits {
++            window: 100_000,
++            rate: 1_000_000_000,
++            quantum: 100_000,
++            max_datagram: 1280,
++        };
++        sender
++            .reserve(0, &mut a, false, limits, Duration::ZERO)
++            .unwrap();
++        sender
++            .reserve(0, &mut b, false, limits, Duration::from_micros(10))
++            .unwrap();
++        let handles = [
++            a.handle(0).unwrap(),
++            a.handle(1).unwrap(),
++            b.handle(0).unwrap(),
++            b.handle(1).unwrap(),
++        ];
++        a.complete(2, Some(Duration::ZERO), false).unwrap();
++        b.complete(2, Some(Duration::from_micros(10)), false)
++            .unwrap();
++        sender.reported(b).unwrap();
++        sender.reported(a).unwrap();
++        assert!(sender.advance(0, 64).unwrap().is_some());
++        assert!(sender.advance(0, 64).unwrap().is_some());
++        assert!(sender.feedback_ready(0));
++        (sender, ids, handles)
++    }
++
++    #[test]
++    fn all_losses_across_lanes_must_be_proved_after_the_whole_ack() {
++        for order in [[0, 2], [2, 0]] {
++            let (mut sender, ids, handles) = fixture();
++            let first = sender.lost(0, ids[0], handles[0]).unwrap().unwrap();
++            sender.recovery_started(0, first).unwrap();
++            sender.lost(0, ids[2], handles[2]).unwrap().unwrap();
++            assert!(sender.lost(0, ids[2], handles[2]).unwrap().is_none());
++            assert_eq!(sender.flight_bytes(0), Some((0, 2560)));
++            sender
++                .begin_ack(0, Duration::from_millis(1), false)
++                .unwrap();
++            sender
++                .acknowledged(0, ids[order[0]], handles[order[0]])
++                .unwrap();
++            assert_eq!(sender.spurious_recovery(0), Err(GrantError::Blocked));
++            assert_eq!(
++                sender
++                    .finish_ack(0, Duration::ZERO)
++                    .unwrap()
++                    .unwrap()
++                    .newly_acked,
++                1280
++            );
++            assert!(!sender.spurious_recovery(0).unwrap());
++
++            sender
++                .begin_ack(0, Duration::from_millis(2), false)
++                .unwrap();
++            assert_eq!(
++                sender.acknowledged(0, ids[order[0]], handles[order[0]]),
++                Err(GrantError::Stale)
++            );
++            sender
++                .acknowledged(0, ids[order[1]], handles[order[1]])
++                .unwrap();
++            assert_eq!(sender.spurious_recovery(0), Err(GrantError::Blocked));
++            let sample = sender.finish_ack(0, Duration::ZERO).unwrap().unwrap();
++            assert_eq!(
++                (sample.newly_acked, sample.delivered, sample.lost),
++                (1280, 2560, 2560)
++            );
++            assert!(sender.spurious_recovery(0).unwrap());
++            assert!(!sender.spurious_recovery(0).unwrap());
++            assert_eq!(sender.flight_bytes(0), Some((0, 2560)));
++        }
++    }
++
++    #[test]
++    fn later_recovery_or_missing_evidence_cannot_reuse_old_proof() {
++        for retire in [false, true] {
++            let (mut sender, ids, handles) = fixture();
++            let first = sender.lost(0, ids[0], handles[0]).unwrap().unwrap();
++            sender.recovery_started(0, first).unwrap();
++            let second = sender.lost(0, ids[2], handles[2]).unwrap().unwrap();
++            if retire {
++                sender.retired(0, ids[2], handles[2]).unwrap();
++            } else {
++                sender.recovery_started(0, second).unwrap();
++            }
++            sender
++                .begin_ack(0, Duration::from_millis(1), false)
++                .unwrap();
++            sender.acknowledged(0, ids[0], handles[0]).unwrap();
++            sender.finish_ack(0, Duration::ZERO).unwrap();
++            assert!(
++                !sender.spurious_recovery(0).unwrap(),
++                "old proof cannot cover a later loss or retirement"
++            );
++            if !retire {
++                sender
++                    .begin_ack(0, Duration::from_millis(2), false)
++                    .unwrap();
++                sender.acknowledged(0, ids[2], handles[2]).unwrap();
++                sender.finish_ack(0, Duration::ZERO).unwrap();
++                assert!(sender.spurious_recovery(0).unwrap());
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod recovery_reuse_tests {
++    use super::*;
++
++    #[test]
++    fn retired_loss_evidence_cannot_alias_a_reused_slot_or_generation() {
++        let (mut sender, flights) = Sender::new(1, 1, 1).unwrap();
++        let mut flight = flights.into_vec().pop().unwrap();
++        let limits = Limits {
++            window: 100_000,
++            rate: 1_000_000_000,
++            quantum: 100_000,
++            max_datagram: 1280,
++        };
++        let mut old = None;
++        for generation in 1..=2 {
++            let at = Duration::from_millis(generation * 10);
++            let id = PacketId {
++                session: 0,
++                generation,
++                lane: 1,
++                number: 1,
++            };
++            flight.prepare(&[Planned { id, bytes: 1280 }]).unwrap();
++            sender.reserve(0, &mut flight, false, limits, at).unwrap();
++            let handle = flight.handle(0).unwrap();
++            flight.complete(1, Some(at), false).unwrap();
++            sender.reported(flight).unwrap();
++            flight = sender.advance(0, 64).unwrap().unwrap();
++            let loss = sender.lost(0, id, handle).unwrap().unwrap();
++            sender.recovery_started(0, loss).unwrap();
++            if let Some((old_id, old_handle)) = old {
++                assert_eq!(old_handle, handle);
++                sender
++                    .begin_ack(0, at + Duration::from_millis(1), false)
++                    .unwrap();
++                assert_eq!(
++                    sender.acknowledged(0, old_id, old_handle),
++                    Err(GrantError::Stale)
++                );
++                sender.acknowledged(0, id, handle).unwrap();
++                assert_eq!(
++                    sender
++                        .finish_ack(0, Duration::ZERO)
++                        .unwrap()
++                        .unwrap()
++                        .newly_acked,
++                    1280
++                );
++                assert!(sender.spurious_recovery(0).unwrap());
++            } else {
++                sender.retired(0, id, handle).unwrap();
++                assert!(!sender.spurious_recovery(0).unwrap());
++            }
++            old = Some((id, handle));
++            sender.reopen(0).unwrap();
++        }
++    }
++}
+diff --git a/src/worker/sender/owner.rs b/src/worker/sender/owner.rs
+index b7cced9..bf48e0a 100644
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -663,6 +663,9 @@ impl Owner {
+                                 .sender
+                                 .flight_bytes(group)
+                                 .ok_or(io::ErrorKind::InvalidData)?;
++                            self.sender
++                                .recovery_started(group, loss)
++                                .map_err(io::Error::other)?;
+                             state
+                                 .controller
+                                 .enter_recovery(now, inflight, state.pto.stalled())
+@@ -719,6 +722,17 @@ impl Owner {
+                 .finish_ack(group, state.rtt.minimum().unwrap_or(Duration::ZERO))
+                 .map_err(io::Error::other)?
+             {
++                if self
++                    .sender
++                    .spurious_recovery(group)
++                    .map_err(io::Error::other)?
++                {
++                    state
++                        .controller
++                        .undo_recovery(now)
++                        .map_err(io::Error::other)?;
++                    state.recovery = None;
++                }
+                 let (_, inflight) = self
+                     .sender
+                     .flight_bytes(group)
+@@ -1843,3 +1857,165 @@ mod window_evidence_tests {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod recovery_tests {
++    use super::*;
++
++    fn send(
++        owner: &mut Owner,
++        mut flight: Box<Flight>,
++        numbers: &[u64],
++        at: Duration,
++    ) -> (Box<Flight>, Vec<NonZeroU16>) {
++        let packets: Vec<_> = numbers
++            .iter()
++            .map(|&number| pacing::Planned {
++                id: PacketId {
++                    session: 0,
++                    generation: 1,
++                    lane: 1,
++                    number,
++                },
++                bytes: 1280,
++            })
++            .collect();
++        flight.prepare(&packets).unwrap();
++        owner.sender.reopen(0).unwrap();
++        owner
++            .sender
++            .reserve(
++                0,
++                &mut flight,
++                false,
++                crate::pacing::Limits {
++                    window: 100_000,
++                    rate: 1_000_000_000,
++                    quantum: 100_000,
++                    max_datagram: 1280,
++                },
++                at,
++            )
++            .unwrap();
++        let handles = (0..numbers.len())
++            .map(|i| flight.handle(i).unwrap())
++            .collect();
++        flight.complete(numbers.len(), Some(at), false).unwrap();
++        owner.sender.reported(flight).unwrap();
++        let flight = owner.sender.advance(0, 64).unwrap().unwrap();
++        owner
++            .timers
++            .submitted(0, 1, 1, numbers.len() as u32, at)
++            .unwrap();
++        (flight, handles)
++    }
++
++    fn ack(
++        owner: &mut Owner,
++        number: u64,
++        handle: NonZeroU16,
++        sent: Duration,
++        received: Duration,
++        settled: bool,
++    ) {
++        let mut report = Report::new(0);
++        report.group = 0;
++        report.id = PacketId {
++            session: 0,
++            generation: 1,
++            lane: 1,
++            number: 0,
++        };
++        report.kind = ReportKind::Ack {
++            received,
++            delay_us: 0,
++            first: true,
++            end: Some(AckProgress {
++                packets: 1,
++                eliciting: true,
++                released_bytes: if settled { 1280 } else { 0 },
++                rtt_sent_at: Some(sent),
++            }),
++        };
++        report.count = 1;
++        report.entries[0] = Entry {
++            number,
++            sample: Some(handle),
++            settled,
++        };
++        owner.apply_report(&report, received).unwrap();
++    }
++
++    #[test]
++    fn proof_finishes_before_or_after_the_normal_recovery_exit() {
++        for finish_first in [false, true] {
++            let (mut owner, flights) = Owner::new(1, 1, &[(0, 1, 0)], Duration::ZERO).unwrap();
++            owner.timers.install(0, 1).unwrap();
++            owner.sender.close(0).unwrap();
++            owner.sender.advance(0, 64).unwrap();
++            let (flight, handles) = send(
++                &mut owner,
++                flights.into_vec().pop().unwrap(),
++                &[1, 2],
++                Duration::ZERO,
++            );
++            let mut loss = Report::new(0);
++            loss.group = 0;
++            loss.id = PacketId {
++                session: 0,
++                generation: 1,
++                lane: 1,
++                number: 0,
++            };
++            loss.kind = ReportKind::Loss;
++            loss.count = 2;
++            for (index, &handle) in handles.iter().enumerate() {
++                loss.entries[index] = Entry {
++                    number: index as u64 + 1,
++                    sample: Some(handle),
++                    settled: true,
++                };
++            }
++            owner.apply_report(&loss, Duration::from_millis(1)).unwrap();
++            ack(
++                &mut owner,
++                1,
++                handles[0],
++                Duration::ZERO,
++                Duration::from_millis(3),
++                false,
++            );
++            assert_eq!(owner.groups[0].recovery, Some(Duration::from_millis(1)));
++            if finish_first {
++                let (_flight, new_handles) =
++                    send(&mut owner, flight, &[3], Duration::from_millis(4));
++                ack(
++                    &mut owner,
++                    3,
++                    new_handles[0],
++                    Duration::from_millis(4),
++                    Duration::from_millis(5),
++                    true,
++                );
++                assert_eq!(owner.groups[0].recovery, None);
++            }
++            ack(
++                &mut owner,
++                2,
++                handles[1],
++                Duration::ZERO,
++                Duration::from_millis(6),
++                false,
++            );
++            assert_eq!(owner.groups[0].recovery, None);
++            assert!(!owner.sender.spurious_recovery(0).unwrap());
++            assert_eq!(owner.sender.flight_bytes(0), Some((0, 0)));
++            assert_eq!(
++                owner.groups[0]
++                    .controller
++                    .undo_recovery(Duration::from_millis(6)),
++                Err(crate::bbr::ControllerError::Invalid)
++            );
++        }
++    }
++}

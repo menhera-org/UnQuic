@@ -695,8 +695,8 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
     assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
     assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
     assert!(left.control.session_counters(2).unwrap().tx_outer_bytes - before >= 9000);
-    // A remote pending pair can survive local cancellation for ten seconds plus a retry.
-    let migration_wait = Duration::from_secs(12);
+    // Offset ten-second attempts can require two expiries before tags converge.
+    let migration_wait = Duration::from_secs(30);
     let old_generation = left.control.session(0).unwrap().generation;
     let old_remote_generation = right.control.session(0).unwrap().generation;
     left.control
@@ -726,9 +726,19 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
             && right.control.session(0).unwrap().generation > old_remote_generation
     });
     assert!(left.control.session(0).unwrap().carrier);
+    let frame_started = Instant::now();
     raw_send(&a, &frame);
     until(Duration::from_secs(2), || {
-        capture_frame(&b, &mut capture).is_some_and(|n| capture[..n] == frame)
+        let delivered = capture_frame(&b, &mut capture).is_some_and(|n| capture[..n] == frame);
+        assert!(
+            delivered || frame_started.elapsed() < Duration::from_millis(1900),
+            "post-migration frame: left {:?}, right {:?}, left TX {:?}, right RX {:?}",
+            left.control.session_counters(0),
+            right.control.session_counters(0),
+            [1, 2, 3, 4].map(|lane| left.control.transmit_lane_counters(0, lane)),
+            [1, 2, 3, 4].map(|lane| right.control.receive_lane_counters(0, lane))
+        );
+        delivered
     });
     let migrated = left.control.session(0).unwrap().generation;
     for lane in 1..=4 {

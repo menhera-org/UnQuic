@@ -128,8 +128,13 @@ if [ "${OUTER_ROUTED:-0}" = 1 ]; then
         ip -6 neigh add "fd77:ff:$n::1" lladdr "02:77:ff:00:0$n:01" nud permanent dev "uq-r-$side"
         # Segment before router netem so loss applies to individual datagrams.
         nsenter --net="/run/netns/uq-out-$side" ethtool -K uq-path gso off tso off tx-udp-segmentation off
-        ethtool -K "uq-r-$side" gro off
+        # Use one endpoint NAPI queue; per-CPU backlogs reorder delayed traffic.
+        ethtool -K "uq-r-$side" gro off tso off
+        nsenter --net="/run/netns/uq-out-$side" ethtool -K uq-path gro on
+        ethtool -k "uq-r-$side" > "$out/$side.router-offloads"
+        grep -q '^tcp-segmentation-offload: off' "$out/$side.router-offloads"
         nsenter --net="/run/netns/uq-out-$side" ethtool -k uq-path > "$out/$side.outer-offloads"
+        grep -q '^generic-receive-offload: on' "$out/$side.outer-offloads"
         grep -q '^generic-segmentation-offload: off' "$out/$side.outer-offloads"
         grep -q '^tx-udp-segmentation: off' "$out/$side.outer-offloads"
         netem "uq-r-$side"
@@ -280,6 +285,10 @@ snapshot() {
         outer right cat /proc/net/snmp6 > "$out/$1.outer-right"
         tc -s -d qdisc show dev uq-r-left > "$out/$1.qdisc-left"
         tc -s -d qdisc show dev uq-r-right > "$out/$1.qdisc-right"
+        for side in left right; do
+            outer "$side" ethtool -S uq-path > "$out/$1.$side-veth"
+            outer "$side" ip -s link show uq-path > "$out/$1.$side-outer-link"
+        done
     elif [ "${OUTER_DELAY_US:-0}" -ne 0 ] || [ "${OUTER_LOSS_PERMILLE:-0}" -ne 0 ]; then
         tc -s -d qdisc show dev lo > "$out/$1.qdisc"
     fi

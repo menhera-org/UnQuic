@@ -430,6 +430,14 @@ cleanup releases the unsent remainder. Repairs and ACK retirement do not
 change this balance. This bounds queued work separately from retained payload
 without enlarging physical buffers or memory limits.
 
+Materialization stops once a lane has 64 current path UDP payloads of unsent
+frame bytes, with at most one frame of overshoot. Extra children stay in their
+source buffers. This follows discovered MTU rather than assuming a packet size.
+Blocked lanes keep their source order while other lanes can expand. Owners hold
+foreign readers' replacement credits until materialized work drains; RX credits
+and stale connections return immediately. Send and expiry work release credits
+before the next sleep, without polling held credits every millisecond.
+
 Transmit DATA gathers rewritten headers and payload ranges from retained sources.
 When a grant sends its entire permitted prefix, the never-attempted suffix keeps
 its packet numbers, wire metadata and reservations in the same bounded batch.

@@ -53,6 +53,71 @@ fn encoded(record: Record<'_>) -> Vec<u8> {
 }
 
 #[test]
+fn late_role_election_can_exceed_twelve_seconds_without_permanent_livelock() {
+    let (mut a, mut b) = sessions();
+    let ms = Duration::from_millis;
+    // The first HELLO is unavailable; subsequent flights have 100 ms one-way delay.
+    a.on_timer(ms(0), tag(20)).unwrap();
+    let hello = b.on_timer(ms(9800), tag(10)).unwrap().send.unwrap();
+    let challenge = a.on_record(hello, ms(9900), tag(30)).unwrap().send.unwrap();
+    let confirm = b
+        .on_record(challenge, ms(10000), None)
+        .unwrap()
+        .send
+        .unwrap();
+    // Yielding to the lower tag kept A's original 10-second absolute deadline.
+    let expired = a.on_record(confirm, ms(10100), None).unwrap();
+    assert!(expired.send.is_none() && expired.commit.is_none());
+    let hello = a.on_timer(ms(10100), tag(40)).unwrap().send.unwrap();
+    assert!(b.on_record(hello, ms(10200), None).unwrap().send.is_none());
+
+    // Both endpoints retry every second, but B retains the old fixed pair until 19.8s.
+    for second in 11..=19 {
+        let at = second * 1000;
+        let confirm = b.on_timer(ms(at), None).unwrap().send.unwrap();
+        assert!(matches!(
+            confirm,
+            Record::Confirm {
+                initiator: 10,
+                responder: 30
+            }
+        ));
+        assert!(
+            a.on_record(confirm, ms(at + 100), None)
+                .unwrap()
+                .send
+                .is_none()
+        );
+        let hello = a.on_timer(ms(at + 100), None).unwrap().send.unwrap();
+        assert!(matches!(hello, Record::Hello { initiator: 40, .. }));
+        let ignored = b.on_record(hello, ms(at + 200), None).unwrap();
+        assert!(ignored.send.is_none() && ignored.commit.is_none());
+        assert!(a.connection().is_none() && b.connection().is_none());
+    }
+
+    let hello = b.on_timer(ms(19800), tag(50)).unwrap().send.unwrap();
+    assert!(a.on_record(hello, ms(19900), None).unwrap().send.is_none());
+    let hello = a.on_timer(ms(20100), tag(60)).unwrap().send.unwrap();
+    assert!(b.on_record(hello, ms(20200), None).unwrap().send.is_none());
+    let hello = b.on_timer(ms(20800), None).unwrap().send.unwrap();
+    let challenge = a
+        .on_record(hello, ms(20900), tag(70))
+        .unwrap()
+        .send
+        .unwrap();
+    let confirm = b
+        .on_record(challenge, ms(21000), None)
+        .unwrap()
+        .send
+        .unwrap();
+    let ready = a.on_record(confirm, ms(21100), None).unwrap();
+    assert!(ready.commit.is_some());
+    let committed = b.on_record(ready.send.unwrap(), ms(21200), None).unwrap();
+    assert!(committed.commit.is_some());
+    same_pair(a.connection().unwrap(), b.connection().unwrap());
+}
+
+#[test]
 fn losing_each_flight_and_repeating_messages_commits_once() {
     for lost in [3, 4, 8, 9] {
         let (a, b) = sessions();

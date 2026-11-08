@@ -423,6 +423,12 @@ Do not defer this performance coverage to the stage 4 composition matrix.
   softirq, core budget, flow count and the precise measurement layer. Keep
   this requirement open until a repeatable run passes.
 
+The delayed benchmark now uses one endpoint veth NAPI queue. Captures traced
+unintended reordering to the old per-CPU receive backlog; the corrected short
+diagnostic runs have zero outer reordering and ordinary loss declarations.
+This fixes the lab path, not the transport's outstanding throughput gaps.
+BENCH.md retains the original results and the before/after evidence.
+
 ## Stage 3: recovery and congestion control
 
 Goal: a production candidate under loss.
@@ -664,6 +670,14 @@ repair, cleanup and generation replacement. The matched single-lane release
 sweep preserves about 1.9 Gbit/s through overload, instead of falling below
 0.6 Gbit/s; eight-lane throughput remains about 1.6–1.8 Gbit/s. Neither original
 performance target is met. See BENCH.md for CPU, loss and pressure attribution.
+
+A second bound now limits materialized unsent bytes to 64 discovered UDP payloads
+per lane, plus one frame. Remaining source children wait in order; other lanes
+continue, and foreign-reader credits wait until sends or expiry reopen capacity.
+RX credits and stale generations bypass that hold. Targeted tests cover source
+order, credits, cross-lane progress, expiry and 1232/1452/8952-byte payload limits.
+The initial delayed bridged sweep improves unlimited delivery to 0.855 / 0.606
+Gbit/s while reducing daemon CPU, but ACK-buffer drops and the GSO ceiling remain.
 Worker regressions
 cover mapping pressure, bounded report processing, partial sends and late-ACK
 cancellation. A bidirectional release runtime test drops the original prefix and first repair, verifies

@@ -1,0 +1,11 @@
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -1435,7 +1435,7 @@
+             Ok(bytes) => self.counters.receive_buffer_bytes += bytes as u64,
+             Err(_) => self.counters.socket_errors += 1,
+         }
+-        if socket.enable_gro().is_err() {
++        if false && socket.enable_gro().is_err() {
+             self.counters.socket_errors += 1;
+         }
+         self.reactor.add(

@@ -1,0 +1,121 @@
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -649,6 +649,8 @@
+     control_budgets: Vec<pacing::Control>,
+     receive: Vec<Option<ReceiveSocket>>,
+     receive_overflow: Vec<u32>,
++    diag_raw_identity: Option<(crate::UnquicUuid, u128)>,
++    diag_raw_highest: [u64; 64],
+     pending_receive: VecDeque<(usize, usize, ReceiveSocket)>,
+     receive_enabled: bool,
+     rx_retained: usize,
+@@ -912,6 +914,8 @@
+             incoming: (0..count).map(|_| None).collect(),
+             receive: (0..config.endpoints.len()).map(|_| None).collect(),
+             receive_overflow: vec![0; config.endpoints.len()],
++            diag_raw_identity: None,
++            diag_raw_highest: [0; 64],
+             pending_receive: VecDeque::with_capacity(if id == 0 {
+                 config.endpoints.len() * count
+             } else {
+@@ -1695,6 +1699,55 @@
+         Ok(())
+     }
+ 
++    // Temporary diagnostic: one cookie/tag identity, lanes 1..=64 per reader.
++    // Counts all decoded datagrams; older duplicates also count as reordered.
++    // No admission state is changed. These are raw socket arrival counters.
++    fn diagnose_raw_receive(&mut self, bytes: &[u8], segment_size: usize) {
++        let size = if segment_size == 0 { bytes.len().max(1) } else { segment_size };
++        self.counters.diag_raw_buffers = self.counters.diag_raw_buffers.wrapping_add(1);
++        self.counters.diag_raw_gro_buffers = self.counters.diag_raw_gro_buffers
++            .wrapping_add(u64::from(segment_size != 0));
++        for segment in bytes.chunks(size) {
++            let Ok(datagram) = Datagram::decode(segment) else {
++                self.counters.diag_raw_malformed = self.counters.diag_raw_malformed.wrapping_add(1);
++                continue;
++            };
++            let header = datagram.header();
++            if header.lane == 0 {
++                continue;
++            }
++            let identity = (header.cookie, header.receive_tag);
++            let tracked = self.diag_raw_identity.get_or_insert(identity);
++            let lane = usize::from(header.lane) - 1;
++            if *tracked != identity || lane >= 64 {
++                self.counters.diag_raw_scope_skip = self.counters.diag_raw_scope_skip.wrapping_add(1);
++                continue;
++            }
++            let cookie = header.cookie.as_bytes();
++            let cookie_low = u32::from_be_bytes([cookie[12], cookie[13], cookie[14], cookie[15]]);
++            let expected = cookie_low.wrapping_add(lane as u32) as usize % self.shared.workers();
++            self.counters.diag_raw_owner_mismatch = self.counters.diag_raw_owner_mismatch
++                .wrapping_add(u64::from(expected != self.id));
++            let high = &mut self.diag_raw_highest[lane];
++            let lag = high.saturating_sub(header.packet_number);
++            self.counters.diag_raw_equal_highest = self.counters.diag_raw_equal_highest
++                .wrapping_add(u64::from(header.packet_number == *high));
++            *high = (*high).max(header.packet_number);
++            let totals = &mut self.counters;
++            if datagram.records().any(|record| matches!(record, Record::Data { .. })) {
++                totals.diag_raw_data_received = totals.diag_raw_data_received.wrapping_add(1);
++                totals.diag_raw_data_reordered = totals.diag_raw_data_reordered.wrapping_add(u64::from(lag != 0));
++                totals.diag_raw_data_reorder_lag = totals.diag_raw_data_reorder_lag.wrapping_add(lag);
++                totals.diag_raw_data_reorder_lag_max = totals.diag_raw_data_reorder_lag_max.max(lag);
++            } else {
++                totals.diag_raw_control_received = totals.diag_raw_control_received.wrapping_add(1);
++                totals.diag_raw_control_reordered = totals.diag_raw_control_reordered.wrapping_add(u64::from(lag != 0));
++                totals.diag_raw_control_reorder_lag = totals.diag_raw_control_reorder_lag.wrapping_add(lag);
++                totals.diag_raw_control_reorder_lag_max = totals.diag_raw_control_reorder_lag_max.max(lag);
++            }
++        }
++    }
++
+     fn read_socket(&mut self, endpoint: usize, now: Duration) -> io::Result<()> {
+         let mut clock = self.io_clock(now);
+         let available = (RECEIVE_BUFFERS - self.rx_retained).min(self.free.len());
+@@ -1749,6 +1802,7 @@
+                 );
+             }
+             if index < count && !truncated[index] {
++                self.diagnose_raw_receive(&buffer.bytes[..lengths[index]], segments[index]);
+                 buffer.length = lengths[index];
+                 buffer.rx_counted = false;
+                 buffer.offset = 0;
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -92,6 +92,34 @@
+ }
+ 
+ metrics! {
++    /// Temporary raw socket order experiment; worker totals only.
++    diag_raw_buffers: sum,
++    /// Temporary raw socket order experiment; worker totals only.
++    diag_raw_gro_buffers: sum,
++    /// Temporary raw socket order experiment; worker totals only.
++    diag_raw_malformed: sum,
++    /// Temporary raw socket order experiment; worker totals only.
++    diag_raw_scope_skip: sum,
++    /// Temporary raw socket order experiment; worker totals only.
++    diag_raw_owner_mismatch: sum,
++    /// Temporary raw socket order experiment; worker totals only.
++    diag_raw_equal_highest: sum,
++    /// Temporary raw socket order experiment; worker totals only.
++    diag_raw_data_received: sum,
++    /// Temporary raw socket order experiment; worker totals only.
++    diag_raw_data_reordered: sum,
++    /// Temporary raw socket order experiment; worker totals only.
++    diag_raw_data_reorder_lag: sum,
++    /// Temporary raw socket order experiment; worker totals only.
++    diag_raw_control_received: sum,
++    /// Temporary raw socket order experiment; worker totals only.
++    diag_raw_control_reordered: sum,
++    /// Temporary raw socket order experiment; worker totals only.
++    diag_raw_control_reorder_lag: sum,
++    /// Temporary raw socket order experiment; worker totals only.
++    diag_raw_data_reorder_lag_max: max,
++    /// Temporary raw socket order experiment; worker totals only.
++    diag_raw_control_reorder_lag_max: max,
+     /// Temporary outer packet order experiment; successful fresh admission only.
+     diag_rx_data_fresh: sum,
+     /// Temporary outer packet order experiment; successful fresh admission only.

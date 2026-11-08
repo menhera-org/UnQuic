@@ -1,8 +1,11 @@
-use super::super::tests::test_workers;
 use super::*;
 
 fn workers() -> ([Worker; 2], ReceiveSocket) {
-    let (_, mut workers) = test_workers();
+    workers_with_lanes(2)
+}
+
+fn workers_with_lanes(lanes: usize) -> ([Worker; 2], ReceiveSocket) {
+    let (_, mut workers) = super::super::tests::test_workers_with_lanes(lanes);
     let params = wire::Params {
         port: 40000,
         max_frame_len: 9022,
@@ -440,6 +443,7 @@ fn partial_batches_with_feedback(feedback: bool) {
         for worker in &mut workers {
             worker.drain_queues(now).unwrap();
             worker.service_sender(now).unwrap();
+            worker.drain_tap_inputs(now).unwrap();
             worker.flush_frames(now).unwrap();
             if feedback && worker.id == 0 && worker.sender.job.is_some() {
                 worker
@@ -464,12 +468,15 @@ fn partial_batches_with_feedback(feedback: bool) {
             let datagram = Datagram::decode(&storage[..length]).unwrap();
             let header = datagram.header();
             let owner = usize::from(header.lane - 1);
+            assert!(
+                header.packet_number >= next_packet[owner],
+                "packet numbers must increase across control and DATA sends"
+            );
             if !feedback {
                 assert_eq!(
                     header.packet_number, next_packet[owner],
                     "never-attempted suffix must retain its original identity"
                 );
-                next_packet[owner] += 1;
                 assert_eq!(receiver[owner].admit(&datagram, now), Admission::Fresh);
                 while let Some(frame) = receiver[owner].front(now) {
                     delivered[owner] += 1;
@@ -479,6 +486,7 @@ fn partial_batches_with_feedback(feedback: bool) {
                     assert!(receiver[owner].finish_front());
                 }
             }
+            next_packet[owner] = header.packet_number + 1;
             for record in datagram.records() {
                 if let Record::Data {
                     frame_id,
@@ -1714,18 +1722,20 @@ fn mapping_pressure_preserves_fresh_fifo_and_leaves_reserved_space_for_repair() 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
 fn continuous_backlog_cannot_starve_the_opposite_frame_class() {
+    // Keep both full fresh batches below the input gate; test class scheduling separately.
+    const FRAME_LEN: usize = 600;
     fn enqueue(worker: &mut Worker, repair: bool) -> u64 {
-        queue_frame(worker, 1514);
+        queue_frame(worker, FRAME_LEN);
         let batch = worker.sessions[0].batches[1].as_ref().unwrap();
         let slot = batch.pending.iter(&worker.frames).last().unwrap();
         let id = worker.frames.frame(slot).unwrap().id;
         if repair {
             let mut batch = worker.sessions[0].batches[1].take().unwrap();
             assert!(worker.frames.unqueue(&mut batch.pending, slot).unwrap());
-            worker.frames.frame_mut(slot).unwrap().offset = 1514;
-            submit_original(worker, slot, 0..1514);
+            worker.frames.frame_mut(slot).unwrap().offset = FRAME_LEN;
+            submit_original(worker, slot, 0..FRAME_LEN);
             let coverage = worker.frames.recovery_mut(slot).unwrap();
-            assert!(coverage.lost(0..1514, 0));
+            assert!(coverage.lost(0..FRAME_LEN, 0));
             worker.recovery.set(slot, Place::Retained).unwrap();
             worker.sessions[0].batches[1] = Some(batch);
             worker.queue_recovery(slot).unwrap();
@@ -2531,12 +2541,171 @@ fn gso_input_with_qinq(worker: &mut Worker, count: usize, size: u16, qinq: bool)
 }
 
 fn fill_fresh_budget(worker: &mut Worker) {
-    for _ in 0..FRESH_BYTES / 9022 {
-        queue_frame(worker, 9022);
-    }
-    queue_frame(worker, FRESH_BYTES % 9022);
+    queue_frame(worker, FRESH_BYTES % 43);
+    let input = gso_input(worker, FRESH_BYTES / 43, 1);
+    worker.input_frame(input, Duration::ZERO).unwrap();
+    worker.drain_tap_inputs(Duration::ZERO).unwrap();
     let index = worker.sender_index(0, worker.id).unwrap();
     assert_eq!(worker.sender.lanes[index].unsent_bytes, FRESH_BYTES);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn fresh_materialization_gates_large_sources_without_losing_order_or_credit() {
+    let (mut workers, _rx) = workers();
+    let [worker, reader] = &mut workers;
+    // This fixture installs directly, without running the coordinator barrier.
+    assert!(worker.sessions[0].acknowledged.take().is_some());
+    assert!(!worker.has_backpressure());
+    let index = worker.sender_index(0, 0).unwrap();
+    let limit = BATCH_SIZE * worker.transmit[0].paths[0].lanes[0].mtu.payload_limit();
+    for _ in 0..4 {
+        let input = gso_input_with_qinq(worker, 44, 1472, true);
+        worker.input_frame(input, Duration::ZERO).unwrap();
+    }
+    while worker.drain_tap_inputs(Duration::ZERO).unwrap() {}
+    let materialized =
+        worker.sender.lanes[index].unsent_bytes - worker.sessions[0].unexpanded_bytes[0];
+    assert!(materialized >= limit && materialized < limit + 1522);
+    assert_eq!(worker.tap_capacity(0), 0);
+    let sources: Vec<_> = worker.sessions[0].tap_inputs.iter().copied().collect();
+    assert!(!worker.drain_tap_inputs(Duration::ZERO).unwrap());
+    assert_eq!(
+        worker.sessions[0]
+            .tap_inputs
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        sources
+    );
+
+    let free = reader.free.len();
+    let mut input = gso_input(reader, 3, 100);
+    input.lane = 0;
+    worker.input_frame(input, Duration::ZERO).unwrap();
+    assert_eq!(worker.returns[reader.id].len(), 1);
+    let credit = &worker.returns[reader.id][0];
+    assert_eq!((credit.session, credit.lane, credit.tag), (0, 0, 1));
+    assert!(credit.tx_reserved && !credit.rx_reserved);
+    assert!(!worker.has_backpressure());
+
+    let mut receive = reader.free.pop().unwrap();
+    receive.rx_reserved = true;
+    reader.rx_retained += 1;
+    worker.release(receive);
+    reader.drain_queues(Duration::ZERO).unwrap();
+    assert_eq!(reader.rx_retained, 0);
+    assert_eq!(reader.free.len(), free - 1);
+    worker.flush_returns();
+    assert_eq!(worker.returns[reader.id].len(), 1);
+
+    let mut sequence = 1;
+    while worker.sender.lanes[index].unsent_bytes != 0 {
+        let mut batch = worker.sessions[0].batches[0].take().unwrap();
+        while let Some(frame) = batch.pending.pop_front(&mut worker.frames).unwrap() {
+            assert_eq!(worker.frames.frame(frame).unwrap().id, (1 << 48) | sequence);
+            sequence += 1;
+            worker.release_frame(frame).unwrap();
+        }
+        worker.sessions[0].batches[0] = Some(batch);
+        while worker.cleanup_frames().unwrap() {}
+        worker.flush_returns();
+        reader.drain_queues(Duration::ZERO).unwrap();
+        worker.drain_tap_inputs(Duration::ZERO).unwrap();
+    }
+    assert_eq!(sequence, 4 * 44 + 3 + 1);
+    assert_eq!(worker.sessions[0].unexpanded_bytes[0], 0);
+    assert!(worker.sessions[0].tap_inputs.is_empty());
+    assert!(worker.returns[reader.id].is_empty());
+    assert_eq!(reader.free.len(), free);
+    assert_eq!(reader.sessions[0].tx_retained, 0);
+    assert!(worker.tap_capacity(0) > 0);
+    assert_eq!(worker.counters.queue_drops, 0);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn fresh_materialization_tracks_discovered_mtu_and_resumes_on_expiry() {
+    for ceiling in [BASE_UDP_PAYLOAD, 1452, 8952] {
+        let (mut workers, _rx) = workers();
+        let worker = &mut workers[0];
+        let path = &mut worker.transmit[0].paths[0].lanes[0].mtu;
+        *path = pmtu::Path::new(ceiling, Duration::ZERO).unwrap();
+        let mut packet = 1;
+        while path.payload_limit() != ceiling {
+            let now = path.deadline();
+            let length = path.poll(now).unwrap();
+            let id = pmtu::ProbeId {
+                session: 0,
+                tag: 1,
+                lane: 1,
+                packet,
+            };
+            assert!(path.submitted(id, length, now));
+            assert!(path.reply(id, length, now + Duration::from_millis(1)));
+            packet += 1;
+        }
+        while !worker.fresh_full(0, 0) {
+            queue_frame(worker, 9022);
+        }
+        let index = worker.sender_index(0, 0).unwrap();
+        assert!(worker.sender.lanes[index].unsent_bytes >= BATCH_SIZE * ceiling);
+        assert!(worker.sender.lanes[index].unsent_bytes < BATCH_SIZE * ceiling + 9022);
+        queue_frame(worker, 60);
+        assert_eq!(worker.sessions[0].unexpanded_bytes[0], 60);
+        assert_eq!(worker.tap_capacity(0), 0);
+        assert!(!worker.drain_tap_inputs(Duration::ZERO).unwrap());
+        let now = reassembly::FRAME_LIFETIME;
+        while worker.expire_frames(now).unwrap() {}
+        while worker.cleanup_frames().unwrap() {}
+        worker.drain_tap_inputs(now).unwrap();
+        assert_eq!(worker.sender.lanes[index].unsent_bytes, 0);
+        assert_eq!(worker.sessions[0].unexpanded_bytes[0], 0);
+        assert!(worker.tap_capacity(0) > 0);
+    }
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn fresh_materialization_stalled_lane_does_not_block_another_lane() {
+    let (mut workers, _rx) = workers_with_lanes(4);
+    let worker = &mut workers[0];
+    while !worker.fresh_full(0, 0) {
+        queue_frame(worker, 9022);
+    }
+    queue_frame(worker, 60);
+    queue_frame(worker, 60);
+    let stalled: Vec<_> = worker.sessions[0].tap_inputs.iter().copied().collect();
+    let mut input = gso_input(worker, 3, 100);
+    input.lane = 2;
+    worker.input_frame(input, Duration::ZERO).unwrap();
+    assert!(worker.tap_can_expand(0));
+    assert!(!worker.drain_tap_inputs(Duration::ZERO).unwrap());
+    assert_eq!(
+        worker.sessions[0]
+            .tap_inputs
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        stalled
+    );
+    let batch = worker.sessions[0].batches[2].as_ref().unwrap();
+    assert_eq!(batch.pending.len(), 3);
+    for (sequence, frame) in batch.pending.iter(&worker.frames).enumerate() {
+        assert_eq!(
+            worker.frames.frame(frame).unwrap().id,
+            (3 << 48) | (sequence as u64 + 1)
+        );
+    }
+    worker.sessions[0].connection = None;
+    worker.drain_tap_inputs(Duration::ZERO).unwrap();
+    assert!(worker.sessions[0].tap_inputs.is_empty());
+    assert!(
+        worker.sessions[0]
+            .unexpanded_bytes
+            .iter()
+            .all(|&bytes| bytes == 0)
+    );
 }
 
 #[test]
@@ -2873,4 +3042,107 @@ fn fully_protected_loss_fence_continues_queued_ack_without_external_wakeup() {
     assert!(worker.service_sender(now).unwrap());
     assert!(worker.sender.incoming.is_empty());
     assert_eq!(worker.sender.lanes[index].history.inflight_bytes(), 0);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn successful_pmtu_probe_overtakes_retained_suffix_without_reordering_data() {
+    let (mut workers, rx) = workers();
+    for _ in 0..16 {
+        queue_frame(&mut workers[1], 1514);
+    }
+    workers[1].flush_frames(Duration::ZERO).unwrap();
+    for _ in 0..8 {
+        service(&mut workers);
+    }
+    let batch = workers[1].sessions[0].batches[1].as_ref().unwrap();
+    let retained_first = batch.plan.packet(0).expect("retained suffix").number;
+    assert!(workers[1].sender.job.is_none());
+    let mut bytes = [0; BASE_UDP_PAYLOAD];
+    let mut last = 0;
+    while let Ok((length, _)) = rx.recv(&mut bytes) {
+        let packet = Datagram::decode(&bytes[..length]).unwrap();
+        assert_eq!(packet.header().packet_number, last + 1);
+        last += 1;
+    }
+    assert_eq!(retained_first, last + 1);
+    let now = Duration::from_millis(2);
+    workers[1]
+        .incoming_ack(
+            0,
+            1,
+            2,
+            0,
+            AckRanges::new(&[AckRange {
+                start: 1,
+                end: last,
+            }])
+            .unwrap(),
+            now,
+        )
+        .unwrap();
+    for _ in 0..8 {
+        for worker in &mut workers {
+            worker.io_time = Some(Ok);
+            worker.drain_queues(now).unwrap();
+            worker.service_sender(now).unwrap();
+        }
+    }
+    workers[1]
+        .request_probe(0, 1, BASE_UDP_PAYLOAD, true, None, now)
+        .unwrap();
+    let probe = workers[1].sender.job.expect("PMTU request").first;
+    assert!(probe > retained_first);
+    for _ in 0..8 {
+        for worker in &mut workers {
+            worker.drain_queues(now).unwrap();
+            worker.service_sender(now).unwrap();
+        }
+    }
+    let length = rx.recv(&mut bytes).unwrap().0;
+    let packet = Datagram::decode(&bytes[..length]).unwrap();
+    assert_eq!(packet.header().packet_number, probe);
+    assert!(
+        packet
+            .records()
+            .any(|record| matches!(record, Record::Probe))
+    );
+    last = probe;
+    workers[1]
+        .incoming_ack(
+            0,
+            1,
+            2,
+            0,
+            AckRanges::new(&[AckRange {
+                start: probe,
+                end: probe,
+            }])
+            .unwrap(),
+            now + Duration::from_micros(100),
+        )
+        .unwrap();
+    let mut data = 0;
+    for tick in 1..=32 {
+        let now = now + Duration::from_micros(tick * 100);
+        for worker in &mut workers {
+            worker.drain_queues(now).unwrap();
+            worker.service_sender(now).unwrap();
+            worker.flush_frames(now).unwrap();
+        }
+        while let Ok((length, _)) = rx.recv(&mut bytes) {
+            let packet = Datagram::decode(&bytes[..length]).unwrap();
+            assert!(
+                packet.header().packet_number > last,
+                "an overtaken suffix must be renumbered before submission"
+            );
+            last = packet.header().packet_number;
+            data += usize::from(
+                packet
+                    .records()
+                    .any(|record| matches!(record, Record::Data { .. })),
+            );
+        }
+    }
+    assert!(data != 0, "DATA must resume after the PMTU probe");
 }

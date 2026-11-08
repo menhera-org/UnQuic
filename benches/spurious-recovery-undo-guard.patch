@@ -1,0 +1,108 @@
+diff --git a/src/bbr/controller/tests.rs b/src/bbr/controller/tests.rs
+index e30f8c9..c4e4b83 100644
+--- a/src/bbr/controller/tests.rs
++++ b/src/bbr/controller/tests.rs
+@@ -619,3 +619,58 @@ fn later_loss_rounds_do_not_forget_the_loss_caused_probe_departure() {
+     assert_eq!(c.state(), State::Refill);
+     assert_eq!(c.inflight_longterm, INFINITY);
+ }
++
++#[test]
++fn spurious_recovery_preserves_an_older_unadapted_loss() {
++    for adapt_during in [false, true] {
++        for finish_first in [false, true] {
++            let mut c = cruise();
++            c.enter_recovery(c.now, 30_000, false).unwrap();
++            loss(&mut c, 1500, 1500, 30_000, false);
++            let s = sample(&c, 100_000, 1500);
++            c.on_ack(s, Some(ms(10)), 15_000, false, ms(60)).unwrap();
++            assert!(!c.loss_in_round);
++            let delayed_prior = c.delivered;
++
++            let mut s = sample(&c, 100_000, 1500);
++            s.prior_delivered = delayed_prior - 1500;
++            s.delivered = c.delivered + s.newly_acked - s.prior_delivered;
++            c.on_ack(s, Some(ms(10)), 15_000, false, ms(62)).unwrap();
++            loss(&mut c, 1500, 1500, 30_000, false);
++
++            // An ACK sent after recovery began can end it before its newest
++            // loss round completes: its delivered snapshot predates that round.
++            c.recovery_finished(ms(64), false).unwrap();
++            let mut s = sample(&c, 100_000, 1500);
++            s.prior_delivered = delayed_prior;
++            s.delivered = c.delivered + s.newly_acked - s.prior_delivered;
++            c.on_ack(s, Some(ms(10)), 15_000, false, ms(64)).unwrap();
++            assert!(c.loss_in_round);
++            let before = (c.bw_shortterm, c.inflight_shortterm);
++
++            c.enter_recovery(ms(65), 15_000, false).unwrap();
++            loss(&mut c, 1500, 1500, 15_000, false);
++            if adapt_during {
++                let s = sample(&c, 10_000, 1500);
++                c.on_ack(s, Some(ms(10)), 7500, false, ms(66)).unwrap();
++                assert!(c.bw_shortterm < before.0);
++                assert!(c.inflight_shortterm < before.1);
++            }
++            if finish_first {
++                c.recovery_finished(ms(67), false).unwrap();
++            }
++            let bounds = (c.bw_shortterm, c.inflight_shortterm);
++            let evidence = (c.loss_in_round, c.loss_events);
++            c.undo_recovery(ms(68)).unwrap();
++            assert_eq!((c.bw_shortterm, c.inflight_shortterm), bounds);
++            assert_eq!((c.loss_in_round, c.loss_events), evidence);
++            assert!(!c.recovering);
++            assert_eq!(c.undo_recovery(ms(68)), Err(ControllerError::Invalid));
++
++            let s = sample(&c, 10_000, 1500);
++            c.on_ack(s, Some(ms(10)), 7500, false, ms(69)).unwrap();
++            assert!(c.bw_shortterm < before.0);
++            assert!(c.inflight_shortterm < before.1);
++        }
++    }
++}
+diff --git a/src/bbr/controller.rs b/src/bbr/controller.rs
+index de53d8c..6dc2541 100644
+--- a/src/bbr/controller.rs
++++ b/src/bbr/controller.rs
+@@ -146,6 +146,7 @@ pub struct Controller {
+     recovering: bool,
+     prior_cwnd: u64,
+     undo_valid: bool,
++    undo_eligible: bool,
+     undo_cwnd: u64,
+     undo_state: Option<State>,
+     undo_bw: u64,
+@@ -232,6 +233,7 @@ impl Controller {
+             recovering: false,
+             prior_cwnd: 0,
+             undo_valid: false,
++            undo_eligible: false,
+             undo_cwnd: 0,
+             undo_state: None,
+             undo_bw: 0,
+@@ -460,6 +462,16 @@ impl Controller {
+             return Err(ControllerError::Invalid);
+         }
+         self.now = now;
++        if !self.undo_eligible {
++            // A preceding episode still had an unadapted loss round when this one
++            // began. Proof for this episode cannot erase that older evidence.
++            if self.recovering {
++                self.cwnd = self.cwnd.max(self.prior_cwnd);
++            }
++            self.undo_valid = false;
++            self.recovering = false;
++            return Ok(());
++        }
+         if self.recovering {
+             self.undo_cwnd = self.undo_cwnd.max(self.prior_cwnd);
+         }
+@@ -791,6 +803,7 @@ impl Controller {
+     fn save_loss_state(&mut self) {
+         self.save_cwnd();
+         self.undo_valid = true;
++        self.undo_eligible = !self.loss_in_round;
+         self.undo_cwnd = self.prior_cwnd;
+         self.undo_state = None;
+         self.undo_bw = self.bw_shortterm;
