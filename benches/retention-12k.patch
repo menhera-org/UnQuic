@@ -1,0 +1,72 @@
+diff --git a/src/worker/frames.rs b/src/worker/frames.rs
+index 0ceec77..cdc1562 100644
+--- a/src/worker/frames.rs
++++ b/src/worker/frames.rs
+@@ -3,7 +3,8 @@ use super::{BUFFERS, Buffer};
+ use crate::{loss::FrameRecovery, pack, tap::Segments};
+ use std::{io, mem::size_of, ops::Range, time::Duration};
+ 
+-pub(super) const CAPACITY: usize = 8192;
++pub(super) const CAPACITY: usize = 12288;
++const _: () = assert!(CAPACITY < u16::MAX as usize);
+ pub(super) const HEADER_BYTES: usize = 128;
+ 
+ const END: usize = CAPACITY;
+diff --git a/src/worker.rs b/src/worker.rs
+index 6668eb2..94c3e9b 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -6150,12 +6150,13 @@ mod tests {
+     #[test]
+     fn origin_reservations_bound_every_session_direction() {
+         for workers in 1..=64 {
+-            assert!(frame_quota(workers) * workers <= 8192);
++            assert!(frame_quota(workers) * workers <= frames::CAPACITY);
+             assert!((64 * 1024 * 1024 / workers) * workers <= 64 * 1024 * 1024);
+             assert!(frame_quota(workers) <= frames::CAPACITY);
+         }
+         assert_eq!(frame_quota(1), frames::CAPACITY);
+-        assert_eq!(frame_quota(64), 128);
++        assert_eq!(frame_quota(8), 1536);
++        assert_eq!(frame_quota(64), 192);
+     }
+ 
+     #[test]
+diff --git a/README.md b/README.md
+index 056d441..76bdf09 100644
+--- a/README.md
++++ b/README.md
+@@ -396,9 +396,9 @@ These conservative reservations can reject large configurations before startup.
+ 
+ Fixed receive storage permits at most 4096 frames and 36,954,112 reserved frame
+ bytes per session, below the 8192-frame/64-MiB directional ceilings. Transmit
+-reservations divide the frame and 64-MiB byte budgets among the union of the
++reservations divide the 12288-frame and 64-MiB byte budgets among the union of the
+ session's TAP readers and transmit owners. Each worker preallocates the sum
+-of its participating sessions' frame quotas, capped at 8192 shared views,
++of its participating sessions' frame quotas, capped at 12288 shared views,
+ plus source metadata for its 128 pool buffers. Workers outside a session's
+ TAP/transmit ownership set reserve no views for that session. A view holds a rewritten header of at most 128 bytes and a range in
+ a retained source. Larger headers use the ordinary-frame copy path. Sources
+diff --git a/initial-design.md b/initial-design.md
+index 9db1abf..8d05f49 100644
+--- a/initial-design.md
++++ b/initial-design.md
+@@ -246,7 +246,7 @@ Each active receive lane has a 65536-packet sliding window and a separate 65536-
+ 
+ Do not deduplicate using only a time-limited completion cache. Window advancement may discard unusually reordered traffic; this is bounded loss, never duplicate Ethernet delivery. Only the owning worker changes these windows. Retired-lane bits reject the whole lane before frame lookup, so its windows can be freed safely. For still-active lanes, preserve the lower bounds even through long idle periods.
+ 
+-Initial resource limits are 8192 retained transmit frames and 8192 receive frames (incomplete plus queued complete) per session, with 64 MiB of payload storage per direction and at most 64 active lanes per direction. The daemon's default total transport-memory ceiling is 256 MiB, including metadata, histories, and queues; caller-provided ceilings may raise or lower it. Refuse reservations beyond either limit. The sender also keeps at most 65536 sent-packet entries per lane; if advancing would overwrite an unresolved entry, apply backpressure rather than forget its inflight charge. On startup validate fixed allocations against the ceiling. Unknown cookies allocate nothing; pending handshakes, lane tables and worker queues are bounded separately. These are initial implementation limits, not performance claims.
++Initial resource limits are 12288 retained transmit frames and 8192 receive frames (incomplete plus queued complete) per session, with 64 MiB of payload storage per direction and at most 64 active lanes per direction. The daemon's default total transport-memory ceiling is 256 MiB, including metadata, histories, and queues; caller-provided ceilings may raise or lower it. Refuse reservations beyond either limit. The sender also keeps at most 65536 sent-packet entries per lane; if advancing would overwrite an unresolved entry, apply backpressure rather than forget its inflight charge. On startup validate fixed allocations against the ceiling. Unknown cookies allocate nothing; pending handshakes, lane tables and worker queues are bounded separately. These are initial implementation limits, not performance claims.
+ 
+ Bound sampling metadata in a shared fixed pool. Keep complete sampling state for
+ each retained, unacknowledged charged transmission, including declared losses.
+@@ -724,7 +724,7 @@ through partial sends. Metadata uses frame indices/ranges without payload copies
+ or self-references; expiry preserves live frames and quiescence drains batches.
+ The socket API gathers original slices within a fixed descriptor budget.
+ Each worker's frame-view allocation follows its participating session quotas,
+-with the existing 8192-view ceiling shared across sessions.
++with the existing 12288-view ceiling shared across sessions.
+ Generated sequences, small-frame bursts and partial batches have regression tests.
+ A ten-second bidirectional TAP storm checks observed packing, integrity, duplicate
+ suppression and zero allocations/deallocations, while reporting drops. BENCH.md

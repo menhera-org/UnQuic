@@ -89,6 +89,55 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Larger retention quota worsens overload (November 8)
+
+The review's proposed frame-limit increase does not fix the current bottleneck.
+A [12288-credit candidate](benches/retention-12k.patch) raises the eight-owner
+quota from 1024 to 1536. The 2 MiB fresh-work cap, source buffers, byte limits,
+deadlines and receive limits stay unchanged. It passes 349 ordinary release
+tests, strict Clippy, and 81 kernel plus three runtime tests on Linux 6.8 and
+7.0. A 16384-credit predecessor fails the existing default-memory regression:
+the normal eight-worker fixture needs 274,655,641 bytes, exceeding 256 MiB.
+
+[Matched release observations](benches/tap-retention-12k.json) use the existing
+twenty-second QinQ workload with sixteen flows each way and active PMTU
+discovery capped at 1500 outer bytes. CPU percentages are per daemon; 100%
+is one core.
+
+| Build | Requested Gbit/s each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| before | 1 | 0.990 / 0.982 | 0.07 / 0.93 | 101.14 / 95.00 |
+| before | 4 | 1.774 / 1.528 | 55.01 / 61.27 | 212.83 / 208.07 |
+| before | 21 | 1.774 / 1.574 | 91.40 / 92.34 | 214.27 / 207.88 |
+| before | Unlimited | 1.720 / 1.558 | 96.98 / 97.09 | 211.52 / 205.39 |
+| candidate | 1 | 0.981 / 0.981 | 0.93 / 0.97 | 99.90 / 96.63 |
+| candidate | 4 | 1.761 / 1.670 | 55.57 / 57.85 | 244.90 / 222.50 |
+| candidate | 21 | 1.185 / 1.299 | 94.30 / 93.74 | 311.50 / 319.43 |
+| candidate | Unlimited | 1.200 / 1.264 | 96.99 / 96.38 | 314.47 / 341.98 |
+| after | 1 | 0.981 / 0.982 | 0.99 / 0.89 | 106.59 / 98.76 |
+| after | 4 | 1.661 / 1.506 | 57.46 / 61.33 | 210.51 / 203.87 |
+| after | 21 | 1.745 / 1.574 | 91.56 / 92.40 | 218.09 / 208.47 |
+| after | Unlimited | 1.726 / 1.536 | 96.99 / 97.26 | 212.90 / 205.34 |
+
+The candidate falls 31.9 / 24.3% from its 4G point to unlimited, while CPU
+rises above three cores per daemon. Unlimited expiry grows to 6.78 / 8.16
+million frames, versus 1.36 / 1.95 million in the opening control and
+1.36 / 1.98 million in the closing control. Most are never submitted:
+5.99 / 7.26 million candidate frames expire unsent. Admission pressure rises
+to 34,606 / 61,234, and fresh-backlog rejections reach 681,839 / 836,237.
+The fixed 21G point also regresses, so different unlimited generator rates
+do not explain the result. Resident memory grows by 17.5 / 18.1 MiB.
+
+All twelve observations have zero inner corruption, duplicates, reordering,
+wrong-run or too-old records, socket overflow, inner UDP receive errors,
+outer UDP errors and outer fragments. Counter units remain distinct; source
+drops cannot be summed with expired child frames as a loss total.
+
+Production retains 8192 credits. More capacity admits more work that expires;
+it does not relieve the measured scheduling failure. The review's full-deadline
+retention estimate is a stress bound: normally ACKed data can be released
+earlier. Loaded-RTT and lossy-path measurements must guide any later increase.
+
 ## TAP gating mostly reflects exhausted retention credits (November 8)
 
 A [temporary diagnostic](benches/tap-input-gate.patch) observes registered TAPs
@@ -130,9 +179,8 @@ Simply allowing another read while the logical gate is closed cannot address
 most of the measured interval under unchanged physical credits. A bounded
 retention-quota increase is worth testing with the fresh-work cap kept intact:
 the current 1024-credit quota can bind before 2 MiB of fresh frame data.
-This is a hypothesis, not a measured improvement. More retained slots cost
-memory and may only postpone pressure; measure deadline margins and longer
-overload behavior before adopting a larger bound.
+The subsequent 12288-credit experiment above rejects this hypothesis for the
+current workload: throughput falls and expiry rises. No larger bound is adopted.
 
 The diagnostic passes 349 ordinary release tests, strict Clippy/formatting,
 82 Linux 6.8 kernel tests and all three unchanged runtime tests, including
