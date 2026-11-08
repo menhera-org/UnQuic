@@ -67,7 +67,7 @@ earlier tables retain their original builds and test conditions.
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
 | At least 20 Gbit/s each way at inner MTU 1500 | After the ACK/loss fairness fix, sixty-second QinQ sweep: 1.82 / 1.58 Gbit/s paced, 1.82 / 1.64 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe integration regression; paced missing fractions are 91.26 / 92.28%. The recovery ascending sweep stays under 1% missing in both directions only at 0.5G offered. Five successful 20G repeats remain unmet. |
-| Goodput must plateau under excess traffic | The latest ascending sweep falls 11.73 / 15.58% from each direction's peak under unlimited load. Its sixty-second repeat remains near 1.82 / 1.64 Gbit/s and uses about 2.1 / 2.0 cores | No stable plateau or CPU ceiling is established. Source-expiry work, incomplete reassembly and grant/feedback scheduling require separate attribution. |
+| Goodput must plateau under excess traffic | Latest matched twenty-second baseline: eight-lane unlimited 1.63–1.74 / 1.56–1.59 Gbit/s; single-lane unlimited 0.47–0.54 / 0.42–0.44. Experimental coalesced abandonment raises the latter to 0.76 / 0.74 but still falls about 60% from peak | No stable plateau or CPU ceiling is established. Source-expiry work, incomplete reassembly and grant/feedback scheduling require separate attribution. |
 | Small-frame overload must remain efficient | Earlier pre-recovery tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
@@ -82,6 +82,75 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## Delaying abandonment requests does not remove collapse (November 8)
+
+A second candidate waits up to 5 ms before requesting the first transmission
+of an origin-0 advisory. An already-needed packet can include younger eligible
+records. The fixed 100 ms lifetime, three-copy limit, ordinary grant accounting
+and 128-entry metadata pool are unchanged. Failed requests retain their backoff.
+
+Matched twenty-second release-musl A/B/A sweeps repeat the packed experiment
+below, separately with eight transmit lanes and one. Both use eight workers
+and TAP queues. The single-lane harness changes only `tx_lanes = $workers` to
+`tx_lanes = 1` in `benches/tap_transport.sh`.
+[All 24 observations](benches/tap-source-abandon-coalesced.json) include the
+1 Gbit/s points, actual offered rates, CPU, drop counters and binary identities.
+The [incremental patch](benches/source-abandon-coalesced.patch) applies after
+the two abandonment patches below; production remains unchanged.
+
+| TX lanes | Build | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- | --- |
+| 8 | Baseline before | 4 Gbit/s | 1.726 / 1.542 | 56.19 / 60.89 | 213.39 / 206.20 |
+| 8 | Baseline before | 21 Gbit/s | 1.744 / 1.582 | 91.53 / 92.26 | 213.73 / 205.21 |
+| 8 | Baseline before | Unlimited | 1.626 / 1.565 | 97.14 / 96.96 | 201.39 / 196.88 |
+| 8 | Coalesced | 4 Gbit/s | 1.640 / 1.509 | 58.42 / 61.76 | 212.30 / 205.85 |
+| 8 | Coalesced | 21 Gbit/s | 1.638 / 1.526 | 92.06 / 92.57 | 209.76 / 204.31 |
+| 8 | Coalesced | Unlimited | 1.639 / 1.497 | 97.09 / 97.12 | 211.90 / 201.78 |
+| 8 | Baseline after | 4 Gbit/s | 1.791 / 1.571 | 54.54 / 60.16 | 222.36 / 210.61 |
+| 8 | Baseline after | 21 Gbit/s | 1.754 / 1.582 | 91.50 / 92.35 | 215.62 / 207.88 |
+| 8 | Baseline after | Unlimited | 1.740 / 1.595 | 96.92 / 97.07 | 215.47 / 206.94 |
+| 1 | Baseline before | 4 Gbit/s | 1.961 / 2.043 | 50.52 / 48.46 | 145.17 / 143.83 |
+| 1 | Baseline before | 21 Gbit/s | 1.200 / 0.988 | 94.22 / 95.23 | 184.33 / 186.07 |
+| 1 | Baseline before | Unlimited | 0.465 / 0.421 | 98.65 / 98.76 | 198.51 / 202.53 |
+| 1 | Coalesced | 4 Gbit/s | 1.900 / 1.842 | 52.10 / 53.55 | 147.69 / 148.49 |
+| 1 | Coalesced | 21 Gbit/s | 1.324 / 1.169 | 93.62 / 94.37 | 195.44 / 191.32 |
+| 1 | Coalesced | Unlimited | 0.759 / 0.738 | 97.75 / 97.80 | 206.64 / 210.41 |
+| 1 | Baseline after | 4 Gbit/s | 1.909 / 1.878 | 51.75 / 52.58 | 146.26 / 147.20 |
+| 1 | Baseline after | 21 Gbit/s | 1.191 / 0.941 | 94.26 / 95.46 | 182.20 / 186.76 |
+| 1 | Baseline after | Unlimited | 0.535 / 0.438 | 98.44 / 98.67 | 194.60 / 203.57 |
+
+With eight lanes, unlimited reverse goodput is 4.3–6.1% below the baseline
+repeats. Forward goodput lies between them. Admission pressure is zero, but
+incomplete receive-frame expiry remains 108 / 51. The candidate sends
+229,284 / 225,965 records in 8,506 / 7,705 datagrams: 27.0 / 29.3 records
+per grant. Metadata drops are 848 / 2,041. Worker queue drops remain
+1,697 / 24,315 and total frame expiries 1,470,456 / 2,024,929.
+Removing admission pressure still does not establish the CPU ceiling.
+
+With one lane, unlimited delivery improves over both baseline repeats, but
+falls 60.1 / 59.9% from the candidate's 4 Gbit/s point. Admission pressure is
+102,036 / 104,959; incomplete receive-frame expiry is 10,841 / 10,966.
+Fully submitted source-frame expiries are 729,407 / 721,285, versus
+20,307 / 20,198 partial expiries. Metadata drops reach 535,554 / 524,643.
+The candidate sends 214,182 / 216,819 records in 3,961 / 3,963 datagrams;
+0 / 23 queued notices expire. Worker queue drops are 1,193,627 / 1,175,885;
+total frame expiries are 4,552,969 / 4,584,496. These differently scoped
+counters cannot be summed into an exact missing-frame count.
+
+Every point has zero outer socket overflow, inner UDP errors, corruption,
+duplicates and outer fragmentation. Eight-lane reordering is zero.
+Single-lane reordering reaches 0.00799%; the candidate records
+0.00494 / 0.00230% at 21 Gbit/s and 0 / 0.00245% unlimited.
+Thus this candidate does not establish lossless ordering either.
+
+Validation passes 351 ordinary release tests, formatting, strict Clippy,
+87 library kernel tests on each of Linux 6.8 and 7, and the three original
+runtime tests with unchanged deadlines and allocation assertions. Despite
+this coverage, the candidate remains experimental. The next isolated changes
+prioritize advisories for known unsent tails when metadata is full and measure
+final-send deadline margin alongside ACK staging age. Neither hypothesis is
+yet a verified explanation for the remaining throughput collapse.
 
 ## Packed abandonment reduces cost but leaves overload collapse (November 8)
 

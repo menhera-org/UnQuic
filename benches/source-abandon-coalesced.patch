@@ -1,0 +1,298 @@
+diff --git a/src/worker/sender/abandon.rs b/src/worker/sender/abandon.rs
+index 042b978..f515e89 100644
+--- a/src/worker/sender/abandon.rs
++++ b/src/worker/sender/abandon.rs
+@@ -23,6 +23,16 @@ struct Advisory {
+     attempts: usize,
+ }
+ impl Advisory {
++    fn trigger(self) -> Duration {
++        if self.attempts == 0 {
++            // Initial controls wait at most 5 ms to share a grant; failures
++            // still honor due, and piggyback selection need not wait.
++            self.due
++                .max(self.expires.saturating_sub(Duration::from_millis(95)))
++        } else {
++            self.due
++        }
++    }
+     fn acknowledged(self, history: &History) -> bool {
+         // shortcut: retired ACK proof may allow a redundant bounded copy. Keep
+         // no permanent ACK ledger; add one only if its measured cost warrants it.
+@@ -171,7 +181,7 @@ impl Worker {
+             .flatten()
+             .map(|a| {
+                 if available && a.attempts < a.sent.len() {
+-                    a.expires.min(a.due)
++                    a.expires.min(a.trigger())
+                 } else {
+                     a.expires
+                 }
+@@ -195,7 +205,7 @@ impl Worker {
+             let index = self.sender_index(advisory.session, advisory.lane)?;
+             let history = &self.sender.lanes[index];
+             let current = advisory.current(&self.sessions[advisory.session], history);
+-            if current && now < advisory.due && now < advisory.expires {
++            if current && now < advisory.trigger() && now < advisory.expires {
+                 continue;
+             }
+             let acknowledged = current && advisory.acknowledged(&history.history);
+@@ -207,7 +217,7 @@ impl Worker {
+                     self.count_abandon(advisory.session, advisory.lane, |s| &mut s.abandon_expired);
+                 }
+             } else if !yield_data
+-                && now >= advisory.due
++                && now >= advisory.trigger()
+                 && advisory.attempts < advisory.sent.len()
+                 && self.sender.job.is_none()
+                 && self.sender.flight.is_some()
+@@ -638,7 +648,7 @@ mod tests {
+         worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
+         let mut previous = 0;
+         without_allocations(|| {
+-            for millis in [1, 20, 40] {
++            for millis in [6, 20, 40] {
+                 let now = Duration::from_millis(millis);
+                 permit(worker, now);
+                 worker.use_sender_permit(now).unwrap();
+@@ -711,7 +721,7 @@ mod tests {
+         let (mut workers, rx) = setup();
+         let worker = &mut workers[0];
+         worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
+-        let now = Duration::from_millis(1);
++        let now = Duration::from_millis(6);
+         permit(worker, now);
+         worker.use_sender_permit(now).unwrap();
+         pump(worker, now);
+@@ -773,7 +783,7 @@ mod tests {
+             let data_number = retain_data_plan(worker);
+             let retained = worker.sessions[0].tx_retained;
+             worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
+-            let now = Duration::from_millis(1);
++            let now = Duration::from_millis(6);
+             let job = permit(worker, now);
+             let JobKind::Abandon { .. } = job.kind else {
+                 panic!("wrong job")
+@@ -806,7 +816,7 @@ mod tests {
+         worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
+         worker.install_sender(0, 2, true).unwrap();
+         worker.sessions[0].installed.as_mut().unwrap().generation = 2;
+-        pump(worker, Duration::from_millis(1));
++        pump(worker, Duration::from_millis(6));
+         assert_eq!(worker.sender.abandons.count, 0);
+         assert_eq!(worker.counters.abandon_dropped, 1);
+     }
+@@ -817,7 +827,7 @@ mod tests {
+         let (mut workers, rx) = setup();
+         let worker = &mut workers[0];
+         worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
+-        let now = Duration::from_millis(1);
++        let now = Duration::from_millis(6);
+         permit(worker, now);
+         CLOCK_CALLS.with(|c| c.set(0));
+         worker.io_time = Some(|now| {
+@@ -837,9 +847,9 @@ mod tests {
+         assert_eq!(worker.sender.abandons.entries[0].unwrap().expires, LIFETIME);
+         worker.io_time = Some(Ok);
+         pump(worker, now);
+-        permit(worker, Duration::from_millis(3));
+-        worker.use_sender_permit(Duration::from_millis(3)).unwrap();
+-        pump(worker, Duration::from_millis(3));
++        permit(worker, Duration::from_millis(8));
++        worker.use_sender_permit(Duration::from_millis(8)).unwrap();
++        pump(worker, Duration::from_millis(8));
+         receive(&rx);
+         without_allocations(|| {
+             for id in 2..=CAPACITY as u64 + 1 {
+@@ -872,7 +882,7 @@ mod tests {
+                 .unwrap();
+         }
+         worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
+-        let now = Duration::from_millis(1);
++        let now = Duration::from_millis(6);
+         without_allocations(|| {
+             for _ in 0..32 {
+                 worker.service_abandons(now).unwrap();
+@@ -896,12 +906,12 @@ mod tests {
+         let (mut workers, rx) = setup();
+         let worker = &mut workers[0];
+         worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
+-        let now = Duration::from_millis(1);
++        let now = Duration::from_millis(6);
+         permit(worker, now);
+         worker.use_sender_permit(now).unwrap();
+         pump(worker, now);
+         let first = receive(&rx);
+-        let acked = Duration::from_millis(2);
++        let acked = Duration::from_millis(7);
+         worker
+             .incoming_ack(
+                 0,
+@@ -976,7 +986,7 @@ mod tests {
+         let data_number = retain_data_plan(worker);
+         let retained = worker.sessions[0].tx_retained;
+         worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
+-        permit(worker, Duration::from_millis(1));
++        permit(worker, Duration::from_millis(6));
+         let expires = worker
+             .sender
+             .flight
+@@ -1013,7 +1023,7 @@ mod tests {
+         let worker = &mut workers[0];
+         let mut remote = reassembly::Lane::new(1, 1514).unwrap();
+         let mut encoded = [0; BASE_UDP_PAYLOAD];
+-        let first = Duration::from_millis(1);
++        let first = Duration::from_millis(6);
+         without_allocations(|| {
+             for sequence in 1..=64 {
+                 let id = (1 << 48) | sequence;
+@@ -1128,9 +1138,9 @@ mod tests {
+         let (mut workers, rx) = setup();
+         let worker = &mut workers[0];
+         worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
+-        permit(worker, Duration::from_millis(1));
+-        worker.use_sender_permit(Duration::from_millis(1)).unwrap();
+-        pump(worker, Duration::from_millis(1));
++        permit(worker, Duration::from_millis(6));
++        worker.use_sender_permit(Duration::from_millis(6)).unwrap();
++        pump(worker, Duration::from_millis(6));
+         let first = receive(&rx);
+         let now = Duration::from_millis(20);
+         for id in 2..=4 {
+@@ -1218,4 +1228,136 @@ mod tests {
+         assert_eq!(worker.counters.abandon_datagrams, 0);
+         assert_eq!(worker.counters.abandon_expired, 1);
+     }
++
++    #[test]
++    fn initial_trigger_does_not_replace_member_backoff_or_lifetime() {
++        let mut advisory = Advisory {
++            serial: 1,
++            session: 0,
++            generation: 1,
++            lane: 0,
++            frame: (1 << 48) | 1,
++            expires: LIFETIME,
++            due: Duration::ZERO,
++            sent: [0; 3],
++            attempts: 0,
++        };
++        assert_eq!(advisory.trigger(), Duration::from_millis(5));
++        assert_eq!(advisory.due, Duration::ZERO);
++        advisory.due = Duration::from_millis(8);
++        assert_eq!(advisory.trigger(), advisory.due);
++        assert_eq!(advisory.expires, LIFETIME);
++        advisory.attempts = 1;
++        advisory.due = Duration::from_millis(3);
++        assert_eq!(advisory.trigger(), advisory.due);
++        advisory.attempts = 0;
++        advisory.expires = Duration::MAX;
++        advisory.due = Duration::MAX - Duration::from_millis(2);
++        assert_eq!(advisory.trigger(), advisory.due);
++        assert_eq!(advisory.expires, Duration::MAX);
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn initial_coalescing_piggybacks_young_records_without_extending_lifetimes() {
++        let (mut workers, rx) = setup();
++        let worker = &mut workers[0];
++        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        let young = Duration::from_millis(4);
++        worker.queue_abandon(0, 0, (1 << 48) | 2, young);
++        without_allocations(|| {
++            pump(worker, young);
++            assert!(worker.sender.job.is_none());
++            assert_eq!(worker.abandon_deadline(), Some(Duration::from_millis(5)));
++            empty(&rx);
++            let now = Duration::from_millis(5);
++            let job = permit(worker, now);
++            assert_eq!(job.deadline, LIFETIME);
++            assert_eq!(worker.sender.abandons.selected_len, 2);
++            assert_eq!(
++                worker.sender.abandons.entries[1].unwrap().trigger(),
++                Duration::from_millis(9)
++            );
++            worker.use_sender_permit(now).unwrap();
++            pump(worker, now);
++            let mut bytes = [0; BASE_UDP_PAYLOAD];
++            let length = rx.recv(&mut bytes).unwrap().0;
++            assert_eq!(Datagram::decode(&bytes[..length]).unwrap().record_count, 2);
++            assert_eq!(worker.counters.abandon_datagrams, 1);
++            assert_eq!(worker.counters.abandon_sent, 2);
++            assert_eq!(worker.sender.abandons.entries[0].unwrap().expires, LIFETIME);
++            assert_eq!(
++                worker.sender.abandons.entries[1].unwrap().expires,
++                young + LIFETIME
++            );
++            pump(worker, LIFETIME);
++            assert!(worker.sender.abandons.entries[0].is_none());
++            assert_eq!(
++                worker.sender.abandons.entries[1].unwrap().expires,
++                young + LIFETIME
++            );
++            pump(worker, young + LIFETIME);
++            assert_eq!(worker.sender.abandons.count, 0);
++        });
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn failed_early_piggyback_keeps_backoff_and_original_initial_trigger() {
++        let (mut workers, rx) = setup();
++        let worker = &mut workers[0];
++        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        worker.queue_abandon(0, 0, (1 << 48) | 2, Duration::from_millis(4));
++        let now = Duration::from_millis(5);
++        permit(worker, now);
++        assert_eq!(worker.sender.abandons.selected_len, 2);
++        CLOCK_CALLS.with(|c| c.set(0));
++        worker.io_time = Some(|now| {
++            CLOCK_CALLS.with(|c| {
++                let call = c.get();
++                c.set(call + 1);
++                if call == 1 {
++                    Err(io::ErrorKind::WouldBlock.into())
++                } else {
++                    Ok(now)
++                }
++            })
++        });
++        without_allocations(|| worker.use_sender_permit(now).unwrap());
++        worker.io_time = Some(Ok);
++        empty(&rx);
++        let young = worker.sender.abandons.entries[1].unwrap();
++        assert_eq!(young.attempts, 0);
++        assert_eq!(young.due, Duration::from_millis(6));
++        assert_eq!(young.trigger(), Duration::from_millis(9));
++        assert_eq!(young.expires, Duration::from_millis(104));
++        without_allocations(|| {
++            pump(worker, now + Duration::from_micros(500));
++            assert!(worker.sender.job.is_none());
++            empty(&rx);
++            // Remove the older anchor to test the young member independently.
++            let old = worker.sender.abandons.entries[0].unwrap();
++            worker.sender.abandons.remove(0, old.serial);
++            pump(worker, Duration::from_millis(8));
++            assert!(worker.sender.job.is_none());
++            assert_eq!(worker.abandon_deadline(), Some(Duration::from_millis(9)));
++            permit(worker, Duration::from_millis(9));
++            worker.use_sender_permit(Duration::from_millis(9)).unwrap();
++            let mut bytes = [0; BASE_UDP_PAYLOAD];
++            let length = rx.recv(&mut bytes).unwrap().0;
++            let packet = Datagram::decode(&bytes[..length]).unwrap();
++            assert_eq!(packet.record_count, 1);
++            assert!(matches!(
++                packet.records().next(),
++                Some(Record::FrameAbandon {
++                    frame_id: 0x0001_0000_0000_0002,
++                    ..
++                })
++            ));
++            let young = worker.sender.abandons.entries[1].unwrap();
++            assert_eq!(young.attempts, 1);
++            assert_eq!(young.expires, Duration::from_millis(104));
++            assert_eq!(worker.counters.abandon_retried, 0);
++        });
++    }
+ }
