@@ -79,7 +79,7 @@ earlier tables retain their original builds and test conditions.
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
 | Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Throughput sweeps currently cap outer packets at 1500 bytes. Larger-MTU throughput and real routed-path validation remain open. DATA-quoted PTB validation now has targeted kernel coverage. |
-| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | These throughput sweeps are local container tests without injected impairment | No real-path or independent/burst-loss result verifies the target. Recovery is connected; sustained lossy-path performance and complete congestion-control integration remain unverified. |
+| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | Routed local-container controls now inject 4.5 ms RTT and 0.1% independent datagram loss. At 0.5G offered, repeated delivery is 0.483 / 0.461 Gbit/s; delay alone delivers 0.450 / 0.476 | No real-path or independent/burst-loss result verifies the target. Recovery is connected; sustained lossy-path performance and complete congestion-control integration remain unverified. |
 
 Unlimited loss remains high. TAP ingress drops, bounded worker queue drops,
 outer socket overflows, expired frames and inner UDP receive-buffer errors
@@ -88,6 +88,74 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## Routed delay and independent-loss baseline (November 8)
+
+The harness now supports a private IPv6 router with separate endpoint
+namespaces. Source GSO and router GRO are disabled before netem, so its loss
+acts on individual outer datagrams. Loopback impairment remains a separate,
+correlated-aggregate mode. All routes, neighbors, forwarding and qdiscs live
+inside disposable namespaces. This fixes a measurement gap identified by the
+November 6 review; it does not improve the daemon.
+
+[This twelve-point release sweep](benches/tap-routed-baseline.json) holds the
+production build fixed. Each phase runs 0.5G twice, 5G and unlimited for twenty
+seconds each, with two seconds to drain. Eight workers/lanes carry sixteen
+QinQ flows per direction, inner MTU 1500, 44-segment sources and 500-entry TAP
+queues. Active discovery has a 1452-byte UDP ceiling. CPU placement is
+disjoint; no local build or kernel test overlaps load.
+
+“Zero” adds neither delay nor loss. “Delayed” adds 2250 µs per direction
+without loss. “Lossy” adds the same delay and 0.1% random datagram loss per
+direction. Observed delayed-path RTT gauges are approximately 4.6–4.9 ms.
+These are routed local-container results, not real access-line measurements.
+
+| Phase | Requested each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| zero | 0.5G | 0.494 / 0.490 | 0.21 / 1.05 | 101.4 / 95.9 |
+| zero | 0.5G repeat | 0.486 / 0.490 | 1.86 / 0.99 | 99.4 / 92.8 |
+| zero | 5G | 0.675 / 0.639 | 86.26 / 87.02 | 208.0 / 204.3 |
+| zero | unlimited | 0.676 / 0.637 | 98.81 / 98.83 | 206.0 / 199.8 |
+| delayed | 0.5G | 0.461 / 0.454 | 6.81 / 8.26 | 92.0 / 88.5 |
+| delayed | 0.5G repeat | 0.450 / 0.476 | 9.22 / 3.83 | 92.4 / 88.7 |
+| delayed | 5G | 0.619 / 0.879 | 87.40 / 82.17 | 205.6 / 190.7 |
+| delayed | unlimited | 0.428 / 0.678 | 99.24 / 98.72 | 255.9 / 230.6 |
+| lossy | 0.5G | 0.432 / 0.451 | 12.77 / 8.96 | 90.2 / 88.6 |
+| lossy | 0.5G repeat | 0.483 / 0.461 | 2.41 / 6.98 | 92.3 / 90.5 |
+| lossy | 5G | 0.625 / 0.537 | 87.25 / 89.11 | 190.9 / 220.1 |
+| lossy | unlimited | 0.521 / 0.796 | 99.08 / 98.52 | 200.0 / 180.6 |
+
+Delay alone exposes loss well below the target rate. At the repeated 0.5G
+point, 849024 frames are offered in each direction; 78250 / 32490 are missing.
+Never-submitted expiry accounts for 76931 / 31908 frames, or 98.31 / 98.21%
+of those missing counts. Qdisc drops, socket overflow and admission pressure
+are all zero at that point. The sender's waiting time is the next attribution
+target; extending deadlines would conceal it.
+
+The same delayed point sends 2186 / 2889 repairs, exactly matching duplicate
+pieces at the opposite endpoints. Both copies arrive, but these counters do
+not establish their order. Incoming ACK-buffer drops are 937 / 1031, all on
+worker 7, versus 97 / 16 in the zero-delay repeat. Queued feedback and bounded
+loss-sweep ordering are candidate causes of avoidable repairs, not proven
+causes of the dominant pre-submission expiry.
+
+All delay-only qdiscs report zero drops, overlimits, requeues and final backlog.
+Lossy-phase qdisc drops are close to the configured 0.1% of datagrams.
+All twelve points have zero corruption, duplicate frame delivery, wrong-run
+or out-of-window records, inner UDP receive errors and outer fragmentation.
+Delayed/lossy overload points have some outer socket overflow: 8 and 481 SKBs
+in the delayed 5G/unlimited observations, and 4 in lossy unlimited. Other
+points have zero. The JSON retains reordering, per-worker CPU, TAP ingress
+drops, each expiry class, admission pressure, queue drops and qdisc counters.
+Fully-sent expiry can include frames already delivered while feedback waits;
+it must not be added to receiver loss.
+
+Shell syntax and seven invalid-input checks pass. Separate Linux 6.8 and 7.0
+captures each inspect 200 outer packets, including 136 / 134 DATA packets:
+none exceeds 1500 IPv6 bytes, and capture overflow is zero. Source offload
+flags are checked at startup. These bounded captures validate the test setup,
+not every packet in the sweep. No production Rust code changes here.
+The 20G plateau and 5G lossy-path targets remain unmet.
 
 ## Gauge accumulation alone also loses paced goodput (November 8)
 

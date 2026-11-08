@@ -96,6 +96,28 @@ Check actual offered rates: kernel encapsulation can saturate a generator
 before it reaches the requested rate. Compare `SEGMENTS=1` with aggregates
 to distinguish burst losses from sustained capacity.
 
+`OUTER_ROUTED=1` puts the daemons in separate network namespaces, joined
+through a private IPv6 router and 1500-byte veth links. The harness disables
+UDP segmentation on the endpoint links and GRO on the router links, so netem
+sees individual outer datagrams. It verifies the endpoint offload flags and
+records them. All links, routes, neighbors and forwarding settings belong to
+the harness's private namespaces. This mode requires `ethtool`.
+
+`OUTER_DELAY_US` adds a fixed one-way delay: 2250 models 4.5 ms added RTT,
+and 3750 models 7.5 ms. `OUTER_LOSS_PERMILLE` sets random loss: 1, 10 and
+50 mean 0.1%, 1% and 5%. Both default to zero. The delay range is 0–1000000
+microseconds and the loss range is 0–1000; use decimal integers without leading
+zeroes. Netem has an 8192-entry queue on each router egress. Qdisc snapshots
+record drops and backlog; drops can include queue overflow as well as the
+configured random loss.
+
+Without `OUTER_ROUTED=1`, these impairment settings apply to loopback and may
+drop whole GSO aggregates. That mode measures correlated aggregate loss,
+not independent datagram loss. Do not compare the two topologies without their
+own zero-loss controls. Each output records the path settings; routed snapshots
+also include both endpoint IPv6 counters and both router qdiscs.
+`qdisc-left` affects R→L and `qdisc-right` affects L→R.
+
 `SESSION_COOKIE` overrides the session UUID for queue-placement controls;
 record it when comparing runs because it affects receive-worker assignment.
 

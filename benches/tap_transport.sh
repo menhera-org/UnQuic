@@ -13,6 +13,11 @@ case "${OUTER_PAYLOAD_LIMIT:-1232}" in ''|*[!0-9]*) exit 2;; esac
 [ "${OUTER_PAYLOAD_LIMIT:-1232}" -ge 1232 ] && [ "${OUTER_PAYLOAD_LIMIT:-1232}" -le 1452 ] || exit 2
 case "${TAP_TXQUEUELEN:-10000}" in ''|*[!0-9]*) exit 2;; esac
 [ "${TAP_TXQUEUELEN:-10000}" -ge 1 ] && [ "${TAP_TXQUEUELEN:-10000}" -le 10000 ] || exit 2
+for number in "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}"; do
+    case "$number" in ''|*[!0-9]*|0[0-9]*) exit 2;; esac
+done
+[ "${OUTER_DELAY_US:-0}" -le 1000000 ] && [ "${OUTER_LOSS_PERMILLE:-0}" -le 1000 ] || exit 2
+case "${OUTER_ROUTED:-0}" in 0|1) ;; *) exit 2;; esac
 case "${VLAN_DEPTH:-0}" in 0|1|2) ;; *) echo "VLAN_DEPTH must be 0, 1 or 2" >&2; exit 2;; esac
 case "${SRV6:-0}" in 0|1) ;; *) echo "SRV6 must be 0 or 1" >&2; exit 2;; esac
 [ "${SRV6:-0}" = 0 ] || [ -n "${UDP_LOAD:-}" ] || { echo "SRV6 requires UDP_LOAD" >&2; exit 2; }
@@ -68,6 +73,8 @@ cleanup() {
     wait || :
     ip netns del uq-left 2>/dev/null || :
     ip netns del uq-right 2>/dev/null || :
+    ip netns del uq-out-left 2>/dev/null || :
+    ip netns del uq-out-right 2>/dev/null || :
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -76,20 +83,65 @@ netip() {
     shift
     nsenter --net="/run/netns/$namespace" ip "$@"
 }
+left_netns=/proc/self/ns/net
+right_netns=/proc/self/ns/net
+outer() {
+    case "$1" in left) namespace=$left_netns;; right) namespace=$right_netns;; esac
+    shift
+    nsenter --net="$namespace" "$@"
+}
+netem() {
+    if [ "${OUTER_DELAY_US:-0}" -ne 0 ] || [ "${OUTER_LOSS_PERMILLE:-0}" -ne 0 ]; then
+        loss=${OUTER_LOSS_PERMILLE:-0}
+        tc qdisc add dev "$1" root netem limit 8192 delay "${OUTER_DELAY_US:-0}us" loss "$((loss / 10)).$((loss % 10))%"
+    fi
+}
 ip link set lo up
+if [ "${OUTER_ROUTED:-0}" = 1 ]; then
+    for side in left right; do
+        if [ "$side" = left ]; then n=1; peer=2; else n=2; peer=1; fi
+        ip netns add "uq-out-$side"
+        ip link add "uq-r-$side" type veth peer name uq-path netns "uq-out-$side"
+        ip link set "uq-r-$side" address "02:77:ff:00:0$n:02" mtu 1500 up
+        ip -6 addr add "fd77:ff:$n::2/64" dev "uq-r-$side" nodad
+        netip "uq-out-$side" link set lo up
+        netip "uq-out-$side" link set uq-path address "02:77:ff:00:0$n:01" mtu 1500 up
+        netip "uq-out-$side" -6 addr add "fd77:ff:$n::1/64" dev uq-path nodad
+        netip "uq-out-$side" -6 route add "fd77:ff:$peer::/64" via "fd77:ff:$n::2"
+        netip "uq-out-$side" -6 neigh add "fd77:ff:$n::2" lladdr "02:77:ff:00:0$n:02" nud permanent dev uq-path
+        ip -6 neigh add "fd77:ff:$n::1" lladdr "02:77:ff:00:0$n:01" nud permanent dev "uq-r-$side"
+        # Segment before router netem so loss applies to individual datagrams.
+        nsenter --net="/run/netns/uq-out-$side" ethtool -K uq-path gso off tso off tx-udp-segmentation off
+        ethtool -K "uq-r-$side" gro off
+        nsenter --net="/run/netns/uq-out-$side" ethtool -k uq-path > "$out/$side.outer-offloads"
+        grep -q '^generic-segmentation-offload: off' "$out/$side.outer-offloads"
+        grep -q '^tx-udp-segmentation: off' "$out/$side.outer-offloads"
+        netem "uq-r-$side"
+    done
+    sysctl -qw net.ipv6.conf.all.forwarding=1
+    left_netns=/run/netns/uq-out-left
+    right_netns=/run/netns/uq-out-right
+else
+    netem lo
+fi
 ip netns add uq-left
 ip netns add uq-right
 for side in left right; do
     if [ "$side" = left ]; then port=40100; remote=40101; mac=01; else port=40101; remote=40100; mac=02; fi
+    listen=::1
+    host=::1
+    if [ "${OUTER_ROUTED:-0}" = 1 ]; then
+        if [ "$side" = left ]; then listen=fd77:ff:1::1; host=fd77:ff:2::1; else listen=fd77:ff:2::1; host=fd77:ff:1::1; fi
+    fi
     cat > "$out/$side.toml" <<CONFIG
 [[endpoints]]
 name = "rx"
-listen_address = "::1"
+listen_address = "$listen"
 listen_port = $port
 [[peers]]
 name = "peer"
 endpoint = "rx"
-host = "::1"
+host = "$host"
 peer_port = $remote
 tx_lanes = $workers
 outer_payload_limit = ${OUTER_PAYLOAD_LIMIT:-1232}
@@ -102,19 +154,19 @@ mac = "02:00:00:00:00:$mac"
 queue_count = $workers
 CONFIG
 done
-taskset -c "${DAEMON_LEFT_CPUS:-0-$((workers - 1))}" "$daemon" run "$out/left.toml" > "$out/left.log" 2>&1 &
+nsenter --net="$left_netns" taskset -c "${DAEMON_LEFT_CPUS:-0-$((workers - 1))}" "$daemon" run "$out/left.toml" > "$out/left.log" 2>&1 &
 left=$!
-taskset -c "${DAEMON_RIGHT_CPUS:-$workers-$((workers * 2 - 1))}" "$daemon" run "$out/right.toml" > "$out/right.log" 2>&1 &
+nsenter --net="$right_netns" taskset -c "${DAEMON_RIGHT_CPUS:-$workers-$((workers * 2 - 1))}" "$daemon" run "$out/right.toml" > "$out/right.log" 2>&1 &
 right=$!
 for side in left right; do
     attempts=0
-    until ip link show "uq-$side" >/dev/null 2>&1; do
+    until outer "$side" ip link show "uq-$side" >/dev/null 2>&1; do
         kill -0 "$left" && kill -0 "$right" || exit 1
         attempts=$((attempts + 1))
         [ "$attempts" -lt 500 ] || { echo "TAP readiness timeout" >&2; exit 1; }
         sleep 0.01
     done
-    ip link set "uq-$side" netns "uq-$side"
+    outer "$side" ip link set "uq-$side" netns "uq-$side"
     netip "uq-$side" link set lo up
     netip "uq-$side" link set "uq-$side" txqueuelen "${TAP_TXQUEUELEN:-10000}"
     netip "uq-$side" link set "uq-$side" up
@@ -176,6 +228,14 @@ snapshot() {
     cat /proc/"$left"/stat /proc/"$right"/stat > "$out/$1.process"
     cat /proc/"$left"/task/*/stat /proc/"$right"/task/*/stat > "$out/$1.threads"
     cat /proc/net/snmp6 > "$out/$1.outer"
+    if [ "${OUTER_ROUTED:-0}" = 1 ]; then
+        outer left cat /proc/net/snmp6 > "$out/$1.outer-left"
+        outer right cat /proc/net/snmp6 > "$out/$1.outer-right"
+        tc -s -d qdisc show dev uq-r-left > "$out/$1.qdisc-left"
+        tc -s -d qdisc show dev uq-r-right > "$out/$1.qdisc-right"
+    elif [ "${OUTER_DELAY_US:-0}" -ne 0 ] || [ "${OUTER_LOSS_PERMILLE:-0}" -ne 0 ]; then
+        tc -s -d qdisc show dev lo > "$out/$1.qdisc"
+    fi
     for side in left right; do
         nsenter --net="/run/netns/uq-$side" cat /proc/net/snmp > "$out/$1.$side-ipv4"
         nsenter --net="/run/netns/uq-$side" cat /proc/net/snmp6 > "$out/$1.$side-ipv6"
@@ -200,6 +260,7 @@ printf '%s\n' "$GENERATOR_LEFT_CPUS" "$RECEIVER_LEFT_CPUS" \
 printf '%s\n' "${VLAN_DEPTH:-0}" > "$out/vlan-depth"
 printf '%s\n' "${SRV6:-0}" > "$out/srv6"
 printf '%s\n' "$frame" > "$out/frame-bytes"
+printf 'routed=%s\none_way_delay_us=%s\nloss_permille=%s\n' "${OUTER_ROUTED:-0}" "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" > "$out/outer-path"
 base=$out
 index=0
 for rate in ${BITRATE:-0}; do
