@@ -155,8 +155,8 @@ snapshot() {
         kill -USR1 "$server" "$reverse_server"
     fi
     sleep 0.1
-    cp "$base/left.log" "$out/$1.left-log"
-    cp "$base/right.log" "$out/$1.right-log"
+    cat "$base/left.log" > "$out/$1.left-log"
+    cat "$base/right.log" > "$out/$1.right-log"
     cat /proc/uptime > "$out/$1.uptime"
     cat /proc/stat > "$out/$1.cpu"
     cat /proc/"$left"/stat /proc/"$right"/stat > "$out/$1.process"

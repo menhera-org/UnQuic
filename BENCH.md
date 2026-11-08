@@ -83,6 +83,20 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Snapshot startup delay (November 8)
+
+A fresh release pilot failed before completing its first point: a receiver
+reached its 22-second lifetime while its sender was still active. Timing the
+harness isolated a 3.6-second snapshot delay to copying the daemon log;
+another snapshot took 6.75 seconds. The underlying copy-path cause is not
+established. Neither attempt supplies a valid goodput measurement.
+
+The harness now reads the two logs with `cat` into their snapshot files.
+Two consecutive two-second points complete, with snapshot durations around
+0.15 seconds. Receiver lifetimes, signal sampling, CPU collection and transport
+settings are unchanged. All subsequent comparisons use this harness on both
+sides of the change.
+
 ## Current sender service measurements (November 7)
 
 The current production build includes sent-history PTB validation and the
