@@ -77,6 +77,15 @@ receivers reject and count late packets from earlier points. Report those
 `wrong_run` counters rather than crediting them as delivery. A failed child
 fails the run.
 
+For TCP comparisons, leave `UDP_LOAD` unset and set `IPERF_PROTOCOL=tcp`.
+The same harness runs concurrent forward/reverse iperf3 connections with
+64 KiB application writes; the flow argument selects streams per direction.
+`BITRATE=0` lets TCP send without an application rate cap. TCP's congestion
+control still limits offered traffic, so report delivered goodput and
+retransmissions, not a UDP-style missing fraction. The frame-size argument
+does not fix TCP segment size; the TAP MTU and TCP negotiation do.
+`IPERF_PROTOCOL=udp` is the default.
+
 `VLAN_DEPTH=0|1|2` selects untagged, 802.1Q or QinQ traffic. Frame sizes
 include those tags. `SRV6=1` adds IPv6-in-IPv6 encapsulation with a one-segment
 routing header and End.DT6 decapsulation inside the private endpoint

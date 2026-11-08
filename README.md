@@ -627,23 +627,26 @@ read requests (`tap_read_requests`), ring batches (`tap_read_batches`),
 valid ring frames (`tap_ring_frames`) and fallback events
 (`tap_read_fallbacks`). Startup fallback counts belong to workers.
 `tap_checksums` counts completed partial checksums, including segmented outputs.
-`tap_gso_reads` counts retained UDP super-frames on the reader;
+`tap_gso_reads` counts retained UDP/TCP super-frames on the reader;
 `tap_gso_frames` counts ordinary frames expanded on the transmit owner.
 
 ## TAP write coalescing
 
 TAP queues use an internal 10-byte virtio header. The runtime enables checksum
 offload and completes partial Internet checksums in place after validating the
-metadata bounds. UDP L4 read offloads let the runtime accept host super-frames
-up to 65,535 bytes. The reader selects the lane and hands the whole input to
+metadata bounds. UDP L4 and TCPv4/v6 read offloads let the runtime accept host
+super-frames up to 65,535 bytes. The reader selects the lane and hands the whole input to
 its transmit owner once. That owner segments it into ordinary Ethernet frames
-before packing; TCP read offloads remain disabled. Older kernels that reject USO
-use checksum-only reads and kernel segmentation. Standalone `Tap::create`
+before packing. Older kernels that reject USO retain TCP and checksum offloads,
+with UDP segmentation performed by the kernel. Standalone `Tap::create`
 keeps read offloads disabled until runtime setup.
 
-UDP expansion accepts IPv4 options, VLAN tags, and IPv6 hop-by-hop, routing
+UDP/TCP expansion accepts IPv4 options, VLAN tags, and IPv6 hop-by-hop, routing
 and destination headers. It validates protocol, lengths and checksum offsets,
 adjusts the supplied pseudo-header checksum seed, and advances IPv4 IDs.
+TCP expansion preserves options, advances sequence numbers modulo 2³², places
+FIN/PSH only on the final segment and CWR only on the first. TCP output
+coalescing remains unfinished; complete TCP frames use ordinary TAP writes.
 Unknown flags, unsupported GSO types, and fragmented GSO inputs are rejected.
 Pending input retains its original connection tag. The transmit owner shortens
 the initial 100 ms read-time deadline to its current 20–100 ms RTT-based lifetime

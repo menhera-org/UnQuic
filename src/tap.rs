@@ -136,16 +136,16 @@ impl Tap {
     pub(crate) fn enable_input_offloads(&self) -> io::Result<()> {
         let fd = self.queues[0].fd.as_raw_fd();
         // Linux requires both TUN_F_USO4 (0x20) and TUN_F_USO6 (0x40).
-        let flags = libc::TUN_F_CSUM as libc::c_ulong | 0x60;
+        let tcp = (libc::TUN_F_CSUM | libc::TUN_F_TSO4 | libc::TUN_F_TSO6 | libc::TUN_F_TSO_ECN)
+            as libc::c_ulong;
+        let flags = tcp | 0x60;
         // SAFETY: TUNSETOFFLOAD takes an integer bitmask for this TAP.
         let result = cvt(unsafe { libc::ioctl(fd, libc::TUNSETOFFLOAD, flags) });
         match result {
             Ok(_) => Ok(()),
             Err(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) => {
-                // Older kernels still segment in software before checksum-only TAP reads.
-                cvt(unsafe {
-                    libc::ioctl(fd, libc::TUNSETOFFLOAD, libc::TUN_F_CSUM as libc::c_ulong)
-                })?;
+                // Kernels without USO still support TCP segmentation offload.
+                cvt(unsafe { libc::ioctl(fd, libc::TUNSETOFFLOAD, tcp) })?;
                 Ok(())
             }
             Err(error) => Err(error),

@@ -185,7 +185,7 @@ metrics! {
     tap_ring_frames: sum,
     /// Partial Internet checksums completed before transmit admission.
     tap_checksums: sum,
-    /// UDP super-frames retained from TAP reads.
+    /// UDP/TCP super-frames retained from TAP reads.
     tap_gso_reads: sum,
     /// Complete wire frames produced from TAP super-frames.
     tap_gso_frames: sum,

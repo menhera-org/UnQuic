@@ -19,6 +19,8 @@ case "${SRV6:-0}" in 0|1) ;; *) echo "SRV6 must be 0 or 1" >&2; exit 2;; esac
 [ "$2" -le "$((1514 + 4 * ${VLAN_DEPTH:-0}))" ] || exit 2
 case "${WORKERS:-4}" in 4|8) ;; *) echo "WORKERS must be 4 or 8" >&2; exit 2;; esac
 case "${UDP_LOAD:-}" in ''|/*) ;; *) echo "UDP_LOAD must be an absolute path" >&2; exit 2;; esac
+case "${IPERF_PROTOCOL:-udp}" in udp|tcp) ;; *) echo "IPERF_PROTOCOL must be udp or tcp" >&2; exit 2;; esac
+[ "${IPERF_PROTOCOL:-udp}" = udp ] || [ -z "${UDP_LOAD:-}" ] || { echo "TCP requires iperf3, not UDP_LOAD" >&2; exit 2; }
 if [ -n "${UDP_LOAD:-}" ]; then
     [ "$2" -ge "$((58 + 4 * ${VLAN_DEPTH:-0} + 84 * ${SRV6:-0}))" ] || { echo "UDP_LOAD needs 16 payload bytes after headers" >&2; exit 2; }
 fi
@@ -190,6 +192,7 @@ if [ -n "${UDP_LOAD:-}" ]; then
     printf '%s\n' "udp_load segments=${SEGMENTS:-64}" > "$out/generator"
 else
     iperf3 --version > "$out/iperf-version"
+    printf 'iperf3 protocol=%s\n' "${IPERF_PROTOCOL:-udp}" > "$out/generator"
 fi
 printf '%s\n' "${DAEMON_LEFT_CPUS:-0-$((workers - 1))}" "${DAEMON_RIGHT_CPUS:-$workers-$((workers * 2 - 1))}" > "$out/daemon-cpus"
 printf '%s\n' "$GENERATOR_LEFT_CPUS" "$RECEIVER_LEFT_CPUS" \
@@ -234,12 +237,15 @@ for rate in ${BITRATE:-0}; do
         reverse_server=$!
         sleep 0.2
         snapshot before
-        nsenter --net=/run/netns/uq-left taskset -c "$GENERATOR_LEFT_CPUS" iperf3 -c 10.77.0.2 -u -b "$rate" --dont-fragment \
-            -l "$payload" -P "$flows" --cport 51000 -t "$seconds" -J \
+        if [ "${IPERF_PROTOCOL:-udp}" = tcp ]; then
+            set -- -l 65536
+        else
+            set -- -u --dont-fragment -l "$payload"
+        fi
+        nsenter --net=/run/netns/uq-left taskset -c "$GENERATOR_LEFT_CPUS" iperf3 -c 10.77.0.2 -b "$rate" "$@" -P "$flows" --cport 51000 -t "$seconds" -J \
             --connect-timeout 3000 > "$out/client.json" &
         client=$!
-        nsenter --net=/run/netns/uq-right taskset -c "$GENERATOR_RIGHT_CPUS" iperf3 -c 10.77.0.1 -u -b "$rate" --dont-fragment \
-            -l "$payload" -P "$flows" --cport 51000 -t "$seconds" -J \
+        nsenter --net=/run/netns/uq-right taskset -c "$GENERATOR_RIGHT_CPUS" iperf3 -c 10.77.0.1 -b "$rate" "$@" -P "$flows" --cport 51000 -t "$seconds" -J \
             --connect-timeout 3000 > "$out/reverse-client.json" &
         reverse_client=$!
     fi

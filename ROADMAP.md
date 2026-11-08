@@ -389,15 +389,15 @@ Do not defer this performance coverage to the stage 4 composition matrix.
   but no packet is ACK-eligible until all its nonterminal DATA is retained.
 - TAP reads retain the 64-frame budget and strip internal `IFF_VNET_HDR`
   metadata. The runtime enables checksum offload and completes partial checksums
-  in place. UDP super-frame input uses bounded userspace segmentation from
+  in place. UDP/TCP super-frame input uses bounded userspace segmentation from
   the existing pool after one whole-input handoff to the selected lane owner;
-  TCP read offloads remain disabled. Compatible complete
+  TCP options and sequence/flag semantics are preserved. Compatible complete
   UDP frames can share a lossless USO TAP write, preserving per-flow order,
   backpressure and the existing receive deadline. Other frames use single writes.
   Workers use bounded nonblocking io_uring read batches when available,
   draining completions before releasing buffers and falling back to plain reads
   on unsupported kernels. UDP super-frame sweeps improve delivery but still
-  miss the 20 Gbit/s gate and show overload declines. TCP super-frame input
+  miss the 20 Gbit/s gate and show overload declines. TCP output coalescing
   remains unfinished.
 - Preallocated buffer pools and descriptor rings in the worker; no allocation
   on the data path after startup. Verify by a test that counts allocations
@@ -410,9 +410,9 @@ Do not defer this performance coverage to the stage 4 composition matrix.
 - The Rust UDP_SEGMENT/GRO load tool uses concurrent sockets, per-flow pacing,
   byte validation and duplicate tracking; it reports generator CPU separately.
   Direct veth probes exceed 20 Gbit/s each way. Four-/eight-worker harness
-  smoke tests pass with plain UDP. B3 UDP super-frame input is implemented;
-  TCP input remains segmented by the kernel. Direct harness probes do not
-  pass the tunnel gate; see BENCH.md for measured transport limits.
+  smoke tests pass with plain UDP. B3 UDP/TCP super-frame input is implemented;
+  unsupported offloads remain segmented by the kernel. Direct harness probes
+  do not pass the tunnel gate; see BENCH.md for measured transport limits.
 - Measure: record frames per second and CPU per core on the container
   loopback in a `BENCH.md` table with kernel version and CPU model. These
   numbers are a baseline until a complete-transport run demonstrates at least

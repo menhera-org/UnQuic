@@ -5566,9 +5566,14 @@ mod tests {
     #[test]
     #[ignore = "kernel descriptor test; run in a disposable container"]
     fn super_frame_handoff_expands_only_on_its_owner_and_keeps_order() {
-        use crate::tap::test_common::udp;
+        use crate::tap::test_common::{tcp, udp};
         use std::os::unix::net::UnixDatagram;
-        for (size, count) in [(1472, 44), (1, 10_000)] {
+        for (tcp_input, size, count) in [
+            (false, 1472, 44),
+            (false, 1, 10_000),
+            (true, 1448, 44),
+            (true, 1, 10_000),
+        ] {
             let (_, mut workers) = test_workers();
             let params = wire::Params {
                 port: 40000,
@@ -5601,10 +5606,23 @@ mod tests {
             }
             let tags = [0x88, 0xa8, 0, 7, 0x81, 0, 0, 42];
             let payload: Vec<_> = (0..size * count).map(|i| (i * 13) as u8).collect();
-            let mut input = udp::frame(false, 65530, &payload);
-            let mut header = udp::partial(&mut input, false);
+            let make_frame = |id, offset, payload: &[u8]| {
+                if tcp_input {
+                    tcp::frame(false, id, offset, 0x10, &[1; 12], payload)
+                } else {
+                    udp::frame(false, id, payload)
+                }
+            };
+            let mut input = make_frame(65530, 0, &payload);
+            let mut header = if tcp_input {
+                tcp::partial(&mut input, false, size as u16)
+            } else {
+                udp::partial(&mut input, false)
+            };
             input.splice(12..12, tags);
-            header[1] = 5;
+            if !tcp_input {
+                header[1] = 5;
+            }
             header[4..6].copy_from_slice(&(size as u16).to_ne_bytes());
             header[6..8].copy_from_slice(&42u16.to_ne_bytes());
             input[11] = (0..=255)
@@ -5613,7 +5631,7 @@ mod tests {
                     pack::flow_hash(&input) % 2 == 1
                 })
                 .unwrap();
-            let mut plain = udp::frame(false, 123, &[7; 60]);
+            let mut plain = make_frame(123, payload.len() as u32, &[7; 60]);
             plain[..12].copy_from_slice(&input[..12]);
             plain.splice(12..12, tags);
             let (fd, sender) = UnixDatagram::pair().unwrap();
@@ -5670,9 +5688,9 @@ mod tests {
                     let expected = if seen == count {
                         plain.clone()
                     } else {
-                        let mut expected = udp::frame(
-                            false,
+                        let mut expected = make_frame(
                             65530u16.wrapping_add(seen as u16),
+                            (seen * size) as u32,
                             &payload[seen * size..(seen + 1) * size],
                         );
                         expected[..12].copy_from_slice(&input[..12]);

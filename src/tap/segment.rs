@@ -1,10 +1,12 @@
-//! Checked UDP L4 super-frame expansion; no wire-format change.
+//! Checked UDP/TCP super-frame expansion; no wire-format change.
 use super::uso::{fold, sum};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Segments {
     network: usize,
     transport: usize,
+    header: usize,
+    tcp: bool,
     size: usize,
     next: usize,
     id: u16,
@@ -17,7 +19,9 @@ fn word(bytes: &[u8], at: usize) -> u16 {
 
 impl Segments {
     pub(super) fn parse(header: &[u8; 10], bytes: &[u8], limit: usize) -> Option<Self> {
-        if header[0] != 1 || header[1] != 5 || bytes.len() > 65535 {
+        let kind = header[1];
+        let tcp = matches!(kind, 1 | 4 | 0x81 | 0x84);
+        if header[0] != 1 || (!tcp && kind != 5) || bytes.len() > 65535 {
             return None;
         }
         let size = u16::from_ne_bytes([header[4], header[5]]) as usize;
@@ -25,11 +29,23 @@ impl Segments {
         let hint = u16::from_ne_bytes([header[2], header[3]]) as usize;
         if size == 0
             || hint > bytes.len()
-            || header[8..10] != 6u16.to_ne_bytes()
-            || transport + 8 >= bytes.len()
-            || transport + 8 + size > limit
+            || header[8..10] != (if tcp { 16u16 } else { 6 }).to_ne_bytes()
+            || transport + if tcp { 20 } else { 8 } >= bytes.len()
             || bytes.len() < 14
         {
+            return None;
+        }
+        let header_len = transport
+            + if tcp {
+                let length = usize::from(bytes[transport + 12] >> 4) * 4;
+                if length < 20 {
+                    return None;
+                }
+                length
+            } else {
+                8
+            };
+        if header_len >= bytes.len() || header_len + size > limit {
             return None;
         }
         let mut network = 14;
@@ -46,6 +62,10 @@ impl Segments {
             0x86dd => true,
             _ => return None,
         };
+        if tcp && (kind & 0x7f == 4) != v6 {
+            return None;
+        }
+        let transport_protocol = if tcp { 6 } else { 17 };
         if v6 {
             if network + 40 > transport
                 || bytes[network] >> 4 != 6
@@ -63,27 +83,29 @@ impl Segments {
                 next = bytes[at];
                 at += length;
             }
-            if next != 17 || at != transport {
+            if next != transport_protocol || at != transport {
                 return None;
             }
         } else if network + 20 > transport
             || bytes[network] >> 4 != 4
             || bytes[network] & 15 < 5
             || network + usize::from(bytes[network] & 15) * 4 != transport
-            || bytes[network + 9] != 17
+            || bytes[network + 9] != transport_protocol
             || word(bytes, network + 2) as usize != bytes.len() - network
             || word(bytes, network + 6) & !0x4000 != 0
         {
             return None;
         }
-        if word(bytes, transport + 4) as usize != bytes.len() - transport {
+        if !tcp && word(bytes, transport + 4) as usize != bytes.len() - transport {
             return None;
         }
         Some(Self {
             network,
             transport,
+            header: header_len,
+            tcp,
             size,
-            next: transport + 8,
+            next: header_len,
             id: if v6 { 0 } else { word(bytes, network + 4) },
             v6,
         })
@@ -103,7 +125,7 @@ impl Segments {
     }
 
     pub(crate) const fn header_len(&self) -> usize {
-        self.transport + 8
+        self.header
     }
 
     pub(crate) fn next_len(&self, length: usize) -> usize {
@@ -127,19 +149,36 @@ impl Segments {
         output[..header].copy_from_slice(&input[..header]);
         self.next += count;
         let at = self.transport;
-        let udp_length = (8 + count) as u16;
+        let transport_length = (header - at + count) as u16;
+        let checksum_at = at + if self.tcp { 16 } else { 6 };
         // Adjust the supplied pseudo-header seed, preserving routing-header semantics.
         let seed = fold(
-            u32::from(word(input, at + 6))
-                + u32::from(!word(input, at + 4))
-                + u32::from(udp_length),
+            u32::from(word(input, checksum_at))
+                + u32::from(!((input.len() - at) as u16))
+                + u32::from(transport_length),
         );
-        output[at + 4..at + 6].copy_from_slice(&udp_length.to_be_bytes());
-        output[at + 6..at + 8].copy_from_slice(&seed.to_be_bytes());
-        // The eight-byte UDP header leaves payload word alignment unchanged.
+        if self.tcp {
+            let seq = u32::from_be_bytes(input[at + 4..at + 8].try_into().ok()?);
+            let seq = seq.wrapping_add((range.start - header) as u32);
+            output[at + 4..at + 8].copy_from_slice(&seq.to_be_bytes());
+            if self.next != input.len() {
+                output[at + 13] &= !0x09; // FIN and PSH belong to the final segment.
+            }
+            if range.start != header {
+                output[at + 13] &= !0x80; // CWR belongs to the first segment.
+            }
+        } else {
+            output[at + 4..at + 6].copy_from_slice(&transport_length.to_be_bytes());
+        }
+        output[checksum_at..checksum_at + 2].copy_from_slice(&seed.to_be_bytes());
+        // Both transport headers preserve payload word alignment.
         let checksum = !fold(sum(&output[at..header]) + sum(&input[range.clone()]));
-        output[at + 6..at + 8]
-            .copy_from_slice(&if checksum == 0 { 65535u16 } else { checksum }.to_be_bytes());
+        let checksum = if !self.tcp && checksum == 0 {
+            65535
+        } else {
+            checksum
+        };
+        output[checksum_at..checksum_at + 2].copy_from_slice(&checksum.to_be_bytes());
         let ip = self.network;
         if self.v6 {
             output[ip + 4..ip + 6].copy_from_slice(&((length - ip - 40) as u16).to_be_bytes());
@@ -182,6 +221,174 @@ mod tests {
         header[1] = 5;
         header[4..6].copy_from_slice(&(size as u16).to_ne_bytes());
         (bytes, header)
+    }
+
+    #[test]
+    fn tcp_segments_match_independent_frames_with_flags_options_and_sequence_wrap() {
+        use crate::tap::test_common::tcp;
+        for v6 in [false, true] {
+            for tags in [
+                &[][..],
+                &[0x81, 0, 0, 7][..],
+                &[0x88, 0xa8, 0, 7, 0x81, 0, 0, 9][..],
+            ] {
+                for options in [&[][..], &[1; 12][..], &[1; 40][..]] {
+                    for (size, count) in [(1, 3), (101, 3), (1448, 44)] {
+                        for flags in [0x10, 0x19, 0xd9] {
+                            let payload: Vec<_> = (0..size * count - usize::from(size > 1))
+                                .map(|i| (i * 13) as u8)
+                                .collect();
+                            let mut input =
+                                tcp::frame(v6, 65534, u32::MAX - 10, flags, options, &payload);
+                            let mut header = tcp::partial(&mut input, v6, size as u16);
+                            input.splice(12..12, tags.iter().copied());
+                            for at in [2, 6] {
+                                let offset = u16::from_ne_bytes([header[at], header[at + 1]])
+                                    + tags.len() as u16;
+                                header[at..at + 2].copy_from_slice(&offset.to_ne_bytes());
+                            }
+                            let mut segments = Segments::parse(&header, &input, 1600).unwrap();
+                            let mut output = [0; 1600];
+                            for (i, data) in payload.chunks(size).enumerate() {
+                                let flags = flags
+                                    & if i + 1 == count { 0xff } else { !0x09 }
+                                    & if i == 0 { 0xff } else { !0x80 };
+                                let mut expected = tcp::frame(
+                                    v6,
+                                    65534u16.wrapping_add(i as u16),
+                                    (u32::MAX - 10).wrapping_add((i * size) as u32),
+                                    flags,
+                                    options,
+                                    data,
+                                );
+                                expected.splice(12..12, tags.iter().copied());
+                                let mut borrowed = segments;
+                                let mut prefix = [0xa5; 128];
+                                assert!(
+                                    borrowed
+                                        .write_header(
+                                            &input,
+                                            &mut prefix[..segments.header_len() - 1]
+                                        )
+                                        .is_none()
+                                );
+                                assert_eq!(prefix, [0xa5; 128]);
+                                let range = borrowed.write_header(&input, &mut prefix).unwrap();
+                                assert_eq!(
+                                    &prefix[..segments.header_len()],
+                                    &expected[..segments.header_len()]
+                                );
+                                assert_eq!(&input[range], &expected[segments.header_len()..]);
+                                let remaining = segments.remaining_bytes(input.len()).unwrap();
+                                let n = segments.write(&input, &mut output);
+                                assert_eq!(&output[..n], expected);
+                                assert_eq!(
+                                    segments.remaining_bytes(input.len()),
+                                    Some(remaining - n)
+                                );
+                                assert_eq!(
+                                    crate::pack::flow_hash(&input),
+                                    crate::pack::flow_hash(&output[..n])
+                                );
+                            }
+                            assert!(segments.done(input.len()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_extension_headers_and_routing_checksum_seed_survive_segmentation() {
+        use crate::tap::test_common::tcp;
+        for v6 in [false, true] {
+            let mut input = tcp::frame(v6, 65535, 0, 0x19, &[1; 40], &[7; 201]);
+            let mut header = tcp::partial(&mut input, v6, 100);
+            let transport = if v6 { 54 } else { 34 };
+            let final_address = [9; 16];
+            let pseudo_addresses = if v6 {
+                let seed = fold(sum(&input[22..38]) + sum(&final_address) + 6 + 261);
+                input[70..72].copy_from_slice(&seed.to_be_bytes());
+                let mut extension = [0; 104];
+                extension[0] = 43;
+                extension[1] = 9;
+                extension[80] = 6;
+                extension[81] = 2;
+                extension[82] = 4;
+                extension[88..].copy_from_slice(&final_address);
+                input.splice(54..54, extension);
+                input[20] = 60;
+                let length = (input.len() - 54) as u16;
+                input[18..20].copy_from_slice(&length.to_be_bytes());
+                sum(&input[22..38]) + sum(&final_address)
+            } else {
+                input.splice(34..34, [1; 40]);
+                input[14] = 0x4f;
+                let length = (input.len() - 14) as u16;
+                input[16..18].copy_from_slice(&length.to_be_bytes());
+                sum(&input[26..34])
+            };
+            let at = transport + if v6 { 104 } else { 40 };
+            header[2..4].copy_from_slice(&((at + 60) as u16).to_ne_bytes());
+            header[6..8].copy_from_slice(&(at as u16).to_ne_bytes());
+            let mut segments = Segments::parse(&header, &input, 1514).unwrap();
+            let mut output = [0; 1514];
+            for i in 0..3 {
+                let n = segments.write(&input, &mut output);
+                assert_eq!(&output[transport..at], &input[transport..at]);
+                assert_eq!(&output[at + 20..at + 60], &[1; 40]);
+                assert_eq!(&output[at + 4..at + 8], &(i * 100u32).to_be_bytes());
+                assert_eq!(output[at + 13], if i == 2 { 0x19 } else { 0x10 });
+                assert_eq!(
+                    fold(pseudo_addresses + 6 + (n - at) as u32 + sum(&output[at..n])),
+                    65535
+                );
+                if !v6 {
+                    assert_eq!(fold(sum(&output[14..at])), 65535);
+                }
+            }
+            assert!(segments.done(input.len()));
+            if v6 {
+                input[20] = 44;
+            } else {
+                input[20] |= 0x20;
+            }
+            assert!(Segments::parse(&header, &input, 1514).is_none());
+        }
+    }
+
+    #[test]
+    fn tcp_metadata_rejects_truncation_protocol_mismatch_and_invalid_headers() {
+        use crate::tap::test_common::tcp;
+        for v6 in [false, true] {
+            let mut input = tcp::frame(v6, 0, 0, 0x10, &[], &[7; 201]);
+            let header = tcp::partial(&mut input, v6, 100);
+            let at = if v6 { 54 } else { 34 };
+            for length in 0..input.len() {
+                assert!(Segments::parse(&header, &input[..length], 1514).is_none());
+            }
+            for (index, value) in [
+                (0, 0),
+                (0, 3),
+                (1, if v6 { 1 } else { 4 }),
+                (1, 0x41),
+                (4, 0),
+                (6, 0),
+                (8, 6),
+                (9, 1),
+            ] {
+                let mut bad = header;
+                bad[index] = value;
+                assert!(Segments::parse(&bad, &input, 1514).is_none());
+            }
+            for (index, value) in [(at + 12, 0x40), (if v6 { 20 } else { 23 }, 17)] {
+                let mut bad = input.clone();
+                bad[index] = value;
+                assert!(Segments::parse(&header, &bad, 1514).is_none());
+            }
+            assert!(Segments::parse(&header, &input, at + 119).is_none());
+        }
     }
 
     #[test]

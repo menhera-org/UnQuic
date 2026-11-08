@@ -75,7 +75,7 @@ earlier tables retain their original builds and test conditions.
 | At least 20 Gbit/s each way at inner MTU 1500 | After the ACK/loss fairness fix, sixty-second QinQ sweep: 1.82 / 1.58 Gbit/s paced, 1.82 / 1.64 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe integration regression; paced missing fractions are 91.26 / 92.28%. The recovery ascending sweep stays under 1% missing in both directions only at 0.5G offered. Five successful 20G repeats remain unmet. |
 | Goodput must plateau under excess traffic | Bounded fresh work raises matched twenty-second single-lane unlimited delivery to 1.89 / 1.85 Gbit/s from 0.45–0.51, only 0.3 / 2.3% below its 4G point. Eight-lane delivery remains 1.77 / 1.55 with admission pressure | No universal plateau or CPU ceiling is established. The single-lane scheduling failure is reduced; the eight-lane ceiling and original targets remain open. |
 | Small-frame overload must remain efficient | Earlier pre-recovery tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
-| VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads remain unfinished. |
+| VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads now improve the matched TCP sweep; output coalescing remains unfinished. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
 | Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Throughput sweeps currently cap outer packets at 1500 bytes. Larger-MTU throughput and real routed-path validation remain open. DATA-quoted PTB validation now has targeted kernel coverage. |
@@ -88,6 +88,100 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## TCP input offload from the November 6 review (November 8)
+
+TCPv4/v6 super-frames now use the existing bounded gather path. The reader
+hands off one source; its owner borrows payload and rewrites each segment's
+header. TCP options and routing checksum seeds are preserved, sequence numbers
+wrap correctly, FIN/PSH appear only on the final segment, and CWR only on the
+first. Longer headers use the existing slab fallback. Source deadlines,
+per-turn budgets, lane selection, admission and recovery accounting stay
+unchanged. Older kernels without USO retain TCP and checksum offloads.
+
+The [matched release TCP observations](benches/tap-tcp-input.json) use QinQ,
+inner MTU 1500, eight workers/lanes, twenty seconds per point, and concurrent
+forward/reverse iperf3 connections. Each point starts fresh daemons. Application
+writes are 64 KiB; TCP chooses its segment sizes and sending rate.
+Outer discovery remains active with a 1452-byte UDP cap. The CPU is Xeon Gold
+6138; the local kernel is Linux 6.8.0-149-generic and iperf3 is 3.20.
+
+| Build | Streams each way | Delivered Gbit/s L→R / R→L | CPU % L / R | TCP retransmissions L→R / R→L |
+| --- | --- | --- | --- | --- |
+| before | 1 | 1.152 / 1.278 | 253.03 / 293.20 | 3849 / 3374 |
+| before | 4 | 1.092 / 0.870 | 291.37 / 271.79 | 4327 / 4180 |
+| before | 16 | 0.727 / 0.803 | 257.90 / 261.02 | 11565 / 11647 |
+| candidate | 1 | 1.585 / 1.385 | 267.16 / 326.98 | 6458 / 3961 |
+| candidate | 4 | 1.294 / 1.098 | 301.04 / 277.11 | 4134 / 6084 |
+| candidate | 16 | 0.801 / 0.917 | 258.56 / 258.56 | 11070 / 10230 |
+| after | 1 | 1.196 / 1.351 | 263.08 / 305.30 | 3620 / 2737 |
+| after | 4 | 1.052 / 0.971 | 291.53 / 275.57 | 7308 / 6248 |
+| after | 16 | 0.733 / 0.822 | 260.27 / 263.83 | 11140 / 13450 |
+
+The candidate exceeds both controls in all six direction/stream-count
+comparisons. Against the better control in each direction, gains are
+32.5 / 2.5% with one stream, 18.5 / 13.1% with four, and 9.2 / 11.6% with
+sixteen. These are single observations, not repeatability or acceptance
+results. One-stream ring completions fall from 3.07 / 3.10 million in the
+opening control to 1.19 / 1.26 million despite higher delivery. The candidate
+expands 2.74 / 2.39 million children from 67,138 / 60,564 TCP source reads.
+Read syscalls do not fall consistently: ACK traffic, placement and bounded
+read turns still matter. TCP output remains one TAP write per frame.
+
+| Build / streams | Worker queue drops L / R | Expired frames L / R | TAP ingress drops L / R |
+| --- | --- | --- | --- |
+| before / 1 | 977 / 11 | 4326 / 4712 | 0 / 209 |
+| before / 4 | 512 / 801 | 6711 / 6150 | 0 / 0 |
+| before / 16 | 227 / 1863 | 23501 / 15309 | 0 / 0 |
+| candidate / 1 | 597 / 288 | 3773 / 3550 | 48 / 0 |
+| candidate / 4 | 390 / 799 | 4426 / 6830 | 0 / 0 |
+| candidate / 16 | 168 / 1201 | 22617 / 12073 | 0 / 0 |
+| after / 1 | 1162 / 104 | 3053 / 3543 | 160 / 0 |
+| after / 4 | 427 / 951 | 10920 / 7718 | 0 / 0 |
+| after / 16 | 197 / 1916 | 21283 / 17372 | 0 / 0 |
+
+All nine points have zero reassembly admission pressure, outer socket
+overflow, TCP input/checksum errors, TAP errors and outer fragments.
+The outer sockets have 425984-byte receive buffers. TCP retransmissions are
+not an exact packet-loss ratio; these counters use different units and cannot
+be added into one. No injected delay or loss was used.
+
+The release checks include byte-exact comparison with Linux segmentation on
+6.8 and 7.0: IPv4/IPv6, VLAN/QinQ, TCP options, short final segments, sequence
+and IPv4-ID wrap, ECN flags, and a deliberately zero TCP checksum. Pure tests
+also cover long IPv4 options, IPv6 routing/destination headers, malformed
+metadata and truncation. The worker handoff regression covers 44-child and
+10000-child TCP sources, bounded turns, borrowed lifetime and quota cleanup.
+Both kernels pass the 81 kernel tests and three runtime tests; the latter
+retain recovery, restart and allocation assertions. Ordinary release tests,
+strict Clippy, formatting and Rust 1.89 all-target musl checks pass.
+No builds, kernel tests or Git packing
+overlapped the load measurements.
+
+A separate UDP A/B/A uses the same binaries and sixteen QinQ flows each way,
+with 44-segment sends and the same twenty-second duration:
+
+| Build | Requested Gbit/s each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| before | 4 | 1.738 / 1.512 | 55.17 / 61.01 | 208.42 / 202.97 |
+| before | Unlimited | 1.779 / 1.549 | 96.93 / 96.89 | 208.47 / 202.63 |
+| candidate | 4 | 1.789 / 1.520 | 54.54 / 61.43 | 216.36 / 209.67 |
+| candidate | Unlimited | 1.740 / 1.581 | 96.94 / 96.97 | 216.20 / 207.68 |
+| after | 4 | 1.774 / 1.463 | 55.00 / 62.91 | 219.73 / 212.74 |
+| after | Unlimited | 1.685 / 1.562 | 97.04 / 97.06 | 212.98 / 204.46 |
+
+The candidate's unlimited forward result lies between the controls; reverse
+delivery exceeds both slightly. This establishes no consistent throughput
+regression in this comparison. It does not establish a UDP gain or fix
+admission pressure and expiry. Candidate unlimited pressure is 16,006 / 3,919;
+expiry is 1.34 / 1.93 million frames. All six UDP points report zero invalid,
+duplicate, reordered, too-old or wrong-run records, socket overflow and outer
+fragments. Full counter and per-worker CPU data are in the same JSON.
+
+TCP coalescing, low sender utilization, strict-flow placement costs and the
+original throughput gates remain open. More streams still reduce goodput
+on this recovery build. This change does not establish an overload plateau
+or the real lossy-path target.
 
 ## Larger retention quota worsens overload (November 8)
 

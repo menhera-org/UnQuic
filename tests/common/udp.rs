@@ -1,11 +1,11 @@
 //! Valid UDP frame fixtures and checksum repair for offload tests.
-fn fold(mut sum: u32) -> u16 {
+pub(super) fn fold(mut sum: u32) -> u16 {
     while sum > 65535 {
         sum = (sum & 65535) + (sum >> 16);
     }
     sum as u16
 }
-fn sum(bytes: &[u8]) -> u32 {
+pub(super) fn sum(bytes: &[u8]) -> u32 {
     bytes
         .chunks(2)
         .map(|p| u16::from_be_bytes([p[0], *p.get(1).unwrap_or(&0)]) as u32)

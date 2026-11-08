@@ -199,6 +199,75 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
         }
     }
 
+    // Compare TCP expansion with the kernel using identical virtio metadata.
+    for tags in [
+        &[][..],
+        &[0x81, 0, 0xb0, 7][..],
+        &[0x88, 0xa8, 0xd0, 11, 0x81, 0, 0x70, 7][..],
+    ] {
+        for v6 in [false, true] {
+            for options in [&[][..], &[1, 1, 8, 10, 0, 0, 0, 7, 0, 0, 0, 9][..]] {
+                for flags in [0x19, 0xd9] {
+                    for count in [2, 44] {
+                        let size = if v6 { 1400 } else { 1440 };
+                        let mut payload: Vec<_> =
+                            (0..size * count - 1).map(|i| (i * 13) as u8).collect();
+                        // Force a zero TCP checksum to distinguish it from UDP's mangled zero.
+                        payload[size - 2..size].fill(0);
+                        let first = common::tcp::frame(
+                            v6,
+                            65520,
+                            u32::MAX - 10,
+                            flags & !0x09,
+                            options,
+                            &payload[..size],
+                        );
+                        let check = if v6 { 70 } else { 50 };
+                        payload[size - 2..size].copy_from_slice(&first[check..check + 2]);
+                        let mut input =
+                            common::tcp::frame(v6, 65520, u32::MAX - 10, flags, options, &payload);
+                        let mut header = common::tcp::partial(&mut input, v6, size as u16);
+                        input.splice(12..12, tags.iter().copied());
+                        for at in [2, 6] {
+                            let offset = u16::from_ne_bytes([header[at], header[at + 1]])
+                                + tags.len() as u16;
+                            header[at..at + 2].copy_from_slice(&offset.to_ne_bytes());
+                        }
+                        let mut segments =
+                            super::Segments::parse(&header, &input, crate::MAX_FRAME_LEN).unwrap();
+                        let iov = [
+                            libc::iovec {
+                                iov_base: header.as_ptr().cast_mut().cast(),
+                                iov_len: header.len(),
+                            },
+                            libc::iovec {
+                                iov_base: input.as_ptr().cast_mut().cast(),
+                                iov_len: input.len(),
+                            },
+                        ];
+                        // SAFETY: writev borrows both initialized buffers until completion.
+                        assert_eq!(
+                            unsafe { libc::writev(tap.fd.as_raw_fd(), iov.as_ptr(), 2) },
+                            (input.len() + 10) as isize
+                        );
+                        let mut output = [0; crate::MAX_FRAME_LEN];
+                        for segment in 0..count {
+                            let n = segments.write(&input, &mut output);
+                            assert_eq!(
+                                receive(&capture),
+                                &output[..n],
+                                "TCP tags={} v6={v6} options={} flags={flags:x} count={count} segment={segment}",
+                                tags.len() / 4,
+                                options.len()
+                            );
+                        }
+                        assert!(segments.done(input.len()));
+                    }
+                }
+            }
+        }
+    }
+
     // Reorder only across flows; a changed header within a flow is a barrier.
     for v6 in [false, true] {
         let at = if v6 { 54 } else { 34 };
