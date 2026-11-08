@@ -1,0 +1,71 @@
+diff --git a/src/worker/sender/owner.rs b/src/worker/sender/owner.rs
+index 356323e..bf5d089 100644
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -7,6 +7,8 @@ use crate::{
+ };
+ 
+ pub(super) const SAMPLE_SLOTS: usize = 65_535;
++// Isolated diagnostic: commit/report work only; grant and visit limits stay unchanged.
++const OWNER_WORK_BUDGET: usize = 2 * BATCH_SIZE;
+ 
+ pub(crate) struct Request {
+     pub flight: Box<Flight>,
+@@ -450,7 +452,7 @@ impl Owner {
+         self.diagnostic
+             .pass(now, self.requests.iter().any(Option::is_some));
+         let mut more = false;
+-        let mut work = BATCH_SIZE;
++        let mut work = OWNER_WORK_BUDGET;
+         let visits = (self.groups.len() - self.cursor).min(BATCH_SIZE);
+         for _ in 0..visits {
+             if work == 0 || outgoing.len() == outgoing.capacity() {
+@@ -1711,9 +1713,35 @@ mod drain_tests {
+     }
+ 
+     #[test]
+-    fn ready_reports_do_not_overrun_remaining_turn_budget() {
++    fn commit_and_feedback_fit_without_an_extra_owner_turn() {
+         let mut owner = ready(31);
+         let mut outgoing = VecDeque::with_capacity(16);
++        owner
++            .advance(Duration::from_millis(1), &mut outgoing)
++            .unwrap();
++        assert_eq!(outgoing.len(), 4);
++        assert!(
++            outgoing
++                .iter()
++                .take(2)
++                .all(|(_, message)| matches!(message, Message::Recycle(_)))
++        );
++        assert!(
++            outgoing
++                .iter()
++                .skip(2)
++                .all(|(_, message)| matches!(message, Message::ReportReturn(_)))
++        );
++        assert_eq!(owner.sender.flight_bytes(0), Some((0, 0)));
++        assert!(!owner.sender.feedback_ready(0));
++        assert_eq!(owner.timers.earliest(0), None);
++    }
++
++    #[test]
++    fn ready_reports_do_not_overrun_remaining_turn_budget() {
++        let count = OWNER_WORK_BUDGET / 2 - 1;
++        let mut owner = ready(count);
++        let mut outgoing = VecDeque::with_capacity(16);
+         owner
+             .advance(Duration::from_millis(1), &mut outgoing)
+             .unwrap();
+@@ -1723,7 +1751,10 @@ mod drain_tests {
+                 .iter()
+                 .all(|(_, message)| matches!(message, Message::Recycle(_)))
+         );
+-        assert_eq!(owner.sender.flight_bytes(0), Some((0, 6200)));
++        assert_eq!(
++            owner.sender.flight_bytes(0),
++            Some((0, 2 * count as u64 * 100))
++        );
+         assert!(owner.sender.feedback_ready(0));
+         outgoing.clear();
+         owner

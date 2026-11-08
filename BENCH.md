@@ -110,6 +110,116 @@ Equal session transmit/receive byte totals establish receive accounting, not
 protocol admission. The cause of the unrelated missing feedback remains unknown;
 rotation also cannot guarantee a new frame's deadline at an already long backoff.
 
+## Owner accounting budget experiment (November 8)
+
+Doubling the owner work budget does not establish a reliable bidirectional gain,
+so production retains 64 work items per turn. The candidate allows 128
+commit/feedback/request items while retaining the 64 group visits, 64 request
+visits, per-grant packet limit, quantum, windows and queue capacities. A focused
+regression verifies that 62 send commits and 62 terminal ACKs finish in one
+turn; a larger fixture still yields at its bound. The isolated candidate passes
+352 ordinary release tests, Clippy, formatting, 73 library kernel checks and
+the original forwarding/restart/allocation runtime test.
+
+These are matched baseline/candidate/baseline twenty-second release-musl sweeps:
+eight workers per daemon, sixteen flows each way, QinQ, 1522-byte frames,
+1472-byte UDP payloads, 44 segments per send and 500-entry TAP queues. Active
+PMTU discovery retains a 1452-byte UDP ceiling. CPU placement matches the
+preceding service experiment. All six sweeps use the same fresh Ubuntu 24.04
+image and the corrected snapshot harness. Actual socket receive buffers are
+425,984 bytes; the older larger-buffer runs are not causal controls. No local
+builds, kernel tests or Git packing overlap load.
+
+[Raw observations](benches/tap-sender-owner-budget.json) include binary hashes,
+offered load, flow/thread data, service counters and separate drop sources.
+The [candidate patch](benches/sender-owner-budget-experiment.patch) applies
+after the existing [service diagnostic](benches/sender-service-diagnostic.patch)
+on `9747161`. The later PTO target-fairness change is absent from every measured
+binary.
+
+With normal controller limits:
+
+| Build | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| 64 items before | 1 Gbit/s | 0.980 / 0.982 | 0.96 / 0.90 | 124.86 / 114.66 |
+| 64 items before | 4 Gbit/s | 1.688 / 1.482 | 57.11 / 62.40 | 237.12 / 229.09 |
+| 64 items before | 21 Gbit/s | 1.776 / 1.513 | 91.40 / 92.68 | 238.60 / 228.54 |
+| 64 items before | Unlimited | 1.747 / 1.532 | 96.89 / 96.77 | 236.49 / 228.61 |
+| 128 items | 1 Gbit/s | 0.978 / 0.987 | 1.29 / 0.42 | 128.26 / 118.05 |
+| 128 items | 4 Gbit/s | 1.694 / 1.522 | 56.92 / 61.34 | 238.34 / 230.36 |
+| 128 items | 21 Gbit/s | 1.805 / 0.930 | 91.22 / 95.48 | 217.20 / 271.95 |
+| 128 items | Unlimited | 1.782 / 1.618 | 96.73 / 96.56 | 241.21 / 229.77 |
+| 64 items after | 1 Gbit/s | 0.981 / 0.982 | 0.95 / 0.96 | 121.91 / 112.00 |
+| 64 items after | 4 Gbit/s | 1.577 / 1.517 | 60.01 / 61.57 | 232.11 / 226.16 |
+| 64 items after | 21 Gbit/s | 1.678 / 1.561 | 91.87 / 92.45 | 233.45 / 225.67 |
+| 64 items after | Unlimited | 1.799 / 1.526 | 96.75 / 97.02 | 235.33 / 227.60 |
+
+Unlimited forward delivery falls within the baseline range. Reverse delivery is
+about 6% higher, but the candidate's reverse 21 Gbit/s point falls to 0.930 Gbit/s,
+below both baselines. That point also has uneven worker CPU use; scheduling,
+placement and controller state are hypotheses, not established causes.
+The normal-limit runs have zero outer socket overflow, outer fragmentation,
+duplicates, invalid frames and reordering. Inner UDP reports 30 receive errors
+in baseline-before unlimited and 44 in baseline-after at 4 Gbit/s; other points
+have none.
+
+The second bracket fixes diagnostic pacing at 4 GB/s and the ordinary window
+at 8 MiB. ProbeRTT and stalled-PTO restrictions still apply. The controller's
+quantum and actual congestion accounting remain intact; these overrides are
+not a proposed production configuration.
+
+| Build with both overrides | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| 64 items before | 1 Gbit/s | 0.912 / 0.979 | 7.45 / 0.80 | 135.51 / 100.30 |
+| 64 items before | 4 Gbit/s | 2.240 / 2.858 | 43.11 / 27.55 | 329.68 / 269.87 |
+| 64 items before | 21 Gbit/s | 1.861 / 2.896 | 91.01 / 85.99 | 327.59 / 261.86 |
+| 64 items before | Unlimited | 2.455 / 2.862 | 95.55 / 94.52 | 299.45 / 271.90 |
+| 128 items | 1 Gbit/s | 0.981 / 0.981 | 0.83 / 0.90 | 95.79 / 90.48 |
+| 128 items | 4 Gbit/s | 2.481 / 2.567 | 37.00 / 34.98 | 331.47 / 324.73 |
+| 128 items | 21 Gbit/s | 2.171 / 2.972 | 89.50 / 85.63 | 314.72 / 287.71 |
+| 128 items | Unlimited | 2.606 / 2.564 | 95.21 / 95.11 | 290.33 / 319.53 |
+| 64 items after | 1 Gbit/s | 0.981 / 0.982 | 1.01 / 0.89 | 113.68 / 106.00 |
+| 64 items after | 4 Gbit/s | 2.452 / 2.708 | 37.83 / 31.41 | 286.83 / 277.27 |
+| 64 items after | 21 Gbit/s | 2.051 / 2.719 | 90.06 / 86.86 | 330.96 / 265.13 |
+| 64 items after | Unlimited | 1.905 / 2.124 | 96.42 / 95.24 | 323.74 / 309.71 |
+
+Baseline unlimited goodput varies substantially, and the candidate does not
+beat both baselines in both directions. Its reverse delivery falls 13.7% from
+the 21 Gbit/s point to unlimited. Reassembly admission pressure is zero
+throughout this bracket, so pressure cannot account for this decline.
+Outer receive overflows range from 8 to 406 datagrams per point; inner UDP
+errors, duplicates, invalid frames and outer fragments remain zero. Reordering
+reaches 0.0549%, with bounded recovery active.
+
+Unlimited-load drop attribution, by daemon (these counters have different units
+and cannot be added into an exact inner-frame loss count):
+
+| Build | Admission pressure L / R | Expired frames L / R | Queue drops L / R | Outer overflow L / R |
+| --- | --- | --- | --- | --- |
+| Normal before | 9465 / 2059 | 1313433 / 2015649 | 1551 / 24120 | 0 / 0 |
+| Normal candidate | 17108 / 2556 | 1263941 / 1895389 | 1534 / 24152 | 0 / 0 |
+| Normal after | 9519 / 2397 | 1231237 / 2009939 | 1514 / 24095 | 0 / 0 |
+| Overrides before | 0 / 0 | 498324 / 417935 | 3600 / 26181 | 209 / 56 |
+| Overrides candidate | 0 / 0 | 431662 / 806500 | 2518 / 27836 | 154 / 0 |
+| Overrides after | 0 / 0 | 1253204 / 1197513 | 2295 / 29948 | 19 / 0 |
+
+The service measurements retain the same constraint. With both overrides,
+unlimited grants average roughly 47–50 KB and 1.19–1.24 grants per epoch.
+Sampled reservation-to-report wall time is 87–107 µs; sampled owner calls are
+1.27–1.85 µs. A larger per-turn budget leaves the cross-worker completion
+dependency intact.
+
+Code inspection verifies that all outstanding reservations in a path group
+share one quantum, capped at 64 KiB. The first completion closes issuance;
+commit waits for all issued reports, then feedback must finish before reopening.
+For illustration, a full 64 KiB cycle lasting 80 µs permits only 6.55 Gbit/s of
+outer traffic. Twenty Gbit/s requires a cycle below 26.2 µs before protocol
+overhead. This is conditional arithmetic, not a measured CPU ceiling; the
+timing samples do not capture the entire cycle. The next experiment tests
+colocation of transmission and congestion ownership before attempting a payload
+ownership refactor. Overlapping current epochs without preserving send/ACK
+ordering would invalidate delivery sampling.
+
 ## Snapshot startup delay (November 8)
 
 A fresh release pilot failed before completing its first point: a receiver
