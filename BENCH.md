@@ -100,6 +100,66 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## ACK pruning on the corrected routed path (November 8)
+
+[An eighteen-point release comparison](benches/tap-ack-pruning-napi.json)
+retests [exact three-success pruning](benches/ack-pruning-35ed011.patch) on
+`35ed011`, including early ACK-buffer recycling and bounded fresh expansion.
+The patch is archived, not applied. It preserves failed-send snapshots and
+counts only the ranges actually submitted. Two fixed bitplanes cost 16 KiB
+per receive lane; duplicate suppression remains separate.
+
+Control, candidate, then control each ran ascending 0.5G, 5G and unlimited
+bidirectional loads for twenty seconds per point, with a two-second drain.
+The corrected NAPI harness uses 4.5 ms routed RTT, no configured loss, QinQ
+1,522-byte frames and a 1,500-byte outer IPv6 ceiling with active discovery.
+GSO uses eight workers, sixteen flows and 44-segment input. Bridged UDP uses
+four workers, four flows and individual frames. No local build or other
+test load overlapped the sweep. CPU excludes the drain; counters include it.
+
+Unlimited results, L→R / R→L (CPU is left/right, 100% = one core):
+
+| Input | Build | Delivered Gbit/s | Actually offered Gbit/s | Missing % | CPU % |
+| --- | --- | ---: | ---: | ---: | ---: |
+| gso | baseline | 0.943 / 0.416 | 58.25 / 58.92 | 98.34 / 99.27 | 247.1 / 179.8 |
+| bridge | baseline | 0.873 / 0.756 | 2.47 / 2.55 | 64.30 / 70.12 | 239.0 / 253.5 |
+| gso | pruning | 0.772 / 1.376 | 58.39 / 57.06 | 98.65 / 97.55 | 322.3 / 241.3 |
+| bridge | pruning | 0.602 / 0.777 | 2.82 / 2.57 | 78.40 / 69.50 | 187.3 / 238.0 |
+| gso | baseline_repeat | 0.902 / 1.095 | 58.85 / 57.91 | 98.43 / 98.08 | 277.5 / 260.2 |
+| bridge | baseline_repeat | 0.794 / 0.772 | 2.58 / 2.49 | 68.98 / 68.66 | 213.3 / 242.0 |
+
+The bridge generator reaches only 2.36–2.82 Gbit/s at the requested 5G and
+unlimited points. Pruning lowers unlimited forward bridge delivery by 24–31%
+against the surrounding controls; the reverse direction barely changes.
+Its mean ACK size falls to 2.28 / 1.12 ranges, and ACK-buffer drops fall by
+about 92% on the left, yet throughput does not recover. GSO remains unstable:
+the candidate delivers 1.088 / 0.252 Gbit/s at 5G requested and
+0.772 / 1.376 unlimited; the controls also show large asymmetric collapses.
+These observations reject pruning as a standalone performance fix.
+
+Unlimited bridge drop attribution, left/right endpoint counts:
+
+| Build | ACK-buffer drops | All queue drops | Unsent frame expiry | Fully sent frame expiry | Socket overflow |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline | 34080 / 2299 | 2084240 / 873477 | 4626 / 155795 | 16904 / 4027 | 22 / 72 |
+| pruning | 2790 / 1370 | 2172317 / 861564 | 1873 / 145060 | 2945 / 3789 | 0 / 0 |
+| baseline_repeat | 32719 / 1920 | 2095617 / 864577 | 1876 / 157868 | 18588 / 4999 | 65 / 28 |
+
+ACK-buffer drops are included in queue drops; these columns must not be added.
+All eighteen observations have zero netem drops, veth receive-ring drops,
+inner UDP receive-buffer errors and outer fragments. One final-control
+0.5G bridge point records 38 admission-pressure attempts; all other points
+record zero. Full per-worker counters, TAP drops and per-flow records remain
+in the JSON. Smaller ACKs do not explain the remaining loss by themselves.
+Three successful local submissions also do not prove remote receipt, especially
+when ACK loss is correlated.
+
+The candidate passes 365 ordinary release-musl tests, all 90 library kernel
+checks on Linux 6.8 and 7.0, and all three runtime checks on Linux 7.0.
+This retest adds no lossy-path or TCP measurements because it already loses
+forward bridged goodput without injected loss. Production keeps the existing
+ACK history; neither performance target nor the overload plateau is achieved.
+
 ## Return incoming ACK transfer buffers after validation (November 8)
 
 The sender history already copies validated ACK ranges into fixed pending

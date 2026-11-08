@@ -1,0 +1,694 @@
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -96,6 +96,10 @@
+     delivered_frame_bytes: sum,
+     /// Successfully submitted outer IPv6 bytes, including IPv6 and UDP headers.
+     tx_outer_bytes: sum,
++    /// ACK records successfully submitted; worker and session totals.
++    tx_ack_records: sum,
++    /// Sum of ranges in successfully submitted ACK records; worker and session totals.
++    tx_ack_ranges: sum,
+     /// Received outer IPv6 bytes, including IPv6 and UDP headers.
+     rx_outer_bytes: sum,
+     /// Repair DATA records successfully submitted.
+--- a/src/reassembly.rs
++++ b/src/reassembly.rs
+@@ -107,17 +107,25 @@
+         self.bits[(number as usize / 64) % WORDS] |= 1 << (number % 64);
+     }
+ 
+-    fn ranges(&self, highest: u64, output: &mut [AckRange; MAX_ACK_RANGES]) -> usize {
++    fn ranges(
++        &self,
++        highest: u64,
++        output: &mut [AckRange; MAX_ACK_RANGES],
++        counts: Option<&[Window; 2]>,
++        lower: u64,
++    ) -> usize {
+         let mut cursor = highest;
+         let mut count = 0;
+         while count < output.len() {
+-            let Some(end) = self.last_bit(cursor, true) else {
++            let Some(end) = self.last_bit(cursor, true, highest, counts, lower) else {
+                 break;
+             };
+-            let start = self.last_bit(end, false).map_or(self.lower, |gap| gap + 1);
++            let start = self
++                .last_bit(end, false, highest, counts, lower)
++                .map_or(lower, |gap| gap + 1);
+             output[count] = AckRange { start, end };
+             count += 1;
+-            if start == self.lower {
++            if start == lower {
+                 break;
+             }
+             cursor = start - 1;
+@@ -125,21 +133,36 @@
+         count
+     }
+ 
+-    fn last_bit(&self, mut number: u64, set: bool) -> Option<u64> {
+-        while number >= self.lower {
++    fn last_bit(
++        &self,
++        mut number: u64,
++        set: bool,
++        highest: u64,
++        counts: Option<&[Window; 2]>,
++        lower: u64,
++    ) -> Option<u64> {
++        while number >= lower {
+             let base = number & !63;
+-            let mut bits = self.bits[(number as usize / 64) % WORDS];
++            let index = (number as usize / 64) % WORDS;
++            let mut bits = self.bits[index];
++            if let Some(counts) = counts {
++                bits &= !(counts[0].bits[index] & counts[1].bits[index]);
++                // Keep the highest packet as the duplicate-feedback and delay anchor.
++                if base == (highest & !63) {
++                    bits |= 1 << (highest % 64);
++                }
++            }
+             if !set {
+                 bits = !bits;
+             }
+             bits &= u64::MAX >> (63 - number % 64);
+-            if base <= self.lower {
+-                bits &= u64::MAX << (self.lower % 64);
++            if base <= lower {
++                bits &= u64::MAX << (lower % 64);
+             }
+             if bits != 0 {
+                 return Some(base + 63 - u64::from(bits.leading_zeros()));
+             }
+-            if base <= self.lower {
++            if base <= lower {
+                 break;
+             }
+             number = base - 1;
+@@ -235,6 +258,8 @@
+     retired: bool,
+     packets: Window,
+     ack: Schedule,
++    ack_counts: [Window; 2],
++    ack_lower: u64,
+     terminal: Window,
+     frames: Box<[Frame]>,
+     index: [u8; INDEX_LEN],
+@@ -257,6 +282,8 @@
+             retired: false,
+             packets: Window::new(),
+             ack: Schedule::new(),
++            ack_counts: [Window::new(), Window::new()],
++            ack_lower: 1,
+             terminal: Window::new(),
+             frames: (0..FRAME_CAPACITY).map(|_| Frame::empty()).collect(),
+             index: [EMPTY; INDEX_LEN],
+@@ -327,7 +354,8 @@
+         self.ack.deadline
+     }
+ 
+-    /// Constructs due feedback using at most the newest 32 receive-window ranges.
++    /// Constructs at most 32 ranges from packets reported fewer than three times.
++    /// The highest accepted packet remains an anchor for duplicate feedback.
+     ///
+     /// Reserve feedback-queue space before calling: this consumes the pending
+     /// schedule. The caller supplies a fresh local transmit packet number and
+@@ -338,7 +366,12 @@
+         output: &'a mut [AckRange; MAX_ACK_RANGES],
+     ) -> Option<Record<'a>> {
+         let delay_us = self.ack.take(now)?;
+-        let count = self.packets.ranges(self.ack.highest, output);
++        let count = self.packets.ranges(
++            self.ack.highest,
++            output,
++            Some(&self.ack_counts),
++            self.ack_lower,
++        );
+         Some(Record::Ack {
+             lane: self.id,
+             delay_us,
+@@ -346,9 +379,45 @@
+         })
+     }
+ 
+-    /// Records successful ACK submission after queueing, preserving duplicate spacing.
+-    pub fn ack_transmitted(&mut self, sent_at: Duration) {
++    /// Records the actual successfully submitted ranges, preserving duplicate spacing.
++    ///
++    /// Call exactly once per successful transmission; failed or cancelled sends do
++    /// not count. Delayed reports cannot affect recycled receive-window positions.
++    pub fn ack_transmitted(&mut self, sent_at: Duration, ranges: AckRanges<'_>) {
+         self.ack.transmitted(sent_at);
++        for range in ranges.iter() {
++            let mut start = range.start.max(self.packets.lower);
++            let end = range.end.min(self.ack.highest);
++            while start <= end {
++                let offset = start % 64;
++                let count = (end - start).min(63 - offset) + 1;
++                let mask = (u64::MAX >> (64 - count)) << offset;
++                let index = (start as usize / 64) % WORDS;
++                let [low, high] = &mut self.ack_counts;
++                let active =
++                    mask & self.packets.bits[index] & !(low.bits[index] & high.bits[index]);
++                high.bits[index] |= low.bits[index] & active;
++                low.bits[index] ^= active;
++                if end - start < count {
++                    break;
++                }
++                start += count;
++            }
++        }
++        // Pruned history is scanned once, then only a fresh late arrival can reopen it.
++        while self.ack_lower < self.ack.highest {
++            let index = (self.ack_lower as usize / 64) % WORDS;
++            let bits = self.packets.bits[index]
++                & !(self.ack_counts[0].bits[index] & self.ack_counts[1].bits[index])
++                & (u64::MAX << (self.ack_lower % 64));
++            if bits != 0 {
++                self.ack_lower = (self.ack_lower & !63) + u64::from(bits.trailing_zeros());
++                break;
++            }
++            self.ack_lower = (self.ack_lower & !63)
++                .saturating_add(64)
++                .min(self.ack.highest);
++        }
+     }
+ 
+     /// Recycles storage for a new connection or a never-used remote lane ID.
+@@ -365,6 +434,10 @@
+         self.duplicate_pieces = 0;
+         self.packets.reset();
+         self.ack = Schedule::new();
++        self.ack_lower = 1;
++        for counts in &mut self.ack_counts {
++            counts.reset();
++        }
+         self.terminal.reset();
+         self.clear_frames();
+         Ok(())
+@@ -509,6 +582,13 @@
+             return Admission::Pressure;
+         }
+         self.packets.mark(header.packet_number);
++        self.ack_lower = self
++            .ack_lower
++            .max(self.packets.lower)
++            .min(header.packet_number);
++        for counts in &mut self.ack_counts {
++            counts.advance(header.packet_number);
++        }
+         self.ack.accepted(header.packet_number, eliciting, now);
+         Admission::Fresh
+     }
+@@ -704,6 +784,64 @@
+     use super::*;
+ 
+     #[test]
++    fn ack_search_floor_skips_pruned_history_and_reopens_only_for_fresh_packets() {
++        fn probe(lane: &mut Lane, number: u64) -> Admission {
++            let mut bytes = [0; 64];
++            let length = crate::wire::encode_datagram(
++                crate::wire::Header {
++                    cookie: crate::UnquicUuid::from_bytes([1; 16]),
++                    receive_tag: 1,
++                    lane: 1,
++                    packet_number: number,
++                    record_area_len: 0,
++                },
++                &[Record::Probe],
++                &mut bytes,
++            )
++            .unwrap();
++            lane.admit(&Datagram::decode(&bytes[..length]).unwrap(), Duration::ZERO)
++        }
++        let mut lane = Lane::new(1, 1514).unwrap();
++        let highest = WINDOW_LEN as u64 - 1;
++        assert_eq!(probe(&mut lane, 1), Admission::Fresh);
++        assert_eq!(probe(&mut lane, highest), Admission::Fresh);
++        let ranges = [
++            AckRange {
++                start: highest,
++                end: highest,
++            },
++            AckRange { start: 1, end: 1 },
++        ];
++        for _ in 0..3 {
++            lane.ack_transmitted(Duration::ZERO, AckRanges::new(&ranges).unwrap());
++        }
++        assert_eq!(lane.ack_lower, highest);
++        assert_eq!(lane.packets.lower, 1);
++        assert_eq!(probe(&mut lane, 1), Admission::Duplicate);
++        assert_eq!(lane.ack_lower, highest);
++        assert_eq!(probe(&mut lane, 2), Admission::Fresh);
++        assert_eq!(lane.ack_lower, 2);
++        let ranges = [
++            AckRange {
++                start: highest,
++                end: highest,
++            },
++            AckRange { start: 2, end: 2 },
++        ];
++        for _ in 0..3 {
++            lane.ack_transmitted(Duration::ZERO, AckRanges::new(&ranges).unwrap());
++        }
++        assert_eq!(lane.ack_lower, highest);
++        assert_eq!(
++            probe(&mut lane, highest + WINDOW_LEN as u64),
++            Admission::Fresh
++        );
++        assert_eq!(lane.ack_lower, lane.packets.lower);
++        lane.reset(1, 1514).unwrap();
++        assert_eq!(lane.ack_lower, 1);
++    }
++
++    #[test]
+     fn batch_completion_releases_only_selected_slots_and_preserves_other_frames() {
+         let mut lane = Lane::new(1, 9022).unwrap();
+         let mut bytes = [0; 256];
+@@ -865,7 +1003,7 @@
+             seen = seen.split_off(&lower);
+             assert_eq!(window.lower, lower);
+             let mut actual = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
+-            let count = window.ranges(highest, &mut actual);
++            let count = window.ranges(highest, &mut actual, None, window.lower);
+             let mut expected: Vec<AckRange> = Vec::new();
+             for &number in seen.iter().rev() {
+                 if let Some(last) = expected.last_mut()
+@@ -902,11 +1040,14 @@
+     fn ack_ranges_cross_words_and_wrap_without_including_old_aliases() {
+         let mut window = Window::new();
+         let mut output = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
+-        assert_eq!(window.ranges(0, &mut output), 0);
++        assert_eq!(window.ranges(0, &mut output, None, window.lower), 0);
+         for number in 1..=WINDOW_LEN as u64 + 1 {
+             window.mark(number);
+         }
+-        assert_eq!(window.ranges(WINDOW_LEN as u64 + 1, &mut output), 1);
++        assert_eq!(
++            window.ranges(WINDOW_LEN as u64 + 1, &mut output, None, window.lower),
++            1
++        );
+         assert_eq!(
+             output[0],
+             AckRange {
+@@ -915,7 +1056,7 @@
+             }
+         );
+         window.mark(u64::MAX);
+-        assert_eq!(window.ranges(u64::MAX, &mut output), 1);
++        assert_eq!(window.ranges(u64::MAX, &mut output, None, window.lower), 1);
+         assert_eq!(
+             output[0],
+             AckRange {
+@@ -926,7 +1067,7 @@
+         for n in 1..=130 {
+             window.mark(u64::MAX - n);
+         }
+-        assert_eq!(window.ranges(u64::MAX, &mut output), 1);
++        assert_eq!(window.ranges(u64::MAX, &mut output, None, window.lower), 1);
+         assert_eq!(
+             output[0],
+             AckRange {
+--- a/src/worker/feedback.rs
++++ b/src/worker/feedback.rs
+@@ -14,7 +14,7 @@
+     count: usize,
+     delay_us: u32,
+     created: Duration,
+-    sent: Option<Duration>,
++    sent: Option<(Duration, usize)>,
+     due: Duration,
+     ranges: [AckRange; MAX_ACK_RANGES],
+ }
+@@ -96,8 +96,10 @@
+                     && lane.id() == feedback.lane
+                 {
+                     local.ack_inflight &= !(1 << feedback.slot);
+-                    if let Some(sent) = feedback.sent {
+-                        lane.ack_transmitted(sent);
++                    if let Some((sent, count)) = feedback.sent {
++                        let ranges =
++                            AckRanges::new(&feedback.ranges[..count]).map_err(io::Error::other)?;
++                        lane.ack_transmitted(sent, ranges);
+                     }
+                 }
+             }
+@@ -281,7 +283,15 @@
+                             },
+                             now,
+                         )? {
+-                            feedback.sent = Some(started);
++                            feedback.sent = Some((started, feedback.count));
++                            for totals in [
++                                &mut self.counters,
++                                &mut self.sessions[feedback.session].totals,
++                            ] {
++                                totals.tx_ack_records = totals.tx_ack_records.wrapping_add(1);
++                                totals.tx_ack_ranges =
++                                    totals.tx_ack_ranges.wrapping_add(feedback.count as u64);
++                            }
+                         } else {
+                             self.counters.ack_send_deferred =
+                                 self.counters.ack_send_deferred.wrapping_add(1);
+@@ -327,6 +337,89 @@
+     }
+ 
+     #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn ack_returns_count_only_successful_snapshot_ranges() {
++        let (mut worker, _tap) = receive_worker();
++        let mut bytes = [0; BASE_UDP_PAYLOAD];
++        for number in [1, 3] {
++            let length = receive_bytes(number, &[Record::Probe], &mut bytes);
++            assert_eq!(
++                worker.sessions[0].rx[0]
++                    .as_mut()
++                    .unwrap()
++                    .admit(&Datagram::decode(&bytes[..length]).unwrap(), Duration::ZERO,),
++                Admission::Fresh,
++            );
++        }
++        let mut rx = None;
++        for attempt in 0..6 {
++            let now = Duration::from_millis(10 * (attempt + 1));
++            if attempt == 1 {
++                rx = Some(socket(&mut worker));
++            }
++            let length = receive_bytes(3, &[Record::Probe], &mut bytes);
++            assert_eq!(
++                worker.sessions[0].rx[0]
++                    .as_mut()
++                    .unwrap()
++                    .admit(&Datagram::decode(&bytes[..length]).unwrap(), now - RETRY,),
++                Admission::Duplicate,
++            );
++            for _ in 0..(worker.sessions.len() * LANES).div_ceil(BATCH_SIZE) {
++                worker.collect_acks(now).unwrap();
++            }
++            assert_eq!(worker.sessions[0].ack_inflight, 1);
++            if attempt == 1 {
++                let length = receive_bytes(2, &[Record::Probe], &mut bytes);
++                assert_eq!(
++                    worker.sessions[0].rx[0]
++                        .as_mut()
++                        .unwrap()
++                        .admit(&Datagram::decode(&bytes[..length]).unwrap(), now,),
++                    Admission::Fresh,
++                );
++            }
++            worker.flush_control(now).unwrap();
++            assert_eq!(
++                worker.feedback_free.len(),
++                BUFFERS - usize::from(attempt == 0)
++            );
++            assert_eq!(worker.sessions[0].ack_inflight, u64::from(attempt == 0));
++            if attempt == 0 {
++                let Some(Pending::Ack(feedback)) = worker.pending_control.front() else {
++                    panic!("missing retained ACK");
++                };
++                assert!(feedback.sent.is_none());
++                assert_eq!(feedback.count, 2);
++                assert_eq!(
++                    &feedback.ranges[..2],
++                    &[AckRange { start: 3, end: 3 }, AckRange { start: 1, end: 1 }]
++                );
++            }
++            for totals in [&worker.counters, &worker.sessions[0].totals] {
++                assert_eq!(totals.ack_send_deferred, 1);
++                assert_eq!(totals.tx_ack_records, attempt);
++                assert_eq!(totals.tx_ack_ranges, attempt + u64::from(attempt != 0));
++            }
++            let Some(rx) = &rx else {
++                continue; // The failed snapshot remains queued for the next attempt.
++            };
++            let length = rx.recv(&mut bytes).unwrap().0;
++            let packet = Datagram::decode(&bytes[..length]).unwrap();
++            let Some(Record::Ack { ranges, .. }) = packet.records().next() else {
++                panic!("missing ACK");
++            };
++            let expected = match attempt {
++                1 => vec![AckRange { start: 3, end: 3 }, AckRange { start: 1, end: 1 }],
++                2 | 3 => vec![AckRange { start: 1, end: 3 }],
++                4 => vec![AckRange { start: 2, end: 3 }],
++                _ => vec![AckRange { start: 3, end: 3 }],
++            };
++            assert_eq!(ranges.iter().collect::<Vec<_>>(), expected);
++        }
++    }
++
++    #[test]
+     #[ignore = "kernel descriptor test; run in a disposable container"]
+     fn failed_ack_submission_keeps_snapshot_and_yields_until_retry() {
+         for stale in [false, true] {
+--- a/tests/pack.rs
++++ b/tests/pack.rs
+@@ -1107,7 +1107,7 @@
+         panic!("expected ACK");
+     };
+     history.begin_ack(ranges).unwrap();
+-    receiver.ack_transmitted(now);
++    receiver.ack_transmitted(now, ranges);
+     for _ in 0..256 {
+         if let Some(progress) = history.advance_ack(1, |acked| {
+             while let Some(piece) = journal.pop_packet(acked.packet.number as usize) {
+--- a/tests/reassembly.rs
++++ b/tests/reassembly.rs
+@@ -740,3 +740,237 @@
+     assert_eq!(lane.expired_frames(), 0);
+     assert_eq!(lane.expired_incomplete_frames(), 0);
+ }
++
++fn repeated_ack(
++    lane: &mut Lane,
++    highest: u64,
++    millis: u64,
++    transmitted: bool,
++) -> Vec<unquic::wire::AckRange> {
++    use unquic::wire::{AckRange, MAX_ACK_RANGES};
++    let now = Duration::from_millis(millis);
++    assert_eq!(
++        admit(lane, highest, &[Record::Probe], now),
++        Admission::Duplicate
++    );
++    let mut output = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
++    let Some(Record::Ack { ranges, .. }) =
++        lane.take_ack(now + Duration::from_millis(1), &mut output)
++    else {
++        panic!("missing repeated ACK");
++    };
++    if transmitted {
++        lane.ack_transmitted(now + Duration::from_millis(1), ranges);
++    }
++    ranges.iter().collect()
++}
++
++#[test]
++fn ack_pruning_counts_only_successful_snapshots_and_preserves_late_arrivals() {
++    use unquic::wire::{AckRange, MAX_ACK_RANGES};
++    let mut lane = Lane::new(1, 1514).unwrap();
++    for number in [1, 3] {
++        assert_eq!(
++            admit(&mut lane, number, &[Record::Probe], Duration::ZERO),
++            Admission::Fresh
++        );
++    }
++    let mut output = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
++    let Some(Record::Ack { ranges, .. }) = lane.take_ack(Duration::ZERO, &mut output) else {
++        panic!("missing initial ACK");
++    };
++    assert_eq!(
++        admit(&mut lane, 2, &[Record::Probe], Duration::from_micros(1)),
++        Admission::Fresh
++    );
++    lane.ack_transmitted(Duration::from_micros(2), ranges);
++    let all = [AckRange { start: 1, end: 3 }];
++    // A cancelled/failed submission contributes no repetition.
++    assert_eq!(repeated_ack(&mut lane, 3, 10, false), all);
++    assert_eq!(repeated_ack(&mut lane, 3, 20, true), all);
++    assert_eq!(repeated_ack(&mut lane, 3, 30, true), all);
++    // Packet 2 was absent from the delayed first snapshot and needs one more ACK.
++    assert_eq!(
++        repeated_ack(&mut lane, 3, 40, true),
++        [AckRange { start: 2, end: 3 }]
++    );
++    assert_eq!(
++        repeated_ack(&mut lane, 3, 50, true),
++        [AckRange { start: 3, end: 3 }]
++    );
++    assert_eq!(lane.lower_bounds().0, 1);
++    assert_eq!(
++        admit(&mut lane, 1, &[Record::Probe], Duration::from_millis(60)),
++        Admission::Duplicate
++    );
++
++    assert_eq!(
++        admit(&mut lane, 5, &[Record::Probe], Duration::from_millis(60)),
++        Admission::Fresh
++    );
++    for millis in [70, 80, 90] {
++        repeated_ack(&mut lane, 5, millis, true);
++    }
++    // A late fresh packet remains ACK-eligible below pruned packet numbers.
++    assert_eq!(
++        admit(&mut lane, 4, &[Record::Probe], Duration::from_millis(100)),
++        Admission::Fresh
++    );
++    for millis in [110, 120, 130] {
++        assert_eq!(
++            repeated_ack(&mut lane, 5, millis, true),
++            [AckRange { start: 4, end: 5 }]
++        );
++    }
++    assert_eq!(
++        repeated_ack(&mut lane, 5, 140, true),
++        [AckRange { start: 5, end: 5 }]
++    );
++}
++
++#[test]
++fn ack_pruning_retains_unreported_old_ranges_and_resets_with_the_lane() {
++    use unquic::wire::AckRange;
++    let mut lane = Lane::new(1, 1514).unwrap();
++    for number in (1..=67).step_by(2) {
++        admit(&mut lane, number, &[Record::Probe], Duration::ZERO);
++    }
++    for millis in [10, 20, 30] {
++        let ranges = repeated_ack(&mut lane, 67, millis, true);
++        assert_eq!(ranges.len(), 32);
++        assert_eq!(ranges.last(), Some(&AckRange { start: 5, end: 5 }));
++    }
++    assert_eq!(
++        repeated_ack(&mut lane, 67, 40, true),
++        [
++            AckRange { start: 67, end: 67 },
++            AckRange { start: 3, end: 3 },
++            AckRange { start: 1, end: 1 },
++        ]
++    );
++    lane.reset(1, 1514).unwrap();
++    for number in [1, 3] {
++        admit(&mut lane, number, &[Record::Probe], Duration::ZERO);
++    }
++    assert_eq!(
++        repeated_ack(&mut lane, 3, 10, true),
++        [AckRange { start: 3, end: 3 }, AckRange { start: 1, end: 1 },]
++    );
++}
++
++#[test]
++fn delayed_ack_reports_do_not_charge_recycled_window_bits() {
++    use unquic::wire::{AckRange, MAX_ACK_RANGES};
++    let mut lane = Lane::new(1, 1514).unwrap();
++    for number in 1..=130 {
++        admit(&mut lane, number, &[Record::Probe], Duration::ZERO);
++    }
++    let mut output = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
++    let Some(Record::Ack { ranges, .. }) = lane.take_ack(Duration::ZERO, &mut output) else {
++        panic!("missing initial ACK");
++    };
++    let high = WINDOW_LEN as u64 + 130;
++    for number in high - 129..=high {
++        admit(
++            &mut lane,
++            number,
++            &[Record::Probe],
++            Duration::from_millis(1),
++        );
++    }
++    lane.ack_transmitted(Duration::from_millis(2), ranges);
++    for millis in [10, 20, 30] {
++        assert_eq!(
++            repeated_ack(&mut lane, high, millis, true),
++            [AckRange {
++                start: high - 129,
++                end: high
++            },]
++        );
++    }
++    assert_eq!(
++        repeated_ack(&mut lane, high, 40, true),
++        [AckRange {
++            start: high,
++            end: high
++        }]
++    );
++    for number in u64::MAX - 129..=u64::MAX {
++        admit(
++            &mut lane,
++            number,
++            &[Record::Probe],
++            Duration::from_millis(50),
++        );
++    }
++    for millis in [60, 70, 80] {
++        assert_eq!(
++            repeated_ack(&mut lane, u64::MAX, millis, true),
++            [AckRange {
++                start: u64::MAX - 129,
++                end: u64::MAX
++            },]
++        );
++    }
++    assert_eq!(
++        repeated_ack(&mut lane, u64::MAX, 90, true),
++        [AckRange {
++            start: u64::MAX,
++            end: u64::MAX
++        },]
++    );
++}
++
++#[test]
++fn delayed_ack_report_counts_only_the_surviving_part_of_its_snapshot() {
++    use unquic::wire::{AckRange, MAX_ACK_RANGES};
++    let mut lane = Lane::new(1, 1514).unwrap();
++    for number in 1..=130 {
++        admit(&mut lane, number, &[Record::Probe], Duration::ZERO);
++    }
++    let mut output = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
++    let Some(Record::Ack { ranges, .. }) = lane.take_ack(Duration::ZERO, &mut output) else {
++        panic!("missing initial ACK");
++    };
++    let alias = WINDOW_LEN as u64 + 1;
++    let highest = WINDOW_LEN as u64 + 64;
++    for number in [alias, highest] {
++        assert_eq!(
++            admit(
++                &mut lane,
++                number,
++                &[Record::Probe],
++                Duration::from_millis(1),
++            ),
++            Admission::Fresh,
++        );
++    }
++    assert_eq!(lane.lower_bounds().0, 65);
++    lane.ack_transmitted(Duration::from_millis(2), ranges);
++    let newer = [
++        AckRange {
++            start: highest,
++            end: highest,
++        },
++        AckRange {
++            start: alias,
++            end: alias,
++        },
++    ];
++    for millis in [10, 20] {
++        assert_eq!(
++            repeated_ack(&mut lane, highest, millis, true),
++            [
++                newer[0],
++                newer[1],
++                AckRange {
++                    start: 65,
++                    end: 130
++                }
++            ],
++        );
++    }
++    // Surviving old packets have three reports; recycled aliases have only two.
++    assert_eq!(repeated_ack(&mut lane, highest, 30, true), newer);
++    assert_eq!(repeated_ack(&mut lane, highest, 40, true), [newer[0]],);
++}
