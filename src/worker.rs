@@ -4064,7 +4064,10 @@ impl Worker {
     }
 
     fn deadline(&self, now: Duration) -> Option<Duration> {
-        let mut due = self.setup_due.min(self.mtu_due);
+        let mut due = self.setup_due;
+        if !self.mtu_jobs.is_empty() {
+            due = due.min(self.mtu_due);
+        }
         if let Some(at) = self.sender.owner.as_ref().and_then(|owner| owner.due) {
             due = due.min(at);
         }
@@ -6998,6 +7001,10 @@ mod tests {
     }
 
     pub(super) fn test_workers() -> (Arc<Shared>, [Worker; 2]) {
+        test_workers_with_lanes(2)
+    }
+
+    fn test_workers_with_lanes(tx_lanes: usize) -> (Arc<Shared>, [Worker; 2]) {
         use crate::config::{Config, Daemon, Endpoint, Peer, Session as ConfigSession};
         use std::{
             net::Ipv6Addr,
@@ -7018,7 +7025,7 @@ mod tests {
                 address: Some(Ipv6Addr::LOCALHOST),
                 peer_port: 40001,
                 scope_id: 0,
-                tx_lanes: 2,
+                tx_lanes,
                 outer_payload_limit: BASE_UDP_PAYLOAD,
                 path_group: None,
             }],
@@ -7053,7 +7060,7 @@ mod tests {
                 .collect(),
             transmit_counters: (0..2)
                 .map(|_| {
-                    (0..2)
+                    (0..tx_lanes)
                         .map(|_| crate::counters::LaneCounters::new())
                         .collect()
                 })
@@ -7071,6 +7078,52 @@ mod tests {
         });
 
         (shared, workers)
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn receive_only_worker_ignores_empty_mtu_schedule_after_install() {
+        let (_, mut workers) = test_workers_with_lanes(1);
+        let worker = &mut workers[1];
+        assert!(worker.mtu_jobs.is_empty());
+        assert!(worker.sender.lanes.is_empty());
+        let now = monotonic_now().unwrap();
+        let setup = now + Duration::from_secs(1);
+        worker.setup_due = setup;
+        for generation in 0..3 {
+            if generation != 0 {
+                worker
+                    .command(
+                        0,
+                        Command {
+                            generation,
+                            phase: Phase::Install,
+                            connection: None,
+                        },
+                        0,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(worker.mtu_due, Duration::ZERO);
+            assert!(!worker.mtu_timers(now).unwrap());
+            assert_eq!(worker.deadline(now), Some(setup));
+            worker.reactor.arm(worker.deadline(now)).unwrap();
+            let mut events = [libc::epoll_event { events: 0, u64: 0 }; 2];
+            assert_eq!(worker.reactor.wait(&mut events, 1).unwrap(), 0);
+        }
+        let feedback = now + Duration::from_millis(500);
+        worker.queue_reply(0, 1, 1, 1, 52, feedback);
+        assert_eq!(worker.deadline(now), Some(feedback));
+        worker.pending_control.clear();
+        worker.setup_due = now;
+        assert_eq!(worker.deadline(now), Some(now));
+
+        let owner = &mut workers[0];
+        assert!(!owner.mtu_jobs.is_empty());
+        owner.setup_due = setup;
+        assert_eq!(owner.deadline(now), Some(now));
+        owner.mtu_due = feedback;
+        assert_eq!(owner.deadline(now), Some(feedback));
     }
 
     #[test]

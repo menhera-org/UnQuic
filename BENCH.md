@@ -83,6 +83,29 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Receive-only worker timer spin (November 8)
+
+A one-wire-lane diagnostic retained eight TAP queues and eight workers per
+daemon. At only 1 Gbit/s offered each way, the daemons consumed 715 / 729% CPU.
+Several workers recorded no outer traffic and at most six TAP reads over
+twenty seconds, yet consumed 88–99% of a core each. Unlimited goodput fell to
+0.661 / 0.565 Gbit/s. This exposed an idle-loop bug before it could establish
+whether colocating transmission with congestion ownership improves throughput.
+
+Workers without transmit lanes have an empty, immutable MTU job list.
+The MTU timer pass skips that list, leaving its initial zero deadline intact.
+The event-loop deadline calculation still included that timestamp and clamped
+it to the current observation time, repeatedly arming an already-due timer.
+
+The deadline calculation now excludes an empty MTU schedule. No probe rate,
+packet budget, queue size or congestion rule changes. A real one-lane/two-worker
+regression fails before the fix and passes afterward, covering startup,
+reinstallation, idle epoll and preserved setup, feedback and active-MTU
+deadlines. Validation passes 349 all-feature and 340 default ordinary release
+tests, Clippy, formatting and all 74 library kernel tests on Linux 6.8.
+Matched throughput validation follows; this fix does not close the overload,
+migration or throughput gates.
+
 ## Stalled PTO target fairness (November 8)
 
 A deterministic regression reproduces target starvation: once a group stalls,
@@ -187,7 +210,7 @@ Baseline unlimited goodput varies substantially, and the candidate does not
 beat both baselines in both directions. Its reverse delivery falls 13.7% from
 the 21 Gbit/s point to unlimited. Reassembly admission pressure is zero
 throughout this bracket, so pressure cannot account for this decline.
-Outer receive overflows range from 8 to 406 datagrams per point; inner UDP
+Kernel-reported outer receive overflows range from 8 to 406 per point; inner UDP
 errors, duplicates, invalid frames and outer fragments remain zero. Reordering
 reaches 0.0549%, with bounded recovery active.
 
