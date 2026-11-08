@@ -265,6 +265,96 @@ fn uso_delivery_allocates_nothing(
     assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
 }
 
+fn tso_delivery_allocates_nothing(net: &UdpSocket) {
+    let source = raw_socket(c"uq-left", libc::ETH_P_IP as u16);
+    let receiver = raw_socket(c"uq-right", libc::ETH_P_IP as u16);
+    for fd in [&source, &receiver] {
+        let vnet = 1i32;
+        // SAFETY: PACKET_VNET_HDR reads one initialized integer.
+        check(unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_PACKET,
+                libc::PACKET_VNET_HDR,
+                (&vnet as *const i32).cast(),
+                size_of_val(&vnet) as _,
+            )
+        });
+    }
+    let destination_mac = mac_address(net, c"uq-right");
+    let source_mac = mac_address(net, c"uq-left");
+    let frames: Vec<_> = (0..512u16)
+        .map(|id| {
+            let mut payload = [0x5a; 1460];
+            payload[..2].copy_from_slice(&id.to_be_bytes());
+            let mut frame =
+                common::tcp::frame(false, id, u32::from(id) * 1460, 0x10, &[], &payload);
+            frame[..6].copy_from_slice(destination_mac.as_bytes());
+            frame[6..12].copy_from_slice(source_mac.as_bytes());
+            frame
+        })
+        .collect();
+    let batches: Vec<_> = frames
+        .chunks(32)
+        .enumerate()
+        .map(|(batch, frames)| {
+            let payload: Vec<_> = frames
+                .iter()
+                .flat_map(|f| f[54..].iter().copied())
+                .collect();
+            let id = (batch * 32) as u16;
+            let mut frame =
+                common::tcp::frame(false, id, u32::from(id) * 1460, 0x10, &[], &payload);
+            frame[..12].copy_from_slice(&frames[0][..12]);
+            let header = common::tcp::partial(&mut frame, false, 1460);
+            [header.as_slice(), frame.as_slice()].concat()
+        })
+        .collect();
+    let mut input = [0u8; 65536];
+    let mut seen = [false; 512];
+    let mut coalesced = false;
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    DEALLOCATIONS.store(0, Ordering::Relaxed);
+    COUNTING.store(true, Ordering::SeqCst);
+    for batch in &batches {
+        // SAFETY: send reads the complete virtio header and frame on the bound socket.
+        assert_eq!(
+            unsafe { libc::send(source.as_raw_fd(), batch.as_ptr().cast(), batch.len(), 0) },
+            batch.len() as isize
+        );
+        let mut received = 0;
+        until(Duration::from_secs(2), || {
+            let Some(n) = raw_read(&receiver, &mut input) else {
+                return false;
+            };
+            if n < 64 || input[16..22] != source_mac.as_bytes()[..] {
+                return false;
+            }
+            assert_eq!((n - 64) % 1460, 0);
+            if n > 64 + 1460 {
+                coalesced = true;
+                assert_eq!(input[1], 1);
+                assert_eq!(u16::from_ne_bytes([input[4], input[5]]), 1460);
+            }
+            let sequence = u32::from_be_bytes(input[48..52].try_into().unwrap());
+            for (index, payload) in input[64..n].chunks(1460).enumerate() {
+                let id = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+                assert!(id < seen.len() && !seen[id]);
+                assert_eq!(sequence + index as u32 * 1460, id as u32 * 1460);
+                assert_eq!(payload, &frames[id][54..]);
+                seen[id] = true;
+                received += 1;
+            }
+            received == 32
+        });
+    }
+    COUNTING.store(false, Ordering::SeqCst);
+    assert!(seen.iter().all(|&v| v));
+    assert!(coalesced, "the allocation check must exercise TSO delivery");
+    assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
+}
+
 fn frame_storm() {
     let sockets = [
         raw_socket(c"uq-left", 0x88b5),
@@ -427,6 +517,7 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
         })
     });
     uso_delivery_allocates_nothing(&net, &left.control, &right.control);
+    tso_delivery_allocates_nothing(&net);
     until(Duration::from_secs(2), || {
         (0..2)
             .map(|worker| left.control.worker_counters(worker).unwrap().tap_gso_frames)

@@ -645,8 +645,7 @@ UDP/TCP expansion accepts IPv4 options, VLAN tags, and IPv6 hop-by-hop, routing
 and destination headers. It validates protocol, lengths and checksum offsets,
 adjusts the supplied pseudo-header checksum seed, and advances IPv4 IDs.
 TCP expansion preserves options, advances sequence numbers modulo 2³², places
-FIN/PSH only on the final segment and CWR only on the first. TCP output
-coalescing remains unfinished; complete TCP frames use ordinary TAP writes.
+FIN/PSH only on the final segment and CWR only on the first.
 Unknown flags, unsupported GSO types, and fragmented GSO inputs are rejected.
 Pending input retains its original connection tag. The transmit owner shortens
 the initial 100 ms read-time deadline to its current 20–100 ms RTT-based lifetime
@@ -664,12 +663,22 @@ Wire DATA remains ordinary Ethernet frames on the input's selected lane,
 with unchanged packet-admission rules.
 
 A receive flush may combine already-complete UDP frames into one USO
-`writev`, borrowing their payloads directly from reassembly slots. Supported
+`writev` or consecutive TCP data frames into one TSO `writev`, borrowing their
+payloads directly from reassembly slots. Supported UDP
 frames contain IPv4 without options, with DF set, or IPv6 without extension
 headers, optionally behind one or two 802.1Q/802.1ad tags. The complete VLAN
 stack, including VID and PCP/DEI, must match and is preserved. IP/UDP lengths and checksums must be valid; UDP checksums
 must be present. Headers must match apart from lengths, checksums and consecutive
-IPv4 IDs. The final payload may be shorter. Other frames use ordinary writes.
+IPv4 IDs. The final payload may be shorter.
+
+TCP requires consecutive sequence numbers, identical ACK numbers, windows,
+options and other header fields. ACK data segments may carry ECE. PSH closes a
+group; SYN, FIN, RST, URG, CWR, reserved flags and empty payloads use ordinary
+writes. TCP supports IPv4 options and IPv6 hop-by-hop, destination and type-4
+routing headers within a 128-byte total header bound. Active routing headers
+use the final destination for checksum validation. Fragments, encapsulated IP,
+unsupported headers and noncanonical zero checksums use ordinary writes.
+These fallbacks preserve the original frame bytes.
 
 Within a receive lane, grouping preserves order within the existing flow-hash definition and may
 pass frames from other flows. An incompatible frame in the same flow stops
@@ -679,10 +688,12 @@ heap allocation or lock is required.
 
 WouldBlock and Interrupted retain every selected frame. A successful write
 releases exactly those frames; a permanent failure makes them terminal.
-EINVAL or EOPNOTSUPP disables USO on that TAP queue and retries a single frame.
-Counters report TAP write calls, successful USO batches and frames, and offload
-fallbacks as `tap_write_calls`, `tap_uso_batches`, `tap_uso_frames` and
-`tap_uso_fallbacks`. Delivered bytes count the original Ethernet frames.
+EINVAL or EOPNOTSUPP disables the rejected offload on that TAP queue and retries
+a single frame; UDP and TCP fallback states are independent.
+`tap_write_calls` counts syscalls. Successful groups and their original frames
+use `tap_uso_batches` / `tap_uso_frames` for UDP and `tap_tso_batches` /
+`tap_tso_frames` for TCP. Capability rejections use `tap_uso_fallbacks` and
+`tap_tso_fallbacks`. Delivered bytes count the original Ethernet frames.
 
 ## Socket offloads
 

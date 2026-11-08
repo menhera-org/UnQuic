@@ -42,3 +42,38 @@ pub fn partial(bytes: &mut [u8], v6: bool, size: u16) -> [u8; 10] {
     header[8..10].copy_from_slice(&16u16.to_ne_bytes());
     header
 }
+
+/// IPv4 options or an active IPv6 SRH preceded by destination options.
+pub fn extend(bytes: &mut Vec<u8>, v6: bool) -> usize {
+    if v6 {
+        let mut extension = [0; 32];
+        extension[0] = 43;
+        extension[8] = 6;
+        extension[9] = 2;
+        extension[10] = 4;
+        extension[11] = 1;
+        extension[16..].copy_from_slice(&bytes[38..54]);
+        bytes[38..54].fill(9);
+        bytes.splice(54..54, extension);
+        bytes[20] = 60;
+        let length = (bytes.len() - 54) as u16;
+        bytes[18..20].copy_from_slice(&length.to_be_bytes());
+        32
+    } else {
+        bytes.splice(34..34, [1; 8]);
+        bytes[14] = 0x47;
+        let length = (bytes.len() - 14) as u16;
+        bytes[16..18].copy_from_slice(&length.to_be_bytes());
+        bytes[24..26].fill(0);
+        let checksum = !fold(sum(&bytes[14..42]));
+        bytes[24..26].copy_from_slice(&checksum.to_be_bytes());
+        8
+    }
+}
+
+pub fn repair(bytes: &mut [u8], v6: bool) {
+    let at = if v6 { 54 } else { 34 };
+    partial(bytes, v6, 1);
+    let checksum = !fold(sum(&bytes[at..]));
+    bytes[at + 16..at + 18].copy_from_slice(&checksum.to_be_bytes());
+}

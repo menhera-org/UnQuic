@@ -419,6 +419,7 @@ mod tests {
                 frame_limit: crate::MAX_FRAME_LEN,
                 vnet,
                 uso: false,
+                tso: false,
                 completed_checksums: 0,
             },
             b,

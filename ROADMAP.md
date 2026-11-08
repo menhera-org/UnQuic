@@ -392,13 +392,13 @@ Do not defer this performance coverage to the stage 4 composition matrix.
   in place. UDP/TCP super-frame input uses bounded userspace segmentation from
   the existing pool after one whole-input handoff to the selected lane owner;
   TCP options and sequence/flag semantics are preserved. Compatible complete
-  UDP frames can share a lossless USO TAP write, preserving per-flow order,
+  UDP/TCP frames can share a lossless USO/TSO TAP write, preserving per-flow order,
   backpressure and the existing receive deadline. Other frames use single writes.
   Workers use bounded nonblocking io_uring read batches when available,
   draining completions before releasing buffers and falling back to plain reads
   on unsupported kernels. UDP super-frame sweeps improve delivery but still
   miss the 20 Gbit/s gate and show overload declines. TCP output coalescing
-  remains unfinished.
+  preserves sequence, checksum and header semantics with independent fallback.
 - Preallocated buffer pools and descriptor rings in the worker; no allocation
   on the data path after startup. Verify by a test that counts allocations
   with a global allocator wrapper in the test binary.

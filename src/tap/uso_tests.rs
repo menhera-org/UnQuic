@@ -89,6 +89,7 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
         frame_limit: crate::MAX_FRAME_LEN,
         vnet: true,
         uso: true,
+        tso: true,
         completed_checksums: 0,
     };
     let capture = raw_socket(c"uq-v1", libc::ETH_P_ALL as u16);
@@ -131,7 +132,7 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
                         assert_eq!(receive(&capture), *p, "single frame changed");
                     }
                     let frames: Vec<_> = expected.iter().map(Vec::as_slice).collect();
-                    let (mask, result) = tap.write_batch(frames.iter().copied());
+                    let (mask, _, result) = tap.write_batch(frames.iter().copied());
                     let expected_mask = (1_u64 << count) - 1;
                     assert_eq!(mask, expected_mask);
                     assert_eq!(
@@ -206,10 +207,19 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
         &[0x88, 0xa8, 0xd0, 11, 0x81, 0, 0x70, 7][..],
     ] {
         for v6 in [false, true] {
-            for options in [&[][..], &[1, 1, 8, 10, 0, 0, 0, 7, 0, 0, 0, 9][..]] {
-                for flags in [0x19, 0xd9] {
+            for (options, extension) in [
+                (&[][..], false),
+                (&[1, 1, 8, 10, 0, 0, 0, 7, 0, 0, 0, 9][..], false),
+                (&[][..], true),
+                (&[1, 1, 8, 10, 0, 0, 0, 7, 0, 0, 0, 9][..], true),
+            ] {
+                for flags in [0x19, 0xd9, 0x18, 0x58] {
                     for count in [2, 44] {
-                        let size = if v6 { 1400 } else { 1440 };
+                        let size = if v6 {
+                            if extension { 1368 } else { 1400 }
+                        } else {
+                            1440
+                        };
                         let mut payload: Vec<_> =
                             (0..size * count - 1).map(|i| (i * 13) as u8).collect();
                         // Force a zero TCP checksum to distinguish it from UDP's mangled zero.
@@ -227,10 +237,15 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
                         let mut input =
                             common::tcp::frame(v6, 65520, u32::MAX - 10, flags, options, &payload);
                         let mut header = common::tcp::partial(&mut input, v6, size as u16);
+                        let extra = if extension {
+                            common::tcp::extend(&mut input, v6)
+                        } else {
+                            0
+                        };
                         input.splice(12..12, tags.iter().copied());
                         for at in [2, 6] {
                             let offset = u16::from_ne_bytes([header[at], header[at + 1]])
-                                + tags.len() as u16;
+                                + (tags.len() + extra) as u16;
                             header[at..at + 2].copy_from_slice(&offset.to_ne_bytes());
                         }
                         let mut segments =
@@ -251,8 +266,10 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
                             (input.len() + 10) as isize
                         );
                         let mut output = [0; crate::MAX_FRAME_LEN];
+                        let mut expected = Vec::new();
                         for segment in 0..count {
                             let n = segments.write(&input, &mut output);
+                            expected.push(output[..n].to_vec());
                             assert_eq!(
                                 receive(&capture),
                                 &output[..n],
@@ -262,6 +279,34 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
                             );
                         }
                         assert!(segments.done(input.len()));
+                        if flags & 0x81 == 0 {
+                            let (mask, tcp, result) =
+                                tap.write_batch(expected.iter().map(Vec::as_slice));
+                            assert!(tcp);
+                            assert_eq!(mask, (1u64 << count) - 1);
+                            assert_eq!(
+                                result.unwrap(),
+                                expected.iter().map(Vec::len).sum::<usize>()
+                            );
+                            for frame in &expected {
+                                assert_eq!(
+                                    receive(&capture),
+                                    *frame,
+                                    "TCP coalesced output changed"
+                                );
+                            }
+                            let at = u16::from_ne_bytes([header[6], header[7]]) as usize;
+                            assert_eq!(&expected[0][at + 16..at + 18], &[0, 0]);
+                            let mut mangled = expected[0].clone();
+                            mangled[at + 16..at + 18].fill(255);
+                            let (mask, tcp, result) = tap.write_batch(
+                                [mangled.as_slice(), expected[1].as_slice()].into_iter(),
+                            );
+                            assert_eq!(mask, 1);
+                            assert!(!tcp);
+                            assert_eq!(result.unwrap(), mangled.len());
+                            assert_eq!(receive(&capture), mangled);
+                        }
                     }
                 }
             }
@@ -276,7 +321,7 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
         let mut other = frame(v6, 900, &[3; 120]);
         other[at..at + 2].copy_from_slice(&9001u16.to_be_bytes());
         repair(&mut other, v6);
-        let (mask, result) =
+        let (mask, _, result) =
             tap.write_batch([a.as_slice(), other.as_slice(), b.as_slice()].into_iter());
         assert_eq!(mask, 0b101);
         assert_eq!(result.unwrap(), a.len() + b.len());
@@ -287,7 +332,7 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
         let mut barrier = b.clone();
         barrier[if v6 { 21 } else { 22 }] ^= 1;
         repair(&mut barrier, v6);
-        let (mask, result) =
+        let (mask, _, result) =
             tap.write_batch([a.as_slice(), barrier.as_slice(), b.as_slice()].into_iter());
         assert_eq!(mask, 1);
         assert_eq!(result.unwrap(), a.len());
@@ -298,14 +343,14 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
         zero_payload[118..].copy_from_slice(&base[at + 6..at + 8]);
         let zero = [frame(v6, 1, &zero_payload), frame(v6, 2, &zero_payload)];
         assert_eq!(&zero[0][at + 6..at + 8], &[255, 255]);
-        let (mask, result) = tap.write_batch(zero.iter().map(Vec::as_slice));
+        let (mask, _, result) = tap.write_batch(zero.iter().map(Vec::as_slice));
         assert_eq!(mask, 3);
         assert_eq!(result.unwrap(), zero.iter().map(Vec::len).sum::<usize>());
         for p in &zero {
             assert_eq!(receive(&capture), *p);
         }
         let empty = frame(v6, 1, &[]);
-        let (mask, result) = tap.write_batch([empty.as_slice(), empty.as_slice()].into_iter());
+        let (mask, _, result) = tap.write_batch([empty.as_slice(), empty.as_slice()].into_iter());
         assert_eq!(mask, 1);
         assert_eq!(result.unwrap(), empty.len());
         assert_eq!(receive(&capture), empty);
@@ -320,7 +365,7 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
                 crate::pack::flow_hash(&a),
                 crate::pack::flow_hash(&extension)
             );
-            let (mask, result) =
+            let (mask, _, result) =
                 tap.write_batch([a.as_slice(), extension.as_slice(), b.as_slice()].into_iter());
             assert_eq!(mask, 1, "extension header must remain a same-flow barrier");
             assert_eq!(result.unwrap(), a.len());
@@ -329,7 +374,7 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
         let size = if v6 { 1432 } else { 1472 };
         let large: Vec<_> = (0..64u16).map(|id| frame(v6, id, &vec![1; size])).collect();
         let capacity = (65535 - at - 8) / size;
-        let (mask, result) = tap.write_batch(large.iter().map(Vec::as_slice));
+        let (mask, _, result) = tap.write_batch(large.iter().map(Vec::as_slice));
         assert_eq!(mask, (1u64 << capacity) - 1);
         assert_eq!(result.unwrap(), capacity * large[0].len());
         for p in &large[..capacity] {
@@ -337,7 +382,7 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
         }
 
         let small: Vec<_> = (0..64u16).map(|id| frame(v6, id, &[1; 100])).collect();
-        let (mask, result) = tap.write_batch(small.iter().map(Vec::as_slice));
+        let (mask, _, result) = tap.write_batch(small.iter().map(Vec::as_slice));
         assert_eq!(mask, u64::MAX);
         assert_eq!(result.unwrap(), small.iter().map(Vec::len).sum::<usize>());
         for p in &small {
@@ -393,7 +438,7 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
             if !v6 && offset == 24 {
                 changed[offset] ^= 1;
             }
-            let (mask, result) = tap.write_batch([a.as_slice(), changed.as_slice()].into_iter());
+            let (mask, _, result) = tap.write_batch([a.as_slice(), changed.as_slice()].into_iter());
             assert_eq!(mask, 1, "v6={v6} offset={offset} unexpectedly coalesced");
             assert_eq!(result.unwrap(), a.len());
             assert_eq!(receive(&capture), a);
@@ -412,49 +457,61 @@ fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
 fn batching_preserves_backpressure_and_disables_rejected_offloads() {
     use std::io;
     use std::os::unix::net::UnixDatagram;
-    let (sender, receiver) = UnixDatagram::pair().unwrap();
-    sender.set_nonblocking(true).unwrap();
-    receiver.set_nonblocking(true).unwrap();
-    while sender.send(&[7]).is_ok() {}
-    let mut tap = TapQueue {
-        fd: sender.into(),
-        frame_limit: crate::MAX_FRAME_LEN,
-        vnet: true,
-        uso: true,
-        completed_checksums: 0,
-    };
-    let a = frame(false, 1, &[1; 120]);
-    let b = frame(false, 2, &[2; 120]);
-    let (mask, result) = tap.write_batch([a.as_slice(), b.as_slice()].into_iter());
-    assert_eq!(mask, 3);
-    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
-    assert!(tap.uso);
-    let mut bytes = [0; 1024];
-    while let Ok(n) = receiver.recv(&mut bytes) {
-        assert_eq!(&bytes[..n], &[7]);
-    }
-    let (mask, result) = tap.write_batch([a.as_slice(), b.as_slice()].into_iter());
-    assert_eq!(mask, 3);
-    assert_eq!(result.unwrap(), a.len() + b.len());
-    assert_eq!(receiver.recv(&mut bytes).unwrap(), 10 + 42 + 240);
-    assert_eq!(bytes[1], 5);
+    for tcp in [false, true] {
+        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        while sender.send(&[7]).is_ok() {}
+        let mut tap = TapQueue {
+            fd: sender.into(),
+            frame_limit: crate::MAX_FRAME_LEN,
+            vnet: true,
+            uso: true,
+            tso: true,
+            completed_checksums: 0,
+        };
+        let a = if tcp {
+            common::tcp::frame(false, 1, 0, 0x10, &[], &[1; 120])
+        } else {
+            frame(false, 1, &[1; 120])
+        };
+        let b = if tcp {
+            common::tcp::frame(false, 2, 120, 0x18, &[], &[2; 120])
+        } else {
+            frame(false, 2, &[2; 120])
+        };
+        let (mask, _, result) = tap.write_batch([a.as_slice(), b.as_slice()].into_iter());
+        assert_eq!(mask, 3);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(tap.uso);
+        let mut bytes = [0; 1024];
+        while let Ok(n) = receiver.recv(&mut bytes) {
+            assert_eq!(&bytes[..n], &[7]);
+        }
+        let (mask, _, result) = tap.write_batch([a.as_slice(), b.as_slice()].into_iter());
+        assert_eq!(mask, 3);
+        assert_eq!(result.unwrap(), a.len() + b.len());
+        assert_eq!(receiver.recv(&mut bytes).unwrap(), 10 + a.len() + 120);
+        assert_eq!(bytes[1], if tcp { 1 } else { 5 });
 
-    // An epoll descriptor rejects writes with EINVAL, exercising capability fallback.
-    let fd = check(unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) });
-    // SAFETY: sole owner of the new descriptor.
-    let mut rejected = TapQueue {
-        fd: unsafe { OwnedFd::from_raw_fd(fd) },
-        frame_limit: crate::MAX_FRAME_LEN,
-        vnet: true,
-        uso: true,
-        completed_checksums: 0,
-    };
-    let (mask, result) = rejected.write_batch([a.as_slice(), b.as_slice()].into_iter());
-    assert_eq!(mask, 1);
-    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EINVAL));
-    assert!(!rejected.uso);
-    let (mask, _) = rejected.write_batch([a.as_slice(), b.as_slice()].into_iter());
-    assert_eq!(mask, 1);
+        // An epoll descriptor rejects writes with EINVAL, exercising capability fallback.
+        let fd = check(unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) });
+        // SAFETY: sole owner of the new descriptor.
+        let mut rejected = TapQueue {
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            frame_limit: crate::MAX_FRAME_LEN,
+            vnet: true,
+            uso: true,
+            tso: true,
+            completed_checksums: 0,
+        };
+        let (mask, _, result) = rejected.write_batch([a.as_slice(), b.as_slice()].into_iter());
+        assert_eq!(mask, 1);
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(rejected.write_offloads(), (tcp, !tcp));
+        let (mask, _, _) = rejected.write_batch([a.as_slice(), b.as_slice()].into_iter());
+        assert_eq!(mask, 1);
+    }
 }
 
 #[test]
@@ -468,6 +525,7 @@ fn tap_metadata_is_removed_and_unsupported_partial_frames_are_rejected() {
         frame_limit: crate::MAX_FRAME_LEN,
         vnet: true,
         uso: true,
+        tso: true,
         completed_checksums: 0,
     };
     let mut bytes = [0u8; crate::MAX_FRAME_LEN + 1];

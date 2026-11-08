@@ -3244,22 +3244,31 @@ impl Worker {
         if let Some(tap) = &mut local.tap {
             let mut budget = BATCH_SIZE;
             while budget != 0 {
-                let uso = tap.uso_enabled();
-                let (mask, result) = tap.write_batch(lane.ready_frames(now).take(budget));
+                let (uso, tso) = tap.write_offloads();
+                let (mask, tcp, result) = tap.write_batch(lane.ready_frames(now).take(budget));
                 if mask == 0 {
                     break;
                 }
                 let attempted = mask.count_ones() as usize;
                 debug_assert!(attempted <= budget);
-                let fallback = u64::from(uso && !tap.uso_enabled());
+                let offloads = tap.write_offloads();
+                let uso_fallback = u64::from(uso && !offloads.0);
+                let tso_fallback = u64::from(tso && !offloads.1);
                 for totals in [
                     &mut self.counters,
                     &mut local.totals,
                     &mut local.rx_totals[slot],
                 ] {
-                    totals.tap_write_calls = totals.tap_write_calls.wrapping_add(1 + fallback);
-                    totals.tap_uso_fallbacks = totals.tap_uso_fallbacks.wrapping_add(fallback);
-                    if attempted > 1 && result.is_ok() {
+                    totals.tap_write_calls = totals
+                        .tap_write_calls
+                        .wrapping_add(1 + uso_fallback + tso_fallback);
+                    totals.tap_uso_fallbacks = totals.tap_uso_fallbacks.wrapping_add(uso_fallback);
+                    totals.tap_tso_fallbacks = totals.tap_tso_fallbacks.wrapping_add(tso_fallback);
+                    if attempted > 1 && result.is_ok() && tcp {
+                        totals.tap_tso_batches = totals.tap_tso_batches.wrapping_add(1);
+                        totals.tap_tso_frames =
+                            totals.tap_tso_frames.wrapping_add(attempted as u64);
+                    } else if attempted > 1 && result.is_ok() {
                         totals.tap_uso_batches = totals.tap_uso_batches.wrapping_add(1);
                         totals.tap_uso_frames =
                             totals.tap_uso_frames.wrapping_add(attempted as u64);

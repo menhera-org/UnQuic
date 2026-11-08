@@ -75,7 +75,7 @@ earlier tables retain their original builds and test conditions.
 | At least 20 Gbit/s each way at inner MTU 1500 | After the ACK/loss fairness fix, sixty-second QinQ sweep: 1.82 / 1.58 Gbit/s paced, 1.82 / 1.64 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe integration regression; paced missing fractions are 91.26 / 92.28%. The recovery ascending sweep stays under 1% missing in both directions only at 0.5G offered. Five successful 20G repeats remain unmet. |
 | Goodput must plateau under excess traffic | Bounded fresh work raises matched twenty-second single-lane unlimited delivery to 1.89 / 1.85 Gbit/s from 0.45–0.51, only 0.3 / 2.3% below its 4G point. Eight-lane delivery remains 1.77 / 1.55 with admission pressure | No universal plateau or CPU ceiling is established. The single-lane scheduling failure is reduced; the eight-lane ceiling and original targets remain open. |
 | Small-frame overload must remain efficient | Earlier pre-recovery tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
-| VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input offloads now improve the matched TCP sweep; output coalescing remains unfinished. |
+| VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input and output offloads improve matched TCP sweeps; single-stream output coalescing reaches 2.01 / 2.26 Gbit/s, still below the deployment target. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
 | Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Throughput sweeps currently cap outer packets at 1500 bytes. Larger-MTU throughput and real routed-path validation remain open. DATA-quoted PTB validation now has targeted kernel coverage. |
@@ -88,6 +88,108 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## TCP output coalescing from the November 6 review (November 8)
+
+Compatible TCP frames now share a bounded TSO write using borrowed reassembly
+payloads. No payload copy, allocation, lock, waiting period or larger queue is
+added. Sequence numbers, ACK/window/options, VLAN stacks and checksums are
+checked before grouping; PSH closes the group. IPv4 options and supported IPv6
+extensions remain byte-exact after kernel segmentation. Unsupported frames
+retain single writes. UDP and TCP capability fallbacks are independent.
+
+The [matched release observations](benches/tap-tcp-output.json) compare the
+input-offload build with input plus output offloads. They use the same twenty-second
+QinQ setup as the input comparison: inner MTU 1500, eight workers/lanes, 500-entry
+TAP queues, a 1452-byte outer UDP cap with active discovery, and concurrent
+iperf3 forward/reverse TCP connections. Application writes are 64 KiB.
+Each point starts fresh daemons; the baseline runs before and after the
+candidate. No build, local kernel test or Git packing overlaps load.
+
+| Build | Streams each way | Delivered Gbit/s L→R / R→L | CPU % L / R | TCP retransmissions L→R / R→L |
+| --- | --- | --- | --- | --- |
+| before | 1 | 1.619 / 1.483 | 286.76 / 342.14 | 874 / 2442 |
+| before | 4 | 1.313 / 1.068 | 303.12 / 281.67 | 4833 / 4129 |
+| before | 16 | 0.845 / 0.886 | 262.11 / 262.36 | 12447 / 12662 |
+| candidate | 1 | 2.014 / 2.264 | 276.14 / 281.70 | 2326 / 1357 |
+| candidate | 4 | 1.847 / 1.922 | 303.02 / 282.80 | 6089 / 6389 |
+| candidate | 16 | 1.372 / 1.198 | 253.71 / 247.48 | 12681 / 11503 |
+| after | 1 | 1.595 / 1.389 | 266.72 / 327.53 | 3103 / 2331 |
+| after | 4 | 1.250 / 1.077 | 300.05 / 276.23 | 5009 / 3589 |
+| after | 16 | 0.831 / 0.881 | 258.22 / 258.02 | 14677 / 13696 |
+
+Against the better control in each direction, delivery improves by
+24.4 / 52.7% with one stream, 40.7 / 78.5% with four, and 62.4 / 35.2%
+with sixteen. At one stream, TAP writes fall from 3.81 / 3.99 million in
+the opening control to 0.626 / 0.627 million while delivering more bytes.
+The candidate combines 3.88 / 3.45 million TCP frames into
+312,686 / 286,407 writes, averaging 12.42 / 12.06 frames per group.
+The two iperf receiver CPU totals fall from 50.78 / 47.76% to 13.88 / 13.95%;
+the busiest candidate daemon thread uses 80.65% of one core.
+
+All nine points have zero admission pressure, socket overflow, TAP ingress
+drops, TAP errors, inner TCP checksum/errors and outer IPv6 fragmentation.
+The candidate also reports zero TSO fallbacks. Expiry still loses retained
+frames: the one-stream candidate expires 2029 / 953 frames, including
+1742 / 675 never submitted and 22 / 30 incomplete receive frames.
+At sixteen streams it expires 13,974 / 11,124 frames and reports 94 / 406
+queue drops, all attributed to ACK buffering. The JSON retains each expiry
+class, worker counters and process/thread CPU. TCP retransmissions are not
+an exact frame-loss ratio.
+
+The gain verifies that per-frame TAP delivery was a material TCP cost.
+It does not establish a CPU ceiling: sixteen-stream delivery is still below
+single-stream delivery, and the local 20G and routed 5G gates remain unmet.
+This is one observation per build/stream count with no injected delay or loss.
+TCP's adaptive sending rate does not test the unlimited UDP overload plateau.
+
+Validation passes 354 ordinary release-musl tests, strict Clippy, formatting
+and Rust 1.89 checks. All 81 library kernel tests and three runtime tests
+pass on Linux 6.8 and 7.0. Byte comparisons cover IPv4/IPv6, VLAN stacks,
+options/extensions, zero checksums, sequence/ID wrap, short tails and control
+flags. Backpressure and independent capability fallback are tested. A subsequent
+allocator exercise delivers 512 TCP segments through input and output
+offloads with zero hot allocations/deallocations on both kernels. One Linux
+6.8 run then times out in the existing five-second migration-generation wait;
+a repeat passes. That failure remains unattributed and separate from the
+TCP delivery checks.
+
+The same JSON includes UDP controls to check the shared coalescing path:
+
+| Run | Requested each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| 20s before | 4G | 1.564 / 1.571 | 60.30 / 60.18 | 215.06 / 207.09 |
+| 20s before | unlimited | 1.740 / 1.559 | 96.82 / 96.87 | 203.57 / 204.21 |
+| 20s candidate | 4G | 1.615 / 1.621 | 58.98 / 58.94 | 214.32 / 207.04 |
+| 20s candidate | unlimited | 1.648 / 1.535 | 97.13 / 96.89 | 203.47 / 199.60 |
+| 20s after | 4G | 1.652 / 1.604 | 58.13 / 59.36 | 217.88 / 208.96 |
+| 20s after | unlimited | 1.719 / 1.585 | 96.87 / 97.04 | 216.40 / 206.54 |
+| 30s before | 21G | 1.780 / 1.441 | 91.26 / 92.92 | 216.41 / 211.96 |
+| 30s before | unlimited | 1.738 / 1.579 | 97.17 / 97.05 | 216.17 / 207.92 |
+| 30s candidate | 21G | 1.631 / 1.620 | 92.15 / 92.19 | 216.17 / 209.34 |
+| 30s candidate | unlimited | 1.759 / 1.572 | 96.91 / 96.91 | 217.06 / 209.11 |
+| 30s after | 21G | 1.718 / 1.504 | 91.70 / 92.72 | 215.14 / 208.68 |
+| 30s after | unlimited | 1.742 / 1.592 | 96.84 / 96.88 | 215.73 / 207.78 |
+
+The first candidate unlimited point trails both controls; the thirty-second
+repeat does not reproduce that forward decline. The 21G candidate is slower
+forward and faster in reverse than both controls. These observations establish
+neither a consistent UDP gain nor a general plateau. All twelve UDP points
+have zero corruption, duplicate delivery, reordering, socket overflow,
+inner UDP errors and outer fragmentation. The thirty-second unlimited candidate
+reports admission pressure 18,679 / 5,335, queue drops 2344 / 36,235,
+and expiry 1,961,244 / 2,913,519. TAP ingress drops are
+3,188,470 / 2,779,936 source SKBs. The differing units must not be summed
+into a frame-loss count. High loss and low utilization remain open problems.
+
+The review's proposed shared receive pool remains an experiment to evaluate,
+not an established fix for this ceiling. The existing 64 lane tables belong
+to the entire session: 4096 frame slots in total. Sharing within a worker
+would redistribute those slots and change capacity under uneven lane placement.
+The current 64-record and 64-KiB receive budgets also limit normally split
+MTU-1500 traffic to about 32 completions per turn; a pool change alone cannot
+produce the review's predicted 44-frame writes. Keep admission, drain cadence
+and turn-budget changes separate when measuring them.
 
 ## TCP input offload from the November 6 review (November 8)
 

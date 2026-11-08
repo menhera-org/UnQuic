@@ -199,6 +199,12 @@ metrics! {
     tap_uso_frames: sum,
     /// TAP queues that disabled USO after a kernel capability rejection.
     tap_uso_fallbacks: sum,
+    /// Successful TAP TSO writes representing two or more original TCP frames.
+    tap_tso_batches: sum,
+    /// Original TCP frames delivered in successful multi-frame TAP TSO writes.
+    tap_tso_frames: sum,
+    /// TAP queues that disabled TSO after a kernel capability rejection.
+    tap_tso_fallbacks: sum,
     /// Frames discarded after permanent TAP write errors, plus TAP read errors.
     tap_errors: sum,
 }

@@ -43,7 +43,7 @@ impl Tap {
     /// Creates a named TAP with MTU 1500..9000 and 1..64 queues.
     ///
     /// Uses IFF_TAP, IFF_NO_PI, IFF_MULTI_QUEUE and internal virtio metadata.
-    /// Read checksum/GSO offloads stay disabled; eligible writes may use USO.
+    /// Read checksum/GSO offloads stay disabled; eligible writes may use USO/TSO.
     /// Any failure closes all queues created by this call.
     /// Sets the supplied MAC; None derives a Menhera MAC-M address from the
     /// current UTS hostname and interface name using SHA-256.
@@ -106,6 +106,7 @@ impl Tap {
                 frame_limit: mtu as usize + 22,
                 vnet: true,
                 uso: true,
+                tso: true,
                 completed_checksums: 0,
             });
         }
@@ -181,6 +182,7 @@ pub struct TapQueue {
     frame_limit: usize,
     vnet: bool,
     uso: bool,
+    tso: bool,
     pub(crate) completed_checksums: u64,
 }
 
@@ -192,6 +194,7 @@ impl TapQueue {
             frame_limit: MAX_FRAME_LEN,
             vnet,
             uso: false,
+            tso: false,
             completed_checksums: 0,
         }
     }
@@ -335,33 +338,44 @@ impl TapQueue {
         complete_write(n, frame.len() + if self.vnet { header.len() } else { 0 })
     }
 
-    pub(crate) fn uso_enabled(&self) -> bool {
-        self.uso
+    /// Enabled UDP and TCP write offloads, respectively.
+    pub(crate) fn write_offloads(&self) -> (bool, bool) {
+        (self.uso, self.tso)
     }
 
+    /// Returns the attempted mask, whether it used TSO, and the write result.
     /// The mask names every attempted frame, even when the write fails.
     pub(crate) fn write_batch<'a>(
         &mut self,
         mut frames: impl Iterator<Item = &'a [u8]>,
-    ) -> (u64, io::Result<usize>) {
+    ) -> (u64, bool, io::Result<usize>) {
         let Some(first) = frames.next() else {
-            return (0, Ok(0));
+            return (0, false, Ok(0));
         };
-        if self.uso
+        if (self.uso || self.tso)
             && (14..=self.frame_limit).contains(&first.len())
-            && let Some((mask, result)) =
-                uso::write(self.fd.as_raw_fd(), first, frames, self.frame_limit)
+            && let Some((mask, tcp, result)) = uso::write(
+                self.fd.as_raw_fd(),
+                first,
+                frames,
+                self.frame_limit,
+                (self.uso, self.tso),
+            )
         {
             if result
                 .as_ref()
                 .is_err_and(|e| matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)))
             {
-                self.uso = false;
+                if tcp {
+                    self.tso = false;
+                } else {
+                    self.uso = false;
+                }
             } else {
-                return (mask, result);
+                return (mask, tcp, result);
             }
         }
-        (1, self.write_frame(first).map(|()| first.len()))
+        (1, false, self.write_frame(first).map(|()| first.len()))
     }
 }
 
@@ -401,6 +415,7 @@ mod tests {
             frame_limit: MAX_FRAME_LEN,
             vnet: true,
             uso: false,
+            tso: false,
             completed_checksums: 0,
         };
         for v6 in [false, true] {
