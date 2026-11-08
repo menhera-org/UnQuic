@@ -1,0 +1,1328 @@
+diff --git a/src/ack/sent.rs b/src/ack/sent.rs
+index 32d38b1..859d7d6 100644
+--- a/src/ack/sent.rs
++++ b/src/ack/sent.rs
+@@ -408,6 +408,13 @@ impl History {
+         (self.contains(number) && self.submitted[word] & bit != 0).then(|| self.metadata(number))
+     }
+ 
++    /// Whether a retained successful transmission has been acknowledged.
++    /// Missing/retired identities are unknown, never an acknowledgement.
++    pub(crate) fn acknowledged(&self, number: u64) -> bool {
++        let (word, bit) = location(number);
++        self.contains(number) && self.acknowledged[word] & bit != 0
++    }
++
+     /// Checks the whole ACK without mutation, bounded by the retained bitmap span.
+     pub fn validate(&self, ranges: AckRanges<'_>) -> Result<(), HistoryError> {
+         self.checked_ack(ranges).map(|_| ())
+diff --git a/src/counters.rs b/src/counters.rs
+index 0631ce9..35a5ce4 100644
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -114,6 +114,16 @@ metrics! {
+     tx_expired_partial_frames: sum,
+     /// Fully submitted frames expired before ACK completion; a subset of expired_frames.
+     tx_expired_sent_frames: sum,
++    /// Source abandonment advisories retained for bounded transmission.
++    abandon_queued: sum,
++    /// Successfully submitted source abandonment advisories, including retries.
++    abandon_sent: sum,
++    /// Successfully submitted copies after an advisory's first transmission.
++    abandon_retried: sum,
++    /// Advisories rejected by bounded storage or stale/exhausted identities.
++    abandon_dropped: sum,
++    /// Advisories reaching their 100 ms deadline without retained ACK proof.
++    abandon_expired: sum,
+     /// Incomplete receive frames expired; a subset of expired_frames.
+     rx_expired_incomplete_frames: sum,
+     /// Completed receive frames expired while awaiting TAP; a subset of expired_frames.
+diff --git a/src/worker/sender/abandon.rs b/src/worker/sender/abandon.rs
+new file mode 100644
+index 0000000..f5b43d7
+--- /dev/null
++++ b/src/worker/sender/abandon.rs
+@@ -0,0 +1,943 @@
++//! Source-deadline abandonment is advisory metadata, independent of retained DATA.
++//! Each worker retains at most 128 advisories in its accounted inline storage.
++//! Origin 1 and lane-retirement transmission are separate runtime work.
++use super::*;
++
++const CAPACITY: usize = 128;
++const LIFETIME: Duration = Duration::from_millis(100);
++const LENGTH: usize = wire::HEADER_LEN + 4 + 12;
++
++#[derive(Clone, Copy)]
++struct Advisory {
++    serial: u64,
++    session: usize,
++    generation: u64,
++    lane: usize,
++    frame: u64,
++    expires: Duration,
++    due: Duration,
++    sent: [u64; 3],
++    attempts: usize,
++}
++impl Advisory {
++    fn acknowledged(self, history: &History) -> bool {
++        // shortcut: retired ACK proof may allow a redundant bounded copy. Keep
++        // no permanent ACK ledger; add one only if its measured cost warrants it.
++        self.sent
++            .iter()
++            .take(self.attempts)
++            .any(|&n| history.acknowledged(n))
++    }
++    fn current(self, local: &Session, lane: &Lane) -> bool {
++        local.connection.is_some()
++            && local
++                .installed
++                .is_some_and(|c| c.generation == self.generation)
++            && lane.generation == self.generation
++    }
++}
++
++pub(super) struct Pending {
++    entries: [Option<Advisory>; CAPACITY],
++    serial: u64,
++    count: usize,
++    cursor: usize,
++    yield_data: bool,
++}
++impl Pending {
++    pub(super) const fn new() -> Self {
++        Self {
++            entries: [None; CAPACITY],
++            serial: 0,
++            count: 0,
++            cursor: 0,
++            yield_data: false,
++        }
++    }
++    fn get(&self, slot: usize, serial: u64) -> Option<Advisory> {
++        self.entries
++            .get(slot)
++            .copied()
++            .flatten()
++            .filter(|a| a.serial == serial)
++    }
++    fn remove(&mut self, slot: usize, serial: u64) {
++        if self.get(slot, serial).is_some()
++            && let Some(entry) = self.entries.get_mut(slot)
++        {
++            *entry = None;
++            self.count -= 1;
++        }
++    }
++}
++
++impl Worker {
++    fn count_abandon(&mut self, session: usize, lane: usize, field: fn(&mut Snapshot) -> &mut u64) {
++        let local = &mut self.sessions[session];
++        for totals in [
++            &mut self.counters,
++            &mut local.totals,
++            &mut local.tx_totals[lane],
++        ] {
++            let counter = field(totals);
++            *counter = counter.wrapping_add(1);
++        }
++        local.tx_dirty |= 1_u64 << lane;
++    }
++
++    pub(in crate::worker) fn queue_abandon(
++        &mut self,
++        session: usize,
++        lane: usize,
++        frame: u64,
++        now: Duration,
++    ) {
++        if !self.sender_enabled() {
++            return;
++        }
++        let Some(generation) = self
++            .sessions
++            .get(session)
++            .and_then(|s| s.installed)
++            .map(|c| c.generation)
++        else {
++            return;
++        };
++        let pending = &mut self.sender.abandons;
++        if pending.count == CAPACITY {
++            self.count_abandon(session, lane, |s| &mut s.abandon_dropped);
++            return;
++        }
++        let serial = pending.serial.checked_add(1);
++        let slot = pending.entries.iter_mut().find(|a| a.is_none());
++        if let (Some(serial), Some(slot)) = (serial, slot) {
++            *slot = Some(Advisory {
++                serial,
++                session,
++                generation,
++                lane,
++                frame,
++                expires: now.saturating_add(LIFETIME),
++                due: now,
++                sent: [0; 3],
++                attempts: 0,
++            });
++            pending.serial = serial;
++            pending.count += 1;
++            self.count_abandon(session, lane, |s| &mut s.abandon_queued);
++        } else {
++            self.count_abandon(session, lane, |s| &mut s.abandon_dropped);
++        }
++    }
++
++    pub(super) fn defer_abandon(&mut self, job: Job, now: Duration) {
++        if let JobKind::Abandon { slot, serial } = job.kind
++            && let Some(current) = self
++                .sender
++                .abandons
++                .entries
++                .get_mut(slot)
++                .and_then(Option::as_mut)
++                .filter(|a| a.serial == serial)
++        {
++            current.due = now.saturating_add(RETRY);
++        }
++    }
++
++    pub(in crate::worker) fn abandon_deadline(&self) -> Option<Duration> {
++        if self.sender.abandons.count == 0 {
++            return None;
++        }
++        let available = self.sender.job.is_none() && self.sender.flight.is_some();
++        self.sender
++            .abandons
++            .entries
++            .iter()
++            .flatten()
++            .map(|a| {
++                if available && a.attempts < a.sent.len() {
++                    a.expires.min(a.due)
++                } else {
++                    a.expires
++                }
++            })
++            .min()
++    }
++
++    pub(super) fn service_abandons(&mut self, now: Duration) -> io::Result<()> {
++        if self.sender.abandons.count == 0 {
++            return Ok(());
++        }
++        // Every advisory request leaves the next free-flight turn for DATA.
++        let available = self.sender.job.is_none() && self.sender.flight.is_some();
++        let yield_data = available && std::mem::take(&mut self.sender.abandons.yield_data);
++        for _ in 0..32 {
++            let slot = self.sender.abandons.cursor;
++            self.sender.abandons.cursor = (slot + 1) % CAPACITY;
++            let Some(advisory) = self.sender.abandons.entries.get(slot).copied().flatten() else {
++                continue;
++            };
++            let index = self.sender_index(advisory.session, advisory.lane)?;
++            let history = &self.sender.lanes[index];
++            let current = advisory.current(&self.sessions[advisory.session], history);
++            if current && now < advisory.due && now < advisory.expires {
++                continue;
++            }
++            let acknowledged = current && advisory.acknowledged(&history.history);
++            if !current || acknowledged || now >= advisory.expires {
++                self.sender.abandons.remove(slot, advisory.serial);
++                if !current {
++                    self.count_abandon(advisory.session, advisory.lane, |s| &mut s.abandon_dropped);
++                } else if !acknowledged {
++                    self.count_abandon(advisory.session, advisory.lane, |s| &mut s.abandon_expired);
++                }
++            } else if !yield_data
++                && now >= advisory.due
++                && advisory.attempts < advisory.sent.len()
++                && self.sender.job.is_none()
++                && self.sender.flight.is_some()
++            {
++                self.request_abandon(slot, advisory, index, now)?;
++                if self.sender.job.is_some() {
++                    self.sender.abandons.yield_data = true;
++                    break;
++                }
++            }
++        }
++        Ok(())
++    }
++
++    fn request_abandon(
++        &mut self,
++        slot: usize,
++        advisory: Advisory,
++        index: usize,
++        now: Duration,
++    ) -> io::Result<()> {
++        let local = &mut self.sessions[advisory.session];
++        let Some(tx) = local.tx.get_mut(advisory.lane).and_then(Option::as_mut) else {
++            return Ok(());
++        };
++        let number = match tx.allocate_packets(1) {
++            Ok(number) => number,
++            Err(_) => {
++                self.sender.abandons.remove(slot, advisory.serial);
++                self.count_abandon(advisory.session, advisory.lane, |s| &mut s.abandon_dropped);
++                return Ok(());
++            }
++        };
++        match self.sender.lanes[index]
++            .history
++            .reserve(number, (LENGTH + 48) as u16, true, true)
++        {
++            Ok(()) => {}
++            Err(crate::ack::HistoryError::Full) => {
++                self.sender.reclaim = Some(self.sender.lanes.len());
++                if let Some(pending) = self
++                    .sender
++                    .abandons
++                    .entries
++                    .get_mut(slot)
++                    .and_then(Option::as_mut)
++                {
++                    pending.due = now.saturating_add(RETRY);
++                }
++                return Ok(());
++            }
++            Err(error) => return Err(io::Error::other(error)),
++        }
++        let mut flight = self
++            .sender
++            .flight
++            .take()
++            .ok_or(io::ErrorKind::InvalidData)?;
++        flight
++            .prepare(&[pacing::Planned {
++                id: PacketId {
++                    session: advisory.session,
++                    generation: advisory.generation,
++                    lane: advisory.lane as u16 + 1,
++                    number,
++                },
++                bytes: (LENGTH + 48) as u16,
++            }])
++            .map_err(io::Error::other)?;
++        self.sender.job = Some(Job {
++            session: advisory.session,
++            generation: advisory.generation,
++            lane: advisory.lane,
++            path: local.path,
++            first: number,
++            count: 1,
++            deadline: advisory.expires,
++            kind: JobKind::Abandon {
++                slot,
++                serial: advisory.serial,
++            },
++        });
++        let peer = self
++            .shared
++            .config
++            .peer_for_session(advisory.session)
++            .ok_or(io::ErrorKind::InvalidData)?;
++        let mtu = (self.transmit[peer].paths[local.path].lanes[advisory.lane]
++            .mtu
++            .payload_limit()
++            + 48)
++            .max(1280) as u16;
++        self.sender.queue(
++            0,
++            Message::Request(Request {
++                flight,
++                group: self.sender.lanes[index].group,
++                deadline: advisory.expires,
++                probe: None,
++                pmtu: false,
++                mtu,
++            }),
++        )
++    }
++
++    pub(super) fn send_abandon(
++        &mut self,
++        job: Job,
++        slot: usize,
++        serial: u64,
++        now: Duration,
++    ) -> io::Result<()> {
++        let index = self.sender_index(job.session, job.lane)?;
++        let grant = self
++            .sender
++            .flight
++            .as_ref()
++            .and_then(|f| f.grant())
++            .ok_or(io::ErrorKind::InvalidData)?;
++        let Some(advisory) = self.sender.abandons.get(slot, serial) else {
++            return self.finish_sender_send(0, None, false);
++        };
++        let local = &self.sessions[job.session];
++        let connection = local.connection.ok_or(io::ErrorKind::InvalidData)?;
++        let mut bytes = [0; LENGTH];
++        wire::encode_datagram(
++            Header {
++                cookie: self.shared.config.config().sessions[job.session].cookie,
++                receive_tag: connection.remote_tag().get(),
++                lane: job.lane as u16 + 1,
++                packet_number: job.first,
++                record_area_len: 0,
++            },
++            &[Record::FrameAbandon {
++                lane: job.lane as u16 + 1,
++                origin: 0,
++                reason: 1,
++                frame_id: advisory.frame,
++            }],
++            &mut bytes,
++        )
++        .map_err(io::Error::other)?;
++        let peer = self
++            .shared
++            .config
++            .peer_for_session(job.session)
++            .ok_or(io::ErrorKind::InvalidData)?;
++        let mut clock = self.io_clock(now);
++        let pending = &self.sender.abandons;
++        let history = &self.sender.lanes[index];
++        let socket = self.transmit[peer].paths[job.path].lanes[job.lane]
++            .socket
++            .as_ref();
++        let mut canceled = false;
++        let mut acknowledged = false;
++        let result = if let Some(socket) = socket {
++            socket.send_batch_checked(
++                &[SendDatagram { parts: &[&bytes] }],
++                BASE_UDP_PAYLOAD,
++                || {
++                    let at = clock()?;
++                    if !grant.valid_at(at)
++                        || pending.get(slot, serial).is_none_or(|a| {
++                            at >= a.expires
++                                || !a.current(local, history)
++                                || {
++                                    acknowledged = a.acknowledged(&history.history);
++                                    acknowledged
++                                }
++                                || a.attempts >= a.sent.len()
++                        })
++                    {
++                        canceled = true;
++                        return Err(io::ErrorKind::WouldBlock.into());
++                    }
++                    Ok(at)
++                },
++            )
++        } else {
++            Err(io::ErrorKind::NotConnected.into())
++        };
++        let sent = result.as_ref().ok().copied();
++        self.finish_sender_send(
++            sent.map_or(0, |(n, _)| n),
++            sent.and_then(|(n, at)| (n != 0).then_some(at)),
++            !canceled
++                && result
++                    .as_ref()
++                    .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock),
++        )?;
++        if let Some((1, at)) = sent {
++            if let Some(current) = self
++                .sender
++                .abandons
++                .entries
++                .get_mut(slot)
++                .and_then(Option::as_mut)
++                .filter(|a| a.serial == serial)
++            {
++                let number = current
++                    .sent
++                    .get_mut(current.attempts)
++                    .ok_or(io::ErrorKind::InvalidData)?;
++                *number = job.first;
++                current.attempts += 1;
++                current.due = if current.attempts == current.sent.len() {
++                    current.expires
++                } else {
++                    at.saturating_add(self.sender.lanes[index].rtt.pto_period(0))
++                };
++            }
++            self.count_abandon(job.session, job.lane, |s| &mut s.abandon_sent);
++            if advisory.attempts != 0 {
++                self.count_abandon(job.session, job.lane, |s| &mut s.abandon_retried);
++            }
++            let local = &mut self.sessions[job.session];
++            for totals in [
++                &mut self.counters,
++                &mut local.totals,
++                &mut local.tx_totals[job.lane],
++            ] {
++                totals.tx_outer_bytes = totals.tx_outer_bytes.wrapping_add((LENGTH + 48) as u64);
++            }
++            local.tx_dirty |= 1_u64 << job.lane;
++        } else if acknowledged {
++            self.sender.abandons.remove(slot, serial);
++        } else if let Some(current) = self
++            .sender
++            .abandons
++            .entries
++            .get_mut(slot)
++            .and_then(Option::as_mut)
++            .filter(|a| a.serial == serial)
++        {
++            current.due = now.saturating_add(RETRY);
++        }
++        if let Err(error) = result
++            && !canceled
++            && !transient(&error)
++        {
++            self.counters.socket_errors = self.counters.socket_errors.wrapping_add(1);
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::{
++        alloc::{GlobalAlloc, Layout, System},
++        cell::Cell,
++    };
++
++    struct Allocator;
++    thread_local! {
++        static ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
++        static CLOCK_CALLS: Cell<usize> = const { Cell::new(0) };
++    }
++    #[global_allocator]
++    static ALLOCATOR: Allocator = Allocator;
++    // SAFETY: the unchanged allocation contracts are delegated to System.
++    unsafe impl GlobalAlloc for Allocator {
++        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++            let _ = ALLOCATIONS.try_with(|c| c.set(c.get().map(|n| n + 1)));
++            // SAFETY: forwarding the caller's layout.
++            unsafe { System.alloc(layout) }
++        }
++        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
++            // SAFETY: forwarding the live pointer and matching layout.
++            unsafe { System.dealloc(pointer, layout) }
++        }
++        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
++            let _ = ALLOCATIONS.try_with(|c| c.set(c.get().map(|n| n + 1)));
++            // SAFETY: forwarding the caller's allocation and requested size.
++            unsafe { System.realloc(pointer, layout, size) }
++        }
++    }
++
++    fn without_allocations(f: impl FnOnce()) {
++        ALLOCATIONS.with(|c| c.set(Some(0)));
++        f();
++        assert_eq!(ALLOCATIONS.with(|c| c.replace(None)), Some(0));
++    }
++
++    #[test]
++    fn acknowledgement_is_not_loss_retirement_or_reservation() {
++        let mut history = History::new().unwrap();
++        without_allocations(|| {
++            for number in 1..=3 {
++                history.reserve(number, 112, true, true).unwrap();
++            }
++            assert!(history.submit(1, Duration::ZERO));
++            assert!(history.submit(2, Duration::ZERO));
++            assert!(history.lose(2).is_some());
++            assert!(!history.acknowledged(1));
++            assert!(!history.acknowledged(2));
++            assert!(!history.acknowledged(3));
++            history
++                .acknowledge(
++                    AckRanges::new(&[AckRange { start: 1, end: 1 }]).unwrap(),
++                    |_| {},
++                )
++                .unwrap();
++            assert!(history.acknowledged(1));
++            assert_eq!(history.retire_oldest_resolved().unwrap().unwrap().number, 1);
++            assert!(!history.acknowledged(1));
++        });
++    }
++
++    fn setup() -> ([Worker; 2], ReceiveSocket) {
++        let (mut workers, rx) = super::super::tests::workers();
++        for worker in &mut workers {
++            worker.io_time = Some(Ok);
++            for control in &mut worker.controls {
++                control.probe_due = Duration::MAX;
++            }
++            for lane in &mut worker.sender.lanes {
++                lane.rtt.sample(Duration::ZERO, Duration::from_millis(1), 0);
++            }
++        }
++        (workers, rx)
++    }
++
++    fn pump(worker: &mut Worker, now: Duration) {
++        for _ in 0..16 {
++            worker.service_sender(now).unwrap();
++        }
++    }
++
++    fn permit(worker: &mut Worker, now: Duration) -> Job {
++        for _ in 0..16 {
++            worker.service_abandons(now).unwrap();
++            worker.flush_sender_messages(now).unwrap();
++            worker
++                .sender
++                .owner
++                .as_mut()
++                .unwrap()
++                .advance(now, &mut worker.sender.outgoing)
++                .unwrap();
++            worker.flush_sender_messages(now).unwrap();
++            if worker.sender.permitted {
++                return worker.sender.job.unwrap();
++            }
++        }
++        panic!("advisory did not obtain ordinary credit");
++    }
++
++    fn receive(rx: &ReceiveSocket) -> u64 {
++        let mut bytes = [0; BASE_UDP_PAYLOAD];
++        let length = rx.recv(&mut bytes).unwrap().0;
++        assert_eq!(length, LENGTH);
++        let packet = Datagram::decode(&bytes[..length]).unwrap();
++        assert!(matches!(
++            packet.records().next(),
++            Some(Record::FrameAbandon {
++                lane: 1,
++                origin: 0,
++                reason: 1,
++                frame_id: 0x0001_0000_0000_0001,
++            })
++        ));
++        packet.header().packet_number
++    }
++
++    fn empty(rx: &ReceiveSocket) {
++        assert_eq!(
++            rx.recv(&mut [0; BASE_UDP_PAYLOAD]).unwrap_err().kind(),
++            io::ErrorKind::WouldBlock
++        );
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn abandonment_retries_are_charged_and_stop_at_three_copies_and_original_deadline() {
++        let (mut workers, rx) = setup();
++        let worker = &mut workers[0];
++        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        let mut previous = 0;
++        without_allocations(|| {
++            for millis in [1, 20, 40] {
++                let now = Duration::from_millis(millis);
++                permit(worker, now);
++                worker.use_sender_permit(now).unwrap();
++                pump(worker, now);
++                let number = receive(&rx);
++                assert!(number > previous);
++                previous = number;
++                let packet = worker.sender.lanes[0].history.packet(number).unwrap();
++                assert!(packet.eliciting && packet.charged && packet.sample_slot.is_some());
++                assert!(!worker.sender.lanes[0].history.acknowledged(number));
++            }
++            pump(worker, Duration::from_millis(60));
++            empty(&rx);
++            assert_eq!(worker.counters.abandon_sent, 3);
++            assert_eq!(worker.counters.abandon_retried, 2);
++            assert_eq!(
++                worker
++                    .sender
++                    .owner
++                    .as_ref()
++                    .unwrap()
++                    .snapshot(0)
++                    .unwrap()
++                    .bytes_in_flight,
++                3 * 112
++            );
++            pump(worker, Duration::from_millis(100));
++            assert_eq!(worker.sender.abandons.count, 0);
++            assert_eq!(worker.counters.abandon_expired, 1);
++            assert_eq!(worker.sender.lanes[0].history.inflight_bytes(), 3 * 112);
++        });
++    }
++
++    fn retain_data_plan(worker: &mut Worker) -> u64 {
++        let mut frame = worker.free.pop().unwrap();
++        frame.session = 0;
++        frame.lane = 0;
++        frame.tag = 1;
++        frame.length = 60;
++        frame.bytes[..60].fill(7);
++        frame.deadline = Duration::from_millis(100);
++        frame.tx_reserved = true;
++        worker.sessions[0].tx_retained += 1;
++        worker.sessions[0].tx_bytes += frame.length;
++        worker.input_frame(frame, Duration::ZERO).unwrap();
++        let mut batch = worker.sessions[0].batches[0].take().unwrap();
++        let index = batch
++            .pending
++            .pop_front(&mut worker.frames)
++            .unwrap()
++            .unwrap();
++        batch.frames[0] = Some(index);
++        batch.len = 1;
++        worker.recovery.set(index, Place::Batch).unwrap();
++        batch
++            .prepare(
++                worker.sessions[0].tx[0].as_mut().unwrap(),
++                &worker.frames,
++                BASE_UDP_PAYLOAD,
++            )
++            .unwrap();
++        let number = batch.plan.packet(0).unwrap().number;
++        worker.sessions[0].batches[0] = Some(batch);
++        number
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn acknowledged_copy_cancels_waiting_retry_without_discarding_unrelated_data() {
++        let (mut workers, rx) = setup();
++        let worker = &mut workers[0];
++        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        let now = Duration::from_millis(1);
++        permit(worker, now);
++        worker.use_sender_permit(now).unwrap();
++        pump(worker, now);
++        let first = receive(&rx);
++        let data_number = retain_data_plan(worker);
++        let retained = worker.sessions[0].tx_retained;
++        let now = Duration::from_millis(20);
++        let retry = permit(worker, now);
++        assert!(retry.first > data_number);
++        // Admit the ACK while the retry grant still waits for its syscall.
++        worker
++            .incoming_ack(
++                0,
++                1,
++                1,
++                0,
++                AckRanges::new(&[AckRange {
++                    start: first,
++                    end: first,
++                }])
++                .unwrap(),
++                now,
++            )
++            .unwrap();
++        pump(worker, now);
++        empty(&rx);
++        assert_eq!(worker.counters.abandon_sent, 1);
++        assert_eq!(worker.sender.abandons.count, 0);
++        assert_eq!(
++            worker.sessions[0].batches[0]
++                .as_ref()
++                .unwrap()
++                .plan
++                .packet(0)
++                .unwrap()
++                .number,
++            data_number
++        );
++        assert_eq!(worker.sessions[0].tx_retained, retained);
++        assert_eq!(
++            worker
++                .sender
++                .owner
++                .as_ref()
++                .unwrap()
++                .snapshot(0)
++                .unwrap()
++                .bytes_in_flight,
++            0
++        );
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn stale_advisory_serial_and_generation_cancel_grants_and_keep_data_plan() {
++        for replace_generation in [false, true] {
++            let (mut workers, rx) = setup();
++            let worker = &mut workers[0];
++            let data_number = retain_data_plan(worker);
++            let retained = worker.sessions[0].tx_retained;
++            worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++            let now = Duration::from_millis(1);
++            let job = permit(worker, now);
++            let JobKind::Abandon { slot, serial } = job.kind else {
++                panic!("wrong job")
++            };
++            if replace_generation {
++                worker.sessions[0].installed.as_mut().unwrap().generation += 1;
++            } else {
++                worker.sender.abandons.remove(slot, serial);
++                worker.queue_abandon(0, 0, (1 << 48) | 2, now);
++                assert!(worker.sender.abandons.get(slot, serial).is_none());
++            }
++            worker.use_sender_permit(now).unwrap();
++            empty(&rx);
++            assert_eq!(worker.counters.abandon_sent, 0);
++            assert_eq!(
++                worker.sessions[0].batches[0]
++                    .as_ref()
++                    .unwrap()
++                    .plan
++                    .packet(0)
++                    .unwrap()
++                    .number,
++                data_number
++            );
++            assert_eq!(worker.sessions[0].tx_retained, retained);
++        }
++        let (mut workers, _) = setup();
++        let worker = &mut workers[0];
++        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        worker.install_sender(0, 2, true).unwrap();
++        worker.sessions[0].installed.as_mut().unwrap().generation = 2;
++        pump(worker, Duration::from_millis(1));
++        assert_eq!(worker.sender.abandons.count, 0);
++        assert_eq!(worker.counters.abandon_dropped, 1);
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn advisory_eagain_and_capacity_pressure_never_extend_lifetime_or_allocate() {
++        let (mut workers, rx) = setup();
++        let worker = &mut workers[0];
++        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        let now = Duration::from_millis(1);
++        permit(worker, now);
++        CLOCK_CALLS.with(|c| c.set(0));
++        worker.io_time = Some(|now| {
++            CLOCK_CALLS.with(|c| {
++                let call = c.get();
++                c.set(call + 1);
++                if call == 1 {
++                    Err(io::ErrorKind::WouldBlock.into())
++                } else {
++                    Ok(now)
++                }
++            })
++        });
++        without_allocations(|| worker.use_sender_permit(now).unwrap());
++        empty(&rx);
++        assert_eq!(worker.sender.abandons.entries[0].unwrap().attempts, 0);
++        assert_eq!(worker.sender.abandons.entries[0].unwrap().expires, LIFETIME);
++        worker.io_time = Some(Ok);
++        pump(worker, now);
++        permit(worker, Duration::from_millis(3));
++        worker.use_sender_permit(Duration::from_millis(3)).unwrap();
++        pump(worker, Duration::from_millis(3));
++        receive(&rx);
++        without_allocations(|| {
++            for id in 2..=CAPACITY as u64 + 1 {
++                worker.queue_abandon(0, 0, (1 << 48) | id, now);
++            }
++        });
++        assert_eq!(worker.sender.abandons.count, CAPACITY);
++        assert_eq!(worker.counters.abandon_dropped, 1);
++        assert_eq!(worker.counters.abandon_retried, 0);
++    }
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn pinned_history_defers_advisory_without_spinning_or_burning_numbers() {
++        let (mut workers, _) = setup();
++        let worker = &mut workers[0];
++        worker.sender.lanes[0]
++            .history
++            .reserve(1, 112, true, true)
++            .unwrap();
++        worker.sender.lanes[0].history.submit(1, Duration::ZERO);
++        worker.sender.lanes[0]
++            .history
++            .reserve(65_536, 112, true, true)
++            .unwrap();
++        for _ in 0..1024 {
++            worker.sessions[0].tx[0]
++                .as_mut()
++                .unwrap()
++                .allocate_packets(64)
++                .unwrap();
++        }
++        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        let now = Duration::from_millis(1);
++        without_allocations(|| {
++            for _ in 0..32 {
++                worker.service_abandons(now).unwrap();
++            }
++            assert!(worker.sender.job.is_none());
++            assert_eq!(worker.abandon_deadline(), Some(now + RETRY));
++            assert_eq!(worker.sender.abandons.entries[0].unwrap().expires, LIFETIME);
++        });
++        assert_eq!(
++            worker.sessions[0].tx[0]
++                .as_mut()
++                .unwrap()
++                .allocate_packets(1)
++                .unwrap(),
++            65_538
++        );
++    }
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn retired_ack_proof_allows_only_the_remaining_bounded_copies() {
++        let (mut workers, rx) = setup();
++        let worker = &mut workers[0];
++        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        let now = Duration::from_millis(1);
++        permit(worker, now);
++        worker.use_sender_permit(now).unwrap();
++        pump(worker, now);
++        let first = receive(&rx);
++        let acked = Duration::from_millis(2);
++        worker
++            .incoming_ack(
++                0,
++                1,
++                1,
++                0,
++                AckRanges::new(&[AckRange {
++                    start: first,
++                    end: first,
++                }])
++                .unwrap(),
++                acked,
++            )
++            .unwrap();
++        pump(worker, acked);
++        assert!(worker.sender.lanes[0].history.acknowledged(first));
++        assert_eq!(worker.sender.abandons.count, 1); // Maintenance waits for retry due.
++        assert_eq!(
++            worker.sender.lanes[0]
++                .history
++                .retire_oldest_resolved()
++                .unwrap()
++                .unwrap()
++                .number,
++            first
++        );
++        assert!(!worker.sender.lanes[0].history.acknowledged(first));
++        for millis in [20, 40] {
++            let now = Duration::from_millis(millis);
++            permit(worker, now);
++            worker.use_sender_permit(now).unwrap();
++            pump(worker, now);
++            let number = receive(&rx);
++            assert!(number > first);
++            let acked = now + Duration::from_millis(1);
++            worker
++                .incoming_ack(
++                    0,
++                    1,
++                    1,
++                    0,
++                    AckRanges::new(&[AckRange {
++                        start: number,
++                        end: number,
++                    }])
++                    .unwrap(),
++                    acked,
++                )
++                .unwrap();
++            pump(worker, acked);
++            assert!(worker.sender.lanes[0].history.acknowledged(number));
++            worker.sender.lanes[0]
++                .history
++                .retire_oldest_resolved()
++                .unwrap()
++                .unwrap();
++        }
++        pump(worker, Duration::from_millis(60));
++        empty(&rx);
++        assert_eq!(worker.counters.abandon_sent, 3);
++        assert_eq!(worker.counters.abandon_retried, 2);
++        pump(worker, LIFETIME);
++        assert_eq!(worker.sender.abandons.count, 0);
++        assert_eq!(worker.counters.abandon_expired, 1);
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn expired_advisory_grant_defers_without_touching_data_or_lifetime() {
++        let (mut workers, rx) = setup();
++        let worker = &mut workers[0];
++        let data_number = retain_data_plan(worker);
++        let retained = worker.sessions[0].tx_retained;
++        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        permit(worker, Duration::from_millis(1));
++        let expires = worker
++            .sender
++            .flight
++            .as_ref()
++            .unwrap()
++            .grant()
++            .unwrap()
++            .expires();
++        assert!(expires < LIFETIME);
++        without_allocations(|| worker.use_sender_permit(expires).unwrap());
++        empty(&rx);
++        let advisory = worker.sender.abandons.entries[0].unwrap();
++        assert_eq!(advisory.due, expires + RETRY);
++        assert_eq!(advisory.expires, LIFETIME);
++        assert_eq!(advisory.attempts, 0);
++        assert_eq!(worker.counters.abandon_sent, 0);
++        assert_eq!(worker.sessions[0].tx_retained, retained);
++        assert_eq!(
++            worker.sessions[0].batches[0]
++                .as_ref()
++                .unwrap()
++                .plan
++                .packet(0)
++                .unwrap()
++                .number,
++            data_number
++        );
++    }
++}
+diff --git a/src/worker/sender/owner.rs b/src/worker/sender/owner.rs
+index 4d16d65..c4222e4 100644
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -1842,3 +1842,207 @@ mod window_evidence_tests {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod orphan_tests {
++    use super::*;
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn expired_split_frames_release_remote_capacity_before_receiver_deadline() {
++        let (mut workers, rx) = super::super::tests::workers();
++        let worker = &mut workers[0];
++        worker.io_time = Some(Ok);
++        worker.controls[0].probe_due = Duration::MAX;
++        assert!(
++            worker.sender.lanes[0]
++                .rtt
++                .sample(Duration::ZERO, Duration::from_millis(1), 0)
++        );
++        assert_eq!(
++            worker.sender.lanes[0].rtt.frame_lifetime(),
++            Duration::from_millis(20)
++        );
++        let mut input = worker.free.pop().unwrap();
++        input.session = 0;
++        input.lane = 0;
++        input.tag = 1;
++        input.length = 1514;
++        input.bytes[..1514].fill(0xa5);
++        input.deadline = reassembly::FRAME_LIFETIME;
++        input.tx_reserved = true;
++        worker.sessions[0].tx_retained += 1;
++        worker.sessions[0].tx_bytes += input.length;
++        worker.input_frame(input, Duration::ZERO).unwrap();
++
++        let deadline = Duration::from_millis(20);
++        let now = deadline - Duration::from_micros(1);
++        worker.flush_frames(now).unwrap();
++        let Some((0, Message::Request(mut request))) = worker.sender.outgoing.pop_front() else {
++            panic!("expected ordinary DATA request");
++        };
++        assert!(request.flight.packets().len() >= 2);
++        worker
++            .sender
++            .owner
++            .as_mut()
++            .unwrap()
++            .sender
++            .reserve_prefix(
++                0,
++                &mut request.flight,
++                1280,
++                false,
++                pacing::Limits {
++                    window: 1280,
++                    rate: 1_000_000_000,
++                    quantum: 65536,
++                    max_datagram: 1280,
++                },
++                now,
++            )
++            .unwrap();
++        assert_eq!(request.flight.packets().len(), 1);
++        worker
++            .sender_message(Message::Permit(request.flight), now)
++            .unwrap();
++        worker.use_sender_permit(now).unwrap();
++
++        let mut storage = [0; BASE_UDP_PAYLOAD];
++        let length = rx.recv(&mut storage).unwrap().0;
++        let datagram = Datagram::decode(&storage[..length]).unwrap();
++        let mut header = datagram.header();
++        let Some(Record::Data {
++            frame_id,
++            total_len: 1514,
++            offset: 0,
++            bytes,
++        }) = datagram.records().next()
++        else {
++            panic!("expected a frame prefix");
++        };
++        assert_eq!(frame_id, (1 << 48) | 1);
++        let prefix_length = bytes.len();
++        assert!(prefix_length < 1514);
++        let mut receiver = reassembly::Lane::new(1, 9022).unwrap();
++        assert_eq!(receiver.admit(&datagram, now), Admission::Fresh);
++        assert_eq!(receiver.ready_count(), 0);
++        assert_eq!(
++            rx.recv(&mut storage).unwrap_err().kind(),
++            io::ErrorKind::WouldBlock
++        );
++        for _ in 0..4 {
++            worker.service_sender(now).unwrap();
++        }
++        worker
++            .incoming_ack(
++                0,
++                1,
++                1,
++                0,
++                wire::AckRanges::new(&[wire::AckRange {
++                    start: header.packet_number,
++                    end: header.packet_number,
++                }])
++                .unwrap(),
++                now + Duration::from_nanos(100),
++            )
++            .unwrap();
++        for _ in 0..4 {
++            worker
++                .service_sender(now + Duration::from_nanos(100))
++                .unwrap();
++        }
++        assert_eq!(worker.sender.lanes[0].history.inflight_bytes(), 0);
++        assert!(!worker.expire_frames(deadline).unwrap());
++        while worker.cleanup_frames().unwrap() {}
++        assert_eq!(worker.counters.tx_expired_partial_frames, 1);
++        assert_eq!(worker.counters.tx_expired_unsent_frames, 0);
++        assert_eq!(worker.sessions[0].tx_retained, 0);
++        assert_eq!(receiver.retained_frames(), 1);
++
++        let mut now = Duration::from_millis(33);
++        for _ in 0..128 {
++            worker.service_sender(now).unwrap();
++            worker.flush_frames(now).unwrap();
++            loop {
++                let length = match rx.recv(&mut storage) {
++                    Ok((length, _)) => length,
++                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
++                    Err(error) => panic!("{error}"),
++                };
++                let datagram = Datagram::decode(&storage[..length]).unwrap();
++                header = datagram.header();
++                assert!(
++                    datagram
++                        .records()
++                        .any(|r| matches!(r, Record::FrameAbandon { origin: 0, .. }))
++                );
++                assert_eq!(receiver.admit(&datagram, now), Admission::Fresh);
++                worker
++                    .incoming_ack(
++                        0,
++                        1,
++                        1,
++                        0,
++                        wire::AckRanges::new(&[wire::AckRange {
++                            start: header.packet_number,
++                            end: header.packet_number,
++                        }])
++                        .unwrap(),
++                        now,
++                    )
++                    .unwrap();
++                for _ in 0..4 {
++                    worker.service_sender(now).unwrap();
++                }
++            }
++            now += Duration::from_micros(10);
++        }
++        assert_eq!(
++            receiver.retained_frames(),
++            0,
++            "expired sender prefix still occupies a receiver slot"
++        );
++        assert_eq!(receiver.expired_frames(), 0);
++        assert_eq!(worker.counters.abandon_sent, 1);
++
++        header.packet_number += 1;
++        let tail = [0xa5; 1514];
++        let length = wire::encode_datagram(
++            header,
++            &[Record::Data {
++                frame_id,
++                total_len: 1514,
++                offset: prefix_length as u32,
++                bytes: &tail[prefix_length..],
++            }],
++            &mut storage,
++        )
++        .unwrap();
++        assert_eq!(
++            receiver.admit(&Datagram::decode(&storage[..length]).unwrap(), now),
++            Admission::Fresh
++        );
++        assert_eq!(receiver.retained_frames(), 0);
++        assert_eq!(receiver.ready_count(), 0);
++
++        header.packet_number += 1;
++        let length = wire::encode_datagram(
++            header,
++            &[Record::Data {
++                frame_id: (1 << 48) | 65,
++                total_len: 60,
++                offset: 0,
++                bytes: &[7; 60],
++            }],
++            &mut storage,
++        )
++        .unwrap();
++        assert_eq!(
++            receiver.admit(&Datagram::decode(&storage[..length]).unwrap(), now),
++            Admission::Fresh
++        );
++        assert_eq!(receiver.front(now).unwrap().bytes, [7; 60]);
++    }
++}
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index d06e3c8..8611877 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -1,7 +1,7 @@
+ use super::super::tests::test_workers;
+ use super::*;
+ 
+-fn workers() -> ([Worker; 2], ReceiveSocket) {
++pub(super) fn workers() -> ([Worker; 2], ReceiveSocket) {
+     let (_, mut workers) = test_workers();
+     let params = wire::Params {
+         port: 40000,
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 07101de..1dd5098 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -8,6 +8,7 @@ use crate::{
+ };
+ use std::num::NonZeroU16;
+ 
++mod abandon;
+ mod history;
+ mod owner;
+ #[cfg(test)]
+@@ -178,6 +179,7 @@ impl Lane {
+ pub(super) enum JobKind {
+     Data,
+     Probe { length: usize, pmtu: bool },
++    Abandon { slot: usize, serial: u64 },
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -203,6 +205,7 @@ struct LossCheck {
+ }
+ 
+ pub(super) struct State {
++    abandons: abandon::Pending,
+     pub(super) owner: Option<Owner>,
+     pub(super) fresh: Vec<bool>,
+     reclaim: Option<usize>,
+@@ -295,6 +298,7 @@ impl State {
+             .map_err(io::Error::other)?;
+         losses.resize(config.path_groups(), None);
+         Ok(Self {
++            abandons: abandon::Pending::new(),
+             fresh: {
+                 let mut fresh = Vec::new();
+                 fresh
+@@ -1050,6 +1054,7 @@ impl Worker {
+                 }
+             }
+         }
++        self.service_abandons(now)?;
+         if self.sender.job.is_none() && self.sender.flight.is_some() {
+             for _ in 0..self.controls.len().min(BATCH_SIZE) {
+                 let session = self.sender.liveness_cursor;
+@@ -1413,7 +1418,7 @@ impl Worker {
+                 old_count = old_count.max(batch.plan.len());
+                 batch.plan.renumber(tx)
+             }
+-            JobKind::Probe { .. } => tx.allocate_packets(1),
++            JobKind::Probe { .. } | JobKind::Abandon { .. } => tx.allocate_packets(1),
+         };
+         let Ok(first) = first else { return Ok(false) };
+         let history = &mut self.sender.lanes[index].history;
+@@ -1474,8 +1479,11 @@ impl Worker {
+                 .is_none_or(|c| c.generation != job.generation)
+         {
+             self.rejected_sender_grant(job.session, job.lane, !grant.valid_at(now));
++            self.defer_abandon(job, now);
+             self.finish_sender_send(0, None, false)?;
+-            if let Some(batch) = self.sessions[job.session].batches[job.lane].as_mut() {
++            if matches!(job.kind, JobKind::Data)
++                && let Some(batch) = self.sessions[job.session].batches[job.lane].as_mut()
++            {
+                 batch.discard(Some(&mut self.sender.lanes[index].history));
+             }
+             return Ok(());
+@@ -1484,14 +1492,20 @@ impl Worker {
+             && !self.refresh_sender_numbers(job, index)?
+         {
+             self.rejected_sender_grant(job.session, job.lane, false);
++            self.defer_abandon(job, now);
+             self.finish_sender_send(0, None, false)?;
+-            if let Some(batch) = self.sessions[job.session].batches[job.lane].as_mut() {
++            if matches!(job.kind, JobKind::Data)
++                && let Some(batch) = self.sessions[job.session].batches[job.lane].as_mut()
++            {
+                 batch.discard(Some(&mut self.sender.lanes[index].history));
+             }
+             return Ok(());
+         }
+         let job = self.sender.job.ok_or(io::ErrorKind::InvalidData)?;
+         match job.kind {
++            JobKind::Abandon { slot, serial } => {
++                self.send_abandon(job, slot, serial, now)?;
++            }
+             JobKind::Data => {
+                 let mut batch = self.sessions[job.session].batches[job.lane]
+                     .take()
+diff --git a/src/worker.rs b/src/worker.rs
+index 7607e4d..fc61260 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -2613,7 +2613,11 @@ impl Worker {
+         } else {
+             TxExpiry::Sent
+         };
+-        self.record_tx_expiry(source.session, frame.lane, 1, kind);
++        let (session, lane, id, tag) = (source.session, frame.lane, frame.id, source.tag);
++        self.record_tx_expiry(session, lane, 1, kind);
++        if submitted != 0 && self.matches(session, tag) {
++            self.queue_abandon(session, lane, id, now);
++        }
+         true
+     }
+ 
+@@ -4074,6 +4078,9 @@ impl Worker {
+         if let Some(at) = self.sender.feedback_deadline() {
+             due = due.min(at);
+         }
++        if let Some(at) = self.abandon_deadline() {
++            due = due.min(at);
++        }
+         if let Some(feedback) = self.feedback_deadline() {
+             due = due.min(feedback);
+         }

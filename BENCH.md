@@ -83,6 +83,72 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Source expiry leaves receive slots occupied (November 8)
+
+A real-socket regression verifies another source of reassembly pressure.
+An ordinary sender grant can end after a frame prefix. If the unsent tail
+then reaches its original source deadline, the source releases it while the
+receiver retains the prefix until its own 100 ms deadline. In the baseline
+regression, 64 such frames fill a receive lane on a lossless socket. Unrelated
+DATA then encounters admission pressure and remains unacknowledged.
+This proves the mechanism; it does not attribute all measured loss to it.
+
+A candidate queues origin-0 FRAME_ABANDON when an expired frame has submitted
+pieces. It uses 128 bounded metadata slots per worker, ordinary transmission
+credit, fresh packet numbers, at most three successful copies and a fixed
+100 ms advisory lifetime. Payload release and packet-charge settlement remain
+independent. The regression verifies prompt receive-slot release, terminal
+suppression of a delayed tail and admission of unrelated DATA. Retained ACK
+proof cancels retries; retired proof can permit a redundant bounded copy.
+
+Sending each advisory in its own grant regresses throughput and is rejected
+for production. The twenty-second release-musl A/B/A sweeps below compare
+uninstrumented binaries at normal controller settings. They use eight workers
+and lanes, sixteen QinQ flows, 1522-byte frames, 500-entry TAP queues, fixed CPU
+placement, and active PMTU capped at a 1452-byte UDP payload. Builds, kernel
+tests and Git packing were stopped during load.
+[Raw observations](benches/tap-source-abandon-unbatched.json) retain binaries,
+source revision, all counters and distinct CPU/counter observation intervals.
+The [candidate patch](benches/source-abandon-unbatched.patch) preserves the
+rejected implementation and its regression tests.
+
+| Build | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| Baseline before | 1 Gbit/s | 0.990 / 0.982 | 0.13 / 0.90 | 102.28 / 95.14 |
+| Baseline before | 4 Gbit/s | 1.706 / 1.575 | 56.68 / 60.07 | 214.92 / 205.90 |
+| Baseline before | 21 Gbit/s | 1.728 / 1.585 | 91.64 / 92.26 | 212.99 / 204.46 |
+| Baseline before | Unlimited | 1.607 / 1.558 | 97.30 / 96.74 | 201.54 / 195.24 |
+| One advisory/grant | 1 Gbit/s | 0.964 / 0.964 | 1.53 / 1.41 | 103.42 / 97.32 |
+| One advisory/grant | 4 Gbit/s | 1.015 / 0.973 | 73.96 / 75.21 | 213.68 / 199.55 |
+| One advisory/grant | 21 Gbit/s | 1.140 / 1.036 | 94.47 / 94.98 | 219.98 / 204.71 |
+| One advisory/grant | Unlimited | 1.112 / 1.049 | 98.02 / 97.99 | 222.91 / 207.44 |
+| Baseline after | 1 Gbit/s | 0.983 / 0.982 | 0.82 / 0.91 | 101.98 / 96.33 |
+| Baseline after | 4 Gbit/s | 1.764 / 1.556 | 55.23 / 60.54 | 221.31 / 209.91 |
+| Baseline after | 21 Gbit/s | 1.740 / 1.579 | 91.57 / 92.36 | 215.86 / 207.78 |
+| Baseline after | Unlimited | 1.740 / 1.592 | 97.01 / 96.96 | 215.62 / 207.09 |
+
+At unlimited load, admission pressure falls from 10,132–16,033 / 479–3,090
+events in the baseline repeats to zero. Incomplete receive-frame expiries fall
+from 25,774–26,484 / 21,318–22,446 to 10,450 / 11,945. Throughput nevertheless
+falls below both baseline repeats, while CPU rises to 222.91 / 207.44%.
+The candidate sends 95,969 / 74,756 advisory records, drops 100,245 / 65,788
+at its bounded pending pool, and expires 36,956 / 40,331 metadata entries
+without retained ACK proof.
+Fully submitted source-frame expiries (201,199 / 154,998) outnumber partial
+expiries (31,678 / 25,540); both can create advisories. Remaining worker queue
+drops are 1,868 / 24,134 and total frame expiries 2,317,258 / 2,699,862.
+All twelve points have zero socket overflow, inner UDP errors, corruption,
+duplicates, reordering and outer fragmentation. Counter units differ and
+cannot be summed into an exact loss total.
+
+The candidate passes 350 ordinary release tests, formatting, Clippy, all 82
+library kernel tests on Linux 7 and all three original runtime tests with
+unchanged deadlines and allocation checks. One runtime pass does not close
+the earlier intermittent migration failure. Origin-1 and lane-retirement
+transmission remain unfinished. The next experiment batches same-lane
+advisories to test the cost of one grant per record; it must establish a gain
+before adoption.
+
 ## Shorter transmit-handoff batches (November 8)
 
 Reducing each producer's handoff quota from 64 to 8 events yields no goodput
