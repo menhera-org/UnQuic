@@ -83,6 +83,60 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Overload leaves little time after final original submission (November 8)
+
+An isolated diagnostic measures the remaining lifetime when a frame's final
+original piece is successfully submitted, using the existing actual-send time.
+A second histogram measures each ACK-report chunk's age at staging start,
+using its original userspace receive timestamp and a fresh clock read.
+There is no per-frame timing storage or scheduling change. The fourteen extra
+counters and clock reads add measurement overhead.
+
+A twenty-second release-musl A/B/A sequence uses one TX lane, eight workers
+and TAP queues, and the same QinQ workload and placement as the abandonment
+experiments. [Raw results](benches/tap-expiry-timing.json) retain all twelve
+points and histograms. The [diagnostic patch](benches/expiry-timing.patch)
+applies to the ordinary baseline; it is not production code.
+
+| Build | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| Baseline before | 4 Gbit/s | 1.879 / 1.814 | 52.59 / 54.24 | 147.74 / 146.55 |
+| Baseline before | Unlimited | 0.506 / 0.495 | 98.50 / 98.45 | 199.26 / 198.12 |
+| Timing diagnostic | 4 Gbit/s | 1.917 / 1.864 | 51.59 / 52.99 | 148.02 / 147.92 |
+| Timing diagnostic | Unlimited | 0.496 / 0.587 | 98.62 / 98.07 | 202.38 / 195.44 |
+| Baseline after | 4 Gbit/s | 1.921 / 1.863 | 51.55 / 53.01 | 146.63 / 147.87 |
+| Baseline after | Unlimited | 0.516 / 0.454 | 98.50 / 98.58 | 196.68 / 200.84 |
+
+| Candidate offered each way | Final fresh submissions with ≤250 µs left, % L / R | With ≤1 ms left, % L / R | ACK chunks staged within 250 µs, % L / R |
+| --- | --- | --- | --- |
+| 4 Gbit/s | 0.16 / 0.80 | 0.92 / 4.15 | 96.94 / 92.36 |
+| 21 Gbit/s | 33.14 / 37.51 | 81.68 / 85.11 | 96.84 / 96.43 |
+| Unlimited | 58.87 / 50.63 | 97.25 / 90.21 | 98.86 / 96.88 |
+
+At unlimited load, 605,173 / 590,208 final original submissions have at most
+250 µs left. Fully submitted frame expiries are 597,228 / 584,528.
+These close totals are not a per-frame join: they do not prove that the same
+frames expired or that an expired frame failed to reach TAP. Only 1 / 17 ACK
+chunks take more than 1 ms from userspace receipt to staging, out of
+41,273 / 48,471 chunks. Routine multi-millisecond delay in that measured part
+of the ACK path is therefore not supported. Remote ACK generation, pre-read
+socket queueing and missing ACK coverage remain outside this measurement.
+
+Candidate unlimited admission pressure is 180,665 / 201,695. Late original
+completion is verified; time in source queues, materialized queues, pacing
+and unfinished-tail service remains unseparated. A blanket early-deadline
+rejection could discard tails of already-started frames and cycle the same
+grant request. The next candidate instead limits fresh unsent backlog when
+admitting new sources, preserving admitted tails, repairs and original deadlines.
+
+All twelve points have zero outer socket overflow, inner UDP errors,
+corruption, duplicates and outer fragmentation. Reordering is nonzero at
+21 Gbit/s, at most 0.00424%; the final baseline also reorders
+0.00260 / 0.00141% unlimited. The diagnostic passes 350 ordinary release tests,
+formatting, strict Clippy, four affected kernel tests and all 74 library kernel
+tests on Linux 6.8. It establishes no throughput improvement; the original
+runtime integration suite was not rerun for this instrumentation.
+
 ## Delaying abandonment requests does not remove collapse (November 8)
 
 A second candidate waits up to 5 ms before requesting the first transmission
