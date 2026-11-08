@@ -89,6 +89,48 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Gauge accumulation alone also loses paced goodput (November 8)
+
+Removing only the two retained-gauge summation passes is a smaller version of
+the experiment below. This [candidate](benches/rx-totals.patch) accumulates
+frame and byte counts during the existing TAP flush. It adds no bitmap and
+changes neither session layout nor deadline or barrier scans.
+
+[The release comparison](benches/tap-rx-totals.json) uses the same
+thirty-second QinQ setup as the bitmap experiment, with fresh production/
+candidate/production phases and no overlapping local build or kernel test.
+
+| Build | Requested each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| Production before | 4G | 1.738 / 1.574 | 56.07 / 60.27 | 222.73 / 210.74 |
+| Production before | 21G | 1.738 / 1.562 | 91.62 / 92.47 | 218.52 / 209.15 |
+| Production before | unlimited | 1.734 / 1.568 | 96.93 / 97.00 | 217.03 / 207.79 |
+| Gauge fusion | 4G | 1.745 / 1.493 | 55.88 / 62.31 | 216.04 / 209.74 |
+| Gauge fusion | 21G | 1.699 / 1.557 | 91.81 / 92.48 | 214.05 / 207.46 |
+| Gauge fusion | unlimited | 1.770 / 1.576 | 96.81 / 97.03 | 216.80 / 207.85 |
+| Production after | 4G | 1.647 / 1.604 | 58.47 / 59.58 | 218.69 / 208.45 |
+| Production after | 21G | 1.712 / 1.570 | 91.76 / 92.44 | 215.90 / 205.83 |
+| Production after | unlimited | 1.696 / 1.554 | 96.92 / 96.89 | 212.76 / 201.52 |
+
+Reverse 4G goodput falls 5.1–6.9% below both controls. Unlimited delivery rises
+2.1–4.4 / 0.5–1.4%, but CPU falls against one control and rises against the
+other. At 21G both directions trail both controls. **This candidate is also
+rejected.** The recurring paced regression is not specific to the bitmap;
+its scheduling cause remains unverified. These small fixed-cost changes do
+not resolve the sender ceiling.
+
+All nine points have zero corruption, duplicate delivery, reordering, outer
+socket overflow and outer fragmentation. The closing production unlimited
+point reports eight forward inner socket-overflow SKBs and eight matching
+inner UDP receive errors; all other points report zero. Candidate unlimited
+admission pressure is 24390 / 6654, queue drops 2241 / 36356, expiry
+1940765 / 2904397 frames and TAP ingress drops 3097597 / 2913980 SKBs.
+Full counter classes and per-worker CPU remain in the JSON.
+
+Validation passes 354 ordinary release-musl tests, strict Clippy and formatting,
+plus 82 library kernel tests and three runtime tests on both Linux 6.8 and 7.0.
+No production code from either receive-scan experiment is retained.
+
 ## Occupied receive-slot scans do not establish a throughput gain (November 8)
 
 The November 6 review identifies fixed per-turn receive scans as a smaller
@@ -127,8 +169,7 @@ The bitmap's reverse 4G goodput is below both controls in both comparisons:
 High-load CPU reductions therefore do not establish a consistent bidirectional
 gain. **The bitmap candidate is rejected.** Its scheduling effect remains
 unattributed; these measurements do not prove that fixed scans are free.
-A separate candidate will test gauge accumulation without the bitmap or
-session-layout change.
+The separate gauge-only comparison above also loses reverse paced goodput.
 
 All fifteen points have zero corrupt, duplicate, reordered, out-of-window or
 wrong-run application records, outer socket overflow, inner UDP errors and

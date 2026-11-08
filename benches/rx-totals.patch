@@ -1,0 +1,97 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index b52bcff..fa416dd 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -3183,6 +3183,8 @@ impl Worker {
+         for session in 0..self.sessions.len() {
+             let readable = self.tap_capacity(session) != 0;
+             let mut writable = false;
++            let mut frames = 0;
++            let mut bytes = 0;
+             for slot in 0..LANES {
+                 let local = &mut self.sessions[session];
+                 let Some(lane) = &mut local.rx[slot] else {
+@@ -3209,12 +3211,13 @@ impl Worker {
+                     writable |= self.flush_rx(session, slot, now);
+                 }
+                 self.refresh_rx_counters(session, slot);
++                let totals = &self.sessions[session].rx_totals[slot];
++                frames += totals.reassembly_frames;
++                bytes += totals.reassembly_bytes;
+             }
+             let local = &mut self.sessions[session];
+-            local.totals.reassembly_frames =
+-                local.rx_totals.iter().map(|s| s.reassembly_frames).sum();
+-            local.totals.reassembly_bytes =
+-                local.rx_totals.iter().map(|s| s.reassembly_bytes).sum();
++            local.totals.reassembly_frames = frames;
++            local.totals.reassembly_bytes = bytes;
+             if !writable {
+                 local.tap_blocked = false;
+             }
+@@ -5926,6 +5929,65 @@ mod tests {
+         assert_eq!(worker.counters.queue_drops, 0);
+     }
+ 
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn sparse_receive_slots_keep_deadlines_and_retention_totals() {
++        let (mut worker, _tap) = receive_worker();
++        worker.setup_due = Duration::from_secs(1);
++        worker.mtu_jobs.clear();
++        let mut lane = worker.sessions[0].free.pop().unwrap();
++        lane.reset(8, 9022).unwrap();
++        worker.sessions[0].rx[63] = Some(lane);
++        worker.sessions[0].rx_index[8] = 64;
++        worker.shared.owners[0][8].store(1, Ordering::Release);
++        worker.install_rx_counters(0, 63);
++        for (slot, id) in [(0, 7), (63, 8)] {
++            let mut bytes = [0; 128];
++            let length = wire::encode_datagram(
++                Header {
++                    cookie: crate::UnquicUuid::from_bytes([1; 16]),
++                    receive_tag: 1,
++                    lane: id,
++                    record_area_len: 0,
++                    packet_number: 1,
++                },
++                &[Record::Data {
++                    frame_id: (u64::from(id) << 48) | 1,
++                    total_len: 60,
++                    offset: 0,
++                    bytes: &[5; 30],
++                }],
++                &mut bytes,
++            )
++            .unwrap();
++            assert_eq!(
++                worker.sessions[0].rx[slot]
++                    .as_mut()
++                    .unwrap()
++                    .admit(&Datagram::decode(&bytes[..length]).unwrap(), Duration::ZERO,),
++                Admission::Fresh
++            );
++        }
++        worker.flush_taps(Duration::ZERO).unwrap();
++        assert_eq!(worker.sessions[0].totals.reassembly_frames, 2);
++        assert_eq!(worker.sessions[0].totals.reassembly_bytes, 120);
++        worker.sessions[0].ack_inflight = 1;
++        let ack_due = worker.sessions[0].rx[63].as_ref().unwrap().ack_deadline();
++        assert_eq!(worker.deadline(Duration::ZERO), ack_due);
++        worker.sessions[0].ack_inflight = 1 | (1_u64 << 63);
++        assert_eq!(
++            worker.deadline(Duration::ZERO),
++            Some(reassembly::FRAME_LIFETIME)
++        );
++        worker.shared.owners[0][8].store(255, Ordering::Release);
++        worker.flush_taps(Duration::ZERO).unwrap();
++        assert_eq!(worker.sessions[0].totals.reassembly_frames, 1);
++        assert_eq!(worker.sessions[0].totals.reassembly_bytes, 60);
++        worker.flush_taps(reassembly::FRAME_LIFETIME).unwrap();
++        assert_eq!(worker.sessions[0].totals.reassembly_frames, 0);
++        assert_eq!(worker.sessions[0].totals.reassembly_bytes, 0);
++    }
++
+     #[test]
+     #[ignore = "kernel descriptor test; run in a disposable container"]
+     fn receive_bursts_budget_expanded_datagrams_records_and_bytes() {
