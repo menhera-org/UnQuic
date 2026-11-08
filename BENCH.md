@@ -89,6 +89,68 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Credit available at first send completion (November 8)
+
+The [isolated diagnostic](benches/completion-opportunity.patch) samples one in
+64 send completions that encounter an open issuance cycle. It checks pending
+ordinary DATA requests before and after the unchanged completion accounting.
+Only sampled completions take a fresh clock reading and scan the bounded
+request array. No grant, feedback, packet ordering or deadline changes.
+
+[Six release observations](benches/tap-completion-opportunity.json) use
+thirty-second QinQ points, eight workers/lanes, sixteen 44-segment flows per
+direction, inner MTU 1500, 500-entry TAP queues and active PMTU discovery capped
+at 1452 outer UDP bytes. Daemons persist through paced and unlimited points.
+No build, local kernel test or Git packing overlaps load.
+
+| Build | Requested each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| Production before | 21G | 1.749 / 1.539 | 91.53 / 92.53 | 218.42 / 209.41 |
+| Production before | unlimited | 1.741 / 1.596 | 96.98 / 97.04 | 214.35 / 205.60 |
+| Instrumented | 21G | 1.788 / 1.521 | 91.39 / 92.68 | 219.22 / 211.73 |
+| Instrumented | unlimited | 1.690 / 1.572 | 97.09 / 97.23 | 213.62 / 207.12 |
+| Production after | 21G | 1.791 / 1.600 | 91.36 / 92.29 | 220.08 / 211.63 |
+| Production after | unlimited | 1.757 / 1.589 | 96.94 / 97.11 | 219.75 / 209.71 |
+
+The instrumented unlimited forward rate is 3.0–3.8% below the two controls.
+This comparison does not rule out measurement overhead; it is not a throughput
+improvement. Production remains far below both original performance targets.
+
+| Sampled completion observation, L / R | 21G | Unlimited |
+| --- | ---: | ---: |
+| Samples | 1946 / 2028 | 1845 / 1981 |
+| Mean valid pending DATA requests | 3.83 / 5.26 | 3.87 / 4.93 |
+| Pacing deadline passed (%) | 35.10 / 35.26 | 35.12 / 29.58 |
+| At least one request fits before reporting (%) | 4.06 / 3.75 | 4.28 / 5.20 |
+| At least one request fits after reporting, hypothetically (%) | 6.58 / 4.98 | 6.72 / 5.96 |
+| Mean remaining window before reporting (bytes) | 5688 / 4167 | 5636 / 5138 |
+
+A fit requires the first packet to meet current pacing, sampling-slot,
+window and quantum limits. Differing-MTU requests are excluded: 2573 such
+request observations occur on the right at 21G, none in the other three
+cases. These are completion-event samples including drain, not time-weighted
+occupancy. They neither invoke the next controller transition nor predict a
+full grant.
+
+The small pre-report opportunity does not support a large gain from simply
+serving queued requests before first-completion closure. Post-report credit
+cannot be reused blindly: completion has already closed issuance, and ordered
+sample installation and aggregate burst accounting still apply. The diagnostic
+remains outside production.
+
+At instrumented unlimited load, L/R counters record 22779 / 6896 admission
+pressure events, 2286 / 36300 queue drops, and 2117045 / 2904045 expired
+frames. Never-submitted expiry accounts for 1732058 / 2490582 of those frames.
+TAP ingress drops are 3252762 / 3128752 SKBs; units differ and cannot be summed
+into an exact loss total. All six points have zero socket overflow, inner UDP
+errors, corruption, duplicates and outer fragmentation. The closing production
+21G point reports seventeen reordered frames forward; its cause is unverified.
+
+The patch passes 356 ordinary release-musl tests, strict Clippy and formatting.
+Focused regressions cover full, partial and unused completions, returned credit,
+pacing, stale generations, MTU differences and exclusion of every probe kind.
+Kernel tests were not repeated for this observational candidate.
+
 ## Address-replacement test deadline (November 8)
 
 The existing cancellation regression now proves that local cancellation does

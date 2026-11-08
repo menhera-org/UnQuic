@@ -1,0 +1,467 @@
+diff --git a/src/counters.rs b/src/counters.rs
+index f3a6ae0..6e60764 100644
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -155,6 +155,46 @@ metrics! {
+     feedback_delay_ns: max,
+     /// Current pacing rate in outer IP bytes per second.
+     pacing_bytes_per_second: sum,
++    /// Diagnostic only: Accepted send completions, sampled or not.
++    opportunity_completions: sum,
++    /// Diagnostic only: Accepted completions that close an Open issuance epoch.
++    opportunity_open_completions: sum,
++    /// Diagnostic only: One observed Open completion in every 64; all following sums use these samples.
++    opportunity_samples: sum,
++    /// Diagnostic only: Valid queued ordinary DATA requests observed across samples; requests, not samples.
++    opportunity_pending: sum,
++    /// Diagnostic only: Samples whose rate is nonzero and pacing deadline has passed.
++    opportunity_pacing: sum,
++    /// Diagnostic only: Sum of free sampling slots before completion; slots.
++    opportunity_pre_slots: sum,
++    /// Diagnostic only: Sum of free sampling slots after completion; slots.
++    opportunity_post_slots: sum,
++    /// Diagnostic only: Sum of remaining window before completion; outer IPv6 bytes.
++    opportunity_pre_window: sum,
++    /// Diagnostic only: Sum of remaining window after completion; outer IPv6 bytes.
++    opportunity_post_window: sum,
++    /// Diagnostic only: Sum of remaining quantum before completion; outer IPv6 bytes.
++    opportunity_pre_quantum: sum,
++    /// Diagnostic only: Sum of remaining quantum after completion; outer IPv6 bytes.
++    opportunity_post_quantum: sum,
++    /// Diagnostic only: Valid requests excluded from fit counts because their MTU differs from current limits.
++    opportunity_mtu_mismatch: sum,
++    /// Diagnostic only: Matched-MTU requests whose first packet fits pre-report window; requests.
++    opportunity_pre_window_fit: sum,
++    /// Diagnostic only: Matched-MTU requests whose first packet fits post-report window; requests.
++    opportunity_post_window_fit: sum,
++    /// Diagnostic only: Matched-MTU requests whose first packet fits pre-report quantum; requests.
++    opportunity_pre_quantum_fit: sum,
++    /// Diagnostic only: Matched-MTU requests whose first packet fits post-report quantum; requests.
++    opportunity_post_quantum_fit: sum,
++    /// Diagnostic only: Matched-MTU requests fitting pacing, one sample slot, window and quantum before report.
++    opportunity_pre_fit: sum,
++    /// Diagnostic only: Same hypothetical fit after report, ignoring the now-closed issuance epoch.
++    opportunity_post_fit: sum,
++    /// Diagnostic only: Samples containing at least one pre-report credit-fit request.
++    opportunity_pre_any: sum,
++    /// Diagnostic only: Samples containing at least one hypothetical post-report credit-fit request.
++    opportunity_post_any: sum,
+     /// Issued send permissions received by transmit workers.
+     send_grants: sum,
+     /// Send permissions rejected after their submission interval elapsed.
+diff --git a/src/pacing/sender.rs b/src/pacing/sender.rs
+index 27b892d..44bd63d 100644
+--- a/src/pacing/sender.rs
++++ b/src/pacing/sender.rs
+@@ -359,6 +359,12 @@ impl Sender {
+             .checked_add(workers.checked_mul(size_of::<Flight>() + size_of::<Box<Flight>>())?)
+     }
+ 
++    pub(crate) fn issuance_open(&self, group: usize) -> bool {
++        self.groups
++            .get(group)
++            .is_some_and(|state| state.phase == Phase::Open)
++    }
++
+     /// Unreserved sampling slots; expired grants still hold their slots.
+     pub const fn available(&self) -> usize {
+         self.available
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 7457ab9..5eb81b4 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -591,12 +591,23 @@ impl Worker {
+                 .as_mut()
+                 .ok_or(io::ErrorKind::InvalidData)?
+                 .request(request)?,
+-            Message::Complete(flight) => self
+-                .sender
+-                .owner
+-                .as_mut()
+-                .ok_or(io::ErrorKind::InvalidData)?
+-                .complete(flight)?,
++            Message::Complete(flight) => {
++                let sample = self
++                    .sender
++                    .owner
++                    .as_ref()
++                    .is_some_and(|owner| owner.sample_completion(&flight));
++                let observed = if sample {
++                    Some(self.io_clock(now)()?)
++                } else {
++                    None
++                };
++                self.sender
++                    .owner
++                    .as_mut()
++                    .ok_or(io::ErrorKind::InvalidData)?
++                    .complete_observed(flight, observed)?;
++            }
+             Message::Report(report) => self
+                 .sender
+                 .owner
+@@ -1225,6 +1236,7 @@ impl Worker {
+             0,
+             Message::Request(Request {
+                 flight,
++                diagnostic_data: true,
+                 group: self.sender.lanes[index].group,
+                 deadline,
+                 probe: None,
+@@ -1317,6 +1329,7 @@ impl Worker {
+             0,
+             Message::Request(Request {
+                 flight,
++                diagnostic_data: false,
+                 group: self.sender.lanes[index].group,
+                 deadline,
+                 probe,
+@@ -1641,6 +1654,32 @@ impl Worker {
+ 
+ impl Worker {
+     pub(super) fn publish_sender(&mut self) {
++        if let Some(owner) = &self.sender.owner {
++            self.counters.opportunity_completions = owner.opportunity.opportunity_completions;
++            self.counters.opportunity_open_completions =
++                owner.opportunity.opportunity_open_completions;
++            self.counters.opportunity_samples = owner.opportunity.opportunity_samples;
++            self.counters.opportunity_pending = owner.opportunity.opportunity_pending;
++            self.counters.opportunity_pacing = owner.opportunity.opportunity_pacing;
++            self.counters.opportunity_pre_slots = owner.opportunity.opportunity_pre_slots;
++            self.counters.opportunity_post_slots = owner.opportunity.opportunity_post_slots;
++            self.counters.opportunity_pre_window = owner.opportunity.opportunity_pre_window;
++            self.counters.opportunity_post_window = owner.opportunity.opportunity_post_window;
++            self.counters.opportunity_pre_quantum = owner.opportunity.opportunity_pre_quantum;
++            self.counters.opportunity_post_quantum = owner.opportunity.opportunity_post_quantum;
++            self.counters.opportunity_mtu_mismatch = owner.opportunity.opportunity_mtu_mismatch;
++            self.counters.opportunity_pre_window_fit = owner.opportunity.opportunity_pre_window_fit;
++            self.counters.opportunity_post_window_fit =
++                owner.opportunity.opportunity_post_window_fit;
++            self.counters.opportunity_pre_quantum_fit =
++                owner.opportunity.opportunity_pre_quantum_fit;
++            self.counters.opportunity_post_quantum_fit =
++                owner.opportunity.opportunity_post_quantum_fit;
++            self.counters.opportunity_pre_fit = owner.opportunity.opportunity_pre_fit;
++            self.counters.opportunity_post_fit = owner.opportunity.opportunity_post_fit;
++            self.counters.opportunity_pre_any = owner.opportunity.opportunity_pre_any;
++            self.counters.opportunity_post_any = owner.opportunity.opportunity_post_any;
++        }
+         self.counters.rtt_ns = 0;
+         self.counters.bytes_in_flight = 0;
+         self.counters.pacing_bytes_per_second = 0;
+diff --git a/src/worker/sender/owner.rs b/src/worker/sender/owner.rs
+index 4d16d65..5033306 100644
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -10,6 +10,7 @@ pub(super) const SAMPLE_SLOTS: usize = 65_535;
+ 
+ pub(crate) struct Request {
+     pub flight: Box<Flight>,
++    pub diagnostic_data: bool,
+     pub group: usize,
+     pub deadline: Duration,
+     pub probe: Option<u64>,
+@@ -43,6 +44,7 @@ struct Group {
+ 
+ pub(in crate::worker) struct Owner {
+     sender: Sender,
++    pub(super) opportunity: Snapshot,
+     pub(super) timers: timers::Timers,
+     groups: Vec<Group>,
+     requests: Vec<Option<Request>>,
+@@ -108,6 +110,7 @@ impl Owner {
+                 round_due: None,
+                 rescan: false,
+                 request_cursor: 0,
++                opportunity: Snapshot::default(),
+                 due: None,
+             },
+             flights,
+@@ -146,9 +149,36 @@ impl Owner {
+         Ok(())
+     }
+ 
++    pub(super) fn sample_completion(&self, flight: &Flight) -> bool {
++        flight
++            .group()
++            .is_some_and(|group| self.sender.issuance_open(group))
++            && self
++                .opportunity
++                .opportunity_open_completions
++                .is_multiple_of(64)
++    }
++
++    #[cfg(test)]
+     pub(super) fn complete(&mut self, flight: Box<Flight>) -> io::Result<()> {
++        self.complete_observed(flight, None)
++    }
++
++    pub(super) fn complete_observed(
++        &mut self,
++        flight: Box<Flight>,
++        observed: Option<Duration>,
++    ) -> io::Result<()> {
+         let sent = flight.completion().is_some_and(|(count, _, _)| count != 0);
+         let group = flight.group().ok_or(io::ErrorKind::InvalidInput)?;
++        let open = self.sender.issuance_open(group);
++        let before = if open && observed.is_some() {
++            self.sender
++                .flight_bytes(group)
++                .map(|credit| (credit, self.sender.available()))
++        } else {
++            None
++        };
+         self.sender
+             .reported(flight)
+             .map_err(|(error, _)| io::Error::other(format!("sender completion: {error}")))?;
+@@ -162,6 +192,88 @@ impl Owner {
+             && inflight != 0
+             && limits.window.saturating_sub(inflight) < u64::from(limits.max_datagram);
+         self.rescan |= group < self.cursor;
++        self.opportunity.opportunity_completions += 1;
++        self.opportunity.opportunity_open_completions += u64::from(open);
++        if let (Some(now), Some((before, slots))) = (observed, before) {
++            self.observe_completion(group, before, slots, now)?;
++        }
++        Ok(())
++    }
++
++    fn observe_completion(
++        &mut self,
++        group: usize,
++        before: (u64, u64),
++        slots: usize,
++        now: Duration,
++    ) -> io::Result<()> {
++        let mut limits = self.groups[group].controller.limits();
++        if self.groups[group].pto.stalled() {
++            limits.window = 0;
++        }
++        let after = self
++            .sender
++            .flight_bytes(group)
++            .ok_or(io::ErrorKind::InvalidData)?;
++        let quantum = u64::from(limits.quantum.min(64 * u32::from(limits.max_datagram)));
++        let pre_window = limits
++            .window
++            .saturating_sub(before.0)
++            .saturating_sub(before.1);
++        let post_window = limits
++            .window
++            .saturating_sub(after.0)
++            .saturating_sub(after.1);
++        let pre_quantum = quantum.saturating_sub(before.0);
++        let post_quantum = quantum.saturating_sub(after.0);
++        let post_slots = self.sender.available();
++        let pacing = limits.rate != 0 && self.sender.deadline(group, now).is_none();
++        let d = &mut self.opportunity;
++        d.opportunity_samples += 1;
++        d.opportunity_pacing += u64::from(pacing);
++        d.opportunity_pre_slots += slots as u64;
++        d.opportunity_post_slots += post_slots as u64;
++        d.opportunity_pre_window += pre_window;
++        d.opportunity_post_window += post_window;
++        d.opportunity_pre_quantum += pre_quantum;
++        d.opportunity_post_quantum += post_quantum;
++        let mut pre_any = false;
++        let mut post_any = false;
++        for request in self.requests.iter().flatten() {
++            if !request.diagnostic_data
++                || request.group != group
++                || request.probe.is_some()
++                || request.pmtu
++                || now >= request.deadline
++            {
++                continue;
++            }
++            let Some(packet) = request.flight.packets().next() else {
++                continue;
++            };
++            if !self.timers.matches(packet.id) {
++                continue;
++            }
++            d.opportunity_pending += 1;
++            // Do not mutate the controller to predict a differently sized request.
++            if request.mtu != limits.max_datagram {
++                d.opportunity_mtu_mismatch += 1;
++                continue;
++            }
++            let bytes = u64::from(packet.bytes);
++            d.opportunity_pre_window_fit += u64::from(bytes <= pre_window);
++            d.opportunity_post_window_fit += u64::from(bytes <= post_window);
++            d.opportunity_pre_quantum_fit += u64::from(bytes <= pre_quantum);
++            d.opportunity_post_quantum_fit += u64::from(bytes <= post_quantum);
++            let pre = pacing && slots != 0 && bytes <= pre_window && bytes <= pre_quantum;
++            let post = pacing && post_slots != 0 && bytes <= post_window && bytes <= post_quantum;
++            d.opportunity_pre_fit += u64::from(pre);
++            d.opportunity_post_fit += u64::from(post);
++            pre_any |= pre;
++            post_any |= post;
++        }
++        d.opportunity_pre_any += u64::from(pre_any);
++        d.opportunity_post_any += u64::from(post_any);
+         Ok(())
+     }
+ 
+@@ -746,6 +858,105 @@ impl Owner {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn completion_opportunity_distinguishes_returned_credit_from_send_capacity() {
++        for sent in [0, 5, 10] {
++            let (mut owner, flights) =
++                Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)], Duration::ZERO).unwrap();
++            owner.timers.install(0, 1).unwrap();
++            let mut flights = flights.into_vec().into_iter();
++            let mut outgoing = VecDeque::with_capacity(16);
++            owner
++                .request(request(flights.next().unwrap(), 1, 64))
++                .unwrap();
++            owner.advance(Duration::ZERO, &mut outgoing).unwrap();
++            let (_, Message::Permit(mut flight)) = outgoing.pop_front().unwrap() else {
++                panic!()
++            };
++            assert_eq!(flight.packets().len(), 10);
++            owner
++                .request(request(flights.next().unwrap(), 2, 1))
++                .unwrap();
++            assert!(owner.sample_completion(&flight));
++            flight
++                .complete(sent, (sent != 0).then_some(Duration::ZERO), false)
++                .unwrap();
++            owner
++                .complete_observed(flight, Some(Duration::from_millis(1)))
++                .unwrap();
++            let d = owner.opportunity;
++            assert_eq!(d.opportunity_completions, 1);
++            assert_eq!(d.opportunity_open_completions, 1);
++            assert_eq!(d.opportunity_samples, 1);
++            assert_eq!(d.opportunity_pending, 1);
++            assert_eq!(d.opportunity_pacing, 1);
++            assert_eq!(d.opportunity_pre_window, 0);
++            assert_eq!(d.opportunity_post_window, (10 - sent) as u64 * 1280);
++            assert_eq!(
++                d.opportunity_post_quantum - d.opportunity_pre_quantum,
++                12800
++            );
++            assert_eq!(
++                d.opportunity_post_slots - d.opportunity_pre_slots,
++                (10 - sent) as u64
++            );
++            assert_eq!(d.opportunity_pre_fit, 0);
++            assert_eq!(d.opportunity_pre_any, 0);
++            assert_eq!(d.opportunity_post_fit, u64::from(sent < 10));
++            assert_eq!(d.opportunity_post_any, u64::from(sent < 10));
++            assert_eq!(owner.sender.flight_bytes(0), Some((0, sent as u64 * 1280)));
++            assert!(!owner.sender.issuance_open(0));
++            assert!(owner.requests[1].is_some());
++        }
++    }
++
++    #[test]
++    fn completion_opportunity_filters_requests_and_observes_pacing_without_changing_it() {
++        for kind in 0..7 {
++            for now in [Duration::ZERO, Duration::from_millis(1)] {
++                let (mut owner, flights) =
++                    Owner::new(1, 2, &[(0, 1, 0), (0, 2, 0)], Duration::ZERO).unwrap();
++                owner.timers.install(0, 1).unwrap();
++                let mut flights = flights.into_vec().into_iter();
++                let mut outgoing = VecDeque::with_capacity(16);
++                owner
++                    .request(request(flights.next().unwrap(), 1, 1))
++                    .unwrap();
++                owner.advance(Duration::ZERO, &mut outgoing).unwrap();
++                let (_, Message::Permit(mut flight)) = outgoing.pop_front().unwrap() else {
++                    panic!()
++                };
++                let mut next = request(flights.next().unwrap(), 2, 1);
++                match kind {
++                    1 => next.deadline = Duration::ZERO,
++                    2 => next.pmtu = true,
++                    3 => next.probe = Some(0),
++                    4 => {
++                        let mut packet = next.flight.packets().next().unwrap();
++                        packet.id.generation = 2;
++                        next.flight.prepare(&[packet]).unwrap();
++                    }
++                    5 => next.mtu = 1500,
++                    6 => next.diagnostic_data = false,
++                    _ => {}
++                }
++                owner.request(next).unwrap();
++                let due = owner.sender.deadline(0, now);
++                flight.complete(1, Some(Duration::ZERO), false).unwrap();
++                owner.complete_observed(flight, Some(now)).unwrap();
++                let d = owner.opportunity;
++                assert_eq!(d.opportunity_pending, u64::from(kind == 0 || kind == 5));
++                assert_eq!(d.opportunity_mtu_mismatch, u64::from(kind == 5));
++                assert_eq!(d.opportunity_pacing, u64::from(now != Duration::ZERO));
++                let fits = u64::from(kind == 0 && now != Duration::ZERO);
++                assert_eq!(d.opportunity_pre_fit, fits);
++                assert_eq!(d.opportunity_post_fit, fits);
++                assert_eq!(owner.sender.deadline(0, now), due);
++                assert!(owner.requests[1].is_some());
++            }
++        }
++    }
++
+     #[test]
+     fn first_ack_uses_controller_creation_time_at_any_uptime() {
+         for start in [Duration::ZERO, Duration::from_secs(86_400)] {
+@@ -782,6 +993,7 @@ mod tests {
+         flight.prepare(&packets).unwrap();
+         Request {
+             flight,
++            diagnostic_data: true,
+             group: 0,
+             deadline: Duration::from_millis(100),
+             probe: None,
+@@ -947,6 +1159,7 @@ mod scheduling_tests {
+             .unwrap();
+         Request {
+             flight,
++            diagnostic_data: true,
+             group: 0,
+             deadline,
+             probe: None,
+@@ -1142,6 +1355,7 @@ mod scheduling_tests {
+         owner
+             .request(Request {
+                 flight,
++                diagnostic_data: true,
+                 group: 0,
+                 deadline: Duration::from_secs(1),
+                 probe: None,
+@@ -1511,6 +1725,7 @@ mod blocked_prefix_regression {
+         owner
+             .request(Request {
+                 flight,
++                diagnostic_data: true,
+                 group: 0,
+                 deadline: Duration::from_millis(100),
+                 probe: None,
+@@ -1679,6 +1894,7 @@ mod fairness_regression {
+             .unwrap();
+         Request {
+             flight,
++            diagnostic_data: true,
+             group,
+             deadline: Duration::from_secs(1),
+             probe: None,
+@@ -1796,6 +2012,7 @@ mod window_evidence_tests {
+             owner
+                 .request(Request {
+                     flight,
++                    diagnostic_data: true,
+                     group: 0,
+                     deadline: Duration::from_secs(1),
+                     probe: None,
+@@ -1828,6 +2045,7 @@ mod window_evidence_tests {
+             owner
+                 .request(Request {
+                     flight,
++                    diagnostic_data: true,
+                     group: 0,
+                     deadline: Duration::from_secs(1),
+                     probe: None,
