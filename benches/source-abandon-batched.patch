@@ -1,0 +1,685 @@
+diff --git a/src/counters.rs b/src/counters.rs
+index 35a5ce4..19f6d86 100644
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -118,6 +118,8 @@ metrics! {
+     abandon_queued: sum,
+     /// Successfully submitted source abandonment advisories, including retries.
+     abandon_sent: sum,
++    /// Physical datagrams carrying source abandonment records.
++    abandon_datagrams: sum,
+     /// Successfully submitted copies after an advisory's first transmission.
+     abandon_retried: sum,
+     /// Advisories rejected by bounded storage or stale/exhausted identities.
+diff --git a/src/worker/sender/abandon.rs b/src/worker/sender/abandon.rs
+index f5b43d7..042b978 100644
+--- a/src/worker/sender/abandon.rs
++++ b/src/worker/sender/abandon.rs
+@@ -5,7 +5,10 @@ use super::*;
+ 
+ const CAPACITY: usize = 128;
+ const LIFETIME: Duration = Duration::from_millis(100);
+-const LENGTH: usize = wire::HEADER_LEN + 4 + 12;
++const RECORDS: usize = wire::MAX_RECORDS;
++#[cfg(test)]
++const LENGTH: usize = wire::HEADER_LEN + 16;
++const MAX_LENGTH: usize = wire::HEADER_LEN + RECORDS * 16;
+ 
+ #[derive(Clone, Copy)]
+ struct Advisory {
+@@ -43,6 +46,9 @@ pub(super) struct Pending {
+     count: usize,
+     cursor: usize,
+     yield_data: bool,
++    batch_serial: u64,
++    selected: [(usize, u64); RECORDS],
++    selected_len: usize,
+ }
+ impl Pending {
+     pub(super) const fn new() -> Self {
+@@ -52,6 +58,9 @@ impl Pending {
+             count: 0,
+             cursor: 0,
+             yield_data: false,
++            batch_serial: 0,
++            selected: [(0, 0); RECORDS],
++            selected_len: 0,
+         }
+     }
+     fn get(&self, slot: usize, serial: u64) -> Option<Advisory> {
+@@ -131,16 +140,22 @@ impl Worker {
+     }
+ 
+     pub(super) fn defer_abandon(&mut self, job: Job, now: Duration) {
+-        if let JobKind::Abandon { slot, serial } = job.kind
+-            && let Some(current) = self
+-                .sender
+-                .abandons
+-                .entries
+-                .get_mut(slot)
+-                .and_then(Option::as_mut)
+-                .filter(|a| a.serial == serial)
++        if let JobKind::Abandon { serial } = job.kind
++            && self.sender.abandons.batch_serial == serial
+         {
+-            current.due = now.saturating_add(RETRY);
++            for position in 0..self.sender.abandons.selected_len {
++                let (slot, serial) = self.sender.abandons.selected[position];
++                if let Some(current) = self
++                    .sender
++                    .abandons
++                    .entries
++                    .get_mut(slot)
++                    .and_then(Option::as_mut)
++                    .filter(|a| a.serial == serial)
++                {
++                    current.due = now.saturating_add(RETRY);
++                }
++            }
+         }
+     }
+ 
+@@ -214,6 +229,40 @@ impl Worker {
+         index: usize,
+         now: Duration,
+     ) -> io::Result<()> {
++        let Some(serial) = self.sender.abandons.batch_serial.checked_add(1) else {
++            self.sender.abandons.remove(slot, advisory.serial);
++            self.count_abandon(advisory.session, advisory.lane, |s| &mut s.abandon_dropped);
++            return Ok(());
++        };
++        let mut count = 0;
++        let mut deadline = advisory.expires;
++        for offset in 0..CAPACITY {
++            let slot = (slot + offset) % CAPACITY;
++            let Some(a) = self.sender.abandons.entries[slot] else {
++                continue;
++            };
++            if a.session == advisory.session
++                && a.generation == advisory.generation
++                && a.lane == advisory.lane
++                && now >= a.due
++                && now < a.expires
++                && a.attempts < a.sent.len()
++                && !a.acknowledged(&self.sender.lanes[index].history)
++            {
++                self.sender.abandons.selected[count] = (slot, a.serial);
++                count += 1;
++                deadline = deadline.min(a.expires);
++                if count == RECORDS {
++                    break;
++                }
++            }
++        }
++        if count == 0 {
++            return Ok(());
++        }
++        self.sender.abandons.batch_serial = serial;
++        self.sender.abandons.selected_len = count;
++        let length = wire::HEADER_LEN + count * 16;
+         let local = &mut self.sessions[advisory.session];
+         let Some(tx) = local.tx.get_mut(advisory.lane).and_then(Option::as_mut) else {
+             return Ok(());
+@@ -228,19 +277,17 @@ impl Worker {
+         };
+         match self.sender.lanes[index]
+             .history
+-            .reserve(number, (LENGTH + 48) as u16, true, true)
++            .reserve(number, (length + 48) as u16, true, true)
+         {
+             Ok(()) => {}
+             Err(crate::ack::HistoryError::Full) => {
+                 self.sender.reclaim = Some(self.sender.lanes.len());
+-                if let Some(pending) = self
+-                    .sender
+-                    .abandons
+-                    .entries
+-                    .get_mut(slot)
+-                    .and_then(Option::as_mut)
+-                {
+-                    pending.due = now.saturating_add(RETRY);
++                for &(slot, serial) in &self.sender.abandons.selected[..count] {
++                    if let Some(a) = self.sender.abandons.entries[slot].as_mut()
++                        && a.serial == serial
++                    {
++                        a.due = now.saturating_add(RETRY);
++                    }
+                 }
+                 return Ok(());
+             }
+@@ -259,7 +306,7 @@ impl Worker {
+                     lane: advisory.lane as u16 + 1,
+                     number,
+                 },
+-                bytes: (LENGTH + 48) as u16,
++                bytes: (length + 48) as u16,
+             }])
+             .map_err(io::Error::other)?;
+         self.sender.job = Some(Job {
+@@ -269,11 +316,8 @@ impl Worker {
+             path: local.path,
+             first: number,
+             count: 1,
+-            deadline: advisory.expires,
+-            kind: JobKind::Abandon {
+-                slot,
+-                serial: advisory.serial,
+-            },
++            deadline,
++            kind: JobKind::Abandon { serial },
+         });
+         let peer = self
+             .shared
+@@ -290,7 +334,7 @@ impl Worker {
+             Message::Request(Request {
+                 flight,
+                 group: self.sender.lanes[index].group,
+-                deadline: advisory.expires,
++                deadline,
+                 probe: None,
+                 pmtu: false,
+                 mtu,
+@@ -298,13 +342,7 @@ impl Worker {
+         )
+     }
+ 
+-    pub(super) fn send_abandon(
+-        &mut self,
+-        job: Job,
+-        slot: usize,
+-        serial: u64,
+-        now: Duration,
+-    ) -> io::Result<()> {
++    pub(super) fn send_abandon(&mut self, job: Job, serial: u64, now: Duration) -> io::Result<()> {
+         let index = self.sender_index(job.session, job.lane)?;
+         let grant = self
+             .sender
+@@ -312,67 +350,84 @@ impl Worker {
+             .as_ref()
+             .and_then(|f| f.grant())
+             .ok_or(io::ErrorKind::InvalidData)?;
+-        let Some(advisory) = self.sender.abandons.get(slot, serial) else {
++        if self.sender.abandons.batch_serial != serial {
+             return self.finish_sender_send(0, None, false);
+-        };
++        }
++        let count = self.sender.abandons.selected_len;
+         let local = &self.sessions[job.session];
+         let connection = local.connection.ok_or(io::ErrorKind::InvalidData)?;
+-        let mut bytes = [0; LENGTH];
+-        wire::encode_datagram(
+-            Header {
+-                cookie: self.shared.config.config().sessions[job.session].cookie,
+-                receive_tag: connection.remote_tag().get(),
+-                lane: job.lane as u16 + 1,
+-                packet_number: job.first,
+-                record_area_len: 0,
+-            },
+-            &[Record::FrameAbandon {
+-                lane: job.lane as u16 + 1,
+-                origin: 0,
+-                reason: 1,
+-                frame_id: advisory.frame,
+-            }],
+-            &mut bytes,
+-        )
+-        .map_err(io::Error::other)?;
+-        let peer = self
+-            .shared
+-            .config
+-            .peer_for_session(job.session)
+-            .ok_or(io::ErrorKind::InvalidData)?;
+-        let mut clock = self.io_clock(now);
+-        let pending = &self.sender.abandons;
+         let history = &self.sender.lanes[index];
+-        let socket = self.transmit[peer].paths[job.path].lanes[job.lane]
+-            .socket
+-            .as_ref();
+-        let mut canceled = false;
+-        let mut acknowledged = false;
+-        let result = if let Some(socket) = socket {
+-            socket.send_batch_checked(
+-                &[SendDatagram { parts: &[&bytes] }],
+-                BASE_UDP_PAYLOAD,
+-                || {
+-                    let at = clock()?;
+-                    if !grant.valid_at(at)
+-                        || pending.get(slot, serial).is_none_or(|a| {
+-                            at >= a.expires
+-                                || !a.current(local, history)
+-                                || {
+-                                    acknowledged = a.acknowledged(&history.history);
+-                                    acknowledged
+-                                }
+-                                || a.attempts >= a.sent.len()
+-                        })
+-                    {
+-                        canceled = true;
+-                        return Err(io::ErrorKind::WouldBlock.into());
+-                    }
+-                    Ok(at)
++        let pending = &self.sender.abandons;
++        // Any changed member cancels the whole reservation. The next request
++        // rebuilds it, keeping credit exact without enlarging Copy Job.
++        let valid = |at| {
++            pending.selected[..count].iter().all(|&(slot, serial)| {
++                pending.get(slot, serial).is_some_and(|a| {
++                    at < a.expires
++                        && a.current(local, history)
++                        && a.attempts < a.sent.len()
++                        && !a.acknowledged(&history.history)
++                })
++            })
++        };
++        let mut canceled = !valid(now);
++        let mut checked_at = now;
++        let result = if canceled {
++            Err(io::ErrorKind::WouldBlock.into())
++        } else {
++            let mut records = [Record::Padding { length: 0 }; RECORDS];
++            for (record, &(slot, serial)) in records.iter_mut().zip(&pending.selected[..count]) {
++                let a = pending
++                    .get(slot, serial)
++                    .ok_or(io::ErrorKind::InvalidData)?;
++                *record = Record::FrameAbandon {
++                    lane: job.lane as u16 + 1,
++                    origin: 0,
++                    reason: 1,
++                    frame_id: a.frame,
++                };
++            }
++            let mut bytes = [0; MAX_LENGTH];
++            let length = wire::encode_datagram(
++                Header {
++                    cookie: self.shared.config.config().sessions[job.session].cookie,
++                    receive_tag: connection.remote_tag().get(),
++                    lane: job.lane as u16 + 1,
++                    packet_number: job.first,
++                    record_area_len: 0,
+                 },
++                &records[..count],
++                &mut bytes,
+             )
+-        } else {
+-            Err(io::ErrorKind::NotConnected.into())
++            .map_err(io::Error::other)?;
++            let peer = self
++                .shared
++                .config
++                .peer_for_session(job.session)
++                .ok_or(io::ErrorKind::InvalidData)?;
++            let mut clock = self.io_clock(now);
++            if let Some(socket) = self.transmit[peer].paths[job.path].lanes[job.lane]
++                .socket
++                .as_ref()
++            {
++                socket.send_batch_checked(
++                    &[SendDatagram {
++                        parts: &[&bytes[..length]],
++                    }],
++                    BASE_UDP_PAYLOAD,
++                    || {
++                        let at = clock()?;
++                        checked_at = at;
++                        if !grant.valid_at(at) || !valid(at) {
++                            canceled = true;
++                            return Err(io::ErrorKind::WouldBlock.into());
++                        }
++                        Ok(at)
++                    },
++                )
++            } else {
++                Err(io::ErrorKind::NotConnected.into())
++            }
+         };
+         let sent = result.as_ref().ok().copied();
+         self.finish_sender_send(
+@@ -384,29 +439,26 @@ impl Worker {
+                     .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock),
+         )?;
+         if let Some((1, at)) = sent {
+-            if let Some(current) = self
+-                .sender
+-                .abandons
+-                .entries
+-                .get_mut(slot)
+-                .and_then(Option::as_mut)
+-                .filter(|a| a.serial == serial)
+-            {
+-                let number = current
+-                    .sent
+-                    .get_mut(current.attempts)
+-                    .ok_or(io::ErrorKind::InvalidData)?;
+-                *number = job.first;
+-                current.attempts += 1;
+-                current.due = if current.attempts == current.sent.len() {
+-                    current.expires
+-                } else {
+-                    at.saturating_add(self.sender.lanes[index].rtt.pto_period(0))
+-                };
+-            }
+-            self.count_abandon(job.session, job.lane, |s| &mut s.abandon_sent);
+-            if advisory.attempts != 0 {
+-                self.count_abandon(job.session, job.lane, |s| &mut s.abandon_retried);
++            let mut retries = 0;
++            let retry_due = at.saturating_add(self.sender.lanes[index].rtt.pto_period(0));
++            for position in 0..count {
++                let (slot, serial) = self.sender.abandons.selected[position];
++                if let Some(a) = self.sender.abandons.entries[slot].as_mut()
++                    && a.serial == serial
++                {
++                    let number = a
++                        .sent
++                        .get_mut(a.attempts)
++                        .ok_or(io::ErrorKind::InvalidData)?;
++                    *number = job.first;
++                    retries += u64::from(a.attempts != 0);
++                    a.attempts += 1;
++                    a.due = if a.attempts == a.sent.len() {
++                        a.expires
++                    } else {
++                        retry_due
++                    };
++                }
+             }
+             let local = &mut self.sessions[job.session];
+             for totals in [
+@@ -414,20 +466,32 @@ impl Worker {
+                 &mut local.totals,
+                 &mut local.tx_totals[job.lane],
+             ] {
+-                totals.tx_outer_bytes = totals.tx_outer_bytes.wrapping_add((LENGTH + 48) as u64);
++                totals.abandon_sent = totals.abandon_sent.wrapping_add(count as u64);
++                totals.abandon_retried = totals.abandon_retried.wrapping_add(retries);
++                totals.abandon_datagrams = totals.abandon_datagrams.wrapping_add(1);
++                totals.tx_outer_bytes = totals
++                    .tx_outer_bytes
++                    .wrapping_add((wire::HEADER_LEN + count * 16 + 48) as u64);
+             }
+             local.tx_dirty |= 1_u64 << job.lane;
+-        } else if acknowledged {
+-            self.sender.abandons.remove(slot, serial);
+-        } else if let Some(current) = self
+-            .sender
+-            .abandons
+-            .entries
+-            .get_mut(slot)
+-            .and_then(Option::as_mut)
+-            .filter(|a| a.serial == serial)
+-        {
+-            current.due = now.saturating_add(RETRY);
++        } else {
++            for position in 0..count {
++                let (slot, serial) = self.sender.abandons.selected[position];
++                let Some(a) = self.sender.abandons.get(slot, serial) else {
++                    continue;
++                };
++                let current = a.current(&self.sessions[job.session], &self.sender.lanes[index]);
++                let acked = current && a.acknowledged(&self.sender.lanes[index].history);
++                if !current || acked || checked_at >= a.expires {
++                    self.sender.abandons.remove(slot, serial);
++                    if !current {
++                        self.count_abandon(job.session, job.lane, |s| &mut s.abandon_dropped);
++                    } else if !acked {
++                        self.count_abandon(job.session, job.lane, |s| &mut s.abandon_expired);
++                    }
++                }
++            }
++            self.defer_abandon(job, checked_at);
+         }
+         if let Err(error) = result
+             && !canceled
+@@ -711,9 +775,10 @@ mod tests {
+             worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
+             let now = Duration::from_millis(1);
+             let job = permit(worker, now);
+-            let JobKind::Abandon { slot, serial } = job.kind else {
++            let JobKind::Abandon { .. } = job.kind else {
+                 panic!("wrong job")
+             };
++            let (slot, serial) = worker.sender.abandons.selected[0];
+             if replace_generation {
+                 worker.sessions[0].installed.as_mut().unwrap().generation += 1;
+             } else {
+@@ -940,4 +1005,217 @@ mod tests {
+             data_number
+         );
+     }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn packed_advisories_release_full_receive_lane_with_one_ordinary_datagram() {
++        let (mut workers, rx) = setup();
++        let worker = &mut workers[0];
++        let mut remote = reassembly::Lane::new(1, 1514).unwrap();
++        let mut encoded = [0; BASE_UDP_PAYLOAD];
++        let first = Duration::from_millis(1);
++        without_allocations(|| {
++            for sequence in 1..=64 {
++                let id = (1 << 48) | sequence;
++                let length = wire::encode_datagram(
++                    Header {
++                        cookie: worker.shared.config.config().sessions[0].cookie,
++                        receive_tag: 2,
++                        lane: 1,
++                        packet_number: sequence,
++                        record_area_len: 0,
++                    },
++                    &[Record::Data {
++                        frame_id: id,
++                        total_len: 1514,
++                        offset: 0,
++                        bytes: &[7; 100],
++                    }],
++                    &mut encoded,
++                )
++                .unwrap();
++                assert_eq!(
++                    remote.admit(
++                        &Datagram::decode(&encoded[..length]).unwrap(),
++                        Duration::ZERO
++                    ),
++                    Admission::Fresh
++                );
++                worker.queue_abandon(0, 0, id, Duration::ZERO);
++            }
++            assert_eq!(remote.retained_frames(), 64);
++            // The fixture's control packet must follow these admitted DATA IDs.
++            worker.sessions[0].tx[0]
++                .as_mut()
++                .unwrap()
++                .allocate_packets(64)
++                .unwrap();
++            let job = permit(worker, first);
++            assert_eq!(job.deadline, LIFETIME);
++            assert_eq!(worker.sender.abandons.selected_len, 64);
++            worker.use_sender_permit(first).unwrap();
++            pump(worker, first);
++            let length = rx.recv(&mut encoded).unwrap().0;
++            assert_eq!(length, MAX_LENGTH);
++            let packet = Datagram::decode(&encoded[..length]).unwrap();
++            assert_eq!(packet.record_count, 64);
++            assert_eq!(remote.admit(&packet, first), Admission::Fresh);
++            assert_eq!(remote.retained_frames(), 0);
++            assert_eq!(worker.counters.abandon_sent, 64);
++            assert_eq!(worker.counters.abandon_datagrams, 1);
++            assert_eq!(
++                worker.sender.lanes[0].history.inflight_bytes(),
++                (MAX_LENGTH + 48) as u64
++            );
++            assert_eq!(
++                worker
++                    .sender
++                    .owner
++                    .as_ref()
++                    .unwrap()
++                    .snapshot(0)
++                    .unwrap()
++                    .bytes_in_flight,
++                (MAX_LENGTH + 48) as u64
++            );
++            empty(&rx);
++            let length = wire::encode_datagram(
++                Header {
++                    cookie: worker.shared.config.config().sessions[0].cookie,
++                    receive_tag: 2,
++                    lane: 1,
++                    packet_number: job.first + 1,
++                    record_area_len: 0,
++                },
++                &[Record::Data {
++                    frame_id: (1 << 48) | 65,
++                    total_len: 60,
++                    offset: 0,
++                    bytes: &[9; 60],
++                }],
++                &mut encoded,
++            )
++            .unwrap();
++            assert_eq!(
++                remote.admit(&Datagram::decode(&encoded[..length]).unwrap(), first),
++                Admission::Fresh
++            );
++            assert_eq!(remote.front(first).unwrap().bytes, &[9; 60]);
++            assert!(remote.finish_front());
++            worker
++                .incoming_ack(
++                    0,
++                    1,
++                    1,
++                    0,
++                    AckRanges::new(&[AckRange {
++                        start: job.first,
++                        end: job.first,
++                    }])
++                    .unwrap(),
++                    first,
++                )
++                .unwrap();
++            pump(worker, Duration::from_millis(20));
++            assert_eq!(worker.sender.abandons.count, 0);
++            assert_eq!(worker.sender.lanes[0].history.inflight_bytes(), 0);
++        });
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn changed_members_cancel_batch_then_rebuild_only_live_members() {
++        let (mut workers, rx) = setup();
++        let worker = &mut workers[0];
++        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        permit(worker, Duration::from_millis(1));
++        worker.use_sender_permit(Duration::from_millis(1)).unwrap();
++        pump(worker, Duration::from_millis(1));
++        let first = receive(&rx);
++        let now = Duration::from_millis(20);
++        for id in 2..=4 {
++            worker.queue_abandon(0, 0, (1 << 48) | id, Duration::from_millis(2));
++        }
++        let job = permit(worker, now);
++        assert_eq!(worker.sender.abandons.selected_len, 4);
++        assert_eq!(job.deadline, LIFETIME);
++        worker.sender.lanes[0]
++            .history
++            .acknowledge(
++                AckRanges::new(&[AckRange {
++                    start: first,
++                    end: first,
++                }])
++                .unwrap(),
++                |_| {},
++            )
++            .unwrap();
++        worker.sender.abandons.entries[2].as_mut().unwrap().expires = now;
++        let replaced = worker.sender.abandons.entries[3].unwrap();
++        worker.sender.abandons.remove(3, replaced.serial);
++        worker.queue_abandon(0, 0, (1 << 48) | 5, now);
++        without_allocations(|| {
++            worker.use_sender_permit(now).unwrap();
++            empty(&rx);
++            assert!(worker.sender.abandons.entries[0].is_none());
++            assert!(worker.sender.abandons.entries[2].is_none());
++            assert_eq!(worker.sender.abandons.entries[1].unwrap().attempts, 0);
++            assert_eq!(worker.sender.abandons.entries[3].unwrap().attempts, 0);
++            assert_eq!(
++                worker.sender.abandons.entries[1].unwrap().expires,
++                Duration::from_millis(102)
++            );
++            // Recycle and rebuild after both surviving members become due.
++            permit(worker, now + Duration::from_millis(2));
++            worker
++                .use_sender_permit(now + Duration::from_millis(2))
++                .unwrap();
++            let mut bytes = [0; BASE_UDP_PAYLOAD];
++            let length = rx.recv(&mut bytes).unwrap().0;
++            let packet = Datagram::decode(&bytes[..length]).unwrap();
++            assert_eq!(packet.record_count, 2);
++            let mut ids = [0; 2];
++            for (id, record) in ids.iter_mut().zip(packet.records()) {
++                let Record::FrameAbandon { frame_id, .. } = record else {
++                    panic!("unexpected record")
++                };
++                *id = frame_id;
++            }
++            ids.sort_unstable();
++            assert_eq!(ids, [(1 << 48) | 2, (1 << 48) | 5]);
++            assert_eq!(worker.counters.abandon_sent, 3);
++            assert_eq!(worker.counters.abandon_datagrams, 2);
++            assert_eq!(worker.counters.abandon_retried, 0);
++        });
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn partial_batch_uses_earliest_deadline_and_rechecks_expiry_at_syscall() {
++        let (mut workers, rx) = setup();
++        let worker = &mut workers[0];
++        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        worker.queue_abandon(0, 0, (1 << 48) | 2, Duration::from_millis(1));
++        let now = Duration::from_millis(99);
++        let job = permit(worker, now);
++        assert_eq!(job.deadline, LIFETIME);
++        assert_eq!(worker.sender.abandons.selected_len, 2);
++        CLOCK_CALLS.with(|c| c.set(0));
++        worker.io_time = Some(|now| {
++            CLOCK_CALLS.with(|c| {
++                let call = c.get();
++                c.set(call + 1);
++                Ok(if call == 0 { now } else { LIFETIME })
++            })
++        });
++        without_allocations(|| worker.use_sender_permit(now).unwrap());
++        empty(&rx);
++        assert!(worker.sender.abandons.entries[0].is_none());
++        let remaining = worker.sender.abandons.entries[1].unwrap();
++        assert_eq!(remaining.expires, Duration::from_millis(101));
++        assert_eq!(remaining.attempts, 0);
++        assert_eq!(remaining.due, LIFETIME + RETRY);
++        assert_eq!(worker.counters.abandon_datagrams, 0);
++        assert_eq!(worker.counters.abandon_expired, 1);
++    }
+ }
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 1dd5098..3bc08a3 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -179,7 +179,7 @@ impl Lane {
+ pub(super) enum JobKind {
+     Data,
+     Probe { length: usize, pmtu: bool },
+-    Abandon { slot: usize, serial: u64 },
++    Abandon { serial: u64 },
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -1503,8 +1503,8 @@ impl Worker {
+         }
+         let job = self.sender.job.ok_or(io::ErrorKind::InvalidData)?;
+         match job.kind {
+-            JobKind::Abandon { slot, serial } => {
+-                self.send_abandon(job, slot, serial, now)?;
++            JobKind::Abandon { serial } => {
++                self.send_abandon(job, serial, now)?;
+             }
+             JobKind::Data => {
+                 let mut batch = self.sessions[job.session].batches[job.lane]

@@ -83,6 +83,95 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Packed abandonment reduces cost but leaves overload collapse (November 8)
+
+Packing same-lane origin-0 advisories improves the rejected prototype, but
+does not restore throughput. Each ordinary grant now carries up to 64 records
+in one datagram, at most 1072 UDP bytes. Every record keeps its own fixed
+100 ms lifetime and three-copy limit. A stale, acknowledged or expired member
+cancels the unsent packet and releases its reservation; subsequent service
+rebuilds the packet from eligible members.
+
+Two separate twenty-second bidirectional release-musl A/B/A sequences compare
+the ordinary baseline with this candidate: eight transmit lanes, then one.
+Both retain eight workers and TAP queues, sixteen QinQ flows, 1522-byte frames,
+fixed CPU placement, 500-entry TAP queues and active PMTU capped at a
+1452-byte UDP payload. Builds, kernel tests and Git packing were stopped
+during load. [Raw observations](benches/tap-source-abandon-batched.json)
+contain all 24 points, counter units and binary/source identities.
+The [incremental patch](benches/source-abandon-batched.patch) applies after
+the unbatched patch below; neither is applied to production.
+
+| TX lanes | Build | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- | --- |
+| 8 | Baseline before | 1 Gbit/s | 0.972 / 0.962 | 0.13 / 1.02 | 103.52 / 93.55 |
+| 8 | Baseline before | 4 Gbit/s | 1.694 / 1.561 | 56.99 / 60.41 | 220.62 / 207.44 |
+| 8 | Baseline before | 21 Gbit/s | 1.752 / 1.595 | 91.54 / 92.30 | 220.81 / 208.37 |
+| 8 | Baseline before | Unlimited | 1.734 / 1.571 | 97.06 / 97.07 | 219.09 / 207.24 |
+| 8 | Batched | 1 Gbit/s | 0.981 / 0.982 | 0.97 / 0.91 | 104.46 / 98.61 |
+| 8 | Batched | 4 Gbit/s | 1.459 / 1.335 | 62.16 / 65.76 | 212.05 / 199.45 |
+| 8 | Batched | 21 Gbit/s | 1.504 / 1.400 | 92.68 / 93.22 | 216.61 / 203.32 |
+| 8 | Batched | Unlimited | 1.503 / 1.391 | 97.41 / 97.47 | 212.00 / 202.97 |
+| 8 | Baseline after | 1 Gbit/s | 0.991 / 0.982 | 0.03 / 0.90 | 103.57 / 94.85 |
+| 8 | Baseline after | 4 Gbit/s | 1.688 / 1.537 | 57.16 / 60.97 | 218.39 / 206.45 |
+| 8 | Baseline after | 21 Gbit/s | 1.757 / 1.578 | 91.46 / 92.38 | 222.36 / 207.88 |
+| 8 | Baseline after | Unlimited | 1.764 / 1.561 | 97.01 / 97.12 | 217.15 / 206.54 |
+| 1 | Baseline before | 1 Gbit/s | 0.980 / 0.980 | 1.03 / 0.95 | 71.88 / 74.06 |
+| 1 | Baseline before | 4 Gbit/s | 1.962 / 1.837 | 50.52 / 53.67 | 146.95 / 147.84 |
+| 1 | Baseline before | 21 Gbit/s | 1.002 / 0.851 | 95.18 / 95.86 | 183.59 / 182.60 |
+| 1 | Baseline before | Unlimited | 0.494 / 0.451 | 98.59 / 98.63 | 198.76 / 200.69 |
+| 1 | Batched | 1 Gbit/s | 0.967 / 0.976 | 1.04 / 0.25 | 69.76 / 70.75 |
+| 1 | Batched | 4 Gbit/s | 1.959 / 1.881 | 50.60 / 52.55 | 146.31 / 148.54 |
+| 1 | Batched | 21 Gbit/s | 1.534 / 1.357 | 92.59 / 93.39 | 203.02 / 197.97 |
+| 1 | Batched | Unlimited | 0.946 / 0.993 | 97.20 / 96.89 | 223.72 / 215.80 |
+| 1 | Baseline after | 1 Gbit/s | 0.961 / 0.961 | 1.35 / 1.68 | 68.62 / 69.41 |
+| 1 | Baseline after | 4 Gbit/s | 1.963 / 1.883 | 50.47 / 52.47 | 150.74 / 148.71 |
+| 1 | Baseline after | 21 Gbit/s | 1.100 / 0.916 | 94.70 / 95.55 | 183.59 / 184.09 |
+| 1 | Baseline after | Unlimited | 0.520 / 0.502 | 98.44 / 98.40 | 197.37 / 200.20 |
+
+With eight lanes, unlimited goodput remains 13.3–14.8% / 10.9–11.4% below the
+baseline repeats. Admission pressure falls from 15,634–16,360 / 4,286–4,442
+to zero; incomplete receive-frame expiry falls from 26,657–26,802 /
+22,195–22,678 to 5 / 0. The candidate sends 244,990 / 208,525 records in
+20,782 / 18,122 datagrams, averaging 11.8 / 11.5 records per grant.
+Worker queue drops remain 1,578 / 24,252 and total frame expiries
+1,699,582 / 2,172,853. Removing orphan pressure does not remove this
+configuration's throughput limit.
+
+With one lane, unlimited goodput improves from 0.494–0.520 / 0.451–0.502
+to 0.946 / 0.993 Gbit/s, but still falls 51.7 / 47.2% from the candidate's
+4 Gbit/s offered point. Admission pressure remains 71,048 / 84,258;
+incomplete receive-frame expiry remains 10,251 / 10,721. Fully submitted
+source-frame expiries reach 1,010,664 / 984,332, compared with 28,793 / 28,637
+partial expiries. They overwhelm the shared 128-entry advisory pool:
+422,311 / 380,969 notices are dropped. The candidate sends 617,330 / 632,043
+records in 25,547 / 25,227 datagrams. Worker queue drops are
+1,195,015 / 1,126,834; total frame expiries are 4,556,668 / 4,451,588.
+These counters have different units and are not an exact missing-frame sum.
+
+Fully submitted expiry means ACK coverage was unresolved at the original
+source deadline. Fully acknowledged frames enter cleanup immediately and are
+excluded from expiry. Late fresh submission, delayed ACK application and
+missing ACK coverage remain distinct hypotheses; the counters do not prove
+which expired frames reached TAP.
+
+All points have zero outer socket overflow, corruption, duplicates and outer
+fragmentation. The first single-lane baseline has six left-side inner UDP
+errors at unlimited load; every other inner-error count is zero. Single-lane
+baseline reordering at 21 Gbit/s is 0.00583 / 0.00219% before and
+0.00350 / 0.00427% after. At unlimited load only the reverse direction
+reorders, by 0.00116% before and 0.00186% after. Candidate reordering is zero.
+
+The candidate passes 350 ordinary release tests, formatting, Clippy, all 85
+library kernel tests on Linux 6.8 and 7, and all three original runtime tests
+with unchanged deadlines and allocation assertions. Tests include releasing
+a full 64-slot receive lane with one control packet, shared ACK cancellation,
+mixed stale members and expiry immediately before submission. Correctness
+coverage does not establish the requested throughput plateau. The next
+experiment delays initial requests by at most 5 ms to collect larger batches;
+prioritizing notices for known unsent tails under metadata pressure remains
+a separate candidate.
+
 ## Source expiry leaves receive slots occupied (November 8)
 
 A real-socket regression verifies another source of reassembly pressure.
