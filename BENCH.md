@@ -182,10 +182,27 @@ The archive separately records TAP ingress drops and unsent, partial, fully
 sent and unexpanded transmit expiry. These counters have different units and
 cannot be added to explain the missing-frame percentage.
 
+All ACK-box drops in both unlimited bridge controls occur on receive worker 3:
+31,607 / 1,890 initially and 35,688 / 1,434 in the repeat. With ACK retention,
+all 29,947 / 3,907 deferrals also occur on worker 3; the left socket's 11,521
+overflows occur there too. This concentration differs from the shared sender
+coordinator's worker-0 role.
+
+The code gives each receiving worker four ACK boxes total, shared across
+sessions and destination history owners. It routes each ACK to
+`(lane - 1) % workers`; a valid box returns after history admission, which
+waits for pending loss checks, loss fences and lane report ownership.
+Consequently, the receiver's four-box pool can be occupied by work waiting
+on several owners. These are verified ownership rules; the saved counters
+do not measure how long each wait lasts or establish which one dominates.
+
 Retaining ACKs consumes receive credits while feedback waits for its owner.
 The measured bridge socket overflow and reduced CPU use are consistent with
-moving pressure into the receive queue; the measurements do not isolate
-credit exhaustion from ACK service delay. Both remain profiling questions.
+moving pressure into the receive queue. Follow-up instrumentation should
+separate receive→history-owner handoff, history/loss-fence wait and return
+handoff, recording box occupancy at the receiving worker. It must also track
+retained receive credits so a faster ACK stage does not conceal a stalled
+receive queue. The existing measurements do not isolate those costs.
 The successor result also leaves ordered sender sampling as a possible cost,
 but does not justify removing the ordering required by ACK and loss accounting.
 
