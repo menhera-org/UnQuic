@@ -1,5 +1,14 @@
 # Release transport overload investigation
 
+The November 8 wrap-up keeps production at `35ed011`. A 24-point routed
+release comparison rejects both early successor requests and ACK-record
+retention: the first retains GSO collapse; the second improves GSO but regresses
+bridged input. Repeated production controls deliver 0.602–1.059 / 0.670–0.696
+Gbit/s unlimited with GSO and 0.770–0.876 / 0.729–0.761 through the bridge.
+The patches and complete measurements are archived below. No performance gate
+has passed; the current experiments are finished, while the broader
+performance work remains open.
+
 The original receive-admission collapse and TAP readiness busy loop are fixed.
 Compact transmit storage now keeps payloads in bounded source buffers and
 slabs, with per-lane FIFOs and zero-copy ownership exchange. A rejected
@@ -99,6 +108,114 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## Successor requests and ACK retention do not fix both input paths (November 8)
+
+[Twenty-four matched release points](benches/tap-refill-candidates.json) compare
+production `35ed011`, two separate candidates, then production again.
+Each build runs ascending 0.5G, 5G and unlimited requested load in both
+directions for twenty seconds, followed by a two-second drain. All runs use
+one container image, the corrected routed NAPI harness, 4.5 ms RTT, no injected
+loss, QinQ, active PMTU discovery and a 1,500-byte outer IPv6 ceiling.
+GSO uses eight workers and sixteen flows per direction; bridged individual
+frames use four workers and four flows. No local compilation, tests or Git
+packing ran during load.
+
+[The successor candidate](benches/successor-flight-35ed011.patch) adds one
+startup-allocated Flight per worker. After a fully successful DATA submission,
+the worker can submit its next request while the old completion waits for
+ordered sampling. Existing busy-worker and ACK barriers still govern grants.
+Partial sends and probe completions remain serialized; due probes can use the
+spare flight. The tests caught and removed an initial guard that starved
+liveness probes under continuous DATA.
+
+[The ACK-retention candidate](benches/ack-resume-35ed011.patch) keeps a received
+buffer and exact record index when the four ACK transfer boxes are busy.
+It resumes without admitting DATA twice, changing its timestamp or discarding
+the GRO suffix. A separate deferral counter replaces ACK drops at that point.
+Blocked buffers rotate so other receive work can progress. Review found a
+busy loop with more than 64 blocked buffers; a regression test covers its fix.
+
+Neither candidate is adopted. The unlimited results are:
+
+| Build | Input | Delivered Gbit/s L→R / R→L | Actual offered Gbit/s | Missing % | Daemon CPU %, left/right |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Control | GSO | 1.059 / 0.670 | 57.68 / 60.69 | 98.13 / 98.87 | 238.7 / 189.8 |
+| Successor | GSO | 0.319 / 1.145 | 62.53 / 56.13 | 99.47 / 97.92 | 169.0 / 258.5 |
+| ACK retention | GSO | 1.443 / 1.511 | 60.54 / 58.85 | 97.57 / 97.38 | 240.9 / 228.8 |
+| Repeated control | GSO | 0.602 / 0.696 | 63.71 / 60.58 | 99.03 / 98.82 | 165.8 / 171.1 |
+| Control | Bridge | 0.770 / 0.729 | 2.53 / 2.43 | 69.32 / 69.74 | 211.0 / 248.1 |
+| Successor | Bridge | 0.810 / 0.808 | 2.48 / 2.56 | 67.07 / 68.14 | 218.6 / 250.5 |
+| ACK retention | Bridge | 0.480 / 0.573 | 2.51 / 2.48 | 80.69 / 76.62 | 164.5 / 142.4 |
+| Repeated control | Bridge | 0.876 / 0.761 | 2.55 / 2.44 | 65.27 / 68.50 | 227.8 / 257.9 |
+
+CPU 100% means one logical CPU. Goodput uses receiver snapshots during load;
+missing fractions include the drain. CPU and context-switch deltas stop when
+the generators finish; protocol counters include the drain. Bridge generators
+also fall short of the requested 5G point, offering 2.40–2.67 Gbit/s per
+direction. The JSON retains every paced point and its actual offered rate.
+
+At 5G requested, the successor delivers 0.957 / 0.948 Gbit/s with GSO.
+Its forward goodput falls 66.7% under unlimited load. The bridge result is
+within the controls' forward variation, with only a small reverse increase.
+ACK retention sustains 1.432 / 1.499 at 5G and 1.443 / 1.511 unlimited with
+GSO, but its unlimited bridge result is 38–45% below the controls forward
+and 21–25% below them reverse. Removing local ACK drops alone is insufficient.
+
+Unlimited drop attribution, left/right endpoint counters:
+
+| Build/input | ACK records dropped | ACK deferrals | Queue drops, including ACK drops | Socket overflow | Incomplete RX frame expiry |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Control/GSO | 754 / 549 | n/a | 754 / 551 | 0 / 0 | 3100 / 154 |
+| Successor/GSO | 148 / 251 | n/a | 148 / 259 | 0 / 0 | 4835 / 13 |
+| ACK retention/GSO | 0 / 0 | 1419 / 901 | 0 / 25 | 4 / 0 | 8790 / 31 |
+| Repeated control/GSO | 282 / 240 | n/a | 282 / 256 | 0 / 0 | 2964 / 78 |
+| Control/bridge | 31607 / 1890 | n/a | 2046656 / 855265 | 0 / 0 | 25 / 17 |
+| Successor/bridge | 33147 / 2277 | n/a | 1940875 / 898065 | 0 / 164 | 23 / 33 |
+| ACK retention/bridge | 0 / 0 | 29947 / 3907 | 1562978 / 632087 | 11521 / 4 | 477 / 16 |
+| Repeated control/bridge | 35688 / 1434 | n/a | 2109925 / 944694 | 0 / 22 | 12 / 16 |
+
+Admission pressure, expired ready RX frames, router/veth drops and outer IPv6
+fragments are zero at all 24 points. Inner UDP receive-buffer errors are zero
+except for three left-side errors at the ACK-retention bridge 5G point.
+The archive separately records TAP ingress drops and unsent, partial, fully
+sent and unexpanded transmit expiry. These counters have different units and
+cannot be added to explain the missing-frame percentage.
+
+Retaining ACKs consumes receive credits while feedback waits for its owner.
+The measured bridge socket overflow and reduced CPU use are consistent with
+moving pressure into the receive queue; the measurements do not isolate
+credit exhaustion from ACK service delay. Both remain profiling questions.
+The successor result also leaves ordered sender sampling as a possible cost,
+but does not justify removing the ordering required by ACK and loss accounting.
+
+Per-thread data corrects the earlier audit's blanket serialization-only
+diagnosis. In the repeated unlimited bridge control, the busiest right worker
+uses 95.5% of a CPU while its daemon totals 257.9%. That endpoint's daemon threads
+make 18,712 voluntary context switches per second. On the affined CPUs,
+the busiest CPU is 96.0% busy; another spends 25.3% in softirq.
+Per-CPU counters include other host work, so they are evidence to investigate
+kernel cost and placement, not a daemon-only profile or a theoretical ceiling.
+The GSO ACK-retention run has busiest workers of 53.1 / 57.8%, leaving a
+different bottleneck. The JSON preserves raw CPU and context-switch snapshots.
+
+Both candidates pass 360 ordinary release-musl tests, 93 ignored library tests
+on Linux 6.8, and 93 library plus three runtime tests on Linux 7.0.
+Successor also passes strict Clippy. ACK-retention Clippy and the candidates'
+full Linux 6.8 runtime suites were not run. Regression coverage includes
+retained DATA suffixes, old/new flight ownership, early probe cancellation,
+mixed DATA/control/ACK records, GRO resumption, stale owners and blocked-pool
+sleeping. These tests establish correctness of the tested paths, not
+performance acceptance.
+
+The two controls bracket the pair of candidates; each candidate has one
+sweep. Neither candidate received a new TCP, injected-loss or real-access
+throughput run because it already fails the no-injected-loss comparison.
+The next performance investigation should trace ACK-box residence and receive
+credit occupancy alongside owner scheduling, then profile the busy bridged
+worker and softirq cost. Keep ordered sampling until a replacement preserves
+physical-send order, partial-send accounting and ACK/loss barriers. Stage 5
+must return to the original 20G local, 5G routed-loss and overload-plateau gates.
 
 ## Measure sender refill before changing its ownership (November 8)
 

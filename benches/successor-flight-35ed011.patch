@@ -1,0 +1,481 @@
+--- a/src/pacing/sender.rs
++++ b/src/pacing/sender.rs
+@@ -36,7 +36,7 @@
+ 
+ /// A reusable worker-owned request, permission and completion buffer.
+ ///
+-/// Startup creates exactly one per worker. Move its box through the handoff
++/// Startup creates a bounded pool per worker. Move its box through the handoff
+ /// queues; retain it on queue backpressure. Return every granted flight, even
+ /// when no syscall succeeds. A completion retains its handles until ordered
+ /// sampling finishes; outgoing ACK buffers cannot replace this storage.
+@@ -57,6 +57,23 @@
+ }
+ 
+ impl Flight {
++    pub(crate) fn new(worker: usize) -> Self {
++        Self {
++            worker,
++            group: None,
++            grant: None,
++            origin: PacketId::default(),
++            records: [Record::default(); BATCH],
++            count: 0,
++            successful: 0,
++            started: None,
++            host_limited: false,
++            pmtu: false,
++            completed: false,
++            cursor: 0,
++        }
++    }
++
+     /// Worker to which the buffer must return.
+     pub const fn worker(&self) -> usize {
+         self.worker
+@@ -314,20 +331,7 @@
+             // Vec's fallible allocation avoids an infallible Box::new at startup.
+             let mut one = Vec::new();
+             one.try_reserve_exact(1).map_err(io::Error::other)?;
+-            one.push(Flight {
+-                worker,
+-                group: None,
+-                grant: None,
+-                origin: PacketId::default(),
+-                records: [Record::default(); BATCH],
+-                count: 0,
+-                successful: 0,
+-                started: None,
+-                host_limited: false,
+-                pmtu: false,
+-                completed: false,
+-                cursor: 0,
+-            });
++            one.push(Flight::new(worker));
+             let array: Box<[Flight; 1]> = one
+                 .into_boxed_slice()
+                 .try_into()
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -16,6 +16,8 @@
+ use owner::{Owner, Request};
+ 
+ const ACK_BUFFERS: usize = 4;
++// Protect all mandatory pooled returns, including the successor Flight.
++const RESERVED_MESSAGES: usize = 7;
+ 
+ pub(crate) struct Ack {
+     origin: usize,
+@@ -227,6 +229,9 @@
+     pub(super) cursor: usize,
+     pub(super) flight: Option<Box<Flight>>,
+     pub(super) job: Option<Job>,
++    spare: Option<Box<Flight>>,
++    retiring: Option<Job>,
++    successor_ready: bool,
+     pub(super) report: Option<Box<Report>>,
+     #[allow(clippy::vec_box)]
+     pub(super) ack_free: Vec<Box<Ack>>,
+@@ -291,7 +296,7 @@
+             .map_err(io::Error::other)?;
+         let mut outgoing = VecDeque::new();
+         outgoing
+-            .try_reserve_exact(workers * (ACK_BUFFERS + 4))
++            .try_reserve_exact(workers * (ACK_BUFFERS + 5))
+             .map_err(io::Error::other)?;
+         let mut probes = Vec::new();
+         probes
+@@ -326,6 +331,9 @@
+             cursor: 0,
+             flight: None,
+             job: None,
++            spare: None,
++            retiring: None,
++            successor_ready: false,
+             report: Some(boxed(Report::new(id))?),
+             ack_free,
+             incoming,
+@@ -511,9 +519,10 @@
+             .checked_mul(size_of::<usize>())?
+             .checked_add(ACK_BUFFERS * (size_of::<Ack>() + size_of::<Box<Ack>>()))?
+             .checked_add(size_of::<Report>())?
++            .checked_add(size_of::<Flight>())?
+             .checked_add(workers.checked_mul(ACK_BUFFERS * size_of::<Box<Ack>>())?)?
+             .checked_add(
+-                (workers * (ACK_BUFFERS + 4))
++                (workers * (ACK_BUFFERS + 5))
+                     .next_power_of_two()
+                     .checked_mul(size_of::<(usize, Message)>())?,
+             )?
+@@ -579,6 +588,7 @@
+         let now = first.io_clock(Duration::ZERO)()?;
+         let (owner, flights) = Owner::new(groups, workers.len(), &descriptors, now)?;
+         for (worker, flight) in workers.iter_mut().zip(flights.into_vec()) {
++            worker.sender.spare = Some(boxed(Flight::new(worker.id))?);
+             worker.sender.flight = Some(flight);
+         }
+         workers
+@@ -661,9 +671,30 @@
+                 self.sender_message(Message::Recycle(flight), now)?;
+             }
+             Message::Recycle(flight) => {
++                if let Some(retiring) = self.sender.retiring
++                    && flight.completion().is_some()
++                {
++                    let id = PacketId {
++                        session: retiring.session,
++                        generation: retiring.generation,
++                        lane: retiring.lane as u16 + 1,
++                        number: retiring.first,
++                    };
++                    if self.sender.spare.is_some()
++                        || flight.worker() != self.id
++                        || flight.packets().len() != retiring.count
++                        || flight.packets().next().is_none_or(|packet| packet.id != id)
++                    {
++                        return Err(io::Error::other("unexpected retiring send completion"));
++                    }
++                    self.sender.retiring = None;
++                    self.sender.spare = Some(flight);
++                    return Ok(());
++                }
+                 if self.sender.flight.is_some() {
+                     return Err(io::ErrorKind::InvalidData.into());
+                 }
++                self.sender.successor_ready = false;
+                 if let Some(job) = self.sender.job.take() {
+                     if matches!(job.kind, JobKind::Probe { pmtu: true, .. })
+                         && flight.completion().is_none_or(|(sent, _, _)| sent == 0)
+@@ -919,7 +950,7 @@
+                         .sender
+                         .outgoing
+                         .capacity()
+-                        .saturating_sub(6 * self.shared.workers())
++                        .saturating_sub(RESERVED_MESSAGES * self.shared.workers())
+             {
+                 self.sender.queue(
+                     0,
+@@ -942,7 +973,7 @@
+                             .sender
+                             .outgoing
+                             .capacity()
+-                            .saturating_sub(6 * self.shared.workers());
++                            .saturating_sub(RESERVED_MESSAGES * self.shared.workers());
+             }
+         }
+         Ok(more
+@@ -953,7 +984,7 @@
+                         .sender
+                         .outgoing
+                         .capacity()
+-                        .saturating_sub(6 * self.shared.workers())))
++                        .saturating_sub(RESERVED_MESSAGES * self.shared.workers())))
+     }
+ 
+     pub(super) fn service_sender(&mut self, now: Duration) -> io::Result<bool> {
+@@ -970,7 +1001,7 @@
+                         .sender
+                         .outgoing
+                         .capacity()
+-                        .saturating_sub(6 * self.shared.workers())
++                        .saturating_sub(RESERVED_MESSAGES * self.shared.workers())
+             {
+                 self.sender.queue(0, Message::ProbeReplied { group })?;
+                 self.sender.fresh[group] = false;
+@@ -1083,7 +1114,7 @@
+                             .sender
+                             .outgoing
+                             .capacity()
+-                            .saturating_sub(6 * self.shared.workers())
++                            .saturating_sub(RESERVED_MESSAGES * self.shared.workers())
+                     {
+                         self.sender.queue(
+                             0,
+@@ -1158,6 +1189,10 @@
+         if self.recovery.quiesce.is_some()
+             || self.sessions[session].tx_retained != 0
+             || self.sender.job.is_some_and(|job| job.session == session)
++            || self
++                .sender
++                .retiring
++                .is_some_and(|job| job.session == session)
+         {
+             return false;
+         }
+@@ -1412,6 +1447,8 @@
+             .map_err(io::Error::other)?;
+         if retain_suffix {
+             self.sender.job = Some(Job { count, ..job });
++            self.sender.successor_ready =
++                self.sender.retiring.is_none() && self.sender.spare.is_some();
+         }
+         self.sender.permitted = false;
+         self.sender.queue(0, Message::Complete(flight))
+@@ -1564,6 +1601,12 @@
+                     }
+                 }
+                 self.sessions[job.session].batches[job.lane] = Some(batch);
++                // Only the submitted prefix is retiring. The remaining plan now
++                // owns its suffix and can request the spare without waiting.
++                if std::mem::take(&mut self.sender.successor_ready) {
++                    self.sender.retiring = self.sender.job.take();
++                    self.sender.flight = self.sender.spare.take();
++                }
+             }
+             JobKind::Probe { length, pmtu } => {
+                 let mut clock = self.io_clock(now);
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -334,7 +334,10 @@
+         if let Some(check) = &mut self.groups[group].check {
+             if self.sender.feedback_ready(group)
+                 && check.unsent != 0
+-                && outgoing.len() < outgoing.capacity().saturating_sub(6 * self.requests.len())
++                && outgoing.len()
++                    < outgoing
++                        .capacity()
++                        .saturating_sub(RESERVED_MESSAGES * self.requests.len())
+             {
+                 let worker = check.unsent.trailing_zeros() as usize;
+                 outgoing.push_back((
+@@ -359,7 +362,10 @@
+         if let Some(at) = state.pto.deadline(&state.rtt, latest.map(|(_, at)| at)) {
+             self.round_due = Some(self.round_due.map_or(at, |old| old.min(at)));
+         }
+-        if outgoing.len() < outgoing.capacity().saturating_sub(6 * self.requests.len())
++        if outgoing.len()
++            < outgoing
++                .capacity()
++                .saturating_sub(RESERVED_MESSAGES * self.requests.len())
+             && let Some((target, count)) = state.probe
+             && let Some(id) = target
+                 .filter(|id| self.timers.matches(*id))
+@@ -482,7 +488,10 @@
+             self.reclaim_due = now.saturating_add(RETRY);
+         }
+         if self.reclaim != 0
+-            && outgoing.len() < outgoing.capacity().saturating_sub(6 * self.requests.len())
++            && outgoing.len()
++                < outgoing
++                    .capacity()
++                    .saturating_sub(RESERVED_MESSAGES * self.requests.len())
+         {
+             let worker = self.reclaim.trailing_zeros() as usize;
+             self.reclaim &= self.reclaim - 1;
+@@ -1471,7 +1480,7 @@
+             .pto
+             .deadline(&owner.groups[0].rtt, Some(Duration::ZERO))
+             .unwrap();
+-        let mut outgoing = VecDeque::with_capacity(8);
++        let mut outgoing = VecDeque::with_capacity(ACK_BUFFERS + 5);
+         owner.advance(now, &mut outgoing).unwrap();
+         assert!(outgoing.is_empty());
+         assert!(!owner.advance(now, &mut outgoing).unwrap());
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -3258,3 +3258,205 @@
+     assert!(workers[1].sender.incoming.is_empty());
+     assert_eq!(workers[0].counters.ack_buffer_drops, 0);
+ }
++
++fn successful_predecessor(length: usize) -> ([Worker; 2], ReceiveSocket) {
++    let (mut workers, rx) = workers();
++    workers[1].mtu_due = Duration::MAX;
++    queue_frame(&mut workers[1], length);
++    workers[1].flush_frames(Duration::ZERO).unwrap();
++    let (_, Message::Request(mut request)) = workers[1].sender.outgoing.pop_front().unwrap() else {
++        panic!()
++    };
++    let first_bytes = request.flight.packets().next().unwrap().bytes;
++    request.flight.truncate(u32::from(first_bytes)).unwrap();
++    let owner = workers[0].sender.owner.as_mut().unwrap();
++    owner.request(request).unwrap();
++    let mut outgoing = VecDeque::with_capacity(32);
++    owner
++        .advance(Duration::from_millis(1), &mut outgoing)
++        .unwrap();
++    let (_, Message::Permit(flight)) = outgoing.pop_front().unwrap() else {
++        panic!()
++    };
++    workers[1]
++        .sender_message(Message::Permit(flight), Duration::from_millis(1))
++        .unwrap();
++    workers[1]
++        .use_sender_permit(Duration::from_millis(1))
++        .unwrap();
++    assert!(workers[1].sender.job.is_none());
++    assert!(workers[1].sender.retiring.is_some());
++    assert!(workers[1].sender.flight.is_some());
++    assert!(workers[1].sender.spare.is_none());
++    (workers, rx)
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn successor_preserves_reserved_suffix_and_waits_for_predecessor_commit() {
++    let (mut workers, _rx) = successful_predecessor(9022);
++    let old = workers[1].sender.retiring.unwrap();
++    assert_eq!(old.count, 1);
++    let index = workers[1].sender_index(0, 1).unwrap();
++    let suffix = workers[1].sessions[0].batches[1]
++        .as_ref()
++        .unwrap()
++        .plan
++        .packet(0)
++        .unwrap()
++        .number;
++    assert_eq!(suffix, old.first + 1);
++    assert!(workers[1].sender.lanes[index].history.is_reserved(suffix));
++    workers[1].flush_frames(Duration::from_millis(1)).unwrap();
++    let (_, Message::Complete(complete)) = workers[1].sender.outgoing.pop_front().unwrap() else {
++        panic!()
++    };
++    let (_, Message::Request(request)) = workers[1].sender.outgoing.pop_front().unwrap() else {
++        panic!()
++    };
++    assert_eq!(request.flight.packets().next().unwrap().id.number, suffix);
++    let owner = workers[0].sender.owner.as_mut().unwrap();
++    owner.request(request).unwrap();
++    let mut outgoing = VecDeque::with_capacity(32);
++    owner
++        .advance(Duration::from_millis(2), &mut outgoing)
++        .unwrap();
++    assert!(
++        !outgoing
++            .iter()
++            .any(|(_, message)| matches!(message, Message::Permit(_)))
++    );
++    owner.complete(complete).unwrap();
++    owner
++        .advance(Duration::from_millis(3), &mut outgoing)
++        .unwrap();
++    let (_, Message::Recycle(retired)) = outgoing.pop_front().unwrap() else {
++        panic!()
++    };
++    workers[1]
++        .sender_message(Message::Recycle(retired), Duration::from_millis(3))
++        .unwrap();
++    assert!(workers[1].sender.retiring.is_none());
++    assert!(workers[1].sender.spare.is_some());
++    assert_eq!(workers[1].sender.job.unwrap().first, suffix);
++    assert!(workers[1].sender.lanes[index].history.is_reserved(suffix));
++    if let Some((_, Message::Permit(flight))) = outgoing.pop_front() {
++        workers[1]
++            .sender_message(Message::Permit(flight), Duration::from_millis(3))
++            .unwrap();
++        assert!(workers[1].sender.permitted);
++    }
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn unissued_successor_can_return_before_predecessor_without_losing_either_buffer() {
++    let (mut workers, _rx) = successful_predecessor(60);
++    queue_frame(&mut workers[1], 60);
++    workers[1].flush_frames(Duration::from_millis(1)).unwrap();
++    let (_, Message::Complete(complete)) = workers[1].sender.outgoing.pop_front().unwrap() else {
++        panic!()
++    };
++    let (_, Message::Request(request)) = workers[1].sender.outgoing.pop_front().unwrap() else {
++        panic!()
++    };
++    let old = workers[1].sender.retiring.unwrap();
++    workers[1]
++        .sender_message(Message::Recycle(request.flight), Duration::from_millis(2))
++        .unwrap();
++    assert!(workers[1].sender.job.is_none());
++    assert!(workers[1].sender.flight.is_some());
++    assert_eq!(workers[1].sender.retiring.unwrap().first, old.first);
++    assert!(!workers[1].sender_idle(0));
++    let owner = workers[0].sender.owner.as_mut().unwrap();
++    owner.complete(complete).unwrap();
++    let mut outgoing = VecDeque::with_capacity(32);
++    owner
++        .advance(Duration::from_millis(2), &mut outgoing)
++        .unwrap();
++    let (_, Message::Recycle(retired)) = outgoing.pop_front().unwrap() else {
++        panic!()
++    };
++    workers[1]
++        .sender_message(Message::Recycle(retired), Duration::from_millis(2))
++        .unwrap();
++    assert!(workers[1].sender.retiring.is_none());
++    assert!(workers[1].sender.spare.is_some());
++    assert!(workers[1].sender.flight.is_some());
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn retiring_successor_identity_rejects_wrong_generation_without_releasing_state() {
++    let (mut workers, _rx) = successful_predecessor(60);
++    let (_, Message::Complete(complete)) = workers[1].sender.outgoing.pop_front().unwrap() else {
++        panic!()
++    };
++    let owner = workers[0].sender.owner.as_mut().unwrap();
++    owner.complete(complete).unwrap();
++    let mut outgoing = VecDeque::with_capacity(32);
++    owner
++        .advance(Duration::from_millis(2), &mut outgoing)
++        .unwrap();
++    let (_, Message::Recycle(retired)) = outgoing.pop_front().unwrap() else {
++        panic!()
++    };
++    workers[1].sender.retiring.as_mut().unwrap().generation += 1;
++    assert!(
++        workers[1]
++            .sender_message(Message::Recycle(retired), Duration::from_millis(2))
++            .is_err()
++    );
++    assert!(workers[1].sender.retiring.is_some());
++    assert!(workers[1].sender.spare.is_none());
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn successor_probe_resize_or_cancel_before_retirement_preserves_data_accounting() {
++    for resize in [false, true] {
++        let (mut workers, _rx) = successful_predecessor(60);
++        let old = workers[1].sender.retiring.unwrap();
++        let (_, Message::Complete(complete)) = workers[1].sender.outgoing.pop_front().unwrap()
++        else {
++            panic!()
++        };
++        workers[1]
++            .request_probe(0, 1, BASE_UDP_PAYLOAD, true, None, Duration::from_millis(2))
++            .unwrap();
++        let (_, Message::Request(request)) = workers[1].sender.outgoing.pop_front().unwrap() else {
++            panic!()
++        };
++        assert!(request.flight.completion().is_none());
++        let message = if resize {
++            Message::Resize {
++                flight: request.flight,
++                payload: BASE_UDP_PAYLOAD,
++            }
++        } else {
++            Message::Recycle(request.flight)
++        };
++        workers[1]
++            .sender_message(message, Duration::from_millis(2))
++            .unwrap();
++        assert!(workers[1].sender.job.is_none());
++        assert!(workers[1].sender.flight.is_some());
++        assert!(workers[1].sender.spare.is_none());
++        assert_eq!(workers[1].sender.retiring.unwrap().first, old.first);
++        let owner = workers[0].sender.owner.as_mut().unwrap();
++        owner.complete(complete).unwrap();
++        let mut outgoing = VecDeque::with_capacity(32);
++        owner
++            .advance(Duration::from_millis(2), &mut outgoing)
++            .unwrap();
++        let (_, Message::Recycle(retired)) = outgoing.pop_front().unwrap() else {
++            panic!()
++        };
++        workers[1]
++            .sender_message(Message::Recycle(retired), Duration::from_millis(2))
++            .unwrap();
++        assert!(workers[1].sender.retiring.is_none());
++        assert!(workers[1].sender.spare.is_some());
++        assert!(workers[1].sender.flight.is_some());
++    }
++}

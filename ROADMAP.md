@@ -7,6 +7,24 @@ read that section before writing code. Keep the "Current status" paragraph in
 section 15 of the design and the "Implementation status" section of
 [README.md](README.md) true after every step.
 
+## November 8 checkpoint
+
+Production transport remains at `35ed011`: bounded fresh expansion, corrected
+routed benchmark ordering, failed-ACK retry and early ACK-buffer recycling are
+retained. The latest completed comparison rejects early successor requests
+and receive-side ACK retention. Both pass their documented correctness suites,
+but the first still collapses under GSO overload and the second regresses
+bridged input. [BENCH.md](BENCH.md#successor-requests-and-ack-retention-do-not-fix-both-input-paths-november-8)
+contains the patches, all 24 measurements, drop attribution and test limits.
+
+No 20G local, 5G routed-loss or universal overload-plateau gate has passed.
+Next, measure ACK-box residence and receive-credit occupancy against owner
+service, and profile the bridged worker that reaches 95.5% CPU plus kernel
+softirq cost. The earlier claim that no thread approaches saturation does not
+cover this profile. Preserve physical-send ordering and ACK/loss barriers in
+any sender redesign. Stage 4 TAP lifetime/restart and production panic work
+remain open; stage 5 must revisit every original performance gate.
+
 ## Rules for every change
 
 - `libc` is the only dependency of the library. Feature-gated crates

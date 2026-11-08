@@ -18,6 +18,14 @@ QUIC-style UDP, may carry SRv6 encapsulating IPv4 or IPv6, arrives through a
 bridge from a NIC, and comes in a few large flows. This report ranks blockers
 by their effect on that traffic first and the local gate second.
 
+Follow-up, November 8: [BENCH.md](BENCH.md#successor-requests-and-ack-retention-do-not-fix-both-input-paths-november-8)
+records the implementation work and matched release experiments after this
+report. Early successor requests still collapse with GSO; retaining ACK
+records improves GSO but regresses bridged input. Neither candidate is
+applied. A bridged control worker reaches 95.5% CPU, so section 2's
+serialization-only conclusion does not cover the newer workload. The
+original report below remains a record of its stated revision.
+
 ## 1. Verdict
 
 The current build delivers 1.5 to 1.8 Gbit/s per direction on the eight-lane
