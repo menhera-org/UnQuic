@@ -1,0 +1,409 @@
+diff --git a/src/bbr/controller.rs b/src/bbr/controller.rs
+index ac1e107..23661af 100644
+--- a/src/bbr/controller.rs
++++ b/src/bbr/controller.rs
+@@ -243,6 +243,15 @@ impl Controller {
+         self.state
+     }
+ 
++    pub(crate) fn diagnostic_bounds(&self) -> (u64, u64, u64, u64) {
++        (
++            self.max_bw,
++            self.bw_shortterm,
++            self.inflight_shortterm,
++            self.lost,
++        )
++    }
++
+     /// Shared window, pacing rate and send quantum in outer bytes.
+     pub const fn limits(&self) -> Limits {
+         Limits {
+diff --git a/src/bin/unquic.rs b/src/bin/unquic.rs
+index 2e92c5d..a290d81 100644
+--- a/src/bin/unquic.rs
++++ b/src/bin/unquic.rs
+@@ -111,6 +111,10 @@ fn serve(loaded: config::Loaded) -> io::Result<()> {
+         .spawn(move || runtime::run(loaded.config, worker_control))?;
+     let mut lookups = Some(loaded.lookups);
+     let mut helper_error = None;
++    let diagnostic_start = Instant::now();
++    eprintln!(
++        "unquic-diag columns=elapsed_ns worker tx_outer_bytes delivered_frame_bytes tx_expired_input_frames tx_expired_unsent_frames tx_expired_partial_frames send_grants expired_grants pacing_bytes_per_second bytes_in_flight diag_now_ns diag_state diag_startup_ns diag_drain_ns diag_down_ns diag_cruise_ns diag_refill_ns diag_up_ns diag_probe_rtt_ns diag_probe_rtt_entries diag_cwnd diag_cwnd_min diag_cwnd_max diag_rate_min diag_rate_max diag_max_bw diag_bw_shortterm diag_inflight_shortterm diag_lost_bytes diag_loss_declarations diag_reserved diag_request_attempts diag_request_expired diag_request_wait_ns diag_request_wait_max_ns diag_request_margin_min_ns diag_request_late_max_ns diag_granted diag_blocked diag_window_blocked diag_pacer_blocked"
++    );
+     while !transport.is_finished() {
+         if REPORT.swap(false, Ordering::Relaxed) {
+             let mut worker = 0;
+@@ -119,6 +123,56 @@ fn serve(loaded: config::Loaded) -> io::Result<()> {
+                 worker += 1;
+             }
+         }
++        let elapsed = diagnostic_start.elapsed().as_nanos();
++        let mut worker = 0;
++        while let Some(snapshot) = control.worker_counters(worker) {
++            eprintln!(
++                "unquic-diag {elapsed} {worker} {:?}",
++                [
++                    snapshot.tx_outer_bytes,
++                    snapshot.delivered_frame_bytes,
++                    snapshot.tx_expired_input_frames,
++                    snapshot.tx_expired_unsent_frames,
++                    snapshot.tx_expired_partial_frames,
++                    snapshot.send_grants,
++                    snapshot.expired_grants,
++                    snapshot.pacing_bytes_per_second,
++                    snapshot.bytes_in_flight,
++                    snapshot.diag_now_ns,
++                    snapshot.diag_state,
++                    snapshot.diag_startup_ns,
++                    snapshot.diag_drain_ns,
++                    snapshot.diag_down_ns,
++                    snapshot.diag_cruise_ns,
++                    snapshot.diag_refill_ns,
++                    snapshot.diag_up_ns,
++                    snapshot.diag_probe_rtt_ns,
++                    snapshot.diag_probe_rtt_entries,
++                    snapshot.diag_cwnd,
++                    snapshot.diag_cwnd_min,
++                    snapshot.diag_cwnd_max,
++                    snapshot.diag_rate_min,
++                    snapshot.diag_rate_max,
++                    snapshot.diag_max_bw,
++                    snapshot.diag_bw_shortterm,
++                    snapshot.diag_inflight_shortterm,
++                    snapshot.diag_lost_bytes,
++                    snapshot.diag_loss_declarations,
++                    snapshot.diag_reserved,
++                    snapshot.diag_request_attempts,
++                    snapshot.diag_request_expired,
++                    snapshot.diag_request_wait_ns,
++                    snapshot.diag_request_wait_max_ns,
++                    snapshot.diag_request_margin_min_ns,
++                    snapshot.diag_request_late_max_ns,
++                    snapshot.diag_granted,
++                    snapshot.diag_blocked,
++                    snapshot.diag_window_blocked,
++                    snapshot.diag_pacer_blocked,
++                ]
++            );
++            worker += 1;
++        }
+         if STOP.load(Ordering::Relaxed) {
+             control.shutdown();
+             break;
+diff --git a/src/counters.rs b/src/counters.rs
+index f3a6ae0..cf8cf8e 100644
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -92,6 +92,68 @@ macro_rules! metrics {
+ }
+ 
+ metrics! {
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_now_ns: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_state: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_startup_ns: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_drain_ns: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_down_ns: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_cruise_ns: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_refill_ns: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_up_ns: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_probe_rtt_ns: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_probe_rtt_entries: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_cwnd: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_cwnd_min: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_cwnd_max: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_rate_min: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_rate_max: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_max_bw: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_bw_shortterm: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_inflight_shortterm: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_lost_bytes: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_loss_declarations: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_reserved: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_request_attempts: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_request_expired: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_request_wait_ns: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_request_wait_max_ns: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_request_margin_min_ns: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_request_late_max_ns: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_granted: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_blocked: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_window_blocked: sum,
++    /// Temporary controller diagnostic; owner worker, path group zero only.
++    diag_pacer_blocked: sum,
+     /// Ethernet bytes successfully written as complete frames to TAP.
+     delivered_frame_bytes: sum,
+     /// Successfully submitted outer IPv6 bytes, including IPv6 and UDP headers.
+diff --git a/src/worker/sender/owner.rs b/src/worker/sender/owner.rs
+index b7cced9..440de8b 100644
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -28,6 +28,8 @@ struct LossBarrier {
+ }
+ 
+ struct Group {
++    diagnostic: Snapshot,
++    diagnostic_at: Duration,
+     controller: Controller,
+     rtt: Rtt,
+     pto: ProbeTimeout,
+@@ -41,8 +43,57 @@ struct Group {
+     probe_cursor: Option<usize>,
+ }
+ 
++impl Group {
++    fn diagnostic_account(&mut self, now: Duration) {
++        let elapsed = now.saturating_sub(self.diagnostic_at).as_nanos() as u64;
++        self.diagnostic_at = now;
++        let d = &mut self.diagnostic;
++        d.diag_now_ns = now.as_nanos() as u64;
++        let dwell = match self.controller.state() {
++            crate::bbr::State::Startup => &mut d.diag_startup_ns,
++            crate::bbr::State::Drain => &mut d.diag_drain_ns,
++            crate::bbr::State::Down => &mut d.diag_down_ns,
++            crate::bbr::State::Cruise => &mut d.diag_cruise_ns,
++            crate::bbr::State::Refill => &mut d.diag_refill_ns,
++            crate::bbr::State::Up => &mut d.diag_up_ns,
++            crate::bbr::State::ProbeRtt => &mut d.diag_probe_rtt_ns,
++        };
++        *dwell = dwell.wrapping_add(elapsed);
++    }
++
++    fn diagnostic_observe(&mut self) {
++        let limits = self.controller.limits();
++        let state = self.controller.state() as u64;
++        let d = &mut self.diagnostic;
++        if state == crate::bbr::State::ProbeRtt as u64 && d.diag_state != state {
++            d.diag_probe_rtt_entries += 1;
++        }
++        d.diag_state = state;
++        d.diag_cwnd = limits.window;
++        d.diag_cwnd_min = if d.diag_cwnd_min == 0 {
++            limits.window
++        } else {
++            d.diag_cwnd_min.min(limits.window)
++        };
++        d.diag_cwnd_max = d.diag_cwnd_max.max(limits.window);
++        d.diag_rate_min = if d.diag_rate_min == 0 {
++            limits.rate
++        } else {
++            d.diag_rate_min.min(limits.rate)
++        };
++        d.diag_rate_max = d.diag_rate_max.max(limits.rate);
++        (
++            d.diag_max_bw,
++            d.diag_bw_shortterm,
++            d.diag_inflight_shortterm,
++            d.diag_lost_bytes,
++        ) = self.controller.diagnostic_bounds();
++    }
++}
++
+ pub(in crate::worker) struct Owner {
+     sender: Sender,
++    request_first_examined: [Option<Duration>; 64],
+     pub(super) timers: timers::Timers,
+     groups: Vec<Group>,
+     requests: Vec<Option<Request>>,
+@@ -72,6 +123,8 @@ impl Owner {
+         states.try_reserve_exact(groups).map_err(io::Error::other)?;
+         for group in 0..groups {
+             states.push(Group {
++                diagnostic: Snapshot::default(),
++                diagnostic_at: now,
+                 controller: Controller::new(1280, None, now, group as u64 + 1)
+                     .map_err(io::Error::other)?,
+                 rtt: Rtt::new(),
+@@ -98,6 +151,7 @@ impl Owner {
+         Ok((
+             Self {
+                 sender,
++                request_first_examined: [None; 64],
+                 timers: timers::Timers::new(groups, descriptors)?,
+                 groups: states,
+                 requests,
+@@ -142,6 +196,7 @@ impl Owner {
+         if slot.is_some() || request.group >= self.groups.len() {
+             return Err(io::Error::other("duplicate sender request"));
+         }
++        self.request_first_examined[request.flight.worker()] = None;
+         *slot = Some(request);
+         Ok(())
+     }
+@@ -189,7 +244,7 @@ impl Owner {
+             }),
+             pacing_bytes_per_second: state.controller.limits().rate,
+             bytes_in_flight: self.sender.flight_bytes(group)?.1,
+-            ..Snapshot::default()
++            ..state.diagnostic
+         })
+     }
+ 
+@@ -398,6 +453,9 @@ impl Owner {
+         now: Duration,
+         outgoing: &mut VecDeque<(usize, Message)>,
+     ) -> io::Result<bool> {
++        for state in &mut self.groups {
++            state.diagnostic_account(now);
++        }
+         let mut more = false;
+         let mut work = BATCH_SIZE;
+         let visits = (self.groups.len() - self.cursor).min(BATCH_SIZE);
+@@ -513,10 +571,31 @@ impl Owner {
+                 .ok_or(io::ErrorKind::InvalidData)?
+                 .id;
+             let state = &mut self.groups[request.group];
++            let first_attempt = self.request_first_examined[worker].is_none();
++            let first = self.request_first_examined[worker].get_or_insert(now);
++            let wait = now.saturating_sub(*first).as_nanos() as u64;
++            let d = &mut state.diagnostic;
++            d.diag_request_attempts += 1;
++            if first_attempt {
++                let margin = request.deadline.saturating_sub(now).as_nanos() as u64;
++                d.diag_request_margin_min_ns = if d.diag_request_attempts == 1 {
++                    margin
++                } else {
++                    d.diag_request_margin_min_ns.min(margin)
++                };
++            }
+             if now >= request.deadline
+                 || !self.timers.matches(id)
+                 || request.probe.is_some_and(|epoch| epoch != state.epoch)
+             {
++                if now >= request.deadline {
++                    d.diag_request_expired += 1;
++                    d.diag_request_wait_ns += wait;
++                    d.diag_request_wait_max_ns = d.diag_request_wait_max_ns.max(wait);
++                    d.diag_request_late_max_ns = d
++                        .diag_request_late_max_ns
++                        .max(now.saturating_sub(request.deadline).as_nanos() as u64);
++                }
+                 outgoing.push_back((worker, Message::Recycle(request.flight)));
+                 more = true;
+                 continue;
+@@ -593,6 +672,10 @@ impl Owner {
+             );
+             match result {
+                 Ok(()) => {
++                    let d = &mut state.diagnostic;
++                    d.diag_granted += 1;
++                    d.diag_request_wait_ns += wait;
++                    d.diag_request_wait_max_ns = d.diag_request_wait_max_ns.max(wait);
+                     request.flight.pmtu = request.pmtu;
+                     outgoing.push_back((worker, Message::Permit(request.flight)));
+                     granted_next.get_or_insert(self.request_cursor);
+@@ -603,6 +686,14 @@ impl Owner {
+                     more = true;
+                 }
+                 Err(GrantError::Blocked) => {
++                    let d = &mut state.diagnostic;
++                    d.diag_blocked += 1;
++                    d.diag_window_blocked += u64::from(available < u64::from(limits.max_datagram));
++                    d.diag_pacer_blocked += u64::from(
++                        self.sender
++                            .deadline(request.group, now)
++                            .is_some_and(|at| at > now),
++                    );
+                     if let Some(at) = self.sender.deadline(request.group, now) {
+                         self.due = Some(self.due.map_or(at, |old| old.min(at)));
+                     }
+@@ -621,6 +712,10 @@ impl Owner {
+         if let Some(next) = granted_next {
+             self.request_cursor = next;
+         }
++        for (index, state) in self.groups.iter_mut().enumerate() {
++            state.diagnostic.diag_reserved = self.sender.flight_bytes(index).map_or(0, |v| v.0);
++            state.diagnostic_observe();
++        }
+         Ok(more)
+     }
+ 
+@@ -658,6 +753,7 @@ impl Owner {
+                         .lost(group, id, sample)
+                         .map_err(io::Error::other)?
+                     {
++                        state.diagnostic.diag_loss_declarations += 1;
+                         if state.recovery.is_none() {
+                             let (_, inflight) = self
+                                 .sender
+@@ -739,6 +835,7 @@ impl Owner {
+             }
+             state.ack = None;
+         }
++        state.diagnostic_observe();
+         Ok(())
+     }
+ }
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 6202b14..3759df4 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -1707,6 +1707,39 @@ impl Worker {
+             self.counters.rtt_ns = self.counters.rtt_ns.max(totals.rtt_ns);
+         }
+         if let Some(owner) = &self.sender.owner {
++            if let Some(snapshot) = owner.snapshot(0) {
++                self.counters.diag_now_ns = snapshot.diag_now_ns;
++                self.counters.diag_state = snapshot.diag_state;
++                self.counters.diag_startup_ns = snapshot.diag_startup_ns;
++                self.counters.diag_drain_ns = snapshot.diag_drain_ns;
++                self.counters.diag_down_ns = snapshot.diag_down_ns;
++                self.counters.diag_cruise_ns = snapshot.diag_cruise_ns;
++                self.counters.diag_refill_ns = snapshot.diag_refill_ns;
++                self.counters.diag_up_ns = snapshot.diag_up_ns;
++                self.counters.diag_probe_rtt_ns = snapshot.diag_probe_rtt_ns;
++                self.counters.diag_probe_rtt_entries = snapshot.diag_probe_rtt_entries;
++                self.counters.diag_cwnd = snapshot.diag_cwnd;
++                self.counters.diag_cwnd_min = snapshot.diag_cwnd_min;
++                self.counters.diag_cwnd_max = snapshot.diag_cwnd_max;
++                self.counters.diag_rate_min = snapshot.diag_rate_min;
++                self.counters.diag_rate_max = snapshot.diag_rate_max;
++                self.counters.diag_max_bw = snapshot.diag_max_bw;
++                self.counters.diag_bw_shortterm = snapshot.diag_bw_shortterm;
++                self.counters.diag_inflight_shortterm = snapshot.diag_inflight_shortterm;
++                self.counters.diag_lost_bytes = snapshot.diag_lost_bytes;
++                self.counters.diag_loss_declarations = snapshot.diag_loss_declarations;
++                self.counters.diag_reserved = snapshot.diag_reserved;
++                self.counters.diag_request_attempts = snapshot.diag_request_attempts;
++                self.counters.diag_request_expired = snapshot.diag_request_expired;
++                self.counters.diag_request_wait_ns = snapshot.diag_request_wait_ns;
++                self.counters.diag_request_wait_max_ns = snapshot.diag_request_wait_max_ns;
++                self.counters.diag_request_margin_min_ns = snapshot.diag_request_margin_min_ns;
++                self.counters.diag_request_late_max_ns = snapshot.diag_request_late_max_ns;
++                self.counters.diag_granted = snapshot.diag_granted;
++                self.counters.diag_blocked = snapshot.diag_blocked;
++                self.counters.diag_window_blocked = snapshot.diag_window_blocked;
++                self.counters.diag_pacer_blocked = snapshot.diag_pacer_blocked;
++            }
+             for group in 0..self.shared.config.path_groups() {
+                 if let Some(snapshot) = owner.snapshot(group) {
+                     self.counters.pacing_bytes_per_second = self

@@ -565,6 +565,10 @@ one ACK sample across bounded processing turns. It distinguishes application
 bubbles from host-queue limitation. The pure BBRv3 controller implements draft-07's
 model and state machine. Worker integration includes recovery, but general
 application-limited detection and the performance gates remain unfinished.
+PMTU provenance follows each successful probe through delivery sampling.
+An ACK containing only newly delivered PMTU probes cannot establish a bandwidth
+plateau or end Startup on that evidence. Mixed DATA/probe ACKs remain eligible;
+all probe bytes still count toward delivery, loss and congestion accounting.
 
 `pacing::Sender` combines the grant ledger with a shared bounded sampling slab
 and ordered completion processing. One reusable flight buffer per worker carries
@@ -573,7 +577,11 @@ issued grant report before committing sends in timestamp order, then accepts
 generation-qualified ACK, loss and retirement reports. Tests cover delayed and
 reversed completions, partial sends, metadata pressure and allocation-free reuse.
 TX owners now retain sent histories and route ACKs by the acknowledged lane,
-independently of the lane carrying the ACK. Bounded ACK, loss and retirement
+independently of the lane carrying the ACK. ACKs are validated before entering
+the TX owner's queue. Valid queued ACKs protect their covered packets while
+earlier finite loss passes finish; stale, future and known-unsent claims do not.
+Finishing a fully protected pass schedules continuation for waiting ACK work.
+Bounded ACK, loss and retirement
 reports use storage separate from send completions. Startup memory accounting
 includes these histories, the shared sampler and all reserved message buffers.
 The coordinator drains ready completions and feedback within one shared

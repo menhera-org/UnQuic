@@ -11,6 +11,7 @@ pub struct DeliveryPacket {
     bytes: u16,
     acknowledged: bool,
     declared_lost: bool,
+    pub(crate) pmtu: bool,
 }
 
 /// Delivery observation from all newly acknowledged transmissions in one ACK.
@@ -34,6 +35,9 @@ pub struct RateSample {
     pub app_limited: bool,
     /// Whether host queues limited that transmission or this ACK's processing.
     pub host_limited: bool,
+    /// Every newly delivered packet in this ACK was a path-MTU probe.
+    /// This is provenance, not a claim that the application was idle.
+    pub pmtu_only: bool,
     /// Shared monotonic identifier of the newest acknowledged transmission.
     pub last_packet: u64,
 }
@@ -67,6 +71,7 @@ struct Snapshot {
 }
 
 struct Pending {
+    pmtu_only: bool,
     at: Duration,
     newly_acked: u64,
     host_limited: bool,
@@ -232,6 +237,7 @@ impl Delivery {
             bytes,
             acknowledged: false,
             declared_lost: false,
+            pmtu: false,
         };
         self.last_sent_at = at;
         self.next_id = next;
@@ -248,6 +254,7 @@ impl Delivery {
             return Err(DeliveryError::Invalid);
         }
         self.pending = Some(Pending {
+            pmtu_only: true,
             at,
             newly_acked: 0,
             host_limited,
@@ -288,6 +295,7 @@ impl Delivery {
             self.first_sent_at = snapshot.sent_at;
         }
         ack.newly_acked = newly_acked;
+        ack.pmtu_only &= packet.pmtu;
         self.delivered = delivered;
         self.delivered_at = ack.at;
         packet.acknowledged = true;
@@ -322,6 +330,7 @@ impl Delivery {
             tx_in_flight: packet.in_flight,
             app_limited: packet.app_limited,
             host_limited: packet.host_limited || ack.host_limited,
+            pmtu_only: ack.pmtu_only,
             last_packet: packet.id,
         }))
     }
@@ -360,6 +369,67 @@ impl Delivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_provenance_uses_all_new_deliveries_independent_of_ack_order() {
+        for mask in 0..8 {
+            for order in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ] {
+                let mut delivery = Delivery::new();
+                let mut packets = [
+                    delivery.sent(Duration::ZERO, 100, 0, false).unwrap(),
+                    delivery
+                        .sent(Duration::from_nanos(1), 200, 100, false)
+                        .unwrap(),
+                    delivery
+                        .sent(Duration::from_nanos(2), 300, 300, false)
+                        .unwrap(),
+                ];
+                for (index, packet) in packets.iter_mut().enumerate() {
+                    packet.pmtu = mask & (1 << index) != 0;
+                }
+                // Late delivery remains real delivery; declaring loss does not erase provenance.
+                delivery.declared_lost(&mut packets[1]).unwrap();
+                delivery
+                    .begin_ack(Duration::from_nanos(100), false)
+                    .unwrap();
+                for index in order {
+                    assert!(delivery.acknowledged(&mut packets[index]).unwrap());
+                    assert!(!delivery.acknowledged(&mut packets[index]).unwrap());
+                }
+                let sample = delivery.finish_ack(Duration::ZERO).unwrap().unwrap();
+                assert_eq!(sample.pmtu_only, mask == 7);
+                assert_eq!(
+                    (sample.newly_acked, sample.delivered, sample.lost),
+                    (600, 600, 200)
+                );
+                assert_eq!(sample.rate, Some(6_000_000_000));
+                assert!(!sample.app_limited);
+
+                let mut probe = delivery
+                    .sent(Duration::from_nanos(101), 1280, 0, false)
+                    .unwrap();
+                probe.pmtu = true;
+                delivery
+                    .begin_ack(Duration::from_nanos(200), false)
+                    .unwrap();
+                assert!(!delivery.acknowledged(&mut packets[0]).unwrap());
+                delivery.acknowledged(&mut probe).unwrap();
+                let sample = delivery.finish_ack(Duration::ZERO).unwrap().unwrap();
+                assert!(
+                    sample.pmtu_only,
+                    "old duplicate DATA does not taint a new probe-only ACK"
+                );
+                assert_eq!(sample.newly_acked, 1280);
+            }
+        }
+    }
 
     #[test]
     fn unrepresentable_rate_does_not_discard_delivered_bytes() {

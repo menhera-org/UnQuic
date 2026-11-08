@@ -19,6 +19,7 @@ fn sample(c: &Controller, rate: u64, bytes: u64) -> RateSample {
         tx_in_flight: bytes.max(1500),
         app_limited: false,
         host_limited: false,
+        pmtu_only: false,
         last_packet: c.delivered + 1,
     }
 }
@@ -526,4 +527,26 @@ fn drained_transmission_preserves_round_evidence_without_idle_proof() {
         assert_eq!(c.probe_up_acked, if app_limited { 0 } else { 1500 });
         assert!(!c.cwnd_limited);
     }
+}
+
+#[test]
+fn sparse_pmtu_samples_do_not_end_startup_but_data_still_does() {
+    let mut c = controller();
+    for round in 1..=16 {
+        let mut s = sample(&c, 150_000, 1500);
+        s.pmtu_only = true;
+        c.on_ack(s, Some(ms(10)), 30_000, false, ms(round * 100))
+            .unwrap();
+        assert_eq!(c.state(), State::Startup);
+        assert_eq!(c.full_bw_count, 0);
+        assert_eq!(c.delivered, round * 1500);
+    }
+    for round in 17..=20 {
+        let s = sample(&c, 150_000, 1500);
+        c.on_ack(s, Some(ms(10)), 30_000, false, ms(round * 100))
+            .unwrap();
+    }
+    assert!(c.full_bw_reached);
+    assert_eq!(c.state(), State::Drain);
+    assert_eq!(c.delivered, 30_000);
 }

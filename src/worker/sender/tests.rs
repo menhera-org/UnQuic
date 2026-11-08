@@ -2779,3 +2779,98 @@ fn fresh_admission_preserves_sixteen_flow_qinq_gso_burst_before_bounding_excess(
     assert_eq!(worker.counters.tx_backlog_drops, 1);
     assert_eq!(worker.counters.queue_drops, 1);
 }
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn queued_ack_validation_precedes_loss_fences_and_future_submissions() {
+    let (mut workers, _rx) = workers();
+    let index = workers[0].sender_index(0, 0).unwrap();
+    for number in 1..=3 {
+        let lane = &mut workers[0].sender.lanes[index];
+        lane.history.reserve(number, 1280, true, true).unwrap();
+        if number == 2 {
+            assert!(lane.history.cancel(number));
+        } else {
+            assert!(lane.submitted(number, Duration::from_millis(1), None));
+        }
+    }
+    workers[0].sender.loss_fences = 1;
+    for range in [AckRange { start: 4, end: 4 }, AckRange { start: 1, end: 3 }] {
+        workers[0]
+            .incoming_ack(
+                0,
+                1,
+                1,
+                0,
+                AckRanges::new(&[range]).unwrap(),
+                Duration::from_millis(2),
+            )
+            .unwrap();
+        assert!(workers[0].sender.incoming.is_empty());
+        assert_eq!(workers[0].sender.ack_free.len(), ACK_BUFFERS);
+    }
+    let mut remote = workers[1].sender.ack_free.pop().unwrap();
+    remote.session = 0;
+    remote.tag = 1;
+    remote.lane = 1;
+    remote.count = 1;
+    remote.ranges[0] = AckRange { start: 4, end: 4 };
+    workers[0]
+        .sender_message(Message::Ack(remote), Duration::from_millis(2))
+        .unwrap();
+    assert!(workers[0].sender.incoming.is_empty());
+    let lane = &mut workers[0].sender.lanes[index];
+    lane.history.reserve(4, 1280, true, true).unwrap();
+    assert!(lane.submitted(4, Duration::from_millis(3), None));
+    assert!(workers[0].sender.incoming.is_empty());
+    workers[0]
+        .incoming_ack(
+            0,
+            1,
+            1,
+            0,
+            AckRanges::new(&[AckRange { start: 3, end: 4 }]).unwrap(),
+            Duration::from_millis(4),
+        )
+        .unwrap();
+    workers[0].begin_sender_ack().unwrap();
+    assert_eq!(workers[0].sender.incoming.len(), 1);
+    assert!(workers[0].sender.lanes[index].ack.is_none());
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn fully_protected_loss_fence_continues_queued_ack_without_external_wakeup() {
+    let (mut workers, _rx) = workers();
+    let worker = &mut workers[1];
+    let now = Duration::from_millis(2);
+    let index = worker.sender_index(0, 1).unwrap();
+    let lane = &mut worker.sender.lanes[index];
+    lane.history.reserve(1, 1280, true, true).unwrap();
+    assert!(lane.submitted(1, Duration::ZERO, None));
+    lane.largest_ack = 4;
+    lane.loss_due = Some(now);
+    lane.loss_passes = 1;
+    worker.sender.loss_fences = 1;
+    worker
+        .incoming_ack(
+            0,
+            1,
+            2,
+            0,
+            AckRanges::new(&[AckRange { start: 1, end: 1 }]).unwrap(),
+            now,
+        )
+        .unwrap();
+    worker.flush_sender_messages(now).unwrap();
+    assert!(worker.service_sender(now).unwrap());
+    assert_eq!(worker.sender.loss_fences, 0);
+    assert_eq!(worker.sender.incoming.len(), 1);
+    assert!(worker.sender.lanes[index].ack.is_none());
+    assert_eq!(worker.sender.lanes[index].history.inflight_bytes(), 1280);
+    assert!(worker.recovery.staged.is_none());
+    assert!(worker.sender.report.is_some());
+    assert!(worker.service_sender(now).unwrap());
+    assert!(worker.sender.incoming.is_empty());
+    assert_eq!(worker.sender.lanes[index].history.inflight_bytes(), 0);
+}

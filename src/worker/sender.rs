@@ -406,7 +406,7 @@ impl Worker {
         }
         let owner = (usize::from(lane) - 1) % self.shared.workers();
         if owner == self.id {
-            self.sender.incoming.push_back(ack);
+            self.queue_sender_ack(ack)?;
         } else {
             self.sender.queue(owner, Message::Ack(ack))?;
         }
@@ -419,6 +419,32 @@ impl Worker {
         } else {
             self.sender.queue(ack.origin, Message::AckReturn(ack))?;
         }
+        Ok(())
+    }
+
+    fn queue_sender_ack(&mut self, ack: Box<Ack>) -> io::Result<()> {
+        let index = ack.lane.checked_sub(1).and_then(|lane| {
+            self.sender.lane_index(
+                ack.session,
+                usize::from(lane),
+                self.shared.workers(),
+                self.id,
+            )
+        });
+        let valid = self.matches(ack.session, ack.tag)
+            && index.is_some_and(|index| {
+                ack.ranges
+                    .get(..ack.count)
+                    .and_then(|ranges| AckRanges::new(ranges).ok())
+                    .is_some_and(|ranges| self.sender.lanes[index].history.validate(ranges).is_ok())
+            });
+        if !valid {
+            return self.return_ack(ack);
+        }
+        if self.sender.incoming.len() == self.sender.incoming.capacity() {
+            return Err(io::Error::other("duplicate incoming ACK buffer"));
+        }
+        self.sender.incoming.push_back(ack);
         Ok(())
     }
 
@@ -573,12 +599,7 @@ impl Worker {
 
     pub(super) fn sender_message(&mut self, message: Message, now: Duration) -> io::Result<()> {
         match message {
-            Message::Ack(ack) => {
-                if self.sender.incoming.len() == self.sender.incoming.capacity() {
-                    return Err(io::Error::other("duplicate incoming ACK buffer"));
-                }
-                self.sender.incoming.push_back(ack);
-            }
+            Message::Ack(ack) => self.queue_sender_ack(ack)?,
             Message::AckReturn(ack) => {
                 if ack.origin != self.id || self.sender.ack_free.len() == ACK_BUFFERS {
                     return Err(io::Error::other("invalid returned ACK buffer"));
@@ -862,7 +883,16 @@ impl Worker {
                     .ok_or(io::ErrorKind::InvalidData)?;
                 let prior = *budget;
                 let fenced = lane.loss_passes != 0;
-                let produced = lane.advance_report(&mut report, now, budget)?;
+                let tag = self.sessions[lane.session]
+                    .connection
+                    .map(|c| c.local_tag().get());
+                let produced = lane.advance_report_with_acks(
+                    &mut report,
+                    now,
+                    budget,
+                    &self.sender.incoming,
+                    tag,
+                )?;
                 self.sender.loss_fences = self
                     .sender
                     .loss_fences
@@ -926,6 +956,7 @@ impl Worker {
             return Ok(false);
         }
         let mut more = self.flush_sender_messages(now)?;
+        let ack_blocked = self.sender.checks_pending != 0 || self.sender.loss_fences != 0;
         self.begin_sender_ack()?;
         for group in 0..self.sender.fresh.len() {
             if self.sender.fresh[group]
@@ -968,8 +999,16 @@ impl Worker {
             let quiescing = self.sessions[lane.session].connection.is_none();
             let retire = quiescing || self.sender.reclaim.is_some();
             let fenced = lane.loss_passes != 0;
-            let produced = lane.advance_report(&mut report, now, &mut budget)?
-                || (retire && lane.retire_report(&mut report, &mut budget)?);
+            let tag = self.sessions[lane.session]
+                .connection
+                .map(|c| c.local_tag().get());
+            let produced = lane.advance_report_with_acks(
+                &mut report,
+                now,
+                &mut budget,
+                &self.sender.incoming,
+                tag,
+            )? || (retire && lane.retire_report(&mut report, &mut budget)?);
             self.sender.loss_fences = self
                 .sender
                 .loss_fences
@@ -994,6 +1033,12 @@ impl Worker {
             }
         }
         more |= budget == 0 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0);
+        // A fully protected final loss pass emits no report to wake queued ACK work.
+        more |= ack_blocked
+            && self.sender.checks_pending == 0
+            && self.sender.loss_fences == 0
+            && !self.sender.incoming.is_empty()
+            && self.sender.report.is_some();
         more |= self.stage_recovery()?;
         if self.sender.owner.is_some() {
             // Apply local feedback before the shared owner considers fresh grants.

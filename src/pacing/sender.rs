@@ -51,6 +51,7 @@ pub struct Flight {
     successful: usize,
     started: Option<Duration>,
     host_limited: bool,
+    pub(crate) pmtu: bool,
     completed: bool,
     cursor: usize,
 }
@@ -165,6 +166,7 @@ impl Flight {
         self.count = packets.len();
         self.successful = 0;
         self.started = None;
+        self.pmtu = false;
         self.completed = false;
         self.cursor = 0;
         Ok(())
@@ -322,6 +324,7 @@ impl Sender {
                 successful: 0,
                 started: None,
                 host_limited: false,
+                pmtu: false,
                 completed: false,
                 cursor: 0,
             });
@@ -651,7 +654,7 @@ impl Sender {
             if !matches!(slot.state, SlotState::Reserved) {
                 return Err(GrantError::Stale);
             }
-            let packet = state
+            let mut packet = state
                 .delivery
                 .sent(
                     report.started.ok_or(GrantError::Invalid)?,
@@ -660,6 +663,7 @@ impl Sender {
                     report.host_limited,
                 )
                 .map_err(delivery_error)?;
+            packet.pmtu = report.pmtu;
             state.time = state.time.max(report.started.ok_or(GrantError::Invalid)?);
             slot.state = SlotState::Sent {
                 packet,
@@ -983,6 +987,63 @@ mod tests {
 #[cfg(test)]
 mod reidentify_tests {
     use super::*;
+
+    #[test]
+    fn probe_provenance_survives_partial_completion_but_not_flight_reuse() {
+        let (mut sender, flights) = Sender::new(1, 1, 4).unwrap();
+        let mut flight = flights.into_vec().pop().unwrap();
+        let limits = Limits {
+            window: 100_000,
+            rate: 1_000_000_000,
+            quantum: 100_000,
+            max_datagram: 1280,
+        };
+        for (round, (pmtu, count)) in [(true, 0), (true, 1), (false, 2), (true, 2), (false, 1)]
+            .into_iter()
+            .enumerate()
+        {
+            let at = Duration::from_millis(round as u64 * 50);
+            let packets = [1, 2].map(|number| Planned {
+                id: PacketId {
+                    session: 0,
+                    generation: 1,
+                    lane: 1,
+                    number: round as u64 * 2 + number,
+                },
+                bytes: 1280,
+            });
+            flight.prepare(&packets).unwrap();
+            assert!(!flight.pmtu);
+            flight.pmtu = pmtu;
+            sender.reserve(0, &mut flight, false, limits, at).unwrap();
+            let handles = [flight.handle(0).unwrap(), flight.handle(1).unwrap()];
+            flight
+                .complete(count, (count != 0).then_some(at), false)
+                .unwrap();
+            sender.reported(flight).unwrap();
+            flight = sender.advance(0, 64).unwrap().unwrap();
+            sender
+                .begin_ack(0, at + Duration::from_millis(1), false)
+                .unwrap();
+            for index in 0..count {
+                sender
+                    .acknowledged(0, packets[index].id, handles[index])
+                    .unwrap();
+            }
+            let sample = sender.finish_ack(0, Duration::ZERO).unwrap();
+            if count == 0 {
+                assert!(sample.is_none());
+            } else {
+                let sample = sample.unwrap();
+                assert_eq!(sample.pmtu_only, pmtu);
+                assert_eq!(sample.newly_acked, count as u64 * 1280);
+                assert!(!sample.app_limited);
+            }
+            assert_eq!(sender.flight_bytes(0), Some((0, 0)));
+            assert_eq!(sender.available(), 4);
+            sender.reopen(0).unwrap();
+        }
+    }
 
     #[test]
     fn refresh_preserves_grant_handles_and_exact_delivery_identity() {

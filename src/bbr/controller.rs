@@ -536,7 +536,8 @@ impl Controller {
     }
 
     fn check_full_bw(&mut self, sample: &RateSample) {
-        if self.full_bw_now || !self.round_start || sample.app_limited {
+        // Probe cadence cannot establish that an application's path is full.
+        if self.full_bw_now || !self.round_start || sample.app_limited || sample.pmtu_only {
             return;
         }
         let rate = sample.rate.unwrap_or(0);

@@ -70,6 +70,7 @@ fn pinned_draft_07_delivery_vectors() {
                         tx_in_flight: n(11),
                         app_limited: flag(12),
                         host_limited: flag(13),
+                        pmtu_only: false,
                         last_packet: n(14),
                     });
                     assert_eq!(actual, expected, "{name}:{}", line + 1);

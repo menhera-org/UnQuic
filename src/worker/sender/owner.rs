@@ -593,6 +593,7 @@ impl Owner {
             );
             match result {
                 Ok(()) => {
+                    request.flight.pmtu = request.pmtu;
                     outgoing.push_back((worker, Message::Permit(request.flight)));
                     granted_next.get_or_insert(self.request_cursor);
                     more = true;

@@ -77,3 +77,19 @@ it before applying the terminating ACK to reapply model bounds. Repeated recover
 entry is rejected. ProbeRTT's return flag tells the caller to mark the sampler
 application-limited even if data remains queued. Successful transmission reports
 must precede feedback, as specified in the shared grant-epoch design.
+
+## PMTU sample provenance
+
+The transport tags successful PMTU probes through flight completion and ACK
+accumulation. A sample is PMTU-only only when every newly delivered packet is
+a PMTU probe. Duplicate DATA ACKs do not change that classification; newly
+delivered DATA does. Such samples still update delivery, RTT, bandwidth filters,
+loss and inflight accounting, but cannot establish the three-round bandwidth
+plateau. Sparse probe cadence does not demonstrate a full application path.
+This is a transport-specific exclusion from `check_full_bw`, not a global
+application-limited claim. General application-limited detection remains open.
+
+Existing text vectors describe ordinary DATA and set `pmtu_only=false`.
+Unit tests cover all probe/DATA combinations and ACK orders for three packets,
+late and duplicate ACKs, zero/partial sends, flight reuse, and a probe-only
+sequence followed by genuine non-growing DATA rounds.

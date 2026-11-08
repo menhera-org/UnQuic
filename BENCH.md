@@ -44,6 +44,12 @@ passes routed reduction/recovery tests, including filtered ICMPv6 PTB.
 Missing recovery or congestion control does not explain away the remaining
 scheduling and admission problems.
 
+The latest focused fixes protect already-queued ACKs from premature loss and
+prevent PMTU-only samples from declaring a bandwidth plateau. They pass both
+kernel test matrices but do not restore throughput: the latest production
+unlimited loopback result is 1.725 / 1.572 Gbit/s. See the November 8 feedback
+comparison below.
+
 ## Current performance gaps
 
 The sender integration passes forwarding/restart and allocation checks,
@@ -88,6 +94,96 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## Queued ACKs and PMTU capacity evidence (November 8)
+
+Two correctness fixes follow the audit experiments. A TX owner previously
+allowed a mandatory loss pass to overtake an already-received ACK waiting in
+its local queue. Queued ACKs now validate before enqueue and protect covered
+packets during finite loss scans. Future, known-unsent and stale-connection
+claims cannot protect packets. An all-protected final pass schedules another
+turn for waiting ACKs. The scan still finishes, including during forced cleanup.
+
+Sparse PMTU traffic also ended Startup before the benchmark sent bulk traffic.
+Successful PMTU transmissions now retain provenance through delivery sampling.
+An ACK containing only newly delivered PMTU probes cannot establish the
+three-round bandwidth plateau. Mixed DATA/probe ACKs retain normal eligibility;
+probe delivery, loss, RTT and congestion charges remain accounted. This does
+not implement general application-limited detection.
+
+[Twenty production release comparisons](benches/tap-feedback-fixes.json) use
+the previous eight-worker QinQ workload, with diagnostics removed. `queued`
+contains only queued-ACK protection; `combined` adds PMTU provenance.
+The five earlier experimental changes are absent. Each phase starts fresh
+daemons, then runs ascending twenty-second rates with a two-second drain.
+
+| Path | Build | Requested each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- | --- |
+| delayed | production | 0.5G | 0.465 / 0.462 | 6.02 / 6.60 | 89.5 / 86.1 |
+| delayed | production | 5G | 0.689 / 0.618 | 86.01 / 87.40 | 200.3 / 235.3 |
+| delayed | production | unlimited | 0.440 / 0.630 | 99.21 / 98.80 | 244.8 / 219.2 |
+| delayed | queued | 0.5G | 0.463 / 0.474 | 6.24 / 4.14 | 90.0 / 88.4 |
+| delayed | queued | 5G | 0.513 / 0.997 | 89.59 / 79.77 | 207.1 / 206.5 |
+| delayed | queued | unlimited | 0.675 / 0.548 | 98.84 / 99.00 | 223.9 / 271.7 |
+| delayed | combined | 0.5G | 0.484 / 0.459 | 2.02 / 7.16 | 90.2 / 86.0 |
+| delayed | combined | 5G | 0.880 / 0.745 | 82.06 / 84.89 | 196.1 / 237.4 |
+| delayed | combined | unlimited | 0.542 / 0.886 | 99.09 / 98.39 | 264.1 / 211.0 |
+| delayed | after | 0.5G | 0.472 / 0.449 | 4.58 / 9.26 | 89.9 / 87.0 |
+| delayed | after | 5G | 0.761 / 0.815 | 84.51 / 83.40 | 190.1 / 193.3 |
+| delayed | after | unlimited | 0.583 / 0.504 | 99.07 / 99.07 | 240.4 / 272.0 |
+| loopback | production | 4G | 1.747 / 1.582 | 55.61 / 59.86 | 221.7 / 211.4 |
+| loopback | production | unlimited | 1.726 / 1.568 | 96.99 / 97.36 | 216.5 / 209.4 |
+| loopback | queued | 4G | 1.879 / 1.607 | 52.29 / 59.22 | 224.6 / 213.3 |
+| loopback | queued | unlimited | 1.709 / 1.585 | 97.06 / 97.31 | 216.5 / 209.1 |
+| loopback | combined | 4G | 1.846 / 1.613 | 53.09 / 59.06 | 220.2 / 213.7 |
+| loopback | combined | unlimited | 1.725 / 1.572 | 96.91 / 97.31 | 216.0 / 209.7 |
+| loopback | after | 4G | 1.598 / 1.624 | 58.70 / 58.39 | 217.2 / 206.7 |
+| loopback | after | unlimited | 1.726 / 1.585 | 96.92 / 97.15 | 216.0 / 207.7 |
+
+These fixes do not restore general throughput. Combined loopback unlimited
+delivery is 1.725 / 1.572 Gbit/s, within the production controls' variation.
+Delayed 5G delivery improves forward to 0.880 Gbit/s, but reverse is between
+the controls; unlimited and light-load results also remain asymmetric.
+The original 20G local and 5G lossy-path gates remain unmet.
+
+All routed observations have zero admission pressure and zero netem drops.
+The opening production and queued-only 5G points record 18 and 43 outer
+socket-overflow SKBs on the left; the other eighteen points record none.
+All twenty have zero inner UDP receive errors, invalid/duplicate/out-of-window/
+wrong-run receiver records, and outer fragmentation. Loopback combined
+unlimited still rejects 16860 / 6957 datagrams under admission pressure and
+expires 1090283 / 1657555 unsent frames. ACK-buffer drops remain separate from
+DATA admission: the same point drops 11 / 34 ACK buffers. The JSON retains
+offered rates, per-worker CPU, context switches and every drop counter.
+
+[Temporary diagnostic snapshots](benches/tap-sender-duty.json) isolate the queued-ACK correction on top of the
+five experimental changes: at 0.5G offered it reduces declared losses from
+7767 / 7147 packets to 5582 / 6455, while delivery changes only from
+0.446 / 0.440 to 0.448 / 0.443 Gbit/s. Both paths have zero injected loss.
+Local ACK-buffer drops remain, so queued coverage is only part of the feedback
+problem. ProbeRTT occupies roughly 0.2 seconds per endpoint and cannot alone
+explain a twenty-second slowdown.
+
+A separate instrumented production-fix run verifies the PMTU correction:
+both controllers remain in Startup before bulk traffic, retaining the initial
+35.456 MB/s pacing rate. Previously both had left Startup with about
+0.5 MB/s estimated bandwidth. The corrected run leaves Startup after
+0.267 / 0.152 seconds of actual load; steady-state false-loss and rate-limit
+attribution still need work. The [production diagnostic patch](benches/sender-duty-diagnostic.patch) is excluded
+from production measurements and code. The earlier instrumented comparison uses
+[the pre-fix diagnostic patch](benches/sender-duty-before.patch) and
+[queued-ACK candidate patch](benches/queued-ack-loss-candidate.patch) after the
+archived five-candidate patch.
+
+Validation: 359 ordinary release-musl all-feature tests, strict musl Clippy,
+83 library kernel tests and three runtime tests on both Linux 6.8 and 7.0.
+Regressions cover queued ACK protection and continuation, invalid claims,
+stale cleanup, mixed probe/DATA ACK order, late/duplicate ACKs, partial sends
+and flight reuse. The fixes add no hot-path allocation, lock or syscall.
+General application-limited detection, ACK-buffer pressure, sender scheduling,
+single-flow capacities and repeated overload/real-path acceptance remain open.
+Re-evaluate exact ACK pruning with these fixes before reconsidering it for
+production.
 
 ## Incremental audit candidates (November 8)
 
@@ -6640,3 +6736,46 @@ Validation: 347 all-feature and 338 default-feature ordinary release tests,
 Clippy and formatting pass. All 73 library kernel checks and three runtime
 tests pass on Linux 6.8. The separate intermittent Linux 7 migration failure
 remains under investigation; this change does not claim to fix it.
+
+## Bridged feedback-fix follow-up (November 8)
+
+A separate release-build control/fixes/control run used four workers and lanes,
+QinQ bridges, 1,522-byte frames, 4.5 ms routed delay and 0.1% independent outer
+datagram loss. UDP used four flows, individual source frames and source bridge
+checksum/segmentation offloads disabled; TCP used one stream with normal
+offloads. Each load lasted 20 seconds, followed by two seconds to drain. UDP
+rates are aggregate per direction. CPU is daemon CPU percent (100% is one core);
+TCP CPU includes the drain interval. These are single observations, not confidence
+intervals. Raw counters and observations are in
+[the bridged results](benches/tap-feedback-bridge.json).
+
+| Build | Load | Delivered Gbit/s L→R / R→L | UDP missing % / TCP retransmissions L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| Production before | UDP 1 Gbit/s | 0.240 / 0.600 | 73.66 / 34.02 | 235.0 / 239.3 |
+| Production before | UDP unlimited | 0.183 / 0.206 | 92.52 / 91.15 | 274.2 / 370.5 |
+| Both fixes | UDP 1 Gbit/s | 0.171 / 0.712 | 81.20 / 21.94 | 237.6 / 230.6 |
+| Both fixes | UDP unlimited | 0.216 / 0.214 | 91.27 / 90.93 | 272.8 / 368.0 |
+| Production after | UDP 1 Gbit/s | 0.178 / 0.490 | 80.48 / 45.58 | 234.6 / 238.9 |
+| Production after | UDP unlimited | 0.062 / 0.113 | 97.46 / 95.39 | 281.7 / 365.4 |
+| Production before | TCP unlimited | 0.115 / 0.354 | 343 / 523 | 67.1 / 79.9 |
+| Both fixes | TCP unlimited | 0.318 / 0.338 | 645 / 227 | 86.0 / 97.1 |
+| Production after | TCP unlimited | 0.284 / 0.316 | 201 / 298 | 80.5 / 91.8 |
+
+Overload collapse remains: with both fixes, reverse UDP goodput fell from 0.712
+to 0.214 Gbit/s as offered load increased. The corrected ACK and Startup
+semantics do not establish a general performance improvement. The controls also
+vary substantially. The 20 Gbit/s local and 5 Gbit/s access-line targets remain
+unmet; this isolated test does not measure the real access line.
+
+For the combined-fix UDP points, counter deltas below are left/right endpoint
+counts. Admission attempts, queue entries, frames and socket datagrams are
+different units and must not be added into one loss estimate.
+
+| Load | Admission pressure | Queue drops | ACK buffer drops | Unsent frame expiry | Socket overflow | TAP TX drops |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 Gbit/s | 133 / 912 | 1494 / 1806 | 1369 / 1793 | 1256739 / 337416 | 967 / 460 | 0 / 0 |
+| Unlimited | 2839 / 2608 | 1521322 / 655946 | 2838 / 1812 | 2344565 / 3008068 | 1356 / 138 | 873 / 127 |
+
+Further profiling must distinguish sender scheduling and recovery work, ACK queue
+pressure, and ordinary-frame bridge/TAP overhead. These remain hypotheses about
+the residual collapse, not established explanations.

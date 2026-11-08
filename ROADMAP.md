@@ -478,7 +478,11 @@ budget of bitmap scans, range transitions and callbacks. Whole-record validation
 precedes application and trims already-acknowledged range boundaries without
 discarding late-loss delivery or changing the original-largest RTT reference.
 Pending ACKs pin their history window and protect covered
-packets from interleaved loss. Tests cover a full-window ACK, duplicate-only
+packets from interleaved loss. TX owners also validate queued ACKs before
+enqueue and protect their covered packets during mandatory preceding loss
+passes. Scans still finish, stale connections cannot block cleanup, and a fully
+protected final pass requests continuation without an external wake.
+Tests cover a full-window ACK, duplicate-only
 scans, floor pressure, competing ACKs, late loss and RTT sampling across yields.
 Outstanding-charge scans now yield on a bitmap-read budget, including empty
 words. A 128-byte per-history summary skips empty ranges; summary reads consume
@@ -513,6 +517,10 @@ prevents the first ACK from spuriously entering ProbeRTT.
 Successful window-use evidence now survives multiple ACKs of one packet-timed
 round, including its boundary ACK. Unused reservations do not set it, and an
 application-limited idle restart clears it. Zero inflight alone does not prove idle.
+PMTU-only delivery samples cannot establish a bandwidth plateau: probe cadence
+does not measure application supply. Per-transmission provenance survives
+partial sends, flight reuse and late ACKs; mixed DATA/probe ACKs retain normal
+capacity evidence. Delivery, loss and RTT accounting remain unchanged.
 General application-limited detection remains unfinished;
 congestion-control integration is not complete.
 Reserve sampling metadata against the startup memory ceiling; a full sampling

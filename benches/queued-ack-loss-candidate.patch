@@ -1,0 +1,378 @@
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -418,7 +418,7 @@
+         }
+         let owner = (usize::from(lane) - 1) % self.shared.workers();
+         if owner == self.id {
+-            self.sender.incoming.push_back(ack);
++            self.queue_sender_ack(ack)?;
+         } else {
+             self.sender.queue(owner, Message::Ack(ack))?;
+         }
+@@ -434,6 +434,32 @@
+         Ok(())
+     }
+ 
++    fn queue_sender_ack(&mut self, ack: Box<Ack>) -> io::Result<()> {
++        let index = ack.lane.checked_sub(1).and_then(|lane| {
++            self.sender.lane_index(
++                ack.session,
++                usize::from(lane),
++                self.shared.workers(),
++                self.id,
++            )
++        });
++        let valid = self.matches(ack.session, ack.tag)
++            && index.is_some_and(|index| {
++                ack.ranges
++                    .get(..ack.count)
++                    .and_then(|ranges| AckRanges::new(ranges).ok())
++                    .is_some_and(|ranges| self.sender.lanes[index].history.validate(ranges).is_ok())
++            });
++        if !valid {
++            return self.return_ack(ack);
++        }
++        if self.sender.incoming.len() == self.sender.incoming.capacity() {
++            return Err(io::Error::other("duplicate incoming ACK buffer"));
++        }
++        self.sender.incoming.push_back(ack);
++        Ok(())
++    }
++
+     pub(super) fn begin_sender_ack(&mut self) -> io::Result<()> {
+         // A finite loss pass cannot wait behind an endless stream of duplicate ACKs.
+         if self.sender.checks_pending != 0 || self.sender.loss_fences != 0 {
+@@ -585,12 +611,7 @@
+ 
+     pub(super) fn sender_message(&mut self, message: Message, now: Duration) -> io::Result<()> {
+         match message {
+-            Message::Ack(ack) => {
+-                if self.sender.incoming.len() == self.sender.incoming.capacity() {
+-                    return Err(io::Error::other("duplicate incoming ACK buffer"));
+-                }
+-                self.sender.incoming.push_back(ack);
+-            }
++            Message::Ack(ack) => self.queue_sender_ack(ack)?,
+             Message::AckReturn(ack) => {
+                 if ack.origin != self.id || self.sender.ack_free.len() == ACK_BUFFERS {
+                     return Err(io::Error::other("invalid returned ACK buffer"));
+@@ -874,7 +895,16 @@
+                     .ok_or(io::ErrorKind::InvalidData)?;
+                 let prior = *budget;
+                 let fenced = lane.loss_passes != 0;
+-                let produced = lane.advance_report(&mut report, now, budget)?;
++                let tag = self.sessions[lane.session]
++                    .connection
++                    .map(|c| c.local_tag().get());
++                let produced = lane.advance_report_with_acks(
++                    &mut report,
++                    now,
++                    budget,
++                    &self.sender.incoming,
++                    tag,
++                )?;
+                 self.sender.loss_fences = self
+                     .sender
+                     .loss_fences
+@@ -938,6 +968,7 @@
+             return Ok(false);
+         }
+         let mut more = self.flush_sender_messages(now)?;
++        let ack_blocked = self.sender.checks_pending != 0 || self.sender.loss_fences != 0;
+         self.begin_sender_ack()?;
+         for group in 0..self.sender.fresh.len() {
+             if self.sender.fresh[group]
+@@ -980,8 +1011,16 @@
+             let quiescing = self.sessions[lane.session].connection.is_none();
+             let retire = quiescing || self.sender.reclaim.is_some();
+             let fenced = lane.loss_passes != 0;
+-            let produced = lane.advance_report(&mut report, now, &mut budget)?
+-                || (retire && lane.retire_report(&mut report, &mut budget)?);
++            let tag = self.sessions[lane.session]
++                .connection
++                .map(|c| c.local_tag().get());
++            let produced = lane.advance_report_with_acks(
++                &mut report,
++                now,
++                &mut budget,
++                &self.sender.incoming,
++                tag,
++            )? || (retire && lane.retire_report(&mut report, &mut budget)?);
+             self.sender.loss_fences = self
+                 .sender
+                 .loss_fences
+@@ -1011,6 +1050,12 @@
+             }
+         }
+         more |= budget == 0 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0);
++        // A fully protected final loss pass emits no report to wake queued ACK work.
++        more |= ack_blocked
++            && self.sender.checks_pending == 0
++            && self.sender.loss_fences == 0
++            && !self.sender.incoming.is_empty()
++            && self.sender.report.is_some();
+         more |= self.stage_recovery()?;
+         if self.sender.owner.is_some() {
+             // Apply local feedback before the shared owner considers fresh grants.
+--- a/src/worker/sender/history.rs
++++ b/src/worker/sender/history.rs
+@@ -131,12 +131,24 @@
+ 
+     /// True transfers the populated report to the owner; retain it on queue pressure.
+     /// Budget bounds bitmap reads as well as callbacks, with at most 64 entries.
++    #[cfg(test)]
+     pub(in crate::worker) fn advance_report(
+         &mut self,
+         report: &mut Report,
+         now: Duration,
+         budget: &mut usize,
+     ) -> io::Result<bool> {
++        self.advance_report_with_acks(report, now, budget, &VecDeque::new(), None)
++    }
++
++    pub(in crate::worker) fn advance_report_with_acks(
++        &mut self,
++        report: &mut Report,
++        now: Duration,
++        budget: &mut usize,
++        queued: &VecDeque<Box<Ack>>,
++        tag: Option<u128>,
++    ) -> io::Result<bool> {
+         if self.report_pending || *budget == 0 {
+             return Ok(false);
+         }
+@@ -189,6 +201,16 @@
+             self.scan_due = None;
+             self.loss_due = None;
+         }
++        // Validate on TX-owner enqueue; cache this lane's ranges once per bounded pass.
++        // Configuration permits at most 64 workers, each owning ACK_BUFFERS buffers.
++        let mut protected = [None; ACK_BUFFERS * 64];
++        let mut protected_count = 0;
++        for (slot, ack) in protected.iter_mut().zip(queued.iter().filter(|ack| {
++            ack.session == self.session && ack.lane == self.lane && Some(ack.tag) == tag
++        })) {
++            *slot = Some(ack.as_ref());
++            protected_count += 1;
++        }
+         self.prepare_report(report, ReportKind::Loss);
+         let mut remaining = allowance;
+         let scan = self.scan.as_mut().ok_or(io::ErrorKind::InvalidData)?;
+@@ -201,7 +223,14 @@
+                 .is_some_and(|cutoff| packet.sent_at <= cutoff)
+                 || due.is_some_and(|due| due <= now)
+             {
+-                if let Some(packet) = self.history.lose(packet.number) {
++                let covered = protected[..protected_count].iter().flatten().any(|ack| {
++                    let ranges = &ack.ranges[..ack.count];
++                    let index = ranges.partition_point(|range| range.start > packet.number);
++                    ranges
++                        .get(index)
++                        .is_some_and(|range| packet.number <= range.end)
++                });
++                if !covered && let Some(packet) = self.history.lose(packet.number) {
+                     report.entries[report.count] = Entry {
+                         number: packet.number,
+                         sample: packet.sample_slot,
+@@ -490,6 +519,85 @@
+     }
+ 
+     #[test]
++    fn queued_ack_protects_due_and_forced_loss_without_stalling_the_scan() {
++        for force in [false, true] {
++            let mut lane = lane();
++            for number in 1..=5 {
++                send(&mut lane, number, 1);
++            }
++            lane.begin_ack(ack(5, 5)).ok().unwrap();
++            let mut report = Report::new(0);
++            assert!(
++                lane.advance_report(&mut report, Duration::from_millis(100), &mut 64)
++                    .unwrap()
++            );
++            lane.report_completed(&report).unwrap();
++            lane.loss_passes = 1;
++            let mut waiting = ack(1, 1);
++            waiting.tag = 9;
++            lane.history
++                .validate(AckRanges::new(&waiting.ranges[..waiting.count]).unwrap())
++                .unwrap();
++            let mut queued = VecDeque::from([waiting]);
++            if force {
++                lane.force_loss(Duration::from_millis(1));
++            }
++            let now = Duration::from_secs(1);
++            let mut lost = Vec::new();
++            for _ in 0..32 {
++                if lane
++                    .advance_report_with_acks(&mut report, now, &mut 2, &queued, Some(9))
++                    .unwrap()
++                {
++                    lost.extend(
++                        report.entries[..report.count]
++                            .iter()
++                            .map(|entry| entry.number),
++                    );
++                    lane.report_completed(&report).unwrap();
++                }
++                if lane.scan.is_none() {
++                    break;
++                }
++            }
++            assert_eq!(lost, [2, 3, 4]);
++            assert_eq!(lane.loss_passes, 0);
++            assert_eq!(lane.history.inflight_bytes(), 1500);
++            lane.begin_ack(queued.pop_front().unwrap()).ok().unwrap();
++            assert!(lane.advance_report(&mut report, now, &mut 64).unwrap());
++            assert_eq!(report.count, 1);
++            assert_eq!(report.entries[0].number, 1);
++            assert!(report.entries[0].settled);
++            lane.report_completed(&report).unwrap();
++            assert_eq!(lane.history.inflight_bytes(), 0);
++        }
++    }
++
++    #[test]
++    fn queued_ack_from_a_replaced_connection_cannot_block_forced_cleanup() {
++        let mut lane = lane();
++        send(&mut lane, 1, 1);
++        let mut waiting = ack(1, 1);
++        waiting.tag = 9;
++        let queued = VecDeque::from([waiting]);
++        lane.force_loss(Duration::from_millis(1));
++        let mut report = Report::new(0);
++        assert!(
++            lane.advance_report_with_acks(
++                &mut report,
++                Duration::from_millis(2),
++                &mut 64,
++                &queued,
++                None,
++            )
++            .unwrap()
++        );
++        assert_eq!(report.count, 1);
++        assert_eq!(report.entries[0].number, 1);
++        assert_eq!(lane.history.inflight_bytes(), 0);
++    }
++
++    #[test]
+     fn invalid_ack_returns_original_buffer_and_changes_no_lane_state() {
+         let mut lane = lane();
+         send(&mut lane, 1, 1);
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -3004,3 +3004,98 @@
+     };
+     assert_eq!(progress, AckProgress::default());
+ }
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn queued_ack_validation_precedes_loss_fences_and_future_submissions() {
++    let (mut workers, _rx) = workers();
++    let index = workers[0].sender_index(0, 0).unwrap();
++    for number in 1..=3 {
++        let lane = &mut workers[0].sender.lanes[index];
++        lane.history.reserve(number, 1280, true, true).unwrap();
++        if number == 2 {
++            assert!(lane.history.cancel(number));
++        } else {
++            assert!(lane.submitted(number, Duration::from_millis(1), None));
++        }
++    }
++    workers[0].sender.loss_fences = 1;
++    for range in [AckRange { start: 4, end: 4 }, AckRange { start: 1, end: 3 }] {
++        workers[0]
++            .incoming_ack(
++                0,
++                1,
++                1,
++                0,
++                AckRanges::new(&[range]).unwrap(),
++                Duration::from_millis(2),
++            )
++            .unwrap();
++        assert!(workers[0].sender.incoming.is_empty());
++        assert_eq!(workers[0].sender.ack_free.len(), ACK_BUFFERS);
++    }
++    let mut remote = workers[1].sender.ack_free.pop().unwrap();
++    remote.session = 0;
++    remote.tag = 1;
++    remote.lane = 1;
++    remote.count = 1;
++    remote.ranges[0] = AckRange { start: 4, end: 4 };
++    workers[0]
++        .sender_message(Message::Ack(remote), Duration::from_millis(2))
++        .unwrap();
++    assert!(workers[0].sender.incoming.is_empty());
++    let lane = &mut workers[0].sender.lanes[index];
++    lane.history.reserve(4, 1280, true, true).unwrap();
++    assert!(lane.submitted(4, Duration::from_millis(3), None));
++    assert!(workers[0].sender.incoming.is_empty());
++    workers[0]
++        .incoming_ack(
++            0,
++            1,
++            1,
++            0,
++            AckRanges::new(&[AckRange { start: 3, end: 4 }]).unwrap(),
++            Duration::from_millis(4),
++        )
++        .unwrap();
++    workers[0].begin_sender_ack().unwrap();
++    assert_eq!(workers[0].sender.incoming.len(), 1);
++    assert!(workers[0].sender.lanes[index].ack.is_none());
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn fully_protected_loss_fence_continues_queued_ack_without_external_wakeup() {
++    let (mut workers, _rx) = workers();
++    let worker = &mut workers[1];
++    let now = Duration::from_millis(2);
++    let index = worker.sender_index(0, 1).unwrap();
++    let lane = &mut worker.sender.lanes[index];
++    lane.history.reserve(1, 1280, true, true).unwrap();
++    assert!(lane.submitted(1, Duration::ZERO, None));
++    lane.largest_ack = 4;
++    lane.loss_due = Some(now);
++    lane.loss_passes = 1;
++    worker.sender.loss_fences = 1;
++    worker
++        .incoming_ack(
++            0,
++            1,
++            2,
++            0,
++            AckRanges::new(&[AckRange { start: 1, end: 1 }]).unwrap(),
++            now,
++        )
++        .unwrap();
++    worker.flush_sender_messages(now).unwrap();
++    assert!(worker.service_sender(now).unwrap());
++    assert_eq!(worker.sender.loss_fences, 0);
++    assert_eq!(worker.sender.incoming.len(), 1);
++    assert!(worker.sender.lanes[index].ack.is_none());
++    assert_eq!(worker.sender.lanes[index].history.inflight_bytes(), 1280);
++    assert!(worker.recovery.staged.is_none());
++    assert!(worker.sender.report.is_some());
++    assert!(worker.service_sender(now).unwrap());
++    assert!(worker.sender.incoming.is_empty());
++    assert_eq!(worker.sender.lanes[index].history.inflight_bytes(), 0);
++}
+--- a/src/worker/feedback.rs
++++ b/src/worker/feedback.rs
+@@ -941,6 +941,12 @@
+             queue_snapshot(&mut worker, 0, lane, 1, 0);
+         }
+         worker.flush_control(Duration::ZERO).unwrap();
++        let index = worker.sender_index(0, 0).unwrap();
++        worker.sender.lanes[index]
++            .history
++            .reserve(2, 1280, false, false)
++            .unwrap();
++        assert!(worker.sender.lanes[index].submitted(2, Duration::ZERO, None));
+         let mut buffer = worker.free.pop().unwrap();
+         buffer.length = rx.recv(&mut buffer.bytes).unwrap().0;
+         let mut header = Datagram::decode(&buffer.bytes[..buffer.length])

@@ -131,11 +131,23 @@ impl Lane {
 
     /// True transfers the populated report to the owner; retain it on queue pressure.
     /// Budget bounds bitmap reads as well as callbacks, with at most 64 entries.
+    #[cfg(test)]
     pub(in crate::worker) fn advance_report(
         &mut self,
         report: &mut Report,
         now: Duration,
         budget: &mut usize,
+    ) -> io::Result<bool> {
+        self.advance_report_with_acks(report, now, budget, &VecDeque::new(), None)
+    }
+
+    pub(in crate::worker) fn advance_report_with_acks(
+        &mut self,
+        report: &mut Report,
+        now: Duration,
+        budget: &mut usize,
+        queued: &VecDeque<Box<Ack>>,
+        tag: Option<u128>,
     ) -> io::Result<bool> {
         if self.report_pending || *budget == 0 {
             return Ok(false);
@@ -189,6 +201,16 @@ impl Lane {
             self.scan_due = None;
             self.loss_due = None;
         }
+        // Validate on TX-owner enqueue; cache this lane's ranges once per bounded pass.
+        // Configuration permits at most 64 workers, each owning ACK_BUFFERS buffers.
+        let mut protected = [None; ACK_BUFFERS * 64];
+        let mut protected_count = 0;
+        for (slot, ack) in protected.iter_mut().zip(queued.iter().filter(|ack| {
+            ack.session == self.session && ack.lane == self.lane && Some(ack.tag) == tag
+        })) {
+            *slot = Some(ack.as_ref());
+            protected_count += 1;
+        }
         self.prepare_report(report, ReportKind::Loss);
         let mut remaining = allowance;
         let scan = self.scan.as_mut().ok_or(io::ErrorKind::InvalidData)?;
@@ -201,7 +223,14 @@ impl Lane {
                 .is_some_and(|cutoff| packet.sent_at <= cutoff)
                 || due.is_some_and(|due| due <= now)
             {
-                if let Some(packet) = self.history.lose(packet.number) {
+                let covered = protected[..protected_count].iter().flatten().any(|ack| {
+                    let ranges = &ack.ranges[..ack.count];
+                    let index = ranges.partition_point(|range| range.start > packet.number);
+                    ranges
+                        .get(index)
+                        .is_some_and(|range| packet.number <= range.end)
+                });
+                if !covered && let Some(packet) = self.history.lose(packet.number) {
                     report.entries[report.count] = Entry {
                         number: packet.number,
                         sample: packet.sample_slot,
@@ -487,6 +516,85 @@ mod tests {
         assert!(lane.idle());
         lane.install(8).unwrap();
         assert!(lane.idle());
+    }
+
+    #[test]
+    fn queued_ack_protects_due_and_forced_loss_without_stalling_the_scan() {
+        for force in [false, true] {
+            let mut lane = lane();
+            for number in 1..=5 {
+                send(&mut lane, number, 1);
+            }
+            lane.begin_ack(ack(5, 5)).ok().unwrap();
+            let mut report = Report::new(0);
+            assert!(
+                lane.advance_report(&mut report, Duration::from_millis(100), &mut 64)
+                    .unwrap()
+            );
+            lane.report_completed(&report).unwrap();
+            lane.loss_passes = 1;
+            let mut waiting = ack(1, 1);
+            waiting.tag = 9;
+            lane.history
+                .validate(AckRanges::new(&waiting.ranges[..waiting.count]).unwrap())
+                .unwrap();
+            let mut queued = VecDeque::from([waiting]);
+            if force {
+                lane.force_loss(Duration::from_millis(1));
+            }
+            let now = Duration::from_secs(1);
+            let mut lost = Vec::new();
+            for _ in 0..32 {
+                if lane
+                    .advance_report_with_acks(&mut report, now, &mut 2, &queued, Some(9))
+                    .unwrap()
+                {
+                    lost.extend(
+                        report.entries[..report.count]
+                            .iter()
+                            .map(|entry| entry.number),
+                    );
+                    lane.report_completed(&report).unwrap();
+                }
+                if lane.scan.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(lost, [2, 3, 4]);
+            assert_eq!(lane.loss_passes, 0);
+            assert_eq!(lane.history.inflight_bytes(), 1500);
+            lane.begin_ack(queued.pop_front().unwrap()).ok().unwrap();
+            assert!(lane.advance_report(&mut report, now, &mut 64).unwrap());
+            assert_eq!(report.count, 1);
+            assert_eq!(report.entries[0].number, 1);
+            assert!(report.entries[0].settled);
+            lane.report_completed(&report).unwrap();
+            assert_eq!(lane.history.inflight_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn queued_ack_from_a_replaced_connection_cannot_block_forced_cleanup() {
+        let mut lane = lane();
+        send(&mut lane, 1, 1);
+        let mut waiting = ack(1, 1);
+        waiting.tag = 9;
+        let queued = VecDeque::from([waiting]);
+        lane.force_loss(Duration::from_millis(1));
+        let mut report = Report::new(0);
+        assert!(
+            lane.advance_report_with_acks(
+                &mut report,
+                Duration::from_millis(2),
+                &mut 64,
+                &queued,
+                None,
+            )
+            .unwrap()
+        );
+        assert_eq!(report.count, 1);
+        assert_eq!(report.entries[0].number, 1);
+        assert_eq!(lane.history.inflight_bytes(), 0);
     }
 
     #[test]
