@@ -1,0 +1,647 @@
+diff --git a/src/tap/segment.rs b/src/tap/segment.rs
+index d8e3c2c..bdd0df3 100644
+--- a/src/tap/segment.rs
++++ b/src/tap/segment.rs
+@@ -158,6 +158,12 @@ impl Segments {
+         (length - self.next).div_ceil(self.size)
+     }
+ 
++    /// Logical Ethernet bytes still represented by this source, including repeated headers.
++    pub(crate) fn remaining_bytes(&self, length: usize) -> Option<usize> {
++        let payload = length.checked_sub(self.next)?;
++        payload.checked_add(self.header_len().checked_mul(payload.div_ceil(self.size))?)
++    }
++
+     pub(crate) fn done(&self, length: usize) -> bool {
+         self.next == length
+     }
+@@ -188,7 +194,13 @@ mod tests {
+                         let payload = if v6 { 62 } else { 42 };
+                         let mut segments = Segments::parse(&header, &input, 1514 + 20).unwrap();
+                         let mut output = [0u8; crate::MAX_FRAME_LEN];
++                        let mut remaining = input[payload..]
++                            .chunks(size)
++                            .map(|data| payload + data.len())
++                            .sum::<usize>();
++                        assert_eq!(segments.remaining_bytes(payload - 1), None);
+                         for (i, data) in input[payload..].chunks(size).enumerate() {
++                            assert_eq!(segments.remaining_bytes(input.len()), Some(remaining));
+                             let expected = udp::frame(v6, 65534u16.wrapping_add(i as u16), data);
+                             let mut borrowed = segments;
+                             let mut prefix = [0xa5; 128];
+@@ -203,12 +215,15 @@ mod tests {
+                             assert_eq!(&input[range], &expected[payload..]);
+                             let n = segments.write(&input, &mut output);
+                             assert_eq!(&output[..n], expected);
++                            remaining -= n;
++                            assert_eq!(segments.remaining_bytes(input.len()), Some(remaining));
+                             assert_eq!(
+                                 crate::pack::flow_hash(&input),
+                                 crate::pack::flow_hash(&output[..n])
+                             );
+                         }
+                         assert!(segments.done(input.len()));
++                        assert_eq!(remaining, 0);
+                     }
+                 }
+             }
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 07101de..7457ab9 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -135,6 +135,7 @@ pub(super) struct Lane {
+     pub(super) group: usize,
+     pub(super) history: History,
+     pub(super) generation: u64,
++    pub(super) unsent_bytes: usize,
+     pub(super) rtt: Rtt,
+     pub(super) largest_ack: u64,
+     pub(super) scan: Option<OutstandingScan>,
+@@ -158,6 +159,7 @@ impl Lane {
+             group,
+             history: History::new().map_err(io::Error::other)?,
+             generation: 0,
++            unsent_bytes: 0,
+             rtt: Rtt::new(),
+             largest_ack: 0,
+             scan: None,
+diff --git a/src/worker/sender/history.rs b/src/worker/sender/history.rs
+index 0359519..5ca6a2e 100644
+--- a/src/worker/sender/history.rs
++++ b/src/worker/sender/history.rs
+@@ -3,7 +3,8 @@ use super::*;
+ 
+ impl Lane {
+     pub(in crate::worker) fn idle(&self) -> bool {
+-        self.ack.is_none()
++        self.unsent_bytes == 0
++            && self.ack.is_none()
+             && !self.report_pending
+             && self.loss_passes == 0
+             && self.history.is_retired()
+@@ -16,7 +17,11 @@ impl Lane {
+         if generation == self.generation {
+             return Ok(());
+         }
+-        if self.ack.is_some() || self.report_pending || self.loss_passes != 0 {
++        if self.unsent_bytes != 0
++            || self.ack.is_some()
++            || self.report_pending
++            || self.loss_passes != 0
++        {
+             return Err(io::ErrorKind::WouldBlock.into());
+         }
+         self.history.reset().map_err(io::Error::other)?;
+diff --git a/src/worker.rs b/src/worker.rs
+index 7607e4d..bb15e70 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -278,6 +278,8 @@ const TAP_TOKEN: u64 = 1 << 32;
+ const TX_TOKEN: u64 = 2 << 32;
+ const RETRY: Duration = Duration::from_millis(1);
+ const RECEIVE_BYTES: usize = 65_536;
++// Two maximum sender quanta of logical fresh data; an oversized source needs an empty lane.
++const FRESH_BYTES: usize = 128 * 1024;
+ // A bounded GRO backlog must not consume the transmit pool (or vice versa).
+ const RECEIVE_BUFFERS: usize = 8;
+ const _: () = assert!(RECEIVE_BUFFERS <= BATCH_SIZE && RECEIVE_BUFFERS < BUFFERS);
+@@ -352,6 +354,14 @@ pub(crate) struct Buffer {
+ }
+ 
+ impl Buffer {
++    fn fresh_bytes(&self) -> io::Result<usize> {
++        self.segments
++            .map_or(Some(self.length), |segments| {
++                segments.remaining_bytes(self.length)
++            })
++            .ok_or(io::ErrorKind::InvalidData.into())
++    }
++
+     fn advance(&mut self) -> bool {
+         self.offset = if self.segment_size == 0 {
+             self.length
+@@ -2297,6 +2307,28 @@ impl Worker {
+             self.release(buffer);
+             return Ok(());
+         }
++        let fresh = buffer.fresh_bytes()?;
++        let index = if self.sender_enabled() {
++            let index = self.sender_index(session, buffer.lane)?;
++            let queued = self.sender.lanes[index].unsent_bytes;
++            if queued != 0 && fresh > FRESH_BYTES.saturating_sub(queued) {
++                let local = &mut self.sessions[session];
++                for totals in [
++                    &mut self.counters,
++                    &mut local.totals,
++                    &mut local.tx_totals[buffer.lane],
++                ] {
++                    totals.queue_drops = totals.queue_drops.wrapping_add(1);
++                    totals.tx_backlog_drops = totals.tx_backlog_drops.wrapping_add(1);
++                }
++                local.tx_dirty |= 1_u64 << buffer.lane;
++                self.release(buffer);
++                return Ok(());
++            }
++            Some(index)
++        } else {
++            None
++        };
+         if foreign {
+             let mut replacement = self
+                 .free
+@@ -2322,6 +2354,12 @@ impl Worker {
+                 return Err(io::Error::other("transmit source capacity exhausted"));
+             }
+         };
++        if let Some(index) = index {
++            self.sender.lanes[index].unsent_bytes = self.sender.lanes[index]
++                .unsent_bytes
++                .checked_add(fresh)
++                .ok_or(io::ErrorKind::InvalidData)?;
++        }
+         if plain
+             && self.sessions[session].tap_inputs.is_empty()
+             && self.materialize(source)?.is_some()
+@@ -2375,6 +2413,27 @@ impl Worker {
+         }
+     }
+ 
++    fn release_unsent(&mut self, session: usize, lane: usize, bytes: usize) -> io::Result<()> {
++        if self.sender_enabled() {
++            let index = self.sender_index(session, lane)?;
++            let balance = &mut self.sender.lanes[index].unsent_bytes;
++            *balance = balance
++                .checked_sub(bytes)
++                .ok_or(io::ErrorKind::InvalidData)?;
++        }
++        Ok(())
++    }
++
++    fn discard_input(&mut self, source: usize) -> io::Result<()> {
++        let input = self
++            .frames
++            .source(source)
++            .ok_or(io::ErrorKind::InvalidData)?;
++        self.release_unsent(input.session, input.lane, input.fresh_bytes()?)?;
++        self.close_source(source);
++        Ok(())
++    }
++
+     fn close_slab(&mut self, session: usize) {
+         if let Some(source) = self.sessions[session].slab.take() {
+             self.close_source(source);
+@@ -2427,11 +2486,11 @@ impl Worker {
+         );
+         let length = segments.map_or(input_length, |s| s.next_len(input_length));
+         let Some(sender) = self.sessions[session].tx[lane].as_mut() else {
+-            self.close_source(source);
++            self.discard_input(source)?;
+             return Ok(Some(0));
+         };
+         let Ok(id) = sender.start_frame(length) else {
+-            self.close_source(source);
++            self.discard_input(source)?;
+             return Ok(Some(0));
+         };
+ 
+@@ -2532,7 +2591,7 @@ impl Worker {
+                 if !self.matches(session, tag)
+                     || self.expired_at(session, lane, deadline, remaining, now)
+                 {
+-                    self.close_source(source);
++                    self.discard_input(source)?;
+                     frames += 1;
+                     continue;
+                 }
+@@ -3053,6 +3112,7 @@ impl Worker {
+         retain_suffix: bool,
+     ) -> io::Result<()> {
+         let mut bytes = 0;
++        let mut fresh = 0;
+         let mut repairs = 0;
+         for packet in 0..sent {
+             bytes += (batch.plan.packet(packet).unwrap().length + 48) as u64;
+@@ -3063,10 +3123,12 @@ impl Worker {
+                 } else if let Some(frame) =
+                     batch.frames[slot].and_then(|id| self.frames.frame_mut(id))
+                 {
++                    fresh += range.len();
+                     frame.offset = range.end;
+                 }
+             }
+         }
++        self.release_unsent(session, lane, fresh)?;
+         self.counters.tx_outer_bytes = self.counters.tx_outer_bytes.wrapping_add(bytes);
+         self.counters.repairs = self.counters.repairs.wrapping_add(repairs);
+         let local = &mut self.sessions[session];
+diff --git a/src/worker/recovery.rs b/src/worker/recovery.rs
+index 97be11d..a133530 100644
+--- a/src/worker/recovery.rs
++++ b/src/worker/recovery.rs
+@@ -117,6 +117,18 @@ impl Worker {
+         if !self.sender_enabled() {
+             self.release_frame_storage(index);
+         } else if self.recovery.place(index)? != Place::Cleanup {
++            let (session, lane) = self.frame_owner(index)?;
++            let frame = self.frames.frame(index).ok_or(io::ErrorKind::InvalidData)?;
++            let sent = self
++                .frames
++                .recovery(index)
++                .ok_or(io::ErrorKind::InvalidData)?
++                .sent();
++            let unsent = frame
++                .length()
++                .checked_sub(sent)
++                .ok_or(io::ErrorKind::InvalidData)?;
++            self.release_unsent(session, lane, unsent)?;
+             self.recovery.set(index, Place::Cleanup)?;
+             if self.recovery.cleanup.len() == self.recovery.cleanup.capacity() {
+                 return Err(io::ErrorKind::InvalidData.into());
+diff --git a/src/counters.rs b/src/counters.rs
+index 0631ce9..71cc2bf 100644
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -132,6 +132,9 @@ metrics! {
+     recovery_selection_changed: sum,
+     /// Entries rejected because a bounded queue was full.
+     queue_drops: sum,
++    /// TAP sources rejected by fresh-unsent byte admission; a subset of queue_drops.
++    /// One GSO source can represent many Ethernet frames.
++    tx_backlog_drops: sum,
+     /// ACK records dropped for lack of a reserved receive buffer; a subset of queue_drops, not additive.
+     ack_buffer_drops: sum,
+     /// Datagrams not fully admitted because receive frame storage was full.
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index d06e3c8..de4f5db 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -66,6 +66,28 @@ fn queue_frame(worker: &mut Worker, length: usize) {
+     worker.input_frame(frame, Duration::ZERO).unwrap();
+ }
+ 
++// Recovery fixtures may begin with work admitted before the current queue budget.
++// Keep this bypass explicit and local to those fixtures; admission tests use queue_frame.
++fn queue_admitted_frame(worker: &mut Worker, length: usize) {
++    let index = worker.sender_index(0, worker.id).unwrap();
++    let previous = std::mem::take(&mut worker.sender.lanes[index].unsent_bytes);
++    queue_frame(worker, length);
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, length);
++    worker.sender.lanes[index].unsent_bytes += previous;
++}
++
++fn submit_original(worker: &mut Worker, slot: usize, range: std::ops::Range<usize>) {
++    assert!(
++        worker
++            .frames
++            .recovery_mut(slot)
++            .unwrap()
++            .submitted(range.clone(), 0)
++    );
++    let (session, lane) = worker.frame_owner(slot).unwrap();
++    worker.release_unsent(session, lane, range.len()).unwrap();
++}
++
+ fn frame(worker: &mut Worker) {
+     queue_frame(worker, 60);
+     worker.flush_frames(Duration::ZERO).unwrap();
+@@ -411,7 +433,7 @@ fn partial_batches_with_feedback(feedback: bool) {
+     for worker in &mut workers {
+         worker.io_time = Some(Ok);
+         for _ in 0..96 {
+-            queue_frame(worker, 1514);
++            queue_admitted_frame(worker, 1514);
+         }
+     }
+     let mut received = [[0usize; 96]; 2];
+@@ -1397,11 +1419,13 @@ fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
+                 end: 60,
+                 attempt,
+             };
+-            let state = worker.frames.recovery_mut(index).unwrap();
+-            if attempt != 0 {
++            if attempt == 0 {
++                submit_original(worker, index, 0..60);
++            } else {
++                let state = worker.frames.recovery_mut(index).unwrap();
+                 assert!(state.lost(0..60, attempt - 1));
++                assert!(state.submitted(0..60, attempt));
+             }
+-            assert!(state.submitted(0..60, attempt));
+         }
+         assert!(
+             worker
+@@ -1629,8 +1653,8 @@ fn mapping_pressure_preserves_fresh_fifo_and_leaves_reserved_space_for_repair()
+         .unwrap();
+     let id = worker.frames.frame(old).unwrap().id;
+     worker.frames.frame_mut(old).unwrap().offset = 9022;
++    submit_original(worker, old, 0..9022);
+     let state = worker.frames.recovery_mut(old).unwrap();
+-    assert!(state.submitted(0..9022, 0));
+     assert!(state.lost(0..100, 0));
+     worker.recovery.set(old, Place::Retained).unwrap();
+     let pieces: Vec<_> = (0..48)
+@@ -1709,8 +1733,8 @@ fn continuous_backlog_cannot_starve_the_opposite_frame_class() {
+             let mut batch = worker.sessions[0].batches[1].take().unwrap();
+             assert!(worker.frames.unqueue(&mut batch.pending, slot).unwrap());
+             worker.frames.frame_mut(slot).unwrap().offset = 1514;
++            submit_original(worker, slot, 0..1514);
+             let coverage = worker.frames.recovery_mut(slot).unwrap();
+-            assert!(coverage.submitted(0..1514, 0));
+             assert!(coverage.lost(0..1514, 0));
+             worker.recovery.set(slot, Place::Retained).unwrap();
+             worker.sessions[0].batches[1] = Some(batch);
+@@ -1827,13 +1851,7 @@ fn admitted_acks_finish_then_loss_progresses_under_continuous_ack_input() {
+             .unwrap();
+         let frame_id = worker.frames.frame(slot).unwrap().id;
+         worker.frames.frame_mut(slot).unwrap().offset = 60;
+-        assert!(
+-            worker
+-                .frames
+-                .recovery_mut(slot)
+-                .unwrap()
+-                .submitted(0..60, 0)
+-        );
++        submit_original(worker, slot, 0..60);
+         worker.recovery.set(slot, Place::Retained).unwrap();
+         worker.sessions[0].batches[1] = Some(batch);
+         assert!(worker.recovery.journal.reserve_packet(
+@@ -2089,20 +2107,8 @@ fn transmit_expiry_classifies_successful_prefixes_once() {
+         .pending
+         .iter(&worker.frames)
+         .collect();
+-    assert!(
+-        worker
+-            .frames
+-            .recovery_mut(slots[1])
+-            .unwrap()
+-            .submitted(0..30, 0)
+-    );
+-    assert!(
+-        worker
+-            .frames
+-            .recovery_mut(slots[2])
+-            .unwrap()
+-            .submitted(0..60, 0)
+-    );
++    submit_original(worker, slots[1], 0..30);
++    submit_original(worker, slots[2], 0..60);
+     assert!(!worker.expire_frames(Duration::from_millis(100)).unwrap());
+     assert!(!worker.cleanup_frames().unwrap());
+     for totals in [
+@@ -2148,13 +2154,7 @@ fn changed_coverage_rejection_is_distinct_from_mapping_pressure() {
+             BASE_UDP_PAYLOAD,
+         )
+         .unwrap();
+-    assert!(
+-        worker
+-            .frames
+-            .recovery_mut(index)
+-            .unwrap()
+-            .submitted(0..1, 0)
+-    );
++    submit_original(worker, index, 0..1);
+     assert!(!worker.reserve_pieces(&batch, 1).unwrap());
+     assert_eq!(worker.counters.recovery_selection_changed, 1);
+     assert_eq!(worker.counters.recovery_mapping_pressure, 0);
+@@ -2503,3 +2503,241 @@ fn liveness_waits_for_barrier_socket_and_returned_flight() {
+     worker.service_sender(RETRY).unwrap();
+     assert!(worker.sender.job.is_some_and(|job| job.session == 0));
+ }
++
++fn gso_input(worker: &mut Worker, count: usize, size: u16) -> Box<Buffer> {
++    use crate::tap::test_common::udp;
++    use std::os::unix::net::UnixDatagram;
++    let mut buffer = worker.free.pop().unwrap();
++    let mut input = udp::frame(false, 42, &vec![7; count * usize::from(size)]);
++    let mut header = udp::partial(&mut input, false);
++    header[1] = 5;
++    header[4..6].copy_from_slice(&size.to_ne_bytes());
++    let (fd, sender) = UnixDatagram::pair().unwrap();
++    sender
++        .send(&[header.as_slice(), input.as_slice()].concat())
++        .unwrap();
++    let mut tap = TapQueue::test_fd(fd.into(), true);
++    (buffer.length, buffer.segments) = tap.read_input(&mut buffer.bytes).unwrap();
++    buffer.session = 0;
++    buffer.lane = worker.id;
++    buffer.tag = 1;
++    buffer.deadline = reassembly::FRAME_LIFETIME;
++    buffer.tx_reserved = true;
++    worker.sessions[0].tx_retained += 1;
++    worker.sessions[0].tx_bytes += buffer.length;
++    buffer
++}
++
++fn fill_fresh_budget(worker: &mut Worker) {
++    for _ in 0..FRESH_BYTES / 9022 {
++        queue_frame(worker, 9022);
++    }
++    queue_frame(worker, FRESH_BYTES % 9022);
++    let index = worker.sender_index(0, worker.id).unwrap();
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, FRESH_BYTES);
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn fresh_admission_caps_plain_fastpath_and_reopens_after_submission() {
++    let (mut workers, _rx) = workers();
++    fill_fresh_budget(&mut workers[0]);
++    let worker = &mut workers[0];
++    let available = worker.frames.available();
++    let retained = worker.sessions[0].tx_retained;
++    let bytes = worker.sessions[0].tx_bytes;
++    queue_frame(worker, 60);
++    assert_eq!(worker.frames.available(), available);
++    assert_eq!(worker.sessions[0].tx_retained, retained);
++    assert_eq!(worker.sessions[0].tx_bytes, bytes);
++    for totals in [
++        &worker.counters,
++        &worker.sessions[0].totals,
++        &worker.sessions[0].tx_totals[0],
++    ] {
++        assert_eq!(totals.tx_backlog_drops, 1);
++        assert_eq!(totals.queue_drops, 1);
++        assert_eq!(totals.expired_frames, 0);
++    }
++    // A full lane does not consume another lane's admission allowance.
++    queue_frame(&mut workers[1], 60);
++    let other = workers[1].sender_index(0, 1).unwrap();
++    assert_eq!(workers[1].sender.lanes[other].unsent_bytes, 60);
++    workers[0].flush_frames(Duration::ZERO).unwrap();
++    for _ in 0..8 {
++        service(&mut workers);
++    }
++    let worker = &mut workers[0];
++    let index = worker.sender_index(0, 0).unwrap();
++    let remaining = worker.sender.lanes[index].unsent_bytes;
++    assert!(remaining < FRESH_BYTES - 60);
++    queue_frame(worker, 60);
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, remaining + 60);
++    assert_eq!(worker.counters.tx_backlog_drops, 1);
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn fresh_admission_charges_unexpanded_gso_and_reclaims_partial_expansion() {
++    let (mut workers, _rx) = workers();
++    let worker = &mut workers[0];
++    let buffer = gso_input(worker, 10_000, 1);
++    assert_eq!(buffer.fresh_bytes().unwrap(), 430_000);
++    worker.input_frame(buffer, Duration::ZERO).unwrap();
++    let index = worker.sender_index(0, 0).unwrap();
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, 430_000);
++    assert_eq!(worker.counters.tap_gso_frames, 0);
++    queue_frame(worker, 60);
++    assert_eq!(worker.counters.tx_backlog_drops, 1);
++    let source = *worker.sessions[0].tap_inputs.front().unwrap();
++    for _ in 0..4 {
++        assert_eq!(worker.materialize(source).unwrap(), Some(43));
++    }
++    // Moving source bytes into views neither charges nor releases fresh credit.
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, 430_000);
++    assert_eq!(
++        worker.frames.source(source).unwrap().fresh_bytes().unwrap(),
++        429_828
++    );
++    worker.drain_tap_inputs(reassembly::FRAME_LIFETIME).unwrap();
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, 172);
++    worker.expire_frames(reassembly::FRAME_LIFETIME).unwrap();
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, 0);
++    assert!(!worker.cleanup_frames().unwrap());
++    assert!(!worker.cleanup_frames().unwrap());
++    assert_eq!(worker.counters.expired_frames, 10_000);
++    assert_eq!(worker.sessions[0].tx_retained, 0);
++    assert_eq!(worker.sessions[0].tx_bytes, 0);
++    let buffer = gso_input(worker, 10_000, 1);
++    worker
++        .input_frame(buffer, reassembly::FRAME_LIFETIME)
++        .unwrap();
++    // An already expired source is rejected before charging the newly empty lane.
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, 0);
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn fresh_admission_rejects_oversized_gso_when_lane_is_not_empty() {
++    let (mut workers, _rx) = workers();
++    let worker = &mut workers[0];
++    queue_frame(worker, 60);
++    let before = worker.frames.available();
++    let buffer = gso_input(worker, 10_000, 1);
++    worker.input_frame(buffer, Duration::ZERO).unwrap();
++    let index = worker.sender_index(0, 0).unwrap();
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, 60);
++    assert!(worker.sessions[0].tap_inputs.is_empty());
++    assert_eq!(worker.frames.available(), before);
++    assert_eq!(worker.counters.tap_gso_frames, 0);
++    assert_eq!(worker.counters.tx_backlog_drops, 1);
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn fresh_admission_returns_foreign_source_reservations_without_exchange() {
++    let (mut workers, _rx) = workers();
++    let [worker, reader] = &mut workers;
++    fill_fresh_budget(worker);
++    let owner_free = worker.free.len();
++    let owner_retained = worker.sessions[0].tx_retained;
++    let owner_bytes = worker.sessions[0].tx_bytes;
++    let reader_free = reader.free.len();
++    let mut buffer = gso_input(reader, 3, 100);
++    buffer.lane = 0;
++    worker.input_frame(buffer, Duration::ZERO).unwrap();
++    assert_eq!(worker.free.len(), owner_free);
++    assert_eq!(worker.sessions[0].tx_retained, owner_retained);
++    assert_eq!(worker.sessions[0].tx_bytes, owner_bytes);
++    assert_eq!(worker.counters.tx_backlog_drops, 1);
++    reader.drain_queues(Duration::ZERO).unwrap();
++    assert_eq!(reader.free.len(), reader_free);
++    assert_eq!(reader.sessions[0].tx_retained, 0);
++    assert_eq!(reader.sessions[0].tx_bytes, 0);
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn fresh_admission_cleanup_releases_only_unsent_prefix_remainder_once() {
++    let (mut workers, _rx) = workers();
++    let worker = &mut workers[0];
++    queue_frame(worker, 60);
++    let index = worker.sender_index(0, 0).unwrap();
++    let slot = worker.sessions[0].batches[0]
++        .as_ref()
++        .unwrap()
++        .pending
++        .iter(&worker.frames)
++        .next()
++        .unwrap();
++    submit_original(worker, slot, 0..30);
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, 30);
++    let coverage = worker.frames.recovery_mut(slot).unwrap();
++    assert!(coverage.lost(0..30, 0));
++    assert!(coverage.submitted(0..30, 1));
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, 30);
++    worker.detach_frame(slot).unwrap();
++    worker.release_frame(slot).unwrap();
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, 0);
++    worker.release_frame(slot).unwrap();
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, 0);
++    worker.cleanup_frames().unwrap();
++}
++
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn fresh_admission_stale_sources_reclaim_credit_before_lane_reinstall() {
++    let (mut workers, _rx) = workers();
++    let worker = &mut workers[0];
++    let buffer = gso_input(worker, 3, 100);
++    worker.input_frame(buffer, Duration::ZERO).unwrap();
++    let index = worker.sender_index(0, 0).unwrap();
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, 426);
++    assert!(!worker.sender.lanes[index].idle());
++    assert_eq!(
++        worker.sender.lanes[index].install(2).unwrap_err().kind(),
++        io::ErrorKind::WouldBlock
++    );
++    let mut connection = worker.sessions[0].connection.unwrap();
++    connection.initiator = Tag::new(3).unwrap();
++    worker
++        .command(
++            0,
++            Command {
++                generation: 2,
++                phase: Phase::Quiesce,
++                connection: Some(connection),
++            },
++            0,
++        )
++        .unwrap();
++    for tag in [1, 3] {
++        let mut buffer = gso_input(worker, 3, 100);
++        buffer.tag = tag;
++        worker.input_frame(buffer, Duration::ZERO).unwrap();
++        assert_eq!(worker.sender.lanes[index].unsent_bytes, 426);
++        assert_eq!(worker.sessions[0].tap_inputs.len(), 1);
++    }
++    worker.drain_tap_inputs(Duration::ZERO).unwrap();
++    while worker.cleanup_frames().unwrap() {}
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, 0);
++    assert!(worker.sender.lanes[index].idle());
++    worker.progress_barriers(Duration::ZERO).unwrap();
++    assert!(worker.sessions[0].command.is_none());
++    worker
++        .command(
++            0,
++            Command {
++                generation: 2,
++                phase: Phase::Install,
++                connection: Some(connection),
++            },
++            0,
++        )
++        .unwrap();
++    let mut buffer = gso_input(worker, 3, 100);
++    buffer.tag = 3;
++    worker.input_frame(buffer, Duration::ZERO).unwrap();
++    assert_eq!(worker.sender.lanes[index].unsent_bytes, 426);
++    assert_eq!(worker.sender.lanes[index].generation, 2);
++}

@@ -1,0 +1,488 @@
+diff --git a/src/counters.rs b/src/counters.rs
+index 19f6d86..d262e61 100644
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -124,6 +124,8 @@ metrics! {
+     abandon_retried: sum,
+     /// Advisories rejected by bounded storage or stale/exhausted identities.
+     abandon_dropped: sum,
++    /// Fully submitted source advisories evicted for partial-source expiries.
++    abandon_evicted: sum,
+     /// Advisories reaching their 100 ms deadline without retained ACK proof.
+     abandon_expired: sum,
+     /// Incomplete receive frames expired; a subset of expired_frames.
+diff --git a/src/worker/sender/abandon.rs b/src/worker/sender/abandon.rs
+index f515e89..bfa6206 100644
+--- a/src/worker/sender/abandon.rs
++++ b/src/worker/sender/abandon.rs
+@@ -17,6 +17,7 @@ struct Advisory {
+     generation: u64,
+     lane: usize,
+     frame: u64,
++    partial: bool,
+     expires: Duration,
+     due: Duration,
+     sent: [u64; 3],
+@@ -80,6 +81,36 @@ impl Pending {
+             .flatten()
+             .filter(|a| a.serial == serial)
+     }
++    // Eviction changes metadata only; packet charges remain in sent history.
++    fn full_victim(&self, job: Option<Job>) -> Option<(usize, Advisory)> {
++        let mut selected = 0_u128;
++        if let Some(Job {
++            kind: JobKind::Abandon { serial },
++            ..
++        }) = job
++            && serial == self.batch_serial
++        {
++            for &(slot, serial) in &self.selected[..self.selected_len] {
++                if self.get(slot, serial).is_some() {
++                    selected |= 1_u128 << slot;
++                }
++            }
++        }
++        let mut fallback = None;
++        for (slot, advisory) in self.entries.iter().enumerate() {
++            let Some(advisory) = advisory.filter(|a| !a.partial) else {
++                continue;
++            };
++            if selected & (1_u128 << slot) == 0 {
++                return Some((slot, advisory));
++            }
++            if fallback.is_none() {
++                fallback = Some((slot, advisory));
++            }
++        }
++        fallback
++    }
++
+     fn remove(&mut self, slot: usize, serial: u64) {
+         if self.get(slot, serial).is_some()
+             && let Some(entry) = self.entries.get_mut(slot)
+@@ -109,6 +140,7 @@ impl Worker {
+         session: usize,
+         lane: usize,
+         frame: u64,
++        partial: bool,
+         now: Duration,
+     ) {
+         if !self.sender_enabled() {
+@@ -122,20 +154,30 @@ impl Worker {
+         else {
+             return;
+         };
+-        let pending = &mut self.sender.abandons;
+-        if pending.count == CAPACITY {
++        let Some(serial) = self.sender.abandons.serial.checked_add(1) else {
+             self.count_abandon(session, lane, |s| &mut s.abandon_dropped);
+             return;
++        };
++        if self.sender.abandons.count == CAPACITY {
++            let victim = partial
++                .then(|| self.sender.abandons.full_victim(self.sender.job))
++                .flatten();
++            let Some((slot, victim)) = victim else {
++                self.count_abandon(session, lane, |s| &mut s.abandon_dropped);
++                return;
++            };
++            self.sender.abandons.remove(slot, victim.serial);
++            self.count_abandon(victim.session, victim.lane, |s| &mut s.abandon_evicted);
+         }
+-        let serial = pending.serial.checked_add(1);
+-        let slot = pending.entries.iter_mut().find(|a| a.is_none());
+-        if let (Some(serial), Some(slot)) = (serial, slot) {
++        let pending = &mut self.sender.abandons;
++        if let Some(slot) = pending.entries.iter_mut().find(|a| a.is_none()) {
+             *slot = Some(Advisory {
+                 serial,
+                 session,
+                 generation,
+                 lane,
+                 frame,
++                partial,
+                 expires: now.saturating_add(LIFETIME),
+                 due: now,
+                 sent: [0; 3],
+@@ -645,7 +687,7 @@ mod tests {
+     fn abandonment_retries_are_charged_and_stop_at_three_copies_and_original_deadline() {
+         let (mut workers, rx) = setup();
+         let worker = &mut workers[0];
+-        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        worker.queue_abandon(0, 0, (1 << 48) | 1, false, Duration::ZERO);
+         let mut previous = 0;
+         without_allocations(|| {
+             for millis in [6, 20, 40] {
+@@ -720,7 +762,7 @@ mod tests {
+     fn acknowledged_copy_cancels_waiting_retry_without_discarding_unrelated_data() {
+         let (mut workers, rx) = setup();
+         let worker = &mut workers[0];
+-        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        worker.queue_abandon(0, 0, (1 << 48) | 1, false, Duration::ZERO);
+         let now = Duration::from_millis(6);
+         permit(worker, now);
+         worker.use_sender_permit(now).unwrap();
+@@ -782,7 +824,7 @@ mod tests {
+             let worker = &mut workers[0];
+             let data_number = retain_data_plan(worker);
+             let retained = worker.sessions[0].tx_retained;
+-            worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++            worker.queue_abandon(0, 0, (1 << 48) | 1, false, Duration::ZERO);
+             let now = Duration::from_millis(6);
+             let job = permit(worker, now);
+             let JobKind::Abandon { .. } = job.kind else {
+@@ -793,7 +835,7 @@ mod tests {
+                 worker.sessions[0].installed.as_mut().unwrap().generation += 1;
+             } else {
+                 worker.sender.abandons.remove(slot, serial);
+-                worker.queue_abandon(0, 0, (1 << 48) | 2, now);
++                worker.queue_abandon(0, 0, (1 << 48) | 2, false, now);
+                 assert!(worker.sender.abandons.get(slot, serial).is_none());
+             }
+             worker.use_sender_permit(now).unwrap();
+@@ -813,7 +855,7 @@ mod tests {
+         }
+         let (mut workers, _) = setup();
+         let worker = &mut workers[0];
+-        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        worker.queue_abandon(0, 0, (1 << 48) | 1, false, Duration::ZERO);
+         worker.install_sender(0, 2, true).unwrap();
+         worker.sessions[0].installed.as_mut().unwrap().generation = 2;
+         pump(worker, Duration::from_millis(6));
+@@ -826,7 +868,7 @@ mod tests {
+     fn advisory_eagain_and_capacity_pressure_never_extend_lifetime_or_allocate() {
+         let (mut workers, rx) = setup();
+         let worker = &mut workers[0];
+-        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        worker.queue_abandon(0, 0, (1 << 48) | 1, false, Duration::ZERO);
+         let now = Duration::from_millis(6);
+         permit(worker, now);
+         CLOCK_CALLS.with(|c| c.set(0));
+@@ -853,7 +895,7 @@ mod tests {
+         receive(&rx);
+         without_allocations(|| {
+             for id in 2..=CAPACITY as u64 + 1 {
+-                worker.queue_abandon(0, 0, (1 << 48) | id, now);
++                worker.queue_abandon(0, 0, (1 << 48) | id, false, now);
+             }
+         });
+         assert_eq!(worker.sender.abandons.count, CAPACITY);
+@@ -881,7 +923,7 @@ mod tests {
+                 .allocate_packets(64)
+                 .unwrap();
+         }
+-        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        worker.queue_abandon(0, 0, (1 << 48) | 1, false, Duration::ZERO);
+         let now = Duration::from_millis(6);
+         without_allocations(|| {
+             for _ in 0..32 {
+@@ -905,7 +947,7 @@ mod tests {
+     fn retired_ack_proof_allows_only_the_remaining_bounded_copies() {
+         let (mut workers, rx) = setup();
+         let worker = &mut workers[0];
+-        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        worker.queue_abandon(0, 0, (1 << 48) | 1, false, Duration::ZERO);
+         let now = Duration::from_millis(6);
+         permit(worker, now);
+         worker.use_sender_permit(now).unwrap();
+@@ -985,7 +1027,7 @@ mod tests {
+         let worker = &mut workers[0];
+         let data_number = retain_data_plan(worker);
+         let retained = worker.sessions[0].tx_retained;
+-        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        worker.queue_abandon(0, 0, (1 << 48) | 1, false, Duration::ZERO);
+         permit(worker, Duration::from_millis(6));
+         let expires = worker
+             .sender
+@@ -1051,7 +1093,7 @@ mod tests {
+                     ),
+                     Admission::Fresh
+                 );
+-                worker.queue_abandon(0, 0, id, Duration::ZERO);
++                worker.queue_abandon(0, 0, id, false, Duration::ZERO);
+             }
+             assert_eq!(remote.retained_frames(), 64);
+             // The fixture's control packet must follow these admitted DATA IDs.
+@@ -1137,14 +1179,14 @@ mod tests {
+     fn changed_members_cancel_batch_then_rebuild_only_live_members() {
+         let (mut workers, rx) = setup();
+         let worker = &mut workers[0];
+-        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        worker.queue_abandon(0, 0, (1 << 48) | 1, false, Duration::ZERO);
+         permit(worker, Duration::from_millis(6));
+         worker.use_sender_permit(Duration::from_millis(6)).unwrap();
+         pump(worker, Duration::from_millis(6));
+         let first = receive(&rx);
+         let now = Duration::from_millis(20);
+         for id in 2..=4 {
+-            worker.queue_abandon(0, 0, (1 << 48) | id, Duration::from_millis(2));
++            worker.queue_abandon(0, 0, (1 << 48) | id, false, Duration::from_millis(2));
+         }
+         let job = permit(worker, now);
+         assert_eq!(worker.sender.abandons.selected_len, 4);
+@@ -1163,7 +1205,7 @@ mod tests {
+         worker.sender.abandons.entries[2].as_mut().unwrap().expires = now;
+         let replaced = worker.sender.abandons.entries[3].unwrap();
+         worker.sender.abandons.remove(3, replaced.serial);
+-        worker.queue_abandon(0, 0, (1 << 48) | 5, now);
++        worker.queue_abandon(0, 0, (1 << 48) | 5, false, now);
+         without_allocations(|| {
+             worker.use_sender_permit(now).unwrap();
+             empty(&rx);
+@@ -1204,8 +1246,8 @@ mod tests {
+     fn partial_batch_uses_earliest_deadline_and_rechecks_expiry_at_syscall() {
+         let (mut workers, rx) = setup();
+         let worker = &mut workers[0];
+-        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
+-        worker.queue_abandon(0, 0, (1 << 48) | 2, Duration::from_millis(1));
++        worker.queue_abandon(0, 0, (1 << 48) | 1, false, Duration::ZERO);
++        worker.queue_abandon(0, 0, (1 << 48) | 2, false, Duration::from_millis(1));
+         let now = Duration::from_millis(99);
+         let job = permit(worker, now);
+         assert_eq!(job.deadline, LIFETIME);
+@@ -1237,6 +1279,7 @@ mod tests {
+             generation: 1,
+             lane: 0,
+             frame: (1 << 48) | 1,
++            partial: false,
+             expires: LIFETIME,
+             due: Duration::ZERO,
+             sent: [0; 3],
+@@ -1262,9 +1305,9 @@ mod tests {
+     fn initial_coalescing_piggybacks_young_records_without_extending_lifetimes() {
+         let (mut workers, rx) = setup();
+         let worker = &mut workers[0];
+-        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
++        worker.queue_abandon(0, 0, (1 << 48) | 1, false, Duration::ZERO);
+         let young = Duration::from_millis(4);
+-        worker.queue_abandon(0, 0, (1 << 48) | 2, young);
++        worker.queue_abandon(0, 0, (1 << 48) | 2, false, young);
+         without_allocations(|| {
+             pump(worker, young);
+             assert!(worker.sender.job.is_none());
+@@ -1306,8 +1349,8 @@ mod tests {
+     fn failed_early_piggyback_keeps_backoff_and_original_initial_trigger() {
+         let (mut workers, rx) = setup();
+         let worker = &mut workers[0];
+-        worker.queue_abandon(0, 0, (1 << 48) | 1, Duration::ZERO);
+-        worker.queue_abandon(0, 0, (1 << 48) | 2, Duration::from_millis(4));
++        worker.queue_abandon(0, 0, (1 << 48) | 1, false, Duration::ZERO);
++        worker.queue_abandon(0, 0, (1 << 48) | 2, false, Duration::from_millis(4));
+         let now = Duration::from_millis(5);
+         permit(worker, now);
+         assert_eq!(worker.sender.abandons.selected_len, 2);
+@@ -1360,4 +1403,201 @@ mod tests {
+             assert_eq!(worker.counters.abandon_retried, 0);
+         });
+     }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn partial_admission_prefers_unselected_full_metadata_and_preserves_sent_charges() {
++        let (mut workers, rx) = setup();
++        let worker = &mut workers[0];
++        for id in 1..=128 {
++            worker.queue_abandon(0, 0, (1 << 48) | id, id > 64 && id != 100, Duration::ZERO);
++        }
++        let now = Duration::from_millis(6);
++        let job = permit(worker, now);
++        let selected_serial = worker.sender.abandons.entries[0].unwrap().serial;
++        let victim_serial = worker.sender.abandons.entries[99].unwrap().serial;
++        without_allocations(|| {
++            worker.queue_abandon(0, 0, (1 << 48) | 129, true, now);
++            assert_eq!(worker.sender.abandons.count, CAPACITY);
++            assert_eq!(
++                worker.sender.abandons.entries[0].unwrap().serial,
++                selected_serial
++            );
++            assert!(worker.sender.abandons.get(99, victim_serial).is_none());
++            let replacement = worker.sender.abandons.entries[99].unwrap();
++            assert!(replacement.partial);
++            assert_eq!(replacement.frame, (1 << 48) | 129);
++            assert_eq!(replacement.expires, now + LIFETIME);
++            assert_eq!(worker.counters.abandon_evicted, 1);
++            assert_eq!(worker.sessions[0].totals.abandon_evicted, 1);
++            assert_eq!(worker.sessions[0].tx_totals[0].abandon_evicted, 1);
++            worker.use_sender_permit(now).unwrap();
++            let mut bytes = [0; BASE_UDP_PAYLOAD];
++            let length = rx.recv(&mut bytes).unwrap().0;
++            assert_eq!(Datagram::decode(&bytes[..length]).unwrap().record_count, 64);
++            let charged = worker.sender.lanes[0].history.inflight_bytes();
++            assert_eq!(charged, (MAX_LENGTH + 48) as u64);
++            // Once the Flight returns, eviction may remove sent metadata too.
++            worker.flush_sender_messages(now).unwrap();
++            worker
++                .sender
++                .owner
++                .as_mut()
++                .unwrap()
++                .advance(now, &mut worker.sender.outgoing)
++                .unwrap();
++            worker.flush_sender_messages(now).unwrap();
++            assert!(worker.sender.job.is_none());
++            worker.queue_abandon(0, 0, (1 << 48) | 130, true, now);
++            assert!(worker.sender.abandons.get(0, selected_serial).is_none());
++            assert_eq!(worker.sender.lanes[0].history.inflight_bytes(), charged);
++            assert!(
++                worker.sender.lanes[0]
++                    .history
++                    .packet(job.first)
++                    .unwrap()
++                    .charged
++            );
++            assert_eq!(worker.counters.abandon_evicted, 2);
++            assert_eq!(
++                worker.sender.abandons.entries[0].unwrap().frame,
++                (1 << 48) | 130
++            );
++            worker.queue_abandon(0, 0, (1 << 48) | 131, false, now);
++            assert_eq!(worker.counters.abandon_dropped, 1);
++            assert_eq!(worker.counters.abandon_evicted, 2);
++            assert_eq!(worker.sender.abandons.count, CAPACITY);
++        });
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn selected_full_victim_cancels_stale_grant_and_rebuilds_all_live_records() {
++        let (mut workers, rx) = setup();
++        let worker = &mut workers[0];
++        for id in 1..=128 {
++            worker.queue_abandon(0, 0, (1 << 48) | id, id > 64, Duration::ZERO);
++        }
++        let now = Duration::from_millis(6);
++        let job = permit(worker, now);
++        let old = worker.sender.abandons.entries[0].unwrap();
++        without_allocations(|| {
++            worker.queue_abandon(0, 0, (1 << 48) | 129, true, now);
++            assert!(worker.sender.abandons.get(0, old.serial).is_none());
++            worker.use_sender_permit(now).unwrap();
++            empty(&rx);
++            assert_eq!(worker.counters.abandon_sent, 0);
++            assert_eq!(worker.sender.lanes[0].history.inflight_bytes(), 0);
++            assert!(worker.sender.lanes[0].history.packet(job.first).is_none());
++            assert!(
++                worker
++                    .sender
++                    .abandons
++                    .entries
++                    .iter()
++                    .flatten()
++                    .all(|a| a.attempts == 0)
++            );
++            let mut seen = 0_u128;
++            let mut datagrams = 0;
++            let mut bytes = [0; BASE_UDP_PAYLOAD];
++            let mut at = Duration::from_millis(12);
++            // Ordinary pacing may space the two grants. ACK each submitted
++            // packet while advancing time, keeping retries out of this fixture.
++            while seen != u128::MAX && at < Duration::from_millis(50) {
++                pump(worker, at);
++                loop {
++                    let length = match rx.recv(&mut bytes) {
++                        Ok((length, _)) => length,
++                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
++                        Err(error) => panic!("{error}"),
++                    };
++                    let packet = Datagram::decode(&bytes[..length]).unwrap();
++                    let number = packet.header().packet_number;
++                    assert!(number > job.first);
++                    for record in packet.records() {
++                        let Record::FrameAbandon { frame_id, .. } = record else {
++                            panic!("unexpected record")
++                        };
++                        let id = frame_id & 0x0000_ffff_ffff_ffff;
++                        assert!((2..=129).contains(&id));
++                        let bit = 1_u128 << (id - 2);
++                        assert_eq!(seen & bit, 0);
++                        seen |= bit;
++                    }
++                    worker
++                        .incoming_ack(
++                            0,
++                            1,
++                            1,
++                            0,
++                            AckRanges::new(&[AckRange {
++                                start: number,
++                                end: number,
++                            }])
++                            .unwrap(),
++                            at,
++                        )
++                        .unwrap();
++                    datagrams += 1;
++                }
++                at += Duration::from_micros(100);
++            }
++            // Capture immutable metadata before ACK processing can retire it.
++            assert_eq!(
++                worker.sender.abandons.entries[0].unwrap().expires,
++                now + LIFETIME
++            );
++            assert!(
++                worker.sender.abandons.entries[1..]
++                    .iter()
++                    .flatten()
++                    .all(|a| a.expires == LIFETIME)
++            );
++            pump(worker, at);
++            assert_eq!(seen, u128::MAX);
++            assert_eq!(datagrams, 2);
++            assert_eq!(worker.counters.abandon_sent, 128);
++            assert_eq!(worker.counters.abandon_datagrams, 2);
++            assert_eq!(worker.counters.abandon_retried, 0);
++            assert_eq!(worker.counters.abandon_evicted, 1);
++            assert_eq!(worker.sender.lanes[0].history.inflight_bytes(), 0);
++        });
++    }
++
++    #[test]
++    #[ignore = "kernel descriptor test; run in a disposable container"]
++    fn full_partial_pool_and_exhausted_serials_never_evict_useful_metadata() {
++        let (mut workers, _) = setup();
++        let worker = &mut workers[0];
++        without_allocations(|| {
++            for id in 1..=128 {
++                worker.queue_abandon(0, 0, (1 << 48) | id, true, Duration::ZERO);
++            }
++            for partial in [true, false] {
++                worker.queue_abandon(0, 0, (1 << 48) | 129, partial, Duration::from_millis(6));
++            }
++            assert_eq!(worker.counters.abandon_dropped, 2);
++            assert_eq!(worker.counters.abandon_evicted, 0);
++            assert_eq!(worker.sender.abandons.count, CAPACITY);
++            assert!(
++                worker
++                    .sender
++                    .abandons
++                    .entries
++                    .iter()
++                    .flatten()
++                    .all(|a| a.partial && a.expires == LIFETIME)
++            );
++            // Serial exhaustion must be checked before selecting any victim.
++            worker.sender.abandons.entries[0].as_mut().unwrap().partial = false;
++            let old = worker.sender.abandons.entries[0].unwrap();
++            worker.sender.abandons.serial = u64::MAX;
++            worker.queue_abandon(0, 0, (1 << 48) | 129, true, Duration::from_millis(7));
++            assert!(worker.sender.abandons.get(0, old.serial).is_some());
++            assert_eq!(worker.counters.abandon_dropped, 3);
++            assert_eq!(worker.counters.abandon_evicted, 0);
++            assert_eq!(worker.sender.abandons.count, CAPACITY);
++        });
++    }
+ }
+diff --git a/src/worker.rs b/src/worker.rs
+index fc61260..7f320c9 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -2616,7 +2616,7 @@ impl Worker {
+         let (session, lane, id, tag) = (source.session, frame.lane, frame.id, source.tag);
+         self.record_tx_expiry(session, lane, 1, kind);
+         if submitted != 0 && self.matches(session, tag) {
+-            self.queue_abandon(session, lane, id, now);
++            self.queue_abandon(session, lane, id, matches!(kind, TxExpiry::Partial), now);
+         }
+         true
+     }

@@ -83,6 +83,80 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Fresh-backlog admission helps overload but rejects legitimate bursts (November 8)
+
+Two isolated candidates address different parts of the single-lane collapse.
+Priority abandonment lets an advisory for a partially submitted original
+replace metadata for a fully submitted frame when the fixed pool is full.
+It retains the existing coalescing, deadlines and retry limits.
+The [incremental patch](benches/source-abandon-priority.patch) follows the
+three abandonment patches below.
+
+A separate [128 KiB admission candidate](benches/fresh-admission-128k.patch)
+bounds fresh logical bytes per lane, including unexpanded GSO children and
+their repeated headers. Successful original submissions release that budget;
+repairs do not consume it. One oversized legal source is permitted only when
+the lane is empty. Physical quotas, deadlines and grant accounting are unchanged.
+The new `tx_backlog_drops` counter is a subset of source queue drops.
+
+The twenty-second release-musl sequence is **baseline, priority abandonment,
+128 KiB admission, baseline**. Both candidates share these controls; these
+are not two separate adjacent A/B/A comparisons. There is one TX lane, with
+eight workers and TAP queues. [All sixteen observations](benches/tap-admission-priority.json)
+include the 21 Gbit/s points, binary identities, actual offered load and counters.
+
+| Build | Offered each way | Delivered Gbit/s L→R / R→L | Missing % L→R / R→L | CPU % L / R |
+| --- | --- | --- | --- | --- |
+| Baseline before | 1 Gbit/s | 0.981 / 0.981 | 1.01 / 1.02 | 68.43 / 67.79 |
+| Baseline before | 4 Gbit/s | 1.935 / 1.873 | 51.19 / 52.75 | 148.81 / 147.22 |
+| Baseline before | Unlimited | 0.465 / 0.427 | 98.64 / 98.75 | 197.37 / 199.11 |
+| Priority abandonment | 1 Gbit/s | 0.982 / 0.991 | 0.94 / 0.01 | 70.05 / 70.15 |
+| Priority abandonment | 4 Gbit/s | 1.882 / 1.838 | 52.52 / 53.64 | 146.06 / 148.93 |
+| Priority abandonment | Unlimited | 1.666 / 1.524 | 94.98 / 95.48 | 237.51 / 232.46 |
+| 128 KiB admission | 1 Gbit/s | 0.174 / 0.132 | 82.50 / 86.65 | 16.06 / 15.22 |
+| 128 KiB admission | 4 Gbit/s | 0.693 / 0.562 | 82.52 / 85.83 | 56.14 / 54.66 |
+| 128 KiB admission | Unlimited | 1.981 / 1.922 | 94.11 / 93.90 | 245.02 / 235.25 |
+| Baseline after | 1 Gbit/s | 0.982 / 0.981 | 0.96 / 0.97 | 68.62 / 69.61 |
+| Baseline after | 4 Gbit/s | 1.991 / 1.931 | 49.75 / 51.25 | 147.32 / 147.92 |
+| Baseline after | Unlimited | 0.520 / 0.496 | 98.47 / 98.46 | 198.17 / 200.99 |
+
+Priority abandonment has zero admission pressure and zero incomplete receive
+expiry at every point. Unlimited delivery still falls 11.5 / 17.1% from its
+4 Gbit/s point, while daemon CPU rises above both controls. Unlimited source
+partial expiries are 31,509 / 34,448; metadata evictions are 24,801 / 26,456.
+The sender transmits 356,740 / 365,753 advisory records in 5,919 / 6,049
+datagrams, and drops 1,192,901 / 1,096,416 advisory entries. The remaining
+decline therefore cannot be attributed to measured receive admission pressure.
+Eight-lane performance of this candidate remains unmeasured.
+
+The 128 KiB cap also has zero admission pressure throughout, with only
+168 / 563 total expiries at unlimited load. Its unlimited goodput stays close
+to its 21 Gbit/s result, 1.943 / 1.958. But the cap rejects legitimate
+low-rate bursts: the generator sends sixteen synchronized sources of 44
+datagrams, about 1 MiB per burst, roughly every 8.3 ms at the 1 Gbit/s point.
+The cap cannot retain even two complete sources. A handoff drain can process
+many source events before sender service, so this is a verified burst-admission
+failure, not insufficient average bandwidth. At that point, all
+31,837 / 33,440 worker queue drops come from the new backlog check.
+**The 128 KiB candidate is rejected.** A replacement must retain ordinary
+bursts while bounding overload work; the measured workload does not establish
+a universally suitable fixed byte cap.
+
+All sixteen points have zero outer socket overflow, corruption, duplicates
+and outer fragmentation. The admission candidate has one left-side inner UDP
+receive error at 21 Gbit/s; all other inner-error counts are zero.
+Both candidates have zero reordering; baseline reordering reaches 0.00894%.
+Counter units differ: source drops, frame expiries and advisory drops must
+not be summed into a frame-loss total.
+
+Priority abandonment passes 351 ordinary release tests, strict Clippy,
+formatting, 90 kernel tests on Linux 6.8 and 7.0, and the three original
+runtime tests. Fresh admission passes 349 ordinary tests, strict Clippy,
+formatting, and all 80 kernel plus three original runtime tests on both
+kernels, including unchanged allocation assertions. These correctness results
+do not override the measured low-rate regression. Neither candidate is
+production code, and neither proves the requested performance targets.
+
 ## Deferring recovery initialization leaves the collapse intact (November 8)
 
 A small isolated candidate makes recovery-slot reset constant work. Instead
