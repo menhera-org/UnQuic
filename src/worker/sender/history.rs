@@ -269,6 +269,8 @@ impl Lane {
             return Ok(false);
         }
         self.prepare_report(report, ReportKind::Retire);
+        #[cfg(feature = "trace")]
+        let worker = (usize::from(self.lane) - 1) % crate::trace::workers().max(1);
         for _ in 0..(*budget).min(BATCH_SIZE) {
             *budget -= 1;
             let Some(entry) = self
@@ -284,6 +286,23 @@ impl Lane {
                 settled: false,
             };
             report.count += 1;
+        }
+        #[cfg(feature = "trace")]
+        {
+            let [floor, allocated, samples, state] = self.history.trace_floor();
+            let stop = if report.count == BATCH_SIZE { 0 } else { state };
+            trace_event!(
+                worker,
+                RETIRE,
+                stop,
+                [
+                    self.session << 16 | usize::from(self.lane),
+                    report.count,
+                    floor,
+                    allocated,
+                    samples
+                ]
+            );
         }
         self.report_pending = report.count != 0;
         Ok(self.report_pending)

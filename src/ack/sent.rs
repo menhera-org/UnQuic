@@ -248,6 +248,25 @@ impl History {
         self.floor
     }
 
+    /// Diagnostics: floor, highest allocated number, live sample handles, and why
+    /// the floor cannot retire (0 retirable, 1 reserved, 2 inflight, 3 above allocated, 4 pending ACK).
+    #[cfg(feature = "trace")]
+    pub fn trace_floor(&self) -> [u64; 4] {
+        let (word, bit) = location(self.floor);
+        let state = if self.pending.is_some() {
+            4
+        } else if self.floor > self.allocated {
+            3
+        } else if self.reserved[word] & bit != 0 {
+            1
+        } else if self.inflight[word] & bit != 0 {
+            2
+        } else {
+            0
+        };
+        [self.floor, self.allocated, u64::from(self.samples), state]
+    }
+
     /// Highest actual successful submission, not merely an allocated number.
     pub const fn highest_sent(&self) -> u64 {
         self.highest_sent

@@ -243,6 +243,23 @@ impl Controller {
         self.state
     }
 
+    /// Diagnostics: state code, recovery, max_bw, short-term bw, short-term and
+    /// long-term inflight, min RTT ns, delivered and lost bytes.
+    #[cfg(feature = "trace")]
+    pub fn trace_model(&self) -> [u64; 9] {
+        [
+            self.state as u64,
+            u64::from(self.recovering),
+            self.max_bw,
+            self.bw_shortterm,
+            self.inflight_shortterm,
+            self.inflight_longterm,
+            self.min_rtt.map_or(0, |rtt| rtt.as_nanos() as u64),
+            self.delivered,
+            self.lost,
+        ]
+    }
+
     /// Shared window, pacing rate and send quantum in outer bytes.
     pub const fn limits(&self) -> Limits {
         Limits {

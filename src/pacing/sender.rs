@@ -378,6 +378,23 @@ impl Sender {
         Some(self.groups.get(group)?.delivery.is_app_limited())
     }
 
+    /// Issuance phase (0 open, 1 closing, 2 commit, 3 feedback) and next pacing time.
+    #[cfg(feature = "trace")]
+    pub fn trace_state(&self, group: usize) -> Option<(u64, Duration)> {
+        let state = self.groups.get(group)?;
+        Some((state.phase as u64, state.grants.next_send()))
+    }
+
+    /// Whether a committed transmission was already declared lost, for diagnostics only.
+    #[cfg(feature = "trace")]
+    pub fn trace_uncharged(&self, id: PacketId, handle: NonZeroU16) -> bool {
+        self.slots
+            .get(usize::from(handle.get()) - 1)
+            .is_some_and(|slot| {
+                slot.id == id && matches!(slot.state, SlotState::Sent { charged: false, .. })
+            })
+    }
+
     /// Pacing deadline, independent of report and sampler backpressure.
     pub fn deadline(&self, group: usize, now: Duration) -> Option<Duration> {
         self.groups.get(group)?.grants.deadline(now)

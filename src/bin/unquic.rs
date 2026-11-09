@@ -102,8 +102,85 @@ fn resolve(job: config::Lookup, control: Control) {
     }
 }
 
+/// Diagnostics-only writer for `UNQUIC_TRACE_DIR/<first session>.trace`.
+#[cfg(feature = "trace")]
+struct Trace {
+    file: io::BufWriter<std::fs::File>,
+    cursors: Vec<u64>,
+    records: Vec<unquic::trace::Record>,
+    marks: u64,
+    lost: u64,
+}
+
+#[cfg(feature = "trace")]
+impl Trace {
+    fn open(name: &str) -> Option<Self> {
+        let path = std::path::Path::new(&std::env::var_os("UNQUIC_TRACE_DIR")?)
+            .join(format!("{name}.trace"));
+        let file = std::fs::File::create(&path)
+            .map_err(|error| eprintln!("unquic: trace {}: {error}", path.display()))
+            .ok()?;
+        let mut trace = Self {
+            file: io::BufWriter::new(file),
+            cursors: Vec::new(),
+            records: Vec::new(),
+            marks: 0,
+            lost: 0,
+        };
+        trace.mark(false);
+        Some(trace)
+    }
+
+    /// Copies every ring; records are little-endian u64 words in drain order.
+    fn drain(&mut self) {
+        self.cursors.resize(unquic::trace::workers(), 0);
+        for (worker, cursor) in self.cursors.iter_mut().enumerate() {
+            self.lost += unquic::trace::drain(worker, cursor, &mut self.records);
+        }
+        for record in self.records.drain(..) {
+            for word in record {
+                if let Err(error) = self.file.write_all(&word.to_le_bytes()) {
+                    eprintln!("unquic: trace write: {error}");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Markers 1.. follow each SIGUSR1 counter report; 0 opens and closes the file.
+    fn mark(&mut self, report: bool) {
+        self.drain();
+        let sequence = if report {
+            self.marks += 1;
+            self.marks
+        } else {
+            0
+        };
+        let record = [
+            unquic::trace::MARK | 0xff << 8 | sequence << 16,
+            unquic::trace::now().as_nanos() as u64,
+            unquic::trace::boottime().as_nanos() as u64,
+            self.lost,
+            0,
+            0,
+            0,
+            0,
+        ];
+        for word in record {
+            let _ = self.file.write_all(&word.to_le_bytes());
+        }
+        let _ = self.file.flush();
+    }
+}
+
 fn serve(loaded: config::Loaded) -> io::Result<()> {
     signals()?;
+    #[cfg(feature = "trace")]
+    let mut trace = loaded
+        .config
+        .sessions
+        .first()
+        .and_then(|session| Trace::open(&session.name));
     let control = Control::new();
     let worker_control = control.clone();
     let transport = thread::Builder::new()
@@ -118,6 +195,14 @@ fn serve(loaded: config::Loaded) -> io::Result<()> {
                 eprintln!("unquic: worker {worker} {snapshot:?}");
                 worker += 1;
             }
+            #[cfg(feature = "trace")]
+            if let Some(trace) = &mut trace {
+                trace.mark(true);
+            }
+        }
+        #[cfg(feature = "trace")]
+        if let Some(trace) = &mut trace {
+            trace.drain();
         }
         if STOP.load(Ordering::Relaxed) {
             control.shutdown();
@@ -147,6 +232,10 @@ fn serve(loaded: config::Loaded) -> io::Result<()> {
     let result = transport
         .join()
         .unwrap_or_else(|_| Err(io::ErrorKind::Other.into()));
+    #[cfg(feature = "trace")]
+    if let Some(trace) = &mut trace {
+        trace.mark(false);
+    }
     // System DNS has no cancellable timeout; process exit ends any blocked helpers.
     if let Some(error) = helper_error {
         Err(error)

@@ -36,8 +36,10 @@ The crate requires Linux and declares Rust 1.89 or later. Use a
 `libc`; enabling `dns` adds exactly `iphost 0.4.4` with RA and DHCPv6 support,
 without its default features. `uuid-compat` adds lossless conversions to and from
 `uuid::Uuid`, with no UUID generation dependency. `bin` builds the daemon and
-enables `dns`, `serde`, `toml` and iphost's serde support. No optional feature is
-enabled by default.
+enables `dns`, `serde`, `toml` and iphost's serde support. `trace` adds
+diagnostics-only per-worker sender event rings; with it, the daemon writes them
+to `UNQUIC_TRACE_DIR` when that variable is set. Never enable `trace` for
+production or acceptance runs. No optional feature is enabled by default.
 
 Build and run the foreground daemon:
 

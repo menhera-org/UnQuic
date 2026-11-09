@@ -392,6 +392,7 @@ impl Worker {
             return Ok(());
         }
         let Some(mut ack) = self.sender.ack_free.pop() else {
+            trace_event!(self.id, ACK_DROP, 0, [session << 16 | usize::from(lane)]);
             self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
             self.counters.ack_buffer_drops = self.counters.ack_buffer_drops.wrapping_add(1);
             self.sessions[session].totals.queue_drops =
@@ -446,6 +447,40 @@ impl Worker {
                     .is_some_and(|ranges| self.sender.lanes[index].history.validate(ranges).is_ok())
             });
         if !valid {
+            #[cfg(feature = "trace")]
+            {
+                let history = index.map(|index| &self.sender.lanes[index].history);
+                let reason = match (
+                    self.matches(ack.session, ack.tag),
+                    history.zip(
+                        ack.ranges
+                            .get(..ack.count)
+                            .and_then(|ranges| AckRanges::new(ranges).ok()),
+                    ),
+                ) {
+                    (true, Some((history, ranges))) => match history.validate(ranges) {
+                        Err(crate::ack::HistoryError::Future) => 2,
+                        Err(crate::ack::HistoryError::Unsent) => 3,
+                        _ => 4,
+                    },
+                    _ => 1,
+                };
+                trace_event!(
+                    self.id,
+                    ACK_REJECT,
+                    reason,
+                    [
+                        ack.session << 16 | usize::from(ack.lane),
+                        ack.ranges.first().map_or(0, |range| range.end),
+                        ack.ranges[..ack.count]
+                            .last()
+                            .map_or(0, |range| range.start),
+                        ack.count,
+                        history.map_or(0, |history| history.highest_sent()),
+                        history.map_or(0, |history| history.floor())
+                    ]
+                );
+            }
             return self.return_ack(ack);
         }
         if self.sender.incoming.len() == self.sender.incoming.capacity() {
@@ -485,6 +520,21 @@ impl Worker {
                 continue;
             }
             if lane.begin_ack(&ack) {
+                trace_event!(
+                    self.id,
+                    ACK_BEGIN,
+                    0,
+                    [
+                        ack.session << 16 | usize::from(ack.lane),
+                        ack.ranges.first().map_or(0, |range| range.end),
+                        ack.ranges[..ack.count]
+                            .last()
+                            .map_or(0, |range| range.start),
+                        ack.count,
+                        lane.largest_ack,
+                        lane.history.floor()
+                    ]
+                );
                 self.sender.acks_pending += 1;
                 lane.loss_passes = 1 + u8::from(lane.scan.is_some());
                 self.sender.loss_fences = self
@@ -642,6 +692,15 @@ impl Worker {
                 if self.sender.flight.is_some() || self.sender.job.is_none() {
                     return Err(io::Error::other("unexpected send permission"));
                 }
+                trace_event!(
+                    self.id,
+                    PERMIT,
+                    0,
+                    [
+                        flight.grant().map_or(0, |grant| grant.bytes()),
+                        flight.grant().map_or(0, |grant| grant.expires().as_nanos())
+                    ]
+                );
                 self.sender.flight = Some(flight);
                 self.sender.permitted = true;
             }
@@ -664,6 +723,14 @@ impl Worker {
                 if self.sender.flight.is_some() {
                     return Err(io::ErrorKind::InvalidData.into());
                 }
+                trace_event!(
+                    self.id,
+                    RECYCLE,
+                    0,
+                    [flight
+                        .completion()
+                        .map_or(u64::MAX, |(count, _, _)| count as u64)]
+                );
                 if let Some(job) = self.sender.job.take() {
                     if matches!(job.kind, JobKind::Probe { pmtu: true, .. })
                         && flight.completion().is_none_or(|(sent, _, _)| sent == 0)
@@ -1225,6 +1292,16 @@ impl Worker {
             if packet.number <= history.highest_allocated() && !history.is_reserved(packet.number) {
                 // A canceled higher reservation can overtake a never-reserved plan suffix.
                 // Earlier entries in this increasing plan are only existing reservations.
+                trace_hold!(
+                    self.id,
+                    HOLD_OVERTAKEN,
+                    [
+                        session << 16 | (lane + 1),
+                        batch.len,
+                        packet.number,
+                        history.highest_allocated()
+                    ]
+                );
                 return Ok(());
             }
             match if history.is_reserved(packet.number) {
@@ -1234,6 +1311,20 @@ impl Worker {
             } {
                 Ok(()) => {}
                 Err(crate::ack::HistoryError::Full) => {
+                    trace_hold!(
+                        self.id,
+                        HOLD_HISTORY,
+                        [
+                            session << 16 | (lane + 1),
+                            batch.len,
+                            packet.number,
+                            count,
+                            history.trace_floor()[0],
+                            history.trace_floor()[1] << 32
+                                | history.trace_floor()[2] << 8
+                                | history.trace_floor()[3]
+                        ]
+                    );
                     self.sender.reclaim = Some(self.sender.lanes.len());
                     break;
                 }
@@ -1271,6 +1362,22 @@ impl Worker {
             deadline,
             kind: JobKind::Data,
         });
+        trace_event!(
+            self.id,
+            REQUEST,
+            0,
+            [
+                session << 16 | (lane + 1),
+                packets[..count]
+                    .iter()
+                    .map(|p| u64::from(p.bytes))
+                    .sum::<u64>(),
+                count,
+                deadline.as_nanos(),
+                self.frames.deadline().map_or(0, |at| at.as_nanos()),
+                self.sender.lanes[index].unsent_bytes,
+            ]
+        );
         self.sender.queue(
             0,
             Message::Request(Request {
@@ -1390,6 +1497,16 @@ impl Worker {
             .take()
             .ok_or(io::ErrorKind::InvalidData)?;
         self.settle_sent_pieces(&flight, count)?;
+        trace_event!(
+            self.id,
+            SENT,
+            0,
+            [
+                count,
+                flight.packets().len(),
+                at.map_or(0, |at| at.as_nanos())
+            ]
+        );
         let retain_suffix =
             matches!(job.kind, JobKind::Data) && count != 0 && count == flight.packets().len();
 

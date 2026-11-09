@@ -325,6 +325,8 @@ pub fn run(config: Config, control: Control) -> io::Result<()> {
     let wakes = (0..count)
         .map(|_| Wake::new().map(Arc::new))
         .collect::<io::Result<Vec<_>>>()?;
+    #[cfg(feature = "trace")]
+    crate::trace::init(count);
     let transmit_counters = (0..sessions)
         .map(|session| {
             let peer = config.peer_for_session(session).unwrap();

@@ -13,6 +13,32 @@ compile_error!("UnQuic requires the Linux kernel");
 #[cfg(test)]
 extern crate self as unquic;
 
+/// Records a diagnostics event only with the `trace` feature; otherwise expands to nothing.
+macro_rules! trace_event {
+    ($worker:expr, $kind:ident, $aux:expr, [$($word:expr),* $(,)?]) => {
+        #[cfg(feature = "trace")]
+        {
+            let mut words = [0_u64; 6];
+            let values = [$(($word) as u64),*];
+            words[..values.len()].copy_from_slice(&values);
+            $crate::trace::push($worker, $crate::trace::$kind, ($aux) as u64, words);
+        }
+    };
+}
+
+/// Records why a worker skipped a request, only with the `trace` feature.
+macro_rules! trace_hold {
+    ($worker:expr, $reason:ident, [$($word:expr),* $(,)?]) => {
+        #[cfg(feature = "trace")]
+        {
+            let mut words = [0_u64; 6];
+            let values = [$(($word) as u64),*];
+            words[..values.len()].copy_from_slice(&values);
+            $crate::trace::hold($worker, $crate::trace::$reason, words);
+        }
+    };
+}
+
 pub mod ack;
 pub mod bbr;
 pub mod config;
@@ -32,6 +58,8 @@ pub mod socket;
 pub mod spsc;
 mod sys;
 pub mod tap;
+#[cfg(feature = "trace")]
+pub mod trace;
 pub mod uuid;
 pub mod wire;
 mod worker;

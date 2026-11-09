@@ -148,6 +148,12 @@ impl Grants {
         self.in_flight
     }
 
+    /// Next pacing time, for diagnostics only.
+    #[cfg(feature = "trace")]
+    pub const fn next_send(&self) -> Duration {
+        self.next_send
+    }
+
     /// Earliest pacing retry, if pacing alone blocks a request at now.
     ///
     /// The owner arms this only while work is waiting. Other blocked requests

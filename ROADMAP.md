@@ -20,6 +20,15 @@ comparisons need three to five interleaved repeats per build;
 [BENCH.md](BENCH.md#decision-workload-and-its-noise-november-9) has the
 numbers. No performance gate has passed.
 
+A diagnostics-only `trace` feature attributes each never-submitted frame to
+what its sender was waiting for. Light-load collapses and most 2G expiry come
+from one lane that cannot reserve sent-history numbers: an unacknowledged tail
+pins the history floor, retirement waits for pressure and idle ACK work, and
+refused attempts consume packet numbers. Pacing, window, burst and closed
+issuance each explain under 5% of expired lifetimes.
+[BENCH.md](BENCH.md#light-load-expiry-traced-to-a-stalled-lane-november-9)
+has the evidence.
+
 ## November 8 checkpoint
 
 Performance policies remain those of `35ed011`: bounded fresh expansion,

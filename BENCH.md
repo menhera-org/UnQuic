@@ -110,6 +110,81 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Light-load expiry traced to a stalled lane (November 9)
+
+The question for this trace: for each frame that expired before submission,
+what was its sender waiting for during its life? Counters had only shown that
+98% of light-load missing frames were never submitted.
+
+The new `trace` feature is diagnostics only and off by default; production and
+acceptance builds use `--features bin,uuid-compat`. Each worker owns one fixed
+ring of 65,536 eight-word records, allocated when the runtime starts. A push
+takes no lock and allocates nothing; a reader that falls a full ring behind
+loses records and reports how many. With `UNQUIC_TRACE_DIR` set, the daemon
+drains the rings every 50 ms into `<first session>.trace` and writes a marker
+at each SIGUSR1, which splits the file at the harness's before, sent and after
+snapshots. `examples/trace_report.rs` rebuilds each worker's sender state:
+
+- holding its flight without a request, refined by the reason it skipped one
+  (expired batch, blocked socket, no MTU, history full, overtaken numbers);
+- request queued at the owner, or refused by issuance phase, pacing, burst,
+  window or a stalled PTO;
+- grant in transit, permitted, or waiting for the ordered commit.
+
+It also tracks the issuance phase, the BBR state and model every 100 µs,
+losses, late ACKs, ACK-transfer drops, retirement passes and the ACK ranges
+each TX owner applies. Each never-submitted frame is attributed to the states
+its worker occupied during the 20 ms before its deadline; 4 × the 4.6 ms
+smoothed RTT is below the 20 ms floor, so that is the frame's whole life.
+
+Before tracing, these hypotheses were stated with what would confirm each:
+expired lifetimes dominated by a reduced pacing rate or cut window (spurious
+loss from dropped ACKs), by ProbeRTT or Drain, by burst refusal, by closed
+issuance (ordered commit or feedback), or by one worker idling while others
+had credit.
+
+The first traced run (16 flows, 0.5G) caught a collapse: L→R delivered
+0.330 Gbit/s with 66,475 frames expired unsent. Worker 3 expired 63,857 of
+them. Its frames spent 92.8% of their lives with worker 3 holding its flight
+and requesting nothing; pacing, window and closed issuance together cover
+under 7%. Worker 3 sent no request for 9.9 seconds. The trigger was a grant
+that reached it 10.76 ms after issue, long past its 100 µs lifetime; the
+zero-byte completion was followed by incoming ACK-transfer drops on the same
+worker.
+
+Skip-reason tracing then explained the hold. At 2G every run showed it: 98.7%
+and 99.5% of never-submitted lifetimes in the two traced runs were spent with
+the frame's sender unable to reserve a sent-history number, and one worker
+held 169,000–174,000 of the 170,000–176,000 unsent expiries. A retirement
+trace on the R→L sender found one packet, number 701,617, at the history floor
+from 0.47 s to the end of the 20-second window. 1,205,940 of 1,208,316
+retirement passes stopped at it. A further run traced every applied ACK range;
+no ACK was rejected, and its stall at packets 849,164–849,175 showed the
+mechanism:
+
+1. The lane's 65,536-number history is full in steady state, so each new
+   number requires retiring the oldest. Retirement ran only after a refused
+   reservation and only between ACKs, so a busy lane fell behind it.
+2. The ACK for the lane's final batch was dropped at the receiving worker,
+   which receives every ACK packet and has four transfer buffers.
+3. Without later sends on that lane, packet-threshold loss detection never
+   reaches the batch. The group PTO targets the lane, but its probe needs a
+   history number too, and other lanes' ACKs reset the backoff.
+4. Every refused attempt had already allocated its packet numbers. One run
+   moved the lane's next number from about 849,000 to 45,680,127, so even a
+   resolved tail would leave the history unable to reach the next number.
+
+Verdicts: one worker stalls while others have credit (confirmed); dropped ACK
+records matter through stranded history, not through a congestion response
+(controller limits cover under 4% of expired lifetimes); ProbeRTT, Drain,
+burst refusal and closed issuance are rejected as causes, below 5% each.
+During the collapse BBR sat in Down with a halved bandwidth estimate, which
+follows from the stalled lane rather than causing it.
+
+[Trace attributions](benches/tap-sender-trace.json) are archived; raw trace
+files are 0.2–0.3 GB each and are not kept. Traced builds are not used for any
+performance number.
+
 ## Decision workload and its noise (November 9)
 
 The November 8 candidates were judged by one sweep per build. That cannot

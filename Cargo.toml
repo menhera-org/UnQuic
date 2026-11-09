@@ -20,6 +20,8 @@ uuid = { version = "1.29.0", default-features = false, optional = true }
 dns = ["dep:iphost"]
 uuid-compat = ["dep:uuid"]
 bin = ["dns", "dep:serde", "dep:toml", "iphost/serde"]
+# Diagnostics only: per-worker event rings. Never enable for production or acceptance runs.
+trace = []
 
 [[bin]]
 name = "unquic"

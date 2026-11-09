@@ -54,6 +54,74 @@ pub(in crate::worker) struct Owner {
     rescan: bool,
     request_cursor: usize,
     pub(in crate::worker) due: Option<Duration>,
+    #[cfg(feature = "trace")]
+    trace: TraceState,
+}
+
+/// Last emitted diagnostics, so unchanged waits and phases record once.
+#[cfg(feature = "trace")]
+struct TraceState {
+    blocked: [u64; 64],
+    phase: Vec<u64>,
+    control: Option<(Duration, u64)>,
+}
+
+#[cfg(feature = "trace")]
+impl Owner {
+    fn trace_phases(&mut self) {
+        for (group, last) in self.trace.phase.iter_mut().enumerate() {
+            let phase = self.sender.trace_state(group).map_or(0, |(phase, _)| phase);
+            if phase != *last {
+                *last = phase;
+                trace_event!(0, PHASE, phase, [group]);
+            }
+        }
+    }
+
+    fn trace_control(&mut self, group: usize, now: Duration) {
+        let state = &self.groups[group];
+        let model = state.controller.trace_model();
+        let key = model[0] | model[1] << 4;
+        if self
+            .trace
+            .control
+            .is_some_and(|(at, last)| last == key && now < at + Duration::from_micros(100))
+        {
+            return;
+        }
+        self.trace.control = Some((now, key));
+        let limits = state.controller.limits();
+        let inflight = self
+            .sender
+            .flight_bytes(group)
+            .map_or(0, |(_, inflight)| inflight);
+        trace_event!(
+            0,
+            CONTROL,
+            key,
+            [
+                limits.rate,
+                limits.window,
+                inflight,
+                model[2],
+                model[3],
+                model[6]
+            ]
+        );
+        trace_event!(
+            0,
+            BOUNDS,
+            key,
+            [
+                model[4],
+                model[5],
+                model[7],
+                model[8],
+                limits.quantum,
+                state.rtt.smoothed().as_nanos()
+            ]
+        );
+    }
 }
 
 impl Owner {
@@ -109,6 +177,12 @@ impl Owner {
                 rescan: false,
                 request_cursor: 0,
                 due: None,
+                #[cfg(feature = "trace")]
+                trace: TraceState {
+                    blocked: [0; 64],
+                    phase: vec![0; groups],
+                    control: None,
+                },
             },
             flights,
         ))
@@ -142,6 +216,10 @@ impl Owner {
         if slot.is_some() || request.group >= self.groups.len() {
             return Err(io::Error::other("duplicate sender request"));
         }
+        #[cfg(feature = "trace")]
+        {
+            self.trace.blocked[request.flight.worker()] = 0;
+        }
         *slot = Some(request);
         Ok(())
     }
@@ -162,6 +240,8 @@ impl Owner {
             && inflight != 0
             && limits.window.saturating_sub(inflight) < u64::from(limits.max_datagram);
         self.rescan |= group < self.cursor;
+        #[cfg(feature = "trace")]
+        self.trace_phases();
         Ok(())
     }
 
@@ -178,6 +258,8 @@ impl Owner {
         }
         self.rescan |= report.group < self.cursor;
         self.reports.push_back(report);
+        #[cfg(feature = "trace")]
+        self.trace_phases();
         Ok(())
     }
 
@@ -583,6 +665,12 @@ impl Owner {
                 }
                 bytes = next;
             }
+            #[cfg(feature = "trace")]
+            let (requested, phase, next_send) = {
+                let (phase, next_send) = self.sender.trace_state(request.group).unwrap_or_default();
+                let requested = request.flight.packets().map(|p| u64::from(p.bytes));
+                (requested.sum::<u64>(), phase, next_send)
+            };
             let result = self.sender.reserve_prefix(
                 request.group,
                 &mut request.flight,
@@ -593,6 +681,23 @@ impl Owner {
             );
             match result {
                 Ok(()) => {
+                    trace_event!(
+                        0,
+                        GRANT,
+                        worker | request.group << 8,
+                        [
+                            now.as_nanos(),
+                            bytes,
+                            requested,
+                            next_send.as_nanos(),
+                            reserved,
+                            inflight
+                        ]
+                    );
+                    #[cfg(feature = "trace")]
+                    {
+                        self.trace.blocked[worker] = 0;
+                    }
                     request.flight.pmtu = request.pmtu;
                     outgoing.push_back((worker, Message::Permit(request.flight)));
                     granted_next.get_or_insert(self.request_cursor);
@@ -603,6 +708,44 @@ impl Owner {
                     more = true;
                 }
                 Err(GrantError::Blocked) => {
+                    #[cfg(feature = "trace")]
+                    {
+                        use crate::trace::{
+                            BLOCK_BURST, BLOCK_OTHER, BLOCK_PACING, BLOCK_PHASE, BLOCK_STALLED,
+                            BLOCK_WINDOW,
+                        };
+                        let first = request.flight.packets().next().map_or(0, |p| p.bytes);
+                        let burst_left = u64::from(burst).saturating_sub(reserved);
+                        let reason = if phase != 0 {
+                            BLOCK_PHASE
+                        } else if now < next_send {
+                            BLOCK_PACING
+                        } else if limits.window == 0 && request.probe.is_none() {
+                            BLOCK_STALLED
+                        } else if bytes == 0 && u64::from(first) > burst_left {
+                            BLOCK_BURST
+                        } else if bytes == 0 {
+                            BLOCK_WINDOW
+                        } else {
+                            BLOCK_OTHER
+                        };
+                        if self.trace.blocked[worker] != reason {
+                            self.trace.blocked[worker] = reason;
+                            trace_event!(
+                                0,
+                                BLOCK,
+                                worker | request.group << 8,
+                                [
+                                    reason,
+                                    requested,
+                                    next_send.as_nanos(),
+                                    reserved,
+                                    inflight,
+                                    limits.window
+                                ]
+                            );
+                        }
+                    }
                     if let Some(at) = self.sender.deadline(request.group, now) {
                         self.due = Some(self.due.map_or(at, |old| old.min(at)));
                     }
@@ -621,6 +764,8 @@ impl Owner {
         if let Some(next) = granted_next {
             self.request_cursor = next;
         }
+        #[cfg(feature = "trace")]
+        self.trace_phases();
         Ok(more)
     }
 
@@ -648,16 +793,38 @@ impl Owner {
                 ..report.id
             };
             match report.kind {
-                ReportKind::Ack { .. } => self
-                    .sender
-                    .acknowledged(group, id, sample)
-                    .map_err(io::Error::other)?,
+                ReportKind::Ack { .. } => {
+                    #[cfg(feature = "trace")]
+                    {
+                        if self.sender.trace_uncharged(id, sample) {
+                            trace_event!(
+                                0,
+                                LATE_ACK,
+                                0,
+                                [id.session << 16 | usize::from(id.lane), id.number]
+                            );
+                        }
+                    }
+                    self.sender
+                        .acknowledged(group, id, sample)
+                        .map_err(io::Error::other)?
+                }
                 ReportKind::Loss => {
                     if let Some(loss) = self
                         .sender
                         .lost(group, id, sample)
                         .map_err(io::Error::other)?
                     {
+                        trace_event!(
+                            0,
+                            LOSS,
+                            0,
+                            [
+                                id.session << 16 | usize::from(id.lane),
+                                id.number,
+                                loss.bytes
+                            ]
+                        );
                         if state.recovery.is_none() {
                             let (_, inflight) = self
                                 .sender
@@ -739,6 +906,8 @@ impl Owner {
             }
             state.ack = None;
         }
+        #[cfg(feature = "trace")]
+        self.trace_control(group, now);
         Ok(())
     }
 }

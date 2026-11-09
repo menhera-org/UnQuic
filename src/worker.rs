@@ -2727,6 +2727,12 @@ impl Worker {
         if now < deadline {
             return false;
         }
+        trace_event!(
+            self.id,
+            EXPIRE,
+            0,
+            [count, deadline.as_nanos(), session << 16 | (lane + 1)]
+        );
         self.record_tx_expiry(session, lane, count, TxExpiry::Input);
         true
     }
@@ -2762,6 +2768,21 @@ impl Worker {
         } else {
             TxExpiry::Sent
         };
+        trace_event!(
+            self.id,
+            EXPIRE,
+            match kind {
+                TxExpiry::Input => 0,
+                TxExpiry::Unsent => 1,
+                TxExpiry::Partial => 2,
+                TxExpiry::Sent => 3,
+            },
+            [
+                1,
+                frame.deadline.as_nanos(),
+                source.session << 16 | (frame.lane + 1)
+            ]
+        );
         self.record_tx_expiry(source.session, frame.lane, 1, kind);
         true
     }
@@ -2919,6 +2940,15 @@ impl Worker {
                         .frame(index)
                         .is_none_or(|frame| frame.deadline <= now)
                 {
+                    if batch.len == 0 {
+                        trace_hold!(self.id, HOLD_FRONT_EXPIRED, [session << 16 | (lane + 1)]);
+                    } else if !batch.plan.is_empty() && !refill {
+                        trace_hold!(
+                            self.id,
+                            HOLD_RETAINED,
+                            [session << 16 | (lane + 1), batch.len, batch.plan.len()]
+                        );
+                    }
                     break;
                 }
                 let selected = if batch.repair {
@@ -3000,6 +3030,11 @@ impl Worker {
                         .map(|frame| due.min(frame.deadline))
                 });
         let Some(deadline) = deadline.filter(|&due| due > now) else {
+            trace_hold!(
+                self.id,
+                HOLD_BATCH_EXPIRED,
+                [session << 16 | (lane + 1), batch.len, batch.plan.len()]
+            );
             return Ok(());
         };
         let mut clock = self.io_clock(now);
@@ -3016,7 +3051,20 @@ impl Worker {
             self.clear_batch(session, lane, batch)?;
             return Ok(());
         }
-        if tx.blocked || limit == 0 {
+        if tx.blocked {
+            trace_hold!(
+                self.id,
+                HOLD_SOCKET_BLOCKED,
+                [session << 16 | (lane + 1), batch.len]
+            );
+            return Ok(());
+        }
+        if limit == 0 {
+            trace_hold!(
+                self.id,
+                HOLD_NO_MTU,
+                [session << 16 | (lane + 1), batch.len]
+            );
             return Ok(());
         }
         if self.sender_enabled()
@@ -3050,6 +3098,11 @@ impl Worker {
                 )
                 .is_err()
         {
+            trace_hold!(
+                self.id,
+                HOLD_PREPARE,
+                [session << 16 | (lane + 1), batch.len]
+            );
             self.clear_batch(session, lane, batch)?;
             return Ok(());
         }
