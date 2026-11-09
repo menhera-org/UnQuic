@@ -51,8 +51,18 @@ four cores saturate. Fixing BBR's rate and window gains only 5–16% on the
 delayed path. The shared-owner protocol is the limit; tuning inside it will
 not reach the gates.
 [BENCH.md](BENCH.md#the-shared-owner-sender-is-the-throughput-limit-november-9)
-has the data. Next is audit step 4: amend design section 9 for a leased
-sender before implementing it. No performance gate has passed.
+has the data.
+
+Design section 9 now specifies the replacement: published controller state
+read under a sequence check, one atomic inflight counter and one atomic
+pacing clock per group, send records kept in each lane's history, ACKs applied
+by the lane owner with batched reports to the controller, and ACKs sent from
+the receive owner under a per-worker control ceiling. Implement it in this
+order, one commit each: extend the chronological oracle and draft-07 vectors
+to concurrent workers; publish controller state and charge inflight and
+pacing atomically; move send records into lane histories and retire the
+ordered sampler; send ACKs from receive owners. Measure each on the decision
+workload. No performance gate has passed.
 
 ## November 8 checkpoint
 
