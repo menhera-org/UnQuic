@@ -64,6 +64,15 @@ pacing atomically; move send records into lane histories and retire the
 ordered sampler; send ACKs from receive owners. Measure each on the decision
 workload. No performance gate has passed.
 
+The first of those commits is in. `src/pacing/budget.rs` holds the published
+state, the atomic inflight and pacing claims, per-send records and a
+controller-side sampler fed by one report per ACK. A randomized oracle
+compares it with the chronological sampler across one to four lanes, partial
+batches, late ACKs after loss, idle restarts and application-limited marks;
+400 seeds pass in the suite and 20,000 longer seeds passed once by hand. The
+pinned draft-07 delivery vectors replay identically through it. The runtime
+does not use it yet.
+
 ## November 8 checkpoint
 
 Performance policies remain those of `35ed011`: bounded fresh expansion,

@@ -631,6 +631,16 @@ Release forwarding, reconnect, allocation and routed-MTU regression tests pass.
 General application-limited detection remains unfinished. This integration
 does not establish the performance gates.
 
+Measurements show this shared-owner protocol caps throughput, so design section
+9 specifies a replacement without grants or ordered commits. Its primitives
+are in `pacing::Budget` and `pacing::Sampler`, not yet used by the runtime.
+Workers read published controller state under a sequence check, charge one
+atomic inflight counter within the window, claim pacing from one atomic clock,
+and record each send's delivery snapshot. The controller turns one report per
+ACK, carrying the newest acknowledged record, into a rate sample. A randomized
+oracle and the draft-07 vectors show those samples equal the chronological
+sampler's.
+
 ## TAP read batching
 
 Each worker attempts to create one 64-entry io_uring for its TAP queues.

@@ -1,5 +1,8 @@
 use std::time::Duration;
-use unquic::bbr::{Delivery, DeliveryError, RateSample};
+use unquic::{
+    bbr::{Delivery, DeliveryError, RateSample},
+    pacing::{Budget, Sampler, SendRecord},
+};
 
 fn ns(n: u64) -> Duration {
     Duration::from_nanos(n)
@@ -19,8 +22,12 @@ fn pinned_draft_07_delivery_vectors() {
             include_str!("vectors/bbr-07/delivery-app-limited.txt"),
         ),
     ] {
+        // The replacement sender's records and per-ACK reports replay the same fixture.
         let mut delivery = Delivery::new();
+        let budget = Budget::new();
+        let mut sampler = Sampler::default();
         let mut packets = Vec::new();
+        let mut records: Vec<(SendRecord, bool)> = Vec::new();
         for (line, text) in fixture.lines().enumerate() {
             let fields: Vec<_> = text.split_whitespace().collect();
             if fields.is_empty() || fields[0].starts_with('#') {
@@ -33,33 +40,54 @@ fn pinned_draft_07_delivery_vectors() {
                 _ => panic!("bad flag"),
             };
             match fields[0] {
-                "S" => packets.push(
-                    delivery
-                        .sent(ns(n(1)), n(2).try_into().unwrap(), n(3), flag(4))
-                        .unwrap(),
-                ),
-                "M" => delivery.application_limited(n(1)).unwrap(),
-                "L" => assert_eq!(
-                    delivery
-                        .declared_lost(&mut packets[n(1) as usize])
-                        .unwrap()
-                        .is_some(),
-                    flag(2)
-                ),
+                "S" => {
+                    let (at, bytes) = (ns(n(1)), n(2).try_into().unwrap());
+                    packets.push(delivery.sent(at, bytes, n(3), flag(4)).unwrap());
+                    let state = budget.published();
+                    records.push((
+                        budget.record(&state, n(3), bytes, at, false, flag(4)),
+                        false,
+                    ));
+                }
+                "M" => {
+                    delivery.application_limited(n(1)).unwrap();
+                    sampler.application_limited(n(1));
+                }
+                "L" => {
+                    let index = n(1) as usize;
+                    let expected = delivery.declared_lost(&mut packets[index]).unwrap();
+                    assert_eq!(expected.is_some(), flag(2));
+                    let (record, settled) = &mut records[index];
+                    // Owners report a loss once and never after the ACK.
+                    let actual = (!*settled).then(|| sampler.lost(record));
+                    *settled = true;
+                    assert_eq!(actual, expected, "{name}:{}", line + 1);
+                }
                 "A" | "E" => {
                     let empty = fields[0] == "E";
                     let host = if empty { 2 } else { 3 };
-                    delivery.begin_ack(ns(n(1)), flag(host)).unwrap();
+                    let at = ns(n(1));
+                    delivery.begin_ack(at, flag(host)).unwrap();
+                    let (mut newly, mut newest) = (0, None::<SendRecord>);
                     if fields[host + 1] != "-" {
                         for index in fields[host + 1].split(',') {
-                            delivery
-                                .acknowledged(&mut packets[index.parse::<usize>().unwrap()])
-                                .unwrap();
+                            let index = index.parse::<usize>().unwrap();
+                            if delivery.acknowledged(&mut packets[index]).unwrap() {
+                                let (record, settled) = &mut records[index];
+                                *settled = true;
+                                newly += u64::from(record.bytes);
+                                let key = (record.sent_at, record.order);
+                                if newest.is_none_or(|old| key > (old.sent_at, old.order)) {
+                                    newest = Some(*record);
+                                }
+                            }
                         }
                     }
-                    let actual = delivery
-                        .finish_ack(if empty { Duration::ZERO } else { ns(n(2)) })
-                        .unwrap();
+                    let min_rtt = if empty { Duration::ZERO } else { ns(n(2)) };
+                    let actual = delivery.finish_ack(min_rtt).unwrap();
+                    let replacement = newest
+                        .map(|record| sampler.ack(at, newly, &record, false, flag(host), min_rtt));
+                    assert_eq!(replacement, actual, "{name}:{}", line + 1);
                     let expected = (!empty).then(|| RateSample {
                         rate: (fields[5] != "-").then(|| n(5)),
                         interval: ns(n(6)),
@@ -77,6 +105,7 @@ fn pinned_draft_07_delivery_vectors() {
                 }
                 _ => panic!("unknown vector operation"),
             }
+            budget.publish(&sampler.published(1, u64::MAX, 1));
         }
     }
 }

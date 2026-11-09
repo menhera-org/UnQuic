@@ -3,8 +3,10 @@
 //! Workers use shared data grants and bounded ordered completion processing.
 //! ACK-only feedback has a separate control ceiling to avoid window deadlock.
 
+mod budget;
 mod grants;
 mod sender;
+pub use budget::{Budget, Published, Sampler, SendRecord};
 pub use grants::{Grant, GrantError, Grants, Limits};
 pub use sender::{Flight, PacketId, Planned, Sender};
 use std::{io, time::Duration};
