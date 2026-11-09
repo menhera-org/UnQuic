@@ -24,6 +24,16 @@ const PHASE: u64 = 12;
 const ACK_DROP: u64 = 13;
 const MARK: u64 = 14;
 const HOLD: u64 = 15;
+const ADMIT_DROP: u64 = 19;
+const ADMIT_REASONS: [&str; 7] = [
+    "admit_other",
+    "admit_reader_frames",
+    "admit_reader_bytes",
+    "admit_owner_queue",
+    "admit_owner_buffers",
+    "admit_owner_frames",
+    "admit_owner_bytes",
+];
 
 // States 11 + reason refine "held" by the worker's last HOLD reason.
 const WORKER_STATES: [&str; 23] = [
@@ -183,6 +193,7 @@ fn main() -> Result<()> {
             "RETIRE",
             "ACK_REJECT",
             "ACK_BEGIN",
+            "ADMIT_DROP",
         ];
         for r in records
             .iter()
@@ -313,6 +324,11 @@ fn main() -> Result<()> {
             LOSS if inside => *counts.entry("losses").or_default() += 1.0,
             LATE_ACK if inside => *counts.entry("late_acks").or_default() += 1.0,
             ACK_DROP if inside => *counts.entry("ack_drops").or_default() += 1.0,
+            ADMIT_DROP if inside => {
+                *counts
+                    .entry(ADMIT_REASONS[(aux as usize).min(6)])
+                    .or_default() += 1.0
+            }
             BOUNDS | MARK => {}
             _ => {}
         }

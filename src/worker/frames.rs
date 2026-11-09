@@ -244,6 +244,12 @@ impl Store {
         self.free_frames.len()
     }
 
+    /// Sources and slabs holding a buffer, for diagnostics only.
+    #[cfg(feature = "trace")]
+    pub fn trace_sources(&self) -> usize {
+        self.sources.len() - self.free_sources.len()
+    }
+
     pub fn source(&self, index: usize) -> Option<&Buffer> {
         Some(&self.sources.get(index)?.as_ref()?.buffer)
     }

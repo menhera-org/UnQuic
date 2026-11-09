@@ -139,6 +139,12 @@ metrics! {
     ack_send_deferred: sum,
     /// ACK records dropped for lack of a reserved receive buffer; a subset of queue_drops, not additive.
     ack_buffer_drops: sum,
+    /// TAP sources rejected by worker retention quotas, the receive-buffer reserve or a
+    /// full owner input queue; a subset of queue_drops, not additive.
+    tx_admission_drops: sum,
+    /// Frames or datagrams dropped because another worker's handoff queue was full; a
+    /// subset of queue_drops, not additive.
+    handoff_drops: sum,
     /// Datagrams not fully admitted because receive frame storage was full.
     admission_pressure: sum,
     /// Socket receive drops reported by SO_RXQ_OVFL, in kernel skb units.

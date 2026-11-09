@@ -59,6 +59,10 @@ pub const ACK_REJECT: u64 = 17;
 /// The TX owner began applying an ACK: lane key, highest range end, lowest range start,
 /// ranges, lane largest ACK after the update, history floor.
 pub const ACK_BEGIN: u64 = 18;
+/// A TAP source was refused admission; aux = 1 reader frame quota, 2 reader byte quota,
+/// 3 owner input queue full, 4 owner buffer reserve, 5 owner frame quota, 6 owner byte quota:
+/// lane key, retained frames, retained bytes, free buffers.
+pub const ADMIT_DROP: u64 = 19;
 
 /// The lane's next queued frame already passed its deadline; the expiry pass must remove it.
 pub const HOLD_FRONT_EXPIRED: u64 = 1;

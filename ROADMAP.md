@@ -36,9 +36,15 @@ control. In matched repeats it raises most 2G and 5G directions by 22–116%
 and removes the observed collapses; four-flow L→R at 5G falls 14% because the
 left daemon's busiest worker reaches 96% CPU.
 [BENCH.md](BENCH.md#sent-history-headroom-removes-the-lane-stall-november-9)
-records the comparison. Next: separate the `queue_drops` causes, profile the
-saturated worker, then audit step 3's coordination-ceiling builds. No
-performance gate has passed.
+records the comparison.
+
+New `tx_admission_drops` and `handoff_drops` subsets of `queue_drops` show
+that high-load input loss is admission, not handoff overflow. A trace pins it
+on one worker: the receiver of the peer's lane 1, which carries every ACK
+packet, holds most of the transmit buffers as queued sources and unreturned
+credits, so the other readers refuse input. Next: spread ACK reception (the
+audit's ACKs from the receive owner), then audit step 3's coordination-ceiling
+builds. No performance gate has passed.
 
 ## November 8 checkpoint
 

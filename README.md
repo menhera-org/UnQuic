@@ -831,7 +831,11 @@ error counters alongside it.
 `tx_backlog_drops` counts TAP sources rejected by the per-lane fresh-byte
 budget. It is a subset of `queue_drops`, published at worker, session and TX
 lane scope. A GSO source can represent many frames; this is not an additional
-frame-loss count.
+frame-loss count. Two further subsets appear at worker and session scope:
+`tx_admission_drops` counts TAP sources rejected by worker retention quotas,
+the receive-buffer reserve or a full owner input queue, and `handoff_drops`
+counts frames and datagrams dropped because another worker's handoff queue was
+full. Neither is additive with `queue_drops`.
 
 Each receive socket requests 8 MiB with `SO_RCVBUFFORCE`. On `EPERM` it falls
 back to `SO_RCVBUF`, subject to the kernel's configured limit. Worker counters

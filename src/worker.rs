@@ -1847,9 +1847,7 @@ impl Worker {
         if header.lane == 0 {
             if self.id != 0 {
                 if let Err(Event::Packet(buffer)) = self.push(0, Event::Packet(buffer)) {
-                    self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
-                    self.sessions[session].totals.queue_drops =
-                        self.sessions[session].totals.queue_drops.wrapping_add(1);
+                    self.queue_drop(session, true, false);
                     return Ok(Some(buffer));
                 }
                 return Ok(None);
@@ -1885,9 +1883,7 @@ impl Worker {
         if owner == 0 {
             if self.id != 0 {
                 if let Err(Event::Packet(buffer)) = self.push(0, Event::Packet(buffer)) {
-                    self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
-                    self.sessions[session].totals.queue_drops =
-                        self.sessions[session].totals.queue_drops.wrapping_add(1);
+                    self.queue_drop(session, true, false);
                     return Ok(Some(buffer));
                 }
                 return Ok(None);
@@ -1914,9 +1910,7 @@ impl Worker {
                 {
                     self.shared.owners[session][lane_id].store(0, Ordering::Release);
                     self.sessions[session].free.push(lane);
-                    self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
-                    self.sessions[session].totals.queue_drops =
-                        self.sessions[session].totals.queue_drops.wrapping_add(1);
+                    self.queue_drop(session, true, false);
                     return Ok(Some(buffer));
                 }
                 return Ok(None);
@@ -1933,9 +1927,7 @@ impl Worker {
             if let Err(Event::Packet(buffer)) =
                 self.push(usize::from(owner - 1), Event::Packet(buffer))
             {
-                self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
-                self.sessions[session].totals.queue_drops =
-                    self.sessions[session].totals.queue_drops.wrapping_add(1);
+                self.queue_drop(session, true, false);
                 return Ok(Some(buffer));
             }
             return Ok(None);
@@ -2227,16 +2219,26 @@ impl Worker {
                     self.release(buffer);
                     return Ok(false);
                 };
-                let local = &mut self.sessions[session];
+                let local = &self.sessions[session];
                 let workers = local.tx_workers;
                 if local.tx_retained >= frame_quota(workers)
                     || local.tx_bytes + length > 64 * 1024 * 1024 / workers
                 {
-                    self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
-                    local.totals.queue_drops = local.totals.queue_drops.wrapping_add(1);
+                    trace_event!(
+                        self.id,
+                        ADMIT_DROP,
+                        if local.tx_retained >= frame_quota(workers) {
+                            1
+                        } else {
+                            2
+                        },
+                        [session, local.tx_retained, local.tx_bytes, self.free.len()]
+                    );
+                    self.queue_drop(session, false, true);
                     self.release(buffer);
                     return Ok(false);
                 }
+                let local = &mut self.sessions[session];
                 local.tx_retained += 1;
                 local.tx_bytes += length;
                 buffer.tx_reserved = true;
@@ -2281,12 +2283,20 @@ impl Worker {
         if owner == self.id {
             self.input_frame(buffer, now)?;
         } else if let Err(Event::Frame(buffer)) = self.push(owner, Event::Frame(buffer)) {
-            self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
-            self.sessions[session].totals.queue_drops =
-                self.sessions[session].totals.queue_drops.wrapping_add(1);
+            self.queue_drop(session, true, false);
             self.release(buffer);
         }
         Ok(())
+    }
+
+    /// Counts one queue drop and, when known, its handoff or transmit-admission subset.
+    fn queue_drop(&mut self, session: usize, handoff: bool, admission: bool) {
+        for totals in [&mut self.counters, &mut self.sessions[session].totals] {
+            totals.queue_drops = totals.queue_drops.wrapping_add(1);
+            totals.handoff_drops = totals.handoff_drops.wrapping_add(u64::from(handoff));
+            totals.tx_admission_drops =
+                totals.tx_admission_drops.wrapping_add(u64::from(admission));
+        }
     }
 
     fn input_frame(&mut self, mut buffer: Box<Buffer>, now: Duration) -> io::Result<()> {
@@ -2317,9 +2327,28 @@ impl Worker {
                     || local.tx_bytes + buffer.length + MAX_FRAME_LEN
                         > 64 * 1024 * 1024 / local.tx_workers))
         {
-            self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
-            self.sessions[session].totals.queue_drops =
-                self.sessions[session].totals.queue_drops.wrapping_add(1);
+            trace_event!(
+                self.id,
+                ADMIT_DROP,
+                if local.tap_inputs.len() == BUFFERS {
+                    3
+                } else if self.free.len() <= RECEIVE_BUFFERS - self.rx_retained + 1 {
+                    4
+                } else if local.tx_retained + 3 > frame_quota(local.tx_workers) {
+                    5
+                } else {
+                    6
+                },
+                [
+                    session << 16 | (buffer.lane + 1),
+                    local.tx_retained,
+                    self.frames.trace_sources(),
+                    self.free.len(),
+                    local.tap_inputs.len(),
+                    self.returns.iter().map(Vec::len).sum::<usize>() << 16 | self.rx_retained
+                ]
+            );
+            self.queue_drop(session, false, true);
             self.release(buffer);
             return Ok(());
         }
@@ -5955,6 +5984,11 @@ mod tests {
                 workers[1].counters.queue_drops,
                 (RECEIVE_BUFFERS + 3) as u64
             );
+            assert_eq!(
+                workers[1].counters.tx_admission_drops,
+                workers[1].counters.queue_drops
+            );
+            assert_eq!(workers[1].counters.handoff_drops, 0);
             assert_eq!(workers[1].returns[0].len(), BUFFERS);
             workers[1]
                 .command(
@@ -7367,6 +7401,43 @@ mod tests {
         assert_eq!(owner.deadline(now), Some(now));
         owner.mtu_due = feedback;
         assert_eq!(owner.deadline(now), Some(feedback));
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn full_frame_handoff_counts_a_handoff_drop() {
+        let (_shared, mut workers) = test_workers();
+        let (tx, rx) = crate::spsc::channel();
+        workers[0].outgoing[1] = Some(tx);
+        workers[1].incoming[0] = Some(rx);
+        for _ in 0..crate::spsc::CAPACITY {
+            let feedback = Event::ProbeFeedback {
+                session: 0,
+                tag: 0,
+                lane: 1,
+                packet: 0,
+                length: 0,
+            };
+            assert!(workers[0].push(1, feedback).is_ok());
+        }
+        let mut buffer = workers[0].free.pop().unwrap();
+        buffer.session = 0;
+        buffer.lane = 1;
+        buffer.tx_reserved = true;
+        workers[0].sessions[0].tx_retained += 1;
+        workers[0].sessions[0].tx_bytes += buffer.length;
+        workers[0].dispatch_frame(buffer, Duration::ZERO).unwrap();
+        let counters = &workers[0].counters;
+        assert_eq!(
+            (
+                counters.queue_drops,
+                counters.handoff_drops,
+                counters.tx_admission_drops
+            ),
+            (1, 1, 0)
+        );
+        assert_eq!(workers[0].sessions[0].totals.handoff_drops, 1);
+        assert_eq!(workers[0].sessions[0].tx_retained, 0);
     }
 
     #[test]

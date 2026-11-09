@@ -118,6 +118,41 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## High-load input drops come from one starved buffer pool (November 9)
+
+After the history fix, frames that reach a sender rarely expire at 2G. The
+missing frames are lost earlier, in `queue_drops`, which until now merged
+several unrelated rejections. Two new subset counters separate them:
+`tx_admission_drops` (worker retention quotas, the receive-buffer reserve or a
+full owner input queue) and `handoff_drops` (another worker's handoff queue was
+full). Neither is additive with `queue_drops`.
+
+[Two repeats of the decision workload](benches/tap-queue-drops.json), with
+behaviour unchanged, put nearly every drop in admission: 0.75–2.9 million per
+endpoint at 2G and 5G, and fewer than 100,000 elsewhere. `handoff_drops` is zero
+at every point, so no handoff queue overflows.
+
+A trace event then recorded which admission check failed. At 2G every one of
+the 0.7–1.6 million refusals per endpoint is the owner's buffer reserve: the
+owner cannot give the reader an empty buffer for a foreign source and still
+keep its receive reserve. Averaged over refusals on the R→L sender with
+sixteen flows:
+
+| Worker | Refusals | Sources and slabs | Free buffers | Queued TAP inputs | Buffers awaiting return |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0 | 699,487 | 1.0 | 8.7 | 0.2 | 0.4 |
+| 1 | 5,660 | 8.4 | 8.7 | 5.2 | 7.2 |
+| 3 | 508,423 | 107.9 | 8.2 | 96.9 | 169.1 |
+
+Each worker has 128 buffers of 64 KiB. Worker 3 owns lane 4 and also receives
+the peer's lane 1, which carries every ACK-only packet. It holds 97 queued
+sources and 169 empty buffers owed to readers, while worker 0 refuses input
+with almost no buffers of its own in use. Credit therefore piles up behind the
+busiest worker, which runs at 84–93% of a core at 2G, and starves the other
+readers. Its incoming ACK fan-out also drops 21,000–25,000 records per
+twenty-second point. This matches the November 8 audit's case for sending ACKs
+from the receive owner, which would spread ACK reception across workers.
+
 ## Sent-history headroom removes the lane stall (November 9)
 
 The trace below found one lane unable to reserve sent-history numbers behind

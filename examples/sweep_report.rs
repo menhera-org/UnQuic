@@ -19,6 +19,8 @@ const COUNTERS: &[&str] = &[
     "tx_expired_sent_frames",
     "rx_expired_incomplete_frames",
     "queue_drops",
+    "tx_admission_drops",
+    "handoff_drops",
     "tx_backlog_drops",
     "ack_buffer_drops",
     "ack_send_deferred",
