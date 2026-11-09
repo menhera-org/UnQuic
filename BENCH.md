@@ -182,9 +182,13 @@ requested each way, production delivers 2.50–2.81 / 1.91–1.96 Gbit/s and the
 shared budget 1.97–2.42 / 1.46–1.48. Its busiest thread reaches only 55–59%
 of a core, so CPU does not explain the loss. Audit step 1 keeps this check as
 an overload signal, not an adoption basis, so the decision above stands, but
-the regression is unexplained. Candidates to test first: eight workers
-contending for one pacing clock that never banks credit, the 50 µs retry while
-the window is full, and the single report per worker.
+the regression is unexplained. One lead: the shared budget makes 30–50% more
+claims than production made grants (246–284 thousand against 181–199 thousand
+on the left) while delivering less, so each send averages about 20 KB against
+about 35 KB. Eight workers splitting a small zero-RTT window into partial
+claims would explain that. Candidates to test first: that fragmentation, one
+pacing clock that never banks credit, the 50 µs retry while the window is
+full, and the single report per worker.
 
 Kernel suites: all 100 ignored tests pass on Linux 6.8 and 7.0, along with the
 ordinary release-musl suite and strict Clippy.
