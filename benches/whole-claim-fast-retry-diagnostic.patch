@@ -1,0 +1,24 @@
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 9d83595..b170ec2 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -19,7 +19,7 @@ const ACK_BUFFERS: usize = 4;
+ /// Send records per worker; their handles also key the worker's recovery journal.
+ pub(super) const RECORDS: usize = 65_535;
+ /// Retry interval while the shared window, not pacing, refuses a claim.
+-const WINDOW_RETRY: Duration = Duration::from_micros(50);
++const WINDOW_RETRY: Duration = Duration::from_micros(10);
+ // Trace reasons for a refused claim, equal to trace::BLOCK_PACING and BLOCK_WINDOW.
+ const BLOCK_PACING: u64 = 2;
+ const BLOCK_WINDOW: u64 = 4;
+@@ -1576,9 +1576,7 @@ impl Worker {
+             return Ok(Claimed::Abandoned);
+         }
+         let window = job.probe.is_none().then_some(state.window);
+-        let room = window.map_or(state.quantum, |window| {
+-            state.quantum.min(window.saturating_sub(budget.in_flight()))
+-        });
++        let room = state.quantum;
+         let refused = match self.sender.flight.truncate(room, &mut self.sender.records) {
+             Ok(bytes) => match budget.charge(bytes, window) {
+                 Some(prior) => match budget.pace(bytes, state.rate, now) {

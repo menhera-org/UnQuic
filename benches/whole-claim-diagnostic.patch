@@ -1,0 +1,15 @@
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 9d83595..1f79c57 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -1576,9 +1576,7 @@ impl Worker {
+             return Ok(Claimed::Abandoned);
+         }
+         let window = job.probe.is_none().then_some(state.window);
+-        let room = window.map_or(state.quantum, |window| {
+-            state.quantum.min(window.saturating_sub(budget.in_flight()))
+-        });
++        let room = state.quantum;
+         let refused = match self.sender.flight.truncate(room, &mut self.sender.records) {
+             Ok(bytes) => match budget.charge(bytes, window) {
+                 Some(prior) => match budget.pace(bytes, state.rate, now) {

@@ -69,8 +69,11 @@ slab and ordered commits are gone. On the decision workload fourteen of
 sixteen 2G and 5G directions rise beyond production's range, by 16–129%
 ([BENCH.md](BENCH.md#replacing-grants-with-a-shared-send-budget-november-9)).
 The busiest worker now saturates on ACK handling. The zero-delay loopback
-overload check regresses by about a fifth without saturating any core;
-explain that before item 2. No performance gate has passed.
+overload check regresses by about a fifth without saturating any core. A
+diagnostic traces most of that to partial claims fragmenting sends; claiming
+whole plans recovers the reverse direction with less CPU and should be
+measured on the decision workload for adoption before item 2. A faster window
+retry does not help. No performance gate has passed.
 
 ### Next, in order
 

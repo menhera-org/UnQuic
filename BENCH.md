@@ -190,6 +190,27 @@ claims would explain that. Candidates to test first: that fragmentation, one
 pacing clock that never banks credit, the 50 µs retry while the window is
 full, and the single report per worker.
 
+Two diagnostic builds then tested the first and third candidates on the same
+check, two interleaved repeats each, never production:
+
+- [Whole-plan claims](benches/whole-claim-diagnostic.patch) take up to one
+  quantum but wait until it fits the window instead of claiming the part that
+  fits. Claims fall from 271–285 thousand to 104–106 thousand, daemon CPU from
+  263–274% to 234–245%, and delivery moves from 2.26–2.40 / 1.54–1.57 to
+  2.12–2.18 / 2.11–2.17 Gbit/s
+  ([data](benches/tap-whole-claim-loopback.json)). Fragmentation explains the
+  reverse direction's loss and the extra CPU, not the forward deficit against
+  production.
+- [Whole-plan claims with a 10 µs window retry](benches/whole-claim-fast-retry-diagnostic.patch)
+  deliver 1.98–2.10 / 2.15–2.21 Gbit/s at 391–436% CPU
+  ([data](benches/tap-whole-claim-fast-retry-loopback.json)). The retry
+  interval is not the cap; faster polling only burns CPU.
+
+Both directions now stop near 2.15 Gbit/s with the busiest thread at about
+51%. Whole-plan claims look worth adopting, after the decision workload and
+both kernel suites. The remaining cap is probably the ACK return path setting
+the effective round trip, which roadmap item 2 changes.
+
 Kernel suites: all 100 ignored tests pass on Linux 6.8 and 7.0, along with the
 ordinary release-musl suite and strict Clippy.
 
