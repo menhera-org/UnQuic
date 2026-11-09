@@ -721,6 +721,9 @@ sampling records. Pressure retirement can run with no free sampling slot.
 The controller has fixed cycle vectors, model/loss/recovery boundary tests and
 allocation checks; tests/vectors/bbr-07/README.md records draft interpretations.
 Bounded grant batches and shared controller ownership are connected.
+Measurements show this shared-owner protocol caps throughput; section 9 now
+specifies its replacement, whose pure state and equivalence oracle exist but
+are not yet used by the runtime.
 Worker-local payload retention, packet-to-frame mappings and two-generation
 selective repair are connected. ACK/retirement coverage work and frame cleanup
 are bounded independently of congestion-charge settlement. General

@@ -18,7 +18,7 @@ bimodal: most runs miss under 1%, but one invocation in five collapses one
 direction to 0.16–0.37 Gbit/s through never-submitted expiry. Matched
 comparisons need three to five interleaved repeats per build;
 [BENCH.md](BENCH.md#decision-workload-and-its-noise-november-9) has the
-numbers. No performance gate has passed.
+numbers.
 
 A diagnostics-only `trace` feature attributes each never-submitted frame to
 what its sender was waiting for. Light-load collapses and most 2G expiry come
@@ -55,26 +55,64 @@ has the data.
 
 Design section 9 now specifies the replacement: published controller state
 read under a sequence check, one atomic inflight counter and one atomic
-pacing clock per group, send records kept in each lane's history, ACKs applied
-by the lane owner with batched reports to the controller, and ACKs sent from
-the receive owner under a per-worker control ceiling. Implement it in this
-order, one commit each: extend the chronological oracle and draft-07 vectors
-to concurrent workers; publish controller state and charge inflight and
-pacing atomically; move send records into lane histories and retire the
-ordered sampler; send ACKs from receive owners. Measure each on the decision
-workload. No performance gate has passed.
+pacing clock per group, send records kept by each lane's owner, one report per
+ACK to the controller, and ACKs sent from the receive owner under a per-worker
+control ceiling.
 
-The first of those commits is in. `src/pacing/budget.rs` holds the published
-state, the atomic inflight and pacing claims, per-send records and a
-controller-side sampler fed by one report per ACK. A randomized oracle
-compares it with the chronological sampler across one to four lanes, partial
-batches, late ACKs after loss, idle restarts and application-limited marks;
-400 seeds pass in the suite and 20,000 longer seeds passed once by hand. The
-pinned draft-07 delivery vectors replay identically through it. The runtime
-does not use it yet.
+Its pure part is in. `src/pacing/budget.rs` holds the published state, the
+atomic inflight and pacing claims, per-send records and a controller-side
+sampler fed by one report per ACK. A randomized oracle compares it with the
+chronological sampler across one to four lanes, partial batches, late ACKs
+after loss, idle restarts and application-limited marks; 400 seeds pass in
+the suite and 20,000 longer seeds passed once by hand. The pinned draft-07
+delivery vectors replay identically through it. The runtime does not use it
+yet. No performance gate has passed.
+
+### Next, in order
+
+Stages 2 through 5 close only when their gates pass. Work through this list;
+each item is one commit with its tests, both kernel suites, and a BENCH.md
+entry when it changes performance. Items 1 to 3 finish the November 9
+throughput audit: its steps 1 to 3, the section 9 amendment and the
+equivalence oracle are done.
+
+1. **Replace the grant protocol in the runtime.** Workers claim inflight and
+   pacing from `pacing::Budget` immediately before each syscall and keep each
+   send's record in a sampling slab owned by the lane's worker. Lane owners
+   report one aggregate per ACK and one record per loss; the controller owner
+   publishes after each feedback pass. Grants, flights, the shared slab, ordered
+   commits and retirement reports go away. The roadmap's earlier split into
+   "charge atomically" and "move records into lane histories" cannot land as
+   two commits: without per-batch grants the ordered sampler has no epoch to
+   wait for. Keep PTO probe allowance, loss-check barriers, ProbeRTT and PMTU
+   provenance with their present meaning. Measure on the decision workload and
+   the loopback check against the current production build.
+2. **Send ACKs from receive owners** on their own lanes, with the control
+   ceiling scaled per worker by received bytes, so one worker no longer carries
+   every ACK packet and its fan-out. Measure the same way.
+3. **Size capacities** (audit step 5): per-session retention credit that busy
+   workers can borrow, shared receive slots per worker, and the ACK-box pool,
+   each sized from the delayed and lossy rows, with memory cost reported.
+   Target one flow at 5 Gbit/s at 7.5 ms with 0.5% and 1% loss on four workers,
+   within two to four cores per daemon.
+4. **Finish stage 3:** general application-limited detection; the container
+   test with `tc netem` loss and reordering proving no duplicate delivery and
+   bounded memory; the 0, 0.1, 1 and 5% loss sweep at 4.5 and 7.5 ms with
+   independent and burst loss.
+5. **Close the stage 2 gate:** 20 Gbit/s each direction locally at inner MTU
+   1500, plus the small-frame burst rows.
+6. **Stage 4**, as listed in its section: TAP lifetime and descriptor handover,
+   the panic audit, the composition matrix, VRF, resource stress, restart and
+   path changes, double-fork readiness and the systemd unit.
+7. **Stage 5:** profile what remains and try its candidates behind switches.
+
+If evidence shows a gate cannot be reached within the current design, write
+that conclusion with its evidence in BENCH.md and here instead of trying more
+small changes.
 
 ## November 8 checkpoint
 
+The November 9 checkpoint supersedes this section's next steps.
 Performance policies remain those of `35ed011`: bounded fresh expansion,
 corrected routed benchmark ordering, failed-ACK retry and early ACK-buffer
 recycling are retained. Subsequent parser hardening replaces the ancillary
@@ -171,7 +209,9 @@ The target layout. Create files when their step arrives, not before.
 | `src/loss.rs` | RTT, loss detection, PTO (RFC 9002 parameters) | 3 |
 | `src/pmtu.rs` | DPLPMTUD per lane | 3 |
 | `src/bbr.rs` | BBRv3 (draft 07) | 3 |
-| `src/pacing.rs` | Grants, pacing deadlines | 3 |
+| `src/pacing.rs` | Grants, pacing deadlines, control ceiling | 3 |
+| `src/pacing/budget.rs` | Section 9 replacement: published state, atomic inflight and pacing, per-ACK sampler | 3 |
+| `src/trace.rs` | Diagnostics-only event rings (feature `trace`) | done |
 
 ## Stage 1: socket and device foundation — complete
 
@@ -840,9 +880,12 @@ full expired batches sharing the cleanup budget.
   direction and path group, charging outer IP bytes, initial window ten
   datagrams. Pin deterministic vectors derived from the draft's pseudocode
   before optimising anything. Do not substitute a simpler controller.
-- `pacing.rs`: grants with 100 µs expiry and reservation-before-grant,
-  burst cap of min(send quantum, 64 datagrams), `timerfd` deadlines, the
-  separate 4 MiB/s control-traffic ceiling with a 16-datagram burst.
+- `pacing.rs`: the section 9 replacement sender. Each claim charges inflight
+  within the published window and takes pacing credit of at most
+  min(send quantum, 64 datagrams) from the group's atomic clock; `timerfd`
+  deadlines; the separate 4 MiB/s control-traffic ceiling with a 16-datagram
+  burst. The current grants with 100 µs expiry and ordered commits are
+  measured as the throughput limit and are being replaced.
 - Liveness from section 5.3: PROBE once per second on idle, degraded after
   3 s, inactive after 30 s, replacement handshake with automatic election.
 - Tests: the BBR and feedback cases under "Protocol and ownership regression
