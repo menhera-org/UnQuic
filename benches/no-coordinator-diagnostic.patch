@@ -1,0 +1,18 @@
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 9230da9..ff65f62 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -647,11 +647,8 @@ impl Worker {
+     }
+ 
+     pub(super) fn sender_enabled(&self) -> bool {
+-        #[cfg(test)]
+-        if self.unpaced_fixture {
+-            return false;
+-        }
+-        true
++        // DIAGNOSTIC ONLY: send without grants, ordered commits, pacing, window or recovery.
++        false
+     }
+ 
+     pub(super) fn sender_index(&self, session: usize, lane: usize) -> io::Result<usize> {

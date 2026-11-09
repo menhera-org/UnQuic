@@ -6,7 +6,10 @@ diagnostics-only sender trace traced light-load collapses and most 2G expiry
 to one lane stalled behind an unacknowledged tail in its full sent history.
 The adopted fix raises most 2G and 5G directions by 22–116% in matched repeats;
 delivery still reaches only 0.45–1.25 Gbit/s per direction at 2–5 Gbit/s
-offered, and the busiest worker approaches a full core. No gate has passed.
+offered, and the busiest worker approaches a full core. Diagnostic builds then
+show the shared-owner sender itself is the limit: without it, loopback
+recovers 6.75 / 15.66 Gbit/s against production's 2.02 / 1.84. No gate has
+passed.
 
 The November 8 comparison uses production `35ed011` as its control across
 24 routed release points. It rejects early successor requests and ACK-record
@@ -117,6 +120,59 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## The shared-owner sender is the throughput limit (November 9)
+
+Audit step 3 asks whether coordination itself caps throughput. Two diagnostic
+builds, never production, test it against unchanged production `f7db9dc`:
+
+- [Controller bypass](benches/controller-bypass-diagnostic.patch) keeps the
+  grant path but fixes pacing at 5 GB/s, the window at 64 MiB and the quantum
+  at 64 KiB.
+- [No coordinator](benches/no-coordinator-diagnostic.patch) disables the
+  shared sender: workers send without grants, ordered commits, pacing, window
+  or recovery. It shows the data path's ceiling, not a usable transport.
+
+Stated beforehand: if the no-coordinator build recovers most of the
+pre-integration rate and the bypass does not, the shared-owner protocol is the
+limit. If the bypass recovers most, BBR or pacing is. If neither does, the data
+path is.
+
+[Two interleaved repeats](benches/tap-coordination-ceiling.json) of the
+decision workload without loss, delivered Gbit/s L→R / R→L (medians):
+
+| Flows | Offered | Production | Controller bypass | No coordinator |
+| --- | --- | --- | --- | --- |
+| 16 | 2G | 1.133 / 1.001 | 1.283 / 1.075 | 1.975 / 1.672 |
+| 16 | 5G | 0.948 / 1.085 | 1.110 / 1.116 | 2.271 / 2.034 |
+| 4 | 2G | 0.851 / 1.227 | 0.927 / 1.223 | 1.879 / 1.711 |
+| 4 | 5G | 0.579 / 1.253 | 0.558 / 1.332 | 0.700 / 2.967 |
+
+With no coordinator, the busiest worker on each daemon reaches 97–98% of a core
+and the four-worker daemons use 335–391% CPU: the data path itself is then
+CPU-bound near 2–3 Gbit/s per direction on four cores.
+
+The same builds on the zero-delay loopback overload check (QinQ, eight
+workers, sixteen 44-segment GSO flows, 21 Gbit/s requested each way):
+
+| Build | Delivered Gbit/s L→R / R→L | Daemon CPU % | Busiest thread % |
+| --- | --- | --- | --- |
+| Production | 2.019 / 1.843 | 221 / 204 | 51 / 63 |
+| Controller bypass | 3.148 / 3.469 | 308 / 283 | 68 / 76 |
+| No coordinator | 6.750 / 15.657 | 476 / 476 | 99 / 98 |
+
+The last pre-integration build delivered 7.76 / 16.70 Gbit/s on this harness.
+**The no-coordinator build recovers most of that rate and the controller
+bypass does not. The shared-owner protocol is the limit, and further tuning
+inside it will not reach the gates.** Fixing BBR's outputs gains only 5–16% on
+the delayed path; on loopback its 32 µs window costs more, as the November 8
+audit predicted. The traces above show the mechanism on one busy lane: each
+~66 KB grant costs a request, a pacing or closed-issuance wait, the sends, and
+an ordered commit that waits for the slowest worker, about 720 µs per cycle.
+
+Next is audit step 4: amend design section 9 for a sender that leases rate and
+inflight shares to workers instead of granting each batch, then prove it
+against the chronological oracle and draft-07 vectors before any rate sweep.
 
 ## High-load input drops come from one starved buffer pool (November 9)
 

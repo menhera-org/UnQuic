@@ -1,0 +1,15 @@
+diff --git a/src/worker/sender/owner.rs b/src/worker/sender/owner.rs
+index 32b91d7..ead0f52 100644
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -620,6 +620,10 @@ impl Owner {
+                 .on_transmit(now, inflight, app_limited)
+                 .map_err(io::Error::other)?;
+             let mut limits = state.controller.limits();
++            // DIAGNOSTIC ONLY: fixed 40 Gbit/s pacing, a 64 MiB window and a 64 KiB quantum.
++            limits.rate = 5_000_000_000;
++            limits.window = 64 << 20;
++            limits.quantum = 65_536;
+             if state.pto.stalled() {
+                 limits.window = 0;
+             }

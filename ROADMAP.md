@@ -42,9 +42,17 @@ New `tx_admission_drops` and `handoff_drops` subsets of `queue_drops` show
 that high-load input loss is admission, not handoff overflow. A trace pins it
 on one worker: the receiver of the peer's lane 1, which carries every ACK
 packet, holds most of the transmit buffers as queued sources and unreturned
-credits, so the other readers refuse input. Next: spread ACK reception (the
-audit's ACKs from the receive owner), then audit step 3's coordination-ceiling
-builds. No performance gate has passed.
+credits, so the other readers refuse input.
+
+Audit step 3's diagnostic builds settle the larger question. Disabling the
+shared sender recovers 6.75 / 15.66 Gbit/s on the loopback check, close to the
+pre-integration 7.76 / 16.70, and roughly doubles delayed-path delivery until
+four cores saturate. Fixing BBR's rate and window gains only 5–16% on the
+delayed path. The shared-owner protocol is the limit; tuning inside it will
+not reach the gates.
+[BENCH.md](BENCH.md#the-shared-owner-sender-is-the-throughput-limit-november-9)
+has the data. Next is audit step 4: amend design section 9 for a leased
+sender before implementing it. No performance gate has passed.
 
 ## November 8 checkpoint
 
