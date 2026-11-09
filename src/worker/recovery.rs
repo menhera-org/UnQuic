@@ -382,9 +382,16 @@ impl Worker {
         }
         if self.recovery.cursor == report.count {
             self.recovery.cursor = 0;
-            self.sender.queue(0, sender::Message::Report(report))?;
+            let mut report = report;
+            self.settle_report(&mut report)?;
             self.counters.recovery_staged_reports =
                 self.counters.recovery_staged_reports.wrapping_add(1);
+            if matches!(report.kind, sender::ReportKind::Retire) {
+                // Retirement only frees this worker's records; the owner has nothing to apply.
+                self.report_returned(report)?;
+                return Ok(true);
+            }
+            self.sender.queue(0, sender::Message::Report(report))?;
             Ok(false)
         } else {
             self.recovery.staged = Some(report);
@@ -435,11 +442,7 @@ impl Worker {
                 return Ok(false);
             }
         }
-        let flight = self
-            .sender
-            .flight
-            .as_ref()
-            .ok_or(io::ErrorKind::InvalidData)?;
+        let flight = &self.sender.flight;
         for ordinal in 0..count {
             let sample = flight.handle(ordinal).ok_or(io::ErrorKind::InvalidData)?;
             if !self
@@ -536,13 +539,10 @@ impl Worker {
         Ok(true)
     }
 
-    pub(super) fn settle_sent_pieces(
-        &mut self,
-        flight: &pacing::Flight,
-        sent: usize,
-    ) -> io::Result<()> {
-        for ordinal in 0..flight.packets().len() {
-            let Some(sample) = flight.handle(ordinal) else {
+    /// Call before completing the flight, while every prepared packet is visible.
+    pub(super) fn settle_sent_pieces(&mut self, sent: usize) -> io::Result<()> {
+        for ordinal in 0..self.sender.flight.packets().len() {
+            let Some(sample) = self.sender.flight.handle(ordinal) else {
                 continue;
             };
             let packet = usize::from(sample.get()) - 1;

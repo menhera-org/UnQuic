@@ -1,15 +1,27 @@
-//! Owner-local byte grants and the separate control-traffic ceiling.
+//! Shared send budgets, worker flights and the separate control-traffic ceiling.
 //!
-//! Workers use shared data grants and bounded ordered completion processing.
-//! ACK-only feedback has a separate control ceiling to avoid window deadlock.
+//! Workers claim inflight and pacing credit from their path group's budget
+//! immediately before each syscall. ACK-only feedback has a separate control
+//! ceiling to avoid window deadlock.
 
 mod budget;
-mod grants;
 mod sender;
-pub use budget::{Budget, Published, Sampler, SendRecord};
-pub use grants::{Grant, GrantError, Grants, Limits};
-pub use sender::{Flight, PacketId, Planned, Sender};
+pub use budget::{Batch, Budget, Published, Records, Sampler, SendRecord};
+pub use sender::{Claim, Flight, FlightError, PacketId, Planned};
 use std::{io, time::Duration};
+
+/// Current controller limits, in outer IPv6 bytes, for one sending path group.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// Congestion window. Zero stops ordinary sends without discarding charges.
+    pub window: u64,
+    /// Pacing rate in bytes per second. Zero stops all sends, including probes.
+    pub rate: u64,
+    /// BBR's send quantum; one claim takes at most this many bytes.
+    pub quantum: u32,
+    /// Effective maximum outer datagram size, from 1280 through 9000 bytes.
+    pub max_datagram: u16,
+}
 
 const RATE: u64 = 4 * 1024 * 1024;
 const BURST: usize = 16;

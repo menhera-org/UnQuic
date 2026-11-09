@@ -95,10 +95,9 @@ fn service(workers: &mut [Worker; 2]) {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
-fn fresh_grant_clock_survives_older_worker_turn_through_handoff() {
+fn fresh_claim_clock_survives_older_worker_turn() {
     let (mut workers, rx) = workers();
     frame(&mut workers[1]);
-    let number = workers[1].sender.job.unwrap().first;
     for _ in 0..8 {
         service(&mut workers);
     }
@@ -106,7 +105,7 @@ fn fresh_grant_clock_survives_older_worker_turn_through_handoff() {
     let length = rx.recv(&mut bytes).unwrap().0;
     let datagram = Datagram::decode(&bytes[..length]).unwrap();
     assert_eq!(datagram.header().lane, 2);
-    assert_eq!(datagram.header().packet_number, number);
+    let number = datagram.header().packet_number;
     assert!(
         datagram
             .records()
@@ -133,22 +132,18 @@ fn fresh_grant_clock_survives_older_worker_turn_through_handoff() {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
-fn local_ack_settles_before_the_owner_grants_again() {
+fn local_ack_releases_the_shared_charge_in_the_same_turn() {
     let (mut workers, rx) = workers();
     frame(&mut workers[0]);
-    let number = workers[0].sender.job.unwrap().first;
     for _ in 0..8 {
         service(&mut workers);
     }
     let mut bytes = [0; BASE_UDP_PAYLOAD];
     let length = rx.recv(&mut bytes).unwrap().0;
-    assert_eq!(
-        Datagram::decode(&bytes[..length])
-            .unwrap()
-            .header()
-            .packet_number,
-        number
-    );
+    let number = Datagram::decode(&bytes[..length])
+        .unwrap()
+        .header()
+        .packet_number;
     assert!(
         workers[0]
             .sender
@@ -171,9 +166,6 @@ fn local_ack_settles_before_the_owner_grants_again() {
     workers[0]
         .incoming_ack(0, 1, 1, 0, AckRanges::new(&ranges).unwrap(), now)
         .unwrap();
-    // A foreign request is already eligible when the coordinator produces its local ACK report.
-    frame(&mut workers[1]);
-    workers[1].flush_sender_messages(now).unwrap();
     workers[0].drain_queues(now).unwrap();
     workers[0].service_sender(now).unwrap();
     let index = workers[0].sender_index(0, 0).unwrap();
@@ -188,20 +180,15 @@ fn local_ack_settles_before_the_owner_grants_again() {
             .unwrap()
             .bytes_in_flight,
         0,
-        "local settlement must reach the shared owner before issuing another grant"
+        "the lane owner releases its ACKed charge before the next claim"
     );
     assert!(!workers[0].sender.lanes[index].report_pending);
     assert!(workers[0].sender.report.is_some());
-    workers[1].drain_queues(now).unwrap();
-    assert!(
-        workers[1].sender.permitted,
-        "the normal post-advance permit handoff still runs"
-    );
 }
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
-fn steady_control_does_not_starve_local_data_or_consume_another_grant() {
+fn steady_control_does_not_starve_local_data_or_consume_another_claim() {
     let (mut workers, rx) = workers();
     for worker in &mut workers {
         worker.io_time = Some(Ok);
@@ -210,6 +197,8 @@ fn steady_control_does_not_starve_local_data_or_consume_another_grant() {
     let mut previous = 0;
     for turn in 1..=8 {
         let now = Duration::from_millis(turn);
+        // Pacing holds the plan while control takes the lane's next number.
+        workers[0].sender.budgets[0].hold_pacing(Duration::MAX);
         frame(&mut workers[0]);
         let old = workers[0].sender.job.unwrap().first;
         let ranges = [wire::AckRange { start: 1, end: 1 }];
@@ -227,6 +216,7 @@ fn steady_control_does_not_starve_local_data_or_consume_another_grant() {
             .unwrap()
             .0;
         assert!(control > old && old > previous);
+        workers[0].sender.budgets[0].hold_pacing(Duration::ZERO);
         for _ in 0..8 {
             for worker in &mut workers {
                 worker.drain_queues(now).unwrap();
@@ -271,33 +261,16 @@ fn steady_control_does_not_starve_local_data_or_consume_another_grant() {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
-fn control_overtaking_a_permit_behind_a_full_message_turn_refreshes_it() {
+fn control_overtaking_a_waiting_plan_refreshes_it_when_claimed() {
     let (mut workers, rx) = workers();
     let worker = &mut workers[0];
+    let held = Duration::from_millis(5);
+    worker.sender.budgets[0].hold_pacing(held);
     frame(worker);
-    worker.flush_sender_messages(Duration::ZERO).unwrap();
-    let now = Duration::from_millis(1);
-    // Model a full bounded message turn before the local permit; allocation is fixture setup.
-    worker.sender.outgoing.reserve(BATCH_SIZE + 1);
-    for _ in 0..BATCH_SIZE {
-        worker.sender.outgoing.push_back((0, Message::Reclaim));
-    }
-    worker
-        .sender
-        .owner
-        .as_mut()
-        .unwrap()
-        .advance(now, &mut worker.sender.outgoing)
-        .unwrap();
-    worker.flush_sender_messages(now).unwrap();
+    let job = worker.sender.job.unwrap();
     assert!(!worker.sender.permitted);
-    assert!(
-        worker
-            .sender
-            .outgoing
-            .iter()
-            .any(|(_, m)| matches!(m, Message::Permit(_)))
-    );
+    assert_eq!(worker.sender.retry, Some(held));
+    let now = Duration::from_millis(1);
     let control = worker
         .send_record(
             0,
@@ -311,6 +284,8 @@ fn control_overtaking_a_permit_behind_a_full_message_turn_refreshes_it() {
         .unwrap()
         .unwrap()
         .0;
+    assert!(control > job.first);
+    workers[0].io_time = Some(|_| Ok(Duration::from_millis(5)));
     for _ in 0..8 {
         service(&mut workers);
     }
@@ -567,16 +542,17 @@ fn partial_batches_with_feedback(feedback: bool) {
 fn crossed_group_acks_finish_before_loss_checks_use_the_only_report() {
     let (mut workers, _rx) = workers();
     let descriptors = [(0, 1, 0), (0, 2, 0), (1, 1, 1), (1, 2, 1)];
-    let (mut owner, flights) = Owner::new(2, 2, &descriptors, Duration::ZERO).unwrap();
+    let budgets: Arc<[Budget]> = (0..2).map(|_| Budget::new()).collect();
+    let mut owner = Owner::new(2, &descriptors, Duration::ZERO, Arc::clone(&budgets)).unwrap();
     for session in 0..2 {
         owner.timers.install(session, 1).unwrap();
     }
-    for (worker, flight) in workers.iter_mut().zip(flights.into_vec()) {
+    for worker in workers.iter_mut() {
         let command = worker.sessions[0].installed.unwrap();
         worker.command(1, command, 0).unwrap();
         worker.install_sender(1, 1, true).unwrap();
         worker.sender.owner = None;
-        worker.sender.flight = Some(flight);
+        worker.sender.budgets = Arc::clone(&budgets);
         worker.sender.fresh.resize(2, false);
         worker.sender.probes.resize(2, None);
         worker.sender.losses.resize(2, None);
@@ -780,12 +756,25 @@ fn sender_queue_pressure_preserves_destination_order_across_partial_sweeps() {
             )
             .unwrap();
         if token == 1 {
-            worker.sender.queue(0, Message::Reclaim).unwrap();
+            worker
+                .sender
+                .queue(
+                    0,
+                    Message::Probe {
+                        group: 0,
+                        epoch: 0,
+                        session: 0,
+                        generation: 1,
+                        lane: 1,
+                        count: 1,
+                    },
+                )
+                .unwrap();
         }
     }
     assert!(worker.flush_sender_messages(Duration::ZERO).unwrap());
     assert!(
-        worker.sender.reclaim.is_some(),
+        worker.sender.probes[0].is_some(),
         "another destination must still progress"
     );
     let incoming = peer.incoming[0].as_mut().unwrap();
@@ -826,6 +815,8 @@ fn feedback_overtakes_a_request_held_by_pacing_without_starving_it() {
     }
     let mut bytes = [0; BASE_UDP_PAYLOAD];
     rx.recv(&mut bytes).unwrap();
+    let later = Duration::from_millis(2);
+    workers[0].sender.budgets[0].hold_pacing(later);
     frame(&mut workers[0]);
     let old = workers[0].sender.job.unwrap().first;
     for _ in 0..4 {
@@ -849,7 +840,6 @@ fn feedback_overtakes_a_request_held_by_pacing_without_starving_it() {
         .unwrap()
         .unwrap()
         .0;
-    let later = Duration::from_millis(2);
     for _ in 0..8 {
         for w in &mut workers {
             w.drain_queues(later).unwrap();
@@ -916,6 +906,7 @@ fn refresh_history_pressure_reports_unused_and_preserves_frame() {
     let history = &mut workers[0].sender.lanes[index].history;
     history.reserve(pinned, 100, true, true).unwrap();
     assert!(history.submit(pinned, Duration::ZERO));
+    workers[0].sender.budgets[0].hold_pacing(Duration::MAX);
     frame(&mut workers[0]);
     let retained = workers[0].sessions[0].tx_retained;
     let old = workers[0].sender.job.unwrap().first;
@@ -941,6 +932,7 @@ fn refresh_history_pressure_reports_unused_and_preserves_frame() {
         .unwrap()
         .0;
     assert_eq!(control, 65536 - PROBE_HEADROOM);
+    workers[0].sender.budgets[0].hold_pacing(Duration::ZERO);
     for _ in 0..8 {
         service(&mut workers);
     }
@@ -1067,31 +1059,10 @@ fn partial_attempt_discards_all_unsent_reservations_and_retries_fresh_numbers() 
     let (mut workers, rx) = refilled_request();
     let worker = &mut workers[1];
     let job = worker.sender.job.unwrap();
-    let (_, Message::Request(request)) = worker.sender.outgoing.pop_front().unwrap() else {
-        panic!()
-    };
-    workers[0]
-        .sender
-        .owner
-        .as_mut()
-        .unwrap()
-        .request(request)
-        .unwrap();
-    let mut outgoing = VecDeque::with_capacity(16);
     let now = Duration::from_millis(2);
-    workers[0]
-        .sender
-        .owner
-        .as_mut()
-        .unwrap()
-        .advance(now, &mut outgoing)
-        .unwrap();
-    let (_, Message::Permit(flight)) = outgoing.pop_front().unwrap() else {
-        panic!()
-    };
-    assert!(flight.packets().len() > 1);
-    let worker = &mut workers[1];
-    worker.sender_message(Message::Permit(flight), now).unwrap();
+    worker.sender.budgets[0].hold_pacing(Duration::ZERO);
+    assert_eq!(worker.claim_sender(now).unwrap(), Claimed::Ready);
+    assert!(worker.sender.flight.packets().len() > 1);
     let mut batch = worker.sessions[0].batches[1].take().unwrap();
     let inputs: Vec<_> = batch.frames[..batch.len]
         .iter()
@@ -1111,7 +1082,7 @@ fn partial_attempt_discards_all_unsent_reservations_and_retries_fresh_numbers() 
         .iter()
         .flat_map(|part| part.iter().copied())
         .collect();
-    let granted = worker.sender.flight.as_ref().unwrap().packets().len();
+    let granted = worker.sender.flight.packets().len();
     assert!(worker.reserve_pieces(&batch, granted).unwrap());
     worker.transmit[0].paths[0].lanes[1]
         .socket
@@ -1187,6 +1158,8 @@ fn canceled_higher_reservation_discards_an_unreserved_old_plan_suffix() {
     history.reserve(overtaker, 100, false, false).unwrap();
     assert!(history.cancel(overtaker));
     assert_eq!(history.highest_sent(), 0);
+    // Pacing keeps the renumbered plan waiting so its identity is observable.
+    worker.sender.budgets[0].hold_pacing(Duration::MAX);
     worker
         .flush_batch(0, 1, &mut batch, Duration::from_millis(1))
         .unwrap();
@@ -1200,11 +1173,11 @@ fn canceled_higher_reservation_discards_an_unreserved_old_plan_suffix() {
 fn ack_buffer_pressure_counts_only_excess_and_reuses_returned_storage() {
     let (mut workers, _rx) = workers();
     frame(&mut workers[1]);
-    let number = workers[1].sender.job.unwrap().first;
     for _ in 0..8 {
         service(&mut workers);
     }
     let index = workers[1].sender_index(0, 1).unwrap();
+    let number = workers[1].sender.lanes[index].history.highest_sent();
     assert!(workers[1].sender.lanes[index].history.inflight_bytes() != 0);
     let ranges = [AckRange {
         start: number,
@@ -1278,7 +1251,6 @@ fn refilled_request_with_gap(gap: bool) -> ([Worker; 2], ReceiveSocket) {
     }
     let worker = &mut workers[1];
     assert!(worker.sender.job.is_none());
-    assert!(worker.sender.flight.is_some());
     let batch = worker.sessions[0].batches[1].as_ref().unwrap();
     let retained: Vec<_> = (0..batch.plan.len())
         .map(|i| batch.plan.packet(i).unwrap())
@@ -1322,6 +1294,8 @@ fn refilled_request_with_gap(gap: bool) -> ([Worker; 2], ReceiveSocket) {
     for _ in 0..16 {
         queue_frame(worker, 1514);
     }
+    // Hold pacing so the refilled plan waits with its reservations.
+    worker.sender.budgets[0].hold_pacing(Duration::MAX);
     worker.flush_frames(now).unwrap();
     let job = worker.sender.job.unwrap();
     if !gap {
@@ -1353,6 +1327,7 @@ fn canceled_probe_defers_refill_until_reserved_suffix_drains() {
         );
     }
     let now = Duration::from_millis(2);
+    workers[1].sender.budgets[0].hold_pacing(Duration::ZERO);
     for _ in 0..8 {
         for worker in &mut workers {
             worker.drain_queues(now).unwrap();
@@ -1388,6 +1363,7 @@ fn canceled_probe_defers_refill_until_reserved_suffix_drains() {
     }
     let index = workers[1].sender_index(0, 1).unwrap();
     assert_eq!(workers[1].sender.lanes[index].history.inflight_bytes(), 0);
+    workers[1].sender.budgets[0].hold_pacing(Duration::MAX);
     workers[1].flush_frames(observed).unwrap();
     assert!(workers[1].sender.job.unwrap().first > job.first + count);
 }
@@ -1442,12 +1418,16 @@ fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
     };
     // One additional physical copy keeps two mappings per frame after staging two ACKs.
     assert!(worker.recovery.journal.reserve_packet(3, &pieces));
+    for handle in 1..=3 {
+        assert_eq!(worker.sender.records.take().unwrap().get(), handle);
+    }
     report.count = 3;
     for ordinal in 0..3 {
         report.entries[ordinal] = Entry {
             number: ordinal as u64 + 1,
             sample: NonZeroU16::new(ordinal as u16 + 1),
             settled: true,
+            ..Entry::default()
         };
     }
     worker.recovery.staged = Some(report);
@@ -1582,6 +1562,8 @@ fn lost_original_repairs_only_missing_bytes_and_late_ack_cancels_prepared_repair
             .front(),
         Some(slot)
     );
+    // Pacing holds the prepared repair so the late ACK can cancel it.
+    workers[1].sender.budgets[0].hold_pacing(Duration::MAX);
     workers[1].flush_frames(Duration::from_millis(3)).unwrap();
     let batch = workers[1].sessions[0].batches[1].as_ref().unwrap();
     assert!(batch.repair && !batch.plan.is_empty());
@@ -1693,10 +1675,12 @@ fn mapping_pressure_preserves_fresh_fifo_and_leaves_reserved_space_for_repair() 
     );
     worker.sessions[0].batches[1] = Some(batch);
     worker.queue_recovery(old).unwrap();
+    worker.sender.budgets[0].hold_pacing(Duration::MAX);
     worker.flush_frames(Duration::from_millis(1)).unwrap();
     let batch = worker.sessions[0].batches[1].as_ref().unwrap();
     assert!(batch.repair);
     assert_eq!(batch.frames[0], Some(old));
+    worker.sender.budgets[0].hold_pacing(Duration::ZERO);
     for _ in 0..8 {
         service(&mut workers);
     }
@@ -1866,6 +1850,8 @@ fn admitted_acks_finish_then_loss_progresses_under_continuous_ack_input() {
             }]
         ));
         let index = worker.sender_index(0, 1).unwrap();
+        // Packet 1's sampling handle is the worker's first record.
+        assert_eq!(worker.sender.records.take(), NonZeroU16::new(1));
         for number in 1..=130 {
             worker.sender.lanes[index]
                 .history
@@ -2319,6 +2305,8 @@ fn busy_data_flight_preserves_due_liveness_for_each_session() {
     }
 
     workers[0].shared.bound[0].store(3, Ordering::Release);
+    // Pacing keeps the first DATA plan busy until the first turn.
+    workers[0].sender.budgets[0].hold_pacing(Duration::from_millis(1));
     frame(&mut workers[0]);
     assert!(workers[0].sender.job.is_some());
     workers[0].timers(Duration::ZERO).unwrap();
@@ -2447,7 +2435,6 @@ fn liveness_history_pressure_retries_without_spinning_or_losing_turn() {
     let report = worker.sender.report.take();
     worker.service_sender(Duration::ZERO).unwrap();
     assert!(worker.sender.job.is_none());
-    assert!(worker.sender.flight.is_some());
     assert!(worker.sender.reclaim.is_some());
     assert_eq!(worker.controls[0].probe_due, RETRY);
     assert_eq!(worker.deadline(Duration::ZERO), Some(RETRY));
@@ -2463,7 +2450,8 @@ fn liveness_history_pressure_retries_without_spinning_or_losing_turn() {
     assert!(worker.sender.lanes[index].history.lose(pinned).is_some());
     worker.sender.report = report;
     worker.service_sender(RETRY).unwrap();
-    assert!(worker.sender.job.is_some_and(|job| job.session == 0));
+    // The probe is claimed and sent in the same turn.
+    assert!(worker.controls[0].probe.is_some());
     assert_eq!(worker.controls[0].probe_due, RETRY + Duration::from_secs(1));
 }
 
@@ -2522,7 +2510,7 @@ fn unacknowledged_tail_leaves_probe_headroom_without_consuming_numbers() {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
-fn liveness_waits_for_barrier_socket_and_returned_flight() {
+fn liveness_waits_for_barrier_and_socket_then_parks_waiting_data() {
     let (mut workers, _rx) = workers();
     let worker = &mut workers[0];
     for control in &mut worker.controls {
@@ -2554,14 +2542,23 @@ fn liveness_waits_for_barrier_socket_and_returned_flight() {
             .is_none_or(|due| due > Duration::ZERO)
     );
     worker.transmit[0].paths[0].lanes[0].socket = socket;
-    let flight = worker.sender.flight.take();
+    // A due probe parks a DATA plan waiting on pacing; the plan keeps its numbers.
+    worker.sender.budgets[0].hold_pacing(Duration::MAX);
+    queue_frame(worker, 60);
+    worker.flush_frames(RETRY).unwrap();
+    let data = worker.sender.job.unwrap();
+    assert!(matches!(data.kind, JobKind::Data));
     worker.service_sender(RETRY).unwrap();
+    assert!(matches!(
+        worker.sender.job.map(|job| job.kind),
+        Some(JobKind::Probe { .. })
+    ));
+    let index = worker.sender_index(0, 0).unwrap();
+    assert!(worker.sender.lanes[index].history.is_reserved(data.first));
+    worker.sender.budgets[0].hold_pacing(Duration::ZERO);
+    worker.service_sender(RETRY).unwrap();
+    assert!(worker.controls[0].probe.is_some());
     assert!(worker.sender.job.is_none());
-    assert_eq!(worker.controls[0].probe_due, RETRY);
-    assert!(worker.deadline(RETRY).is_none_or(|due| due > RETRY));
-    worker.sender.flight = flight;
-    worker.service_sender(RETRY).unwrap();
-    assert!(worker.sender.job.is_some_and(|job| job.session == 0));
 }
 
 const OVERSIZED_GSO_FRAMES: usize = FRESH_BYTES / 43 + 1;
@@ -3212,11 +3209,11 @@ fn successful_pmtu_probe_overtakes_retained_suffix_without_reordering_data() {
 fn ack_transfer_returns_before_final_report_and_reuses_without_changing_fences() {
     let (mut workers, _rx) = workers();
     frame(&mut workers[1]);
-    let number = workers[1].sender.job.unwrap().first;
     for _ in 0..8 {
         service(&mut workers);
     }
     let index = workers[1].sender_index(0, 1).unwrap();
+    let number = workers[1].sender.lanes[index].history.highest_sent();
     let ranges = [AckRange {
         start: number,
         end: number,
@@ -3272,6 +3269,8 @@ fn ack_transfer_returns_before_final_report_and_reuses_without_changing_fences()
     assert_eq!(timing.delay_us, 17);
     assert_eq!(workers[0].counters.ack_buffer_drops, 0);
 
+    // Staging copies the send records and settles them before the owner sees the report.
+    workers[1].settle_report(&mut report).unwrap();
     workers[0]
         .sender
         .owner

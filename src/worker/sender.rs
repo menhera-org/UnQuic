@@ -3,19 +3,37 @@ use super::*;
 use crate::{
     ack::{AckProgress, History, OutstandingScan},
     loss::Rtt,
-    pacing::{Flight, PacketId},
+    pacing::{Budget, Claim, Flight, PacketId, Records, SendRecord},
     wire::{AckRange, AckRanges, MAX_ACK_RANGES},
 };
-use std::num::NonZeroU16;
+use std::{num::NonZeroU16, sync::Arc};
 
 mod history;
 mod owner;
 #[cfg(test)]
 mod tests;
 mod timers;
-use owner::{Owner, Request};
+use owner::Owner;
 
 const ACK_BUFFERS: usize = 4;
+/// Send records per worker; their handles also key the worker's recovery journal.
+pub(super) const RECORDS: usize = 65_535;
+/// Retry interval while the shared window, not pacing, refuses a claim.
+const WINDOW_RETRY: Duration = Duration::from_micros(50);
+// Trace reasons for a refused claim, equal to trace::BLOCK_PACING and BLOCK_WINDOW.
+const BLOCK_PACING: u64 = 2;
+const BLOCK_WINDOW: u64 = 4;
+
+/// Outcome of claiming send credit for the prepared job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Claimed {
+    /// Credit is attached; send now.
+    Ready,
+    /// Pacing, the window or message room refused; the plan waits for `retry`.
+    Waiting,
+    /// The job is gone: stale, expired, or a probe that cannot fit.
+    Abandoned,
+}
 /// History numbers only probes may use, so a PTO probe can always expose an
 /// unacknowledged tail. Control stops this far from the wall; DATA also leaves
 /// room for one refused plan's allocated numbers.
@@ -56,9 +74,27 @@ impl Ack {
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct Entry {
+    // Read by tests and traces; the record and handle carry everything else.
+    #[cfg_attr(not(any(test, feature = "trace")), allow(dead_code))]
     pub(super) number: u64,
     pub(super) sample: Option<NonZeroU16>,
     settled: bool,
+    // Copied from the worker's records before the report leaves it.
+    pub(super) record: SendRecord,
+}
+
+/// One syscall's successful transmissions, for PTO bases and controller inputs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Sent {
+    group: usize,
+    // Lane identity; the packet number is zero.
+    id: PacketId,
+    count: u32,
+    at: Duration,
+    mtu: u16,
+    cwnd_limited: bool,
+    // Charged from zero inflight: an idle restart.
+    restart: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -99,14 +135,7 @@ impl Report {
 pub(crate) enum Message {
     Ack(Box<Ack>),
     AckReturn(Box<Ack>),
-    Request(Request),
-    Permit(Box<Flight>),
-    Complete(Box<Flight>),
-    Recycle(Box<Flight>),
-    Resize {
-        flight: Box<Flight>,
-        payload: usize,
-    },
+    Sent(Sent),
     Report(Box<Report>),
     ReportReturn(Box<Report>),
     Probe {
@@ -137,7 +166,6 @@ pub(crate) enum Message {
     ProbeReplied {
         group: usize,
     },
-    Reclaim,
 }
 
 pub(super) struct Lane {
@@ -202,10 +230,15 @@ pub(super) struct Job {
     pub(super) generation: u64,
     pub(super) lane: usize,
     pub(super) path: usize,
+    pub(super) group: usize,
     pub(super) first: u64,
     pub(super) count: usize,
     pub(super) deadline: Duration,
     pub(super) kind: JobKind,
+    // Outer bytes of the lane's confirmed maximum datagram.
+    pub(super) mtu: u16,
+    // A PTO probe's round; it bypasses the window and goes stale with its round.
+    pub(super) probe: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -232,7 +265,11 @@ pub(super) struct State {
     pub(super) offsets: Vec<usize>,
     pub(super) lanes: Vec<Lane>,
     pub(super) cursor: usize,
-    pub(super) flight: Option<Box<Flight>>,
+    pub(super) flight: Flight,
+    pub(super) records: Records,
+    pub(super) budgets: Arc<[Budget]>,
+    // When a refused claim may succeed: the pacing time or a window retry.
+    pub(super) retry: Option<Duration>,
     pub(super) job: Option<Job>,
     pub(super) report: Option<Box<Report>>,
     #[allow(clippy::vec_box)]
@@ -331,7 +368,10 @@ impl State {
             offsets,
             lanes,
             cursor: 0,
-            flight: None,
+            flight: Flight::default(),
+            records: Records::new(RECORDS)?,
+            budgets: Arc::from(Vec::new()),
+            retry: None,
             job: None,
             report: Some(boxed(Report::new(id))?),
             ack_free,
@@ -568,6 +608,7 @@ impl State {
             .checked_mul(size_of::<usize>())?
             .checked_add(ACK_BUFFERS * (size_of::<Ack>() + size_of::<Box<Ack>>()))?
             .checked_add(size_of::<Report>())?
+            .checked_add(Records::storage_bytes(RECORDS)?)?
             .checked_add(workers.checked_mul(ACK_BUFFERS * size_of::<Box<Ack>>())?)?
             .checked_add(
                 (workers * (ACK_BUFFERS + 4))
@@ -634,9 +675,15 @@ impl Worker {
             return Ok(());
         }
         let now = first.io_clock(Duration::ZERO)()?;
-        let (owner, flights) = Owner::new(groups, workers.len(), &descriptors, now)?;
-        for (worker, flight) in workers.iter_mut().zip(flights.into_vec()) {
-            worker.sender.flight = Some(flight);
+        let mut budgets = Vec::new();
+        budgets
+            .try_reserve_exact(groups)
+            .map_err(io::Error::other)?;
+        budgets.resize_with(groups, Budget::new);
+        let budgets: Arc<[Budget]> = Arc::from(budgets);
+        let owner = Owner::new(workers.len(), &descriptors, now, Arc::clone(&budgets))?;
+        for worker in workers.iter_mut() {
+            worker.sender.budgets = Arc::clone(&budgets);
         }
         workers
             .first_mut()
@@ -669,119 +716,19 @@ impl Worker {
                 }
                 self.sender.ack_free.push(ack);
             }
-            Message::Request(request) => self
+            Message::Sent(sent) => self
                 .sender
                 .owner
                 .as_mut()
                 .ok_or(io::ErrorKind::InvalidData)?
-                .request(request)?,
-            Message::Complete(flight) => self
-                .sender
-                .owner
-                .as_mut()
-                .ok_or(io::ErrorKind::InvalidData)?
-                .complete(flight)?,
+                .sent(sent)?,
             Message::Report(report) => self
                 .sender
                 .owner
                 .as_mut()
                 .ok_or(io::ErrorKind::InvalidData)?
                 .report(report)?,
-            Message::Permit(flight) => {
-                self.counters.send_grants = self.counters.send_grants.wrapping_add(1);
-                if let Some(job) = self.sender.job {
-                    let local = &mut self.sessions[job.session];
-                    local.totals.send_grants = local.totals.send_grants.wrapping_add(1);
-                    local.tx_totals[job.lane].send_grants =
-                        local.tx_totals[job.lane].send_grants.wrapping_add(1);
-                    local.tx_dirty |= 1_u64 << job.lane;
-                }
-                if self.sender.flight.is_some() || self.sender.job.is_none() {
-                    return Err(io::Error::other("unexpected send permission"));
-                }
-                trace_event!(
-                    self.id,
-                    PERMIT,
-                    0,
-                    [
-                        flight.grant().map_or(0, |grant| grant.bytes()),
-                        flight.grant().map_or(0, |grant| grant.expires().as_nanos())
-                    ]
-                );
-                self.sender.flight = Some(flight);
-                self.sender.permitted = true;
-            }
-            Message::Resize { flight, payload } => {
-                if let Some(job) = self.sender.job
-                    && let JobKind::Probe { pmtu: true, .. } = job.kind
-                {
-                    let peer = self
-                        .shared
-                        .config
-                        .peer_for_session(job.session)
-                        .ok_or(io::ErrorKind::InvalidInput)?;
-                    self.transmit[peer].paths[job.path].lanes[job.lane]
-                        .mtu
-                        .limit_probe(payload, now);
-                }
-                self.sender_message(Message::Recycle(flight), now)?;
-            }
-            Message::Recycle(flight) => {
-                if self.sender.flight.is_some() {
-                    return Err(io::ErrorKind::InvalidData.into());
-                }
-                trace_event!(
-                    self.id,
-                    RECYCLE,
-                    0,
-                    [flight
-                        .completion()
-                        .map_or(u64::MAX, |(count, _, _)| count as u64)]
-                );
-                if let Some(job) = self.sender.job.take() {
-                    if matches!(job.kind, JobKind::Probe { pmtu: true, .. })
-                        && flight.completion().is_none_or(|(sent, _, _)| sent == 0)
-                    {
-                        let peer = self
-                            .shared
-                            .config
-                            .peer_for_session(job.session)
-                            .ok_or(io::ErrorKind::InvalidInput)?;
-                        self.transmit[peer].paths[job.path].lanes[job.lane]
-                            .mtu
-                            .defer(now);
-                    }
-                    // Completed prefixes no longer own a retained plan's unattempted suffix.
-                    let index = self.sender_index(job.session, job.lane)?;
-                    for offset in 0..job.count {
-                        self.sender.lanes[index]
-                            .history
-                            .cancel(job.first + offset as u64);
-                    }
-                    if let Some(batch) = self.sessions[job.session].batches[job.lane].as_mut()
-                        && batch.plan.packet(0).is_some_and(|p| p.number == job.first)
-                    {
-                        batch.discard(Some(&mut self.sender.lanes[index].history));
-                    }
-                }
-                self.sender.flight = Some(flight);
-                self.sender.permitted = false;
-            }
-            Message::ReportReturn(report) => {
-                if self.sender.report.is_some() {
-                    return Err(io::ErrorKind::InvalidData.into());
-                }
-                let index =
-                    self.sender_index(report.id.session, usize::from(report.id.lane) - 1)?;
-                let ack = self.sender.lanes[index].report_completed(&report)?;
-                if matches!(report.kind, ReportKind::Ack { end: None, .. }) {
-                    self.sender.cursor = index;
-                }
-                if ack.is_some() {
-                    self.sender.acks_pending -= 1;
-                }
-                self.sender.report = Some(report);
-            }
+            Message::ReportReturn(report) => self.report_returned(report)?,
             Message::ProbeReturn {
                 group,
                 epoch,
@@ -852,7 +799,6 @@ impl Worker {
                     count,
                 ));
             }
-            Message::Reclaim => self.sender.reclaim = Some(self.sender.lanes.len()),
             Message::ProbeReplied { group } => self
                 .sender
                 .owner
@@ -861,6 +807,54 @@ impl Worker {
                 .probe_replied(group)?,
         }
         let _ = now;
+        Ok(())
+    }
+
+    /// Reuses a report whose entries the owner applied, or that needed no owner.
+    pub(super) fn report_returned(&mut self, report: Box<Report>) -> io::Result<()> {
+        if self.sender.report.is_some() {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let index = self.sender_index(report.id.session, usize::from(report.id.lane) - 1)?;
+        let ack = self.sender.lanes[index].report_completed(&report)?;
+        if matches!(report.kind, ReportKind::Ack { end: None, .. }) {
+            self.sender.cursor = index;
+        }
+        if ack.is_some() {
+            self.sender.acks_pending -= 1;
+        }
+        self.sender.report = Some(report);
+        Ok(())
+    }
+
+    /// Copies each entry's send record for the owner, then settles locally:
+    /// ACKs and losses release their inflight charge, and ACKs and retirement
+    /// return the record handle. A lost packet keeps its record for a late ACK.
+    pub(super) fn settle_report(&mut self, report: &mut Report) -> io::Result<()> {
+        let mut released = 0;
+        for entry in &mut report.entries[..report.count] {
+            let Some(handle) = entry.sample else {
+                continue;
+            };
+            entry.record = self
+                .sender
+                .records
+                .get(handle)
+                .ok_or_else(|| io::Error::other("missing send record"))?;
+            if entry.settled && !matches!(report.kind, ReportKind::Retire) {
+                released += u64::from(entry.record.bytes);
+            }
+            if !matches!(report.kind, ReportKind::Loss) {
+                self.sender.records.release(handle);
+            }
+        }
+        if released != 0 {
+            self.sender
+                .budgets
+                .get(report.group)
+                .ok_or(io::ErrorKind::InvalidData)?
+                .release(released);
+        }
         Ok(())
     }
 
@@ -1129,13 +1123,21 @@ impl Worker {
             }
         }
         more |= self.flush_sender_messages(now)?;
-        if self.sender.permitted {
-            self.use_sender_permit(now)?;
-            more = true;
-        }
-        if self.sender.job.is_none() && self.sender.flight.is_some() {
+        // Probes park an unclaimed DATA plan rather than wait behind it: under
+        // pacing-limited load such a plan almost always occupies the job slot.
+        if self.parkable() {
             for group in 0..self.sender.probes.len() {
                 if let Some((epoch, id, count)) = self.sender.probes[group] {
+                    // Fresh feedback ended this PTO round; its remaining probes are void.
+                    if self
+                        .sender
+                        .budgets
+                        .get(group)
+                        .is_some_and(|budget| budget.probe_epoch() != epoch)
+                    {
+                        self.sender.probes[group] = None;
+                        continue;
+                    }
                     let installed = self.sessions.get(id.session).and_then(|s| s.installed);
                     if installed
                         .is_some_and(|c| c.generation == id.generation && c.connection.is_some())
@@ -1176,7 +1178,7 @@ impl Worker {
                 }
             }
         }
-        if self.sender.job.is_none() && self.sender.flight.is_some() {
+        if self.parkable() {
             for _ in 0..self.controls.len().min(BATCH_SIZE) {
                 let session = self.sender.liveness_cursor;
                 self.sender.liveness_cursor = (session + 1) % self.controls.len();
@@ -1221,6 +1223,10 @@ impl Worker {
                     break;
                 }
             }
+        }
+        if self.sender.job.is_some() && self.claim_sender(now)? == Claimed::Ready {
+            self.use_sender_permit(now)?;
+            more = true;
         }
         Ok(more)
     }
@@ -1282,7 +1288,7 @@ impl Worker {
         deadline: Duration,
         mtu: usize,
     ) -> io::Result<bool> {
-        if self.sender.job.is_some() || self.sender.flight.is_none() {
+        if self.sender.job.is_some() {
             return Ok(false);
         }
         let index = self.sender_index(session, lane)?;
@@ -1357,23 +1363,31 @@ impl Worker {
         if count == 0 {
             return Ok(full);
         }
-        let mut flight = self
+        if self.sender.records.available() < BATCH_SIZE {
+            self.sender.reclaim = Some(self.sender.lanes.len());
+        }
+        match self
             .sender
             .flight
-            .take()
-            .ok_or(io::ErrorKind::InvalidData)?;
-        flight
-            .prepare(&packets[..count])
-            .map_err(io::Error::other)?;
+            .prepare(&packets[..count], &mut self.sender.records)
+        {
+            Ok(_) => {}
+            // Retained loss records fill the slab: keep the reserved plan until retirement.
+            Err(pacing::FlightError::Blocked) => return Ok(true),
+            Err(error) => return Err(io::Error::other(error)),
+        }
         self.sender.job = Some(Job {
             session,
             generation,
             lane,
             path: self.sessions[session].path,
+            group: self.sender.lanes[index].group,
             first: packets[0].id.number,
             count,
             deadline,
             kind: JobKind::Data,
+            mtu: (mtu + 48).max(1280) as u16,
+            probe: None,
         });
         trace_event!(
             self.id,
@@ -1391,17 +1405,6 @@ impl Worker {
                 self.sender.lanes[index].unsent_bytes,
             ]
         );
-        self.sender.queue(
-            0,
-            Message::Request(Request {
-                flight,
-                group: self.sender.lanes[index].group,
-                deadline,
-                probe: None,
-                pmtu: false,
-                mtu: (mtu + 48).max(1280) as u16,
-            }),
-        )?;
         Ok(false)
     }
 
@@ -1414,7 +1417,13 @@ impl Worker {
         probe: Option<u64>,
         now: Duration,
     ) -> io::Result<()> {
-        if self.sender.job.is_some() || self.sender.flight.is_none() {
+        if !self.parkable() {
+            return Ok(());
+        }
+        // A probe goes before an unclaimed DATA plan, which keeps its reservations.
+        self.park_job();
+        if self.sender.records.available() == 0 {
+            self.sender.reclaim = Some(self.sender.lanes.len());
             return Ok(());
         }
         let index = self.sender_index(session, lane)?;
@@ -1455,22 +1464,22 @@ impl Worker {
             }
             Err(error) => return Err(io::Error::other(error)),
         }
-        let mut flight = self
-            .sender
+        self.sender
             .flight
-            .take()
-            .ok_or(io::ErrorKind::InvalidData)?;
-        flight
-            .prepare(&[pacing::Planned {
-                id: PacketId {
-                    session,
-                    generation,
-                    lane: lane as u16 + 1,
-                    number: piece.packet.number,
-                },
-                bytes: (length + 48) as u16,
-            }])
+            .prepare(
+                &[pacing::Planned {
+                    id: PacketId {
+                        session,
+                        generation,
+                        lane: lane as u16 + 1,
+                        number: piece.packet.number,
+                    },
+                    bytes: (length + 48) as u16,
+                }],
+                &mut self.sender.records,
+            )
             .map_err(io::Error::other)?;
+        self.sender.flight.pmtu = pmtu;
         let peer = self
             .shared
             .config
@@ -1481,28 +1490,224 @@ impl Worker {
             .payload_limit()
             + 48)
             .max(1280);
-        let deadline = now.saturating_add(Duration::from_millis(100));
         self.sender.job = Some(Job {
             session,
             generation,
             lane,
             path: local.path,
+            group: self.sender.lanes[index].group,
             first: piece.packet.number,
             count: 1,
-            deadline,
+            deadline: now.saturating_add(Duration::from_millis(100)),
             kind: JobKind::Probe { length, pmtu },
+            mtu: mtu as u16,
+            probe,
         });
-        self.sender.queue(
+        Ok(())
+    }
+
+    /// Claims inflight and pacing credit for the prepared job immediately before
+    /// its syscall. A refusal keeps the plan and sets the retry time.
+    pub(super) fn claim_sender(&mut self, now: Duration) -> io::Result<Claimed> {
+        let Some(job) = self.sender.job else {
+            return Ok(Claimed::Abandoned);
+        };
+        if self.sender.permitted {
+            return Ok(Claimed::Ready);
+        }
+        let now = self.io_clock(now)()?;
+        let local = self
+            .sessions
+            .get(job.session)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let budget = self
+            .sender
+            .budgets
+            .get(job.group)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        if now >= job.deadline
+            || local.connection.is_none()
+            || local.path != job.path
+            || local
+                .installed
+                .is_none_or(|c| c.generation != job.generation)
+            || job.probe.is_some_and(|epoch| epoch != budget.probe_epoch())
+        {
+            self.rejected_sender_grant(job.session, job.lane, now >= job.deadline);
+            self.recycle_job(now)?;
+            return Ok(Claimed::Abandoned);
+        }
+        // Every successful send owes the owner one summary; never strand it.
+        if self.sender.outgoing.len()
+            >= self
+                .sender
+                .outgoing
+                .capacity()
+                .saturating_sub(6 * self.shared.workers())
+        {
+            self.sender.retry = Some(now);
+            return Ok(Claimed::Waiting);
+        }
+        let state = budget.published();
+        let pmtu = matches!(job.kind, JobKind::Probe { pmtu: true, .. });
+        let first = self
+            .sender
+            .flight
+            .packets()
+            .next()
+            .ok_or(io::ErrorKind::InvalidData)?;
+        // A probe must fit the whole window, not just the pacing burst.
+        // A stalled zero window is temporary and cannot constrain path discovery.
+        let probe_limit = if state.window == 0 {
+            state.quantum
+        } else {
+            state.quantum.min(state.window)
+        };
+        if pmtu && u64::from(first.bytes) > probe_limit {
+            let peer = self
+                .shared
+                .config
+                .peer_for_session(job.session)
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            self.transmit[peer].paths[job.path].lanes[job.lane]
+                .mtu
+                .limit_probe(probe_limit.saturating_sub(48) as usize, now);
+            self.recycle_job(now)?;
+            return Ok(Claimed::Abandoned);
+        }
+        let window = job.probe.is_none().then_some(state.window);
+        let room = window.map_or(state.quantum, |window| {
+            state.quantum.min(window.saturating_sub(budget.in_flight()))
+        });
+        let refused = match self.sender.flight.truncate(room, &mut self.sender.records) {
+            Ok(bytes) => match budget.charge(bytes, window) {
+                Some(prior) => match budget.pace(bytes, state.rate, now) {
+                    Ok(()) => {
+                        let claim = Claim {
+                            group: job.group,
+                            prior,
+                            bytes,
+                            at: now,
+                            state,
+                        };
+                        self.sender
+                            .flight
+                            .set_claim(claim)
+                            .map_err(io::Error::other)?;
+                        None
+                    }
+                    Err(at) => {
+                        budget.release(bytes);
+                        Some((at, BLOCK_PACING))
+                    }
+                },
+                None => Some((now, BLOCK_WINDOW)),
+            },
+            Err(pacing::FlightError::Blocked) => Some((now, BLOCK_WINDOW)),
+            Err(error) => return Err(io::Error::other(error)),
+        };
+        if let Some((at, _reason)) = refused {
+            trace_event!(
+                self.id,
+                BLOCK,
+                self.id | job.group << 8,
+                [
+                    _reason,
+                    state.rate,
+                    at.as_nanos(),
+                    state.window,
+                    budget.in_flight()
+                ]
+            );
+            if pmtu {
+                // Path discovery retries later instead of holding DATA behind it.
+                self.recycle_job(now)?;
+                return Ok(Claimed::Abandoned);
+            }
+            let retry = if at > now {
+                at
+            } else if state.window == 0 {
+                now.saturating_add(RETRY)
+            } else {
+                now.saturating_add(WINDOW_RETRY)
+            };
+            self.sender.retry = Some(retry.min(job.deadline));
+            return Ok(Claimed::Waiting);
+        }
+        trace_event!(self.id, PERMIT, 0, [state.quantum, now.as_nanos()]);
+        self.counters.send_grants = self.counters.send_grants.wrapping_add(1);
+        let local = &mut self.sessions[job.session];
+        local.totals.send_grants = local.totals.send_grants.wrapping_add(1);
+        local.tx_totals[job.lane].send_grants =
+            local.tx_totals[job.lane].send_grants.wrapping_add(1);
+        local.tx_dirty |= 1_u64 << job.lane;
+        self.sender.permitted = true;
+        self.sender.retry = None;
+        Ok(Claimed::Ready)
+    }
+
+    /// Whether a probe may take the job slot: it is free or holds unclaimed DATA.
+    pub(super) fn parkable(&self) -> bool {
+        self.sender
+            .job
+            .is_none_or(|job| !self.sender.permitted && matches!(job.kind, JobKind::Data))
+    }
+
+    /// Steps an unclaimed DATA job aside. Its plan and history reservations stay
+    /// in the batch, so the next flush requests the same numbers again.
+    pub(super) fn park_job(&mut self) {
+        if self.sender.job.take().is_some() {
+            self.sender.flight.release(&mut self.sender.records);
+            self.sender.retry = None;
+        }
+    }
+
+    /// Ends the current job: unsent reservations and handles return, and a plan
+    /// still starting at the job's first number is discarded.
+    pub(super) fn recycle_job(&mut self, now: Duration) -> io::Result<()> {
+        let sent = self
+            .sender
+            .flight
+            .completion()
+            .is_some_and(|(count, _, _)| count != 0);
+        trace_event!(
+            self.id,
+            RECYCLE,
             0,
-            Message::Request(Request {
-                flight,
-                group: self.sender.lanes[index].group,
-                deadline,
-                probe,
-                pmtu,
-                mtu: mtu as u16,
-            }),
-        )
+            [self
+                .sender
+                .flight
+                .completion()
+                .map_or(u64::MAX, |(count, _, _)| count as u64)]
+        );
+        if let Some(job) = self.sender.job.take() {
+            if matches!(job.kind, JobKind::Probe { pmtu: true, .. }) && !sent {
+                let peer = self
+                    .shared
+                    .config
+                    .peer_for_session(job.session)
+                    .ok_or(io::ErrorKind::InvalidInput)?;
+                self.transmit[peer].paths[job.path].lanes[job.lane]
+                    .mtu
+                    .defer(now);
+            }
+            // Completed prefixes no longer own a retained plan's unattempted suffix.
+            let index = self.sender_index(job.session, job.lane)?;
+            for offset in 0..job.count {
+                self.sender.lanes[index]
+                    .history
+                    .cancel(job.first + offset as u64);
+            }
+            if let Some(batch) = self.sessions[job.session].batches[job.lane].as_mut()
+                && batch.plan.packet(0).is_some_and(|p| p.number == job.first)
+            {
+                batch.discard(Some(&mut self.sender.lanes[index].history));
+            }
+        }
+        self.sender.flight.release(&mut self.sender.records);
+        self.sender.permitted = false;
+        self.sender.retry = None;
+        Ok(())
     }
 
     pub(super) fn finish_sender_send(
@@ -1513,47 +1718,72 @@ impl Worker {
     ) -> io::Result<()> {
         let job = self.sender.job.ok_or(io::ErrorKind::InvalidData)?;
         let index = self.sender_index(job.session, job.lane)?;
-        let mut flight = self
+        let claim = self
             .sender
             .flight
-            .take()
+            .claim()
             .ok_or(io::ErrorKind::InvalidData)?;
-        self.settle_sent_pieces(&flight, count)?;
+        let planned = self.sender.flight.packets().len();
+        self.settle_sent_pieces(count)?;
         trace_event!(
             self.id,
             SENT,
             0,
-            [
-                count,
-                flight.packets().len(),
-                at.map_or(0, |at| at.as_nanos())
-            ]
+            [count, planned, at.map_or(0, |at| at.as_nanos())]
         );
-        let retain_suffix =
-            matches!(job.kind, JobKind::Data) && count != 0 && count == flight.packets().len();
-
-        for offset in 0..if retain_suffix { count } else { job.count } {
-            let number = job.first + offset as u64;
-            if offset < count {
-                if !self.sender.lanes[index].submitted(
-                    number,
-                    at.ok_or(io::ErrorKind::InvalidData)?,
-                    flight.handle(offset),
-                ) {
+        let host_limited = host_limited || count < planned;
+        self.sender
+            .flight
+            .complete(count, at, host_limited)
+            .map_err(io::Error::other)?;
+        let budget = self
+            .sender
+            .budgets
+            .get(claim.group)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let mut sent_bytes = 0;
+        if let Some(at) = at {
+            let mut batch = budget.begin(&claim.state, claim.prior, count as u64, at);
+            for (ordinal, packet) in self.sender.flight.packets().enumerate() {
+                let handle = self
+                    .sender
+                    .flight
+                    .handle(ordinal)
+                    .ok_or(io::ErrorKind::InvalidData)?;
+                sent_bytes += u64::from(packet.bytes);
+                let record = batch.push(packet.bytes, self.sender.flight.pmtu, host_limited);
+                if !self.sender.records.set(handle, record)
+                    || !self.sender.lanes[index].submitted(packet.id.number, at, Some(handle))
+                {
                     return Err(io::Error::other("submitted packet has no reservation"));
                 }
-            } else if !retain_suffix {
-                self.sender.lanes[index].history.cancel(number);
             }
         }
-        flight
-            .complete(count, at, host_limited || count < flight.packets().len())
-            .map_err(io::Error::other)?;
-        if retain_suffix {
+        budget.release(claim.bytes.saturating_sub(sent_bytes));
+        if let Some(at) = at {
+            let in_flight = budget.in_flight();
+            let sent = Sent {
+                group: claim.group,
+                id: PacketId {
+                    session: job.session,
+                    generation: job.generation,
+                    lane: job.lane as u16 + 1,
+                    number: 0,
+                },
+                count: count as u32,
+                at,
+                mtu: job.mtu,
+                cwnd_limited: in_flight != 0
+                    && claim.state.window.saturating_sub(in_flight) < u64::from(job.mtu),
+                restart: claim.prior == 0,
+            };
+            self.sender.queue(0, Message::Sent(sent))?;
+        }
+        // A fully sent trimmed plan keeps its never-attempted suffix reserved.
+        if matches!(job.kind, JobKind::Data) && count != 0 && count == planned {
             self.sender.job = Some(Job { count, ..job });
         }
-        self.sender.permitted = false;
-        self.sender.queue(0, Message::Complete(flight))
+        self.recycle_job(at.unwrap_or(claim.at))
     }
 
     pub(super) fn rejected_sender_grant(&mut self, session: usize, lane: usize, expired: bool) {
@@ -1573,17 +1803,10 @@ impl Worker {
         }
     }
 
-    // Only the coordinator sends uncharged feedback directly on its DATA lane.
-    // Refresh unsent identities locally; the existing grant keeps its byte and time limits.
+    // Uncharged feedback sent on a DATA lane can take a claimed plan's numbers.
+    // Refresh unsent identities locally; the claim keeps its bytes and time.
     fn refresh_sender_numbers(&mut self, job: Job, index: usize) -> io::Result<bool> {
-        let Some(owner) = self.sender.owner.as_mut() else {
-            return Ok(false);
-        };
-        let flight = self
-            .sender
-            .flight
-            .as_mut()
-            .ok_or(io::ErrorKind::InvalidData)?;
+        let flight = &mut self.sender.flight;
         let local = &mut self.sessions[job.session];
         let tx = local.tx[job.lane]
             .as_mut()
@@ -1638,7 +1861,7 @@ impl Worker {
                 }
             }
         }
-        if let Err(error) = owner.reidentify(flight, first) {
+        if let Err(error) = flight.reidentify(first) {
             for offset in 0..reserved {
                 history.cancel(first + offset as u64);
             }
@@ -1659,22 +1882,15 @@ impl Worker {
             .sessions
             .get(job.session)
             .ok_or(io::ErrorKind::InvalidData)?;
-        let grant = self
-            .sender
-            .flight
-            .as_ref()
-            .and_then(|f| f.grant())
-            .ok_or(io::ErrorKind::InvalidData)?;
         let index = self.sender_index(job.session, job.lane)?;
         if now >= job.deadline
-            || !grant.valid_at(now)
             || local.connection.is_none()
             || local.path != job.path
             || local
                 .installed
                 .is_none_or(|c| c.generation != job.generation)
         {
-            self.rejected_sender_grant(job.session, job.lane, !grant.valid_at(now));
+            self.rejected_sender_grant(job.session, job.lane, now >= job.deadline);
             self.finish_sender_send(0, None, false)?;
             if let Some(batch) = self.sessions[job.session].batches[job.lane].as_mut() {
                 batch.discard(Some(&mut self.sender.lanes[index].history));
@@ -1743,8 +1959,8 @@ impl Worker {
                 let result = if let Some(socket) = socket {
                     socket.send_batch_checked(&[SendDatagram { parts: &parts }], length, || {
                         let at = clock()?;
-                        if !grant.valid_at(at) || at >= job.deadline {
-                            rejected = Some(!grant.valid_at(at));
+                        if at >= job.deadline {
+                            rejected = Some(true);
                             return Err(io::ErrorKind::WouldBlock.into());
                         }
                         Ok(at)

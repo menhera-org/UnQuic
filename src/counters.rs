@@ -163,11 +163,11 @@ metrics! {
     feedback_delay_ns: max,
     /// Current pacing rate in outer IP bytes per second.
     pacing_bytes_per_second: sum,
-    /// Issued send permissions received by transmit workers.
+    /// Successful claims of shared inflight and pacing credit.
     send_grants: sum,
-    /// Send permissions rejected after their submission interval elapsed.
+    /// Plans dropped because a frame deadline passed before the syscall.
     expired_grants: sum,
-    /// Send permissions canceled by a changed plan, path or connection.
+    /// Plans dropped for a changed plan, path, connection or history pressure.
     cancelled_grants: sum,
     /// Currently charged outer IP bytes in flight.
     bytes_in_flight: sum,

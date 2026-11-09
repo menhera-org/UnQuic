@@ -1064,8 +1064,7 @@ impl Worker {
                 batch.is_some_and(|batch| batch.len == 0 && batch.pending.is_empty())
                     || (!tx.blocked
                         && tx.mtu.payload_limit() != 0
-                        && (!self.sender_enabled()
-                            || (self.sender.flight.is_some() && self.sender.job.is_none())))
+                        && (!self.sender_enabled() || self.sender.job.is_none()))
             });
             self.receive_interest(more)?;
             publish_turns = publish_turns.wrapping_add(1);
@@ -2921,8 +2920,7 @@ impl Worker {
         for _ in 0..self.ready.len().min(BATCH_SIZE) {
             let (session, lane) = self.ready.pop_front().unwrap();
             let mut batch = self.sessions[session].batches[lane].take().unwrap();
-            let refill =
-                self.sender_enabled() && self.sender.job.is_none() && self.sender.flight.is_some();
+            let refill = self.sender_enabled() && self.sender.job.is_none();
             if refill && !batch.plan.is_empty() {
                 batch.compact().map_err(io::Error::other)?;
             }
@@ -3068,7 +3066,6 @@ impl Worker {
         };
         let mut clock = self.io_clock(now);
         let mut expired = false;
-        let mut grant_expired = false;
         if batch.len == 0 {
             return Ok(());
         }
@@ -3097,7 +3094,7 @@ impl Worker {
             return Ok(());
         }
         if self.sender_enabled()
-            && (self.sender.job.is_some() || self.sender.flight.is_none())
+            && self.sender.job.is_some()
             && !(self.sender.permitted
                 && self
                     .sender
@@ -3135,40 +3132,45 @@ impl Worker {
             self.clear_batch(session, lane, batch)?;
             return Ok(());
         }
-        let grant = if self.sender_enabled() {
-            if !self.sender.permitted
+        let claimed = self.sender_enabled();
+        if claimed
+            && (!self.sender.permitted
                 || self
                     .sender
                     .job
-                    .is_none_or(|job| job.session != session || job.lane != lane)
-            {
-                let keep = self.request_batch(session, lane, batch, deadline, limit)?;
-                if self.sender.job.is_none() && !keep {
+                    .is_none_or(|job| job.session != session || job.lane != lane))
+        {
+            let keep = self.request_batch(session, lane, batch, deadline, limit)?;
+            if self.sender.job.is_none() {
+                if !keep {
                     self.discard_batch(session, lane, batch);
                 }
                 return Ok(());
             }
-            Some(
-                self.sender
-                    .flight
-                    .as_ref()
-                    .and_then(|f| f.grant())
-                    .ok_or(io::ErrorKind::InvalidData)?,
-            )
-        } else {
-            None
-        };
-        let count = if grant.is_some() {
-            self.sender
-                .flight
-                .as_ref()
-                .ok_or(io::ErrorKind::InvalidData)?
-                .packets()
-                .len()
+            // Claim immediately before the syscall; a refused plan waits for its retry.
+            match self.claim_sender(now)? {
+                sender::Claimed::Ready => {
+                    // A retained plan overtaken by a later send is renumbered by the
+                    // permit path before submission, never sent with stale numbers.
+                    let first = self.sender.job.map_or(0, |job| job.first);
+                    let index = self.sender_index(session, lane)?;
+                    if first <= self.sender.lanes[index].history.highest_sent() {
+                        return Ok(());
+                    }
+                }
+                sender::Claimed::Waiting => return Ok(()),
+                sender::Claimed::Abandoned => {
+                    self.discard_batch(session, lane, batch);
+                    return Ok(());
+                }
+            }
+        }
+        let count = if claimed {
+            self.sender.flight.packets().len()
         } else {
             batch.plan.len()
         };
-        if grant.is_some() && !self.reserve_pieces(batch, count)? {
+        if claimed && !self.reserve_pieces(batch, count)? {
             self.finish_sender_send(0, None, true)?;
             self.yield_batch(session, lane, batch)?;
             return Ok(());
@@ -3210,15 +3212,14 @@ impl Worker {
                 .unwrap()
                 .send_batch_checked(&packets[..count], limit, || {
                     let at = clock()?;
-                    if at >= deadline || grant.is_some_and(|grant| !grant.valid_at(at)) {
+                    if at >= deadline {
                         expired = true;
-                        grant_expired = grant.is_some_and(|grant| !grant.valid_at(at));
                         return Err(io::ErrorKind::WouldBlock.into());
                     }
                     Ok(at)
                 })
         };
-        if grant.is_some() {
+        if claimed {
             let submitted = result.as_ref().ok().copied();
             self.finish_sender_send(
                 submitted.map_or(0, |(count, _)| count),
@@ -3230,15 +3231,15 @@ impl Worker {
             )?;
         }
         if expired {
-            if grant.is_some() {
-                self.rejected_sender_grant(session, lane, grant_expired);
+            if claimed {
+                self.rejected_sender_grant(session, lane, true);
                 self.discard_batch(session, lane, batch);
             }
             return Ok(());
         }
         match result {
             Ok((sent, _)) => {
-                self.submitted_batch(session, lane, batch, sent, grant.is_some() && sent == count)?
+                self.submitted_batch(session, lane, batch, sent, claimed && sent == count)?
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 let tx = &mut self.transmit[peer].paths[path].lanes[lane];
@@ -3553,7 +3554,11 @@ impl Worker {
     ) -> io::Result<()> {
         if self.sender_enabled() {
             self.request_probe(session, lane, length, true, None, now)?;
-            if self.sender.job.is_none() {
+            if !self
+                .sender
+                .job
+                .is_some_and(|job| matches!(job.kind, sender::JobKind::Probe { pmtu: true, .. }))
+            {
                 self.transmit[peer].paths[path].lanes[lane].mtu.defer(now);
             }
             return Ok(());
@@ -4328,6 +4333,13 @@ impl Worker {
         if let Some(at) = self.sender.feedback_deadline() {
             due = due.min(at);
         }
+        if let Some(at) = self.sender.retry {
+            due = due.min(at);
+        }
+        // Claimed credit is spent by the next sender service, never slept on.
+        if self.sender.permitted {
+            due = due.min(now);
+        }
         if let Some(feedback) = self.feedback_deadline() {
             due = due.min(feedback);
         }
@@ -4346,8 +4358,7 @@ impl Worker {
                     due = due.min(deadline.max(control.retry));
                 }
                 if control.state.connection().is_some()
-                    && (!self.sender_enabled()
-                        || (self.sender.job.is_none() && self.sender.flight.is_some()))
+                    && (!self.sender_enabled() || self.sender.job.is_none())
                 {
                     due = due.min(control.probe_due);
                 }

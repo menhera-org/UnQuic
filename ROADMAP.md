@@ -59,14 +59,18 @@ pacing clock per group, send records kept by each lane's owner, one report per
 ACK to the controller, and ACKs sent from the receive owner under a per-worker
 control ceiling.
 
-Its pure part is in. `src/pacing/budget.rs` holds the published state, the
-atomic inflight and pacing claims, per-send records and a controller-side
-sampler fed by one report per ACK. A randomized oracle compares it with the
-chronological sampler across one to four lanes, partial batches, late ACKs
-after loss, idle restarts and application-limited marks; 400 seeds pass in
-the suite and 20,000 longer seeds passed once by hand. The pinned draft-07
-delivery vectors replay identically through it. The runtime does not use it
-yet. No performance gate has passed.
+The runtime now uses it. `src/pacing/budget.rs` holds the published state,
+the atomic inflight and pacing claims, per-worker send records and the
+controller-side sampler. A randomized oracle compares that sampler with the
+chronological one across one to four lanes, partial batches, late ACKs after
+loss, idle restarts and application-limited marks, and the pinned draft-07
+delivery vectors replay identically through it. Grants, the shared sampling
+slab and ordered commits are gone. On the decision workload fourteen of
+sixteen 2G and 5G directions rise beyond production's range, by 16–129%
+([BENCH.md](BENCH.md#replacing-grants-with-a-shared-send-budget-november-9)).
+The busiest worker now saturates on ACK handling. The zero-delay loopback
+overload check regresses by about a fifth without saturating any core;
+explain that before item 2. No performance gate has passed.
 
 ### Next, in order
 
@@ -76,20 +80,20 @@ entry when it changes performance. Items 1 to 3 finish the
 [November 9 throughput audit](#november-9-throughput-audit) below, whose
 rules apply to all of them.
 
-1. **Replace the grant protocol in the runtime.** Workers claim inflight and
-   pacing from `pacing::Budget` immediately before each syscall and keep each
-   send's record in a sampling slab owned by the lane's worker. Lane owners
-   report one aggregate per ACK and one record per loss; the controller owner
-   publishes after each feedback pass. Grants, flights, the shared slab, ordered
-   commits and retirement reports go away. The roadmap's earlier split into
-   "charge atomically" and "move records into lane histories" cannot land as
-   two commits: without per-batch grants the ordered sampler has no epoch to
-   wait for. Keep PTO probe allowance, loss-check barriers, ProbeRTT and PMTU
-   provenance with their present meaning. Measure on the decision workload and
-   the loopback check against the current production build.
+1. **Replace the grant protocol in the runtime.** Done (see above). The
+   earlier split into "charge atomically" and "move records into lane
+   histories" could not land as two commits: without per-batch grants the
+   ordered sampler has no epoch to wait for.
 2. **Send ACKs from receive owners** on their own lanes, with the control
    ceiling scaled per worker by received bytes, so one worker no longer carries
-   every ACK packet and its fan-out. Measure the same way.
+   every ACK packet and its fan-out. Measure the same way. Two facts shape it.
+   Receive ownership is `(cookie + lane − 1) mod queues` while transmit
+   ownership is `(lane − 1) mod workers`, so an ACK sent from its receive
+   owner generally lands on a peer worker that must forward it. And each worker
+   has one report, so a lane's next ACK waits for worker zero's round trip;
+   while it waits, the peer's ACK transfer buffers stay held, which is where
+   the drops come from. A one-way ACK summary, or a small report pool, removes
+   that wait.
 3. **Size capacities** (audit step 5): per-session retention credit that busy
    workers can borrow, shared receive slots per worker, and the ACK-box pool,
    each sized from the delayed and lossy rows, with memory cost reported.
@@ -157,11 +161,9 @@ Its steps, in order:
    not, so the shared-owner protocol is the limit.
    [BENCH.md](BENCH.md#the-shared-owner-sender-is-the-throughput-limit-november-9)
 4. **Redesign the coordinator and amend the design.** The section 9
-   amendment is committed, and the equivalence oracle and draft-07 vector
-   replay pass. Runtime work remains: item 1 of "Next, in order" (atomic
-   inflight and pacing with lane-held send records and per-ACK reports) and
-   item 2 (ACKs from receive owners with the control ceiling scaled by
-   received bytes per worker).
+   amendment, its equivalence oracle and the runtime replacement are done and
+   measured. Remaining: item 2 of "Next, in order" (ACKs from receive owners
+   with the control ceiling scaled by received bytes per worker).
 5. **Size capacities for the path.** Not started; item 3 of "Next, in
    order". Only after steps 2 to 4: per-session retention credit that busy
    workers can borrow, shared receive slots per worker and the ACK-box pool,

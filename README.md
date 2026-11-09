@@ -256,13 +256,12 @@ The pure piece journal reserves mappings before I/O and keeps packet charges
 separate from payload lifetime. It retains mappings after loss for late ACKs;
 ACKs and bounded frame cleanup unlink mappings without scanning other histories.
 Workers reserve these mappings before sending DATA and settle only the successful
-prefix. They apply coverage changes before returning ACK or retirement reports
-to the sampler owner, preventing premature handle reuse.
+prefix. They apply coverage changes before returning a report's record handles,
+preventing premature handle reuse.
 The path-group PTO state provides shared backoff and the three-PTO
-stop/settlement transition. Indexed timers and aggregate probe grants now drive
-worker loss dispatch. Before PTO, the coordinator waits for issued sends to
-commit and for every worker to finish a bounded loss scan and receive its final
-report back. A third unanswered PTO also waits for forced loss settlement before
+stop/settlement transition. Indexed timers and per-round probe commands drive
+worker loss dispatch. Before PTO, the coordinator waits for every worker to
+finish a bounded loss scan and receive its final report back. A third unanswered PTO also waits for forced loss settlement before
 issuing probes. New ACK work waits behind these finite scans; already accepted
 ACK transactions finish first. Ordinary ACK admission also pauses until the
 accepted transactions and their resulting loss scans finish, so continuous ACK
@@ -278,7 +277,7 @@ canceled, expired and superseded flights are discarded before sending.
 Named groups share across endpoints. The default groups endpoints by local
 address, scope ID and binding device, ignoring names and UDP ports.
 Configure a shared group when different bindings use the same bottleneck.
-DATA and probes use the separate shared congestion and pacing grants.
+DATA and probes claim the separate shared congestion and pacing budget.
 
 `ack::History` separately tracks reservations and successful submissions in a
 fixed 65,536-number window. It validates every ACK range before applying any,
@@ -450,9 +449,9 @@ and stale connections return immediately. Send and expiry work release credits
 before the next sleep, without polling held credits every millisecond.
 
 Transmit DATA gathers rewritten headers and payload ranges from retained sources.
-When a grant sends its entire permitted prefix, the never-attempted suffix keeps
-its packet numbers, wire metadata and reservations in the same bounded batch.
-After the flight buffer returns, the worker compacts consumed metadata and adds
+When a claim sends its entire prefix, the never-attempted suffix keeps its
+packet numbers, wire metadata and reservations in the same bounded batch.
+After the send completes, the worker compacts consumed metadata and adds
 waiting frames under the existing turn and batch limits. Payloads stay in place;
 new datagrams follow the unchanged suffix, including its short final packet.
 Refill waits across packet-number gaps left by canceled probes or controls,
@@ -558,26 +557,48 @@ degraded and attempts replacement while retaining its active connection. After
 30 seconds it retires that connection and lowers carrier through the worker
 barrier. Recovery and per-lane path monitoring remain stage 3 work.
 
-The pure `pacing::Grants` ledger reserves shared path-group credit before
-handoff and retains it until a worker reports successful and unused bytes.
-A grant permits syscall starts for 100 microseconds; a call that returns later
-still reports its successful bytes. Expiry alone frees no credit. Probe grants
-share a two-datagram PTO allowance and may exceed the confirmed MTU for
-discovery, while obeying the aggregate burst cap. Discovery candidates also fit
-within the total congestion window; resizing never confirms a larger DATA MTU.
-Workers now request grants
-for DATA, PMTU and liveness probes from worker zero's per-group controller.
-Due liveness probes wait for a free flight buffer and rotate among sessions
-before fresh DATA. A busy flight preserves the deadline; history pressure
-retries after 1 ms without spinning. Successful submission starts the next
-one-second interval. PTO probes retain priority.
-Combined outstanding grants share the smaller of BBR's send quantum and
-64 maximum-size datagrams. The current controller caps that quantum at 64 KiB.
-ACK-only and PROBE_REPLY traffic retain their separate control ceiling.
+Each path group has one shared send budget, `pacing::Budget`. Worker zero owns
+the group's BBRv3 controller and, after each feedback pass, publishes its pacing
+rate, congestion window, send quantum and delivery state. Workers read the
+publication under a sequence check, without a lock. Immediately before each
+syscall a worker charges the plan's outer bytes to the group's atomic inflight
+counter, only if the sum stays within the published window, and claims pacing
+credit from the group's atomic next-send time. One claim covers at most the
+smaller of BBR's send quantum and 64 maximum-size datagrams; the controller caps
+the quantum at 64 KiB. Unsent bytes return after the syscall; pacing credit is
+not refunded. A refused claim keeps the prepared plan and retries at the pacing
+time, or after 50 microseconds while the window is full.
+
+PTO probes bypass the window but are paced and charged. A PTO round sends at
+most two probes, and feedback that ends the round voids its remaining probe
+commands. A probe command preempts an unclaimed DATA plan. PMTU probes must fit
+the published quantum and the whole window. A stalled zero window does not
+constrain discovery, and a probe that cannot fit lowers its candidate without
+confirming a larger DATA MTU. Due liveness probes wait for the current plan and
+rotate among sessions before fresh DATA; history pressure retries after 1 ms
+without spinning, and successful submission starts the next one-second
+interval. ACK-only and PROBE_REPLY traffic retain their separate control
+ceiling.
+
+Each successful transmission's delivery snapshot is a 64-byte record in its
+worker's `pacing::Records`, addressed by the handle its sent-history entry
+keeps; the same handle keys the worker's recovery journal. Every worker reserves
+65,535 records at startup. When a lane owner stages an ACK or loss report, it
+copies the records into the report, releases the inflight charge of each newly
+acknowledged or lost packet, and returns the handles of acknowledged ones. A lost
+packet's record stays for a late ACK until retirement, which frees handles
+without involving worker zero. Each syscall also sends worker zero a summary of
+its successful packets for the PTO timers, the MTU and window-use evidence.
+
+Worker zero applies one report per ACK: the newest acknowledged record and the
+newly delivered bytes give the draft-07 rate sample through `pacing::Sampler`,
+and each loss record gives a loss sample. A randomized oracle and the draft-07
+vectors show these samples equal the chronological sampler's. A send that races
+an idle restart or an ACK publication may read the preceding state.
 Controllers start from the runtime's monotonic clock, so host uptime does not
-make the first ACK trigger an expired ProbeRTT timer.
-Successful window use is retained across ACKs in a packet-timed round; unused
-grant reservations do not count. An application-limited idle restart clears that evidence.
+make the first ACK trigger an expired ProbeRTT timer. Successful window use is
+retained across ACKs in a packet-timed round; an application-limited idle
+restart clears that evidence.
 
 The pure `bbr::Delivery` sampler now follows draft-07's delivery-rate rules,
 with fixed vectors under `tests/vectors/bbr-07`. It counts newly acknowledged
@@ -591,55 +612,28 @@ An ACK containing only newly delivered PMTU probes cannot establish a bandwidth
 plateau or end Startup on that evidence. Mixed DATA/probe ACKs remain eligible;
 all probe bytes still count toward delivery, loss and congestion accounting.
 
-`pacing::Sender` combines the grant ledger with a shared bounded sampling slab
-and ordered completion processing. One reusable flight buffer per worker carries
-requests, permissions and successful prefixes. The coordinator waits for every
-issued grant report before committing sends in timestamp order, then accepts
-generation-qualified ACK, loss and retirement reports. Tests cover delayed and
-reversed completions, partial sends, metadata pressure and allocation-free reuse.
-TX owners now retain sent histories and route ACKs by the acknowledged lane,
+TX owners retain sent histories and route ACKs by the acknowledged lane,
 independently of the lane carrying the ACK. ACKs are validated before entering
 the TX owner's queue. Valid queued ACKs protect their covered packets while
 earlier finite loss passes finish; stale, future and known-unsent claims do not.
 Finishing a fully protected pass schedules continuation for waiting ACK work.
-Bounded ACK, loss and retirement
-reports use storage separate from send completions. Startup memory accounting
-includes these histories, the shared sampler and all reserved message buffers.
-The coordinator drains ready completions and feedback within one shared
-64-unit work budget. Workers hand off newly queued requests and completions
-before the end-of-turn notification flush. The coordinator also runs a bounded
-handoff of its newly produced ACK/loss reports before the shared owner's grant
-pass, avoiding an extra turn when the outgoing queue can accept them.
-Request priority advances after the first granted worker, so a full scan or
-another path group's later grant cannot repeatedly favor the same worker.
+Bounded ACK and loss reports use one reserved report per worker and return to it
+after worker zero applies them. Worker zero applies reports within a 64-entry
+work budget per turn. Startup memory accounting includes these histories, every
+worker's records and all reserved message buffers.
 
-If coordinator feedback overtakes prepared DATA or a probe, the worker refreshes
-its unsent packet numbers, history reservations and sampling identities under the
-same grant. Payload spans, byte limits and deadlines stay unchanged. Old numbers
-remain unsent; history pressure returns the unused grant and preserves the frame
-for retry. The syscall boundary still checks grant and frame deadlines.
-
-A rejected grant preserves the complete prepared packet plan, so temporary
-window or pacing pressure cannot permanently shrink subsequent batches.
-Blocked PMTU requests return their flight buffer so DATA can proceed. A PTO
-probe can preempt an ungranted ordinary request; it still uses the shared
-two-probe allowance. Pending probe commands survive connection replacement
-without resetting PTO backoff. After a long outage, carrier can return before
-backed-off probing restores DATA service.
+If local control traffic takes a waiting plan's packet numbers, the worker
+renumbers the unsent packets and their history reservations before the
+syscall. Payload spans, sizes and deadlines stay unchanged; history pressure
+discards the plan and preserves its frames for retry. A plan larger than the
+claimable credit sends its fitting prefix and keeps the rest reserved. Pending
+probe commands survive connection replacement without resetting PTO backoff.
+After a long outage, carrier can return before backed-off probing restores DATA
+service.
 
 Release forwarding, reconnect, allocation and routed-MTU regression tests pass.
-General application-limited detection remains unfinished. This integration
-does not establish the performance gates.
-
-Measurements show this shared-owner protocol caps throughput, so design section
-9 specifies a replacement without grants or ordered commits. Its primitives
-are in `pacing::Budget` and `pacing::Sampler`, not yet used by the runtime.
-Workers read published controller state under a sequence check, charge one
-atomic inflight counter within the window, claim pacing from one atomic clock,
-and record each send's delivery snapshot. The controller turns one report per
-ACK, carrying the newest acknowledged record, into a rate sample. A randomized
-oracle and the draft-07 vectors show those samples equal the chronological
-sampler's.
+General application-limited detection remains unfinished. The performance gates
+remain open; BENCH.md records the replacement sender's measurements.
 
 ## TAP read batching
 
@@ -817,7 +811,7 @@ measure application loss: a fully submitted frame may already have reached TAP.
 Worker-only recovery counters report cleanup budget exhaustion and maximum
 queue depth (`recovery_cleanup_yields` / `recovery_cleanup_peak`), reports
 dispatched to shared accounting and staging continuations
-(`recovery_staged_reports` / `recovery_staging_yields`), and granted DATA
+(`recovery_staged_reports` / `recovery_staging_yields`), and claimed DATA
 prefixes rejected for mapping capacity or changed coverage
 (`recovery_mapping_pressure` / `recovery_selection_changed`). The cleanup
 peak is a lifetime maximum, not a current queue gauge. Updates reuse existing
@@ -872,9 +866,10 @@ Configured (5) remains a public counter value but workers no longer emit it.
 TX lanes now report smoothed RTT and charged outer bytes in flight. Worker
 zero reports the sum of group pacing rates; each session reports its group's
 shared rate, so summing session rates can count a group more than once.
-`send_grants` counts received permissions; `expired_grants` counts permissions
-rejected at dispatch or the syscall boundary after expiry; `cancelled_grants`
-counts rejected plans, frame deadlines, paths or connection identities.
+`send_grants` counts successful claims of shared send credit; `expired_grants`
+counts plans whose frame deadline passed before or at the syscall;
+`cancelled_grants` counts claimed or waiting plans dropped for changed paths,
+connection identities or history pressure. The names predate the shared budget.
 `repairs` counts successfully submitted repair DATA records, including separate
 pieces of the same range. Feedback delay remains zero until its integration.
 Cumulative counts wrap modulo 2^64.
@@ -947,8 +942,8 @@ Small liveness probes remain separate and cannot confirm a DATA-sized path.
 Each timer pass visits at most 64 owned sockets before returning to ordinary
 work. Rotating scan order prevents a failing path from monopolising probes.
 Static worker slots allow nominally one padded probe per 3 ms across workers,
-at most 9000 bytes each. Padded probes use the shared congestion and pacing
-grants; replies use the separate path-group control ceiling.
+at most 9000 bytes each. Padded probes claim the shared congestion and pacing
+budget; replies use the separate path-group control ceiling.
 All steady-state discovery storage and packet data are bounded
 and allocated before workers start.
 

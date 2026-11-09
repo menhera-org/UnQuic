@@ -1327,34 +1327,59 @@ fn shared_probe_timeout_transitions_allocate_nothing() {
 }
 
 #[test]
-fn shared_transmission_grants_allocate_nothing_after_startup() {
-    use unquic::pacing::{Grants, Limits};
-    let mut grants = Grants::new(64).unwrap();
-    let limits = Limits {
-        window: 12800,
-        rate: 128_000_000,
-        quantum: 20480,
-        max_datagram: 1280,
-    };
+fn shared_send_budget_and_flights_allocate_nothing_after_startup() {
+    use unquic::pacing::{Budget, Claim, Flight, PacketId, Planned, Records, Sampler};
+    let budget = Budget::new();
+    let mut sampler = Sampler::default();
+    let mut records = Records::new(65_535).unwrap();
+    let mut flight = Flight::default();
+    let plan: Vec<_> = (1..=64)
+        .map(|number| Planned {
+            id: PacketId {
+                session: 0,
+                generation: 1,
+                lane: 1,
+                number,
+            },
+            bytes: 1280,
+        })
+        .collect();
     ALLOCATION_COUNT.set(Some(0));
     for step in 0..10000 {
         let now = Duration::from_millis(step);
-        grants.probe_allowance(2).unwrap();
-        let grant = grants
-            .reserve(step as usize % 64, 1280, true, limits, now)
+        budget.publish(&sampler.published(128_000_000, 12_800, 20_480));
+        let state = budget.published();
+        flight.prepare(&plan, &mut records).unwrap();
+        let bytes = flight
+            .truncate(state.quantum.min(state.window), &mut records)
             .unwrap();
-        grants.reported(grant, 0, None).unwrap();
-        let now = now + Duration::from_micros(10);
-        let grant = grants
-            .reserve(step as usize % 64, 1280, false, limits, now)
+        let prior = budget.charge(bytes, Some(state.window)).unwrap();
+        budget.pace(bytes, state.rate, now).unwrap();
+        flight
+            .set_claim(Claim {
+                group: 0,
+                prior,
+                bytes,
+                at: now,
+                state,
+            })
             .unwrap();
-        grants.reported(grant, 100, Some(now)).unwrap();
-        grants.settled(100).unwrap();
-        grants.probe_allowance(0).unwrap();
+        // One packet succeeds; the rest of the claim returns.
+        flight.complete(1, Some(now), false).unwrap();
+        let handle = flight.handle(0).unwrap();
+        let record = budget.begin(&state, prior, 1, now).push(1280, false, false);
+        assert!(records.set(handle, record));
+        flight.release(&mut records);
+        budget.release(bytes - 1280);
+        // Its ACK returns the record and the remaining charge.
+        let record = records.get(handle).unwrap();
+        assert!(records.release(handle));
+        budget.release(1280);
+        sampler.ack(now, 1280, &record, false, false, Duration::ZERO);
     }
     let count = ALLOCATION_COUNT.replace(None);
     assert_eq!(count, Some(0));
-    assert_eq!((grants.reserved(), grants.in_flight()), (0, 0));
+    assert_eq!((budget.in_flight(), records.available()), (0, 65_535));
 }
 
 #[test]

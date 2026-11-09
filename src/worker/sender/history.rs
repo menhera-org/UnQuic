@@ -182,6 +182,7 @@ impl Lane {
                     number: ack.packet.number,
                     sample: ack.packet.sample_slot,
                     settled: ack.was_in_flight && ack.packet.eliciting,
+                    ..Entry::default()
                 };
                 report.count += 1;
             });
@@ -251,6 +252,7 @@ impl Lane {
                         number: packet.number,
                         sample: packet.sample_slot,
                         settled: packet.eliciting,
+                        ..Entry::default()
                     };
                     report.count += 1;
                 }
@@ -299,6 +301,7 @@ impl Lane {
                     number: entry.number,
                     sample: entry.sample_slot,
                     settled: false,
+                    ..Entry::default()
                 };
                 report.count += 1;
             }

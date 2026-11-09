@@ -1056,40 +1056,21 @@ mod tests {
     }
 
     #[test]
-    fn grant_expiring_between_gso_failure_and_plain_retry_prevents_submission() {
-        use crate::pacing::{Grants, Limits};
+    fn deadline_passing_between_gso_failure_and_plain_retry_prevents_submission() {
         let rx = receiver();
         let tx = TransmitSocket::connect(&rx, rx.local_addr()).unwrap();
         set_int(&tx.socket, libc::IPPROTO_UDP, libc::UDP_NO_CHECK6_TX, 1).unwrap();
         set_int(&rx.socket, libc::IPPROTO_UDP, libc::UDP_NO_CHECK6_RX, 1).unwrap();
-        let mut grants = Grants::new(1).unwrap();
-        let grant = grants
-            .reserve(
-                0,
-                2560,
-                false,
-                Limits {
-                    window: 12800,
-                    rate: 1_000_000,
-                    quantum: 2560,
-                    max_datagram: 1280,
-                },
-                Duration::ZERO,
-            )
-            .unwrap();
+        let deadline = Duration::from_micros(100);
         let outgoing = [SendDatagram {
             parts: &[&[7; BASE_UDP_PAYLOAD]],
         }; 2];
         let mut calls = 0;
         let error = tx
             .send_batch_checked(&outgoing, BASE_UDP_PAYLOAD, || {
-                let at = if calls == 0 {
-                    Duration::ZERO
-                } else {
-                    grant.expires()
-                };
+                let at = if calls == 0 { Duration::ZERO } else { deadline };
                 calls += 1;
-                if grant.valid_at(at) {
+                if at < deadline {
                     Ok(at)
                 } else {
                     Err(io::ErrorKind::WouldBlock.into())
@@ -1103,9 +1084,6 @@ mod tests {
             rx.recv(&mut [0; BASE_UDP_PAYLOAD]).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
-        assert_eq!(grants.reserved(), 2560);
-        grants.reported(grant, 0, None).unwrap();
-        assert_eq!((grants.reserved(), grants.in_flight()), (0, 0));
     }
 
     #[test]

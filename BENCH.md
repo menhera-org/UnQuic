@@ -1,5 +1,11 @@
 # Release transport overload investigation
 
+Later on November 9 the sender's per-batch grants and ordered commits were
+replaced by a shared atomic send budget (design section 9). On the decision
+workload it lifts fourteen of sixteen 2G and 5G directions beyond production's
+range, to 1.28–1.76 Gbit/s per direction at 16 flows. The busiest worker now saturates on
+ACK handling, which is the next limit. No gate has passed.
+
 On November 9 a fixed decision workload (routed 4.5 ms RTT, bridged
 individual QinQ frames, four workers) replaced one-sweep comparisons. A
 diagnostics-only sender trace traced light-load collapses and most 2G expiry
@@ -120,6 +126,68 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## Replacing grants with a shared send budget (November 9)
+
+Design section 9's replacement sender is now the runtime's. Workers claim
+inflight and pacing credit from their group's atomic budget immediately before
+each syscall and keep each send's delivery snapshot in a per-worker record slab.
+Lane owners settle ACKs and losses locally and send worker zero one report per
+ACK chunk. Worker zero applies reports and publishes limits; it no longer issues
+grants or commits sends in order.
+
+Stated before measuring: if grants and ordered commits were the limit, 2G and
+5G delivery should rise toward the no-coordinator diagnostic below. Confirmation
+needs gains beyond production's min–max range in most 2G and 5G directions,
+with 0.5G staying at or under about 1% missing. If nothing moves beyond that
+range, the replacement does not remove the limit. If the busiest worker then
+saturates while ACK-buffer drops grow, the ACK hub is next: every ACK still
+leaves one worker on lane 1 and reaches one peer worker.
+
+[Three interleaved repeats](benches/tap-shared-budget.json) against unchanged
+production `f7db9dc`, delivered Gbit/s L→R / R→L (medians):
+
+| Flows, loss | Offered | Production | Shared budget |
+| --- | --- | --- | --- |
+| 16, 0% | 0.5G | 0.493 / 0.493 | 0.493 / 0.492 |
+| 16, 0% | 2G | 1.191 / 1.031 | 1.446 / 1.575 |
+| 16, 0% | 5G | 0.969 / 1.151 | 1.755 / 1.463 |
+| 16, 0.1% | 0.5G | 0.487 / 0.485 | 0.491 / 0.492 |
+| 16, 0.1% | 2G | 0.907 / 0.884 | 1.465 / 1.403 |
+| 16, 0.1% | 5G | 0.767 / 0.945 | 1.754 / 1.276 |
+| 4, 0% | 0.5G | 0.490 / 0.492 | 0.493 / 0.492 |
+| 4, 0% | 2G | 0.942 / 1.273 | 0.898 / 1.482 |
+| 4, 0% | 5G | 0.568 / 1.304 | 0.582 / 1.862 |
+| 4, 0.1% | 0.5G | 0.484 / 0.487 | 0.492 / 0.491 |
+| 4, 0.1% | 2G | 0.700 / 1.002 | 0.888 / 1.481 |
+| 4, 0.1% | 5G | 0.482 / 1.058 | 0.565 / 1.761 |
+
+Fourteen of the sixteen 2G and 5G directions rise beyond production's whole
+min–max range, by 16–129%. The two that do not are four-flow L→R at 2G and 5G,
+whose ranges overlap production's. At 0.5G with 0.1% loss, median missing
+falls from 1.6–2.2% to 0.64–0.75%; without loss both builds stay near 0.5%.
+The hypothesis is confirmed, and the replacement is adopted.
+
+The next limit shows in the same runs. The busiest worker on each daemon now
+sits at 94–98% of a core at 2G and 5G, against 68–96% for production, and
+daemon CPU rises with the delivered rate. Incoming ACK-buffer drops grow from
+1–45 thousand per run to 25–103 thousand: the peer worker that receives every
+ACK packet runs out of transfer buffers while lane owners wait on worker zero's
+report round trip. Roadmap item 2, ACKs from receive owners, and the ACK-box
+pool of audit step 5 address this.
+
+The zero-delay loopback overload check regresses. In
+[two interleaved repeats](benches/tap-shared-budget-loopback.json) at 21 Gbit/s
+requested each way, production delivers 2.50–2.81 / 1.91–1.96 Gbit/s and the
+shared budget 1.97–2.42 / 1.46–1.48. Its busiest thread reaches only 55–59%
+of a core, so CPU does not explain the loss. Audit step 1 keeps this check as
+an overload signal, not an adoption basis, so the decision above stands, but
+the regression is unexplained. Candidates to test first: eight workers
+contending for one pacing clock that never banks credit, the 50 µs retry while
+the window is full, and the single report per worker.
+
+Kernel suites: all 100 ignored tests pass on Linux 6.8 and 7.0, along with the
+ordinary release-musl suite and strict Clippy.
 
 ## The shared-owner sender is the throughput limit (November 9)
 

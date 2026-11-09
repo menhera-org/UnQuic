@@ -248,6 +248,11 @@ impl Timers {
         Ok(())
     }
 
+    /// Outstanding eliciting transmissions on one installed lane.
+    pub(super) fn outstanding(&self, session: usize, lane: u16, generation: u64) -> Option<u32> {
+        Some(self.lanes[self.index(session, lane, generation)?].outstanding)
+    }
+
     /// Count only first settlements of outstanding eliciting transmissions.
     pub(super) fn settled(
         &mut self,

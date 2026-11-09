@@ -44,10 +44,10 @@ fn pinned_draft_07_delivery_vectors() {
                     let (at, bytes) = (ns(n(1)), n(2).try_into().unwrap());
                     packets.push(delivery.sent(at, bytes, n(3), flag(4)).unwrap());
                     let state = budget.published();
-                    records.push((
-                        budget.record(&state, n(3), bytes, at, false, flag(4)),
-                        false,
-                    ));
+                    let record = budget
+                        .begin(&state, n(3), 1, at)
+                        .push(bytes, false, flag(4));
+                    records.push((record, false));
                 }
                 "M" => {
                     delivery.application_limited(n(1)).unwrap();
@@ -76,8 +76,8 @@ fn pinned_draft_07_delivery_vectors() {
                                 let (record, settled) = &mut records[index];
                                 *settled = true;
                                 newly += u64::from(record.bytes);
-                                let key = (record.sent_at, record.order);
-                                if newest.is_none_or(|old| key > (old.sent_at, old.order)) {
+                                let key = (record.sent_ns, record.order);
+                                if newest.is_none_or(|old| key > (old.sent_ns, old.order)) {
                                     newest = Some(*record);
                                 }
                             }
@@ -363,46 +363,48 @@ fn loss_snapshots_preserve_physical_bytes_and_send_time_counters() {
 }
 
 #[test]
-fn controller_limits_feed_shared_grants_after_partial_submission_and_late_ack() {
+fn controller_limits_feed_the_shared_budget_after_partial_submission_and_late_ack() {
     use unquic::bbr::Controller;
-    use unquic::pacing::Grants;
     let mut c = Controller::new(1280, Some(Duration::from_millis(1)), ns(0), 1).unwrap();
-    let mut d = Delivery::new();
-    let mut g = Grants::new(2).unwrap();
-    let grant = g.reserve(0, 2560, false, c.limits(), ns(0)).unwrap();
-    // Only the first datagram is submitted; unsent bytes earn no sampler identity.
-    g.reported(grant, 1280, Some(ns(0))).unwrap();
-    let mut original = d.sent(ns(0), 1280, 0, false).unwrap();
-    assert_eq!(g.in_flight(), 1280);
-    c.enter_recovery(ns(1_000_000), g.in_flight(), false)
+    let budget = Budget::new();
+    let mut sampler = Sampler::default();
+    let publish = |c: &Controller, sampler: &Sampler| {
+        let limits = c.limits();
+        budget.publish(&sampler.published(limits.rate, limits.window, u64::from(limits.quantum)));
+        budget.published()
+    };
+    let state = publish(&c, &sampler);
+    let prior = budget.charge(2560, Some(state.window)).unwrap();
+    budget.pace(2560, state.rate, ns(0)).unwrap();
+    // Only the first datagram is submitted; the unsent one returns its charge.
+    budget.release(1280);
+    let original = budget
+        .begin(&state, prior, 1, ns(0))
+        .push(1280, false, false);
+    assert_eq!(budget.in_flight(), 1280);
+    c.enter_recovery(ns(1_000_000), budget.in_flight(), false)
         .unwrap();
-    c.on_loss(
-        d.declared_lost(&mut original).unwrap().unwrap(),
-        ns(1_000_000),
-    )
-    .unwrap();
-    g.settled(1280).unwrap();
-    let grant = g
-        .reserve(1, 1280, false, c.limits(), ns(1_000_000))
-        .unwrap();
-    g.reported(grant, 1280, Some(ns(1_000_000))).unwrap();
-    let mut repair = d.sent(ns(1_000_000), 1280, 0, false).unwrap();
-    d.begin_ack(ns(2_000_000), false).unwrap();
-    d.acknowledged(&mut original).unwrap();
-    d.acknowledged(&mut repair).unwrap();
-    let sample = d.finish_ack(ns(1_000_000)).unwrap().unwrap();
+    c.on_loss(sampler.lost(&original), ns(1_000_000)).unwrap();
+    budget.release(1280);
+    let state = publish(&c, &sampler);
+    let prior = budget.charge(1280, Some(state.window)).unwrap();
+    let repair = budget
+        .begin(&state, prior, 1, ns(1_000_000))
+        .push(1280, false, false);
+    // One ACK covers the late original and the repair; only the repair is still charged.
+    budget.release(1280);
+    let sample = sampler.ack(ns(2_000_000), 2560, &repair, false, false, ns(1_000_000));
     assert_eq!(sample.newly_acked, 2560);
-    g.settled(1280).unwrap(); // The lost original was settled once, at loss.
     c.recovery_finished(ns(2_000_000), false).unwrap();
     c.on_ack(
         sample,
         Some(ns(1_000_000)),
-        g.in_flight(),
+        budget.in_flight(),
         false,
         ns(2_000_000),
     )
     .unwrap();
-    assert_eq!(g.in_flight(), 0);
+    assert_eq!(budget.in_flight(), 0);
     assert_eq!(c.limits().window, 15360);
     assert_eq!(c.limits().rate, 35_456_000); // Startup pacing never decreases.
 }

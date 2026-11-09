@@ -278,16 +278,17 @@ would reveal the tail's fate, so a PTO probe must always fit.
 Each history entry carries a two-byte sampling handle without growing its
 16-byte storage. ACK application takes that handle into its retained report;
 loss copies it, and explicit retirement takes it for reclamation. A live-handle
-count blocks implicit floor advancement and reset. Before reuse, the controller
-owner must consume the corresponding report; an ACKed entry cannot later return
-the same handle through retirement. Unsent slots remain owned by the grant.
+count blocks implicit floor advancement and reset. A handle returns to the
+worker's records only after its report has copied the record; an ACKed entry
+cannot later return the same handle through retirement. Unsent handles remain
+owned by the worker's current plan.
 
 Retain frame coverage in stable, preallocated slots alongside the worker's
-payload views. Index the packet-to-frame journal by the granted sampling handle,
-not the reusable sent-history ring index. Reserve a whole granted prefix's
-mappings before I/O, and clear unsuccessful mappings before returning unused
-grants. For ACK and explicit retirement, finish worker-local mapping updates
-before forwarding the report that permits the controller to recycle its handles.
+payload views. Index the packet-to-frame journal by the worker's record handle,
+not the reusable sent-history ring index. Reserve a whole claimed prefix's
+mappings before I/O, and clear unsuccessful mappings before releasing an unsent
+plan's handles. For ACK and explicit retirement, finish worker-local mapping
+updates before returning their handles to the worker's records.
 Loss keeps mappings for a late original ACK. Frame expiry removes payload
 mappings without settling the independent packet congestion charge.
 
@@ -305,17 +306,15 @@ fragmentation pattern. Pressure delays fresh work while ready repairs retain
 service; all work still obeys the original frame deadline and pacing limits.
 When both fresh and repair queues have work, alternate bounded batches. Stop
 refilling a nonempty batch while the opposite class waits, preserving its live
-plan, partial-frame suffix and grant identity until it drains.
+plan, partial-frame suffix and claim until it drains.
 Charge coverage, journal heads, mappings and queues to the existing transport
 memory ceiling. Refuse oversized configurations rather than silently changing
 their requested lane counts, quotas or memory limit.
 
-Keep the sampling slab on the controller owner, with at most 65,535 slots for
-the daemon. Store transmission identity with each slot and check session
-generation, lane and packet number on feedback. A two-byte handle alone cannot
-distinguish a stale report from a reused slot. Separate reserved send-report
-buffers from feedback buffers so frozen ACK work cannot prevent an outstanding
-grant from reporting. Return an incoming ACK's transfer buffer after validated
+Each worker keeps its own 65,535 send records; a handle means nothing outside
+that worker, so a report carries copies of the records the controller needs and
+names the session generation and lane they belong to. Keep the reserved report
+separate from feedback buffers. Return an incoming ACK's transfer buffer after validated
 ranges enter fixed history storage; retain its timing and completion fence until
 the final coordinator report returns. Preserve worker report order within each path group.
 Quiescence must drain reservations, pending ACK work, reports and old sampling
@@ -397,9 +396,9 @@ Charge outer IP bytes, including IPv6 and UDP headers, for each successful physi
 
 The controller owner serializes send/ACK/loss reports from lane owners and issues byte grants covering both pacing and inflight limits. Reserve inflight credit before granting it. Grants expire for future sends after 100 microseconds, but reserved credit is not reusable until the worker reports sent and unused bytes; expiry alone must not double-spend it. Check grant validity with a fresh timestamp immediately before each nonblocking syscall. A call that starts within its grant interval can return after expiry; still account for every successful physical transmission, retaining the pre-syscall timestamp for its successful prefix in sent history and delivery sampling. A timestamp taken after the call returns can be later than that packet's ACK if the sending thread was descheduled. The socket API checks permission and captures time after message construction and again before a retry without GSO; a failed first attempt cannot lend its timestamp or permission to the retry. Failed/partially successful `sendmmsg` submissions return only unsent credit, and each successful GSO segment is a separate transmission. Bounded report queues must retain accounting events: a full queue stops further grants/sends until reports drain, rather than dropping inflight updates.
 
-For the first shared-owner implementation, collect a bounded batch of grants before applying ACK/loss feedback. Close issuance on the first sent/unused completion, including a completion with no successful packets. Before that point, reserved bytes equal cumulative issued bytes, so the grant ledger's burst cap bounds the entire batch. Allocate one movable completion buffer per worker across the daemon. Each successful socket prefix has one timestamp; sort at most 64 run descriptors and budget the physical transmissions committed from them. Close issuance when feedback waits or cumulative issued bytes reach the burst cap; replenishing reported grants must not extend a batch indefinitely. Await every issued grant's sent/unused report, even after expiry. Commit successful physical sends in order of pre-syscall timestamp, grant ID and datagram ordinal, assigning shared sampling IDs in that order. Start from the batch's opening inflight count and add each successful transmission; never use the final batch total for every packet. Shared delivered/lost counters remain frozen until those sends are committed. Then apply a bounded feedback pass before issuing another batch. Run a bounded handoff of the coordinator's own newly produced ACK/loss reports before this pass, preserving outgoing FIFO order, so available feedback need not wait an extra turn. Preserve each ACK's accumulator across processing turns. Use fresh owner-processing time when advancing the shared delivered counter, and retain original receive time separately for RTT estimation. Host/report-queue delay does not itself satisfy the draft's application-limited predicates. Bound all retained reports and stop grants when that storage fills. Measure this batching cost before accepting the performance gates.
+The first shared-owner implementation issued per-batch grants from the controller owner, awaited every grant's report, and committed sends in timestamp order before applying feedback. The replacement below supersedes it; git history and BENCH.md keep its description and measurements.
 
-**Replacement sender (November 9 amendment; specified, not yet implemented).** The batching cost has been measured: one quantum per owner round trip and an ordered commit that waits for the slowest worker cap delivery far below the gates, while a diagnostic build without the shared sender recovers most of the pre-integration rate (BENCH.md). The replacement keeps one congestion budget per path group, accounting for every successful transmission including partial sends, exact send-time delivery sampling, and each packet's send before its ACK. It removes per-batch grants, the shared sampling slab and ordered commits:
+**Replacement sender (November 9 amendment; implemented).** The batching cost has been measured: one quantum per owner round trip and an ordered commit that waits for the slowest worker cap delivery far below the gates, while a diagnostic build without the shared sender recovers most of the pre-integration rate (BENCH.md). The replacement keeps one congestion budget per path group, accounting for every successful transmission including partial sends, exact send-time delivery sampling, and each packet's send before its ACK. It removes per-batch grants, the shared sampling slab and ordered commits:
 
 - The controller owner remains BBR's only writer. After each bounded feedback pass it publishes, per group, the pacing rate, congestion window, send quantum, PTO probe allowance and a delivery snapshot: delivered bytes, delivered time, first-send time and the application-limited marker. Workers read the publication with a sequence check and no lock; a torn read retries.
 - Inflight is one atomic counter per group. Immediately before a nonblocking syscall a worker adds its prepared bytes, but only if the sum stays within the published window; PTO probes may exceed it as today, still charged. It also claims pacing credit from the group's atomic next-send time, at most one quantum and 64 maximum datagrams per claim. After the syscall it removes unsent bytes from inflight. Unused pacing credit is not refunded.
@@ -409,7 +408,9 @@ For the first shared-owner implementation, collect a bounded batch of grants bef
 
 Before any rate sweep, show equivalence with the ordered sampler: extend the 4,374-case chronological oracle and the draft-07 vectors to concurrent workers, including partial sends, reordered reports and losses.
 
-When a grant submits its entire permitted prefix, retain the prepared but never-attempted suffix with its original packet numbers, payload spans and reservations. Keep payload source slots stable until that suffix is consumed or discarded. After the flight buffer returns and no request or grant owns the plan, compact consumed metadata and append waiting frames within the existing frame, datagram, byte and turn budgets. Preserve every retained packet's bytes and length; append new datagrams rather than extending its final packet. Defer refill across allocator gaps so each request retains consecutive packet identities. A partial or failed socket attempt discards the remaining plan and retries unsent frame ranges with fresh numbers. Expiry, PMTU shrink and connection retirement cancel every reservation belonging to a discarded plan. Control packets that overtake a retained plan require fresh identities before DATA submission; canceled numbers are never reused.
+The implementation differs from the outline above in these details. Records are 64 bytes in a per-worker slab of 65,535, addressed by the handle each sent-history entry keeps; that handle also keys the worker's recovery journal. Each worker has one bounded report, returned after the controller applies it. A PTO round's allowance travels with its probe command, and workers drop commands from a round older than the published one. Each successful syscall also sends the controller owner a summary of its packets for the PTO timers, MTU and window-use evidence. A probe takes the place of an unclaimed DATA plan, which keeps its reservations. A claim refused by a full window retries after 50 µs.
+
+When a claim submits its entire prefix, retain the prepared but never-attempted suffix with its original packet numbers, payload spans and reservations. Keep payload source slots stable until that suffix is consumed or discarded. After the send completes and no job owns the plan, compact consumed metadata and append waiting frames within the existing frame, datagram, byte and turn budgets. Preserve every retained packet's bytes and length; append new datagrams rather than extending its final packet. Defer refill across allocator gaps so each request retains consecutive packet identities. A partial or failed socket attempt discards the remaining plan and retries unsent frame ranges with fresh numbers. Expiry, PMTU shrink and connection retirement cancel every reservation belonging to a discarded plan. Control packets that overtake a retained plan require fresh identities before DATA submission; canceled numbers are never reused.
 
 Initially pace in userspace using monotonic deadlines and `timerfd`, without requiring an `fq` qdisc or host networking changes. Workers send only with current grants. Cap the combined outstanding burst allowance at the smaller of BBR's send quantum and 64 maximum-size datagrams, spread across workers; GSO aggregates obey that limit too. Under the replacement sender this cap applies to each pacing claim instead; claims from several workers overlap only as far as the shared pacing clock allows. Timestamp at successful nonblocking socket submission and bound queued socket work. This is a testable baseline; kernel pacing remains a measured optimization. [S11]
 
@@ -707,23 +708,20 @@ attempt, including GSO fallback. Handshake/liveness timers and PMTU proofs
 use pre-send time; receive buffers retain post-receive time across GRO expansion
 and handoff. Delayed control sends start their service at submission rather
 than accumulating credit from an earlier worker turn. Incoming ACKs now route
-to TX histories; DATA and probes use the shared grant coordinator and BBR
-controller. Release forwarding, reconnect, allocation and routed-MTU regression
-tests pass. Before PTO, the runtime waits for issued-send commits and each
+to TX histories. DATA and probes claim the group's shared send budget, which the
+BBR controller's owner publishes. Release forwarding, reconnect, allocation and
+routed-MTU regression tests pass. Before PTO, the runtime waits for each
 worker's bounded loss scan, including the final report return. Third-expiry
 forced settlement completes before probes. Accepted ACK transactions finish
 first; new ACKs wait behind the finite scan. Per-destination FIFO ordering
 preserves these barriers when handoff queues fill.
-The shared accounting coordinator now reserves sampling handles before grants,
-orders complete send reports and validates generation-qualified feedback. Its
-fixed storage includes one flight buffer per worker and at most 65,535 shared
-sampling records. Pressure retirement can run with no free sampling slot.
-The controller has fixed cycle vectors, model/loss/recovery boundary tests and
-allocation checks; tests/vectors/bbr-07/README.md records draft interpretations.
-Bounded grant batches and shared controller ownership are connected.
-Measurements show this shared-owner protocol caps throughput; section 9 now
-specifies its replacement, whose pure state and equivalence oracle exist but
-are not yet used by the runtime.
+Section 9's replacement sender replaced per-batch grants and ordered commits
+after measurements showed they capped throughput. Each worker keeps 65,535
+send records; reports carry the records the controller needs, and a randomized
+oracle and the draft-07 vectors check its samples against the chronological
+sampler. The controller has fixed cycle vectors, model/loss/recovery boundary
+tests and allocation checks; tests/vectors/bbr-07/README.md records draft
+interpretations.
 Worker-local payload retention, packet-to-frame mappings and two-generation
 selective repair are connected. ACK/retirement coverage work and frame cleanup
 are bounded independently of congestion-charge settlement. General

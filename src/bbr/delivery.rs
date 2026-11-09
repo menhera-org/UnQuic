@@ -153,11 +153,6 @@ impl Delivery {
         u64::MAX - self.next_id
     }
 
-    #[cfg(test)]
-    pub(crate) fn limit_packets_for_test(&mut self, remaining: u64) {
-        self.next_id = u64::MAX - remaining;
-    }
-
     /// Total newly acknowledged outer bytes, including acknowledged repairs.
     pub const fn delivered(&self) -> u64 {
         self.delivered

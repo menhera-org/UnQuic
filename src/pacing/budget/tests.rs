@@ -81,6 +81,34 @@ fn concurrent_claims_never_exceed_the_window_or_share_a_pacing_slot() {
 }
 
 #[test]
+fn a_send_record_fills_one_cache_line() {
+    assert_eq!(size_of::<SendRecord>(), 64);
+}
+
+#[test]
+fn records_reuse_handles_and_reject_free_or_unknown_ones() {
+    assert!(Records::new(0).is_err() && Records::new(65_536).is_err());
+    let mut records = Records::new(2).unwrap();
+    let (a, b) = (records.take().unwrap(), records.take().unwrap());
+    assert_eq!((a.get(), b.get(), records.available()), (1, 2, 0));
+    assert_eq!(records.take(), None);
+    let record = SendRecord {
+        bytes: 1280,
+        ..SendRecord::default()
+    };
+    assert!(records.set(b, record));
+    assert_eq!(records.get(b), Some(record));
+    assert!(records.release(a) && !records.release(a), "double release");
+    assert_eq!((records.get(a), records.set(a, record)), (None, false));
+    let unknown = NonZeroU16::new(3).unwrap();
+    assert!(!records.release(unknown) && records.get(unknown).is_none());
+    assert_eq!(records.take(), Some(a));
+    assert_eq!(records.get(a), Some(SendRecord::default()), "reuse clears");
+    let full = Records::new(65_535).unwrap();
+    assert_eq!(full.available(), 65_535);
+}
+
+#[test]
 fn charges_respect_the_window_and_pacing_starts_at_the_claim() {
     let budget = Budget::new();
     assert_eq!(budget.charge(1000, Some(1500)), Some(0));
@@ -135,11 +163,12 @@ fn compare(seed: u64, workers: usize, steps: usize) {
                 let total: u64 = sizes.iter().map(|&b| u64::from(b)).sum();
                 let state = budget.published();
                 let mut prior = budget.charge(total, None).unwrap();
+                let mut batch = budget.begin(&state, prior, count as u64, now);
                 for bytes in sizes {
                     let (pmtu, host) = (next(8) == 0, next(8) == 0);
                     let mut packet = reference.sent(now, bytes, prior, host).unwrap();
                     packet.pmtu = pmtu;
-                    let record = budget.record(&state, prior, bytes, now, pmtu, host);
+                    let record = batch.push(bytes, pmtu, host);
                     packets.push(Packet {
                         lane,
                         record,
@@ -170,8 +199,8 @@ fn compare(seed: u64, workers: usize, steps: usize) {
                     if !packet.lost {
                         budget.release(u64::from(packet.record.bytes));
                     }
-                    let key = (packet.record.sent_at, packet.record.order);
-                    if newest.is_none_or(|old| key > (old.sent_at, old.order)) {
+                    let key = (packet.record.sent_ns, packet.record.order);
+                    if newest.is_none_or(|old| key > (old.sent_ns, old.order)) {
                         newest = Some(packet.record);
                     }
                 }
