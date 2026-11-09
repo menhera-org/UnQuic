@@ -72,9 +72,9 @@ yet. No performance gate has passed.
 
 Stages 2 through 5 close only when their gates pass. Work through this list;
 each item is one commit with its tests, both kernel suites, and a BENCH.md
-entry when it changes performance. Items 1 to 3 finish the November 9
-throughput audit: its steps 1 to 3, the section 9 amendment and the
-equivalence oracle are done.
+entry when it changes performance. Items 1 to 3 finish the
+[November 9 throughput audit](#november-9-throughput-audit) below, whose
+rules apply to all of them.
 
 1. **Replace the grant protocol in the runtime.** Workers claim inflight and
    pacing from `pacing::Budget` immediately before each syscall and keep each
@@ -109,6 +109,65 @@ equivalence oracle are done.
 If evidence shows a gate cannot be reached within the current design, write
 that conclusion with its evidence in BENCH.md and here instead of trying more
 small changes.
+
+## November 9 throughput audit
+
+The audit starts from these facts. The last build before the shared sender
+delivered 7.76 / 16.70 Gbit/s on the loopback QinQ check. Connecting the
+sender, ACKs and recovery cut that to about 2 Gbit/s, and the routed 4.5 ms
+path delivered 0.5–0.9 Gbit/s per direction against gates of 20 Gbit/s
+locally and 5 Gbit/s over a lossy 4.5–7.5 ms path. About two dozen
+single-change candidates had each been judged by one sweep, which cannot
+separate 10–30% effects from run-to-run variation.
+
+Rules it adds to "Rules for every change":
+
+- Do not start another one-constant candidate until steps 1 and 2 are done.
+- The shared sender's contract is provisional and may change with evidence:
+  one coordinator on worker 0, epoch batching with ordered commits, the
+  aggregate burst cap of min(quantum, 64 datagrams), the 4 MiB/s control
+  ceiling, the `8192 / workers` retention split and four ACK boxes per worker.
+  Any replacement must keep one congestion budget per path group, account for
+  every transmitted byte including partial sends, sample delivery rate
+  exactly, and keep each packet's send before its ACK.
+- For every step, write in BENCH.md the hypothesis, the result that would
+  confirm or refute it (written before running), the median and range over
+  the repeats, and the decision. Keep rejected patches in `benches/`.
+- Update this checkpoint and README's status after each step.
+- If evidence shows a gate is unreachable within the current design, stop and
+  write that conclusion with its evidence instead of trying small changes.
+
+Its steps, in order:
+
+1. **Make measurements able to decide.** Done. The decision workload is the
+   routed 4.5 ms path with bridged individual QinQ frames, four workers, 4 and
+   16 flows, 0.5/2/5 Gbit/s and 0%/0.1% loss; 44-segment GSO stays an
+   overload check only. Five production repeats measured the noise, and the
+   generator's timer slack was found and removed.
+   [BENCH.md](BENCH.md#decision-workload-and-its-noise-november-9)
+2. **Explain light-load expiry with a trace.** Done. The `trace` feature
+   attributes each never-submitted frame's lifetime. Verdicts: one stalled
+   lane while others had credit, confirmed; dropped ACK records mattered by
+   stranding sent history, not through a congestion response; ProbeRTT,
+   Drain, burst refusal and closed issuance were rejected at under 5% each.
+   The fix and its regression tests are in.
+   [BENCH.md](BENCH.md#light-load-expiry-traced-to-a-stalled-lane-november-9)
+3. **Measure the coordination ceiling.** Done. The no-coordinator diagnostic
+   recovers most of the pre-integration rate and the controller bypass does
+   not, so the shared-owner protocol is the limit.
+   [BENCH.md](BENCH.md#the-shared-owner-sender-is-the-throughput-limit-november-9)
+4. **Redesign the coordinator and amend the design.** The section 9
+   amendment is committed, and the equivalence oracle and draft-07 vector
+   replay pass. Runtime work remains: item 1 of "Next, in order" (atomic
+   inflight and pacing with lane-held send records and per-ACK reports) and
+   item 2 (ACKs from receive owners with the control ceiling scaled by
+   received bytes per worker).
+5. **Size capacities for the path.** Not started; item 3 of "Next, in
+   order". Only after steps 2 to 4: per-session retention credit that busy
+   workers can borrow, shared receive slots per worker and the ACK-box pool,
+   each sized from the delayed and lossy decision rows with memory cost
+   reported. Target: one flow at 5 Gbit/s at 7.5 ms with 0.5% and 1% loss on
+   four workers, within two to four cores per daemon.
 
 ## November 8 checkpoint
 
