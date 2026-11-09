@@ -346,6 +346,13 @@ fn cpu_ns() -> io::Result<u64> {
 fn run(c: &Config) -> io::Result<()> {
     c.validate()?;
     let mut flows = flows(c)?;
+    if c.send {
+        // The default 50 µs sleep slack starves the two-aggregate bucket above ~40k sends/s per flow.
+        // SAFETY: PR_SET_TIMERSLACK takes an integer argument and affects only this thread.
+        if unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, 1 as libc::c_ulong) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     let mut bytes = vec![0xa5; MAX_BYTES * if c.send { 1 } else { 16 }];
     let mut polls: Vec<_> = flows
         .iter()

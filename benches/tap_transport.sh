@@ -30,6 +30,9 @@ case "${IPERF_PROTOCOL:-udp}" in udp|tcp) ;; *) echo "IPERF_PROTOCOL must be udp
 if [ -n "${UDP_LOAD:-}" ]; then
     [ "$2" -ge "$((58 + 4 * ${VLAN_DEPTH:-0} + 84 * ${SRV6:-0}))" ] || { echo "UDP_LOAD needs 16 payload bytes after headers" >&2; exit 2; }
 fi
+case "${GENERATOR_PROCESSES:-1}" in 1|2|4|8) ;; *) echo "GENERATOR_PROCESSES must be 1, 2, 4 or 8" >&2; exit 2;; esac
+[ "${GENERATOR_PROCESSES:-1}" = 1 ] || [ -n "${UDP_LOAD:-}" ] || { echo "GENERATOR_PROCESSES requires UDP_LOAD" >&2; exit 2; }
+[ "$(($3 % ${GENERATOR_PROCESSES:-1}))" = 0 ] || { echo "FLOWS must be a multiple of GENERATOR_PROCESSES" >&2; exit 2; }
 mkdir "$5"
 # A private mount namespace keeps ip-netns bind mounts out of the caller.
 exec unshare -m -n --propagation private sh -s -- "$@" <<'BENCH'
@@ -69,12 +72,11 @@ case "$workers" in
 esac
 left=
 right=
-server=
-reverse_server=
-client=
-reverse_client=
+servers=
+clients=
+processes=${GENERATOR_PROCESSES:-1}
 cleanup() {
-    for pid in "$client" "$reverse_client" "$server" "$reverse_server" "$left" "$right"; do
+    for pid in $clients $servers "$left" "$right"; do
         [ -z "$pid" ] || kill "$pid" 2>/dev/null || :
     done
     wait || :
@@ -87,6 +89,18 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
+# One CPU per load process for a single A-B range; other CPU lists are shared.
+process_cpu() {
+    case "$1" in
+        *[!0-9-]*|*-*-*|-*|*-) printf '%s\n' "$1";;
+        *-*)
+            first=${1%-*}
+            last=${1#*-}
+            printf '%s\n' "$((first + $2 % (last - first + 1)))"
+            ;;
+        *) printf '%s\n' "$1";;
+    esac
+}
 netip() {
     namespace=$1
     shift
@@ -256,7 +270,7 @@ snapshot() {
     right_count=$((right_count + workers))
     kill -USR1 "$left" "$right"
     if [ -n "${UDP_LOAD:-}" ] && [ "$1" != after ]; then
-        kill -USR1 "$server" "$reverse_server"
+        kill -USR1 $servers
     fi
     sleep 0.1
     attempts=0
@@ -305,7 +319,7 @@ sed -n '/model name/p' /proc/cpuinfo | head -n 1 > "$out/cpu-model"
 getconf CLK_TCK > "$out/clock-ticks"
 if [ -n "${UDP_LOAD:-}" ]; then
     sha256sum "$UDP_LOAD" > "$out/generator-sha256"
-    printf '%s\n' "udp_load segments=${SEGMENTS:-64}" > "$out/generator"
+    printf '%s\n' "udp_load segments=${SEGMENTS:-64} processes=$processes" > "$out/generator"
 else
     iperf3 --version > "$out/iperf-version"
     printf 'iperf3 protocol=%s\n' "${IPERF_PROTOCOL:-udp}" > "$out/generator"
@@ -333,26 +347,42 @@ for rate in ${BITRATE:-0}; do
     if [ -n "${UDP_LOAD:-}" ]; then
         case "$rate" in *[!0-9]*) echo "UDP_LOAD rates must be integer bits/s per flow" >&2; exit 2;; esac
         run=$((index + 1))
-        nsenter --net="$right_inner" taskset -c "$RECEIVER_RIGHT_CPUS" "$UDP_LOAD" recv \
-            "$right_address" "$left_address" 52000 51000 "$flows" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/server.json" &
-        server=$!
-        nsenter --net="$left_inner" taskset -c "$RECEIVER_LEFT_CPUS" "$UDP_LOAD" recv \
-            "$left_address" "$right_address" 52000 51000 "$flows" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/reverse-server.json" &
-        reverse_server=$!
+        share=$((flows / processes))
+        k=0
+        while [ "$k" -lt "$processes" ]; do
+            # Process k carries flows k*share.. on its own port range; process 0 keeps the original file names.
+            suffix=
+            [ "$k" = 0 ] || suffix=-$k
+            offset=$((k * share))
+            nsenter --net="$right_inner" taskset -c "$(process_cpu "$RECEIVER_RIGHT_CPUS" "$k")" "$UDP_LOAD" recv \
+                "$right_address" "$left_address" "$((52000 + offset))" "$((51000 + offset))" "$share" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/server$suffix.json" &
+            servers="$servers $!"
+            nsenter --net="$left_inner" taskset -c "$(process_cpu "$RECEIVER_LEFT_CPUS" "$k")" "$UDP_LOAD" recv \
+                "$left_address" "$right_address" "$((52000 + offset))" "$((51000 + offset))" "$share" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/reverse-server$suffix.json" &
+            servers="$servers $!"
+            k=$((k + 1))
+        done
         sleep 0.2
-        kill -0 "$server" && kill -0 "$reverse_server" || exit 1
+        for pid in $servers; do kill -0 "$pid" || exit 1; done
         snapshot before
-        nsenter --net="$left_inner" taskset -c "$GENERATOR_LEFT_CPUS" "$UDP_LOAD" send \
-            "$left_address" "$right_address" 51000 52000 "$flows" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/client.json" &
-        client=$!
-        nsenter --net="$right_inner" taskset -c "$GENERATOR_RIGHT_CPUS" "$UDP_LOAD" send \
-            "$right_address" "$left_address" 51000 52000 "$flows" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/reverse-client.json" &
-        reverse_client=$!
+        k=0
+        while [ "$k" -lt "$processes" ]; do
+            suffix=
+            [ "$k" = 0 ] || suffix=-$k
+            offset=$((k * share))
+            nsenter --net="$left_inner" taskset -c "$(process_cpu "$GENERATOR_LEFT_CPUS" "$k")" "$UDP_LOAD" send \
+                "$left_address" "$right_address" "$((51000 + offset))" "$((52000 + offset))" "$share" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/client$suffix.json" &
+            clients="$clients $!"
+            nsenter --net="$right_inner" taskset -c "$(process_cpu "$GENERATOR_RIGHT_CPUS" "$k")" "$UDP_LOAD" send \
+                "$right_address" "$left_address" "$((51000 + offset))" "$((52000 + offset))" "$share" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/reverse-client$suffix.json" &
+            clients="$clients $!"
+            k=$((k + 1))
+        done
     else
         nsenter --net="$right_inner" taskset -c "$RECEIVER_RIGHT_CPUS" iperf3 -s -1 -J > "$out/server.json" &
-        server=$!
+        servers="$servers $!"
         nsenter --net="$left_inner" taskset -c "$RECEIVER_LEFT_CPUS" iperf3 -s -1 -J > "$out/reverse-server.json" &
-        reverse_server=$!
+        servers="$servers $!"
         sleep 0.2
         snapshot before
         if [ "${IPERF_PROTOCOL:-udp}" = tcp ]; then
@@ -362,20 +392,16 @@ for rate in ${BITRATE:-0}; do
         fi
         nsenter --net="$left_inner" taskset -c "$GENERATOR_LEFT_CPUS" iperf3 -c 10.77.0.2 -b "$rate" "$@" -P "$flows" --cport 51000 -t "$seconds" -J \
             --connect-timeout 3000 > "$out/client.json" &
-        client=$!
+        clients="$clients $!"
         nsenter --net="$right_inner" taskset -c "$GENERATOR_RIGHT_CPUS" iperf3 -c 10.77.0.1 -b "$rate" "$@" -P "$flows" --cport 51000 -t "$seconds" -J \
             --connect-timeout 3000 > "$out/reverse-client.json" &
-        reverse_client=$!
+        clients="$clients $!"
     fi
-    wait "$client"
-    client=
-    wait "$reverse_client"
-    reverse_client=
+    for pid in $clients; do wait "$pid"; done
+    clients=
     if [ -n "${UDP_LOAD:-}" ]; then snapshot sent; fi
-    wait "$server"
-    server=
-    wait "$reverse_server"
-    reverse_server=
+    for pid in $servers; do wait "$pid"; done
+    servers=
     snapshot after
     index=$((index + 1))
 done

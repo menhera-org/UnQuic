@@ -7,6 +7,19 @@ read that section before writing code. Keep the "Current status" paragraph in
 section 15 of the design and the "Implementation status" section of
 [README.md](README.md) true after every step.
 
+## November 9 checkpoint
+
+Performance decisions now use a fixed decision workload: routed 4.5 ms RTT,
+bridged individual QinQ frames, four workers, 4 and 16 flows, 0.5/2/5 Gbit/s
+per direction, with no loss and 0.1% loss. The generator can now offer those
+rates (four pinned processes and 1 ns timer slack); earlier bridged 5G points
+offered only 2.3–2.8 Gbit/s. Five production repeats show light load is
+bimodal: most runs miss under 1%, but one invocation in five collapses one
+direction to 0.16–0.37 Gbit/s through never-submitted expiry. Matched
+comparisons need three to five interleaved repeats per build;
+[BENCH.md](BENCH.md#decision-workload-and-its-noise-november-9) has the
+numbers. No performance gate has passed.
+
 ## November 8 checkpoint
 
 Performance policies remain those of `35ed011`: bounded fresh expansion,

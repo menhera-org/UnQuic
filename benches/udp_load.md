@@ -25,6 +25,10 @@ A rate of zero is unlimited. Other rates are integer UDP payload bits/s per
 flow, paced with a token bucket capped at two aggregates. Successful sends
 consume credits and sequence numbers; failed sends consume neither. The
 actual offered rate can be below the request and must be reported.
+Senders set a 1 ns timer slack. With Linux's default 50 µs slack, each sleep
+overshoots enough that a two-aggregate bucket loses credit above roughly
+40,000 sends per second per flow: four individual-frame flows at 1.25 Gbit/s
+offered only about 1.9 Gbit/s in total before this change.
 
 Receivers use the library's checked `recvmmsg` path to read up to 16 messages
 per ready socket per turn, with about 1 MiB of reusable payload storage per
@@ -132,6 +136,16 @@ not independent datagram loss. Do not compare the two topologies without their
 own zero-loss controls. Each output records the path settings; routed snapshots
 also include both endpoint IPv6 counters and both router qdiscs.
 `qdisc-left` affects R→L and `qdisc-right` affects L→R.
+
+`GENERATOR_PROCESSES=1|2|4|8` (with `UDP_LOAD`) splits each direction's flows
+across that many sender and receiver processes on consecutive port ranges.
+Process `k` uses the `k`-th CPU of a single `A-B` CPU range, so separate
+processes do not share a core; other CPU lists are shared. Process 0 keeps the
+original `client.json` and `server.json` names; process `k` adds `-k`. One
+individual-frame sender saturates near 2.5 Gbit/s on the bridged path, so use
+four processes to offer 5 Gbit/s. `examples/sweep_report.rs` sums every
+process and reports one record per point plus median, minimum and maximum
+over repeats for a `ROOT/BUILD/COMBO/REPEAT/POINT` tree.
 
 `SESSION_COOKIE` overrides the session UUID for queue-placement controls;
 record it when comparing runs because it affects receive-worker assignment.

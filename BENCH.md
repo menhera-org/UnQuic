@@ -110,6 +110,85 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Decision workload and its noise (November 9)
+
+The November 8 candidates were judged by one sweep per build. That cannot
+separate their 10–30% effects from run-to-run variation, so this section fixes
+a decision workload and measures how much unchanged production varies on it.
+
+The decision workload uses the routed harness with 4.5 ms RTT, bridged
+individual QinQ 1,522-byte frames with completed checksums, four workers and
+lanes, 500-entry TAP queues and a 1,452-byte outer UDP ceiling with active
+discovery. It runs 4 and 16 flows per direction, paced at 0.5, 2 and 5 Gbit/s
+per direction, with no loss and with 0.1% independent datagram loss. Each
+invocation starts fresh daemons, runs a discarded 0.5G warm-up, then the three
+measured points for twenty seconds each with a two-second drain.
+Sixteen-flow 44-segment GSO remains an overload check, not a decision basis.
+
+Two generator limits had to be removed before the 2G and 5G points could be
+offered at all:
+
+- One individual-frame sender process tops out near 2.5 Gbit/s on the bridged
+  path. `GENERATOR_PROCESSES=4` now splits each direction's flows across four
+  pinned senders and receivers.
+- The sender slept with Linux's default 50 µs timer slack, and its
+  two-aggregate token bucket lost credit above about 40,000 sends per second
+  per flow. Four flows asking for 1.25 Gbit/s each offered 1.9 Gbit/s in total.
+  Senders now set a 1 ns slack and offer 4.87–4.96 Gbit/s at the 5G point.
+
+Every earlier bridged 5G and unlimited point therefore offered only
+2.3–2.8 Gbit/s. The daemon needs no such change: it arms `timerfd` deadlines
+and blocks in `epoll_wait(-1)`, and timerfd expiry takes no slack.
+
+Production `781d064` ran five interleaved repeats (twenty invocations) with
+nothing else on the load CPUs. [The JSON](benches/tap-decision-noise.json)
+holds every point, per-worker counters and the analysis inputs;
+`examples/sweep_report.rs` produced it.
+
+Delivered Gbit/s, median [minimum–maximum] over five runs, and median missing
+percentage:
+
+| Flows / loss | Offered each way | Delivered L→R | Delivered R→L | Missing % L→R / R→L |
+| --- | --- | --- | --- | --- |
+| 4 / none | 0.50 | 0.490 [0.487–0.492] | 0.479 [0.160–0.487] | 0.53 / 2.95 |
+| 4 / none | 1.97 | 0.835 [0.788–0.852] | 0.671 [0.655–0.714] | 57.2 / 66.0 |
+| 4 / none | 4.87 | 0.642 [0.633–0.653] | 0.721 [0.702–0.723] | 86.7 / 85.3 |
+| 16 / none | 0.50 | 0.491 [0.210–0.492] | 0.491 [0.372–0.492] | 0.42 / 0.56 |
+| 16 / none | 2.00 | 0.746 [0.677–0.774] | 0.685 [0.628–0.783] | 62.2 / 64.9 |
+| 16 / none | 4.96 | 0.741 [0.682–0.766] | 0.421 [0.218–0.632] | 84.9 / 91.4 |
+| 4 / 0.1% | 0.50 | 0.473 [0.471–0.481] | 0.481 [0.472–0.484] | 4.17 / 2.04 |
+| 4 / 0.1% | 1.98 | 0.634 [0.603–0.694] | 0.510 [0.445–0.670] | 67.7 / 74.0 |
+| 4 / 0.1% | 4.88 | 0.497 [0.469–0.539] | 0.652 [0.557–0.731] | 89.7 / 86.5 |
+| 16 / 0.1% | 0.50 | 0.484 [0.477–0.484] | 0.471 [0.469–0.479] | 2.11 / 4.45 |
+| 16 / 0.1% | 1.99 | 0.696 [0.563–0.784] | 0.576 [0.386–0.726] | 64.7 / 70.7 |
+| 16 / 0.1% | 4.96 | 0.722 [0.523–0.729] | 0.715 [0.667–0.739] | 85.3 / 85.5 |
+
+What the spread shows:
+
+- Light load without loss is bimodal rather than noisy. The median direction
+  misses 0.4–0.6%, but 4 of the 80 direction observations at 0.5G (warm-up and
+  measured points) collapse to 0.16–0.37 Gbit/s with 25–67% missing. Each
+  collapse is never-submitted expiry on one sender, 66,000–165,000 frames,
+  with no repair and no injected loss. That is a transport defect; the next
+  section traces it.
+- No 2G or 5G point reaches its offered rate: delivery is 0.42–0.84 Gbit/s per
+  direction. Without loss, one point's range spans 7–25% of its median; with
+  0.1% loss, up to 45%.
+- 0.1% independent loss raises light-load missing frames to 2–4.5%, twenty to
+  forty times the injected rate.
+
+Without the collapses, a 2G point varies by about ±5–10% around its median.
+Three interleaved repeats per build therefore separate effects above about
+20%, and five above about 10%. Showing that a change removes a collapse seen in
+one run of five needs about fourteen clean runs (0.8^14 is 4%). One sweep per
+build could resolve neither.
+
+Noise sources examined: daemon, sender and receiver CPUs stay pinned as before
+on one socket, and the other socket ran nothing during load. The warm-up and
+measured 0.5G medians agree within 0.012 Gbit/s apart from the same collapses,
+so Startup and PMTU probing do not explain the spread. One container image
+served every run. The generator's timer slack was a real source and is fixed.
+
 ## Successor requests and ACK retention do not fix both input paths (November 8)
 
 [Twenty-four matched release points](benches/tap-refill-candidates.json) compare
