@@ -289,6 +289,13 @@ sent, uncharged feedback can age out without waiting for another ACK. Late ACKs
 retain send metadata but cannot release a lost packet's charge twice. Allocation
 checks cover reservation, submission, ACK, loss, window wrap and reset.
 Workers use this history for submission accounting and incoming ACKs.
+Entries without a sampling handle (acknowledged packets, canceled holes and
+uncharged feedback) retire when each ACK finishes, without an owner report.
+A declared loss keeps its handle for a late ACK; once the span passes half the
+history, the lane reports such handles for retirement before DATA is refused.
+Workers check that a number can be reserved before allocating it, so a refused
+attempt leaves no hole. DATA stops 128 numbers and control 64 numbers short of
+the history limit, so a PTO probe can always reach an unacknowledged tail.
 Worker-local frame storage and the piece journal retain payloads and schedule repairs.
 
 `loss::Rtt` implements the pure RFC 9002 timing calculations: RTT sampling,

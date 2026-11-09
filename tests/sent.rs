@@ -1267,3 +1267,49 @@ fn summary_scan_wraps_ring_and_rechecks_partial_words() {
     );
     assert!(scan.is_complete());
 }
+
+// Regression: an unacknowledged tail at the floor must cap reservations without
+// blocking the local retirement of acknowledged entries and holes behind it.
+#[test]
+fn reservation_capacity_and_unsampled_retirement_follow_the_floor() {
+    use std::num::NonZeroU16;
+    let mut history = History::new().unwrap();
+    sent(&mut history, 1, true);
+    history.reserve(2, 1500, true, true).unwrap();
+    assert!(history.cancel(2));
+    sent(&mut history, 3, true);
+    history
+        .acknowledge(ranges(&[AckRange { start: 3, end: 3 }]), |_| {})
+        .unwrap();
+    let wall = 1 + SENT_CAPACITY as u64 - 1;
+    assert!(history.can_reserve(wall));
+    assert!(!history.can_reserve(wall + 1));
+    assert!(!history.can_reserve(3));
+    assert_eq!(
+        history.reserve(wall + 1, 1500, true, true),
+        Err(HistoryError::Full)
+    );
+    assert_eq!(history.retire_unsampled(64), 0);
+    assert_eq!(history.floor(), 1);
+
+    // Packet 1 resolves; the hole and the ACKed packet retire without an owner report.
+    assert!(history.lose(1).is_some());
+    assert_eq!(history.retire_unsampled(1), 1);
+    assert_eq!(history.retire_unsampled(64), 2);
+    assert_eq!(history.floor(), 4);
+    assert!(history.can_reserve(wall + 1));
+
+    // A lost packet's retained handle and a pending ACK both need the owner path.
+    let slot = NonZeroU16::new(1).unwrap();
+    history.reserve(4, 1500, true, true).unwrap();
+    assert!(history.submit_sampled(4, Duration::ZERO, slot));
+    assert_eq!(history.lose(4).unwrap().sample_slot, Some(slot));
+    assert_eq!(history.retire_unsampled(64), 0);
+    assert!(!history.can_reserve(4 + SENT_CAPACITY as u64));
+    sent(&mut history, 5, true);
+    history
+        .begin_ack(ranges(&[AckRange { start: 5, end: 5 }]))
+        .unwrap();
+    assert_eq!(history.retire_unsampled(64), 0);
+    assert_eq!(history.floor(), 4);
+}

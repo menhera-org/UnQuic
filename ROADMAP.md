@@ -29,6 +29,17 @@ issuance each explain under 5% of expired lifetimes.
 [BENCH.md](BENCH.md#light-load-expiry-traced-to-a-stalled-lane-november-9)
 has the evidence.
 
+The fix retires handle-less history entries as each ACK finishes, requests
+reported retirement once loss handles pin half the history, checks numbers
+before allocating them, and keeps the last history numbers for probes and
+control. In matched repeats it raises most 2G and 5G directions by 22–116%
+and removes the observed collapses; four-flow L→R at 5G falls 14% because the
+left daemon's busiest worker reaches 96% CPU.
+[BENCH.md](BENCH.md#sent-history-headroom-removes-the-lane-stall-november-9)
+records the comparison. Next: separate the `queue_drops` causes, profile the
+saturated worker, then audit step 3's coordination-ceiling builds. No
+performance gate has passed.
+
 ## November 8 checkpoint
 
 Performance policies remain those of `35ed011`: bounded fresh expansion,

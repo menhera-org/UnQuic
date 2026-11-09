@@ -3113,8 +3113,8 @@ impl Worker {
                     .job
                     .is_none_or(|job| job.session != session || job.lane != lane)
             {
-                self.request_batch(session, lane, batch, deadline, limit)?;
-                if self.sender.job.is_none() {
+                let keep = self.request_batch(session, lane, batch, deadline, limit)?;
+                if self.sender.job.is_none() && !keep {
                     self.discard_batch(session, lane, batch);
                 }
                 return Ok(());
@@ -3839,6 +3839,17 @@ impl Worker {
                 .ok()
                 .map(|length| pack::Packet { number: 0, length })
         } else {
+            // Check first: a refused number would become a hole on every retry.
+            // Control leaves the last numbers to probes that can expose a stuck tail.
+            if let Some(index) = history
+                && self.sessions[session].tx[0].as_ref().is_some_and(|lane| {
+                    !self.sender.lanes[index]
+                        .history
+                        .can_reserve(lane.next_packet().saturating_add(sender::PROBE_HEADROOM))
+                })
+            {
+                return Ok(None);
+            }
             self.sessions[session].tx[0]
                 .as_mut()
                 .and_then(|lane| lane.record(record, bytes).ok())

@@ -920,7 +920,8 @@ fn refresh_history_pressure_reports_unused_and_preserves_frame() {
     let retained = workers[0].sessions[0].tx_retained;
     let old = workers[0].sender.job.unwrap().first;
     let tx = workers[0].sessions[0].tx[0].as_mut().unwrap();
-    let mut skip = 65536 - 3;
+    // Control stops PROBE_HEADROOM short of the wall; the refreshed DATA then cannot fit.
+    let mut skip = 65536 - 3 - PROBE_HEADROOM as usize;
     while skip != 0 {
         let count = skip.min(BATCH_SIZE);
         tx.allocate_packets(count).unwrap();
@@ -939,7 +940,7 @@ fn refresh_history_pressure_reports_unused_and_preserves_frame() {
         .unwrap()
         .unwrap()
         .0;
-    assert_eq!(control, 65536);
+    assert_eq!(control, 65536 - PROBE_HEADROOM);
     for _ in 0..8 {
         service(&mut workers);
     }
@@ -2079,7 +2080,7 @@ fn an_empty_history_still_drains_its_ack_loss_fence_before_replacement() {
         .sender_message(Message::ReportReturn(report), now)
         .unwrap();
     let lane = &mut worker.sender.lanes[index];
-    assert!(lane.history.retire_oldest_resolved().unwrap().is_some());
+    // Completing the ACK retired its only entry; the owed scan still pins the lane.
     assert!(lane.history.is_retired());
     assert!(!lane.idle(), "empty history must finish its owed scan");
     assert_eq!(
@@ -2442,6 +2443,7 @@ fn liveness_history_pressure_retries_without_spinning_or_losing_turn() {
     let history = &mut worker.sender.lanes[index].history;
     history.reserve(pinned, 100, true, true).unwrap();
     assert!(history.submit(pinned, Duration::ZERO));
+    let next = worker.sessions[0].tx[0].as_ref().unwrap().next_packet();
     let report = worker.sender.report.take();
     worker.service_sender(Duration::ZERO).unwrap();
     assert!(worker.sender.job.is_none());
@@ -2452,12 +2454,70 @@ fn liveness_history_pressure_retries_without_spinning_or_losing_turn() {
     worker.service_sender(RETRY / 2).unwrap();
     assert_eq!(worker.controls[0].probe_due, RETRY);
     assert!(worker.sender.job.is_none());
+    // Refused probes must not turn numbers into holes that move the history wall.
+    assert_eq!(
+        worker.sessions[0].tx[0].as_ref().unwrap().next_packet(),
+        next
+    );
 
     assert!(worker.sender.lanes[index].history.lose(pinned).is_some());
     worker.sender.report = report;
     worker.service_sender(RETRY).unwrap();
     assert!(worker.sender.job.is_some_and(|job| job.session == 0));
     assert_eq!(worker.controls[0].probe_due, RETRY + Duration::from_secs(1));
+}
+
+// Regression for a lane that stopped for seconds: its tail's ACK was dropped, DATA
+// filled the history behind that tail, and every retry consumed new packet numbers,
+// so neither DATA nor a PTO probe could ever reserve a number again.
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn unacknowledged_tail_leaves_probe_headroom_without_consuming_numbers() {
+    let (mut workers, _rx) = workers();
+    let worker = &mut workers[1];
+    let index = worker.sender_index(0, 1).unwrap();
+    let tx = worker.sessions[0].tx[1].as_mut().unwrap();
+    let pinned = tx.allocate_packets(1).unwrap();
+    let mut remaining = crate::ack::SENT_CAPACITY - 2 * PROBE_HEADROOM as usize;
+    while remaining != 0 {
+        let count = remaining.min(BATCH_SIZE);
+        tx.allocate_packets(count).unwrap();
+        remaining -= count;
+    }
+    let history = &mut worker.sender.lanes[index].history;
+    history.reserve(pinned, 1280, true, true).unwrap();
+    assert!(history.submit(pinned, Duration::ZERO));
+    queue_frame(worker, 1514);
+    worker.flush_frames(Duration::ZERO).unwrap();
+    assert!(
+        worker.sender.job.is_none(),
+        "DATA must leave room for a probe"
+    );
+    assert!(worker.sender.reclaim.is_some());
+    let next = worker.sessions[0].tx[1].as_ref().unwrap().next_packet();
+    for turn in 1..4 {
+        worker.flush_frames(Duration::from_micros(turn)).unwrap();
+        assert!(worker.sender.job.is_none());
+    }
+    assert_eq!(
+        worker.sessions[0].tx[1].as_ref().unwrap().next_packet(),
+        next,
+        "a refused plan keeps its packet numbers"
+    );
+    worker
+        .request_probe(
+            0,
+            1,
+            BASE_UDP_PAYLOAD,
+            false,
+            None,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+    assert!(matches!(
+        worker.sender.job.map(|job| job.kind),
+        Some(JobKind::Probe { .. })
+    ));
 }
 
 #[test]

@@ -1,6 +1,15 @@
 //! Bounded TX-local ACK/loss/retirement work using the worker's reserved report.
 use super::*;
 
+/// Requests owner-reported retirement once retained handles pin over half the history.
+fn retire_due(history: &History) -> bool {
+    let span = history
+        .highest_allocated()
+        .saturating_add(1)
+        .saturating_sub(history.floor());
+    span > crate::ack::SENT_CAPACITY as u64 / 2
+}
+
 impl Lane {
     pub(in crate::worker) fn idle(&self) -> bool {
         self.unsent_bytes == 0
@@ -34,6 +43,7 @@ impl Lane {
         self.forced_before = None;
         self.scan_cutoff = None;
         self.probes = [None; 2];
+        self.retire_due = false;
         Ok(())
     }
 
@@ -176,6 +186,9 @@ impl Lane {
                 report.count += 1;
             });
             if let Some(progress) = end {
+                // Keep reservation headroom so later sends can expose an unacknowledged tail.
+                self.history.retire_unsampled(BATCH_SIZE);
+                self.retire_due = retire_due(&self.history);
                 if let Some(sent) = progress.rtt_sent_at {
                     self.rtt.sample(sent, ack.received, ack.delay_us);
                 }
@@ -271,7 +284,7 @@ impl Lane {
         self.prepare_report(report, ReportKind::Retire);
         #[cfg(feature = "trace")]
         let worker = (usize::from(self.lane) - 1) % crate::trace::workers().max(1);
-        for _ in 0..(*budget).min(BATCH_SIZE) {
+        while *budget != 0 && report.count < BATCH_SIZE {
             *budget -= 1;
             let Some(entry) = self
                 .history
@@ -280,12 +293,15 @@ impl Lane {
             else {
                 break;
             };
-            report.entries[report.count] = Entry {
-                number: entry.number,
-                sample: entry.sample_slot,
-                settled: false,
-            };
-            report.count += 1;
+            // Only a retained handle needs the owner; holes and ACKed entries just advance the floor.
+            if entry.sample_slot.is_some() {
+                report.entries[report.count] = Entry {
+                    number: entry.number,
+                    sample: entry.sample_slot,
+                    settled: false,
+                };
+                report.count += 1;
+            }
         }
         #[cfg(feature = "trace")]
         {
@@ -304,6 +320,7 @@ impl Lane {
                 ]
             );
         }
+        self.retire_due = retire_due(&self.history);
         self.report_pending = report.count != 0;
         Ok(self.report_pending)
     }
@@ -454,7 +471,9 @@ mod tests {
             assert_eq!(entry.settled, entry.number == 2);
         }
         assert!(lane.report_completed(&report).unwrap().is_some());
-        assert!(lane.history.packet(1).unwrap().sample_slot.is_none());
+        // The late ACK took both handles, so both entries retire without a report.
+        assert!(lane.history.packet(1).is_none());
+        assert_eq!(lane.history.floor(), 3);
         assert!(lane.begin_ack(&ack(1, 2)));
         assert!(
             lane.advance_report(&mut report, Duration::from_millis(101), &mut 64)
@@ -531,14 +550,10 @@ mod tests {
                 .unwrap()
         );
         lane.report_completed(&report).unwrap();
-        assert!(lane.retire_report(&mut report, &mut 2).unwrap());
-        assert_eq!(report.count, 2);
-        assert!(
-            report.entries[..2]
-                .iter()
-                .all(|entry| entry.sample.is_none())
-        );
-        lane.report_completed(&report).unwrap();
+        // Holes carry no handle, so they retire without occupying the owner's report.
+        assert!(!lane.retire_report(&mut report, &mut 2).unwrap());
+        assert_eq!(report.count, 0);
+        assert_eq!(lane.history.floor(), 3);
         assert!(!lane.idle());
         assert!(lane.retire_report(&mut report, &mut 2).unwrap());
         assert_eq!(report.count, 1);
@@ -549,6 +564,79 @@ mod tests {
         assert!(lane.idle());
         lane.install(8).unwrap();
         assert!(lane.idle());
+    }
+
+    // Regression: retirement used to wait for history pressure and an idle lane,
+    // so a busy lane filled its history and stopped behind one unacknowledged tail.
+    #[test]
+    fn completed_ack_retires_its_prefix_without_a_retire_report() {
+        let mut lane = lane();
+        for number in 1..=100 {
+            send(&mut lane, number, 1);
+        }
+        assert!(lane.begin_ack(&ack(1, 100)));
+        let mut report = Report::new(0);
+        let mut done = false;
+        while !done {
+            assert!(
+                lane.advance_report(&mut report, Duration::from_millis(100), &mut 64)
+                    .unwrap()
+            );
+            done = matches!(report.kind, ReportKind::Ack { end: Some(_), .. });
+            lane.report_completed(&report).unwrap();
+        }
+        // ACK application took every handle, so one bounded pass advances the floor.
+        assert_eq!(lane.history.floor(), 1 + BATCH_SIZE as u64);
+        assert!(
+            lane.history
+                .can_reserve(BATCH_SIZE as u64 + crate::ack::SENT_CAPACITY as u64)
+        );
+    }
+
+    // Regression: a lost packet keeps its handle for a late ACK, so local retirement
+    // stops behind it; retirement must start well before DATA is refused.
+    #[test]
+    fn retained_loss_handle_requests_retirement_at_half_history() {
+        let mut lane = lane();
+        send(&mut lane, 1, 1);
+        let last = crate::ack::SENT_CAPACITY as u64 / 2 + 2;
+        for number in 2..=last {
+            lane.history.reserve(number, 1500, true, true).unwrap();
+            assert!(lane.history.submit(number, Duration::from_millis(2)));
+        }
+        lane.force_loss(Duration::from_millis(1));
+        let mut report = Report::new(0);
+        while !lane
+            .advance_report(&mut report, Duration::from_millis(3), &mut 64)
+            .unwrap()
+        {}
+        assert_eq!(report.entries[..report.count][0].number, 1);
+        lane.report_completed(&report).unwrap();
+        assert!(lane.begin_ack(&ack(2, last)));
+        loop {
+            if !lane
+                .advance_report(&mut report, Duration::from_millis(100), &mut 64)
+                .unwrap()
+            {
+                continue;
+            }
+            let done = matches!(report.kind, ReportKind::Ack { end: Some(_), .. });
+            lane.report_completed(&report).unwrap();
+            if done {
+                break;
+            }
+        }
+        assert_eq!(
+            lane.history.floor(),
+            1,
+            "the loss handle stops local retirement"
+        );
+        assert!(lane.retire_due);
+        assert!(lane.retire_report(&mut report, &mut 64).unwrap());
+        assert_eq!(report.count, 1);
+        assert_eq!(report.entries[0].sample.unwrap().get(), 1);
+        assert!(!lane.retire_due);
+        lane.report_completed(&report).unwrap();
     }
 
     #[test]

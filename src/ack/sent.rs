@@ -297,19 +297,13 @@ impl History {
         {
             return Err(HistoryError::Invalid);
         }
+        if !self.can_reserve(number) {
+            return Err(HistoryError::Full);
+        }
         let floor = self
             .floor
             .max(number.saturating_sub(SENT_CAPACITY as u64 - 1));
-        if floor != self.floor && (self.pending.is_some() || self.samples != 0) {
-            return Err(HistoryError::Full);
-        }
         let end = self.allocated.min(floor - 1);
-        for (word, mask) in words(self.floor, end) {
-            let index = word as usize & (WORDS - 1);
-            if (self.reserved[index] | self.inflight[index]) & mask != 0 {
-                return Err(HistoryError::Full);
-            }
-        }
         for (word, mask) in words(self.floor, end) {
             let index = word as usize & (WORDS - 1);
             self.submitted[index] &= !mask;
@@ -328,6 +322,48 @@ impl History {
         };
         self.reserved[index / 64] |= 1 << (index % 64);
         Ok(())
+    }
+
+    /// Whether reserve would accept this fresh number without first retiring entries.
+    ///
+    /// Check before allocating a packet identity: a number that cannot be reserved
+    /// becomes a hole and moves every later reservation further from the floor.
+    pub fn can_reserve(&self, number: u64) -> bool {
+        if number == 0 || number <= self.allocated {
+            return false;
+        }
+        let floor = self
+            .floor
+            .max(number.saturating_sub(SENT_CAPACITY as u64 - 1));
+        if floor == self.floor {
+            return true;
+        }
+        if self.pending.is_some() || self.samples != 0 {
+            return false;
+        }
+        words(self.floor, self.allocated.min(floor - 1)).all(|(word, mask)| {
+            let index = word as usize & (WORDS - 1);
+            (self.reserved[index] | self.inflight[index]) & mask == 0
+        })
+    }
+
+    /// Retires up to budget resolved floor entries that hold no sampling handle.
+    ///
+    /// ACKed packets, canceled holes and uncharged feedback need no owner report,
+    /// so this keeps headroom without a report round trip. It stops at a
+    /// reservation, an outstanding charge, a retained loss handle or a pending ACK.
+    pub fn retire_unsampled(&mut self, budget: usize) -> usize {
+        let mut retired = 0;
+        while retired < budget
+            && self.pending.is_none()
+            && self.entries[self.floor as usize & (SENT_CAPACITY - 1)]
+                .sample_slot
+                .is_none()
+            && matches!(self.retire_oldest_resolved(), Ok(Some(_)))
+        {
+            retired += 1;
+        }
+        retired
     }
 
     /// Retires one resolved number at the floor, including a canceled or skipped hole.

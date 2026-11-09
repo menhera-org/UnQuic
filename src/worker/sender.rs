@@ -16,6 +16,10 @@ mod timers;
 use owner::{Owner, Request};
 
 const ACK_BUFFERS: usize = 4;
+/// History numbers only probes may use, so a PTO probe can always expose an
+/// unacknowledged tail. Control stops this far from the wall; DATA also leaves
+/// room for one refused plan's allocated numbers.
+pub(super) const PROBE_HEADROOM: u64 = BATCH_SIZE as u64;
 
 pub(crate) struct Ack {
     origin: usize,
@@ -156,6 +160,8 @@ pub(super) struct Lane {
     // Complete an older scan, if any, then one pass using the admitted ACK.
     pub(super) loss_passes: u8,
     pub(super) probes: [Option<(u64, u16)>; 2],
+    // Retained loss handles pin more than half the history; retire them before DATA is refused.
+    pub(super) retire_due: bool,
 }
 
 impl Lane {
@@ -179,6 +185,7 @@ impl Lane {
             report_pending: false,
             loss_passes: 0,
             probes: [None; 2],
+            retire_due: false,
         })
     }
 }
@@ -1069,7 +1076,7 @@ impl Worker {
                 lane.force_loss(now);
             }
             let quiescing = self.sessions[lane.session].connection.is_none();
-            let retire = quiescing || self.sender.reclaim.is_some();
+            let retire = quiescing || self.sender.reclaim.is_some() || lane.retire_due;
             let fenced = lane.loss_passes != 0;
             let tag = self.sessions[lane.session]
                 .connection
@@ -1265,6 +1272,8 @@ impl Worker {
 }
 
 impl Worker {
+    /// True means history had no room for the plan's first packet: keep the plan,
+    /// so its unreserved numbers are retried instead of becoming holes.
     pub(super) fn request_batch(
         &mut self,
         session: usize,
@@ -1272,9 +1281,9 @@ impl Worker {
         batch: &TxBatch,
         deadline: Duration,
         mtu: usize,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if self.sender.job.is_some() || self.sender.flight.is_none() {
-            return Ok(());
+            return Ok(false);
         }
         let index = self.sender_index(session, lane)?;
         let generation = self.sessions[session]
@@ -1283,6 +1292,7 @@ impl Worker {
             .generation;
         let mut packets = [pacing::Planned::default(); BATCH_SIZE];
         let mut count = 0;
+        let mut full = false;
         for (ordinal, planned) in packets.iter_mut().take(batch.plan.len()).enumerate() {
             let packet = batch
                 .plan
@@ -1302,12 +1312,14 @@ impl Worker {
                         history.highest_allocated()
                     ]
                 );
-                return Ok(());
+                return Ok(false);
             }
             match if history.is_reserved(packet.number) {
                 Ok(())
-            } else {
+            } else if history.can_reserve(packet.number.saturating_add(2 * PROBE_HEADROOM)) {
                 history.reserve(packet.number, (packet.length + 48) as u16, true, true)
+            } else {
+                Err(crate::ack::HistoryError::Full)
             } {
                 Ok(()) => {}
                 Err(crate::ack::HistoryError::Full) => {
@@ -1326,6 +1338,7 @@ impl Worker {
                         ]
                     );
                     self.sender.reclaim = Some(self.sender.lanes.len());
+                    full = true;
                     break;
                 }
                 Err(error) => return Err(io::Error::other(error)),
@@ -1342,7 +1355,7 @@ impl Worker {
             count += 1;
         }
         if count == 0 {
-            return Ok(());
+            return Ok(full);
         }
         let mut flight = self
             .sender
@@ -1388,7 +1401,8 @@ impl Worker {
                 pmtu: false,
                 mtu: (mtu + 48).max(1280) as u16,
             }),
-        )
+        )?;
+        Ok(false)
     }
 
     pub(super) fn request_probe(
@@ -1419,6 +1433,14 @@ impl Worker {
         let Some(tx) = local.tx.get_mut(lane).and_then(Option::as_mut) else {
             return Ok(());
         };
+        // A probe retried every turn under history pressure must not consume a number each time.
+        if !self.sender.lanes[index]
+            .history
+            .can_reserve(tx.next_packet())
+        {
+            self.sender.reclaim = Some(self.sender.lanes.len());
+            return Ok(());
+        }
         let piece = tx.probe(length, &mut prefix).map_err(io::Error::other)?;
         match self.sender.lanes[index].history.reserve(
             piece.packet.number,
@@ -1590,9 +1612,19 @@ impl Worker {
         for offset in 0..old_count {
             history.cancel(job.first + offset as u64);
         }
+        // Refreshed DATA keeps the same headroom as a fresh request; a probe may use it.
+        let headroom = match job.kind {
+            JobKind::Data => 2 * PROBE_HEADROOM,
+            JobKind::Probe { .. } => 0,
+        };
         let mut reserved = 0;
         for packet in flight.packets() {
-            match history.reserve(first + reserved as u64, packet.bytes, true, true) {
+            let number = first + reserved as u64;
+            match if history.can_reserve(number.saturating_add(headroom)) {
+                history.reserve(number, packet.bytes, true, true)
+            } else {
+                Err(crate::ack::HistoryError::Full)
+            } {
                 Ok(()) => reserved += 1,
                 Err(error) => {
                     for offset in 0..reserved {

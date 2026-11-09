@@ -1,5 +1,13 @@
 # Release transport overload investigation
 
+On November 9 a fixed decision workload (routed 4.5 ms RTT, bridged
+individual QinQ frames, four workers) replaced one-sweep comparisons. A
+diagnostics-only sender trace traced light-load collapses and most 2G expiry
+to one lane stalled behind an unacknowledged tail in its full sent history.
+The adopted fix raises most 2G and 5G directions by 22–116% in matched repeats;
+delivery still reaches only 0.45–1.25 Gbit/s per direction at 2–5 Gbit/s
+offered, and the busiest worker approaches a full core. No gate has passed.
+
 The November 8 comparison uses production `35ed011` as its control across
 24 routed release points. It rejects early successor requests and ACK-record
 retention: the first retains GSO collapse; the second improves GSO but regresses
@@ -109,6 +117,82 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## Sent-history headroom removes the lane stall (November 9)
+
+The trace below found one lane unable to reserve sent-history numbers behind
+an unacknowledged tail. The fix keeps the history's limit away from ordinary
+traffic and keeps one escape open:
+
+- Resolved entries without a sampling handle (acknowledged packets, canceled
+  holes, uncharged feedback) retire as each ACK finishes, without an owner
+  report. Retirement reports carry only entries that hold a handle.
+- A declared loss keeps its handle for a late ACK and stops that local
+  retirement. Once the span passes half the history, the lane requests
+  reported retirement, long before DATA approaches the limit.
+- Workers check that a number can be reserved before allocating it. A refused
+  DATA plan keeps its numbers for the next attempt; refused probes and control
+  records allocate nothing.
+- Probes alone may use the last 64 numbers, control the 64 before them, and
+  DATA, including refreshed DATA, stops 128 short. A PTO probe can therefore
+  always reach the lane whose tail pins the floor.
+
+Regression tests reproduce each part: a pinned tail with DATA two plans from
+the limit, which used to consume the last numbers and leave no room for a
+probe; refused probes and plans that consumed packet numbers on every retry;
+an ACK whose acknowledged prefix stayed in history; and a loss handle that
+pinned more than half the history. Existing tests that read entries the new
+rule retires now assert the retirement instead.
+
+[Two matched comparisons](benches/tap-history-fix.json) run the decision
+workload with production and candidate interleaved, three repeats each. The
+first candidate lacked the half-history trigger and the refreshed-DATA headroom;
+it fixed the stall but missed 9.2–22.2% of four-flow 0.5G R→L frames in all
+three runs, through lanes waiting on reported retirement behind loss handles.
+The final candidate below adds both.
+
+Delivered Gbit/s, median [minimum–maximum]:
+
+| Flows / loss | Offered | Production L→R | Candidate L→R | Production R→L | Candidate R→L |
+| --- | --- | --- | --- | --- | --- |
+| 4 / none | 0.5G | 0.491 [0.489–0.491] | 0.489 [0.489–0.491] | 0.480 [0.470–0.488] | 0.489 [0.488–0.490] |
+| 4 / none | 2G | 0.837 [0.837–0.869] | 0.875 [0.822–0.900] | 0.652 [0.651–0.665] | 1.248 [1.214–1.262] |
+| 4 / none | 5G | 0.628 [0.616–0.646] | 0.539 [0.535–0.542] | 0.704 [0.701–0.712] | 1.252 [1.247–1.276] |
+| 16 / none | 0.5G | 0.492 [0.492–0.494] | 0.492 [0.492–0.493] | 0.492 [0.489–0.492] | 0.492 [0.491–0.493] |
+| 16 / none | 2G | 0.603 [0.595–0.757] | 1.116 [1.066–1.117] | 0.451 [0.396–0.531] | 0.974 [0.965–0.998] |
+| 16 / none | 5G | 0.796 [0.517–0.821] | 0.968 [0.919–0.987] | 0.600 [0.573–0.612] | 1.084 [1.064–1.102] |
+| 4 / 0.1% | 0.5G | 0.473 [0.464–0.473] | 0.483 [0.480–0.485] | 0.478 [0.472–0.480] | 0.485 [0.484–0.485] |
+| 4 / 0.1% | 2G | 0.602 [0.553–0.682] | 0.657 [0.651–0.667] | 0.639 [0.525–0.726] | 0.972 [0.946–0.979] |
+| 4 / 0.1% | 5G | 0.479 [0.465–0.536] | 0.445 [0.436–0.471] | 0.612 [0.562–0.679] | 1.008 [0.976–1.016] |
+| 16 / 0.1% | 0.5G | 0.481 [0.461–0.481] | 0.487 [0.487–0.490] | 0.466 [0.466–0.468] | 0.483 [0.480–0.485] |
+| 16 / 0.1% | 2G | 0.705 [0.531–0.790] | 0.890 [0.877–0.897] | 0.631 [0.439–0.676] | 0.805 [0.766–0.810] |
+| 16 / 0.1% | 5G | 0.715 [0.702–0.720] | 0.745 [0.732–0.770] | 0.648 [0.495–0.704] | 0.841 [0.792–0.863] |
+
+**The fix is adopted.** At 2G and 5G, delivery rises 22–116% in eleven of the
+sixteen direction/point pairs, and the candidate's ranges are narrow. With
+0.1% loss, light-load missing frames fall from 2.7–5.6% to 1.4–2.3%. Production
+collapsed again in two of three sixteen-flow warm-ups (R→L 0.328 Gbit/s); no
+final-candidate run collapsed. Production collapsed in 8 of its 44 invocations
+across the noise run and both comparisons, and the final candidate in none of
+12. Twelve runs give only about 90% confidence that the collapse rate fell, so
+later comparisons should keep counting collapses.
+
+Four-flow L→R at 5G falls 14% (7% with loss). Its sender expires only about
+1,000 frames unsent; instead, the left daemon's busiest worker rises from 88%
+to 96% of a core, because R→L delivery doubled and that daemon now receives
+and acknowledges twice as much. Total four-flow 5G delivery rises from 1.33
+to 1.79 Gbit/s. This is the next limit: per-worker CPU, not sender stalls.
+
+At 2G the traced first candidate attributes the remaining unsent expiry to
+group PTO stalls and short history waits behind loss handles; the R→L sender
+expired 30,000–36,000 frames instead of 165,000–175,000. Left-side input
+drops (1.5 million at four-flow 2G) remain and are counted together under
+`queue_drops`; they need separate attribution. No performance gate is met.
+
+Validation: 364 ordinary release-musl all-feature tests and 354 default
+tests pass, as do strict Clippy and formatting. On each of Linux 6.8 and 7.0,
+all 99 ignored kernel tests pass, including the 90 library tests, three
+runtime tests and the routed PMTU discovery test.
 
 ## Light-load expiry traced to a stalled lane (November 9)
 

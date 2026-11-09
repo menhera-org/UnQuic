@@ -88,6 +88,11 @@ impl Lane {
         })
     }
 
+    /// The packet identity the next allocation returns; zero after exhaustion.
+    pub(crate) const fn next_packet(&self) -> u64 {
+        self.header.packet_number
+    }
+
     /// Allocates fresh consecutive packet identities without wrapping.
     pub(crate) fn allocate_packets(&mut self, count: usize) -> Result<u64, PackError> {
         let first = self.header.packet_number;

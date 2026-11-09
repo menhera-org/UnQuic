@@ -261,6 +261,20 @@ The history API retires one resolved number per call, so callers can budget hole
 as well as transmissions. An explicit terminal flag lets the maximum packet
 number retire once without wrapping the history floor.
 
+Resolved entries without a sampling handle (acknowledged packets, canceled
+holes and uncharged feedback) need no owner report. Retire them, within the
+same bounded budget, as each ACK finishes rather than waiting for pressure;
+only entries holding a handle need a retirement report. A declared loss keeps
+its handle for a late ACK and stops this local retirement, so start reported
+retirement once the history span exceeds half its capacity, long before DATA
+reaches the limit and long after any useful late ACK. Check that a number can
+be reserved before allocating it, so a refused attempt leaves no hole that
+moves the reservation limit. Probes alone may use the last 64 numbers below
+that limit, and control traffic the 64 before them. DATA stops 128 short, which
+also leaves room for one refused plan's allocated numbers. A lane whose
+unacknowledged tail blocks retirement cannot otherwise send anything that
+would reveal the tail's fate, so a PTO probe must always fit.
+
 Each history entry carries a two-byte sampling handle without growing its
 16-byte storage. ACK application takes that handle into its retained report;
 loss copies it, and explicit retirement takes it for reclamation. A live-handle
