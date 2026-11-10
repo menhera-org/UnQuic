@@ -1,5 +1,6 @@
 //! Shared helpers for disposable network-namespace tests.
 #![allow(dead_code)]
+pub mod fuzz;
 pub mod runtime;
 pub mod tcp;
 pub mod udp;

@@ -187,16 +187,7 @@ mod tests {
         bytes
     }
 
-    #[test]
-    fn replies_name_a_missing_other_or_tun_device() {
-        let error = message(NLMSG_ERROR, &(-libc::ENODEV).to_ne_bytes());
-        assert_eq!(parse(&error).unwrap(), Link::Missing);
-        let denied = message(NLMSG_ERROR, &(-libc::EPERM).to_ne_bytes());
-        assert_eq!(
-            parse(&denied).unwrap_err().raw_os_error(),
-            Some(libc::EPERM)
-        );
-
+    fn tun_reply() -> Vec<u8> {
         let mut data = Vec::new();
         data.extend(attribute(IFLA_TUN_TYPE, &[libc::IFF_TAP as u8]));
         data.extend(attribute(IFLA_TUN_PI, &[0]));
@@ -209,6 +200,47 @@ mod tests {
         let mut body = vec![0; IFINFO];
         body.extend(attribute(IFLA_IFNAME, b"uq-test\0"));
         body.extend(attribute(IFLA_LINKINFO | 0x8000, &info));
+        message(RTM_NEWLINK, &body)
+    }
+
+    fn bridge_reply() -> Vec<u8> {
+        let mut bridge = vec![0; IFINFO];
+        bridge.extend(attribute(
+            IFLA_LINKINFO,
+            &attribute(IFLA_INFO_KIND, b"bridge\0"),
+        ));
+        message(RTM_NEWLINK, &bridge)
+    }
+
+    #[test]
+    fn random_and_mutated_replies_never_panic_parsing() {
+        use crate::tap::test_common::fuzz::{INPUTS, Rng};
+        let seeds = [
+            message(NLMSG_ERROR, &(-libc::ENODEV).to_ne_bytes()),
+            tun_reply(),
+            bridge_reply(),
+        ];
+        let mut rng = Rng::new(0x11ca_0001);
+        let mut reply = Vec::new();
+        for _ in 0..INPUTS {
+            rng.input(&seeds, &mut reply);
+            if rng.below(2) == 0 && reply.len() >= 4 {
+                let length = reply.len() as u32;
+                reply[..4].copy_from_slice(&length.to_ne_bytes());
+            }
+            let _ = parse(&reply);
+        }
+    }
+
+    #[test]
+    fn replies_name_a_missing_other_or_tun_device() {
+        let error = message(NLMSG_ERROR, &(-libc::ENODEV).to_ne_bytes());
+        assert_eq!(parse(&error).unwrap(), Link::Missing);
+        let denied = message(NLMSG_ERROR, &(-libc::EPERM).to_ne_bytes());
+        assert_eq!(
+            parse(&denied).unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
+        );
         let expected = Tun {
             tap: true,
             pi: false,
@@ -216,17 +248,8 @@ mod tests {
             multi_queue: true,
             queues: 2,
         };
-        assert_eq!(
-            parse(&message(RTM_NEWLINK, &body)).unwrap(),
-            Link::Tun(expected)
-        );
-
-        let mut bridge = vec![0; IFINFO];
-        bridge.extend(attribute(
-            IFLA_LINKINFO,
-            &attribute(IFLA_INFO_KIND, b"bridge\0"),
-        ));
-        assert_eq!(parse(&message(RTM_NEWLINK, &bridge)).unwrap(), Link::Other);
+        assert_eq!(parse(&tun_reply()).unwrap(), Link::Tun(expected));
+        assert_eq!(parse(&bridge_reply()).unwrap(), Link::Other);
         assert!(parse(&[1, 2, 3]).is_err());
         assert!(parse(&message(99, &[])).is_err());
     }

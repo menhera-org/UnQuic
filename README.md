@@ -117,7 +117,10 @@ protocol leaves the daemon running unchanged. A third removes the binary after
 it passes the probe: the exec fails, the daemon resumes on the queues it kept
 without losing the VLAN upper, and a later restart hands those queues to a real
 successor. Library code no longer calls `unwrap`, `expect`, `panic!` or
-`unreachable!`; implicit indexing and arithmetic overflow are not yet audited.
+`unreachable!`. Each parser of untrusted bytes takes 200,000 random and
+mutated inputs in a test without panicking, and indexing on those paths is
+checked; indexing in internal state and arithmetic overflow are not yet
+audited.
 These are tracked in Stage 4 of [ROADMAP.md](ROADMAP.md).
 
 Open TAP descriptors already support foreign renames and network-namespace moves

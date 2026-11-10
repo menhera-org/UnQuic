@@ -1083,8 +1083,16 @@ full expired batches sharing the cleanup budget.
   On November 10 the command below, extended with `clippy::unreachable`,
   `clippy::todo` and `clippy::unimplemented`, reported 97 sites; all are gone.
   Broken invariants now return errors, or skip the item where a local
-  fallback is safe. Remaining: implicit indexing, arithmetic overflow,
-  thread startup/join errors and the fault-injection tests.
+  fallback is safe. Every parser of untrusted bytes now has a randomized
+  robustness test: 200,000 deterministic inputs each for wire decoding, flow
+  keys, TAP completions, GSO segmentation, USO/TSO coalescing, reassembly,
+  ancillary data and rtnetlink replies, as random bytes or mutated valid
+  frames. None panicked. The 82 indexing sites on those paths whose bound
+  came from a check in another function now use checked access; the rest have
+  a local check or index fixed arrays. Remaining: indexing in internal state
+  (worker tables, encoders, the batch planner), arithmetic overflow (release
+  builds wrap; debug builds check), thread startup/join errors and the
+  fault-injection tests.
 
   ```sh
   cargo clippy --release --target x86_64-unknown-linux-musl --lib --all-features -- \

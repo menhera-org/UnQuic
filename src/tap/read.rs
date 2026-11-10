@@ -427,6 +427,63 @@ mod tests {
     }
 
     #[test]
+    fn random_completions_never_panic_input_validation_or_segmentation() {
+        use super::super::test_common::{
+            fuzz::{INPUTS, Rng, fix_lengths},
+            tcp, udp,
+        };
+        let mut seeds = Vec::new();
+        for v6 in [false, true] {
+            let mut frame = udp::frame(v6, 7, &[0x5a; 1471]);
+            let header = udp::partial(&mut frame, v6);
+            let mut gso = header;
+            gso[1] = 5;
+            gso[4..6].copy_from_slice(&100u16.to_ne_bytes());
+            seeds.extend([
+                ([0; 10], udp::frame(v6, 1, &[1; 60])),
+                (header, frame.clone()),
+            ]);
+            seeds.push((gso, frame));
+            let mut frame = tcp::frame(v6, 1, 0, 0x10, &[], &[7; 1000]);
+            let header = tcp::partial(&mut frame, v6, 100);
+            seeds.push((header, frame));
+        }
+        let (mut plain, _peer) = queue(false);
+        let (mut vnet, _vnet_peer) = queue(true);
+        let mut rng = Rng::new(0x4ead_0001);
+        let mut input = Vec::new();
+        let mut buffer = vec![0u8; 65_546];
+        for _ in 0..INPUTS {
+            let (mut header, ref seed) = seeds[rng.below(seeds.len())];
+            if rng.below(2) == 0 {
+                header[rng.below(10)] = rng.bits() as u8;
+            }
+            rng.input(std::slice::from_ref(seed), &mut input);
+            if rng.below(2) == 0 {
+                fix_lengths(&mut input);
+            }
+            let size = [crate::MAX_FRAME_LEN + 1, buffer.len()][rng.below(2)];
+            let copied = input.len().min(size);
+            buffer[..copied].copy_from_slice(&input[..copied]);
+            let tap = if rng.below(2) == 0 {
+                &mut plain
+            } else {
+                &mut vnet
+            };
+            let n = if rng.below(4) == 0 {
+                rng.below(size + 20)
+            } else {
+                copied + if tap.vnet { 10 } else { 0 }
+            };
+            if let Ok((length, Some(mut segments))) =
+                tap.finish_input(&header, n, &mut buffer[..size])
+            {
+                super::super::segment::tests::drain(&mut segments, &buffer[..length], &mut rng);
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "kernel ring test; run in a disposable container"]
     fn read_batches_keep_order_boundaries_and_metadata_without_async_workers() {
         let mut ring = Reader::new().unwrap();

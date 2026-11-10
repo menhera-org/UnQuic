@@ -534,7 +534,7 @@ impl<'a> Datagram<'a> {
     /// Checks the complete record area and all header/record relationships.
     pub fn decode(input: &'a [u8]) -> Result<Self, WireError> {
         let header = Header::decode(input)?;
-        let area = &input[HEADER_LEN..];
+        let area = input.get(HEADER_LEN..).ok_or(WireError::Length)?;
         let mut remaining = area;
         let mut count = 0;
         while !remaining.is_empty() {
@@ -546,7 +546,7 @@ impl<'a> Datagram<'a> {
             // A handshake must consume the entire area on its first record.
             let context_count = if length == area.len() { 1 } else { 2 };
             record.validate_context(header, context_count)?;
-            remaining = &remaining[length..];
+            remaining = remaining.get(length..).ok_or(WireError::Length)?;
         }
         if count == 0 {
             return Err(WireError::RecordCount);
@@ -572,7 +572,7 @@ impl<'a> Datagram<'a> {
             }
             // The area was validated in full, so this never stops early.
             let (record, length) = decode_record(remaining).ok()?;
-            remaining = &remaining[length..];
+            remaining = remaining.get(length..)?;
             Some(record)
         })
     }
@@ -898,5 +898,103 @@ fn scattered_data_prefix_rejects_invalid_lengths_before_writing() {
             Err(expected)
         );
         assert_eq!(output, [0xa5; DATA_PREFIX_LEN]);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn random_and_mutated_datagrams_never_panic_decoding() {
+    use crate::tap::test_common::fuzz::{INPUTS, Rng};
+    let header = |handshake: bool| Header {
+        cookie: UnquicUuid::from_bytes([1; 16]),
+        receive_tag: u128::from(!handshake),
+        lane: u16::from(!handshake),
+        record_area_len: 0,
+        packet_number: u64::from(!handshake),
+    };
+    let params = Params {
+        port: 4444,
+        max_frame_len: 9022,
+        mandatory_features: 0,
+        optional_features: 0,
+    };
+    let ranges = [
+        AckRange { start: 90, end: 99 },
+        AckRange { start: 5, end: 7 },
+        AckRange { start: 1, end: 1 },
+    ];
+    let data = Record::Data {
+        frame_id: (1 << 48) | 5,
+        total_len: 100,
+        offset: 10,
+        bytes: &[7; 50],
+    };
+    let ack = Record::Ack {
+        lane: 2,
+        delay_us: 5,
+        ranges: AckRanges::new(&ranges).unwrap(),
+    };
+    let records: [&[Record<'_>]; 11] = [
+        &[data],
+        &[ack],
+        &[Record::Hello {
+            initiator: 1,
+            params,
+        }],
+        &[Record::Challenge {
+            initiator: 1,
+            responder: 2,
+            params,
+        }],
+        &[Record::Probe, Record::Padding { length: 100 }],
+        &[Record::ProbeReply {
+            lane: 1,
+            packet_number: 9,
+            payload_len: 1232,
+        }],
+        &[Record::FrameAbandon {
+            lane: 1,
+            origin: 0,
+            reason: 1,
+            frame_id: (1 << 48) | 3,
+        }],
+        &[Record::Confirm {
+            initiator: 1,
+            responder: 2,
+        }],
+        &[Record::Ready {
+            initiator: 1,
+            responder: 2,
+        }],
+        &[Record::LaneRetire { lane: 2 }],
+        &[data, ack, Record::Probe, Record::LaneRetire { lane: 2 }],
+    ];
+    let seeds: Vec<_> = records
+        .iter()
+        .map(|records| {
+            let mut bytes = vec![0; 2048];
+            let n =
+                encode_datagram(header(records[0].is_handshake()), records, &mut bytes).unwrap();
+            bytes.truncate(n);
+            bytes
+        })
+        .collect();
+    let mut rng = Rng::new(0x3a7e_0001);
+    let mut input = Vec::new();
+    for _ in 0..INPUTS {
+        rng.input(&seeds, &mut input);
+        if rng.below(2) == 0 && input.len() >= HEADER_LEN {
+            let area = (input.len() - HEADER_LEN) as u16;
+            input[38..40].copy_from_slice(&area.to_be_bytes());
+        }
+        let _ = Header::decode(&input);
+        let Ok(datagram) = Datagram::decode(&input) else {
+            continue;
+        };
+        for record in datagram.records() {
+            if let Record::Ack { ranges, .. } = record {
+                ranges.iter().for_each(drop);
+            }
+        }
     }
 }

@@ -60,7 +60,7 @@ impl MtuError {
     /// Available prefix of the original UDP payload, at most one wire header.
     /// Local errors can have an empty quote; short remote quotes cannot prove identity.
     pub fn quoted_payload(&self) -> &[u8] {
-        &self.quote[..self.quote_len]
+        self.quote.get(..self.quote_len).unwrap_or_default()
     }
 }
 
@@ -110,8 +110,10 @@ impl<'a> ReceiveDatagram<'a> {
         } else {
             self.segment_size
         };
-        Ok((0..self.length.div_ceil(size).max(1))
-            .map(move |index| &self.buffer[index * size..((index + 1) * size).min(self.length)]))
+        Ok((0..self.length.div_ceil(size).max(1)).map(move |index| {
+            let end = ((index + 1) * size).min(self.length);
+            self.buffer.get(index * size..end).unwrap_or_default()
+        }))
     }
 }
 
@@ -689,7 +691,8 @@ pub fn recv_batch(fd: BorrowedFd<'_>, datagrams: &mut [ReceiveDatagram<'_>]) -> 
             std::ptr::null_mut(),
         )
     })? as usize;
-    for ((message, control), datagram) in messages[..count].iter().zip(&controls).zip(datagrams) {
+    for ((message, control), datagram) in messages.iter().take(count).zip(&controls).zip(datagrams)
+    {
         datagram.length = message.msg_len as usize;
         let metadata = receive_control(&message.msg_hdr, control);
         let (segment, overflow) = metadata.unwrap_or((0, None));
@@ -1217,6 +1220,68 @@ mod tests {
             received.segments().unwrap().collect::<Vec<_>>(),
             vec![&[] as &[u8]]
         );
+    }
+
+    #[test]
+    fn random_ancillary_metadata_never_panics_parsing_or_segmenting() {
+        use crate::tap::test_common::fuzz::{INPUTS, Rng};
+        let mut rng = Rng::new(0x50c4_0001);
+        // SAFETY: CMSG_LEN only computes lengths; a zeroed msghdr is valid storage.
+        let (gro, error_len, mut message): (usize, usize, libc::msghdr) = unsafe {
+            (
+                libc::CMSG_LEN(4) as usize,
+                libc::CMSG_LEN(size_of::<libc::sock_extended_err>() as _) as usize,
+                zeroed(),
+            )
+        };
+        let mut buffer = [0; 4096];
+        for _ in 0..INPUTS {
+            // SAFETY: zeroed ancillary records are valid initialized storage.
+            let (mut controls, mut error): ([Ancillary; 2], ErrorControl) = unsafe { zeroed() };
+            for control in &mut controls {
+                control.header.cmsg_len =
+                    [gro, gro - 1, gro + 1, 0, rng.bits() as usize][rng.below(5)] as _;
+                (control.header.cmsg_level, control.header.cmsg_type) = [
+                    (libc::IPPROTO_UDP, libc::UDP_GRO),
+                    (libc::SOL_SOCKET, libc::SO_RXQ_OVFL),
+                    (rng.bits() as i32, rng.bits() as i32),
+                ][rng.below(3)];
+                rng.fill(&mut control.data);
+            }
+            error.header.cmsg_len = [
+                error_len,
+                error_len - 1,
+                size_of::<ErrorControl>(),
+                rng.bits() as usize,
+            ][rng.below(4)] as _;
+            error.header.cmsg_level = [libc::IPPROTO_IPV6, rng.bits() as i32][rng.below(2)];
+            error.header.cmsg_type = [libc::IPV6_RECVERR, rng.bits() as i32][rng.below(2)];
+            error.error.ee_errno = [libc::EMSGSIZE as u32, rng.bits() as u32][rng.below(2)];
+            error.error.ee_origin =
+                [libc::SO_EE_ORIGIN_LOCAL, libc::SO_EE_ORIGIN_ICMP6, 7][rng.below(3)];
+            error.error.ee_type = rng.below(4) as u8;
+            error.error.ee_code = rng.below(2) as u8;
+            error.error.ee_info = rng.bits() as u32;
+            message.msg_controllen = [
+                size_of::<[Ancillary; 2]>(),
+                size_of::<Ancillary>(),
+                size_of::<ErrorControl>(),
+                rng.below(200),
+                rng.bits() as usize,
+            ][rng.below(5)] as _;
+            message.msg_flags =
+                [0, libc::MSG_TRUNC, libc::MSG_CTRUNC, rng.bits() as i32][rng.below(4)];
+            mtu_error(&message, &error);
+            let metadata = receive_control(&message, &controls);
+            let size = rng.below(buffer.len() + 1);
+            let mut datagram = ReceiveDatagram::new(&mut buffer[..size]);
+            datagram.length = rng.below(size + 100);
+            datagram.segment_size = metadata.map_or(rng.below(70_000), |(segment, _)| segment);
+            datagram.truncated = rng.below(8) == 0;
+            if let Ok(segments) = datagram.segments() {
+                segments.for_each(drop);
+            }
+        }
     }
 
     #[test]

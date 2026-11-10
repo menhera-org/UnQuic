@@ -1,5 +1,5 @@
 //! Checked UDP/TCP super-frame expansion; no wire-format change.
-use super::uso::{fold, sum};
+use super::uso::{fold, sum, word};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Segments {
@@ -11,10 +11,6 @@ pub(crate) struct Segments {
     next: usize,
     id: u16,
     v6: bool,
-}
-
-fn word(bytes: &[u8], at: usize) -> u16 {
-    u16::from_be_bytes([bytes[at], bytes[at + 1]])
 }
 
 impl Segments {
@@ -120,8 +116,12 @@ impl Segments {
             return 0;
         };
         let header = self.header_len();
-        output[header..header + range.len()].copy_from_slice(&input[range.clone()]);
-        header + range.len()
+        let end = header + range.len();
+        let (Some(payload), Some(source)) = (output.get_mut(header..end), input.get(range)) else {
+            return 0;
+        };
+        payload.copy_from_slice(source);
+        end
     }
 
     pub(crate) const fn header_len(&self) -> usize {
@@ -146,8 +146,10 @@ impl Segments {
         let count = self.size.min(input.len() - self.next);
         let length = header + count;
         let range = self.next..self.next + count;
-        output[..header].copy_from_slice(&input[..header]);
-        self.next += count;
+        // Parse put every offset below inside the header; checked access only
+        // keeps a mismatched source panic-free, and the cursor moves on success.
+        let output = output.get_mut(..header)?;
+        output.copy_from_slice(input.get(..header)?);
         let at = self.transport;
         let transport_length = (header - at + count) as u16;
         let checksum_at = at + if self.tcp { 16 } else { 6 };
@@ -158,43 +160,64 @@ impl Segments {
                 + u32::from(transport_length),
         );
         if self.tcp {
-            let seq = u32::from_be_bytes(input[at + 4..at + 8].try_into().ok()?);
+            let seq = u32::from_be_bytes(*input.get(at + 4..)?.first_chunk()?);
             let seq = seq.wrapping_add((range.start - header) as u32);
-            output[at + 4..at + 8].copy_from_slice(&seq.to_be_bytes());
-            if self.next != input.len() {
-                output[at + 13] &= !0x09; // FIN and PSH belong to the final segment.
+            output
+                .get_mut(at + 4..at + 8)?
+                .copy_from_slice(&seq.to_be_bytes());
+            let flags = output.get_mut(at + 13)?;
+            if range.end != input.len() {
+                *flags &= !0x09; // FIN and PSH belong to the final segment.
             }
             if range.start != header {
-                output[at + 13] &= !0x80; // CWR belongs to the first segment.
+                *flags &= !0x80; // CWR belongs to the first segment.
             }
         } else {
-            output[at + 4..at + 6].copy_from_slice(&transport_length.to_be_bytes());
+            output
+                .get_mut(at + 4..at + 6)?
+                .copy_from_slice(&transport_length.to_be_bytes());
         }
-        output[checksum_at..checksum_at + 2].copy_from_slice(&seed.to_be_bytes());
+        let checksum_field = checksum_at..checksum_at + 2;
+        output
+            .get_mut(checksum_field.clone())?
+            .copy_from_slice(&seed.to_be_bytes());
         // Both transport headers preserve payload word alignment.
-        let checksum = !fold(sum(&output[at..header]) + sum(&input[range.clone()]));
+        let checksum = !fold(sum(output.get(at..)?) + sum(input.get(range.clone())?));
         let checksum = if !self.tcp && checksum == 0 {
             65535
         } else {
             checksum
         };
-        output[checksum_at..checksum_at + 2].copy_from_slice(&checksum.to_be_bytes());
+        output
+            .get_mut(checksum_field)?
+            .copy_from_slice(&checksum.to_be_bytes());
         let ip = self.network;
         if self.v6 {
-            output[ip + 4..ip + 6].copy_from_slice(&((length - ip - 40) as u16).to_be_bytes());
+            let payload_length = (length - ip - 40) as u16;
+            output
+                .get_mut(ip + 4..ip + 6)?
+                .copy_from_slice(&payload_length.to_be_bytes());
         } else {
-            output[ip + 2..ip + 4].copy_from_slice(&((length - ip) as u16).to_be_bytes());
-            output[ip + 4..ip + 6].copy_from_slice(&self.id.to_be_bytes());
+            let total_length = (length - ip) as u16;
+            output
+                .get_mut(ip + 2..ip + 4)?
+                .copy_from_slice(&total_length.to_be_bytes());
+            output
+                .get_mut(ip + 4..ip + 6)?
+                .copy_from_slice(&self.id.to_be_bytes());
+            output.get_mut(ip + 10..ip + 12)?.fill(0);
+            let checksum = !fold(sum(output.get(ip..at)?));
+            output
+                .get_mut(ip + 10..ip + 12)?
+                .copy_from_slice(&checksum.to_be_bytes());
             self.id = self.id.wrapping_add(1);
-            output[ip + 10..ip + 12].fill(0);
-            let checksum = !fold(sum(&output[ip..at]));
-            output[ip + 10..ip + 12].copy_from_slice(&checksum.to_be_bytes());
         }
+        self.next = range.end;
         Some(range)
     }
 
     pub(crate) fn remaining(&self, length: usize) -> usize {
-        (length - self.next).div_ceil(self.size)
+        length.saturating_sub(self.next).div_ceil(self.size)
     }
 
     /// Logical Ethernet bytes still represented by this source, including repeated headers.
@@ -209,9 +232,9 @@ impl Segments {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
-    use crate::tap::test_common::udp;
+    use crate::tap::test_common::{fuzz, udp};
 
     fn packet(v6: bool, count: usize, size: usize, short: bool) -> (Vec<u8>, [u8; 10]) {
         let length = size * count - usize::from(short);
@@ -221,6 +244,60 @@ mod tests {
         header[1] = 5;
         header[4..6].copy_from_slice(&(size as u16).to_ne_bytes());
         (bytes, header)
+    }
+
+    /// Drives a parsed source through bounded writes into undersized and full outputs.
+    pub(in crate::tap) fn drain(segments: &mut Segments, input: &[u8], rng: &mut fuzz::Rng) {
+        let mut output = [0; crate::MAX_FRAME_LEN];
+        for _ in 0..16 {
+            if segments.done(input.len()) {
+                break;
+            }
+            segments.next_len(input.len());
+            segments.remaining(input.len());
+            segments.remaining_bytes(input.len());
+            let size = rng.below(output.len() + 1);
+            let mut borrowed = *segments;
+            borrowed.write_header(input, &mut output[..size]);
+            segments.write(input, &mut output[..size]);
+        }
+    }
+
+    #[test]
+    fn random_metadata_and_frames_never_panic_parsing_or_segmentation() {
+        use crate::tap::test_common::{fuzz::fix_lengths, tcp};
+        let mut seeds = Vec::new();
+        for v6 in [false, true] {
+            let (input, header) = packet(v6, 3, 100, true);
+            seeds.push((header, input));
+            let mut input = tcp::frame(v6, 65534, u32::MAX - 10, 0x19, &[1; 12], &[7; 300]);
+            let header = tcp::partial(&mut input, v6, 100);
+            seeds.push((header, input));
+            let mut input = tcp::frame(v6, 1, 0, 0x10, &[], &[7; 300]);
+            let mut header = tcp::partial(&mut input, v6, 1);
+            let extension = tcp::extend(&mut input, v6) as u16;
+            for at in [2, 6] {
+                let offset = u16::from_ne_bytes([header[at], header[at + 1]]) + extension;
+                header[at..at + 2].copy_from_slice(&offset.to_ne_bytes());
+            }
+            seeds.push((header, input));
+        }
+        let mut rng = fuzz::Rng::new(0x5e60_0001);
+        let mut input = Vec::new();
+        for _ in 0..fuzz::INPUTS {
+            let (mut header, ref seed) = seeds[rng.below(seeds.len())];
+            if rng.below(2) == 0 {
+                header[rng.below(10)] = rng.bits() as u8;
+            }
+            rng.input(std::slice::from_ref(seed), &mut input);
+            if rng.below(2) == 0 {
+                fix_lengths(&mut input);
+            }
+            let limit = [1514, crate::MAX_FRAME_LEN, rng.below(70_000)][rng.below(3)];
+            if let Some(mut segments) = Segments::parse(&header, &input, limit) {
+                drain(&mut segments, &input, &mut rng);
+            }
+        }
     }
 
     #[test]

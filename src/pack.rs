@@ -685,9 +685,9 @@ pub fn flow_hash(frame: &[u8]) -> u64 {
             41 => ipv6(key.2),
             143 if key.2.len() >= 14 => {
                 let (link, inner) = flow_key(key.2);
-                let protocol = u16::from_be_bytes([link[link.len() - 2], link[link.len() - 1]]);
+                let protocol = link.last_chunk().map(|&bytes| u16::from_be_bytes(bytes));
                 if inner.is_some()
-                    || !matches!(protocol, 0x0800 | 0x86dd | 0x8100 | 0x88a8 | 0x9100)
+                    || !matches!(protocol, Some(0x0800 | 0x86dd | 0x8100 | 0x88a8 | 0x9100))
                 {
                     hash.write(link);
                     inner
@@ -781,7 +781,7 @@ fn ipv6(ip: &[u8]) -> Option<IpKey<'_>> {
     let mut next = ip[6];
     let mut offset = 40;
     loop {
-        let payload = &ip[offset..length];
+        let payload = ip.get(offset..length)?;
         let size = match next {
             0 | 43 | 60 => (usize::from(*payload.get(1)?) + 1) * 8,
             51 => {
@@ -800,7 +800,7 @@ fn ipv6(ip: &[u8]) -> Option<IpKey<'_>> {
         if size > payload.len() {
             return None;
         }
-        next = payload[0];
+        next = *payload.first()?;
         offset += size;
     }
 }
@@ -861,6 +861,51 @@ mod tests {
                 fragment[20] = 0x20;
             }
             assert!(!prefer_local_lane(&fragment));
+        }
+    }
+
+    #[test]
+    fn random_and_mutated_frames_never_panic_flow_keys() {
+        use crate::tap::test_common::{
+            fuzz::{INPUTS, Rng, fix_lengths},
+            tcp, udp,
+        };
+        let mut seeds = Vec::new();
+        for v6 in [false, true] {
+            let frame = udp::frame(v6, 1, &[7; 22]);
+            let mut stacked = frame.clone();
+            stacked.splice(12..12, [0x88, 0xa8, 0, 7, 0x81, 0, 0, 9]);
+            let mut extended = tcp::frame(v6, 1, 0, 0x10, &[1; 12], &[7; 100]);
+            tcp::extend(&mut extended, v6);
+            let mut fragment = frame.clone();
+            fragment[20] = if v6 { 44 } else { 0x20 };
+            if v6 {
+                fragment.splice(54..54, [17, 0, 0, 1, 0, 0, 0, 1]);
+            }
+            seeds.extend([frame.clone(), stacked, extended, fragment]);
+            for (protocol, inner) in [
+                (4, udp::frame(false, 1, &[7; 22])[14..].to_vec()),
+                (41, udp::frame(true, 1, &[7; 22])[14..].to_vec()),
+                (143, frame.clone()),
+            ] {
+                let mut outer = frame[..if v6 { 54 } else { 34 }].to_vec();
+                outer[if v6 { 20 } else { 23 }] = protocol;
+                outer.extend_from_slice(&inner);
+                seeds.push(outer);
+            }
+        }
+        for seed in &mut seeds {
+            fix_lengths(seed);
+        }
+        let mut rng = Rng::new(0x9ac4_0001);
+        let mut frame = Vec::new();
+        for _ in 0..INPUTS {
+            rng.input(&seeds, &mut frame);
+            if rng.below(2) == 0 {
+                fix_lengths(&mut frame);
+            }
+            flow_hash(&frame);
+            prefer_local_lane(&frame);
         }
     }
 

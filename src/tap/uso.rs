@@ -21,8 +21,12 @@ pub(super) fn fold(mut sum: u32) -> u16 {
     }
     sum as u16
 }
-fn word(bytes: &[u8], at: usize) -> u16 {
-    u16::from_be_bytes([bytes[at], bytes[at + 1]])
+/// Callers check lengths first; the zero fallback only keeps this panic-free.
+pub(super) fn word(bytes: &[u8], at: usize) -> u16 {
+    bytes
+        .get(at..)
+        .and_then(<[u8]>::first_chunk)
+        .map_or(0, |&pair| u16::from_be_bytes(pair))
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Layout {
@@ -36,11 +40,12 @@ struct Layout {
 
 impl Layout {
     fn pseudo(self, frame: &[u8], length: usize) -> u32 {
+        // transport() checked these ranges; a short frame only sums as zero.
+        let field = |at: usize, length: usize| sum(frame.get(at..at + length).unwrap_or_default());
         let addresses = if self.v6 {
-            sum(&frame[self.ip + 8..self.ip + 24])
-                + sum(&frame[self.destination..self.destination + 16])
+            field(self.ip + 8, 16) + field(self.destination, 16)
         } else {
-            sum(&frame[self.ip + 12..self.ip + 20])
+            field(self.ip + 12, 8)
         };
         addresses + if self.tcp { 6 } else { 17 } + length as u32
     }
@@ -142,8 +147,12 @@ fn transport(frame: &[u8]) -> Option<Layout> {
     };
     (fold(layout.pseudo(frame, frame.len() - at) + sum(&frame[at..])) == 65535).then_some(layout)
 }
+/// Callers check lengths first; the zero fallback only keeps this panic-free.
 fn sequence(frame: &[u8], at: usize) -> u32 {
-    u32::from_be_bytes([frame[at + 4], frame[at + 5], frame[at + 6], frame[at + 7]])
+    frame
+        .get(at + 4..)
+        .and_then(<[u8]>::first_chunk)
+        .map_or(0, |&bytes| u32::from_be_bytes(bytes))
 }
 fn matches(first: &[u8], next: &[u8], layout: Layout, count: usize, payload: usize) -> bool {
     let Layout {
@@ -154,21 +163,24 @@ fn matches(first: &[u8], next: &[u8], layout: Layout, count: usize, payload: usi
         v6,
         ..
     } = layout;
-    first[..ip] == next[..ip]
-        && first[at..at + 4] == next[at..at + 4]
+    // Both frames passed transport(); a range past either end never matches.
+    let same = |range: std::ops::Range<usize>| matches!((first.get(range.clone()), next.get(range)), (Some(a), Some(b)) if a == b);
+    let flags = |frame: &[u8]| frame.get(at + 13).map(|&flags| flags & !8);
+    same(0..ip)
+        && same(at..at + 4)
         && (!tcp
             || (sequence(next, at) == sequence(first, at).wrapping_add(payload as u32)
-                && first[at + 8..at + 13] == next[at + 8..at + 13]
-                && first[at + 13] & !8 == next[at + 13] & !8
-                && first[at + 14..at + 16] == next[at + 14..at + 16]
-                && first[at + 18..header] == next[at + 18..header]))
+                && same(at + 8..at + 13)
+                && flags(first) == flags(next)
+                && same(at + 14..at + 16)
+                && same(at + 18..header)))
         && if !v6 {
-            first[ip..ip + 2] == next[ip..ip + 2]
-                && first[ip + 6..ip + 10] == next[ip + 6..ip + 10]
-                && first[ip + 12..at] == next[ip + 12..at]
+            same(ip..ip + 2)
+                && same(ip + 6..ip + 10)
+                && same(ip + 12..at)
                 && word(next, ip + 4) == word(first, ip + 4).wrapping_add(count as u16)
         } else {
-            first[ip..ip + 4] == next[ip..ip + 4] && first[ip + 6..at] == next[ip + 6..at]
+            same(ip..ip + 4) && same(ip + 6..at)
         }
 }
 
@@ -191,10 +203,13 @@ pub(super) fn write<'a>(
         v6,
         ..
     } = layout;
-    if !(if tcp { enabled.1 } else { enabled.0 }) || (tcp && first[at + 13] & 8 != 0) {
+    // transport() bounds every offset below by the header; `?` only keeps this panic-free.
+    let first_flags = if tcp { *first.get(at + 13)? } else { 0 };
+    if !(if tcp { enabled.1 } else { enabled.0 }) || first_flags & 8 != 0 {
         return None;
     }
-    let size = first.len() - header_len;
+    let data = first.get(header_len..)?;
+    let size = data.len();
     let hash = flow_hash(first);
     let mut vnet = [0u8; 10];
     let mut header = [0u8; 128];
@@ -206,9 +221,9 @@ pub(super) fn write<'a>(
     let mut mask = 1u64;
     let mut payload = size;
     let mut original_bytes = first.len();
-    let mut last_flags = if tcp { first[at + 13] } else { 0 };
+    let mut last_flags = first_flags;
     iov[2] = libc::iovec {
-        iov_base: first[header_len..].as_ptr().cast_mut().cast(),
+        iov_base: data.as_ptr().cast_mut().cast(),
         iov_len: size,
     };
     for (index, next) in std::iter::once(second).chain(frames).take(63).enumerate() {
@@ -222,12 +237,15 @@ pub(super) fn write<'a>(
         {
             break;
         }
-        let length = next.len() - header_len;
+        let Some(data) = next.get(header_len..) else {
+            break;
+        };
+        let length = data.len();
         if length > size || header_len + payload + length > 65535 {
             break;
         }
         iov[count + 2] = libc::iovec {
-            iov_base: next[header_len..].as_ptr().cast_mut().cast(),
+            iov_base: data.as_ptr().cast_mut().cast(),
             iov_len: length,
         };
         count += 1;
@@ -235,7 +253,7 @@ pub(super) fn write<'a>(
         payload += length;
         original_bytes += next.len();
         if tcp {
-            last_flags = next[at + 13];
+            last_flags = *next.get(at + 13)?;
         }
         if length < size || (tcp && last_flags & 8 != 0) {
             break;
@@ -244,25 +262,38 @@ pub(super) fn write<'a>(
     if count == 1 {
         return None;
     }
-    header[..header_len].copy_from_slice(&first[..header_len]);
+    header
+        .get_mut(..header_len)?
+        .copy_from_slice(first.get(..header_len)?);
     let transport_len = payload + header_len - at;
     let checksum_at = at + if tcp { 16 } else { 6 };
     if tcp {
-        header[at + 13] = last_flags;
+        *header.get_mut(at + 13)? = last_flags;
     } else {
-        header[at + 4..at + 6].copy_from_slice(&(transport_len as u16).to_be_bytes());
+        header
+            .get_mut(at + 4..at + 6)?
+            .copy_from_slice(&(transport_len as u16).to_be_bytes());
     }
     if !v6 {
-        header[ip + 2..ip + 4].copy_from_slice(&((header_len + payload - ip) as u16).to_be_bytes());
-        header[ip + 10..ip + 12].fill(0);
-        let checksum = !fold(sum(&header[ip..at]));
-        header[ip + 10..ip + 12].copy_from_slice(&checksum.to_be_bytes());
+        let total_len = (header_len + payload - ip) as u16;
+        header
+            .get_mut(ip + 2..ip + 4)?
+            .copy_from_slice(&total_len.to_be_bytes());
+        header.get_mut(ip + 10..ip + 12)?.fill(0);
+        let checksum = !fold(sum(header.get(ip..at)?));
+        header
+            .get_mut(ip + 10..ip + 12)?
+            .copy_from_slice(&checksum.to_be_bytes());
     } else {
-        header[ip + 4..ip + 6]
-            .copy_from_slice(&((header_len + payload - ip - 40) as u16).to_be_bytes());
+        let payload_len = (header_len + payload - ip - 40) as u16;
+        header
+            .get_mut(ip + 4..ip + 6)?
+            .copy_from_slice(&payload_len.to_be_bytes());
     }
     let checksum = fold(layout.pseudo(&header, transport_len));
-    header[checksum_at..checksum_at + 2].copy_from_slice(&checksum.to_be_bytes());
+    header
+        .get_mut(checksum_at..checksum_at + 2)?
+        .copy_from_slice(&checksum.to_be_bytes());
     vnet[0] = 1; // VIRTIO_NET_HDR_F_NEEDS_CSUM
     vnet[1] = if tcp { if v6 { 4 } else { 1 } } else { 5 };
     for (offset, value) in [
@@ -372,6 +403,76 @@ fn tcp_eligibility_checks_lengths_checksums_flags_and_sequence() {
                 assert!(transport(&bad).is_none(), "checksum mutation at {offset}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn random_and_mutated_frames_never_panic_validation_or_coalescing() {
+    use crate::tap::test_common::{
+        fuzz::{INPUTS, Rng, fix_lengths},
+        tcp, udp,
+    };
+    let mut flows = Vec::new();
+    for v6 in [false, true] {
+        let mut first = udp::frame(v6, 65535, &[1; 120]);
+        let mut next = udp::frame(v6, 0, &[2; 120]);
+        flows.push([first.clone(), next.clone()]);
+        for bytes in [&mut first, &mut next] {
+            bytes.splice(12..12, [0x88, 0xa8, 0, 7, 0x81, 0, 0, 9]);
+        }
+        flows.push([first, next]);
+        for options in [&[][..], &[1; 40][..]] {
+            flows.push([
+                tcp::frame(v6, 65535, u32::MAX - 99, 0x10, options, &[7; 100]),
+                tcp::frame(v6, 0, 0, 0x18, options, &[8; 99]),
+            ]);
+        }
+        let mut pair = [
+            tcp::frame(v6, 1, 0, 0x10, &[], &[7; 100]),
+            tcp::frame(v6, 2, 100, 0x10, &[], &[8; 100]),
+        ];
+        for bytes in &mut pair {
+            tcp::extend(bytes, v6);
+        }
+        flows.push(pair);
+    }
+    // Restores checksums after a mutation so validation can reach coalescing.
+    let repair = |bytes: &mut Vec<u8>| {
+        let v6 = match bytes.get(12..14) {
+            Some([0x86, 0xdd]) => true,
+            Some([0x08, 0x00]) => false,
+            _ => return,
+        };
+        if bytes.len() >= if v6 { 74 } else { 54 } {
+            fix_lengths(bytes);
+            if bytes[if v6 { 20 } else { 23 }] == 6 {
+                tcp::repair(bytes, v6);
+            } else {
+                udp::repair(bytes, v6);
+            }
+        }
+    };
+    let mut rng = Rng::new(0x0505_0001);
+    let (mut first, mut next) = (Vec::new(), Vec::new());
+    for _ in 0..INPUTS {
+        let [seed, follower] = &flows[rng.below(flows.len())];
+        rng.input(std::slice::from_ref(seed), &mut first);
+        if rng.below(2) == 0 {
+            repair(&mut first);
+        }
+        // An unchanged follower keeps coalescing reachable; a mutated one tests barriers.
+        next.clone_from(follower);
+        if rng.below(2) == 0 {
+            rng.input(std::slice::from_ref(follower), &mut next);
+            if rng.below(2) == 0 {
+                repair(&mut next);
+            }
+        }
+        let limit = [1514, crate::MAX_FRAME_LEN, rng.below(10_000)][rng.below(3)];
+        let enabled = (rng.below(4) != 0, rng.below(4) != 0);
+        let frames = [&next[..], follower].into_iter().take(1 + rng.below(2));
+        write(-1, &first, frames, limit, enabled);
     }
 }
 

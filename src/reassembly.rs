@@ -181,11 +181,16 @@ impl Frame {
         self.remaining = length;
         self.prefix_len = 0;
         self.deadline = now.saturating_add(FRAME_LIFETIME);
-        self.covered[..usize::from(length).div_ceil(64)].fill(0);
+        let words = usize::from(length).div_ceil(64).min(self.covered.len());
+        self.covered[..words].fill(0);
     }
 
     fn piece(&mut self, offset: usize, bytes: &[u8]) {
         let end = offset + bytes.len();
+        // Admission checks the range; this keeps every index below in bounds.
+        if end > usize::from(self.length).min(MAX_FRAME_LEN) {
+            return;
+        }
         // Bulk-copy an append only while no out-of-order bytes exist beyond the prefix.
         if !bytes.is_empty()
             && offset == usize::from(self.prefix_len)
@@ -342,7 +347,7 @@ impl Lane {
         Some(Record::Ack {
             lane: self.id,
             delay_us,
-            ranges: AckRanges::new(&output[..count]).ok()?,
+            ranges: AckRanges::new(output.get(..count)?).ok()?,
         })
     }
 
@@ -431,14 +436,19 @@ impl Lane {
                         if u32::from(self.frames[slot].length) != total_len {
                             return Admission::Invalid;
                         }
-                    } else if let Some((_, length)) =
-                        reservations[..count].iter().find(|(id, _)| *id == sequence)
+                    } else if let Some((_, length)) = reservations
+                        .iter()
+                        .take(count)
+                        .find(|(id, _)| *id == sequence)
                     {
                         if u32::from(*length) != total_len {
                             return Admission::Invalid;
                         }
                     } else {
-                        reservations[count] = (sequence, total_len as u16);
+                        // A datagram holds at most 64 records; any excess still counts as pressure.
+                        if let Some(reservation) = reservations.get_mut(count) {
+                            *reservation = (sequence, total_len as u16);
+                        }
                         count += 1;
                     }
                 }
@@ -571,7 +581,7 @@ impl Lane {
         let frame = &self.frames[usize::from(*self.ready.front()?)];
         Some(ReadyFrame {
             id: (u64::from(self.id) << 48) | frame.sequence,
-            bytes: &frame.bytes[..usize::from(frame.length)],
+            bytes: frame.bytes.get(..usize::from(frame.length))?,
         })
     }
 
@@ -579,7 +589,10 @@ impl Lane {
         self.expire(now);
         self.ready.iter().map(|&slot| {
             let frame = &self.frames[usize::from(slot)];
-            &frame.bytes[..usize::from(frame.length)]
+            frame
+                .bytes
+                .get(..usize::from(frame.length))
+                .unwrap_or_default()
         })
     }
 
@@ -759,6 +772,93 @@ mod tests {
         assert_eq!(lane.free.len(), FRAME_CAPACITY);
         assert_eq!(lane.ready_frames(Duration::ZERO).count(), 0);
     }
+    #[test]
+    fn random_and_mutated_datagrams_never_panic_admission() {
+        use crate::{
+            UnquicUuid,
+            tap::test_common::fuzz::{INPUTS, Rng},
+            wire::{Header, encode_datagram},
+        };
+        let mut rng = Rng::new(0x4ea5_0001);
+        let mut lane = Lane::new(1, 4000).unwrap();
+        let payload = [0x5a; MAX_FRAME_LEN];
+        let mut output = [0; 8192];
+        let mut bytes = Vec::new();
+        let mut ranges = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
+        let (mut now, mut packet, mut base) = (Duration::ZERO, 1_u64, 1_u64);
+        for _ in 0..INPUTS {
+            // Mostly nearby frames, so pieces overlap, conflict and complete.
+            base = base.max(lane.lower_bounds().1)
+                + rng.below(3) as u64
+                + if rng.below(1000) == 0 { 1 << 40 } else { 0 };
+            let mut records = [Record::Probe; 4];
+            let count = 1 + rng.below(records.len());
+            for record in &mut records[..count] {
+                let frame_id = (1 << 48) | ((base + rng.below(300) as u64) & SEQUENCE_MASK);
+                let range = [128, 1600, MAX_FRAME_LEN - 13][rng.below(3)];
+                let total = 14 + rng.below(range);
+                let offset = rng.below(total);
+                let length = 1 + rng.below((total - offset).min(1500));
+                *record = if rng.below(8) == 0 {
+                    Record::FrameAbandon {
+                        lane: 1,
+                        origin: 0,
+                        reason: 1,
+                        frame_id,
+                    }
+                } else {
+                    Record::Data {
+                        frame_id,
+                        total_len: total as u32,
+                        offset: offset as u32,
+                        bytes: &payload[..length],
+                    }
+                };
+            }
+            packet += 1 + rng.below(2) as u64;
+            let packet_number = match rng.below(10) {
+                0 => packet.saturating_sub(rng.below(100_000) as u64).max(1),
+                1 => {
+                    packet += rng.below(70_000) as u64;
+                    packet
+                }
+                _ => packet,
+            };
+            let header = Header {
+                cookie: UnquicUuid::from_bytes([1; 16]),
+                receive_tag: 1,
+                lane: 1,
+                record_area_len: 0,
+                packet_number,
+            };
+            let Ok(n) = encode_datagram(header, &records[..count], &mut output) else {
+                continue;
+            };
+            bytes.clear();
+            bytes.extend_from_slice(&output[..n]);
+            if rng.below(4) == 0 {
+                rng.mutate(&mut bytes);
+                // One mutated packet number must not age out every later packet.
+                if let Some(number) = bytes.get_mut(40..48) {
+                    number.copy_from_slice(&packet_number.to_be_bytes());
+                }
+            }
+            if let Ok(datagram) = Datagram::decode(&bytes) {
+                lane.admit(&datagram, now);
+            }
+            match rng.below(8) {
+                0 => _ = lane.finish_front(),
+                1 => lane.finish_ready(rng.bits()),
+                2 => _ = lane.take_ack(now, &mut ranges),
+                3 => _ = lane.abandon((1 << 48) | (base + rng.below(400) as u64)),
+                // Rare expiry lets incomplete frames fill every slot.
+                4 if rng.below(8) == 0 => now += Duration::from_millis(rng.below(150) as u64),
+                5 => _ = lane.front(now),
+                _ => {}
+            }
+        }
+    }
+
     #[test]
     fn contiguous_copy_preserves_coverage_overlap_and_reused_slots() {
         let mut frame = Frame::empty();
