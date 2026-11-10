@@ -1194,3 +1194,66 @@ fn outer_loss_repairs_twice_and_late_original_never_duplicates_tap_delivery() {
     left.stop();
     right.stop();
 }
+
+#[test]
+#[ignore = "requires disposable container with tun, iproute2, the vrf module and network capabilities"]
+fn endpoints_bound_to_a_vrf_forward_through_its_table() {
+    // SAFETY: only this test thread and its runtimes enter the namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let net = UdpSocket::bind("[::]:0").unwrap();
+    up(&net, c"lo");
+    ip(&["link", "add", "uq-vrf", "type", "vrf", "table", "10"]);
+    ip(&["link", "set", "uq-vrf", "up"]);
+    let addresses: [Ipv6Addr; 2] = ["fd00:10::1".parse().unwrap(), "fd00:10::2".parse().unwrap()];
+    for address in addresses {
+        let address = format!("{address}/128");
+        ip(&["-6", "addr", "add", &address, "dev", "uq-vrf", "nodad"]);
+    }
+    // The main table has no route, so only VRF-bound sockets reach these addresses.
+    let unbound = UdpSocket::bind("[::]:0").unwrap();
+    assert!(unbound.send_to(&[0], (addresses[1], 41301)).is_err());
+    let bound = |name, side: usize, port, remote| {
+        let mut config = config(name, port, remote);
+        config.sessions.truncate(1);
+        config.peers.truncate(1);
+        config.daemon.memory_limit = Daemon::default().memory_limit;
+        config.sessions[0].queue_count = 1;
+        config.peers[0].tx_lanes = 1;
+        config.endpoints[0].listen_address = addresses[side];
+        config.endpoints[0].bind_device = Some(c"uq-vrf".into());
+        config.peers[0].address = Some(addresses[1 - side]);
+        config
+    };
+    let mut left = Running::start(bound("uq-vrf-left", 0, 41300, 41301));
+    let mut right = Running::start(bound("uq-vrf-right", 1, 41301, 41300));
+    until(Duration::from_secs(5), || {
+        left.control.ready() && right.control.ready()
+    });
+    up(&net, c"uq-vrf-left");
+    up(&net, c"uq-vrf-right");
+    until(Duration::from_secs(5), || {
+        left.control.session(0).unwrap().carrier && right.control.session(0).unwrap().carrier
+    });
+    let sockets = [
+        raw_socket(c"uq-vrf-left", 0x88b5),
+        raw_socket(c"uq-vrf-right", 0x88b5),
+    ];
+    let mut input = [0; 2000];
+    for direction in 0..2 {
+        let mut frame = [0x5a; 60];
+        frame[..12].copy_from_slice(&[2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2]);
+        frame[12..14].copy_from_slice(&0x88b5_u16.to_be_bytes());
+        frame[14] = direction as u8;
+        until(Duration::from_secs(5), || {
+            raw_send(&sockets[direction], &frame);
+            while let Some(n) = raw_read(&sockets[1 - direction], &mut input) {
+                if input[..n] == frame {
+                    return true;
+                }
+            }
+            false
+        });
+    }
+    left.stop();
+    right.stop();
+}

@@ -1087,7 +1087,11 @@ three equal points:
 UDP_LOAD=/absolute/udp_load sh benches/netem_check.sh /absolute/unquic /tmp/out
 ```
 
-Bridge/OVS/VRF matrices, real RA/DHCPv6 resolver networks, physical-NIC offload
+A runtime test creates a VRF in its namespace holding both outer addresses,
+which the main table cannot reach, and forwards frames both ways between two
+runtimes whose endpoints bind to it.
+
+Bridge/OVS matrices, real RA/DHCPv6 resolver networks, physical-NIC offload
 qualification, Linux 5.0 qualification and performance acceptance remain open.
 
 ## License
