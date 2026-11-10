@@ -9,13 +9,25 @@ section 15 of the design and the "Implementation status" section of
 
 ## November 10 checkpoint
 
-Two changes are adopted: coalescing waiting ACKs per lane with 32 transfer
-boxes per worker, and draft 07's application-limited bubbles from a per-group
-unsent-data mask
-([BENCH.md](BENCH.md#application-limited-bubbles-from-unsent-data-november-10)).
-The decision workload is CPU-bound: at sixteen flows every worker runs at
-79–99% of a core, so moving work between workers no longer helps, and the
-ACK-lane and whole-plan candidates were rejected.
+Three performance changes are adopted: coalescing waiting ACKs per lane with
+32 transfer boxes per worker, draft 07's application-limited bubbles from a
+per-group unsent-data mask
+([BENCH.md](BENCH.md#application-limited-bubbles-from-unsent-data-november-10)),
+and draft 07's three-quantum offload budget, which lifts the loopback check's
+window-limited direction by up to 71%. The decision workload is CPU-bound: at
+sixteen flows every worker runs at 79–99% of a core, so moving work between
+workers no longer helps, and the ACK-lane and whole-plan candidates were
+rejected. Fixed flow-hash keys also leave workers idle when only a few flows
+run.
+
+Stage 3's remaining work items are done: a netem loss-and-reordering container
+check and the loss sweep, which shows draft 07 collapsing at 5% loss. Stage 4
+gained double-fork readiness, the systemd unit template, VRF and Ethernet
+composition tests, and the removal of every explicit panic call from library
+code. Next, in the order below: stage 4's TAP lifetime and descriptor
+handover, resource stress, the remaining V03 lifecycle cases and implicit
+panics; then stage 5's candidates, led by single-flow striping and lane
+placement, which bound both the single-flow target and the local gate.
 
 On the single-flow target, draft 07's short-term bounds were the first limit.
 After any loss round outside probing, `bw_shortterm` becomes the larger of the
