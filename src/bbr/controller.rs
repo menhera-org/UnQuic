@@ -822,7 +822,8 @@ impl Controller {
     }
 
     fn quantized(&self, cap: u64) -> u64 {
-        let cap = cap.max(u64::from(self.quantum)).max(self.min_cwnd());
+        // Draft 07's TCP offload budget: one quantum queued, one being sent, one at the receiver.
+        let cap = cap.max(3 * u64::from(self.quantum)).max(self.min_cwnd());
         if self.state == State::Up {
             cap.saturating_add(2 * u64::from(self.mss))
         } else {

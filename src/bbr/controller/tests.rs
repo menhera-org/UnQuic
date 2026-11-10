@@ -369,7 +369,8 @@ fn low_bdp_model_floors_and_saturating_volume_math() {
     c.set_cwnd(1500);
     assert_eq!(c.cwnd, 6000);
     c.state = State::Up;
-    assert_eq!(c.quantized(0), 9000);
+    // Three 3,000-byte send quanta exceed the 6,000-byte pipe floor; Up adds two datagrams.
+    assert_eq!(c.quantized(0), 12000);
     assert_eq!(bytes_in(u64::MAX, Duration::MAX, true), u64::MAX);
     assert_eq!(bytes_in(1, Duration::from_nanos(1), true), 1);
     assert_eq!(bytes_in(1, Duration::from_nanos(1), false), 0);

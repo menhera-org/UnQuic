@@ -8,7 +8,9 @@ Gbit/s per direction at 2G and 5G. On the single-flow target with 1% loss,
 draft 07's short-term bounds pin delivery near 0.45–0.8 Gbit/s; a switch, off
 by default, that cuts them only above 2% loss raises it to 0.79–0.98 Gbit/s,
 where one worker's CPU becomes the limit. One generator offers only about
-2.5 Gbit/s for one flow. No gate has passed.
+2.5 Gbit/s for one flow. Draft 07's three-quantum offload budget lifts the
+loopback check to 5.77 / 2.81 Gbit/s. At 5% loss draft 07 collapses delivery,
+and fixed flow hashing leaves workers idle with few flows. No gate has passed.
 
 Later on November 9 the sender's per-batch grants and ordered commits were
 replaced by a shared atomic send budget (design section 9). On the decision
@@ -136,6 +138,68 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## The four-flow asymmetry is a lane-hash collision (November 10)
+
+Four-flow decision rows have shown L→R near 0.6–0.8 Gbit/s at 5G while R→L
+reaches 1.8 in every build since November 9. Per-worker counters from the
+application-limited run explain it. Each direction's four flows hash onto
+lanes, and a lane's transmit owner is fixed. L→R's flows land on only two
+lanes: left workers 2 and 3 send 4.8 and 4.4 GB in 20 s while worker 1 sends
+141 KB and runs at 0% CPU. R→L's flows land on three lanes, sent by three right
+workers. The kernel's TAP queue steering collides the same way, two flows in
+one queue and none in another. Flow tuples and hashes are fixed, so all three
+repeats match. With 16 flows on 8 workers about one worker per daemon still
+idles by chance; on the loopback check two left workers run at 0% and 6%.
+Four-flow rows therefore measure hash placement as much as transport cost.
+Balancing a few heavy flows needs flow-aware lane assignment or stage 5's
+single-flow striping.
+
+## Three-quantum offload budget (November 10)
+
+A traced loopback overload check (QinQ, eight workers, 44-segment GSO,
+21 Gbit/s requested) now delivers 5.32 Gbit/s L→R but 1.54 R→L, and 1.68 R→L
+even at 4G offered, with no worker above 81% of a core. The R→L sender is
+window-limited half the time: its mean window is 115–128 KB against 380 KB
+and more on the left. Its `min_rtt` is 24–38 µs while its smoothed RTT is
+74–580 µs, so twice the BDP is only about 20 KB and the window rests on the
+offload floor of one send quantum plus the aggregation estimate. Window-limited
+delivery then lowers the bandwidth estimate itself.
+
+Draft 07 gives two offload budgets: TCP's three send quanta (one queued at the
+sender, one in segmentation offload, one in the receiver's GRO or delayed ACK)
+and, in the simplest QUIC case, one, which it says should grow when sends are
+scheduled ahead. The design chose one. Here several workers each claim up to
+one quantum per syscall batch and the receiver acknowledges every 16
+datagrams, so the TCP reasoning applies. The change raises the budget to three
+quanta, 192 KB at full rate.
+
+Stated before measuring: on the loopback check R→L delivery should rise beyond
+the control's range at both points. On the 4.5 ms decision workload twice the
+BDP exceeds 192 KB at every measured rate, so delivery should stay within the
+control's range; a fall there rejects the change.
+
+On the [loopback check](benches/tap-offload-loop.json), three interleaved
+repeats (medians, L→R / R→L, Gbit/s):
+
+| Offered | Current head | Three quanta |
+| --- | --- | --- |
+| 4G | 3.93 / 2.64 | 3.96 / 3.95 |
+| 21G | 6.15 / 1.64 | 5.77 / 2.81 |
+
+R→L rises beyond the control's range at both points, by 50% and 71%. At 21G
+L→R falls 6%, just below its range: the left daemon also receives the larger
+R→L stream, and its busiest worker stays near 90% of a core. The sum rises 10%.
+
+The first three-repeat [decision pass](benches/tap-offload-budget.json) put five
+directions 0.3–6% below the control's range and one 6% above. The bar above
+would reject that, but at these rates the floor cannot bind, so a second
+independent pass checked whether the falls replicate. They did not: that pass's
+two clear falls, 5% and 5.5%, were in cells the first pass had within or at
+its range, and no cell fell clearly in both. Pooled over all six repeats per
+build, every one of the sixteen medians lies within the control's six-repeat
+range. Adopted. Draft 07's TCP budget becomes the transport's; design
+section 9 records the change.
 
 ## Stage 3 loss sweep (November 10)
 

@@ -146,7 +146,12 @@ rules apply to all of them.
    stage 5, where the 5% rows need forward error correction or a
    loss-agnostic response.
 5. **Close the stage 2 gate:** 20 Gbit/s each direction locally at inner MTU
-   1500, plus the small-frame burst rows.
+   1500, plus the small-frame burst rows. On November 10 the loopback overload
+   check delivers 5.77 / 2.81 Gbit/s at 21 Gbit/s requested, after draft 07's
+   three-quantum offload budget lifted the window-limited R→L sender by 71%
+   ([BENCH.md](BENCH.md#three-quantum-offload-budget-november-10)). The
+   busiest left worker is near a full core while two others idle, so lane
+   placement and per-frame cost bound it next.
 6. **Stage 4**, as listed in its section: TAP lifetime and descriptor handover,
    the rest of the panic audit (explicit `unwrap`/`expect`/`panic!` sites are
    gone; implicit indexing and overflow remain), OVS in the composition matrix,
@@ -1081,6 +1086,20 @@ design names them: reuseport steering, inner GSO representation as a
 negotiated optional feature bit, single-flow striping with a bounded reorder
 queue, FEC. Each one lands behind a config switch defaulting to off until its
 `BENCH.md` row shows a win on the target CPU budget.
+
+November 10 evidence for that list, all in BENCH.md:
+
+- Single-flow striping: one flow stops near 1 Gbit/s per direction because one
+  transmit worker carries it and saturates, even with `tolerate_random_loss`.
+- Lane placement for few flows: `flow_hash` uses fixed keys, so four flows
+  land on two lanes in one direction and three in the other, every run, and
+  leave workers idle. Load-aware assignment must still pin a flow while its
+  frames are in flight, including when the kernel moves it between TAP queues.
+- FEC or a loss-agnostic response: at 5% random loss draft 07 collapses
+  delivery below 11% of even a 0.5 Gbit/s offer.
+- Batching while application-limited: correctly marked light load stays in
+  Startup and sends about 1.4 frames per claim, costing CPU at equal delivery.
+- `tolerate_random_loss` by default: needs a coexistence measurement first.
 
 ## Stage 6: protocol freeze
 
