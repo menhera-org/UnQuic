@@ -236,6 +236,9 @@ lane identity are rechecked before sends and buffer returns. Incoming ACKs now
 reach TX-owned histories, bounded loss scans and selective payload recovery.
 Once history copies validated ranges, the transfer buffer returns immediately;
 ACK timing and loss protection remain until the final coordinator report returns.
+Each worker owns 32 transfer buffers. While a lane's earlier ACK still waits
+for its turn, a newer ACK for that lane replaces it and the older buffer goes
+back at once.
 UDP receive batches retain a timestamp taken after the receive call, including
 across GRO expansion and worker handoff. Data sends recheck frame deadlines
 immediately before each syscall and GSO fallback. Expired plans return to bounded
@@ -823,7 +826,8 @@ may have been retained, but that packet is not ACK-eligible. `queue_drops`
 counts bounded handoff/retention queue failures separately. Its
 `ack_buffer_drops` subset counts incoming ACK records rejected because all
 reserved ACK buffers are busy; do not add it to `queue_drops`. Both appear
-in worker/session totals. Drops before lane admission have no lane total. `socket_overflow` counts
+in worker/session totals. `ack_coalesced` counts waiting ACK records replaced
+by a newer ACK for the same lane; these are not drops. Drops before lane admission have no lane total. `socket_overflow` counts
 SO_RXQ_OVFL increments per receive socket, in kernel skb units, at worker scope.
 GRO means these are not necessarily logical datagrams. The kernel reports a
 cumulative 32-bit count on subsequent receives. Modular forward deltas below

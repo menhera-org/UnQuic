@@ -15,7 +15,7 @@ mod tests;
 mod timers;
 use owner::Owner;
 
-const ACK_BUFFERS: usize = 4;
+const ACK_BUFFERS: usize = 32;
 /// Send records per worker; their handles also key the worker's recovery journal.
 pub(super) const RECORDS: usize = 65_535;
 /// Retry interval while the shared window, not pacing, refuses a claim.
@@ -529,6 +529,21 @@ impl Worker {
                 );
             }
             return self.return_ack(ack);
+        }
+        // The receiver lists its newest ranges, so the later of two ACKs waiting for
+        // one lane covers the other: keep only it and recycle the stale buffer now.
+        let largest = |ack: &Ack| ack.ranges[..ack.count].first().map_or(0, |range| range.end);
+        if let Some(position) = self.sender.incoming.iter().position(|old| {
+            old.session == ack.session && old.lane == ack.lane && old.tag == ack.tag
+        }) {
+            let old = &mut self.sender.incoming[position];
+            let stale = if largest(&ack) >= largest(old) {
+                std::mem::replace(old, ack)
+            } else {
+                ack
+            };
+            self.counters.ack_coalesced = self.counters.ack_coalesced.wrapping_add(1);
+            return self.return_ack(stale);
         }
         if self.sender.incoming.len() == self.sender.incoming.capacity() {
             return Err(io::Error::other("duplicate incoming ACK buffer"));

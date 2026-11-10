@@ -94,13 +94,16 @@ rules apply to all of them.
    of a core, so moving ACK work around cannot help, and a pool of four
    reports per worker changed nothing on the single-flow target
    ([BENCH.md](BENCH.md#whole-plan-claims-and-acks-routed-to-their-peer-owner-november-10)).
-3. **Size capacities** (audit step 5): per-session retention credit that busy
-   workers can borrow, shared receive slots per worker, and the ACK-box pool,
-   each sized from the delayed and lossy rows, with memory cost reported.
-   Target one flow at 5 Gbit/s at 7.5 ms with 0.5% and 1% loss on four workers,
-   within two to four cores per daemon. One generator process offers only
-   about 2.5 Gbit/s for one flow, so the harness must change before the
-   5 Gbit/s point can be offered.
+3. **Size capacities** (audit step 5). The ACK-box pool is done: 32 boxes per
+   worker, with a newer ACK replacing one still waiting for the same lane,
+   remove ACK-buffer drops and raise ten of sixteen decision directions by
+   5–37% ([BENCH.md](BENCH.md#more-ack-boxes-and-coalescing)). Remaining:
+   per-session retention credit that busy workers can borrow and shared receive
+   slots per worker, each sized from the delayed and lossy rows, with memory
+   cost reported. Target one flow at 5 Gbit/s at 7.5 ms with 0.5% and 1% loss
+   on four workers, within two to four cores per daemon. One generator process
+   offers only about 2.5 Gbit/s for one flow, so the harness must change before
+   the 5 Gbit/s point can be offered.
 4. **Finish stage 3:** general application-limited detection; the container
    test with `tc netem` loss and reordering proving no duplicate delivery and
    bounded memory; the 0, 0.1, 1 and 5% loss sweep at 4.5 and 7.5 ms with
@@ -132,7 +135,7 @@ Rules it adds to "Rules for every change":
 - The shared sender's contract is provisional and may change with evidence:
   one coordinator on worker 0, epoch batching with ordered commits, the
   aggregate burst cap of min(quantum, 64 datagrams), the 4 MiB/s control
-  ceiling, the `8192 / workers` retention split and four ACK boxes per worker.
+  ceiling, the `8192 / workers` retention split and 32 ACK boxes per worker.
   Any replacement must keep one congestion budget per path group, account for
   every transmitted byte including partial sends, sample delivery rate
   exactly, and keep each packet's send before its ACK.
@@ -165,8 +168,8 @@ Its steps, in order:
 4. **Redesign the coordinator and amend the design.** The section 9
    amendment, its equivalence oracle and the runtime replacement are done and
    measured. Sending ACKs from receive owners was measured and rejected.
-5. **Size capacities for the path.** Not started; item 3 of "Next, in
-   order". Only after steps 2 to 4: per-session retention credit that busy
+5. **Size capacities for the path.** In progress; item 3 of "Next, in
+   order". The ACK-box pool is sized. Only after steps 2 to 4: per-session retention credit that busy
    workers can borrow, shared receive slots per worker and the ACK-box pool,
    each sized from the delayed and lossy decision rows with memory cost
    reported. Target: one flow at 5 Gbit/s at 7.5 ms with 0.5% and 1% loss on

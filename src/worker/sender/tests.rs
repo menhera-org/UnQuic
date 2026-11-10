@@ -1170,6 +1170,48 @@ fn canceled_higher_reservation_discards_an_unreserved_old_plan_suffix() {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
+fn a_newer_ack_replaces_one_still_waiting_for_its_lane() {
+    let (mut workers, _rx) = workers();
+    for _ in 0..2 {
+        // The fixture clock stands still; release the pacing slot the last send took.
+        workers[1].sender.budgets[0].hold_pacing(Duration::ZERO);
+        frame(&mut workers[1]);
+        for _ in 0..8 {
+            service(&mut workers);
+        }
+    }
+    let index = workers[1].sender_index(0, 1).unwrap();
+    let newest = workers[1].sender.lanes[index].history.highest_sent();
+    assert!(newest >= 2);
+    let worker = &mut workers[1];
+    worker.io_time = Some(Ok);
+    // A report in flight keeps the lane busy, so ACKs wait in the queue.
+    worker.sender.lanes[index].report_pending = true;
+    let now = Duration::from_millis(2);
+    let ack = |worker: &mut Worker, end: u64| {
+        let ranges = [AckRange { start: 1, end }];
+        worker
+            .incoming_ack(0, 1, 2, 0, AckRanges::new(&ranges).unwrap(), now)
+            .unwrap();
+    };
+    ack(worker, newest - 1);
+    ack(worker, newest);
+    ack(worker, newest - 1);
+    assert_eq!(worker.sender.incoming.len(), 1);
+    assert_eq!(worker.sender.incoming[0].ranges[0].end, newest);
+    assert_eq!(worker.counters.ack_coalesced, 2);
+    assert_eq!(worker.sender.ack_free.len(), ACK_BUFFERS - 1);
+    assert_eq!(worker.counters.ack_buffer_drops, 0);
+    worker.sender.lanes[index].report_pending = false;
+    for _ in 0..8 {
+        service(&mut workers);
+    }
+    assert_eq!(workers[1].sender.lanes[index].history.inflight_bytes(), 0);
+    assert_eq!(workers[1].sender.ack_free.len(), ACK_BUFFERS);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
 fn ack_buffer_pressure_counts_only_excess_and_reuses_returned_storage() {
     let (mut workers, _rx) = workers();
     frame(&mut workers[1]);
@@ -3252,6 +3294,7 @@ fn ack_transfer_returns_before_final_report_and_reuses_without_changing_fences()
     report.id.generation -= 1;
 
     // Reuse every transfer box while the coordinator's final report is held.
+    // Repeats of one lane's ACK wait as one; the superseded boxes go home.
     let later = now + Duration::from_millis(1);
     for _ in 0..ACK_BUFFERS {
         workers[0]
@@ -3261,7 +3304,8 @@ fn ack_transfer_returns_before_final_report_and_reuses_without_changing_fences()
     workers[0].flush_sender_messages(later).unwrap();
     workers[1].drain_queues(later).unwrap();
     workers[1].begin_sender_ack().unwrap();
-    assert_eq!(workers[1].sender.incoming.len(), ACK_BUFFERS);
+    assert_eq!(workers[1].sender.incoming.len(), 1);
+    assert_eq!(workers[1].counters.ack_coalesced, ACK_BUFFERS as u64 - 1);
     assert_eq!(workers[1].sender.acks_pending, 1);
     assert_eq!(workers[1].sender.loss_fences, 1);
     let timing = workers[1].sender.lanes[index].ack.as_ref().unwrap();

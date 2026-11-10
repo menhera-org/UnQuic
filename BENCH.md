@@ -218,10 +218,47 @@ into spurious losses. Early warm-up points also show a rarer failure: one
 direction falls to about 1% delivery at 0.125 Gbit/s offered with zero repairs
 sent while its pacing rate collapses.
 
-Next: size the ACK-transfer pool (step 5's ACK-box pool), then re-measure; if
-the rate stays pinned without ACK drops, the controller's response to random
-loss is the limit, and meeting the target needs a deliberate deviation from
-draft 07 recorded in the design, not a tuning constant.
+### More ACK boxes, and coalescing
+
+Stated before measuring: eight times the ACK-transfer boxes, 32 per worker,
+should remove the drops and raise delivery on the target. If the rate stays
+pinned without drops, the controller's response to random loss is the limit.
+
+[32 boxes alone](benches/tap-single-flow-ack-boxes.json) cut drops from 15–27
+thousand per run to about one thousand, but delivery fell by about 30% in
+every direction, to 0.50–0.56 Gbit/s. The extra boxes let stale ACKs queue
+behind a lane's busy report, so the owner applied old evidence late. Rejected
+on their own.
+
+Coalescing keeps one waiting ACK per lane. A newer ACK for a lane whose
+earlier ACK still waits replaces it, and the older box goes back to its sender
+at once; the `ack_coalesced` counter counts these replacements, which are not
+drops. With 32 boxes and coalescing, [the target](benches/tap-single-flow-coalescing.json)
+drops no ACKs and gains 6–9% at its 2.5 Gbit/s point with 0.5% loss. At
+1 Gbit/s with 1% loss, two of three left-to-right runs collapsed, a warm-up
+failure still to be traced.
+
+On the [decision workload](benches/tap-ack-coalescing.json), three
+interleaved repeats with the shared budget as control (medians, L→R / R→L,
+Gbit/s):
+
+| Flows, loss | Offered | Shared budget | Coalescing |
+| --- | --- | --- | --- |
+| 16, 0% | 2G | 1.503 / 1.586 | 1.588 / 1.588 |
+| 16, 0% | 5G | 1.832 / 1.506 | 2.156 / 1.493 |
+| 16, 0.1% | 2G | 1.521 / 1.463 | 1.646 / 1.616 |
+| 16, 0.1% | 5G | 1.845 / 1.318 | 1.966 / 1.426 |
+| 4, 0% | 2G | 0.967 / 1.508 | 1.302 / 1.364 |
+| 4, 0% | 5G | 0.638 / 1.868 | 0.803 / 1.860 |
+| 4, 0.1% | 2G | 1.029 / 1.503 | 1.104 / 1.451 |
+| 4, 0.1% | 5G | 0.584 / 1.840 | 0.762 / 1.760 |
+
+ACK-buffer drops fall from 24–106 thousand per run to none. Ten directions
+rise beyond the control's range, by 5–37%. Three fall below it: four-flow 2G
+R→L by 10%, four-flow 5G R→L with loss by 4%, and sixteen-flow 5G R→L by 1%.
+Summed delivery rises 6%. Adopted. One repeat's four-flow 5G point with loss
+overlapped an unpinned compile on the host; it has the cell's lowest offered
+load and delivery, and the other two repeats lead to the same conclusion.
 
 ## Replacing grants with a shared send budget (November 9)
 

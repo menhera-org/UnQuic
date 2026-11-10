@@ -139,6 +139,8 @@ metrics! {
     ack_send_deferred: sum,
     /// ACK records dropped for lack of a reserved receive buffer; a subset of queue_drops, not additive.
     ack_buffer_drops: sum,
+    /// Waiting ACK records superseded by a newer ACK of the same lane, not drops.
+    ack_coalesced: sum,
     /// TAP sources rejected by worker retention quotas, the receive-buffer reserve or a
     /// full owner input queue; a subset of queue_drops, not additive.
     tx_admission_drops: sum,
