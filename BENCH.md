@@ -139,6 +139,47 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Round-robin lanes for new flows (November 10)
+
+The section below shows four flows hashing onto two lanes in one direction.
+A switch, `daemon.balance_flows`, off by default, gives each TAP reader a
+fixed four-way flow table: a flow's first frame takes the session's next lane
+round-robin, and the flow keeps that lane while it sends. It may move only
+after a second of silence, beyond any frame's lifetime, so a move cannot
+reorder frames. A full table set falls back to the hash lane. A flow the
+kernel moves to another TAP queue meets a new reader's table and can change
+lanes, which may reorder frames once; the design already accepts this for
+reader-local lanes.
+
+Stated before measuring: on the decision workload's four-flow rows, L→R at 2G
+and 5G should rise beyond the control's range toward the R→L level, since all
+four transmit workers then carry traffic. Sixteen-flow rows should stay within
+range or rise slightly. A direction that falls beyond the control's range
+rejects the switch.
+
+[Three interleaved repeats](benches/tap-balance-flows.json), one binary with
+the switch off and on (medians, L→R / R→L, Gbit/s):
+
+| Flows, loss | Offered | Hash lanes | Balanced lanes |
+| --- | --- | --- | --- |
+| 16, 0% | 2G | 1.520 / 1.525 | 1.855 / 1.749 |
+| 16, 0% | 5G | 1.995 / 1.355 | 1.795 / 1.732 |
+| 16, 0.1% | 2G | 1.545 / 1.503 | 1.855 / 1.814 |
+| 16, 0.1% | 5G | 1.818 / 1.323 | 1.753 / 1.661 |
+| 4, 0% | 2G | 0.957 / 1.449 | 1.928 / 1.780 |
+| 4, 0% | 5G | 0.745 / 1.774 | 1.706 / 1.459 |
+| 4, 0.1% | 2G | 0.941 / 1.365 | 1.706 / 1.834 |
+| 4, 0.1% | 5G | 0.732 / 1.628 | 1.306 / 1.381 |
+
+At 2G, where the daemons have CPU to spare, all eight directions rise beyond
+the control's range, by 15–101%. At 5G both daemons are CPU-bound, and every
+row's total rises, by 5–26%. The direction that hashing had favored falls in
+each 5G row: sixteen-flow L→R by 10% and 4%, four-flow R→L by 18% and 15%,
+all beyond the control's range, as CPU moves to the other direction. The bar
+above rejects the switch on those four directions. It stays off by default,
+as stage 5 requires until a candidate shows a win; turning it on by default
+would need a new bar, stated first, and a fresh run.
+
 ## The four-flow asymmetry is a lane-hash collision (November 10)
 
 Four-flow decision rows have shown L→R near 0.6–0.8 Gbit/s at 5G while R→L

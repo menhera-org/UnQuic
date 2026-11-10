@@ -322,9 +322,72 @@ fn frame_capacity(config: &crate::config::Config, workers: usize, id: usize) -> 
     })
 }
 
+/// One flow's lane in a TAP reader's `balance_flows` table.
+#[derive(Clone, Copy, Default)]
+struct FlowSlot {
+    key: u64,
+    last_ms: u32,
+    lane: u8,
+    used: bool,
+}
+
+/// Slots per worker, in sets of FLOW_WAYS: 64 KiB.
+const FLOW_SLOTS: usize = 4096;
+const FLOW_WAYS: usize = 4;
+/// A flow keeps its lane until silent this long, far beyond any frame's
+/// 200 ms sender and receiver lifetimes, so moving it cannot reorder frames.
+const FLOW_IDLE_MS: u32 = 1000;
+
+/// Pins a flow to the lane it first received, assigning new flows round-robin
+/// across the session's lanes so a few heavy flows do not share one transmit
+/// worker. A full table set falls back to the flow hash.
+fn balanced_lane(
+    slots: &mut [FlowSlot],
+    cursor: &std::sync::atomic::AtomicUsize,
+    key: u64,
+    hash: u64,
+    lanes: usize,
+    ms: u32,
+) -> usize {
+    let sets = slots.len() / FLOW_WAYS;
+    let Some(set) = (sets != 0)
+        .then(|| (key as usize % sets) * FLOW_WAYS)
+        .and_then(|base| slots.get_mut(base..base + FLOW_WAYS))
+    else {
+        return hash as usize % lanes;
+    };
+    let mut free = None;
+    for (way, slot) in set.iter_mut().enumerate() {
+        let idle = ms.wrapping_sub(slot.last_ms) >= FLOW_IDLE_MS;
+        if slot.used && slot.key == key && !idle && usize::from(slot.lane) < lanes {
+            slot.last_ms = ms;
+            return usize::from(slot.lane);
+        }
+        if free.is_none() && (!slot.used || idle) {
+            free = Some(way);
+        }
+    }
+    let Some(way) = free else {
+        return hash as usize % lanes;
+    };
+    let lane = cursor.fetch_add(1, Ordering::Relaxed) % lanes;
+    set[way] = FlowSlot {
+        key,
+        last_ms: ms,
+        lane: lane as u8,
+        used: true,
+    };
+    lane
+}
+
+/// Whether tap_lane spreads this frame across all lanes by its flow hash.
+fn strict_lane(frame: &[u8], worker: usize, workers: usize, queues: usize, lanes: usize) -> bool {
+    queues < workers || worker >= lanes || !pack::prefer_local_lane(frame)
+}
+
 fn tap_lane(frame: &[u8], worker: usize, workers: usize, queues: usize, lanes: usize) -> usize {
     // A session with fewer TAP queues still needs its other transmit workers.
-    if queues < workers || worker >= lanes || !pack::prefer_local_lane(frame) {
+    if strict_lane(frame, worker, workers, queues, lanes) {
         return pack::flow_hash(frame) as usize % lanes;
     }
     let count = (lanes - 1 - worker) / workers + 1;
@@ -678,12 +741,20 @@ pub(crate) struct Worker {
     counters: Snapshot,
     setup_due: Duration,
     retry_due: Option<Duration>,
+    // Empty unless daemon.balance_flows is set.
+    flows: Box<[FlowSlot]>,
 }
 
 impl Worker {
     pub fn storage_bytes(validated: &crate::config::Validated, workers: usize) -> Option<usize> {
         let config = validated.config();
+        let flows = if config.daemon.balance_flows {
+            FLOW_SLOTS * size_of::<FlowSlot>()
+        } else {
+            0
+        };
         let mut per_worker = size_of::<Self>()
+            .checked_add(flows)?
             .checked_add(crate::tap::Reader::storage_bytes()?)?
             .checked_add(
                 feedback::BUFFERS
@@ -1005,6 +1076,11 @@ impl Worker {
             counters,
             setup_due: Duration::ZERO,
             retry_due: None,
+            flows: if config.daemon.balance_flows {
+                vec![FlowSlot::default(); FLOW_SLOTS].into_boxed_slice()
+            } else {
+                Box::default()
+            },
             shared,
         })
     }
@@ -2288,13 +2364,26 @@ impl Worker {
                 local.tx_bytes += length;
                 buffer.tx_reserved = true;
                 buffer.tag = connection.local_tag().get();
-                buffer.lane = tap_lane(
-                    &buffer.bytes[..length],
-                    self.id,
-                    self.shared.workers(),
-                    self.shared.config.config().sessions[session].queue_count,
-                    self.sessions[session].tx.len(),
-                );
+                let frame = &buffer.bytes[..length];
+                let (workers, lanes) = (self.shared.workers(), self.sessions[session].tx.len());
+                let queues = self.shared.config.config().sessions[session].queue_count;
+                let cursor = self.shared.flow_cursors.get(session);
+                buffer.lane = if let Some(cursor) = cursor
+                    && !self.flows.is_empty()
+                    && strict_lane(frame, self.id, workers, queues, lanes)
+                {
+                    let hash = pack::flow_hash(frame);
+                    balanced_lane(
+                        &mut self.flows,
+                        cursor,
+                        hash ^ (session as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                        hash,
+                        lanes,
+                        now.as_millis() as u32,
+                    )
+                } else {
+                    tap_lane(frame, self.id, workers, queues, lanes)
+                };
                 buffer.deadline = now + reassembly::FRAME_LIFETIME;
                 if buffer.segments.is_some() {
                     self.counters.tap_gso_reads = self.counters.tap_gso_reads.wrapping_add(1);
@@ -5713,6 +5802,36 @@ mod tests {
     }
 
     #[test]
+    fn balanced_flows_take_lanes_in_turn_and_keep_them_while_active() {
+        use std::sync::atomic::AtomicUsize;
+        let mut slots = vec![FlowSlot::default(); FLOW_SLOTS];
+        let cursor = AtomicUsize::new(0);
+        // Four new flows spread across four lanes whatever their hashes.
+        let lanes: Vec<_> = (1..=4)
+            .map(|key| balanced_lane(&mut slots, &cursor, key, 0, 4, 10))
+            .collect();
+        assert_eq!(lanes, [0, 1, 2, 3]);
+        // An active flow keeps its lane.
+        assert_eq!(balanced_lane(&mut slots, &cursor, 2, 0, 4, 900), 1);
+        // After a full idle period a flow may move: none of its frames remain.
+        assert_eq!(
+            balanced_lane(&mut slots, &cursor, 2, 0, 4, 900 + FLOW_IDLE_MS),
+            0
+        );
+        // Five active flows in one set: the fifth falls back to its hash lane.
+        let sets = (FLOW_SLOTS / FLOW_WAYS) as u64;
+        let mut slots = vec![FlowSlot::default(); FLOW_SLOTS];
+        for way in 0..FLOW_WAYS as u64 {
+            balanced_lane(&mut slots, &cursor, 7 + way * sets, 0, 4, 0);
+        }
+        assert_eq!(balanced_lane(&mut slots, &cursor, 7 + 4 * sets, 6, 4, 0), 2);
+        // A lane that no longer exists is reassigned.
+        let lane = balanced_lane(&mut slots, &cursor, 7, 0, 2, 1);
+        assert!(lane < 2);
+        assert_eq!(balanced_lane(&mut [], &cursor, 1, 5, 4, 0), 1);
+    }
+
+    #[test]
     fn tap_lanes_stay_local_when_available_and_bound_every_configuration() {
         let frames = [
             crate::tap::test_common::udp::frame(false, 1, &[7; 22]),
@@ -7482,6 +7601,7 @@ mod tests {
             requests: std::sync::Mutex::new(crate::spsc::channel().0),
             address_pending: vec![std::sync::atomic::AtomicBool::new(false)],
             address_ready: (0..2).map(|_| AtomicU64::new(0)).collect(),
+            flow_cursors: Vec::new(),
         });
         let workers: [Worker; 2] = std::array::from_fn(|id| {
             let mut worker = Worker::new(id, Arc::clone(&shared), Control::new()).unwrap();

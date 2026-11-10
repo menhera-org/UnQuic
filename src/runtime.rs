@@ -74,6 +74,8 @@ pub(crate) struct Shared {
     pub requests: Mutex<spsc::Producer<AddressRequest>>,
     pub address_pending: Vec<AtomicBool>,
     pub address_ready: Vec<AtomicU64>,
+    // Next lane for a new flow per session, under daemon.balance_flows.
+    pub flow_cursors: Vec<std::sync::atomic::AtomicUsize>,
 }
 
 impl Control {
@@ -400,6 +402,9 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
         requests: Mutex::new(request_tx),
         address_pending: (0..peers).map(|_| AtomicBool::new(false)).collect(),
         address_ready: (0..peers * count).map(|_| AtomicU64::new(0)).collect(),
+        flow_cursors: (0..sessions)
+            .map(|_| std::sync::atomic::AtomicUsize::new(0))
+            .collect(),
     });
     let mut workers = (0..count)
         .map(|id| Worker::new(id, Arc::clone(&shared), control.clone()))

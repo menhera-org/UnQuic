@@ -1128,6 +1128,10 @@ November 10 evidence for that list, all in BENCH.md:
   land on two lanes in one direction and three in the other, every run, and
   leave workers idle. Load-aware assignment must still pin a flow while its
   frames are in flight, including when the kernel moves it between TAP queues.
+  `daemon.balance_flows` (off) does this with round-robin lanes: every 2G
+  direction rises 15–101%, but under 5G overload the formerly favored
+  direction falls 4–18% while row totals rise, which failed its stated bar.
+  Decide with a bar on row totals and unsaturated points, stated first.
 - FEC or a loss-agnostic response: at 5% random loss draft 07 collapses
   delivery below 11% of even a 0.5 Gbit/s offer.
 - Batching while application-limited: correctly marked light load stays in

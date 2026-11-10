@@ -374,6 +374,18 @@ applies only to new frames: a frame's pieces and repairs stay on its original la
 Any such change must document possible cross-lane reordering and verify overload
 behavior. eBPF is excluded because production hosts may prohibit loading programs.
 
+**Balanced flow lanes (November 10 amendment; `daemon.balance_flows`, off by
+default).** Fixed-key flow hashing can place a few heavy flows on the same
+transmit worker. With the switch, frames that would use strict hashing go
+through a per-reader four-way table of 4096 flows instead: a flow's first
+frame takes the session's next lane round-robin, and the flow keeps that lane
+while it sends. Only after a second of silence, longer than any frame's sender
+and receiver lifetimes, may it take a new lane, so a move cannot reorder
+frames. A full table set falls back to the hash lane. A flow the kernel moves
+to another TAP queue meets another reader's table and can change lanes,
+reordering at most the frames in flight then, as reader-local lanes already
+allow.
+
 The flow key includes one unfragmented IPv4, IPv6 or Ethernet encapsulation
 (IP protocol numbers 4, 41 and 143). Retain the outer key and add the inner
 addresses, protocol and available transport ports, plus inner MAC addresses
