@@ -132,6 +132,69 @@ fn fresh_claim_clock_survives_older_worker_turn() {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
+fn only_new_data_in_an_idle_group_marks_application_limited_sends() {
+    let (mut workers, _rx) = workers();
+    let marks = |workers: &[Worker; 2]| {
+        [
+            workers[0].counters.app_limited_marks,
+            workers[1].counters.app_limited_marks,
+        ]
+    };
+    // Sends every queued frame, so no worker still holds unsent data.
+    let send = |workers: &mut [Worker; 2]| {
+        for _ in 0..8 {
+            // The fixture clock stands still; free the pacing slot the last send took.
+            workers[0].sender.budgets[0].hold_pacing(Duration::ZERO);
+            for worker in workers.iter_mut() {
+                worker.flush_frames(Duration::ZERO).unwrap();
+            }
+            service(workers);
+        }
+        for worker in workers.iter() {
+            let index = worker.sender_index(0, worker.id).unwrap();
+            assert_eq!(worker.sender.lanes[index].unsent_bytes, 0);
+        }
+    };
+    queue_frame(&mut workers[1], 60);
+    queue_frame(&mut workers[0], 60);
+    assert_eq!(marks(&workers), [0, 1], "worker 0 found worker 1's data");
+    send(&mut workers);
+    let index = workers[0].sender_index(0, 0).unwrap();
+    let lane = &workers[0].sender.lanes[index];
+    let packet = lane
+        .history
+        .packet(lane.history.highest_allocated())
+        .unwrap();
+    let record = workers[0]
+        .sender
+        .records
+        .get(packet.sample_slot.unwrap())
+        .unwrap();
+    assert!(
+        record.app_limited,
+        "sends join the bubble until delivery passes it"
+    );
+
+    // A refused admission while idle shows the application had more to send.
+    workers[0].pressed_unsent(index);
+    queue_frame(&mut workers[0], 60);
+    assert_eq!(marks(&workers), [0, 1]);
+    send(&mut workers);
+    // So does a loss awaiting repair.
+    let retained = (0..1 << 16)
+        .find(|&slot| matches!(workers[0].recovery.place(slot), Ok(Place::Retained)))
+        .unwrap();
+    workers[0].recovery.set(retained, Place::Repair).unwrap();
+    queue_frame(&mut workers[0], 60);
+    assert_eq!(marks(&workers), [0, 1]);
+    workers[0].recovery.set(retained, Place::Retained).unwrap();
+    send(&mut workers);
+    queue_frame(&mut workers[0], 60);
+    assert_eq!(marks(&workers), [1, 1]);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
 fn local_ack_releases_the_shared_charge_in_the_same_turn() {
     let (mut workers, rx) = workers();
     frame(&mut workers[0]);
@@ -554,6 +617,7 @@ fn crossed_group_acks_finish_before_loss_checks_use_the_only_report() {
         worker.sender.owner = None;
         worker.sender.budgets = Arc::clone(&budgets);
         worker.sender.fresh.resize(2, false);
+        worker.sender.unsent.resize(2, Unsent::default());
         worker.sender.probes.resize(2, None);
         worker.sender.losses.resize(2, None);
         for lane in &mut worker.sender.lanes {

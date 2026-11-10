@@ -204,7 +204,12 @@ impl Owner {
             .set_max_datagram(sent.mtu)
             .map_err(io::Error::other)?;
         if sent.restart {
-            let app_limited = state.sampler.is_app_limited();
+            let budget = self
+                .budgets
+                .get(sent.group)
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            let app_limited =
+                state.sampler.is_app_limited() || budget.app_limited(budget.published().delivered);
             if app_limited {
                 state.cwnd_limited = false;
             }

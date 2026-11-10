@@ -128,6 +128,38 @@ fn charges_respect_the_window_and_pacing_starts_at_the_claim() {
     assert_eq!(budget.pace(1, 1_000_000, next), Ok(()));
 }
 
+#[test]
+fn only_new_data_in_an_idle_group_below_the_window_starts_a_bubble() {
+    let budget = Budget::new();
+    let mut state = Published {
+        window: 3000,
+        delivered: 500,
+        ..Published::default()
+    };
+    assert!(!budget.app_limited(0), "no bubble before a mark");
+    assert!(budget.supply(1));
+    assert!(!budget.supply(2), "worker 1 still holds data");
+    budget.drained(1);
+    assert!(!budget.supply(1), "worker 2 still holds data");
+    budget.drained(1);
+    budget.drained(2);
+    assert!(budget.supply(0));
+    assert_eq!(budget.charge(3000, None), Some(0));
+    assert!(
+        !budget.application_limited(&state),
+        "a full window is not idle"
+    );
+    budget.release(1000);
+    assert!(budget.application_limited(&state));
+    // Sends join the bubble until delivery passes delivered + inflight at the mark.
+    let at = Duration::from_micros(1);
+    assert!(budget.begin(&state, 2000, 1, at).app_limited);
+    state.delivered = 2500;
+    assert!(budget.begin(&state, 2000, 1, at).app_limited);
+    state.delivered = 2501;
+    assert!(!budget.begin(&state, 2000, 1, at).app_limited);
+}
+
 struct Packet {
     lane: usize,
     record: SendRecord,
@@ -226,8 +258,15 @@ fn compare(seed: u64, workers: usize, steps: usize) {
             _ => {
                 let in_flight = budget.in_flight();
                 reference.application_limited(in_flight).unwrap();
-                sampler.application_limited(in_flight);
-                budget.publish(&sampler.published(1, u64::MAX, 1));
+                if seed.is_multiple_of(2) {
+                    sampler.application_limited(in_flight);
+                    budget.publish(&sampler.published(1, u64::MAX, 1));
+                } else {
+                    // A worker's first unsent data in an idle group marks the shared bubble.
+                    assert!(budget.supply(lane), "seed {seed}");
+                    assert!(budget.application_limited(&budget.published()));
+                    budget.drained(lane);
+                }
             }
         }
         assert_eq!(reference.delivered(), sampler.delivered, "seed {seed}");

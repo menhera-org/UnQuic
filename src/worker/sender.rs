@@ -251,9 +251,19 @@ struct LossCheck {
     next_due: Option<Duration>,
 }
 
+/// One path group's unsent fresh data on this worker.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Unsent {
+    bytes: usize,
+    // Admission refused a frame since this worker last held unsent data, so
+    // the application had more to send than the host accepted.
+    pressed: bool,
+}
+
 pub(super) struct State {
     pub(super) owner: Option<Owner>,
     pub(super) fresh: Vec<bool>,
+    pub(super) unsent: Vec<Unsent>,
     reclaim: Option<usize>,
     pub(super) permitted: bool,
     pub(super) probes: Vec<Option<(u64, PacketId, u8)>>,
@@ -355,6 +365,14 @@ impl State {
                     .map_err(io::Error::other)?;
                 fresh.resize(config.path_groups(), false);
                 fresh
+            },
+            unsent: {
+                let mut unsent = Vec::new();
+                unsent
+                    .try_reserve_exact(config.path_groups())
+                    .map_err(io::Error::other)?;
+                unsent.resize(config.path_groups(), Unsent::default());
+                unsent
             },
             reclaim: None,
             owner: None,
@@ -720,6 +738,88 @@ impl Worker {
         self.sender
             .lane_index(session, lane, self.shared.workers(), self.id)
             .ok_or_else(|| io::Error::other("transmit history on the wrong worker"))
+    }
+
+    /// Adds a lane's unsent fresh bytes. Draft-07 marks an application-limited
+    /// bubble when new data finds nothing unsent, inflight below the window and
+    /// no loss awaiting repair. A worker sees other workers' unsent data through
+    /// the group's mask but only its own repairs; a refused admission since its
+    /// last unsent data also rules the bubble out.
+    pub(super) fn add_unsent(&mut self, index: usize, bytes: usize) -> io::Result<()> {
+        let lane = self
+            .sender
+            .lanes
+            .get_mut(index)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        lane.unsent_bytes = lane
+            .unsent_bytes
+            .checked_add(bytes)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let group = lane.group;
+        let unsent = self
+            .sender
+            .unsent
+            .get_mut(group)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let idle = unsent.bytes == 0 && bytes != 0;
+        unsent.bytes = unsent
+            .bytes
+            .checked_add(bytes)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        if idle {
+            let pressed = std::mem::take(&mut unsent.pressed);
+            if let Some(budget) = self.sender.budgets.get(group)
+                && budget.supply(self.id)
+                && !pressed
+                && self.recovery.repairs() == 0
+                && budget.application_limited(&budget.published())
+            {
+                self.counters.app_limited_marks = self.counters.app_limited_marks.wrapping_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes a lane's sent or discarded fresh bytes.
+    pub(super) fn remove_unsent(&mut self, index: usize, bytes: usize) -> io::Result<()> {
+        let lane = self
+            .sender
+            .lanes
+            .get_mut(index)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        lane.unsent_bytes = lane
+            .unsent_bytes
+            .checked_sub(bytes)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let group = lane.group;
+        let unsent = self
+            .sender
+            .unsent
+            .get_mut(group)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        unsent.bytes = unsent
+            .bytes
+            .checked_sub(bytes)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        if unsent.bytes == 0 && bytes != 0 {
+            unsent.pressed = false;
+            if let Some(budget) = self.sender.budgets.get(group) {
+                budget.drained(self.id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Admission refused a frame for this lane while the application had data.
+    pub(super) fn pressed_unsent(&mut self, index: usize) {
+        if let Some(unsent) = self
+            .sender
+            .lanes
+            .get(index)
+            .and_then(|lane| self.sender.unsent.get_mut(lane.group))
+        {
+            unsent.pressed = true;
+        }
     }
 
     pub(super) fn sender_message(&mut self, message: Message, now: Duration) -> io::Result<()> {

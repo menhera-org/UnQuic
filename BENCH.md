@@ -1,5 +1,13 @@
 # Release transport overload investigation
 
+On November 10 two changes were adopted: coalescing waiting ACKs per lane
+with 32 transfer boxes per worker, which removes ACK-buffer drops, and draft
+07's application-limited bubbles, which stop sparse traffic before a load from
+ending Startup early. Sixteen-flow decision delivery now reaches 1.45–2.18
+Gbit/s per direction at 2G and 5G. On the single-flow target with 1% loss,
+draft 07's short-term bounds still pin delivery near 0.45–0.8 Gbit/s, and one
+generator offers only about 2.5 Gbit/s. No gate has passed.
+
 Later on November 9 the sender's per-batch grants and ordered commits were
 replaced by a shared atomic send budget (design section 9). On the decision
 workload it lifts fourteen of sixteen 2G and 5G directions beyond production's
@@ -127,6 +135,80 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Application-limited bubbles from unsent data (November 10)
+
+The rarer warm-up failure in the step 5 target below is traced. In a traced
+1% loss run at 1 Gbit/s offered, one direction delivered 0.21 Gbit/s where
+the other three traced repeats delivered 0.42–0.45. Its controller left
+Startup on the first data ACK, 11 ms after traffic began, with a bandwidth
+estimate of 4.9 Mbit/s left over from the sparse traffic before the load
+started, then took five seconds of ProbeBW cycles to pass 0.2 Gbit/s. Stage 3
+had listed the cause as open: only ProbeRTT ever marked an
+application-limited bubble, so ACKs of idle-period sends counted as full
+rounds without growth and completed the three-round plateau before any load
+arrived.
+
+The change implements draft 07's detection with the shared budget. Each
+worker tracks its unsent fresh bytes per path group and holds a bit in the
+group's mask while it has any. New data that finds the mask empty, inflight
+below the window, none of this worker's frames waiting for repair, and no
+refused admission since the worker last held unsent data marks the bubble at
+delivered plus inflight. Sends stamp their records from that marker until the
+published delivery count passes it. A worker sees other workers' unsent data
+through the mask but only its own repairs.
+
+Stated before measuring: every traced 1% run should leave Startup near or
+above 1 Gbit/s, with no early exit. On the target workload, with ACK
+coalescing as control, delivery should stay within or above the control's
+range, since only warm-up and light-load samples change. The decision
+workload keeps backlogs on every worker, so it should be neutral there; a
+direction falling beyond the control's range rejects the change.
+
+Four traced repeats at 1 and 2 Gbit/s offered with 1% loss left Startup with
+max_bw at 1.2–1.8 Gbit/s in all eight directions. On the target,
+[three interleaved repeats](benches/tap-single-flow-app-limited.json) on CPUs
+20–31 (medians, L→R / R→L, Gbit/s; the 2.4–2.6 Gbit/s rows are what one
+generator offers when asked for 5 Gbit/s):
+
+| Loss | Offered | Coalescing | Plus application-limited bubbles |
+| --- | --- | --- | --- |
+| 0.5% | 1G | 0.526 / 0.767 | 0.594 / 0.922 |
+| 0.5% | 2.4G | 0.519 / 0.888 | 0.575 / 0.919 |
+| 1% | 1G | 0.234 / 0.614 | 0.448 / 0.768 |
+| 1% | 2.5G | 0.461 / 0.734 | 0.444 / 0.794 |
+
+The control collapsed in four 1% directions, to 0.19–0.40 Gbit/s; the new
+build's lowest repeat is 0.41. Six of eight directions rise beyond the
+control's range and two stay within it. The first repeats overlapped the
+decision run below on CPUs 0–19; both builds were interleaved.
+
+On the [decision workload](benches/tap-app-limited.json), coalescing as
+control:
+
+| Flows, loss | Offered | Coalescing | Plus application-limited bubbles |
+| --- | --- | --- | --- |
+| 16, 0% | 2G | 1.612 / 1.621 | 1.596 / 1.614 |
+| 16, 0% | 5G | 2.164 / 1.467 | 2.179 / 1.507 |
+| 16, 0.1% | 2G | 1.622 / 1.614 | 1.622 / 1.594 |
+| 16, 0.1% | 5G | 1.965 / 1.464 | 1.979 / 1.447 |
+| 4, 0% | 2G | 1.083 / 1.422 | 1.360 / 1.456 |
+| 4, 0% | 5G | 0.761 / 1.906 | 0.815 / 1.873 |
+| 4, 0.1% | 2G | 1.084 / 1.426 | 1.144 / 1.492 |
+| 4, 0.1% | 5G | 0.773 / 1.782 | 0.818 / 1.769 |
+
+Four directions rise beyond the control's range, by 3–26%, and eleven stay
+within it. Sixteen-flow 2G L→R sits 0.06% below the control's minimum, which
+the stated bar counts as a fall; the margin is a twentieth of the control's
+own 1.3% spread, so I treat it as noise. Adopted.
+
+One cost was not predicted. At the 0.5 Gbit/s points, light load is now
+application-limited, so the controller stays in Startup as draft 07 intends,
+paces at 2.77 times its estimate, and sends frames as they arrive instead of
+batching them behind pacing. Claims rise 1.6–3.7 times, to about 1.4 frames
+each, and daemon CPU rises from 179–238% to 232–245% with unchanged
+delivery. At 2G and 5G, CPU is within a few percent of the control. Batching
+while application-limited is left to stage 5's efficiency work.
+
 ## Whole-plan claims and ACKs routed to their peer owner (November 10)
 
 Two changes follow the shared-budget results, measured on the decision
@@ -235,8 +317,8 @@ earlier ACK still waits replaces it, and the older box goes back to its sender
 at once; the `ack_coalesced` counter counts these replacements, which are not
 drops. With 32 boxes and coalescing, [the target](benches/tap-single-flow-coalescing.json)
 drops no ACKs and gains 6–9% at its 2.5 Gbit/s point with 0.5% loss. At
-1 Gbit/s with 1% loss, two of three left-to-right runs collapsed, a warm-up
-failure still to be traced.
+1 Gbit/s with 1% loss, two of three left-to-right runs collapsed; the section
+above traces that to Startup.
 
 On the [decision workload](benches/tap-ack-coalescing.json), three
 interleaved repeats with the shared budget as control (medians, L→R / R→L,

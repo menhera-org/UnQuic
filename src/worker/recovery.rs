@@ -29,6 +29,8 @@ pub(super) struct Recovery {
     pub staged: Option<Box<sender::Report>>,
     pub cursor: usize,
     pub quiesce: Option<usize>,
+    // Frames waiting in a repair queue: unrepaired loss for application-limited checks.
+    repairs: usize,
 }
 
 impl Recovery {
@@ -61,7 +63,12 @@ impl Recovery {
             staged: None,
             cursor: 0,
             quiesce: None,
+            repairs: 0,
         })
+    }
+
+    pub fn repairs(&self) -> usize {
+        self.repairs
     }
 
     pub fn bind(&mut self, index: usize, frame: &frames::Frame) -> io::Result<()> {
@@ -74,6 +81,7 @@ impl Recovery {
                 return Err(io::Error::other("live frame mapping reused"));
             }
             slot.id = frame.id;
+            self.repairs -= usize::from(slot.place == Place::Repair);
             slot.place = Place::Fresh;
         }
         Ok(())
@@ -86,10 +94,13 @@ impl Recovery {
             .ok_or(io::ErrorKind::InvalidData.into())
     }
     pub fn set(&mut self, index: usize, place: Place) -> io::Result<()> {
-        self.slots
+        let slot = self
+            .slots
             .get_mut(index)
-            .ok_or(io::ErrorKind::InvalidData)?
-            .place = place;
+            .ok_or(io::ErrorKind::InvalidData)?;
+        self.repairs = self.repairs + usize::from(place == Place::Repair)
+            - usize::from(slot.place == Place::Repair);
+        slot.place = place;
         Ok(())
     }
     pub fn begin_quiesce(&mut self, frames: &frames::Store) {

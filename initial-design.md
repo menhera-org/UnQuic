@@ -410,6 +410,8 @@ Before any rate sweep, show equivalence with the ordered sampler: extend the 4,3
 
 The implementation differs from the outline above in these details. Records are 64 bytes in a per-worker slab of 65,535, addressed by the handle each sent-history entry keeps; that handle also keys the worker's recovery journal. Each worker has one bounded report, returned after the controller applies it. A PTO round's allowance travels with its probe command, and workers drop commands from a round older than the published one. Each successful syscall also sends the controller owner a summary of its packets for the PTO timers, MTU and window-use evidence. A probe takes the place of an unclaimed DATA plan, which keeps its reservations. A claim refused by a full window retries after 50 µs.
 
+Application-limited bubbles follow draft 07's prerequisites without a shared queue length (November 10 amendment). Each worker counts its unsent fresh bytes per path group and holds one bit in the group's atomic mask while it has any. New data that finds the mask empty, inflight below the published window, none of the worker's own frames waiting for repair, and no admission refused since it last held unsent data marks the bubble at the published delivered count plus inflight. Sends stamp their records application-limited until the published delivered count passes that marker; ProbeRTT's bubble still comes from the controller's sampler, and a send joins either. A later mark replaces an earlier one, as in the draft. A worker cannot see other workers' pending repairs. Without this, ACKs of sparse traffic before a load counted as full rounds and could end Startup before any load arrived (BENCH.md).
+
 When a claim submits its entire prefix, retain the prepared but never-attempted suffix with its original packet numbers, payload spans and reservations. Keep payload source slots stable until that suffix is consumed or discarded. After the send completes and no job owns the plan, compact consumed metadata and append waiting frames within the existing frame, datagram, byte and turn budgets. Preserve every retained packet's bytes and length; append new datagrams rather than extending its final packet. Defer refill across allocator gaps so each request retains consecutive packet identities. A partial or failed socket attempt discards the remaining plan and retries unsent frame ranges with fresh numbers. Expiry, PMTU shrink and connection retirement cancel every reservation belonging to a discarded plan. Control packets that overtake a retained plan require fresh identities before DATA submission; canceled numbers are never reused.
 
 Initially pace in userspace using monotonic deadlines and `timerfd`, without requiring an `fq` qdisc or host networking changes. Workers send only with current grants. Cap the combined outstanding burst allowance at the smaller of BBR's send quantum and 64 maximum-size datagrams, spread across workers; GSO aggregates obey that limit too. Under the replacement sender this cap applies to each pacing claim instead; claims from several workers overlap only as far as the shared pacing clock allows. Timestamp at successful nonblocking socket submission and bound queued socket work. This is a testable baseline; kernel pacing remains a measured optimization. [S11]
@@ -708,7 +710,8 @@ attempt, including GSO fallback. Handshake/liveness timers and PMTU proofs
 use pre-send time; receive buffers retain post-receive time across GRO expansion
 and handoff. Delayed control sends start their service at submission rather
 than accumulating credit from an earlier worker turn. Incoming ACKs now route
-to TX histories. DATA and probes claim the group's shared send budget, which the
+to TX histories through 32 transfer buffers per worker; a newer ACK replaces
+one still waiting for its lane. DATA and probes claim the group's shared send budget, which the
 BBR controller's owner publishes. Release forwarding, reconnect, allocation and
 routed-MTU regression tests pass. Before PTO, the runtime waits for each
 worker's bounded loss scan, including the final report return. Third-expiry
@@ -724,8 +727,8 @@ tests and allocation checks; tests/vectors/bbr-07/README.md records draft
 interpretations.
 Worker-local payload retention, packet-to-frame mappings and two-generation
 selective repair are connected. ACK/retirement coverage work and frame cleanup
-are bounded independently of congestion-charge settlement. General
-application-limited detection remains unfinished.
+are bounded independently of congestion-charge settlement. Application-limited
+bubbles come from each group's unsent-data mask (section 9).
 Configuration
 validation now freezes named endpoint/peer/session relationships into numeric
 indices. Cookie lookup uses short scans for small sets and randomized hashing

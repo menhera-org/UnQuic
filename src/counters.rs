@@ -171,6 +171,9 @@ metrics! {
     expired_grants: sum,
     /// Plans dropped for a changed plan, path, connection or history pressure.
     cancelled_grants: sum,
+    /// Application-limited bubbles started: new data found its path group with
+    /// nothing unsent, inflight below the window and no loss awaiting repair.
+    app_limited_marks: sum,
     /// Currently charged outer IP bytes in flight.
     bytes_in_flight: sum,
     /// Current outer IP size ceiling; consult path_mtu_state for its basis.

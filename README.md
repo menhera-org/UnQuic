@@ -608,8 +608,14 @@ with fixed vectors under `tests/vectors/bbr-07`. It counts newly acknowledged
 physical transmissions, including late originals and repairs, and preserves
 one ACK sample across bounded processing turns. It distinguishes application
 bubbles from host-queue limitation. The pure BBRv3 controller implements draft-07's
-model and state machine. Worker integration includes recovery, but general
-application-limited detection and the performance gates remain unfinished.
+model and state machine. Worker integration includes recovery, and the
+performance gates remain unfinished. Each path group's budget keeps one bit per
+worker holding unsent data. New data that finds no bit set, inflight below the
+window, none of the worker's own frames awaiting repair and no refused
+admission since the worker last held data starts draft 07's
+application-limited bubble at delivered plus inflight; sends join it until
+delivery passes that point. Without this, ACKs of sparse traffic before a load
+could end Startup before the load arrived.
 PMTU provenance follows each successful probe through delivery sampling.
 An ACK containing only newly delivered PMTU probes cannot establish a bandwidth
 plateau or end Startup on that evidence. Mixed DATA/probe ACKs remain eligible;
@@ -635,8 +641,8 @@ After a long outage, carrier can return before backed-off probing restores DATA
 service.
 
 Release forwarding, reconnect, allocation and routed-MTU regression tests pass.
-General application-limited detection remains unfinished. The performance gates
-remain open; BENCH.md records the replacement sender's measurements.
+The performance gates remain open; BENCH.md records the replacement sender's
+measurements.
 
 ## TAP read batching
 
@@ -874,6 +880,7 @@ shared rate, so summing session rates can count a group more than once.
 counts plans whose frame deadline passed before or at the syscall;
 `cancelled_grants` counts claimed or waiting plans dropped for changed paths,
 connection identities or history pressure. The names predate the shared budget.
+`app_limited_marks` counts application-limited bubbles a worker started.
 `repairs` counts successfully submitted repair DATA records, including separate
 pieces of the same range. Feedback delay remains zero until its integration.
 Cumulative counts wrap modulo 2^64.

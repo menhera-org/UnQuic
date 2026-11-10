@@ -87,7 +87,8 @@ delivered DATA does. Such samples still update delivery, RTT, bandwidth filters,
 loss and inflight accounting, but cannot establish the three-round bandwidth
 plateau. Sparse probe cadence does not demonstrate a full application path.
 This is a transport-specific exclusion from `check_full_bw`, not a global
-application-limited claim. General application-limited detection remains open.
+application-limited claim. The runtime's general application-limited detection
+marks bubbles from each path group's unsent-data mask; see design section 9.
 
 Existing text vectors describe ordinary DATA and set `pmtu_only=false`.
 Unit tests cover all probe/DATA combinations and ACK orders for three packets,

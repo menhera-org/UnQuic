@@ -4,7 +4,8 @@
 //! check; workers charge inflight and claim pacing credit with atomics and
 //! record each transmission's delivery snapshot themselves. A per-ACK report of
 //! the newest acknowledged record then yields the draft-07 rate sample that a
-//! single chronological sampler would compute. Not yet used by the runtime.
+//! single chronological sampler would compute. Workers also mark draft-07's
+//! application-limited bubble here when new data finds the group idle.
 use crate::bbr::{LossSample, RateSample};
 use std::{
     io,
@@ -95,12 +96,17 @@ struct Hot {
     order: AtomicU64,
 }
 
-// Read on each send, written only at idle restarts and PTO rounds.
+// Read on each send, written only at idle restarts, PTO rounds and when a
+// worker's unsent data starts or drains.
 #[repr(align(64))]
 struct Rare {
     restart_at: AtomicU64,
     restart_acks: AtomicU64,
     probe_epoch: AtomicU64,
+    // One bit per worker holding unsent data for this group.
+    unsent: AtomicU64,
+    // Draft-07's C.app_limited: sends join the bubble until delivered passes it.
+    bubble: AtomicU64,
 }
 
 impl Default for Budget {
@@ -130,6 +136,8 @@ impl Budget {
                 restart_at: AtomicU64::new(0),
                 restart_acks: AtomicU64::new(0),
                 probe_epoch: AtomicU64::new(0),
+                unsent: AtomicU64::new(0),
+                bubble: AtomicU64::new(0),
             },
         }
     }
@@ -283,8 +291,39 @@ impl Budget {
             delivered: state.delivered,
             lost: state.lost,
             in_flight: prior,
-            app_limited: state.app_limited,
+            app_limited: state.app_limited || self.app_limited(state.delivered),
         }
+    }
+
+    /// Notes that `worker`, below 64, now holds unsent data for this group.
+    /// True when no worker held any before, the draft's first condition for
+    /// an application-limited bubble.
+    pub fn supply(&self, worker: usize) -> bool {
+        self.rare.unsent.fetch_or(1 << worker, Ordering::AcqRel) == 0
+    }
+
+    /// Notes that `worker` sent or discarded all its unsent data for this group.
+    pub fn drained(&self, worker: usize) {
+        self.rare.unsent.fetch_and(!(1 << worker), Ordering::AcqRel);
+    }
+
+    /// Starts draft-07's application-limited bubble at delivered plus inflight,
+    /// unless inflight already fills the window. The caller has checked that
+    /// nothing was unsent and no loss awaits repair.
+    pub fn application_limited(&self, state: &Published) -> bool {
+        let in_flight = self.in_flight();
+        if in_flight >= state.window {
+            return false;
+        }
+        let end = state.delivered.saturating_add(in_flight).max(1);
+        self.rare.bubble.store(end, Ordering::Release);
+        true
+    }
+
+    /// Whether the application-limited bubble covers a send after `delivered` bytes.
+    pub fn app_limited(&self, delivered: u64) -> bool {
+        let end = self.rare.bubble.load(Ordering::Acquire);
+        end != 0 && delivered <= end
     }
 
     /// Moves the pacing clock so claims before `until` wait; zero releases it.

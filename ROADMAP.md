@@ -7,6 +7,24 @@ read that section before writing code. Keep the "Current status" paragraph in
 section 15 of the design and the "Implementation status" section of
 [README.md](README.md) true after every step.
 
+## November 10 checkpoint
+
+Two changes are adopted: coalescing waiting ACKs per lane with 32 transfer
+boxes per worker, and draft 07's application-limited bubbles from a per-group
+unsent-data mask
+([BENCH.md](BENCH.md#application-limited-bubbles-from-unsent-data-november-10)).
+The decision workload is CPU-bound: at sixteen flows every worker runs at
+79–99% of a core, so moving work between workers no longer helps, and the
+ACK-lane and whole-plan candidates were rejected.
+
+On the single-flow target, draft 07's short-term bounds are the limit. After
+any loss round outside probing, `bw_shortterm` becomes the larger of the
+round's delivery rate and 70% of its old value, so under steady 1% random
+loss Cruise ratchets it down to about half of `max_bw`. Reaching 5 Gbit/s at
+0.5–1% loss needs a deliberate deviation recorded in the design and placed
+behind a configuration switch; that is the next experiment. One generator
+process also offers only about 2.5 Gbit/s for one flow.
+
 ## November 9 checkpoint
 
 Performance decisions now use a fixed decision workload: routed 4.5 ms RTT,
@@ -104,10 +122,13 @@ rules apply to all of them.
    on four workers, within two to four cores per daemon. One generator process
    offers only about 2.5 Gbit/s for one flow, so the harness must change before
    the 5 Gbit/s point can be offered.
-4. **Finish stage 3:** general application-limited detection; the container
-   test with `tc netem` loss and reordering proving no duplicate delivery and
-   bounded memory; the 0, 0.1, 1 and 5% loss sweep at 4.5 and 7.5 ms with
-   independent and burst loss.
+4. **Finish stage 3.** General application-limited detection is done: a
+   per-group unsent-data mask starts draft 07's bubble, which removed the
+   warm-up collapse on the lossy target
+   ([BENCH.md](BENCH.md#application-limited-bubbles-from-unsent-data-november-10)).
+   Remaining: the container test with `tc netem` loss and reordering proving
+   no duplicate delivery and bounded memory; the 0, 0.1, 1 and 5% loss sweep
+   at 4.5 and 7.5 ms with independent and burst loss.
 5. **Close the stage 2 gate:** 20 Gbit/s each direction locally at inner MTU
    1500, plus the small-frame burst rows.
 6. **Stage 4**, as listed in its section: TAP lifetime and descriptor handover,
@@ -728,8 +749,9 @@ PMTU-only delivery samples cannot establish a bandwidth plateau: probe cadence
 does not measure application supply. Per-transmission provenance survives
 partial sends, flight reuse and late ACKs; mixed DATA/probe ACKs retain normal
 capacity evidence. Delivery, loss and RTT accounting remain unchanged.
-General application-limited detection remains unfinished;
-congestion-control integration is not complete.
+Application-limited bubbles now come from each path group's unsent-data mask,
+following draft 07's prerequisites; congestion-control integration is not
+complete.
 Reserve sampling metadata against the startup memory ceiling; a full sampling
 record in every lane's 65,536 history slots would exceed that ceiling. Use bounded
 shared storage and retire only resolved sender-history prefixes, preserving

@@ -2348,6 +2348,11 @@ impl Worker {
                 ]
             );
             self.queue_drop(session, false, true);
+            if self.sender_enabled()
+                && let Ok(index) = self.sender_index(session, lane)
+            {
+                self.pressed_unsent(index);
+            }
             self.release(buffer);
             return Ok(());
         }
@@ -2401,10 +2406,7 @@ impl Worker {
             }
         };
         if let Some(index) = index {
-            self.sender.lanes[index].unsent_bytes = self.sender.lanes[index]
-                .unsent_bytes
-                .checked_add(fresh)
-                .ok_or(io::ErrorKind::InvalidData)?;
+            self.add_unsent(index, fresh)?;
             self.sessions[session].unexpanded_bytes[lane] = self.sessions[session].unexpanded_bytes
                 [lane]
                 .checked_add(fresh)
@@ -2504,10 +2506,7 @@ impl Worker {
     fn release_unsent(&mut self, session: usize, lane: usize, bytes: usize) -> io::Result<()> {
         if self.sender_enabled() {
             let index = self.sender_index(session, lane)?;
-            let balance = &mut self.sender.lanes[index].unsent_bytes;
-            *balance = balance
-                .checked_sub(bytes)
-                .ok_or(io::ErrorKind::InvalidData)?;
+            self.remove_unsent(index, bytes)?;
         }
         Ok(())
     }
