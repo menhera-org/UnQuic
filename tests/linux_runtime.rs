@@ -1196,6 +1196,162 @@ fn outer_loss_repairs_twice_and_late_original_never_duplicates_tap_delivery() {
 }
 
 #[test]
+#[ignore = "requires disposable container with tun, iproute2 and network capabilities"]
+fn bridge_vlan_qinq_macvlan_and_non_ip_frames_cross_unchanged() {
+    // SAFETY: only this test thread and its runtimes enter the namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let net = UdpSocket::bind("[::]:0").unwrap();
+    up(&net, c"lo");
+    let single = |name, listen, remote| {
+        let mut config = config(name, listen, remote);
+        config.sessions.truncate(1);
+        config.peers.truncate(1);
+        config.daemon.memory_limit = Daemon::default().memory_limit;
+        config.sessions[0].queue_count = 1;
+        config.peers[0].tx_lanes = 1;
+        config
+    };
+    let mut left = Running::start(single("uqc-l", 41400, 41401));
+    let mut right = Running::start(single("uqc-r", 41401, 41400));
+    until(Duration::from_secs(5), || {
+        left.control.ready() && right.control.ready()
+    });
+    // Left: the TAP is a bridge port next to a veth; frames enter from the veth's peer.
+    ip(&["link", "add", "uqc-br", "type", "bridge"]);
+    ip(&[
+        "link", "add", "uqc-v0", "mtu", "9000", "type", "veth", "peer", "name", "uqc-v1", "mtu",
+        "9000",
+    ]);
+    ip(&["link", "set", "uqc-v0", "master", "uqc-br"]);
+    ip(&["link", "set", "uqc-l", "master", "uqc-br"]);
+    // Right: an 802.1Q upper, an 802.1ad/802.1Q stack and a macvlan on the TAP.
+    ip(&[
+        "link",
+        "add",
+        "link",
+        "uqc-r",
+        "name",
+        "uqc-r.100",
+        "type",
+        "vlan",
+        "id",
+        "100",
+    ]);
+    ip(&[
+        "link",
+        "add",
+        "link",
+        "uqc-r",
+        "name",
+        "uqc-r.200",
+        "type",
+        "vlan",
+        "proto",
+        "802.1ad",
+        "id",
+        "200",
+    ]);
+    ip(&[
+        "link",
+        "add",
+        "link",
+        "uqc-r.200",
+        "name",
+        "uqc-r.200.300",
+        "type",
+        "vlan",
+        "id",
+        "300",
+    ]);
+    ip(&[
+        "link",
+        "add",
+        "link",
+        "uqc-r",
+        "name",
+        "uqc-mv",
+        "address",
+        "02:00:00:00:aa:01",
+        "type",
+        "macvlan",
+        "mode",
+        "bridge",
+    ]);
+    for device in [
+        "uqc-br",
+        "uqc-v0",
+        "uqc-v1",
+        "uqc-l",
+        "uqc-r",
+        "uqc-r.100",
+        "uqc-r.200",
+        "uqc-r.200.300",
+        "uqc-mv",
+    ] {
+        ip(&["link", "set", device, "up"]);
+    }
+    until(Duration::from_secs(5), || {
+        left.control.session(0).unwrap().carrier && right.control.session(0).unwrap().carrier
+    });
+    let input = raw_socket(c"uqc-v1", 0x88b5);
+    const ALL: u16 = libc::ETH_P_ALL as u16;
+    let frame = |destination: [u8; 6], source: u8, kind: &[u8], length: usize| {
+        let mut frame = vec![0; length];
+        frame[..6].copy_from_slice(&destination);
+        frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, source]);
+        frame[12..12 + kind.len()].copy_from_slice(kind);
+        for (index, byte) in frame.iter_mut().enumerate().skip(12 + kind.len()) {
+            *byte = (index as u8) ^ source;
+        }
+        frame
+    };
+    let unknown = [2, 0, 0, 0, 0xbb, 1];
+    let ethertype = 0x88b5_u16.to_be_bytes();
+    // Each case: what enters the bridge, where it leaves, and what must arrive there.
+    let mut cases: Vec<(Vec<u8>, &std::ffi::CStr, Vec<u8>)> = Vec::new();
+    for source in [0x11, 0x12, 0x13] {
+        let sent = frame(unknown, source, &ethertype, 100);
+        cases.push((sent.clone(), c"uqc-r", sent));
+    }
+    let broadcast = frame([0xff; 6], 0x14, &ethertype, 60);
+    cases.push((broadcast.clone(), c"uqc-r", broadcast));
+    let multicast = frame([1, 0, 0x5e, 0, 0, 0xfb], 0x15, &ethertype, 200);
+    cases.push((multicast.clone(), c"uqc-r", multicast));
+    // 802.3 length 38 with an LLC header, padded to the minimum frame.
+    let llc = frame(unknown, 0x16, &[0, 38, 0x42, 0x42, 0x03], 60);
+    cases.push((llc.clone(), c"uqc-r", llc));
+    let macvlan = frame([2, 0, 0, 0, 0xaa, 1], 0x17, &ethertype, 300);
+    cases.push((macvlan.clone(), c"uqc-mv", macvlan));
+    // Full-size tagged frames in the TAP-read direction: 9000 behind one tag,
+    // 1500 behind two. Each upper delivers the frame without its tags.
+    let mut tagged = frame(unknown, 0x18, &[0x81, 0, 0, 100], 9018);
+    tagged[16..18].copy_from_slice(&ethertype);
+    let mut untagged = tagged.clone();
+    untagged.drain(12..16);
+    cases.push((tagged, c"uqc-r.100", untagged));
+    let mut stacked = frame(unknown, 0x19, &[0x88, 0xa8, 0, 200, 0x81, 0, 1, 0x2c], 1522);
+    stacked[20..22].copy_from_slice(&ethertype);
+    let mut untagged = stacked.clone();
+    untagged.drain(12..20);
+    cases.push((stacked, c"uqc-r.200.300", untagged));
+    let mut bytes = [0; 9100];
+    for (sent, device, expected) in &cases {
+        let output = raw_socket(device, ALL);
+        until(Duration::from_secs(5), || {
+            raw_send(&input, sent);
+            while let Some(n) = raw_read(&output, &mut bytes) {
+                if bytes[..n] == expected[..] {
+                    return true;
+                }
+            }
+            false
+        });
+    }
+    left.stop();
+    right.stop();
+}
+
+#[test]
 #[ignore = "requires disposable container with tun, iproute2, the vrf module and network capabilities"]
 fn endpoints_bound_to_a_vrf_forward_through_its_table() {
     // SAFETY: only this test thread and its runtimes enter the namespace.

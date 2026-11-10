@@ -1046,8 +1046,8 @@ The kernel test checks actual IPv6 UDP headers and port use, explicit device
 binding, TAP flags/MTU/MAC, deterministic MAC recreation, administrative state,
 multiqueue frame I/O,
 VLAN/QinQ bytes, carrier transitions and deletion after the last queue closes.
-Maximum-size QinQ is currently checked in the TAP-write direction; testing its
-TAP-read direction through VLAN upper devices belongs to the composition tests.
+Maximum-size QinQ is checked here in the TAP-write direction; the composition
+test below covers the TAP-read direction through VLAN upper devices.
 Run every ignored test binary, including the library unit-test binary. The
 runtime test also covers initial address supply, failed-candidate preservation,
 migration and migration back, unchanged-address updates, multiple peers/sessions,
@@ -1091,8 +1091,14 @@ A runtime test creates a VRF in its namespace holding both outer addresses,
 which the main table cannot reach, and forwards frames both ways between two
 runtimes whose endpoints bind to it.
 
-Bridge/OVS matrices, real RA/DHCPv6 resolver networks, physical-NIC offload
-qualification, Linux 5.0 qualification and performance acceptance remain open.
+A composition test puts one TAP in a Linux bridge fed from a veth and gives the
+other an 802.1Q upper, an 802.1ad/802.1Q stack and a macvlan. Unicast frames
+from three source MACs, broadcast, multicast and an 802.3 LLC frame cross
+unchanged; a 9018-byte single-tagged frame and a 1522-byte QinQ frame arrive at
+their uppers without the tags, which covers the TAP-read direction for both.
+
+OVS, real RA/DHCPv6 resolver networks, physical-NIC offload qualification,
+Linux 5.0 qualification and performance acceptance remain open.
 
 ## License
 

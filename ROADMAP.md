@@ -149,7 +149,7 @@ rules apply to all of them.
    1500, plus the small-frame burst rows.
 6. **Stage 4**, as listed in its section: TAP lifetime and descriptor handover,
    the rest of the panic audit (explicit `unwrap`/`expect`/`panic!` sites are
-   gone; implicit indexing and overflow remain), the composition matrix,
+   gone; implicit indexing and overflow remain), OVS in the composition matrix,
    resource stress, and restart and path changes. Double-fork readiness, the
    systemd unit and the VRF binding test are done.
 7. **Stage 5:** profile what remains and try its candidates behind switches.
@@ -1048,7 +1048,9 @@ full expired batches sharing the cleanup budget.
 - Container tests for Linux bridge, OVS system port where OVS is available,
   VLAN and QinQ uppers, macvlan, multiple MACs, multicast, broadcast and LLC
   frames, as section 14.1 V04 lists. Each test creates and deletes its own
-  devices.
+  devices. Done except OVS, which the test images lack: one runtime test
+  covers a bridge port, 802.1Q and QinQ uppers at full size, a macvlan, three
+  source MACs, broadcast, multicast and LLC on Linux 6.8 and 7.0.
 - VRF binding test with a VRF device created in the namespace. Done: two
   runtimes bound to a VRF that holds both outer addresses, which the main
   table cannot reach, forward frames both ways on Linux 6.8 and 7.0.
