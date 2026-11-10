@@ -309,6 +309,77 @@ fn foreground_readiness_dns_refresh_forwarding_and_signal_shutdown() {
 }
 
 #[test]
+#[ignore = "requires disposable container with tun, iproute2 and network namespace capabilities"]
+fn restart_re_executes_on_the_same_tap_without_a_gap() {
+    use common::*;
+    // SAFETY: this thread and the daemon it starts use a disposable namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let net = UdpSocket::bind("[::]:0").unwrap();
+    let pid_path = std::env::temp_dir().join(format!("unquic-restart-{}.pid", std::process::id()));
+    let file = ConfigFile::new(&config("uq-rx", 40400, 40401, "::1", ""));
+    let started = Command::new(binary())
+        .arg("start")
+        .arg(&file.0)
+        .arg(&pid_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(started.success());
+    let pid: i32 = fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // An upper device dies with its lower, so its survival shows no last-close gap.
+    add_vlan(&net, c"uq-rx", 7);
+    let index = |name: &std::ffi::CStr| {
+        // SAFETY: the name is NUL-terminated; the call only queries this namespace.
+        unsafe { libc::if_nametoindex(name.as_ptr()) }
+    };
+    let (tap, upper, mac) = (
+        index(c"uq-rx"),
+        index(c"uq-rx.7"),
+        mac_address(&net, c"uq-rx"),
+    );
+    assert!(tap != 0 && upper != 0);
+    use std::os::unix::fs::MetadataExt;
+    let inode = |path: &PathBuf| fs::metadata(path).map(|m| m.ino()).ok();
+    let published = inode(&pid_path);
+    let signalled = Command::new(binary())
+        .arg("restart")
+        .arg(&pid_path)
+        .status()
+        .unwrap();
+    assert!(signalled.success());
+    // The re-executed image's initial environment carries the handover marker.
+    let marker = format!("UNQUIC_REEXEC=1:{pid}");
+    until(|| {
+        fs::read(format!("/proc/{pid}/environ")).is_ok_and(|bytes| {
+            bytes
+                .split(|&b| b == 0)
+                .any(|entry| entry == marker.as_bytes())
+        })
+    });
+    // The successor republishes the PID file (a new inode) once its TAPs are ready;
+    // a signal before then would meet default handlers.
+    until(|| inode(&pid_path).is_some_and(|now| Some(now) != published));
+    assert_eq!(fs::read_to_string(&pid_path).unwrap(), format!("{pid}\n"));
+    assert_eq!((index(c"uq-rx"), index(c"uq-rx.7")), (tap, upper));
+    assert_eq!(mac_address(&net, c"uq-rx"), mac);
+    // SAFETY: the PID file names the daemon this test started.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    until(|| !pid_path.exists());
+    assert_eq!(index(c"uq-rx"), tap, "shutdown removed the TAP");
+    let removed = Command::new(binary())
+        .args(["remove-tap", "uq-rx"])
+        .status()
+        .unwrap();
+    assert!(removed.success());
+    until(|| index(c"uq-rx") == 0);
+}
+
+#[test]
 #[ignore = "requires disposable container with tun and network namespace capabilities"]
 fn start_returns_after_taps_exist_and_reports_failure_before_them() {
     use common::*;

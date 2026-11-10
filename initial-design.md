@@ -553,8 +553,9 @@ handover format before implementing adoption, and retain the original descriptor
 if preparation or exec fails. Preserving TAPs does not itself preserve userspace
 transport state or guarantee uninterrupted forwarding.
 
-**Handover format, version 1 (November 10; persistence and library adoption
-implemented, the daemon's restart and re-exec not yet).**
+**Handover format, version 1 (November 10; implemented).** A termination
+signal that reaches the new image before it installs its handlers ends it
+without cleanup; the persistent TAPs remain for the next start.
 It follows rs-l2tpd's adoption protocol with TAP queues in place of sockets.
 
 - Persistence. Created TAPs are marked persistent (`TUNSETPERSIST`), so closing
@@ -573,7 +574,8 @@ It follows rs-l2tpd's adoption protocol with TAP queues in place of sockets.
   The daemon execs the same arguments with the queues as descriptors 3 onward
   in configuration order, session by session and queue by queue, announced
   with `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES`. Each name is
-  `tap:<queue>:<queue count>:<session name in hex>`. `UNQUIC_REEXEC` is
+  `tap.<queue>.<queue count>.<session name in hex>`, since colons separate
+  the names. `UNQUIC_REEXEC` is
   `1:<pid>` and `UNQUIC_PIDFILE` carries the published PID-file state. The
   descriptor shuffle runs in a thread with a private descriptor table, so a
   failed exec leaves the caller's table unchanged and the daemon restarts its

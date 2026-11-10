@@ -141,7 +141,7 @@ impl Readiness {
 }
 
 impl PidFile {
-    fn publish(path: &Path) -> io::Result<Self> {
+    pub fn publish(path: &Path) -> io::Result<Self> {
         let pid = std::process::id();
         let mut temporary = path.as_os_str().to_owned();
         temporary.push(format!(".{pid}.tmp"));

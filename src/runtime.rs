@@ -48,6 +48,9 @@ struct ControlState {
     shutdown: AtomicBool,
     stopped: AtomicBool,
     shared: OnceLock<Arc<Shared>>,
+    handover: AtomicBool,
+    // (session, queue, descriptor) released by workers stopping for a handover.
+    handed: Mutex<Vec<(usize, usize, std::os::fd::OwnedFd)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -104,6 +107,37 @@ impl Control {
 
     pub(crate) fn quitting(&self) -> bool {
         self.0.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Like [`shutdown`](Self::shutdown), but workers release their TAP queue
+    /// descriptors instead of closing them; collect them with
+    /// [`take_handed_queues`](Self::take_handed_queues) after run returns.
+    pub fn handover(&self) {
+        self.0.handover.store(true, Ordering::Release);
+        self.shutdown();
+    }
+
+    pub(crate) fn handing_over(&self) -> bool {
+        self.0.handover.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn keep_queue(&self, session: usize, queue: usize, fd: std::os::fd::OwnedFd) {
+        if let Ok(mut handed) = self.0.handed.lock() {
+            handed.push((session, queue, fd));
+        }
+    }
+
+    /// Queues released by a handover, as (session, queue index, descriptor)
+    /// sorted by session and queue. Empty unless [`handover`](Self::handover) ran.
+    pub fn take_handed_queues(&self) -> Vec<(usize, usize, std::os::fd::OwnedFd)> {
+        let mut handed = self
+            .0
+            .handed
+            .lock()
+            .map(|mut handed| std::mem::take(&mut *handed))
+            .unwrap_or_default();
+        handed.sort_by_key(|&(session, queue, _)| (session, queue));
+        handed
     }
 
     /// Queues an IPv6 candidate for a configured peer without changing its port.

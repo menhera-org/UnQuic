@@ -4,6 +4,8 @@
 mod config;
 #[path = "unquic/daemon.rs"]
 mod daemon;
+#[path = "unquic/restart.rs"]
+mod restart;
 
 use std::{
     io::{self, Write},
@@ -30,6 +32,12 @@ extern "C" fn stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
+static RESTART: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn restart_signal(_: libc::c_int) {
+    RESTART.store(true, Ordering::Relaxed);
+}
+
 fn signals() -> io::Result<()> {
     // SAFETY: zero initializes the platform sigaction, then its handler/mask are set.
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -46,6 +54,11 @@ fn signals() -> io::Result<()> {
     action.sa_sigaction = report as *const () as usize;
     // SAFETY: initialized handler and mask remain alive for this call.
     if unsafe { libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    action.sa_sigaction = restart_signal as *const () as usize;
+    // SAFETY: as above.
+    if unsafe { libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut()) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -176,8 +189,54 @@ impl Trace {
     }
 }
 
-fn serve(loaded: config::Loaded, mut readiness: Option<daemon::Readiness>) -> io::Result<()> {
+/// How serve starts: readiness pipe, PID file and adopted TAPs, if any.
+struct Launch {
+    readiness: Option<daemon::Readiness>,
+    pid_path: Option<std::path::PathBuf>,
+    adopted: Vec<Option<unquic::tap::Tap>>,
+    // Arguments for a re-exec, as this process received them.
+    args: Vec<std::ffi::OsString>,
+}
+
+fn sessions(config: &unquic::config::Config) -> Vec<restart::Session<'_>> {
+    config
+        .sessions
+        .iter()
+        .map(|session| restart::Session {
+            name: &session.name,
+            queues: session.queue_count,
+            mtu: session.inner_mtu,
+        })
+        .collect()
+}
+
+/// Turns queues kept for a failed re-exec back into each session's TAP.
+fn adopt_back(
+    sessions: &[restart::Session<'_>],
+    queues: Vec<(usize, usize, std::os::fd::OwnedFd)>,
+) -> io::Result<Vec<Option<unquic::tap::Tap>>> {
+    let mut grouped: Vec<Vec<std::os::fd::OwnedFd>> = sessions.iter().map(|_| Vec::new()).collect();
+    for (session, _, fd) in queues {
+        if let Some(group) = grouped.get_mut(session) {
+            group.push(fd);
+        }
+    }
+    sessions
+        .iter()
+        .zip(grouped)
+        .map(|(session, fds)| {
+            if fds.is_empty() {
+                Ok(None)
+            } else {
+                unquic::tap::Tap::adopt(fds, session.mtu).map(Some)
+            }
+        })
+        .collect()
+}
+
+fn serve(loaded: config::Loaded, mut launch: Launch) -> io::Result<()> {
     signals()?;
+    let binary = std::env::current_exe()?;
     let mut _pid_file = None;
     #[cfg(feature = "trace")]
     let mut trace = loaded
@@ -185,82 +244,123 @@ fn serve(loaded: config::Loaded, mut readiness: Option<daemon::Readiness>) -> io
         .sessions
         .first()
         .and_then(|session| Trace::open(&session.name));
-    let control = Control::new();
-    let worker_control = control.clone();
-    let transport = thread::Builder::new()
-        .name("unquic-run".into())
-        .spawn(move || runtime::run(loaded.config, worker_control))?;
-    let mut lookups = Some(loaded.lookups);
-    let mut helper_error = None;
-    while !transport.is_finished() {
-        if REPORT.swap(false, Ordering::Relaxed) {
-            let mut worker = 0;
-            while let Some(snapshot) = control.worker_counters(worker) {
-                eprintln!("unquic: worker {worker} {snapshot:?}");
-                worker += 1;
+    let mut adopted = std::mem::take(&mut launch.adopted);
+    loop {
+        let control = Control::new();
+        let transport = {
+            let control = control.clone();
+            let config = loaded.config.clone();
+            let adopted = std::mem::take(&mut adopted);
+            thread::Builder::new()
+                .name("unquic-run".into())
+                .spawn(move || runtime::run_adopting(config, control, adopted))?
+        };
+        let mut lookups = Some(loaded.lookups.clone());
+        let mut helper_error = None;
+        let mut restarting = false;
+        while !transport.is_finished() {
+            if REPORT.swap(false, Ordering::Relaxed) {
+                let mut worker = 0;
+                while let Some(snapshot) = control.worker_counters(worker) {
+                    eprintln!("unquic: worker {worker} {snapshot:?}");
+                    worker += 1;
+                }
+                #[cfg(feature = "trace")]
+                if let Some(trace) = &mut trace {
+                    trace.mark(true);
+                }
             }
             #[cfg(feature = "trace")]
             if let Some(trace) = &mut trace {
-                trace.mark(true);
+                trace.drain();
             }
-        }
-        #[cfg(feature = "trace")]
-        if let Some(trace) = &mut trace {
-            trace.drain();
-        }
-        if STOP.load(Ordering::Relaxed) {
-            control.shutdown();
-            break;
-        }
-        if control.ready()
-            && let Some(jobs) = lookups.take()
-        {
-            eprintln!("unquic: TAPs ready");
-            if let Some(readiness) = readiness.take() {
-                match readiness.ready() {
-                    Ok(pid_file) => _pid_file = Some(pid_file),
-                    Err(error) => {
-                        helper_error = Some(error);
-                        control.shutdown();
-                        break;
-                    }
-                }
-            }
-            for job in jobs {
-                let control = control.clone();
-                if let Err(error) = thread::Builder::new()
-                    .name("unquic-dns".into())
-                    .spawn(move || resolve(job, control))
-                {
-                    helper_error = Some(error);
-                    break;
-                }
-            }
-            if helper_error.is_some() {
+            if STOP.load(Ordering::Relaxed) {
                 control.shutdown();
                 break;
             }
+            if RESTART.swap(false, Ordering::Relaxed) {
+                // A successor that cannot adopt these queues never stops this daemon.
+                match restart::probe(&binary) {
+                    Ok(()) => {
+                        restarting = true;
+                        control.handover();
+                        break;
+                    }
+                    Err(error) => eprintln!("unquic: restart refused: {error}"),
+                }
+            }
+            if control.ready()
+                && let Some(jobs) = lookups.take()
+            {
+                eprintln!("unquic: TAPs ready");
+                if _pid_file.is_none() {
+                    let published = match launch.readiness.take() {
+                        Some(readiness) => readiness.ready().map(Some),
+                        None => launch
+                            .pid_path
+                            .as_deref()
+                            .map(daemon::PidFile::publish)
+                            .transpose(),
+                    };
+                    match published {
+                        Ok(pid_file) => _pid_file = pid_file,
+                        Err(error) => {
+                            helper_error = Some(error);
+                            control.shutdown();
+                            break;
+                        }
+                    }
+                }
+                for job in jobs {
+                    let control = control.clone();
+                    if let Err(error) = thread::Builder::new()
+                        .name("unquic-dns".into())
+                        .spawn(move || resolve(job, control))
+                    {
+                        helper_error = Some(error);
+                        break;
+                    }
+                }
+                if helper_error.is_some() {
+                    control.shutdown();
+                    break;
+                }
+            }
+            thread::park_timeout(Duration::from_millis(50));
         }
-        thread::park_timeout(Duration::from_millis(50));
-    }
-    let result = transport
-        .join()
-        .unwrap_or_else(|_| Err(io::ErrorKind::Other.into()));
-    #[cfg(feature = "trace")]
-    if let Some(trace) = &mut trace {
-        trace.mark(false);
-    }
-    // System DNS has no cancellable timeout; process exit ends any blocked helpers.
-    if let Some(error) = helper_error {
-        Err(error)
-    } else {
-        result
+        let result = transport
+            .join()
+            .unwrap_or_else(|_| Err(io::ErrorKind::Other.into()));
+        if restarting && result.is_ok() && helper_error.is_none() {
+            let sessions = sessions(&loaded.config);
+            let queues = control.take_handed_queues();
+            let error = restart::exec(
+                &binary,
+                &launch.args,
+                &sessions,
+                &queues,
+                launch.pid_path.as_deref(),
+            );
+            eprintln!("unquic: re-exec failed; continuing on the same TAP queues: {error}");
+            adopted = adopt_back(&sessions, queues)?;
+            continue;
+        }
+        #[cfg(feature = "trace")]
+        if let Some(trace) = &mut trace {
+            trace.mark(false);
+        }
+        // System DNS has no cancellable timeout; process exit ends any blocked helpers.
+        return if let Some(error) = helper_error {
+            Err(error)
+        } else {
+            result
+        };
     }
 }
 
 const USAGE: &str = "unquic gen-uuid | unquic run <config.toml> | \
-unquic start <config.toml> <pid-file> | unquic systemd-unit <config.toml> <pid-file> | \
-unquic remove-tap <name>";
+unquic start <config.toml> <pid-file> | unquic restart <pid-file> | \
+unquic systemd-unit <config.toml> <pid-file> | unquic remove-tap <name> | unquic adopt-version";
 
 fn absolute(path: std::ffi::OsString) -> io::Result<std::path::PathBuf> {
     let path = std::path::PathBuf::from(path);
@@ -276,27 +376,56 @@ fn absolute(path: std::ffi::OsString) -> io::Result<std::path::PathBuf> {
 
 /// Returns the process exit status.
 fn execute() -> io::Result<u8> {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let mut args = args.into_iter();
+    let original: Vec<_> = std::env::args_os().skip(1).collect();
+    let mut args = original.clone().into_iter();
     match (args.next(), args.next(), args.next(), args.next()) {
         (Some(command), None, None, None) if command == "gen-uuid" => {
             writeln!(io::stdout().lock(), "{}", UnquicUuid::new_v4()?)?;
         }
+        (Some(command), None, None, None) if command == "adopt-version" => {
+            io::stdout().lock().write_all(restart::VERSION.as_bytes())?;
+        }
+        (Some(command), Some(pid_file), None, None) if command == "restart" => {
+            restart::signal(&absolute(pid_file)?)?;
+        }
         (Some(command), Some(path), None, None) if command == "run" => {
-            serve(
-                config::Loaded::parse(&std::fs::read_to_string(path)?)?,
-                None,
-            )?;
+            let loaded = config::Loaded::parse(&std::fs::read_to_string(path)?)?;
+            let inherited = restart::entry(&sessions(&loaded.config))?;
+            let (adopted, pid_path) =
+                inherited.map_or((Vec::new(), None), |i| (i.taps, i.pid_file));
+            let launch = Launch {
+                readiness: None,
+                pid_path,
+                adopted,
+                args: original,
+            };
+            serve(loaded, launch)?;
         }
         (Some(command), Some(path), Some(pid_file), None) if command == "start" => {
             let path = absolute(path)?;
+            let pid_file = absolute(pid_file)?;
             let loaded = config::Loaded::parse(&std::fs::read_to_string(&path)?)?;
             // Report configuration errors from the launching process, before forking.
             loaded.config.clone().validate().map_err(io::Error::other)?;
-            match daemon::start(absolute(pid_file)?)? {
-                daemon::Started::Parent(status) => return Ok(status),
-                daemon::Started::Daemon(readiness) => serve(loaded, Some(readiness))?,
-            }
+            // A re-executed daemon is already detached and adopts its queues.
+            let launch = match restart::entry(&sessions(&loaded.config))? {
+                Some(inherited) => Launch {
+                    readiness: None,
+                    pid_path: inherited.pid_file.or(Some(pid_file)),
+                    adopted: inherited.taps,
+                    args: original,
+                },
+                None => match daemon::start(pid_file.clone())? {
+                    daemon::Started::Parent(status) => return Ok(status),
+                    daemon::Started::Daemon(readiness) => Launch {
+                        readiness: Some(readiness),
+                        pid_path: Some(pid_file),
+                        adopted: Vec::new(),
+                        args: original,
+                    },
+                },
+            };
+            serve(loaded, launch)?;
         }
         (Some(command), Some(name), None, None) if command == "remove-tap" => {
             use std::os::unix::ffi::OsStringExt;

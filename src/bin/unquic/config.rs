@@ -56,7 +56,7 @@ const fn refresh() -> u64 {
     60
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ResolverConfig {
     System {},
@@ -155,6 +155,7 @@ impl ResolverConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct Lookup {
     pub peer: usize,
     pub host: IpHost,

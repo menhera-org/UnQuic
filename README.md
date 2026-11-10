@@ -100,8 +100,19 @@ closes. For handover, `TapQueue::into_fd` releases a queue's descriptor and
 multiqueue TAP queue with virtio headers and no packet information, all of one
 device, which keeps its current name, so an external rename survives.
 `runtime::run_adopting` runs sessions on adopted TAPs of the configured queue
-count. The daemon's restart and re-exec, the rest of handover format version 1
-in design section 11, are not yet implemented. Library code no longer calls `unwrap`, `expect`, `panic!` or
+count.
+
+`unquic restart /run/unquic.pid` asks a running daemon to re-execute its
+binary, for example after an upgrade, as handover format version 1 in design
+section 11 defines. The daemon first runs the binary with `adopt-version`, which
+must print `unquic-adopt 1`; otherwise it logs the refusal and keeps running.
+It then stops its workers, keeps every TAP queue open and execs the same
+arguments with the queues announced through `LISTEN_FDS`. The new image adopts
+them by device, so TAPs keep their ifindex, MAC, attachments and upper devices,
+and republishes the PID file once ready. UDP sockets and transport state
+restart. If exec fails, the daemon resumes on the same queues. A container test
+checks the ifindex, MAC, a VLAN upper and the PID across a restart on Linux 6.8
+and 7.0; refused probes and failed execs are not yet tested. Library code no longer calls `unwrap`, `expect`, `panic!` or
 `unreachable!`; implicit indexing and arithmetic overflow are not yet audited.
 These are tracked in Stage 4 of [ROADMAP.md](ROADMAP.md).
 

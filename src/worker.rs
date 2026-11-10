@@ -1147,6 +1147,14 @@ impl Worker {
             }
         }
         self.publish_counters();
+        if self.control.handing_over() {
+            // A successor adopts these; closing them is not the device's end anyway.
+            for (session, local) in self.sessions.iter_mut().enumerate() {
+                if let Some(tap) = local.tap.take() {
+                    self.control.keep_queue(session, self.id, tap.into_fd());
+                }
+            }
+        }
         Ok(())
     }
 
