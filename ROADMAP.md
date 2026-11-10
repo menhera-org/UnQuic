@@ -1099,7 +1099,8 @@ full expired batches sharing the cleanup budget.
   two seconds while a second session on the same peer carries numbered
   frames, which arrive intact and once, with no transport allocation during
   the flood, and all arrive afterwards (Linux 6.8 and 7.0). Worker tests
-  cover full queues. Remaining: many sessions and lanes against the ceiling.
+  cover full queues. Another test starts sixteen sessions only under a
+  sufficient ceiling and, under 64 MiB, refuses before creating any TAP.
 - Restart, path change and DNS change cases from V03.
 - Daemon: double-fork readiness exactly as section 12.1 describes, PID file,
   parent exit only after every TAP exists; a test that the parent waits while

@@ -1568,3 +1568,52 @@ fn a_flooded_session_neither_allocates_nor_corrupts_its_neighbour() {
     left.stop();
     right.stop();
 }
+
+#[test]
+#[ignore = "requires disposable container with tun and network namespace capabilities"]
+fn many_sessions_start_within_the_memory_ceiling_or_create_nothing() {
+    use std::ffi::CString;
+    use unquic::runtime::{Control, run};
+    // SAFETY: only this test thread and its runtime enter the namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let net = UdpSocket::bind("[::]:0").unwrap();
+    up(&net, c"lo");
+    let many = |prefix: &str, limit: usize| {
+        let mut config = config("uq-many", 41700, 41701);
+        config.peers.truncate(1);
+        config.peers[0].tx_lanes = 4;
+        let template = config.sessions[0].clone();
+        config.sessions = (0..16_u8)
+            .map(|index| {
+                let mut session = template.clone();
+                session.name = format!("{prefix}{index}");
+                session.cookie = unquic::UnquicUuid::from_bytes([index + 10; 16]);
+                session.queue_count = 1;
+                session.inner_mtu = 1500;
+                session
+            })
+            .collect();
+        config.daemon.memory_limit = limit;
+        config
+    };
+    let exists = |prefix: &str, index: u8| {
+        let name = CString::new(format!("{prefix}{index}")).unwrap();
+        // SAFETY: the name is NUL-terminated; the call only queries this namespace.
+        unsafe { libc::if_nametoindex(name.as_ptr()) != 0 }
+    };
+    // Too little memory: refused before any device exists.
+    let error = run(many("uq-low", 64 << 20), Control::new()).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+    assert!((0..16).all(|index| !exists("uq-low", index)));
+    // Enough memory: every session's TAP exists at readiness.
+    let control = Control::new();
+    let runtime = {
+        let control = control.clone();
+        let config = many("uq-high", 4 << 30);
+        thread::spawn(move || run(config, control))
+    };
+    until(Duration::from_secs(10), || control.ready());
+    assert!((0..16).all(|index| exists("uq-high", index)));
+    control.shutdown();
+    runtime.join().unwrap().unwrap();
+}

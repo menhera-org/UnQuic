@@ -1126,7 +1126,9 @@ An overload test floods one session's TAP with full-size frames for two seconds
 while a second session on the same peer carries numbered frames. Every frame
 the quiet session delivers matches what was sent and arrives once, the
 transport allocates nothing during the flood, and once the backlog drains the
-quiet session delivers every frame again.
+quiet session delivers every frame again. Sixteen sessions on one peer start
+under a sufficient `memory_limit` with every TAP present; under 64 MiB startup
+fails with OutOfMemory before creating any.
 
 OVS, real RA/DHCPv6 resolver networks, physical-NIC offload qualification,
 Linux 5.0 qualification and performance acceptance remain open.
