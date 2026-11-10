@@ -553,6 +553,39 @@ handover format before implementing adoption, and retain the original descriptor
 if preparation or exec fails. Preserving TAPs does not itself preserve userspace
 transport state or guarantee uninterrupted forwarding.
 
+**Handover format, version 1 (November 10; defined, not yet implemented).**
+It follows rs-l2tpd's adoption protocol with TAP queues in place of sockets.
+
+- Persistence. Created TAPs are marked persistent (`TUNSETPERSIST`), so closing
+  every descriptor (a crash, a failed adoption, shutdown) never removes them.
+  Only an explicit removal instruction clears persistence and closes the
+  queues. A later start attaches to a persistent TAP of the configured name only
+  when it is a multiqueue TAP without packet information owned by this user;
+  otherwise startup fails rather than adopting another device.
+- Trigger. `unquic restart <pid-file>` checks the PID file as `rs-l2tpd
+  --restart` does and sends the daemon SIGUSR2.
+- Probe. Before anything stops, the daemon runs the resolved executable with
+  `adopt-version`; it must print exactly `unquic-adopt 1` and a newline and
+  exit 0 within three seconds. Any other result keeps the running daemon
+  unchanged and is logged.
+- Exec. Workers stop and UDP sockets close; TAP queue descriptors stay open.
+  The daemon execs the same arguments with the queues as descriptors 3 onward
+  in configuration order, session by session and queue by queue, announced
+  with `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES`. Each name is
+  `tap:<queue>:<queue count>:<session name in hex>`. `UNQUIC_REEXEC` is
+  `1:<pid>` and `UNQUIC_PIDFILE` carries the published PID-file state. The
+  descriptor shuffle runs in a thread with a private descriptor table, so a
+  failed exec leaves the caller's table unchanged and the daemon restarts its
+  workers on the original queues.
+- Adoption. The new process accepts the announcement only when the marker
+  names its own PID. For each configured session it requires exactly the
+  configured number of named queues, each a multiqueue TAP without packet
+  information per `TUNGETIFF`, all reporting one device; it adopts them
+  without renaming or changing MTU, MAC or administrative state, and reports
+  readiness as soon as every session has its queues. Missing, extra or
+  mismatched descriptors are a startup failure, which leaves the persistent
+  TAPs in place.
+
 **No production panics:** production library and daemon code must not panic.
 Validate fallible inputs and operations, propagate or handle errors, and preserve
 TAP ownership while recovering from transport or worker failures. This includes

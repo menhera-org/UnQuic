@@ -1030,6 +1030,11 @@ full expired batches sharing the cleanup budget.
   requested. Define versioned descriptor adoption and re-exec handover with no
   last-close gap; retain descriptors on failed exec. UDP sockets may be recreated.
   This remains unfinished: current nonpersistent TAPs disappear on last close.
+  Version 1 of the handover format is now defined in design section 11
+  (persistent TAPs, an `adopt-version` probe, systemd-style descriptor
+  announcement, exec from a private descriptor table). Implement it in this
+  order: persistence with an explicit removal command, the library's adoption
+  of supplied queues, then the daemon's restart and re-exec.
 - Support foreign TAP renames during operation and across handover. Test unchanged
   ifindex, MAC, upper devices, bridge membership and forwarding, including reuse
   of the old name by an unrelated device. Never rename back or recreate by name.
