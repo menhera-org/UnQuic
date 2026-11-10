@@ -70,9 +70,9 @@ sixteen 2G and 5G directions rise beyond production's range, by 16–129%
 ([BENCH.md](BENCH.md#replacing-grants-with-a-shared-send-budget-november-9)).
 The busiest worker now saturates on ACK handling. The zero-delay loopback
 overload check regresses by about a fifth without saturating any core. A
-diagnostic traces most of that to partial claims fragmenting sends; claiming
-whole plans recovers the reverse direction with less CPU and should be
-measured on the decision workload for adoption before item 2. A faster window
+diagnostic traces most of that to partial claims fragmenting sends. Claiming
+whole plans recovers the reverse loopback direction with less CPU, but loses
+18% in one decision-workload direction and was rejected. A faster window
 retry does not help. No performance gate has passed.
 
 ### Next, in order
@@ -87,21 +87,20 @@ rules apply to all of them.
    earlier split into "charge atomically" and "move records into lane
    histories" could not land as two commits: without per-batch grants the
    ordered sampler has no epoch to wait for.
-2. **Send ACKs from receive owners** on their own lanes, with the control
-   ceiling scaled per worker by received bytes, so one worker no longer carries
-   every ACK packet and its fan-out. Measure the same way. Two facts shape it.
-   Receive ownership is `(cookie + lane − 1) mod queues` while transmit
-   ownership is `(lane − 1) mod workers`, so an ACK sent from its receive
-   owner generally lands on a peer worker that must forward it. And each worker
-   has one report, so a lane's next ACK waits for worker zero's round trip;
-   while it waits, the peer's ACK transfer buffers stay held, which is where
-   the drops come from. A one-way ACK summary, or a small report pool, removes
-   that wait.
+2. **Send ACKs from receive owners.** Measured and rejected. Steering each
+   ACK to the lane whose peer owner needs it, and sending it on one of the
+   receive owner's own lanes, both cut ACK-buffer drops but moved delivery
+   between directions. At sixteen flows every worker already runs at 79–99%
+   of a core, so moving ACK work around cannot help, and a pool of four
+   reports per worker changed nothing on the single-flow target
+   ([BENCH.md](BENCH.md#whole-plan-claims-and-acks-routed-to-their-peer-owner-november-10)).
 3. **Size capacities** (audit step 5): per-session retention credit that busy
    workers can borrow, shared receive slots per worker, and the ACK-box pool,
    each sized from the delayed and lossy rows, with memory cost reported.
    Target one flow at 5 Gbit/s at 7.5 ms with 0.5% and 1% loss on four workers,
-   within two to four cores per daemon.
+   within two to four cores per daemon. One generator process offers only
+   about 2.5 Gbit/s for one flow, so the harness must change before the
+   5 Gbit/s point can be offered.
 4. **Finish stage 3:** general application-limited detection; the container
    test with `tc netem` loss and reordering proving no duplicate delivery and
    bounded memory; the 0, 0.1, 1 and 5% loss sweep at 4.5 and 7.5 ms with
@@ -165,8 +164,7 @@ Its steps, in order:
    [BENCH.md](BENCH.md#the-shared-owner-sender-is-the-throughput-limit-november-9)
 4. **Redesign the coordinator and amend the design.** The section 9
    amendment, its equivalence oracle and the runtime replacement are done and
-   measured. Remaining: item 2 of "Next, in order" (ACKs from receive owners
-   with the control ceiling scaled by received bytes per worker).
+   measured. Sending ACKs from receive owners was measured and rejected.
 5. **Size capacities for the path.** Not started; item 3 of "Next, in
    order". Only after steps 2 to 4: per-session retention credit that busy
    workers can borrow, shared receive slots per worker and the ACK-box pool,

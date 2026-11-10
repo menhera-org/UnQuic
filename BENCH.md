@@ -127,6 +127,102 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Whole-plan claims and ACKs routed to their peer owner (November 10)
+
+Two changes follow the shared-budget results, measured on the decision
+workload in one interleaved run with the shared budget as control:
+
+- **Whole-plan claims.** A claim takes the plan up to the smaller of one
+  quantum and the whole window, and waits rather than claiming only the part
+  that fits the window's remaining room. Stated before measuring: fewer,
+  larger sends should cut claim counts and CPU without lowering delivery; if
+  delivery falls beyond the control's range in most directions, reject it.
+- **ACK lanes.** Each ACK leaves on the transmit lane whose peer receive owner
+  is the peer's transmit owner of the acknowledged lane, sent by that lane's
+  owner with a 4 MiB/s control ceiling per worker. Stated before measuring:
+  incoming ACK-buffer drops should fall sharply, the busiest worker should
+  leave saturation, and 2G and 5G delivery should rise beyond the whole-plan
+  build's range in most directions. If drops fall but delivery does not move,
+  the report round trip, not ACK forwarding, is the limit.
+
+The container image was refreshed to a newer Ubuntu noble build between these
+runs and the previous section's; both builds in each comparison share one
+image.
+
+[Three interleaved repeats](benches/tap-whole-claim-ack-lanes.json) compared the
+shared budget, whole-plan claims, and whole-plan claims plus ACK lanes in a
+first, steered form: every ACK left on the lane mapped to the peer's owner,
+handed there by its receive owner. Medians at 2G and 5G:
+
+| Flows, loss | Offered | Shared budget | Whole-plan claims | Plus steered ACK lanes |
+| --- | --- | --- | --- | --- |
+| 16, 0% | 2G | 1.539 / 1.572 | 1.493 / 1.590 | 1.446 / 1.499 |
+| 16, 0% | 5G | 1.808 / 1.562 | 1.804 / 1.519 | 1.999 / 1.622 |
+| 16, 0.1% | 2G | 1.579 / 1.474 | 1.600 / 1.485 | 1.538 / 1.472 |
+| 16, 0.1% | 5G | 1.801 / 1.404 | 1.785 / 1.414 | 1.813 / 1.432 |
+| 4, 0% | 2G | 1.043 / 1.528 | 1.059 / 1.540 | 0.973 / 1.651 |
+| 4, 0% | 5G | 0.628 / 1.861 | 0.710 / 1.524 | 0.615 / 1.775 |
+| 4, 0.1% | 2G | 1.044 / 1.461 | 1.081 / 1.490 | 1.184 / 1.222 |
+| 4, 0.1% | 5G | 0.590 / 1.821 | 0.618 / 1.500 | 0.742 / 1.311 |
+
+Whole-plan claims stay within the control's range in thirteen of sixteen
+directions and lose about 18% beyond it in four-flow 5G R→L, with and without
+loss. They do not meet the stated bar and are rejected; their loopback benefit
+stays a diagnostic. The steered ACK lanes cut sixteen-flow ACK-buffer drops by
+60–70% but move delivery between directions, with new outliers near 0.6 Gbit/s.
+
+The simpler [own-lane form](benches/ack-own-lane-rejected.patch), where each
+receive owner sends its ACKs on one of its own lanes, was then compared with
+the shared budget alone ([data](benches/tap-ack-own-lane.json)). It cuts
+ACK-buffer drops by 40–70% but shifts delivery between directions: four-flow
+2G L→R falls from 0.990 to 0.625 and 1.039 to 0.756 while R→L rises from 1.487
+to 1.944 and 1.513 to 1.899; sixteen-flow 2G falls 5–9% and 5G rises 3–8%. Six
+directions move up beyond the control's range and six down. Rejected.
+
+Per-thread CPU explains why moving ACK work around does not help. At
+sixteen-flow 5G every worker on both daemons runs at 79–99% of a core, with
+55–65% of that in the kernel. That kernel time includes the harness itself:
+transmitting into a veth runs the routed netem path in the sender's context.
+TAP input is also uneven, one left worker reading three million frames in 20 s
+and another ten thousand. On this workload the transport now sits near step
+3's no-coordinator ceiling of 2.0–2.3 Gbit/s on four cores; the remaining
+limit is per-frame CPU on individual frames, not coordination.
+
+A [report pool](benches/report-pool-rejected.patch) of four reports per worker,
+completing a lane's report state at handoff so its next ACK need not wait for
+worker zero's round trip, changed nothing on the single-flow target below.
+Rejected.
+
+### Audit step 5 target, measured
+
+The target is one flow at 5 Gbit/s over 7.5 ms with 0.5% and 1% loss on four
+workers. [Three repeats](benches/tap-single-flow-loss.json) of the shared budget
+(L→R / R→L, Gbit/s):
+
+| Loss | Offered | Delivered |
+| --- | --- | --- |
+| 0.5% | 2.45–2.73 / 2.49–2.73 | 0.81–0.89 / 0.84–0.89 |
+| 1% | 2.48–2.82 / 2.40–2.86 | 0.70–0.79 / 0.75–0.80 |
+
+One generator process offers only about 2.5 Gbit/s for a single flow, so the
+5 Gbit/s point cannot be offered with this harness. The daemons are not
+CPU-bound here (127–146% of 400%). Even at 1 Gbit/s offered, 20–30% of frames
+go missing. A traced run at 1 Gbit/s and 1% loss shows why: the controller
+spends 83% of the time in ProbeBW Cruise, nearly always in recovery, pacing at
+about 0.48–0.55 Gbit/s with max_bw stuck near 68 MB/s and the window near one
+BDP. Draft 07 cuts its short-term bounds after any loss round outside probing,
+so steady random loss pins the rate; the owner's backlog then refuses
+200–590 thousand input frames per run. The same run drops 11,516 ACK records
+(20–25 thousand per untraced run), which delay delivery evidence and can turn
+into spurious losses. Early warm-up points also show a rarer failure: one
+direction falls to about 1% delivery at 0.125 Gbit/s offered with zero repairs
+sent while its pacing rate collapses.
+
+Next: size the ACK-transfer pool (step 5's ACK-box pool), then re-measure; if
+the rate stays pinned without ACK drops, the controller's response to random
+loss is the limit, and meeting the target needs a deliberate deviation from
+draft 07 recorded in the design, not a tuning constant.
+
 ## Replacing grants with a shared send budget (November 9)
 
 Design section 9's replacement sender is now the runtime's. Workers claim

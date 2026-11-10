@@ -1,0 +1,445 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index a92099f..457bee9 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -954,11 +954,8 @@ impl Worker {
+             peer_controls: (0..if id == 0 { config.peers.len() } else { 0 })
+                 .map(|_| PeerControl::default())
+                 .collect(),
+-            control_budgets: (0..if id == 0 {
+-                shared.config.path_groups()
+-            } else {
+-                0
+-            })
++            // Every worker sends ACKs for its share of lanes under its own ceiling.
++            control_budgets: (0..shared.config.path_groups())
+                 .map(|_| pacing::Control::new())
+                 .collect(),
+             sessions,
+@@ -3831,18 +3828,22 @@ impl Worker {
+         }
+     }
+ 
++    /// Sends one control record on transmit lane `lane`, which this worker owns.
++    /// Handshakes always use lane 0's socket.
+     fn send_record(
+         &mut self,
+         session: usize,
++        lane: usize,
+         record: Record<'_>,
+         now: Duration,
+     ) -> io::Result<Option<(u64, u16, Duration)>> {
+         if self.sender_enabled() && matches!(record, Record::Probe) {
+-            self.request_probe(session, 0, BASE_UDP_PAYLOAD, false, None, now)?;
++            self.request_probe(session, lane, BASE_UDP_PAYLOAD, false, None, now)?;
+             return Ok(None);
+         }
++        let lane = if record.is_handshake() { 0 } else { lane };
+         let history = if self.sender_enabled() && !record.is_handshake() {
+-            Some(self.sender_index(session, 0)?)
++            Some(self.sender_index(session, lane)?)
+         } else {
+             None
+         };
+@@ -3855,7 +3856,7 @@ impl Worker {
+             } else {
+                 self.sessions[session].path
+             };
+-        let Some(socket) = &self.transmit[peer].paths[path].lanes[0].socket else {
++        let Some(socket) = &self.transmit[peer].paths[path].lanes[lane].socket else {
+             return Ok(None);
+         };
+         let limit = BASE_UDP_PAYLOAD;
+@@ -3876,17 +3877,17 @@ impl Worker {
+             // Check first: a refused number would become a hole on every retry.
+             // Control leaves the last numbers to probes that can expose a stuck tail.
+             if let Some(index) = history
+-                && self.sessions[session].tx[0].as_ref().is_some_and(|lane| {
++                && self.sessions[session].tx[lane].as_ref().is_some_and(|tx| {
+                     !self.sender.lanes[index]
+                         .history
+-                        .can_reserve(lane.next_packet().saturating_add(sender::PROBE_HEADROOM))
++                        .can_reserve(tx.next_packet().saturating_add(sender::PROBE_HEADROOM))
+                 })
+             {
+                 return Ok(None);
+             }
+-            self.sessions[session].tx[0]
++            self.sessions[session].tx[lane]
+                 .as_mut()
+-                .and_then(|lane| lane.record(record, bytes).ok())
++                .and_then(|tx| tx.record(record, bytes).ok())
+         };
+         let Some(packet) = packet else {
+             return Ok(None);
+@@ -3974,10 +3975,10 @@ impl Worker {
+                     .tx_outer_bytes
+                     .wrapping_add((packet.length + 48) as u64);
+                 if !record.is_handshake() {
+-                    local.tx_totals[0].tx_outer_bytes = local.tx_totals[0]
++                    local.tx_totals[lane].tx_outer_bytes = local.tx_totals[lane]
+                         .tx_outer_bytes
+                         .wrapping_add((packet.length + 48) as u64);
+-                    local.tx_dirty |= 1;
++                    local.tx_dirty |= 1 << lane;
+                 }
+                 Ok(Some((packet.number, packet.length as u16, started)))
+             }
+@@ -3987,9 +3988,9 @@ impl Worker {
+                     let local = &mut self.sessions[session];
+                     local.totals.socket_errors = local.totals.socket_errors.wrapping_add(1);
+                     if !record.is_handshake() {
+-                        local.tx_totals[0].socket_errors =
+-                            local.tx_totals[0].socket_errors.wrapping_add(1);
+-                        local.tx_dirty |= 1;
++                        local.tx_totals[lane].socket_errors =
++                            local.tx_totals[lane].socket_errors.wrapping_add(1);
++                        local.tx_dirty |= 1 << lane;
+                     }
+                 }
+                 Ok(None)
+@@ -4254,7 +4255,7 @@ impl Worker {
+             self.controls[session].pending_send = None;
+             return Ok(());
+         }
+-        if let Some((_, _, started)) = self.send_record(session, record, now)? {
++        if let Some((_, _, started)) = self.send_record(session, 0, record, now)? {
+             self.controls[session].pending_send = None;
+             self.controls[session]
+                 .state
+@@ -4305,13 +4306,13 @@ impl Worker {
+                 && now >= self.controls[session].probe_due
+             {
+                 self.controls[session].probe_due = now + Duration::from_secs(1);
+-                self.controls[session].probe = self.send_record(session, Record::Probe, now)?.map(
+-                    |(number, length, started)| {
++                self.controls[session].probe = self
++                    .send_record(session, 0, Record::Probe, now)?
++                    .map(|(number, length, started)| {
+                         self.controls[session].probe_due =
+                             started.saturating_add(Duration::from_secs(1));
+                         (number, length)
+-                    },
+-                );
++                    });
+             }
+             self.shared.publish_state(
+                 session,
+@@ -5132,11 +5133,11 @@ mod tests {
+         let mut charged = 0;
+         let mut bytes = [0; BASE_UDP_PAYLOAD];
+         for session in (0..16).map(|index| index % 2) {
+-            let (_, length, _) = worker.send_record(session, reply, now).unwrap().unwrap();
++            let (_, length, _) = worker.send_record(session, 0, reply, now).unwrap().unwrap();
+             charged += u64::from(length) + 48;
+             assert_eq!(rx.recv(&mut bytes).unwrap().0, usize::from(length));
+         }
+-        assert!(worker.send_record(1, reply, now).unwrap().is_none());
++        assert!(worker.send_record(1, 0, reply, now).unwrap().is_none());
+         assert_eq!(worker.counters.tx_outer_bytes, charged);
+         assert_eq!(worker.counters.socket_errors, 0);
+         assert_eq!(
+@@ -5178,7 +5179,7 @@ mod tests {
+     #[ignore = "kernel descriptor test; run in a disposable container"]
+     fn queued_handshakes_expire_and_socket_retry_preserves_the_flight() {
+         let (_, [mut worker, other]) = test_workers();
+-        assert!(other.control_budgets.is_empty());
++        assert_eq!(other.control_budgets.len(), 1);
+         worker.shared.bound[0].store(3, Ordering::Release);
+         let now = Duration::ZERO;
+         let effects = worker.controls[0].state.on_timer(now, Tag::new(9)).unwrap();
+@@ -7182,7 +7183,7 @@ mod tests {
+         assert_eq!(workers[0].sessions[0].totals.tx_outer_bytes, charged);
+         // A control transmission may overtake the discarded packet-number suffix.
+         let control = workers[0]
+-            .send_record(0, Record::Probe, Duration::ZERO)
++            .send_record(0, 0, Record::Probe, Duration::ZERO)
+             .unwrap()
+             .unwrap();
+         assert!(control.0 > unused);
+diff --git a/src/worker/feedback.rs b/src/worker/feedback.rs
+index 3ee7596..6d8e26a 100644
+--- a/src/worker/feedback.rs
++++ b/src/worker/feedback.rs
+@@ -10,6 +10,8 @@ pub(crate) struct Feedback {
+     session: usize,
+     tag: u128,
+     lane: u16,
++    // Transmit lane index that carries this ACK; its owner sends it.
++    tx_lane: usize,
+     slot: usize,
+     count: usize,
+     delay_us: u32,
+@@ -26,6 +28,7 @@ impl Feedback {
+             session: 0,
+             tag: 0,
+             lane: 0,
++            tx_lane: 0,
+             slot: 0,
+             count: 0,
+             delay_us: 0,
+@@ -37,6 +40,29 @@ impl Feedback {
+     }
+ }
+ 
++/// Transmit lane index on which worker `own` sends the ACK for receive lane
++/// `acked`: one of its own lanes, preferring a lane whose peer receive owner,
++/// `(low + lane) mod queues` as in Worker::packet_one, is the peer's transmit
++/// owner of `acked`, `(acked − 1) mod workers`. None when `own` has no lane.
++fn ack_lane(
++    low: u32,
++    queues: usize,
++    workers: usize,
++    lanes: usize,
++    own: usize,
++    acked: u16,
++) -> Option<usize> {
++    let (queues, workers) = (queues.max(1), workers.max(1));
++    let target = usize::from(acked).saturating_sub(1) % workers;
++    let mut owned = (own..lanes).step_by(workers);
++    let first = owned.clone().next()?;
++    Some(
++        owned
++            .find(|&lane| low.wrapping_add(lane as u32) as usize % queues == target)
++            .unwrap_or(first),
++    )
++}
++
+ pub(super) enum Pending {
+     Handshake(usize),
+     Reply {
+@@ -86,8 +112,32 @@ impl Worker {
+         });
+     }
+ 
++    /// This receive owner's transmit lane for an ACK of receive lane `acked`, so
++    /// ACKs leave the worker that built them; see the free function. Without an
++    /// own lane, worker zero sends it on lane 0. The peer-owner preference
++    /// assumes the peer's worker and queue counts match ours; otherwise the peer
++    /// forwards the ACK as it would any other.
++    pub(super) fn ack_lane(&self, session: usize, acked: u16) -> (usize, usize) {
++        let config = self.shared.config.config();
++        let cookie = config.sessions[session].cookie.as_bytes();
++        let lanes = self
++            .shared
++            .config
++            .peer_for_session(session)
++            .map_or(0, |peer| config.peers[peer].tx_lanes);
++        ack_lane(
++            u32::from_be_bytes([cookie[12], cookie[13], cookie[14], cookie[15]]),
++            config.sessions[session].queue_count,
++            self.shared.workers(),
++            lanes,
++            self.id,
++            acked,
++        )
++        .map_or((0, 0), |lane| (self.id, lane))
++    }
++
+     pub(super) fn receive_feedback(&mut self, feedback: Box<Feedback>) -> io::Result<()> {
+-        if feedback.count != 0 && self.id == 0 {
++        if feedback.count != 0 && feedback.tx_lane % self.shared.workers() == self.id {
+             self.pending_control.push_back(Pending::Ack(feedback));
+         } else if feedback.count == 0 && feedback.origin == self.id {
+             if self.matches(feedback.session, feedback.tag) {
+@@ -117,29 +167,40 @@ impl Worker {
+             if self.feedback_free.is_empty() {
+                 break;
+             }
+-            if self.id != 0 && self.outgoing[0].as_mut().is_none_or(Producer::is_full) {
+-                self.feedback_retry = now.saturating_add(RETRY);
+-                break;
+-            }
+             let index = self.feedback_cursor;
+-            self.feedback_cursor = (index + 1) % slots;
+             let (session, slot) = (index / LANES, index % LANES);
+-            let local = &mut self.sessions[session];
++            let local = &self.sessions[session];
+             if local.ack_inflight & (1 << slot) != 0 || local.returning & (1 << slot) != 0 {
++                self.feedback_cursor = (index + 1) % slots;
+                 continue;
+             }
+             let Some(connection) = local.connection else {
++                self.feedback_cursor = (index + 1) % slots;
+                 continue;
+             };
+-            let Some(lane) = local.rx[slot].as_mut() else {
++            let Some(lane) = local.rx[slot].as_ref() else {
++                self.feedback_cursor = (index + 1) % slots;
+                 continue;
+             };
++            let id = lane.id();
+             if lane.ack_deadline().is_none_or(|due| due > now)
+-                || self.shared.owners[session][usize::from(lane.id())].load(Ordering::Acquire)
++                || self.shared.owners[session][usize::from(id)].load(Ordering::Acquire)
+                     != self.id as u8 + 1
+             {
++                self.feedback_cursor = (index + 1) % slots;
+                 continue;
+             }
++            let (target, tx_lane) = self.ack_lane(session, id);
++            // Keep this lane's turn until its sender's queue has room for the handoff.
++            if target != self.id && self.outgoing[target].as_mut().is_none_or(Producer::is_full) {
++                self.feedback_retry = now.saturating_add(RETRY);
++                break;
++            }
++            self.feedback_cursor = (index + 1) % slots;
++            let local = &mut self.sessions[session];
++            let Some(lane) = local.rx[slot].as_mut() else {
++                continue;
++            };
+             let Some(mut feedback) = self.feedback_free.pop() else {
+                 break;
+             };
+@@ -154,6 +215,7 @@ impl Worker {
+             };
+             feedback.count = ranges.len();
+             feedback.lane = lane;
++            feedback.tx_lane = tx_lane;
+             feedback.delay_us = delay_us;
+             feedback.session = session;
+             feedback.slot = slot;
+@@ -162,9 +224,9 @@ impl Worker {
+             feedback.sent = None;
+             feedback.due = now;
+             local.ack_inflight |= 1 << slot;
+-            if self.id == 0 {
++            if target == self.id {
+                 self.pending_control.push_back(Pending::Ack(feedback));
+-            } else if let Err(Event::Feedback(_)) = self.push(0, Event::Feedback(feedback)) {
++            } else if let Err(Event::Feedback(_)) = self.push(target, Event::Feedback(feedback)) {
+                 return Err(io::Error::other("reserved feedback queue slot disappeared"));
+             }
+         }
+@@ -245,6 +307,7 @@ impl Worker {
+                         }
+                         self.send_record(
+                             session,
++                            0,
+                             Record::ProbeReply {
+                                 lane,
+                                 packet_number: packet,
+@@ -274,6 +337,7 @@ impl Worker {
+                             .map_err(io::Error::other)?;
+                         if let Some((_, _, started)) = self.send_record(
+                             feedback.session,
++                            feedback.tx_lane,
+                             Record::Ack {
+                                 lane: feedback.lane,
+                                 delay_us: (feedback.delay_us + queued).min(1000),
+@@ -317,7 +381,9 @@ impl Worker {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::worker::tests::{receive_bytes, receive_piece, receive_worker, test_workers};
++    use crate::worker::tests::{
++        receive_bytes, receive_piece, receive_worker, test_workers_with_lanes,
++    };
+ 
+     fn socket(worker: &mut Worker) -> ReceiveSocket {
+         let rx = ReceiveSocket::bind("[::1]:40001".parse().unwrap(), None).unwrap();
+@@ -326,6 +392,33 @@ mod tests {
+         rx
+     }
+ 
++    #[test]
++    fn ack_lanes_land_on_the_acked_lanes_transmit_owner() {
++        for (low, queues, workers, lanes) in [
++            (0, 4, 4, 8),
++            (0xffff_fffe, 4, 4, 8),
++            (7, 8, 8, 16),
++            (6, 3, 3, 6),
++        ] {
++            for own in 0..workers {
++                for acked in 1..=lanes as u16 {
++                    let lane = super::ack_lane(low, queues, workers, lanes, own, acked).unwrap();
++                    assert!(lane < lanes && lane % workers == own, "an own lane");
++                    let owner = low.wrapping_add(lane as u32) as usize % queues;
++                    let target = (usize::from(acked) - 1) % workers;
++                    // Lanes own + k·workers reach owners low + own + k·workers mod queues.
++                    let reachable = (own..lanes)
++                        .step_by(workers)
++                        .any(|x| low.wrapping_add(x as u32) as usize % queues == target);
++                    assert_eq!(owner == target, reachable);
++                }
++            }
++        }
++        // Without a reachable owner, the first own lane; without an own lane, none.
++        assert_eq!(super::ack_lane(1, 4, 4, 8, 2, 1), Some(2));
++        assert_eq!(super::ack_lane(0, 2, 2, 1, 1, 1), None);
++    }
++
+     #[test]
+     #[ignore = "kernel descriptor test; run in a disposable container"]
+     fn failed_ack_submission_keeps_snapshot_and_yields_until_retry() {
+@@ -503,7 +596,7 @@ mod tests {
+         };
+         let mut bytes = [0; BASE_UDP_PAYLOAD];
+         for _ in 0..16 {
+-            assert!(worker.send_record(1, reply, now).unwrap().is_some());
++            assert!(worker.send_record(1, 0, reply, now).unwrap().is_some());
+             rx.recv(&mut bytes).unwrap();
+         }
+         let effects = worker.controls[0].state.on_timer(now, Tag::new(9)).unwrap();
+@@ -553,7 +646,8 @@ mod tests {
+     #[test]
+     #[ignore = "kernel descriptor test; run in a disposable container"]
+     fn feedback_reserves_handoff_space_and_returns_through_backpressure_and_replacement() {
+-        let (shared, mut workers) = test_workers();
++        // One transmit lane: worker 1 owns none, so its ACKs go through worker 0.
++        let (shared, mut workers) = test_workers_with_lanes(1);
+         for from in 0..2 {
+             let (tx, rx) = crate::spsc::channel();
+             workers[from].outgoing[1 - from] = Some(tx);
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index d48cd5a..a53e6b3 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -204,6 +204,7 @@ fn steady_control_does_not_starve_local_data_or_consume_another_claim() {
+         let ranges = [wire::AckRange { start: 1, end: 1 }];
+         let control = workers[0]
+             .send_record(
++                0,
+                 0,
+                 Record::Ack {
+                     lane: 1,
+@@ -273,6 +274,7 @@ fn control_overtaking_a_waiting_plan_refreshes_it_when_claimed() {
+     let now = Duration::from_millis(1);
+     let control = worker
+         .send_record(
++            0,
+             0,
+             Record::ProbeReply {
+                 lane: 1,
+@@ -423,6 +425,7 @@ fn partial_batches_with_feedback(feedback: bool) {
+             if feedback && worker.id == 0 && worker.sender.job.is_some() {
+                 worker
+                     .send_record(
++                        0,
+                         0,
+                         Record::ProbeReply {
+                             lane: 1,
+@@ -829,6 +832,7 @@ fn feedback_overtakes_a_request_held_by_pacing_without_starving_it() {
+     assert_eq!(workers[0].sender.job.unwrap().first, old);
+     let control = workers[0]
+         .send_record(
++            0,
+             0,
+             Record::ProbeReply {
+                 lane: 1,
+@@ -865,6 +869,7 @@ fn overtaken_probe_refreshes_its_history_and_reply_identity() {
+     let old = workers[0].sender.job.unwrap().first;
+     let control = workers[0]
+         .send_record(
++            0,
+             0,
+             Record::ProbeReply {
+                 lane: 1,
+@@ -920,6 +925,7 @@ fn refresh_history_pressure_reports_unused_and_preserves_frame() {
+     }
+     let control = workers[0]
+         .send_record(
++            0,
+             0,
+             Record::ProbeReply {
+                 lane: 1,

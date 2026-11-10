@@ -1,0 +1,340 @@
+diff --git a/src/worker/recovery.rs b/src/worker/recovery.rs
+index 6604151..3d0a389 100644
+--- a/src/worker/recovery.rs
++++ b/src/worker/recovery.rs
+@@ -391,6 +391,7 @@ impl Worker {
+                 self.report_returned(report)?;
+                 return Ok(true);
+             }
++            self.complete_report(&mut report)?;
+             self.sender.queue(0, sender::Message::Report(report))?;
+             Ok(false)
+         } else {
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 9d83595..a050d23 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -16,6 +16,8 @@ mod timers;
+ use owner::Owner;
+ 
+ const ACK_BUFFERS: usize = 4;
++/// Reports per worker; a lane continues while earlier ones are on their way.
++pub(super) const REPORTS: usize = 4;
+ /// Send records per worker; their handles also key the worker's recovery journal.
+ pub(super) const RECORDS: usize = 65_535;
+ /// Retry interval while the shared window, not pacing, refuses a claim.
+@@ -117,6 +119,8 @@ pub(crate) struct Report {
+     pub(super) kind: ReportKind,
+     pub(super) count: usize,
+     pub(super) entries: [Entry; BATCH_SIZE],
++    // The lane's state was completed when the report left for the owner.
++    completed: bool,
+ }
+ 
+ impl Report {
+@@ -128,6 +132,7 @@ impl Report {
+             kind: ReportKind::Retire,
+             count: 0,
+             entries: [Entry::default(); BATCH_SIZE],
++            completed: false,
+         }
+     }
+ }
+@@ -271,7 +276,9 @@ pub(super) struct State {
+     // When a refused claim may succeed: the pacing time or a window retry.
+     pub(super) retry: Option<Duration>,
+     pub(super) job: Option<Job>,
+-    pub(super) report: Option<Box<Report>>,
++    // Free reports; the rest are with the owner or staged.
++    #[allow(clippy::vec_box)]
++    pub(super) reports: Vec<Box<Report>>,
+     #[allow(clippy::vec_box)]
+     pub(super) ack_free: Vec<Box<Ack>>,
+     pub(super) incoming: VecDeque<Box<Ack>>,
+@@ -373,7 +380,16 @@ impl State {
+             budgets: Arc::from(Vec::new()),
+             retry: None,
+             job: None,
+-            report: Some(boxed(Report::new(id))?),
++            reports: {
++                let mut reports = Vec::new();
++                reports
++                    .try_reserve_exact(REPORTS)
++                    .map_err(io::Error::other)?;
++                for _ in 0..REPORTS {
++                    reports.push(boxed(Report::new(id))?);
++                }
++                reports
++            },
+             ack_free,
+             incoming,
+             outgoing,
+@@ -394,7 +410,7 @@ impl State {
+ 
+     pub(super) fn feedback_deadline(&self) -> Option<Duration> {
+         // Report returns wake us. Active checks instead schedule their own bounded continuation.
+-        if self.report.is_none() || self.checks_pending != 0 {
++        if self.reports.is_empty() || self.checks_pending != 0 {
+             return None;
+         }
+         self.lanes
+@@ -607,7 +623,7 @@ impl State {
+         let per_worker = (config.config().sessions.len() + 1)
+             .checked_mul(size_of::<usize>())?
+             .checked_add(ACK_BUFFERS * (size_of::<Ack>() + size_of::<Box<Ack>>()))?
+-            .checked_add(size_of::<Report>())?
++            .checked_add(REPORTS * (size_of::<Report>() + size_of::<Box<Report>>()))?
+             .checked_add(Records::storage_bytes(RECORDS)?)?
+             .checked_add(workers.checked_mul(ACK_BUFFERS * size_of::<Box<Ack>>())?)?
+             .checked_add(
+@@ -810,20 +826,33 @@ impl Worker {
+         Ok(())
+     }
+ 
+-    /// Reuses a report whose entries the owner applied, or that needed no owner.
+-    pub(super) fn report_returned(&mut self, report: Box<Report>) -> io::Result<()> {
+-        if self.sender.report.is_some() {
+-            return Err(io::ErrorKind::InvalidData.into());
++    /// Frees the report's lane for its next ACK or scan. Per-worker FIFO order to
++    /// the owner keeps its chunks and loss barriers in order, so the lane need not
++    /// wait for the box to come back.
++    pub(super) fn complete_report(&mut self, report: &mut Report) -> io::Result<()> {
++        if report.completed {
++            return Ok(());
+         }
+         let index = self.sender_index(report.id.session, usize::from(report.id.lane) - 1)?;
+-        let ack = self.sender.lanes[index].report_completed(&report)?;
++        let ack = self.sender.lanes[index].report_completed(report)?;
+         if matches!(report.kind, ReportKind::Ack { end: None, .. }) {
+             self.sender.cursor = index;
+         }
+         if ack.is_some() {
+             self.sender.acks_pending -= 1;
+         }
+-        self.sender.report = Some(report);
++        report.completed = true;
++        Ok(())
++    }
++
++    /// Reuses a report whose entries the owner applied, or that needed no owner.
++    pub(super) fn report_returned(&mut self, mut report: Box<Report>) -> io::Result<()> {
++        if self.sender.reports.len() == REPORTS {
++            return Err(io::ErrorKind::InvalidData.into());
++        }
++        self.complete_report(&mut report)?;
++        report.completed = false;
++        self.sender.reports.push(report);
+         Ok(())
+     }
+ 
+@@ -922,7 +951,7 @@ impl Worker {
+                     *budget -= 1;
+                     continue;
+                 }
+-                if lane.report_pending || self.sender.report.is_none() {
++                if lane.report_pending || self.sender.reports.is_empty() {
+                     break;
+                 }
+                 if check
+@@ -951,8 +980,8 @@ impl Worker {
+                 }
+                 let mut report = self
+                     .sender
+-                    .report
+-                    .take()
++                    .reports
++                    .pop()
+                     .ok_or(io::ErrorKind::InvalidData)?;
+                 let prior = *budget;
+                 let fenced = lane.loss_passes != 0;
+@@ -979,7 +1008,7 @@ impl Worker {
+                     more = true;
+                     break;
+                 }
+-                self.sender.report = Some(report);
++                self.sender.reports.push(report);
+             }
+             if check.cursor == self.sender.lanes.len()
+                 && self.sender.outgoing.len()
+@@ -1004,7 +1033,7 @@ impl Worker {
+             } else {
+                 self.sender.losses[group] = Some(check);
+                 // Reports in transit wake us when returned; do not spin waiting for them.
+-                more |= self.sender.report.is_some()
++                more |= !self.sender.reports.is_empty()
+                     && self.sender.outgoing.len()
+                         < self
+                             .sender
+@@ -1015,7 +1044,7 @@ impl Worker {
+         }
+         Ok(more
+             || (self.sender.checks_pending != 0
+-                && self.sender.report.is_some()
++                && !self.sender.reports.is_empty()
+                 && self.sender.outgoing.len()
+                     < self
+                         .sender
+@@ -1053,7 +1082,7 @@ impl Worker {
+                 more = true;
+                 break;
+             }
+-            let Some(mut report) = self.sender.report.take() else {
++            let Some(mut report) = self.sender.reports.pop() else {
+                 break;
+             };
+             let index = self.sender.cursor;
+@@ -1062,7 +1091,7 @@ impl Worker {
+             if lane.ack.is_none()
+                 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0)
+             {
+-                self.sender.report = Some(report);
++                self.sender.reports.push(report);
+                 budget -= 1;
+                 continue;
+             }
+@@ -1102,7 +1131,7 @@ impl Worker {
+                 more = true;
+             } else {
+                 budget = budget.saturating_sub(1);
+-                self.sender.report = Some(report);
++                self.sender.reports.push(report);
+             }
+         }
+         more |= budget == 0 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0);
+@@ -1111,7 +1140,7 @@ impl Worker {
+             && self.sender.checks_pending == 0
+             && self.sender.loss_fences == 0
+             && !self.sender.incoming.is_empty()
+-            && self.sender.report.is_some();
++            && !self.sender.reports.is_empty();
+         more |= self.stage_recovery()?;
+         if self.sender.owner.is_some() {
+             // Apply local feedback before the shared owner considers fresh grants.
+@@ -1235,9 +1264,11 @@ impl Worker {
+         if !self.sender_enabled() {
+             return true;
+         }
++        // Quiescence also waits for every report: the owner must apply them first.
+         if self.recovery.quiesce.is_some()
+             || self.sessions[session].tx_retained != 0
+             || self.sender.job.is_some_and(|job| job.session == session)
++            || self.sender.reports.len() != REPORTS
+         {
+             return false;
+         }
+diff --git a/src/worker/sender/owner.rs b/src/worker/sender/owner.rs
+index 5a8ac0d..8d170a6 100644
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -144,7 +144,7 @@ impl Owner {
+         }
+         let mut reports = VecDeque::new();
+         reports
+-            .try_reserve_exact(workers)
++            .try_reserve_exact(workers * REPORTS)
+             .map_err(io::Error::other)?;
+         let mut owner = Self {
+             budgets,
+@@ -177,7 +177,7 @@ impl Owner {
+                     .checked_sub(size_of::<timers::Timers>())?,
+             )?
+             .checked_add(groups.checked_mul(size_of::<Group>() + size_of::<Budget>())?)?
+-            .checked_add(workers.checked_mul(size_of::<Box<Report>>())?)?
++            .checked_add(workers.checked_mul(REPORTS * size_of::<Box<Report>>())?)?
+             .checked_add(2 * size_of::<usize>())
+     }
+ 
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index d48cd5a..1fa2e70 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -183,7 +183,7 @@ fn local_ack_releases_the_shared_charge_in_the_same_turn() {
+         "the lane owner releases its ACKed charge before the next claim"
+     );
+     assert!(!workers[0].sender.lanes[index].report_pending);
+-    assert!(workers[0].sender.report.is_some());
++    assert!(workers[0].sender.reports.len() == REPORTS);
+ }
+ 
+ #[test]
+@@ -578,7 +578,7 @@ fn crossed_group_acks_finish_before_loss_checks_use_the_only_report() {
+         worker.sender.incoming.push_back(ack);
+         worker.begin_sender_ack().unwrap();
+         let index = worker.sender_index(session, worker.id).unwrap();
+-        let mut report = worker.sender.report.take().unwrap();
++        let mut report = worker.sender.reports.pop().unwrap();
+         assert!(
+             worker.sender.lanes[index]
+                 .advance_report(&mut report, Duration::from_millis(1), &mut 64,)
+@@ -631,7 +631,7 @@ fn crossed_group_acks_finish_before_loss_checks_use_the_only_report() {
+         assert_eq!(worker.sender.checks_pending, 0);
+         assert_eq!(worker.sender.acks_pending, 0);
+         assert!(worker.sender.incoming.is_empty());
+-        assert!(worker.sender.report.is_some());
++        assert!(worker.sender.reports.len() == REPORTS);
+         assert!(worker.sender.lanes.iter().all(|lane| {
+             lane.ack.is_none()
+                 && !lane.report_pending
+@@ -1409,7 +1409,7 @@ fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
+                 .reserve_packet(usize::from(attempt), &pieces)
+         );
+     }
+-    let mut report = worker.sender.report.take().unwrap();
++    let mut report = worker.sender.reports.pop().unwrap();
+     report.kind = ReportKind::Ack {
+         received: Duration::from_millis(2),
+         delay_us: 0,
+@@ -1590,7 +1590,7 @@ fn lost_original_repairs_only_missing_bytes_and_late_ack_cancels_prepared_repair
+         .unwrap();
+     // Apply local coverage before allowing the held repair request to reach its coordinator.
+     workers[1].begin_sender_ack().unwrap();
+-    let mut report = workers[1].sender.report.take().unwrap();
++    let mut report = workers[1].sender.reports.pop().unwrap();
+     assert!(
+         workers[1].sender.lanes[lane]
+             .advance_report(&mut report, Duration::from_millis(4), &mut 64)
+@@ -2015,7 +2015,7 @@ fn admitted_acks_finish_then_loss_progresses_under_continuous_ack_input() {
+             }
+             if worker.sender.incoming.is_empty()
+                 && worker.sender.acks_pending == 0
+-                && worker.sender.report.is_some()
++                && worker.sender.reports.len() == REPORTS
+                 && worker.sender.lanes[index].scan.is_none()
+                 && worker.sender.lanes[index].loss_due.is_none()
+             {
+@@ -2432,7 +2432,7 @@ fn liveness_history_pressure_retries_without_spinning_or_losing_turn() {
+     history.reserve(pinned, 100, true, true).unwrap();
+     assert!(history.submit(pinned, Duration::ZERO));
+     let next = worker.sessions[0].tx[0].as_ref().unwrap().next_packet();
+-    let report = worker.sender.report.take();
++    let reports = std::mem::take(&mut worker.sender.reports);
+     worker.service_sender(Duration::ZERO).unwrap();
+     assert!(worker.sender.job.is_none());
+     assert!(worker.sender.reclaim.is_some());
+@@ -2448,7 +2448,7 @@ fn liveness_history_pressure_retries_without_spinning_or_losing_turn() {
+     );
+ 
+     assert!(worker.sender.lanes[index].history.lose(pinned).is_some());
+-    worker.sender.report = report;
++    worker.sender.reports = reports;
+     worker.service_sender(RETRY).unwrap();
+     // The probe is claimed and sent in the same turn.
+     assert!(worker.controls[0].probe.is_some());
+@@ -3095,7 +3095,7 @@ fn fully_protected_loss_fence_continues_queued_ack_without_external_wakeup() {
+     assert!(worker.sender.lanes[index].ack.is_none());
+     assert_eq!(worker.sender.lanes[index].history.inflight_bytes(), 1280);
+     assert!(worker.recovery.staged.is_none());
+-    assert!(worker.sender.report.is_some());
++    assert!(worker.sender.reports.len() == REPORTS);
+     assert!(worker.service_sender(now).unwrap());
+     assert!(worker.sender.incoming.is_empty());
+     assert_eq!(worker.sender.lanes[index].history.inflight_bytes(), 0);
+@@ -3232,7 +3232,7 @@ fn ack_transfer_returns_before_final_report_and_reuses_without_changing_fences()
+     assert_eq!(workers[1].sender.loss_fences, 1);
+     assert!(workers[1].sender.lanes[index].install(2).is_err());
+ 
+-    let mut report = workers[1].sender.report.take().unwrap();
++    let mut report = workers[1].sender.reports.pop().unwrap();
+     assert!(
+         workers[1].sender.lanes[index]
+             .advance_report(&mut report, now, &mut 64)
