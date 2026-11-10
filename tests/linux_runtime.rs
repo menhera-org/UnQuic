@@ -1461,3 +1461,110 @@ fn runtime_adopts_handed_over_queues_of_the_configured_count() {
     runtime.join().unwrap().unwrap();
     unquic::tap::remove(c"uq-adopt-rt").unwrap();
 }
+
+#[test]
+#[ignore = "requires disposable container with tun and network namespace capabilities"]
+fn a_flooded_session_neither_allocates_nor_corrupts_its_neighbour() {
+    // SAFETY: only this test thread and its runtimes enter the namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let net = UdpSocket::bind("[::]:0").unwrap();
+    up(&net, c"lo");
+    let pair = |name, listen, remote| {
+        let mut config = config(name, listen, remote);
+        config.sessions.truncate(2);
+        config.peers.truncate(1);
+        config.daemon.memory_limit = Daemon::default().memory_limit;
+        config
+    };
+    let mut left = Running::start(pair("uq-ovl", 41600, 41601));
+    let mut right = Running::start(pair("uq-ovr", 41601, 41600));
+    until(Duration::from_secs(5), || {
+        left.control.ready() && right.control.ready()
+    });
+    for name in [c"uq-ovl", c"uq-ovl-b", c"uq-ovr", c"uq-ovr-b"] {
+        up(&net, name);
+    }
+    until(Duration::from_secs(5), || {
+        (0..2).all(|session| {
+            left.control.session(session).unwrap().carrier
+                && right.control.session(session).unwrap().carrier
+        })
+    });
+    let flooded = raw_socket(c"uq-ovl", 0x88b5);
+    let quiet = raw_socket(c"uq-ovl-b", 0x88b6);
+    let output = raw_socket(c"uq-ovr-b", 0x88b6);
+    let quiet_frame = |sequence: u32| {
+        let mut frame = [0; 200];
+        frame[..12].copy_from_slice(&[2, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 3]);
+        frame[12..14].copy_from_slice(&0x88b6_u16.to_be_bytes());
+        frame[14..18].copy_from_slice(&sequence.to_be_bytes());
+        for (index, byte) in frame.iter_mut().enumerate().skip(18) {
+            *byte = (index as u32 ^ sequence) as u8;
+        }
+        frame
+    };
+    let mut input = [0; 2000];
+    // Delivered quiet frames must match exactly and arrive once.
+    let mut seen = [false; 4096];
+    let receive = |input: &mut [u8; 2000], seen: &mut [bool; 4096]| {
+        while let Some(n) = raw_read(&output, input) {
+            let sequence = u32::from_be_bytes(input[14..18].try_into().unwrap());
+            assert_eq!(&input[..n], &quiet_frame(sequence)[..], "corrupted frame");
+            assert!(!seen[sequence as usize], "duplicate frame {sequence}");
+            seen[sequence as usize] = true;
+        }
+    };
+    raw_send(&quiet, &quiet_frame(0));
+    until(Duration::from_secs(5), || {
+        receive(&mut input, &mut seen);
+        seen[0]
+    });
+    let stop = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let flood = scope.spawn(|| {
+            let mut frame = [0x5a; 1514];
+            frame[..12].copy_from_slice(&[2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 4]);
+            frame[12..14].copy_from_slice(&0x88b5_u16.to_be_bytes());
+            let mut sent = 0_u64;
+            while !stop.load(Ordering::Relaxed) {
+                frame[14..22].copy_from_slice(&sent.to_be_bytes());
+                // SAFETY: frame is readable; a full queue just drops this frame.
+                if unsafe { libc::send(flooded.as_raw_fd(), frame.as_ptr().cast(), frame.len(), 0) }
+                    > 0
+                {
+                    sent += 1;
+                }
+            }
+            sent
+        });
+        thread::sleep(Duration::from_millis(200));
+        ALLOCATIONS.store(0, Ordering::Relaxed);
+        COUNTING.store(true, Ordering::SeqCst);
+        let end = Instant::now() + Duration::from_secs(2);
+        let mut sequence = 1;
+        while Instant::now() < end {
+            raw_send(&quiet, &quiet_frame(sequence));
+            sequence += 1;
+            receive(&mut input, &mut seen);
+            thread::sleep(Duration::from_millis(2));
+        }
+        COUNTING.store(false, Ordering::SeqCst);
+        stop.store(true, Ordering::Relaxed);
+        assert!(flood.join().unwrap() > 10_000, "the flood did not overload");
+    });
+    assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+    // Once the flood's backlog drains, the quiet session recovers: every
+    // frame sent once arrives once.
+    thread::sleep(Duration::from_millis(500));
+    receive(&mut input, &mut seen);
+    for sequence in 3000..3050 {
+        raw_send(&quiet, &quiet_frame(sequence));
+        thread::sleep(Duration::from_millis(2));
+    }
+    until(Duration::from_secs(5), || {
+        receive(&mut input, &mut seen);
+        seen[3000..3050].iter().all(|&seen| seen)
+    });
+    left.stop();
+    right.stop();
+}

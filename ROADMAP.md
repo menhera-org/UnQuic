@@ -1095,6 +1095,11 @@ full expired batches sharing the cleanup budget.
   table cannot reach, forward frames both ways on Linux 6.8 and 7.0.
 - Resource stress: fill reassembly, TAP-write and handoff queues; sustained
   receiver overload; many sessions and lanes against the memory ceiling.
+  Sustained overload is covered: a runtime test floods one session's TAP for
+  two seconds while a second session on the same peer carries numbered
+  frames, which arrive intact and once, with no transport allocation during
+  the flood, and all arrive afterwards (Linux 6.8 and 7.0). Worker tests
+  cover full queues. Remaining: many sessions and lanes against the ceiling.
 - Restart, path change and DNS change cases from V03.
 - Daemon: double-fork readiness exactly as section 12.1 describes, PID file,
   parent exit only after every TAP exists; a test that the parent waits while

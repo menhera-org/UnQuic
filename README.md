@@ -1122,6 +1122,12 @@ from three source MACs, broadcast, multicast and an 802.3 LLC frame cross
 unchanged; a 9018-byte single-tagged frame and a 1522-byte QinQ frame arrive at
 their uppers without the tags, which covers the TAP-read direction for both.
 
+An overload test floods one session's TAP with full-size frames for two seconds
+while a second session on the same peer carries numbered frames. Every frame
+the quiet session delivers matches what was sent and arrives once, the
+transport allocates nothing during the flood, and once the backlog drains the
+quiet session delivers every frame again.
+
 OVS, real RA/DHCPv6 resolver networks, physical-NIC offload qualification,
 Linux 5.0 qualification and performance acceptance remain open.
 
