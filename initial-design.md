@@ -394,7 +394,7 @@ segment routing headers. Stop at fragments and after one inner level;
 malformed inner headers fall back to the outer key. Encapsulated traffic
 retains strict pinning. This key is local and never transmitted.
 
-An individual PTO sends at most two probe datagrams per path group, with exponential backoff; one PTO does not declare all outstanding traffic lost. Retiring a frame does not erase the congestion charge for its outstanding packets. Free payloads at their deadlines but retain packet accounting until ACK or loss. If feedback is absent for three consecutive PTO periods, treat remaining outstanding transmissions as lost once and tell BBR; continue only backed-off probes until feedback resumes. Reset the PTO backoff on newly acknowledged ACK-eliciting traffic. The aggregate controller, not each lane independently, grants probe allowance. These at-most-two probes may exceed the congestion window when it is full, as in RFC 9002, but are still charged to inflight bytes and paced; no other packet bypasses the window this way.
+An individual PTO sends at most two probe datagrams per path group, with exponential backoff capped at one second, or at the unbacked period when that is longer, so that probes keep the idle liveness cadence through an outage and a returning path is found within about a second; one PTO does not declare all outstanding traffic lost. Retiring a frame does not erase the congestion charge for its outstanding packets. Free payloads at their deadlines but retain packet accounting until ACK or loss. If feedback is absent for three consecutive PTO periods, treat remaining outstanding transmissions as lost once and tell BBR; continue only backed-off probes until feedback resumes. Reset the PTO backoff on newly acknowledged ACK-eliciting traffic, and when a connection commits: its handshake round trip is fresh evidence for the path, and its first packets may reach a peer that has not yet installed it. The aggregate controller, not each lane independently, grants probe allowance. These at-most-two probes may exceed the congestion window when it is full, as in RFC 9002, but are still charged to inflight bytes and paced; no other packet bypasses the window this way.
 
 LANE_RETIRE and FRAME_ABANDON retries consume ordinary transmission credit and stop at their own limits. Neither controls the correctness of local duplicate suppression. FEC and intentional per-flow reordering remain later measured experiments.
 
@@ -842,8 +842,10 @@ repair ranges while retaining original frame lengths and IDs. A pure bounded
 packet-to-frame journal now supports reservation before I/O, late-ACK mappings
 after loss and direct cleanup by packet or frame. Shared PTO backoff and the
 three-expiry stop/settlement transition now use indexed group timers and shared
-probe allowances. Worker messages preserve unused pending probe commands across
-connection replacement without resetting backoff. Due liveness probes retain
+probe allowances. Worker messages preserve unused pending probe commands and
+their round across connection replacement; since November 10 a committed
+replacement resets the group's backoff and silence, and backoff is capped at
+one second (section 8.3). Due liveness probes retain
 their deadline while a DATA flight is busy, rotate across sessions before fresh
 DATA, and retry history pressure after 1 ms. PTO probes retain priority.
 Stalled PTO rounds rotate installed sessions before lanes, preventing an

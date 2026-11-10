@@ -25,8 +25,10 @@ check and the loss sweep, which shows draft 07 collapsing at 5% loss. Stage 4
 gained double-fork readiness, the systemd unit template, VRF and Ethernet
 composition tests, and the removal of every explicit panic call from library
 code. TAP persistence, descriptor handover across re-exec (including a failed
-exec) and the overload and memory-ceiling stress tests followed. Next, in the
-order below: stage 4's remaining V03 lifecycle cases and implicit panics; then
+exec) and the overload and memory-ceiling stress tests followed. A V03 test
+that cuts all feedback found that recovery after an outage waited on
+unbounded PTO backoff; backoff is now capped at one second and reset when a
+connection commits. Next, in the order below: stage 4's implicit panics; then
 stage 5's candidates, led by single-flow striping and lane
 placement, which bound both the single-flow target and the local gate.
 
@@ -167,10 +169,10 @@ rules apply to all of them.
    placement and per-frame cost bound it next.
 6. **Stage 4**, as listed in its section: the rest of the panic audit (explicit
    `unwrap`/`expect`/`panic!` sites are gone; implicit indexing and overflow
-   remain), OVS in the composition matrix, resource stress, and the remaining
-   V03 lifecycle cases. TAP persistence and descriptor handover, including a
-   failed exec after a passing probe, double-fork
-   readiness, the systemd unit and the VRF and composition tests are done.
+   remain), OVS in the composition matrix, and the remaining resource stress.
+   TAP persistence and descriptor handover, including a failed exec after a
+   passing probe, double-fork readiness, the systemd unit, the VRF and
+   composition tests and the V03 lifecycle cases are done.
 7. **Stage 5:** profile what remains and try its candidates behind switches.
 
 If evidence shows a gate cannot be reached within the current design, write
@@ -864,11 +866,12 @@ late/duplicate/feedback-only ACKs, long pauses,
 overflow and allocation-free transitions. Runtime grants now enforce the allowance;
 workers run bounded loss passes and gate liveness/PMTU probes. Blocked PMTU requests
 release their flight buffer; PTO dispatch preempts an ungranted ordinary request.
-Pending probe commands survive generation changes without resetting backoff.
+Pending probe commands survive generation changes with their round.
 Once a group stalls, PTO targets rotate across installed sessions, then their
 lanes, so an unanswered lane cannot exclude a working peer. Selection uses the
 existing session links in constant time. The two-probe allowance and backoff
-remain shared; a replacement handshake does not reset them.
+remain shared. Since November 10 a committed replacement resets the backoff
+and silence, and backoff is capped at one second (see stage 4's V03 item).
 Due liveness probes survive a busy DATA flight and rotate among sessions before
 fresh DATA. Bounded visits and 1 ms history-pressure retries prevent monopolizing
 a turn or spinning; the next one-second interval follows successful submission.
@@ -1105,7 +1108,22 @@ full expired batches sharing the cleanup budget.
   the flood, and all arrive afterwards (Linux 6.8 and 7.0). Worker tests
   cover full queues. Another test starts sixteen sessions only under a
   sufficient ceiling and, under 64 MiB, refuses before creating any TAP.
-- Restart, path change and DNS change cases from V03.
+- Restart, path change and DNS change cases from V03. Peer restart, address
+  change and the 30-second fall to inactive are covered by the forwarding and
+  reconnection runtime test. Loss of all feedback is covered by a relay test
+  that drops every datagram both ways until both ends degrade (after 3 s),
+  then restores the path. It found two faults, both fixed: PTO backoff had no
+  ceiling, so after a few seconds of silence the next probe was seconds away
+  and data stayed stopped; and a committed replacement kept the stalled
+  group's backoff, so the first side to commit lost its first packets to the
+  peer's not-yet-installed connection and waited a backed-off PTO before
+  sending again (9 of 10 runs failed). Backoff is now capped at one second,
+  or the unbacked period if longer, and a committed connection resets it like
+  a new ACK. Both directions deliver again within 1.35 s of the path
+  returning in ten of ten runs, with no duplicate frame and no charge left in
+  flight. Remaining V03 cases already have unit coverage: random-tag
+  establishment, delayed old packets and lane replacement in the handshake,
+  reassembly and journal tests.
 - Daemon: double-fork readiness exactly as section 12.1 describes, PID file,
   parent exit only after every TAP exists; a test that the parent waits while
   a TAP is missing and succeeds with no peer reachable. Done: `unquic start`.

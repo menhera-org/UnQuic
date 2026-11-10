@@ -259,6 +259,20 @@ impl Owner {
         })
     }
 
+    /// Installs a committed connection. Its handshake round trip is fresh
+    /// evidence for the path, so, like a new ACK of eliciting traffic, it resets
+    /// the group's PTO silence and backoff. A pending probe still moves to it.
+    pub(super) fn install(&mut self, session: usize, generation: u64) -> io::Result<()> {
+        if let Some(group) = self.timers.install(session, generation)? {
+            self.groups
+                .get_mut(group)
+                .ok_or(io::ErrorKind::InvalidInput)?
+                .pto
+                .acknowledged(true);
+        }
+        Ok(())
+    }
+
     pub(super) fn probe_replied(&mut self, group: usize) -> io::Result<()> {
         self.groups
             .get_mut(group)

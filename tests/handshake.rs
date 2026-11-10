@@ -1317,7 +1317,7 @@ fn shared_probe_timeout_transitions_allocate_nothing() {
         assert!(!pto.stalled());
         assert_eq!(
             pto.deadline(&rtt, Some(Duration::ZERO)),
-            Some(Duration::from_secs(31))
+            Some(Duration::from_secs(16))
         );
         pto.acknowledged(true);
         assert_eq!(pto.deadline(&rtt, None), None);

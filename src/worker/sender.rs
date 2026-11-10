@@ -1392,7 +1392,7 @@ impl Worker {
             lane.install(generation)?;
         }
         if active && let Some(owner) = &mut self.sender.owner {
-            owner.timers.install(session, generation)?;
+            owner.install(session, generation)?;
         }
         Ok(())
     }

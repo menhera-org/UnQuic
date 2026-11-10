@@ -107,13 +107,14 @@ impl Timers {
     }
 
     /// Duplicate installation preserves accounting. Replacements require settled lanes.
-    pub(super) fn install(&mut self, session: usize, generation: u64) -> io::Result<()> {
+    /// Returns the session's group when this installs a new generation.
+    pub(super) fn install(&mut self, session: usize, generation: u64) -> io::Result<Option<usize>> {
         let state = self
             .sessions
             .get(session)
             .ok_or(io::ErrorKind::InvalidInput)?;
         if state.installed && state.generation == Some(generation) {
-            return Ok(());
+            return Ok(None);
         }
         if state.generation.is_some_and(|old| generation <= old) {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -128,8 +129,12 @@ impl Timers {
         for lane in &mut self.lanes[range] {
             lane.latest = Duration::ZERO;
         }
+        let group = self
+            .lanes
+            .get(self.sessions[session].first)
+            .ok_or(io::ErrorKind::InvalidInput)?
+            .group;
         if !self.sessions[session].installed {
-            let group = self.lanes[self.sessions[session].first].group;
             let next = self.installed[group];
             if next != ABSENT {
                 self.sessions[next].previous = session;
@@ -140,7 +145,7 @@ impl Timers {
         self.sessions[session].probe_lane = 0;
         self.sessions[session].generation = Some(generation);
         self.sessions[session].installed = true;
-        Ok(())
+        Ok(Some(group))
     }
 
     pub(super) fn quiesce(&mut self, session: usize, generation: u64) -> io::Result<()> {
@@ -439,7 +444,7 @@ mod tests {
         let before = timers.earliest(0);
         timers.install(0, 1).unwrap();
         for result in [
-            timers.install(0, 2),
+            timers.install(0, 2).map(drop),
             timers.quiesce(0, 1),
             timers.submitted(0, 1, 0, 1, Duration::from_millis(30)),
             timers.submitted(0, 1, 1, 1, Duration::ZERO),

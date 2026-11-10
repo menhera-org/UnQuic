@@ -975,6 +975,273 @@ fn foreign_rename_and_namespace_move_preserve_running_transport() {
     replacement.stop();
 }
 
+/// Forwards one relayed datagram to `port`, rewriting the receive port a
+/// handshake advertises to `advertised` so that replies return through the relay.
+fn forward(socket: &UdpSocket, bytes: &mut [u8; 9000], n: usize, advertised: u16, port: u16) {
+    use unquic::wire::Record;
+    let packet = unquic::wire::Datagram::decode(&bytes[..n]).unwrap();
+    let header = packet.header();
+    let translated = packet.records().find_map(|record| match record {
+        Record::Hello {
+            initiator,
+            mut params,
+        } => {
+            params.port = advertised;
+            Some(Record::Hello { initiator, params })
+        }
+        Record::Challenge {
+            initiator,
+            responder,
+            mut params,
+        } => {
+            params.port = advertised;
+            Some(Record::Challenge {
+                initiator,
+                responder,
+                params,
+            })
+        }
+        _ => None,
+    });
+    let n = match translated {
+        Some(record) => unquic::wire::encode_datagram(header, &[record], bytes).unwrap(),
+        None => n,
+    };
+    assert_eq!(
+        socket
+            .send_to(&bytes[..n], (Ipv6Addr::LOCALHOST, port))
+            .unwrap(),
+        n
+    );
+}
+
+/// Two single-lane runtimes that reach each other only through a relay.
+fn relayed(name: &str, listen: u16, relay: u16) -> Config {
+    let mut config = config(name, listen, relay);
+    config.sessions.truncate(1);
+    config.peers.truncate(1);
+    config.daemon.memory_limit = Daemon::default().memory_limit;
+    config.sessions[0].queue_count = 1;
+    config.peers[0].tx_lanes = 1;
+    config
+}
+
+#[test]
+#[ignore = "requires disposable container with tun and network namespace capabilities"]
+fn losing_all_feedback_degrades_then_recovers_without_duplicate_delivery() {
+    use std::os::fd::OwnedFd;
+    use unquic::handshake::State;
+    // Ports: left 41210, right 41211; the relay listens on 41212 for left, 41213 for right.
+    struct Relay {
+        sockets: [UdpSocket; 2],
+        blackhole: bool,
+    }
+    impl Relay {
+        fn pump(&self) {
+            let mut bytes = [0; 9000];
+            for direction in 0..2 {
+                for _ in 0..128 {
+                    let n = match self.sockets[direction].recv(&mut bytes) {
+                        Ok(n) => n,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("{error}"),
+                    };
+                    if !self.blackhole {
+                        let (advertised, port) = [(41213, 41211), (41212, 41210)][direction];
+                        forward(&self.sockets[direction], &mut bytes, n, advertised, port);
+                    }
+                }
+            }
+        }
+    }
+    struct Traffic {
+        sockets: [OwnedFd; 2],
+        sent: [usize; 2],
+        seen: [Vec<bool>; 2],
+    }
+    impl Traffic {
+        /// Offers one numbered frame each way; a full TAP queue just drops it.
+        fn send(&mut self) {
+            for direction in 0..2 {
+                let mut frame = [0x5a; 1514];
+                frame[..12].copy_from_slice(&[2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2]);
+                frame[12..14].copy_from_slice(&0x88b5_u16.to_be_bytes());
+                frame[14..22].copy_from_slice(b"UQNOFEED");
+                frame[22] = direction as u8;
+                frame[23..31].copy_from_slice(&(self.sent[direction] as u64).to_be_bytes());
+                // SAFETY: frame is readable for its length; the socket is bound to the TAP.
+                unsafe {
+                    libc::send(
+                        self.sockets[direction].as_raw_fd(),
+                        frame.as_ptr().cast(),
+                        frame.len(),
+                        0,
+                    )
+                };
+                self.sent[direction] += 1;
+            }
+        }
+        /// Drains both TAPs: every frame arrives intact, in its direction, at most once.
+        fn receive(&mut self) {
+            let mut input = [0; 9022];
+            for direction in 0..2 {
+                while let Some(n) = raw_read(&self.sockets[1 - direction], &mut input) {
+                    assert_eq!(n, 1514);
+                    assert_eq!(&input[14..22], b"UQNOFEED");
+                    assert_eq!(input[22], direction as u8);
+                    let sequence = u64::from_be_bytes(input[23..31].try_into().unwrap()) as usize;
+                    assert!(sequence < self.sent[direction]);
+                    assert!(
+                        !std::mem::replace(&mut self.seen[direction][sequence], true),
+                        "duplicate frame {sequence} in direction {direction}"
+                    );
+                }
+            }
+        }
+        fn arrived(&self, range: std::ops::Range<usize>) -> bool {
+            self.seen
+                .iter()
+                .all(|seen| seen[range.clone()].iter().all(|&arrived| arrived))
+        }
+    }
+
+    // SAFETY: only this test thread and its runtimes enter the namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let net = UdpSocket::bind("[::]:0").unwrap();
+    up(&net, c"lo");
+    let mut relay = Relay {
+        sockets: [
+            UdpSocket::bind("[::1]:41212").unwrap(),
+            UdpSocket::bind("[::1]:41213").unwrap(),
+        ],
+        blackhole: false,
+    };
+    for socket in &relay.sockets {
+        socket.set_nonblocking(true).unwrap();
+    }
+    let mut left = Running::start(relayed("uq-mute-left", 41210, 41212));
+    let mut right = Running::start(relayed("uq-mute-right", 41211, 41213));
+    until(Duration::from_secs(5), || {
+        relay.pump();
+        left.control.ready() && right.control.ready()
+    });
+    up(&net, c"uq-mute-left");
+    up(&net, c"uq-mute-right");
+    let status = |state: State| {
+        [&left, &right].iter().all(|running| {
+            let status = running.control.session(0).unwrap();
+            status.state == state && status.carrier
+        })
+    };
+    until(Duration::from_secs(5), || {
+        relay.pump();
+        status(State::Active)
+    });
+    let mut traffic = Traffic {
+        sockets: [
+            raw_socket(c"uq-mute-left", 0x88b5),
+            raw_socket(c"uq-mute-right", 0x88b5),
+        ],
+        sent: [0; 2],
+        seen: [vec![false; 1 << 16], vec![false; 1 << 16]],
+    };
+    for _ in 0..8 {
+        traffic.send();
+    }
+    until(Duration::from_secs(3), || {
+        relay.pump();
+        traffic.receive();
+        traffic.arrived(0..8)
+    });
+    // Every datagram is lost both ways while traffic continues: no feedback at all.
+    relay.blackhole = true;
+    let muted = Instant::now();
+    until(Duration::from_secs(6), || {
+        relay.pump();
+        traffic.send();
+        traffic.receive();
+        status(State::Degraded)
+    });
+    let degraded = muted.elapsed();
+    assert!(
+        degraded >= Duration::from_millis(2500),
+        "degraded after {degraded:?}"
+    );
+    // Probes stay capped at one-second intervals, so the returning path is found
+    // within about a second: fresh feedback revives the connection or a
+    // replacement commits, and either way both directions deliver again.
+    relay.blackhole = false;
+    let restored = Instant::now();
+    let base = traffic.sent;
+    let delivering = |traffic: &Traffic| {
+        (0..2).all(|direction| traffic.seen[direction][base[direction]..].contains(&true))
+    };
+    let mut timeline = Vec::new();
+    while !(delivering(&traffic) && status(State::Active)) {
+        // Record when either direction starts delivering or either status changes.
+        let now = (
+            [0, 1].map(|d| traffic.seen[d][base[d]..].contains(&true)),
+            [&left, &right].map(|running| {
+                let status = running.control.session(0).unwrap();
+                (status.generation, status.state)
+            }),
+        );
+        if timeline.last().is_none_or(|(_, last)| *last != now) {
+            timeline.push((restored.elapsed(), now));
+        }
+        assert!(
+            restored.elapsed() < Duration::from_secs(2),
+            "no recovery 2 s after the path returned: {timeline:?}"
+        );
+        traffic.send();
+        relay.pump();
+        traffic.receive();
+        thread::sleep(Duration::from_millis(1));
+    }
+    let resumed = restored.elapsed();
+    // A replacement that was already under way may still commit and briefly
+    // quiesce the session, but every burst sent on a settled generation arrives.
+    let generations =
+        || [&left, &right].map(|running| running.control.session(0).unwrap().generation);
+    let mut attempts = 0;
+    loop {
+        let before = generations();
+        let first = traffic.sent[0];
+        for _ in 0..64 {
+            traffic.send();
+            relay.pump();
+            traffic.receive();
+            thread::sleep(Duration::from_millis(1));
+        }
+        let end = Instant::now() + Duration::from_secs(2);
+        while !traffic.arrived(first..first + 64) && Instant::now() < end {
+            relay.pump();
+            traffic.receive();
+            thread::sleep(Duration::from_millis(1));
+        }
+        if traffic.arrived(first..first + 64) {
+            break;
+        }
+        attempts += 1;
+        assert!(
+            generations() != before && attempts < 3,
+            "burst lost on a settled generation {before:?}, resumed after {resumed:?}"
+        );
+    }
+    // Nothing charged while feedback was lost stays in flight.
+    until(Duration::from_secs(3), || {
+        relay.pump();
+        traffic.receive();
+        [&left, &right].iter().all(|running| {
+            (0..)
+                .map_while(|worker| running.control.worker_counters(worker))
+                .all(|counters| counters.bytes_in_flight == 0)
+        })
+    });
+    left.stop();
+    right.stop();
+}
+
 #[test]
 #[ignore = "requires disposable container with tun and network namespace capabilities"]
 fn outer_loss_repairs_twice_and_late_original_never_duplicates_tap_delivery() {
@@ -996,30 +1263,6 @@ fn outer_loss_repairs_twice_and_late_original_never_duplicates_tap_delivery() {
                         Err(error) => panic!("{error}"),
                     };
                     let packet = unquic::wire::Datagram::decode(&bytes[..n]).unwrap();
-                    // The relay also translates the port advertised by the handshake.
-                    let translated = packet.records().find_map(|record| match record {
-                        unquic::wire::Record::Hello {
-                            initiator,
-                            mut params,
-                        } => {
-                            params.port = if direction == 0 { 41203 } else { 41202 };
-                            Some(unquic::wire::Record::Hello { initiator, params })
-                        }
-                        unquic::wire::Record::Challenge {
-                            initiator,
-                            responder,
-                            mut params,
-                        } => {
-                            params.port = if direction == 0 { 41203 } else { 41202 };
-                            Some(unquic::wire::Record::Challenge {
-                                initiator,
-                                responder,
-                                params,
-                            })
-                        }
-                        _ => None,
-                    });
-                    let header = packet.header();
                     let prefix = packet.records().find_map(|record| match record {
                         unquic::wire::Record::Data {
                             frame_id,
@@ -1045,18 +1288,8 @@ fn outer_loss_repairs_twice_and_late_original_never_duplicates_tap_delivery() {
                             continue;
                         }
                     }
-                    let n = if let Some(record) = translated {
-                        unquic::wire::encode_datagram(header, &[record], &mut bytes).unwrap()
-                    } else {
-                        n
-                    };
-                    let port = if direction == 0 { 41201 } else { 41200 };
-                    assert_eq!(
-                        self.sockets[direction]
-                            .send_to(&bytes[..n], (Ipv6Addr::LOCALHOST, port))
-                            .unwrap(),
-                        n
-                    );
+                    let (advertised, port) = [(41203, 41201), (41202, 41200)][direction];
+                    forward(&self.sockets[direction], &mut bytes, n, advertised, port);
                 }
             }
         }
@@ -1093,17 +1326,8 @@ fn outer_loss_repairs_twice_and_late_original_never_duplicates_tap_delivery() {
     for socket in &relay.sockets {
         socket.set_nonblocking(true).unwrap();
     }
-    let single = |name, listen, remote| {
-        let mut config = config(name, listen, remote);
-        config.sessions.truncate(1);
-        config.peers.truncate(1);
-        config.daemon.memory_limit = Daemon::default().memory_limit;
-        config.sessions[0].queue_count = 1;
-        config.peers[0].tx_lanes = 1;
-        config
-    };
-    let mut left = Running::start(single("uq-repair-left", 41200, 41202));
-    let mut right = Running::start(single("uq-repair-right", 41201, 41203));
+    let mut left = Running::start(relayed("uq-repair-left", 41200, 41202));
+    let mut right = Running::start(relayed("uq-repair-right", 41201, 41203));
     until(Duration::from_secs(5), || {
         relay.pump();
         left.control.ready() && right.control.ready()

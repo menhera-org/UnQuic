@@ -344,7 +344,8 @@ the history limit, so a PTO probe can always reach an unacknowledged tail.
 Worker-local frame storage and the piece journal retain payloads and schedule repairs.
 
 `loss::Rtt` implements the pure RFC 9002 timing calculations: RTT sampling,
-packet/time loss thresholds, exponential PTO periods and sender frame lifetime.
+packet/time loss thresholds, exponential PTO periods capped at one second, and
+sender frame lifetime.
 It applies [verified erratum 7539](https://www.rfc-editor.org/errata/eid7539),
 which computes deviation before updating the smoothed RTT. Tests cover delay
 bounds, backward time, numeric limits and exact estimator values. Worker ACK
@@ -682,9 +683,11 @@ renumbers the unsent packets and their history reservations before the
 syscall. Payload spans, sizes and deadlines stay unchanged; history pressure
 discards the plan and preserves its frames for retry. A plan larger than the
 claimable credit sends its fitting prefix and keeps the rest reserved. Pending
-probe commands survive connection replacement without resetting PTO backoff.
-After a long outage, carrier can return before backed-off probing restores DATA
-service.
+probe commands survive connection replacement. PTO backoff stops at one second,
+or at the unbacked period if that is longer, and a committed connection resets
+it like a new ACK, so DATA resumes about a second after a path returns. A relay
+test that drops all traffic until both ends degrade sees both directions
+deliver again within 1.35 seconds, with no duplicate frame.
 
 Release forwarding, reconnect, allocation and routed-MTU regression tests pass.
 The performance gates remain open; BENCH.md records the replacement sender's

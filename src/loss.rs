@@ -12,6 +12,9 @@ use std::time::Duration;
 const INITIAL: Duration = Duration::from_millis(333);
 const GRANULARITY: Duration = Duration::from_millis(1);
 const MAX_ACK_DELAY: Duration = Duration::from_millis(1);
+/// Longest backed-off PTO period. Probes keep the idle liveness cadence through
+/// an outage, so a returning path is found within about a second.
+pub const MAX_BACKED_OFF_PTO: Duration = Duration::from_secs(1);
 
 /// RTT estimates for one path, without I/O, allocation or internal clock reads.
 #[derive(Clone, Copy, Debug)]
@@ -121,7 +124,8 @@ impl Rtt {
 
     /// Established-packet PTO period with the path group's consecutive backoff.
     ///
-    /// Starts at srtt + max(4 * variation, 1 ms) + 1 ms and doubles per expiry.
+    /// Starts at srtt + max(4 * variation, 1 ms) + 1 ms and doubles per expiry,
+    /// up to [`MAX_BACKED_OFF_PTO`] or the unbacked period if that is longer.
     /// Saturates at Duration::MAX; adding it to a timestamp must be checked.
     /// Expiry alone is not packet loss. The owner grants at most two probes,
     /// and applies the transport's separate three-PTO no-feedback policy.
@@ -134,7 +138,7 @@ impl Rtt {
             .checked_shl(backoff)
             .and_then(|factor| base.as_nanos().checked_mul(factor))
             .unwrap_or(u128::MAX);
-        from_nanos(nanos.min(Duration::MAX.as_nanos()))
+        from_nanos(nanos.min(base.max(MAX_BACKED_OFF_PTO).as_nanos()))
     }
 
     /// Sender payload lifetime: four smoothed RTTs, clamped to 20..100 ms.

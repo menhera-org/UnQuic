@@ -367,14 +367,21 @@ fn pending_pto_without_target_survives_install() {
 }
 
 #[test]
-fn returned_probe_retargets_replacement_without_resetting_epoch_or_backoff() {
+fn returned_probe_retargets_replacement_without_resetting_its_epoch() {
     let mut owner = owner(1, 1, &[(0, 1, 0)]);
     owner.timers.install(0, 1).unwrap();
+    // A 100 ms period, so backoff is visible below the one-second cap.
+    assert!(
+        owner.groups[0]
+            .rtt
+            .sample(Duration::ZERO, Duration::from_millis(33), 0)
+    );
     let now = stalled(&mut owner.groups[0]);
     let state = &mut owner.groups[0];
     state.epoch = 9;
     state.probe = Some((None, 2));
-    let deadline = state.pto.deadline(&state.rtt, None);
+    let unbacked = state.rtt.pto_period(0);
+    assert!(state.pto.deadline(&state.rtt, Some(now)) > Some(now + unbacked));
     let mut outgoing = VecDeque::with_capacity(8);
     owner.advance(now, &mut outgoing).unwrap();
     assert!(matches!(
@@ -390,7 +397,7 @@ fn returned_probe_retargets_replacement_without_resetting_epoch_or_backoff() {
     owner.return_probe(0, 9, 2).unwrap();
     assert!(!owner.advance(now, &mut outgoing).unwrap());
     assert!(outgoing.is_empty());
-    owner.timers.install(0, 2).unwrap();
+    owner.install(0, 2).unwrap();
     owner.advance(now, &mut outgoing).unwrap();
     assert!(matches!(
         outgoing.pop_front().unwrap().1,
@@ -401,14 +408,45 @@ fn returned_probe_retargets_replacement_without_resetting_epoch_or_backoff() {
             ..
         }
     ));
+    // The committed replacement resets silence and backoff, as a new ACK would.
+    assert!(!owner.groups[0].pto.stalled());
     assert_eq!(
-        owner.groups[0].pto.deadline(&owner.groups[0].rtt, None),
-        deadline
+        owner.groups[0]
+            .pto
+            .deadline(&owner.groups[0].rtt, Some(now)),
+        Some(now + unbacked)
     );
-    assert!(owner.groups[0].pto.stalled());
     assert_eq!(owner.groups[0].epoch, 9);
     owner.return_probe(0, 8, 2).unwrap();
     assert!(owner.groups[0].probe.is_none());
+}
+
+#[test]
+fn only_a_new_generation_resets_the_groups_pto() {
+    let mut owner = owner(1, 1, &[(0, 1, 0)]);
+    owner.install(0, 1).unwrap();
+    assert!(
+        owner.groups[0]
+            .rtt
+            .sample(Duration::ZERO, Duration::from_millis(33), 0)
+    );
+    let now = stalled(&mut owner.groups[0]);
+    owner.install(0, 1).unwrap();
+    assert!(owner.groups[0].pto.stalled());
+    assert!(
+        owner.groups[0]
+            .pto
+            .deadline(&owner.groups[0].rtt, Some(now))
+            > Some(now + owner.groups[0].rtt.pto_period(0))
+    );
+    owner.timers.quiesce(0, 1).unwrap();
+    owner.install(0, 2).unwrap();
+    let state = &owner.groups[0];
+    assert!(!state.pto.stalled());
+    assert_eq!(
+        state.pto.deadline(&state.rtt, Some(now)),
+        Some(now + state.rtt.pto_period(0))
+    );
 }
 
 #[test]
