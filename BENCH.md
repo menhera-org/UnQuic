@@ -5,8 +5,10 @@ with 32 transfer boxes per worker, which removes ACK-buffer drops, and draft
 07's application-limited bubbles, which stop sparse traffic before a load from
 ending Startup early. Sixteen-flow decision delivery now reaches 1.45–2.18
 Gbit/s per direction at 2G and 5G. On the single-flow target with 1% loss,
-draft 07's short-term bounds still pin delivery near 0.45–0.8 Gbit/s, and one
-generator offers only about 2.5 Gbit/s. No gate has passed.
+draft 07's short-term bounds pin delivery near 0.45–0.8 Gbit/s; a switch, off
+by default, that cuts them only above 2% loss raises it to 0.79–0.98 Gbit/s,
+where one worker's CPU becomes the limit. One generator offers only about
+2.5 Gbit/s for one flow. No gate has passed.
 
 Later on November 9 the sender's per-batch grants and ordered commits were
 replaced by a shared atomic send budget (design section 9). On the decision
@@ -134,6 +136,72 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## Tolerating random loss below BBR's loss threshold (November 10)
+
+Draft 07 cuts `bw_shortterm` and `inflight_shortterm` after any loss round
+outside bandwidth probing, to the larger of the round's delivery and 70% of
+the old bound. Under steady random loss nearly every round loses something, so
+Cruise ratchets the bound down to the latest round's delivery and never back
+up; traced 1% runs pace at about half of `max_bw`.
+
+A switch, `daemon.tolerate_random_loss`, off by default, deviates from the
+draft: the cut applies only when the ACK that ends the loss round shows more
+than 2% loss over its flight, the test the draft already uses to stop probing.
+A round that loses more than 2% still cuts at once; lower loss is left to the
+probing bound, `inflight_longterm`.
+
+Stated before measuring: on the single-flow target with the switch on,
+delivery at 0.5% and 1% loss should rise beyond the control's range in every
+direction, toward the generator's 2.5 Gbit/s or the daemons' CPU. On the
+decision workload the 0% rows have no loss rounds, so they cannot change, and
+the 0.1% rows should stay within or above the control. If target delivery
+does not rise, the short-term bounds are not the limit and the switch is
+rejected.
+
+Both arms run one binary; only the switch differs. On the target,
+[three interleaved repeats](benches/tap-single-flow-random-loss.json) on CPUs
+20–31 (medians, L→R / R→L, Gbit/s):
+
+| Loss | Offered | Draft 07 | Switch on |
+| --- | --- | --- | --- |
+| 0.5% | 1G | 0.800 / 0.901 | 0.895 / 0.974 |
+| 0.5% | 2.4G | 0.685 / 0.924 | 0.841 / 1.022 |
+| 1% | 1G | 0.486 / 0.798 | 0.836 / 0.941 |
+| 1% | 2.4G | 0.436 / 0.779 | 0.790 / 0.977 |
+
+All eight directions rise beyond the control's range, by 8–81%. The limit
+moves to CPU: with the switch on, the right daemon's busiest worker runs at
+95–97% of a core. One flow hashes to one lane and so to one transmit worker,
+and each 1522-byte frame needs two 1452-byte datagrams, so a single flow
+stops near 1 Gbit/s per direction, about 170 thousand datagrams per second
+on one core. Reaching 5 Gbit/s with one flow needs the design's stage 5
+candidate, striping one flow across lanes, and a generator that can offer it.
+
+On the [decision workload](benches/tap-random-loss.json), with the switch off
+as control:
+
+| Flows, loss | Offered | Switch off | Switch on |
+| --- | --- | --- | --- |
+| 16, 0% | 2G | 1.564 / 1.602 | 1.568 / 1.652 |
+| 16, 0% | 5G | 2.136 / 1.511 | 2.156 / 1.510 |
+| 16, 0.1% | 2G | 1.639 / 1.606 | 1.575 / 1.620 |
+| 16, 0.1% | 5G | 1.960 / 1.425 | 2.144 / 1.498 |
+| 4, 0% | 2G | 1.282 / 1.438 | 1.299 / 1.374 |
+| 4, 0% | 5G | 0.830 / 1.796 | 0.830 / 1.812 |
+| 4, 0.1% | 2G | 1.122 / 1.434 | 1.180 / 1.401 |
+| 4, 0.1% | 5G | 0.806 / 1.752 | 0.785 / 1.777 |
+
+The 0% rows run identical code; their medians still land 2–3% outside the
+other arm's range in two directions, which shows this run's noise. At 0.1%
+loss, sixteen-flow 5G rises 9% and 5% beyond the control's range and four-flow
+2G L→R rises 5%; sixteen-flow 2G L→R sits 1% below, within that noise. CPU is
+unchanged.
+
+The switch meets its bar and is kept, off by default. Coexistence with
+competing flows is not measured: a flow that ignores loss below 2% may take
+more than its share from draft-07 or loss-based neighbours. Turning it on by
+default needs that measurement.
 
 ## Application-limited bubbles from unsent data (November 10)
 

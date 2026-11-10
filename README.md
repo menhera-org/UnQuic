@@ -615,7 +615,10 @@ window, none of the worker's own frames awaiting repair and no refused
 admission since the worker last held data starts draft 07's
 application-limited bubble at delivered plus inflight; sends join it until
 delivery passes that point. Without this, ACKs of sparse traffic before a load
-could end Startup before the load arrived.
+could end Startup before the load arrived. The daemon-wide
+`tolerate_random_loss` switch, off by default, deviates from draft 07: outside
+bandwidth probing, a loss round cuts the short-term bounds only when it lost
+more than 2%. Coexistence with competing traffic is not yet measured.
 PMTU provenance follows each successful probe through delivery sampling.
 An ACK containing only newly delivered PMTU probes cannot establish a bandwidth
 plateau or end Startup on that evidence. Mixed DATA/probe ACKs remain eligible;

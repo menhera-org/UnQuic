@@ -117,6 +117,8 @@ pub struct Controller {
     loss_events: u32,
     bw_latest: u64,
     inflight_latest: u64,
+    // Deviation switch: only loss rounds above the 2% threshold cut short-term bounds.
+    tolerate_random_loss: bool,
 
     extra_filter: [u64; 10],
     extra_index: usize,
@@ -204,6 +206,7 @@ impl Controller {
             loss_events: 0,
             bw_latest: 0,
             inflight_latest: 0,
+            tolerate_random_loss: false,
             extra_filter: [0; 10],
             extra_index: 0,
             extra_acked: 0,
@@ -236,6 +239,14 @@ impl Controller {
         };
         controller.set_quantum();
         Ok(controller)
+    }
+
+    /// Deviation from draft 07, off by default. Outside bandwidth probing, a
+    /// loss round then cuts the short-term bounds only when the ACK that ends
+    /// it shows more than the 2% loss that already stops probing, so steady
+    /// random loss below that no longer ratchets the rate down round by round.
+    pub fn tolerate_random_loss(&mut self, on: bool) {
+        self.tolerate_random_loss = on;
     }
 
     /// Current phase, for diagnostics and deterministic tests.
@@ -512,7 +523,10 @@ impl Controller {
             self.max_bw = self.bw_filter[0].max(self.bw_filter[1]);
         }
         if self.loss_round_start {
-            if !self.state.probing() && self.loss_in_round {
+            if !self.state.probing()
+                && self.loss_in_round
+                && (!self.tolerate_random_loss || too_high(sample.lost, sample.tx_in_flight))
+            {
                 if self.bw_shortterm == INFINITY {
                     self.bw_shortterm = self.max_bw;
                 }

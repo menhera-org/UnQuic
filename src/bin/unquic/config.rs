@@ -266,8 +266,13 @@ mod tests {
             );
             assert_eq!(loaded.config.sessions[0].queue_count, 1);
             assert_eq!(loaded.config.daemon.memory_limit, 256 * 1024 * 1024);
+            assert!(!loaded.config.daemon.tolerate_random_loss);
             loaded.config.validate().unwrap();
         }
+        let text = format!("[daemon]\ntolerate_random_loss = true\n{}", sample());
+        let loaded = Loaded::parse(&text).unwrap();
+        assert!(loaded.config.daemon.tolerate_random_loss);
+        assert_eq!(loaded.config.daemon.memory_limit, 256 * 1024 * 1024);
         let text = sample().replace("test.example.invalid", "2001:db8::1");
         let loaded = Loaded::parse(&text).unwrap();
         assert!(loaded.lookups.is_empty());

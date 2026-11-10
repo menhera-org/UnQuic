@@ -33,11 +33,15 @@ pub struct Config {
 pub struct Daemon {
     /// Total transport storage ceiling, including metadata and queues.
     pub memory_limit: usize,
+    /// Deviation from BBR draft 07, off by default: outside bandwidth probing,
+    /// cut the short-term bounds only after a loss round above 2% loss.
+    pub tolerate_random_loss: bool,
 }
 impl Default for Daemon {
     fn default() -> Self {
         Self {
             memory_limit: 256 * 1024 * 1024,
+            tolerate_random_loss: false,
         }
     }
 }

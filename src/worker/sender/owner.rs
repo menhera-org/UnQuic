@@ -111,6 +111,7 @@ impl Owner {
         descriptors: &[(usize, u16, usize)],
         now: Duration,
         budgets: Arc<[Budget]>,
+        tolerate_random_loss: bool,
     ) -> io::Result<Self> {
         let groups = budgets.len();
         if !(1..=64).contains(&workers) {
@@ -119,9 +120,11 @@ impl Owner {
         let mut states = Vec::new();
         states.try_reserve_exact(groups).map_err(io::Error::other)?;
         for group in 0..groups {
+            let mut controller =
+                Controller::new(1280, None, now, group as u64 + 1).map_err(io::Error::other)?;
+            controller.tolerate_random_loss(tolerate_random_loss);
             states.push(Group {
-                controller: Controller::new(1280, None, now, group as u64 + 1)
-                    .map_err(io::Error::other)?,
+                controller,
                 sampler: Sampler::default(),
                 published: Published::default(),
                 rtt: Rtt::new(),

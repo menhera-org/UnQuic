@@ -51,6 +51,7 @@ fn config(name: &str, port: u16, remote: u16) -> Config {
         // Three sessions retain independent payloads, histories and recovery state.
         daemon: Daemon {
             memory_limit: 512 * 1024 * 1024,
+            ..Daemon::default()
         },
         endpoints: vec![Endpoint {
             name: "rx".into(),

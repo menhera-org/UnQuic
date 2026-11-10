@@ -293,6 +293,30 @@ fn loss_outside_probing_reduces_shortterm_once_per_loss_round() {
 }
 
 #[test]
+fn tolerated_random_loss_cuts_shortterm_only_above_the_loss_threshold() {
+    // 600 of 30,000 bytes is exactly 2%, which is not too high.
+    for (tolerate, lost, cut) in [(false, 600, true), (true, 600, false), (true, 601, true)] {
+        let mut c = cruise();
+        c.tolerate_random_loss(tolerate);
+        c.bw_latest = 0;
+        c.inflight_latest = 0;
+        c.enter_recovery(c.now, 30000, false).unwrap();
+        loss(&mut c, lost, u64::from(lost), 30000, false);
+        let mut s = sample(&c, 100_000, 1500);
+        s.lost = u64::from(lost);
+        s.tx_in_flight = 30000;
+        c.on_ack(s, Some(ms(10)), 15000, false, ms(60)).unwrap();
+        let bounds = (c.bw_shortterm, c.inflight_shortterm);
+        if cut {
+            assert_eq!(bounds, (1_050_000, 31500));
+        } else {
+            assert_eq!(bounds, (INFINITY, INFINITY));
+            assert_eq!(c.pacing_rate, 1_485_000);
+        }
+    }
+}
+
+#[test]
 fn finite_probe_cap_grows_only_with_full_window_and_precaution_retries() {
     let mut c = cruise();
     c.inflight_longterm = c.cwnd;

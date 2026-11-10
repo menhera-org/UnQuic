@@ -12,7 +12,7 @@ fn owner_at(
     now: Duration,
 ) -> Owner {
     let budgets: Arc<[Budget]> = (0..groups).map(|_| Budget::new()).collect();
-    Owner::new(workers, descriptors, now, budgets).unwrap()
+    Owner::new(workers, descriptors, now, budgets, false).unwrap()
 }
 
 fn lane(lane: u16) -> PacketId {

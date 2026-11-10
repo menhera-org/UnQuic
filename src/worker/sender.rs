@@ -714,7 +714,13 @@ impl Worker {
             .map_err(io::Error::other)?;
         budgets.resize_with(groups, Budget::new);
         let budgets: Arc<[Budget]> = Arc::from(budgets);
-        let owner = Owner::new(workers.len(), &descriptors, now, Arc::clone(&budgets))?;
+        let owner = Owner::new(
+            workers.len(),
+            &descriptors,
+            now,
+            Arc::clone(&budgets),
+            first.shared.config.config().daemon.tolerate_random_loss,
+        )?;
         for worker in workers.iter_mut() {
             worker.sender.budgets = Arc::clone(&budgets);
         }

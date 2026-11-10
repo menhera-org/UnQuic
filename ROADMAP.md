@@ -17,13 +17,20 @@ The decision workload is CPU-bound: at sixteen flows every worker runs at
 79–99% of a core, so moving work between workers no longer helps, and the
 ACK-lane and whole-plan candidates were rejected.
 
-On the single-flow target, draft 07's short-term bounds are the limit. After
-any loss round outside probing, `bw_shortterm` becomes the larger of the
-round's delivery rate and 70% of its old value, so under steady 1% random
-loss Cruise ratchets it down to about half of `max_bw`. Reaching 5 Gbit/s at
-0.5–1% loss needs a deliberate deviation recorded in the design and placed
-behind a configuration switch; that is the next experiment. One generator
-process also offers only about 2.5 Gbit/s for one flow.
+On the single-flow target, draft 07's short-term bounds were the first limit.
+After any loss round outside probing, `bw_shortterm` becomes the larger of the
+round's delivery rate and 70% of its old value, so under steady 1% random loss
+Cruise ratchets it down to about half of `max_bw`. The `tolerate_random_loss`
+switch, recorded in design section 9 and off by default, cuts only after a
+round above 2% loss and raises every target direction by 8–81%
+([BENCH.md](BENCH.md#tolerating-random-loss-below-bbrs-loss-threshold-november-10)).
+Its coexistence with competing flows is not yet measured.
+
+The single flow then stops near 1 Gbit/s per direction because one transmit
+worker carries it: each 1522-byte frame takes two 1452-byte datagrams, and
+that worker reaches 95–97% of a core. Five gigabits for one flow needs stage
+5's single-flow striping across lanes, and a generator that can offer it; one
+generator process offers only about 2.5 Gbit/s.
 
 ## November 9 checkpoint
 
@@ -119,9 +126,11 @@ rules apply to all of them.
    per-session retention credit that busy workers can borrow and shared receive
    slots per worker, each sized from the delayed and lossy rows, with memory
    cost reported. Target one flow at 5 Gbit/s at 7.5 ms with 0.5% and 1% loss
-   on four workers, within two to four cores per daemon. One generator process
-   offers only about 2.5 Gbit/s for one flow, so the harness must change before
-   the 5 Gbit/s point can be offered.
+   on four workers, within two to four cores per daemon. That target is out of
+   reach in the current design: with the `tolerate_random_loss` switch one flow
+   reaches about 1 Gbit/s per direction, where its single transmit worker
+   saturates, and one generator process offers only about 2.5 Gbit/s. It
+   returns with stage 5's single-flow striping.
 4. **Finish stage 3.** General application-limited detection is done: a
    per-group unsent-data mask starts draft 07's bubble, which removed the
    warm-up collapse on the lossy target
