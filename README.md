@@ -54,10 +54,25 @@ changes a session cookie. The [configuration model](config-model.md) documents
 the TOML fields and resolver modes. Unknown fields fail, and parse errors report
 a byte position without echoing configuration text or cookies.
 
-The daemon stays in the foreground. It reports `TAPs ready` on stderr once all
+`unquic run` stays in the foreground. It reports `TAPs ready` on stderr once all
 configured TAPs exist; SIGINT or SIGTERM requests shutdown and joins transport
-workers. Administrative interface setup remains external. Double-fork readiness,
-PID files, service integration and configuration reload are still pending.
+workers. Administrative interface setup remains external.
+
+`unquic start /etc/unquic.toml /run/unquic.pid` daemonizes instead, as design
+section 12.1 describes. It validates the configuration, forks twice, and the
+original process exits 0 only after the daemon has written its PID file and
+every configured TAP exists; it exits 1 if the daemon fails or exits first.
+Readiness needs neither a reachable peer nor DNS. SIGINT or SIGTERM sent to the
+waiting parent reaches the daemon too. The daemon keeps stderr for
+diagnostics, reads `/dev/null` and removes its PID file on clean exit. Both
+paths must be absolute.
+
+`unquic systemd-unit /etc/unquic.toml /run/unquic.pid` prints a matching unit
+for the running binary: `Type=forking` with that `PIDFile=`,
+`TimeoutStartSec=infinity`, `Restart=on-failure`, ordered `Before=` and
+`RequiredBy=` both `network.target` and `network-online.target`, and no
+dependency on either. Nothing links against systemd. Configuration reload
+remains pending.
 
 ## Implementation status
 

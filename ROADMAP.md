@@ -150,8 +150,8 @@ rules apply to all of them.
 6. **Stage 4**, as listed in its section: TAP lifetime and descriptor handover,
    the rest of the panic audit (explicit `unwrap`/`expect`/`panic!` sites are
    gone; implicit indexing and overflow remain), the composition matrix, VRF,
-   resource stress, restart and path changes, double-fork readiness and the
-   systemd unit.
+   resource stress, and restart and path changes. Double-fork readiness and
+   the systemd unit are done.
 7. **Stage 5:** profile what remains and try its candidates behind switches.
 
 If evidence shows a gate cannot be reached within the current design, write
@@ -1055,10 +1055,13 @@ full expired batches sharing the cleanup budget.
 - Restart, path change and DNS change cases from V03.
 - Daemon: double-fork readiness exactly as section 12.1 describes, PID file,
   parent exit only after every TAP exists; a test that the parent waits while
-  a TAP is missing and succeeds with no peer reachable.
+  a TAP is missing and succeeds with no peer reachable. Done: `unquic start`.
+  Its container test checks that the TAP exists when the parent returns with
+  no peer reachable, that SIGTERM removes the TAP and PID file, and that a
+  failure after the fork exits 1 with neither.
 - Optional systemd unit template embedded in the daemon, with the exact
   `[Unit]`, `[Install]` and `[Service]` lines of section 12.1. No systemd
-  linkage.
+  linkage. Done: `unquic systemd-unit`, checked line by line in a unit test.
 
 ## Stage 5: measured optimisation
 

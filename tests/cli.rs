@@ -296,3 +296,43 @@ fn foreground_readiness_dns_refresh_forwarding_and_signal_shutdown() {
         dns.join().unwrap();
     });
 }
+
+#[test]
+#[ignore = "requires disposable container with tun and network namespace capabilities"]
+fn start_returns_after_taps_exist_and_reports_failure_before_them() {
+    use common::*;
+    // SAFETY: this thread and the daemons it starts use a disposable namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let pid_path = std::env::temp_dir().join(format!("unquic-start-{}.pid", std::process::id()));
+    let start = |text: &str| {
+        let file = ConfigFile::new(text);
+        Command::new(binary())
+            .arg("start")
+            .arg(&file.0)
+            .arg(&pid_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+    };
+    let present = || {
+        // SAFETY: the name is NUL-terminated; the call only queries this namespace.
+        unsafe { libc::if_nametoindex(c"uq-start".as_ptr()) != 0 }
+    };
+    // No peer listens: readiness needs the TAP, not the path.
+    let text = config("uq-start", 40300, 40301, "::1", "");
+    assert!(start(&text).success());
+    assert!(present(), "the parent returned before the TAP existed");
+    let pid: i32 = fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: the PID file names the detached daemon this test started.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    until(|| !present() && !pid_path.exists());
+    // Storage over memory_limit fails after the fork and before any TAP exists.
+    let failing = format!("[daemon]\nmemory_limit = 4096\n{text}");
+    assert_eq!(start(&failing).code(), Some(1));
+    assert!(!present() && !pid_path.exists());
+}

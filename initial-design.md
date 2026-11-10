@@ -813,8 +813,9 @@ MTU evidence cannot lower the limit. Periodic probes detect silent reductions.
 The foreground daemon now parses the documented TOML, provisions cookies through
 gen-uuid, refreshes hostnames through per-peer iphost helpers after readiness,
 and joins transport workers on SIGINT/SIGTERM. Tests cover delayed DNS, address
-refresh and signal cleanup. Double-fork readiness and service integration remain
-stage 4 work. No performance acceptance claim has been made.
+refresh and signal cleanup. `unquic start` adds section 12.1's double-fork
+readiness with a PID file, and `unquic systemd-unit` prints its unit template.
+No performance acceptance claim has been made.
 
 1. **Socket and device foundation.** Implement fixed receive-only sockets, dynamic transmit pools, IPv6/interface/VRF binding, UUID lookup, TAP ownership, and counters. Validate R01–R10 and the port invariants.
 

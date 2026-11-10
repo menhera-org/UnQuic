@@ -1,6 +1,9 @@
-//! Foreground UnQuic daemon. Process integration stays outside the library.
+//! UnQuic daemon, foreground or double-forked. Process integration stays
+//! outside the library.
 #[path = "unquic/config.rs"]
 mod config;
+#[path = "unquic/daemon.rs"]
+mod daemon;
 
 use std::{
     io::{self, Write},
@@ -173,8 +176,9 @@ impl Trace {
     }
 }
 
-fn serve(loaded: config::Loaded) -> io::Result<()> {
+fn serve(loaded: config::Loaded, mut readiness: Option<daemon::Readiness>) -> io::Result<()> {
     signals()?;
+    let mut _pid_file = None;
     #[cfg(feature = "trace")]
     let mut trace = loaded
         .config
@@ -212,6 +216,16 @@ fn serve(loaded: config::Loaded) -> io::Result<()> {
             && let Some(jobs) = lookups.take()
         {
             eprintln!("unquic: TAPs ready");
+            if let Some(readiness) = readiness.take() {
+                match readiness.ready() {
+                    Ok(pid_file) => _pid_file = Some(pid_file),
+                    Err(error) => {
+                        helper_error = Some(error);
+                        control.shutdown();
+                        break;
+                    }
+                }
+            }
             for job in jobs {
                 let control = control.clone();
                 if let Err(error) = thread::Builder::new()
@@ -244,29 +258,66 @@ fn serve(loaded: config::Loaded) -> io::Result<()> {
     }
 }
 
-fn execute() -> io::Result<()> {
-    let mut args = std::env::args_os().skip(1);
-    match (args.next(), args.next(), args.next()) {
-        (Some(command), None, None) if command == "gen-uuid" => {
-            writeln!(io::stdout().lock(), "{}", UnquicUuid::new_v4()?)
-        }
-        (Some(command), Some(path), None) if command == "run" => {
-            serve(config::Loaded::parse(&std::fs::read_to_string(path)?)?)
-        }
-        (Some(command), None, None) if command == "--help" || command == "-h" => writeln!(
-            io::stdout().lock(),
-            "Usage: unquic gen-uuid | unquic run <config.toml>"
-        ),
-        _ => Err(io::Error::new(
+const USAGE: &str = "unquic gen-uuid | unquic run <config.toml> | \
+unquic start <config.toml> <pid-file> | unquic systemd-unit <config.toml> <pid-file>";
+
+fn absolute(path: std::ffi::OsString) -> io::Result<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(path);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: unquic gen-uuid | unquic run <config.toml>",
-        )),
+            "start and systemd-unit need absolute paths",
+        ))
     }
+}
+
+/// Returns the process exit status.
+fn execute() -> io::Result<u8> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let mut args = args.into_iter();
+    match (args.next(), args.next(), args.next(), args.next()) {
+        (Some(command), None, None, None) if command == "gen-uuid" => {
+            writeln!(io::stdout().lock(), "{}", UnquicUuid::new_v4()?)?;
+        }
+        (Some(command), Some(path), None, None) if command == "run" => {
+            serve(
+                config::Loaded::parse(&std::fs::read_to_string(path)?)?,
+                None,
+            )?;
+        }
+        (Some(command), Some(path), Some(pid_file), None) if command == "start" => {
+            let path = absolute(path)?;
+            let loaded = config::Loaded::parse(&std::fs::read_to_string(&path)?)?;
+            // Report configuration errors from the launching process, before forking.
+            loaded.config.clone().validate().map_err(io::Error::other)?;
+            match daemon::start(absolute(pid_file)?)? {
+                daemon::Started::Parent(status) => return Ok(status),
+                daemon::Started::Daemon(readiness) => serve(loaded, Some(readiness))?,
+            }
+        }
+        (Some(command), Some(path), Some(pid_file), None) if command == "systemd-unit" => {
+            let binary = std::env::current_exe()?;
+            let text = daemon::unit(&binary, &absolute(path)?, &absolute(pid_file)?)?;
+            io::stdout().lock().write_all(text.as_bytes())?;
+        }
+        (Some(command), None, None, None) if command == "--help" || command == "-h" => {
+            writeln!(io::stdout().lock(), "Usage: {USAGE}")?;
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("usage: {USAGE}"),
+            ));
+        }
+    }
+    Ok(0)
 }
 
 fn main() -> ExitCode {
     match execute() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(status) => ExitCode::from(status),
         Err(error) => {
             eprintln!("unquic: {error}");
             ExitCode::FAILURE
