@@ -137,8 +137,14 @@ rules apply to all of them.
    ([BENCH.md](BENCH.md#application-limited-bubbles-from-unsent-data-november-10)).
    The container check with `tc netem` loss and reordering is done:
    `benches/netem_check.sh` passes with no duplicate delivery and a flat
-   peak of about 137 MiB per daemon. Remaining: the 0, 0.1, 1 and 5% loss sweep at
-   4.5 and 7.5 ms with independent and burst loss.
+   peak of about 137 MiB per daemon. The loss sweep is recorded
+   ([BENCH.md](BENCH.md#stage-3-loss-sweep-november-10)): 0.1% costs nothing
+   measurable and 1% halves one 2G direction under draft 07, but 5% loss,
+   independent or in bursts, collapses delivery below 11% of even a 0.5G offer
+   because draft 07 treats sustained loss above 2% as congestion. Stage 3's
+   work items are done; its 5 Gbit/s lossy-path gate stays open and returns in
+   stage 5, where the 5% rows need forward error correction or a
+   loss-agnostic response.
 5. **Close the stage 2 gate:** 20 Gbit/s each direction locally at inner MTU
    1500, plus the small-frame burst rows.
 6. **Stage 4**, as listed in its section: TAP lifetime and descriptor handover,

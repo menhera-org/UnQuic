@@ -137,6 +137,52 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Stage 3 loss sweep (November 10)
+
+[One pass](benches/tap-loss-sweep.json) over the routed path at 4.5 and 7.5 ms
+RTT, with no loss, 0.1%, 1% and 5% loss, each independent and in bursts of
+four datagrams (netem's Gilbert model at the same mean rate). Four bridged
+QinQ flows offer 0.5, 2 and 5 Gbit/s in aggregate on four workers. Both arms run
+the same binary, with `tolerate_random_loss` off and on. This is a
+characterization, not a decision: the 2G points are bimodal, and the two
+lossless arms, which run identical code, differ by up to 25% in one direction.
+
+Delivery, L→R / R→L in Gbit/s:
+
+| RTT | Loss | 0.5G, draft | 0.5G, switch | 2G, draft | 2G, switch |
+| --- | --- | --- | --- | --- | --- |
+| 4.5 ms | none | 0.493 / 0.493 | 0.469 / 0.469 | 1.126 / 1.382 | 0.886 / 1.604 |
+| 4.5 ms | 0.1% | 0.492 / 0.493 | 0.494 / 0.494 | 1.039 / 1.411 | 1.054 / 1.438 |
+| 4.5 ms | 0.1%, bursts | 0.489 / 0.491 | 0.493 / 0.494 | 1.025 / 1.509 | 1.029 / 1.597 |
+| 4.5 ms | 1% | 0.484 / 0.488 | 0.488 / 0.487 | 0.514 / 1.510 | 0.681 / 1.738 |
+| 4.5 ms | 1%, bursts | 0.467 / 0.466 | 0.420 / 0.479 | 0.658 / 1.137 | 0.784 / 1.294 |
+| 4.5 ms | 5% | 0.024 / 0.006 | 0.022 / 0.008 | 0.013 / 0.014 | 0.008 / 0.010 |
+| 4.5 ms | 5%, bursts | 0.034 / 0.046 | 0.057 / 0.057 | 0.050 / 0.041 | 0.020 / 0.033 |
+| 7.5 ms | none | 0.471 / 0.460 | 0.492 / 0.492 | 0.876 / 1.634 | 1.019 / 1.248 |
+| 7.5 ms | 0.1% | 0.491 / 0.491 | 0.494 / 0.494 | 1.045 / 1.434 | 1.116 / 1.314 |
+| 7.5 ms | 0.1%, bursts | 0.490 / 0.492 | 0.490 / 0.493 | 1.006 / 1.372 | 0.944 / 1.495 |
+| 7.5 ms | 1% | 0.466 / 0.480 | 0.490 / 0.493 | 0.458 / 1.517 | 0.895 / 1.505 |
+| 7.5 ms | 1%, bursts | 0.445 / 0.451 | 0.482 / 0.454 | 0.694 / 1.128 | 0.697 / 1.149 |
+| 7.5 ms | 5% | 0.012 / 0.039 | 0.026 / 0.009 | 0.005 / 0.006 | 0.009 / 0.006 |
+| 7.5 ms | 5%, bursts | 0.043 / 0.043 | 0.056 / 0.059 | 0.030 / 0.025 | 0.030 / 0.018 |
+
+At 0.1% loss nothing changes measurably. At 1% the light 0.5G points still
+deliver 89–99%, and the 2G L→R direction loses about half under draft 07 with
+independent loss; the switch recovers part of it, as on the single-flow
+target. The 5G points are CPU-bound overload in every row, as on the decision
+workload.
+
+At 5% loss delivery collapses to 0.5–11% of even the 0.5G offer, with either
+arm, at both RTTs, independent or in bursts. A traced single flow at 7.5 ms
+and 5% loss shows why: within three seconds `inflight_longterm` falls from
+104 KB to 6–15 KB, a handful of datagrams per round, and `max_bw` follows the
+window down from 311 Mbit/s to 10–20 Mbit/s. Repairs do deliver; measured loss
+stays near 6%. Draft 07 reads sustained loss above its 2% threshold as
+congestion, so every probe cuts the long-term bound and the controller never
+recovers. Holding throughput at 5% random loss needs either a loss-agnostic
+response or forward error correction, one of stage 5's candidates in the
+roadmap.
+
 ## Tolerating random loss below BBR's loss threshold (November 10)
 
 Draft 07 cuts `bw_shortterm` and `inflight_shortterm` after any loss round
