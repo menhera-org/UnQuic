@@ -1,6 +1,7 @@
 #!/bin/sh
 # Run only inside a disposable container with tun, iproute2, taskset and a generator.
 # Usage: sh benches/tap_transport.sh /absolute/unquic FRAME_BYTES FLOWS SECONDS OUT
+# DAEMON_TOML, when set, starts both daemon configurations, e.g. a [daemon] table.
 set -eu
 [ "$#" -eq 5 ] || { echo "usage: $0 DAEMON FRAME_BYTES FLOWS SECONDS OUT" >&2; exit 2; }
 case "$1" in /*) ;; *) echo "DAEMON must be an absolute path" >&2; exit 2;; esac
@@ -13,10 +14,16 @@ case "${OUTER_PAYLOAD_LIMIT:-1232}" in ''|*[!0-9]*) exit 2;; esac
 [ "${OUTER_PAYLOAD_LIMIT:-1232}" -ge 1232 ] && [ "${OUTER_PAYLOAD_LIMIT:-1232}" -le 1452 ] || exit 2
 case "${TAP_TXQUEUELEN:-10000}" in ''|*[!0-9]*) exit 2;; esac
 [ "${TAP_TXQUEUELEN:-10000}" -ge 1 ] && [ "${TAP_TXQUEUELEN:-10000}" -le 10000 ] || exit 2
-for number in "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}"; do
+for number in "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" "${OUTER_LOSS_BURST:-1}" "${OUTER_REORDER_PERMILLE:-0}"; do
     case "$number" in ''|*[!0-9]*|0[0-9]*) exit 2;; esac
 done
+# Netem reorders by letting datagrams skip the delay, so reordering needs one.
+[ "${OUTER_REORDER_PERMILLE:-0}" -le 1000 ] || exit 2
+[ "${OUTER_REORDER_PERMILLE:-0}" -eq 0 ] || [ "${OUTER_DELAY_US:-0}" -gt 0 ] || exit 2
 [ "${OUTER_DELAY_US:-0}" -le 1000000 ] && [ "${OUTER_LOSS_PERMILLE:-0}" -le 1000 ] || exit 2
+# A mean loss burst of 1 is independent loss; longer bursts need some delivery.
+[ "${OUTER_LOSS_BURST:-1}" -ge 1 ] && [ "${OUTER_LOSS_BURST:-1}" -le 100 ] || exit 2
+[ "${OUTER_LOSS_BURST:-1}" -eq 1 ] || [ "${OUTER_LOSS_PERMILLE:-0}" -lt 1000 ] || exit 2
 case "${OUTER_ROUTED:-0}" in 0|1) ;; *) exit 2;; esac
 case "${INNER_BRIDGE:-0}" in 0|1) ;; *) exit 2;; esac
 case "${VLAN_DEPTH:-0}" in 0|1|2) ;; *) echo "VLAN_DEPTH must be 0, 1 or 2" >&2; exit 2;; esac
@@ -120,10 +127,28 @@ outer() {
     shift
     nsenter --net="$namespace" "$@"
 }
+percent4() {
+    printf '%s.%04d%%' "$(($1 / 10000))" "$(($1 % 10000))"
+}
 netem() {
     if [ "${OUTER_DELAY_US:-0}" -ne 0 ] || [ "${OUTER_LOSS_PERMILLE:-0}" -ne 0 ]; then
         loss=${OUTER_LOSS_PERMILLE:-0}
-        tc qdisc add dev "$1" root netem limit 8192 delay "${OUTER_DELAY_US:-0}us" loss "$((loss / 10)).$((loss % 10))%"
+        burst=${OUTER_LOSS_BURST:-1}
+        reorder=${OUTER_REORDER_PERMILLE:-0}
+        if [ "$burst" -le 1 ] || [ "$loss" -eq 0 ]; then
+            set -- "$1" loss "$((loss / 10)).$((loss % 10))%"
+        else
+            # Gilbert model: the bad state loses every packet and lasts $burst
+            # packets on average; entry probability keeps the mean loss rate.
+            set -- "$1" loss gemodel \
+                "$(percent4 $((1000000 * loss / (burst * (1000 - loss)))))" \
+                "$(percent4 $((1000000 / burst)))" 100% 0%
+        fi
+        dev=$1
+        shift
+        # Reordered datagrams skip the delay, so they overtake earlier ones.
+        [ "$reorder" -eq 0 ] || set -- "$@" reorder "$((reorder / 10)).$((reorder % 10))%" 50%
+        tc qdisc add dev "$dev" root netem limit 8192 delay "${OUTER_DELAY_US:-0}us" "$@"
     fi
 }
 ip link set lo up
@@ -171,6 +196,7 @@ for side in left right; do
     mac_prefix=00
     [ "${INNER_BRIDGE:-0}" = 0 ] || mac_prefix=01
     cat > "$out/$side.toml" <<CONFIG
+${DAEMON_TOML:-}
 [[endpoints]]
 name = "rx"
 listen_address = "$listen"
@@ -286,6 +312,8 @@ snapshot() {
     cat /proc/uptime > "$out/$1.uptime"
     cat /proc/stat > "$out/$1.cpu"
     cat /proc/"$left"/stat /proc/"$right"/stat > "$out/$1.process"
+    # Peak and current resident memory, left then right, to check bounded storage.
+    sed -n '/^VmHWM:/p; /^VmRSS:/p' /proc/"$left"/status /proc/"$right"/status > "$out/$1.memory"
     cat /proc/"$left"/task/*/stat /proc/"$right"/task/*/stat > "$out/$1.threads"
     for process in "$left" "$right"; do
         for status in /proc/"$process"/task/*/status; do
@@ -331,7 +359,8 @@ printf '%s\n' "${VLAN_DEPTH:-0}" > "$out/vlan-depth"
 printf '%s\n' "${SRV6:-0}" > "$out/srv6"
 printf '%s\n' "${INNER_BRIDGE:-0}" > "$out/inner-bridge"
 printf '%s\n' "$frame" > "$out/frame-bytes"
-printf 'routed=%s\none_way_delay_us=%s\nloss_permille=%s\n' "${OUTER_ROUTED:-0}" "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" > "$out/outer-path"
+printf 'routed=%s\none_way_delay_us=%s\nloss_permille=%s\nloss_burst=%s\nreorder_permille=%s\n' "${OUTER_ROUTED:-0}" "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" "${OUTER_LOSS_BURST:-1}" "${OUTER_REORDER_PERMILLE:-0}" > "$out/outer-path"
+printf '%s\n' "${DAEMON_TOML:-}" > "$out/daemon-toml"
 base=$out
 index=0
 for rate in ${BITRATE:-0}; do

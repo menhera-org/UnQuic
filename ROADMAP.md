@@ -126,9 +126,10 @@ rules apply to all of them.
    per-group unsent-data mask starts draft 07's bubble, which removed the
    warm-up collapse on the lossy target
    ([BENCH.md](BENCH.md#application-limited-bubbles-from-unsent-data-november-10)).
-   Remaining: the container test with `tc netem` loss and reordering proving
-   no duplicate delivery and bounded memory; the 0, 0.1, 1 and 5% loss sweep
-   at 4.5 and 7.5 ms with independent and burst loss.
+   The container check with `tc netem` loss and reordering is done:
+   `benches/netem_check.sh` passes with no duplicate delivery and a flat
+   peak of about 137 MiB per daemon. Remaining: the 0, 0.1, 1 and 5% loss sweep at
+   4.5 and 7.5 ms with independent and burst loss.
 5. **Close the stage 2 gate:** 20 Gbit/s each direction locally at inner MTU
    1500, plus the small-frame burst rows.
 6. **Stage 4**, as listed in its section: TAP lifetime and descriptor handover,

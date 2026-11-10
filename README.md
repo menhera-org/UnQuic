@@ -1056,6 +1056,18 @@ test executables into a container, also copy the daemon and set
 `UNQUIC_TEST_BINARY` to its container path. Otherwise the test uses Cargo's
 built daemon path.
 
+`benches/netem_check.sh` is stage 3's loss-and-reordering check. In the same
+kind of disposable container as the transport benchmark, it runs four bridged
+QinQ flows over a routed 7.5 ms path with 1% loss in bursts of four datagrams
+and 1% reordering. It fails if an inner receiver sees a duplicate, invalid or
+foreign datagram, if a daemon's peak resident memory exceeds the default
+`memory_limit` plus 64 MiB, or if that peak still grows between the last two of
+three equal points:
+
+```sh
+UDP_LOAD=/absolute/udp_load sh benches/netem_check.sh /absolute/unquic /tmp/out
+```
+
 Bridge/OVS/VRF matrices, real RA/DHCPv6 resolver networks, physical-NIC offload
 qualification, Linux 5.0 qualification and performance acceptance remain open.
 

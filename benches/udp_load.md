@@ -126,7 +126,14 @@ the harness's private namespaces. This mode requires `ethtool`.
 and 3750 models 7.5 ms. `OUTER_LOSS_PERMILLE` sets random loss: 1, 10 and
 50 mean 0.1%, 1% and 5%. Both default to zero. The delay range is 0–1000000
 microseconds and the loss range is 0–1000; use decimal integers without leading
-zeroes. Netem has an 8192-entry queue on each router egress. Qdisc snapshots
+zeroes. `OUTER_LOSS_BURST`, 1–100 and default 1, makes the same mean loss
+come in bursts: above 1, netem's Gilbert model loses every datagram in its bad
+state, which lasts that many datagrams on average, and the loss rate must stay
+below 100%. `OUTER_REORDER_PERMILLE`, 0–1000, sends that share of datagrams
+without the delay, so they overtake earlier ones; it needs a nonzero delay.
+Each snapshot's `memory` file records both daemons' VmHWM and VmRSS.
+`DAEMON_TOML`, when set, starts both daemon configurations, for
+example `[daemon]` options. Netem has an 8192-entry queue on each router egress. Qdisc snapshots
 record drops and backlog; drops can include queue overflow as well as the
 configured random loss.
 
