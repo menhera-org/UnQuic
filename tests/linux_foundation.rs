@@ -179,13 +179,38 @@ fn kernel_socket_and_tap_invariants() {
     queues[1].set_carrier(false).unwrap();
     wait_for(|| flags(&control, c"uq-test") & libc::IFF_RUNNING as i16 == 0);
     drop(queues);
+    // The device outlives its queues and is reattached with its MAC and MTU unchanged.
+    // SAFETY: the names are NUL-terminated; the calls only query this namespace.
+    let index = unsafe { libc::if_nametoindex(c"uq-test".as_ptr()) };
+    assert_ne!(index, 0);
+    let mut again = Tap::create(c"uq-test", 9000, 2, None).unwrap();
+    assert_eq!(unsafe { libc::if_nametoindex(c"uq-test".as_ptr()) }, index);
+    assert_eq!(mac_address(&control, again.name()), mac);
+    // A device with attached queues is in use: neither creation nor a name clash reattaches it.
+    assert_eq!(
+        Tap::create(c"uq-test", 1500, 1, None)
+            .err()
+            .and_then(|error| error.raw_os_error()),
+        Some(libc::EBUSY)
+    );
+    assert_eq!(again.queues().len(), 2);
+    drop(again);
+    unquic::tap::remove(c"uq-test").unwrap();
     assert_eq!(unsafe { libc::if_nametoindex(c"uq-test".as_ptr()) }, 0);
+    assert_eq!(
+        unquic::tap::remove(c"uq-test").unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    // Removal is refused for a device that is not a TAP.
+    assert!(unquic::tap::remove(c"lo").is_err());
     // Recreating a TAP with the same names must reproduce the exact address.
     let expected: MacAddress = "60:a4:34:49:63:0a".parse().unwrap();
     for _ in 0..2 {
         let generated = Tap::create(c"uq-test", 1500, 1, None).unwrap();
         assert_eq!(flags(&control, generated.name()) & libc::IFF_UP as i16, 0);
         assert_eq!(mac_address(&control, generated.name()), expected);
+        drop(generated);
+        unquic::tap::remove(c"uq-test").unwrap();
     }
     let other = Tap::create(c"uq-other", 1500, 1, None).unwrap();
     assert_eq!(

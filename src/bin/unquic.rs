@@ -259,7 +259,8 @@ fn serve(loaded: config::Loaded, mut readiness: Option<daemon::Readiness>) -> io
 }
 
 const USAGE: &str = "unquic gen-uuid | unquic run <config.toml> | \
-unquic start <config.toml> <pid-file> | unquic systemd-unit <config.toml> <pid-file>";
+unquic start <config.toml> <pid-file> | unquic systemd-unit <config.toml> <pid-file> | \
+unquic remove-tap <name>";
 
 fn absolute(path: std::ffi::OsString) -> io::Result<std::path::PathBuf> {
     let path = std::path::PathBuf::from(path);
@@ -296,6 +297,12 @@ fn execute() -> io::Result<u8> {
                 daemon::Started::Parent(status) => return Ok(status),
                 daemon::Started::Daemon(readiness) => serve(loaded, Some(readiness))?,
             }
+        }
+        (Some(command), Some(name), None, None) if command == "remove-tap" => {
+            use std::os::unix::ffi::OsStringExt;
+            let name = std::ffi::CString::new(name.into_vec())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in TAP name"))?;
+            unquic::tap::remove(&name)?;
         }
         (Some(command), Some(path), Some(pid_file), None) if command == "systemd-unit" => {
             let binary = std::env::current_exe()?;

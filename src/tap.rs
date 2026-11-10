@@ -1,14 +1,16 @@
-//! Nonpersistent Ethernet TAP devices, independent of underlay readiness.
+//! Persistent Ethernet TAP devices, independent of underlay readiness.
 //!
 //! Requires /dev/net/tun and CAP_NET_ADMIN in the device's network namespace.
 //! Devices start administratively down with carrier down. The caller configures
 //! bridge membership, addresses and administrative state. Queues can be moved
 //! out of the Tap for per-worker ownership; any queue can control carrier.
+//! Closing every queue keeps the device; only [`remove`] deletes it.
 
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
 pub(crate) mod test_common;
 
+mod link;
 mod read;
 pub(crate) use read::Reader;
 mod segment;
@@ -29,24 +31,101 @@ use std::{
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
 };
 
-/// Owns every queue of a newly created TAP.
+/// Owns every queue of a created or reattached TAP.
 ///
-/// Closing the last queue deletes the nonpersistent device. Creation never
-/// attaches to an existing device; descriptor adoption needs a versioned
-/// handover contract and is not implemented.
+/// The device is persistent: closing every queue keeps it, with its MAC,
+/// attachments and upper devices, for the next start to reattach. Only
+/// [`remove`] deletes it.
 pub struct Tap {
     name: [libc::c_char; libc::IFNAMSIZ],
     queues: Vec<TapQueue>,
 }
 
+fn validate(name: &CStr) -> io::Result<()> {
+    if name.is_empty() || name.to_bytes().len() >= libc::IFNAMSIZ || name.to_bytes().contains(&b'%')
+    {
+        return Err(invalid(
+            "TAP name must contain 1..15 bytes and no percent sign",
+        ));
+    }
+    Ok(())
+}
+
+fn request_for(name: &CStr) -> libc::ifreq {
+    // SAFETY: all-zero ifreq is valid before its fields are populated.
+    let mut request: libc::ifreq = unsafe { zeroed() };
+    for (dst, &src) in request.ifr_name.iter_mut().zip(name.to_bytes()) {
+        *dst = src as libc::c_char;
+    }
+    request
+}
+
+/// Opens one queue of the named TAP; `exclusive` refuses an existing device.
+fn attach(request: &mut libc::ifreq, exclusive: bool) -> io::Result<OwnedFd> {
+    // SAFETY: this is a constant NUL-terminated path; open returns a new fd.
+    let fd = cvt(unsafe {
+        libc::open(
+            c"/dev/net/tun".as_ptr(),
+            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    })?;
+    // SAFETY: this is the sole owner of the descriptor returned by open.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    request.ifr_ifru.ifru_flags = (libc::IFF_TAP
+        | libc::IFF_NO_PI
+        | libc::IFF_MULTI_QUEUE
+        | libc::IFF_VNET_HDR
+        | if exclusive { libc::IFF_TUN_EXCL } else { 0 })
+        as libc::c_short;
+    // SAFETY: TUNSETIFF reads/writes the initialized ifreq.
+    cvt(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, request as *mut libc::ifreq) })?;
+    Ok(fd)
+}
+
+fn set_persist(fd: &OwnedFd, persist: bool) -> io::Result<()> {
+    // SAFETY: TUNSETPERSIST takes an integer flag, not a pointer.
+    cvt(unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            libc::TUNSETPERSIST,
+            libc::c_ulong::from(persist),
+        )
+    })?;
+    Ok(())
+}
+
+/// A persistent multiqueue TAP without packet information.
+fn ours(tun: &link::Tun) -> bool {
+    tun.tap && !tun.pi && tun.multi_queue && tun.persist
+}
+
+/// Deletes the named persistent TAP: it disappears once its last queue closes,
+/// immediately if no process holds one. Shutdown and restart never call this;
+/// only an explicit removal instruction does.
+pub fn remove(name: &CStr) -> io::Result<()> {
+    validate(name)?;
+    match link::query(name)? {
+        link::Link::Tun(tun) if ours(&tun) => {}
+        link::Link::Missing => {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such TAP"));
+        }
+        _ => return Err(invalid("not a persistent multiqueue TAP")),
+    }
+    // The same flags leave a running owner's device features unchanged.
+    set_persist(&attach(&mut request_for(name), false)?, false)
+}
+
 impl Tap {
-    /// Creates a named TAP with MTU 1500..9000 and 1..64 queues.
+    /// Creates a named TAP with MTU 1500..9000 and 1..64 queues, or reattaches
+    /// the persistent TAP an earlier run left with that name.
     ///
     /// Uses IFF_TAP, IFF_NO_PI, IFF_MULTI_QUEUE and internal virtio metadata.
     /// Read checksum/GSO offloads stay disabled; eligible writes may use USO/TSO.
-    /// Any failure closes all queues created by this call.
-    /// Sets the supplied MAC; None derives a Menhera MAC-M address from the
-    /// current UTS hostname and interface name using SHA-256.
+    /// A new device gets the supplied MAC, or with None a Menhera MAC-M address
+    /// derived from the current UTS hostname and interface name using SHA-256;
+    /// a reattached device keeps its MAC. Reattaching requires a persistent
+    /// multiqueue TAP with no queue attached; a device in use or of another kind
+    /// fails with EBUSY. Any failure leaves no new device behind.
     /// Administrative state is left to the caller or network manager.
     pub fn create(
         name: &CStr,
@@ -54,48 +133,28 @@ impl Tap {
         queue_count: usize,
         mac: Option<MacAddress>,
     ) -> io::Result<Self> {
-        if name.is_empty()
-            || name.to_bytes().len() >= libc::IFNAMSIZ
-            || name.to_bytes().contains(&b'%')
-        {
-            return Err(invalid(
-                "TAP name must contain 1..15 bytes and no percent sign",
-            ));
-        }
+        validate(name)?;
         if !(1500..=9000).contains(&mtu) || !(1..=64).contains(&queue_count) {
             return Err(invalid("TAP requires MTU 1500..9000 and 1..64 queues"));
         }
-        let mac = match mac {
-            Some(mac) => mac,
-            None => MacAddress::for_interface(name)?,
+        let fresh = match link::query(name)? {
+            link::Link::Missing => true,
+            link::Link::Tun(tun) if ours(&tun) && tun.queues == 0 => false,
+            _ => return Err(io::Error::from_raw_os_error(libc::EBUSY)),
         };
-        // SAFETY: all-zero ifreq is valid before its fields are populated.
-        let mut request: libc::ifreq = unsafe { zeroed() };
-        for (dst, &src) in request.ifr_name.iter_mut().zip(name.to_bytes()) {
-            *dst = src as libc::c_char;
-        }
+        let mac = match (fresh, mac) {
+            (false, _) => None,
+            (true, Some(mac)) => Some(mac),
+            (true, None) => Some(MacAddress::for_interface(name)?),
+        };
+        let mut request = request_for(name);
         let mut tap = Self {
             name: request.ifr_name,
             queues: Vec::with_capacity(queue_count),
         };
         for i in 0..queue_count {
-            // SAFETY: this is a constant NUL-terminated path; open returns a new fd.
-            let fd = cvt(unsafe {
-                libc::open(
-                    c"/dev/net/tun".as_ptr(),
-                    libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                )
-            })?;
-            // SAFETY: this is the sole owner of the descriptor returned by open.
-            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-            request.ifr_ifru.ifru_flags = (libc::IFF_TAP
-                | libc::IFF_NO_PI
-                | libc::IFF_MULTI_QUEUE
-                | libc::IFF_VNET_HDR
-                | if i == 0 { libc::IFF_TUN_EXCL } else { 0 })
-                as libc::c_short;
-            // SAFETY: TUNSETIFF reads/writes the initialized ifreq.
-            cvt(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &mut request) })?;
+            // A fresh device must be ours alone; a race with another creator fails.
+            let fd = attach(&mut request, fresh && i == 0)?;
             // SAFETY: TUNSETOFFLOAD takes an integer bitmask, not a pointer.
             cvt(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETOFFLOAD, 0 as libc::c_ulong) })?;
             let header_len = 10i32;
@@ -114,23 +173,29 @@ impl Tap {
         let control = udp_socket()?;
         // SAFETY: SIOCSIFMTU reads the interface name and integer MTU from ifreq.
         cvt(unsafe { libc::ioctl(control.as_raw_fd(), libc::SIOCSIFMTU as _, &request) })?;
-        let mut address = libc::sockaddr {
-            sa_family: libc::ARPHRD_ETHER,
-            sa_data: [0; 14],
-        };
-        for (dst, &src) in address.sa_data.iter_mut().zip(mac.as_bytes()) {
-            *dst = src as libc::c_char;
+        if let Some(mac) = mac {
+            let mut address = libc::sockaddr {
+                sa_family: libc::ARPHRD_ETHER,
+                sa_data: [0; 14],
+            };
+            for (dst, &src) in address.sa_data.iter_mut().zip(mac.as_bytes()) {
+                *dst = src as libc::c_char;
+            }
+            request.ifr_ifru.ifru_hwaddr = address;
+            // SAFETY: SIOCSIFHWADDR reads an initialized Ethernet sockaddr.
+            cvt(unsafe {
+                libc::ioctl(
+                    tap.queues[0].fd.as_raw_fd(),
+                    libc::SIOCSIFHWADDR as _,
+                    &request,
+                )
+            })?;
         }
-        request.ifr_ifru.ifru_hwaddr = address;
-        // SAFETY: SIOCSIFHWADDR reads an initialized Ethernet sockaddr.
-        cvt(unsafe {
-            libc::ioctl(
-                tap.queues[0].fd.as_raw_fd(),
-                libc::SIOCSIFHWADDR as _,
-                &request,
-            )
-        })?;
         tap.set_carrier(false)?;
+        if fresh {
+            // Last, so a failed creation closes its queues and leaves no device.
+            set_persist(&tap.queues[0].fd, true)?;
+        }
         Ok(tap)
     }
 
@@ -164,8 +229,7 @@ impl Tap {
         &mut self.queues
     }
 
-    /// Gives each queue to its worker. Closing the last queue deletes the
-    /// nonpersistent device, so the caller must keep at least one alive.
+    /// Gives each queue to its worker. The device outlives its queues.
     pub fn into_queues(self) -> Vec<TapQueue> {
         self.queues
     }

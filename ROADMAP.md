@@ -1029,12 +1029,20 @@ full expired batches sharing the cleanup budget.
   through worker/socket failures and shutdown unless removal was explicitly
   requested. Define versioned descriptor adoption and re-exec handover with no
   last-close gap; retain descriptors on failed exec. UDP sockets may be recreated.
-  This remains unfinished: current nonpersistent TAPs disappear on last close.
   Version 1 of the handover format is now defined in design section 11
   (persistent TAPs, an `adopt-version` probe, systemd-style descriptor
   announcement, exec from a private descriptor table). Implement it in this
   order: persistence with an explicit removal command, the library's adoption
-  of supplied queues, then the daemon's restart and re-exec.
+  of supplied queues, then the daemon's restart and re-exec. Persistence is
+  done: TAPs survive shutdown and failed starts, a start reattaches an idle
+  persistent TAP of its name (an rtnetlink query reads the attached-queue
+  count) and `unquic remove-tap` deletes one. Adoption and re-exec remain.
+- Open issue: on Linux 6.8 the routed PMTU test's 1500-byte phase failed in
+  two of four local runs since the three-quantum offload budget, and in none
+  of five before it; Linux 7.0 passed both runs. One lane with little traffic
+  stays confirmed at 9000, because an idle lane learns of a reduction only
+  from a send above the new MTU and the phase allows 15 s. Find what changed
+  how often idle lanes send such a datagram before trusting either result.
 - Support foreign TAP renames during operation and across handover. Test unchanged
   ifindex, MAC, upper devices, bridge membership and forwarding, including reuse
   of the old name by an unrelated device. Never rename back or recreate by name.

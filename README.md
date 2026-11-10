@@ -78,7 +78,7 @@ remains pending.
 
 The first foundation provides `UnquicUuid` parsing and UUIDv4 provisioning,
 duplicate-checked cookie lookup, checked `MacAddress` values, IPv6 receive and
-transmit sockets, and nonpersistent multiqueue TAP ownership. Frame I/O and
+transmit sockets, and persistent multiqueue TAP ownership. Frame I/O and
 cookie lookup allocate no memory. The default build depends only on `libc`;
 `dns` enables exactly `iphost v0.4.4`, without its default Tokio, tracing or serde
 features. Its direct, RA and DHCPv6 resolver modes are available.
@@ -87,9 +87,16 @@ Required device lifetime is stronger than the current implementation: published
 TAPs must survive daemon operation and descriptor-preserving restarts, and may
 be removed only on explicit instruction. UDP sockets may be recreated. External
 TAP renames must be respected without renaming back, recreating the old name or
-changing session identity. Production code must not panic. The current runtime
-still closes nonpersistent TAPs on shutdown and has no descriptor adoption/re-exec
-handover. Library code no longer calls `unwrap`, `expect`, `panic!` or
+changing session identity. Production code must not panic.
+
+TAPs are persistent. Shutdown, a crash or a failed start closes their queues
+but leaves each device, with its MAC, attachments and upper devices, for the
+next start to reattach. A start reattaches a persistent multiqueue TAP of the
+configured name only when no process holds one of its queues, keeping its MAC;
+a device in use or of another kind fails startup with EBUSY. Only
+`unquic remove-tap <name>` (or `tap::remove`) deletes one, once its last queue
+closes. Descriptor adoption and re-exec handover, the rest of handover format
+version 1 in design section 11, are not yet implemented. Library code no longer calls `unwrap`, `expect`, `panic!` or
 `unreachable!`; implicit indexing and arithmetic overflow are not yet audited.
 These are tracked in Stage 4 of [ROADMAP.md](ROADMAP.md).
 
@@ -368,9 +375,9 @@ errors. The library emits no logs.
 
 An idle control handle does not own TAP queues. Keeping it after run returns
 retains configuration, counter storage and wake descriptors, allowing final
-statistics to be read. Drop all handle clones to release that storage. The current
-runtime creates nonpersistent TAPs; descriptor adoption and daemon re-exec
-handover are not implemented.
+statistics to be read. Drop all handle clones to release that storage. The
+runtime creates or reattaches persistent TAPs; descriptor adoption and daemon
+re-exec handover are not implemented.
 
 Readiness means every configured TAP exists. Administrative state remains the
 network manager's responsibility. Receive bindings and missing transmit sockets

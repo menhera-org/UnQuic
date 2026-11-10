@@ -290,8 +290,19 @@ fn foreground_readiness_dns_refresh_forwarding_and_signal_shutdown() {
         });
         left.stop();
         right.stop();
-        // SAFETY: query only; both children have joined and closed their TAP descriptors.
-        assert_eq!(unsafe { libc::if_nametoindex(c"uq-cli-a".as_ptr()) }, 0);
+        // Shutdown is not removal: the TAPs stay until explicitly removed.
+        for name in [c"uq-cli-a", c"uq-cli-b"] {
+            // SAFETY: query only; both children have joined and closed their TAP descriptors.
+            assert_ne!(unsafe { libc::if_nametoindex(name.as_ptr()) }, 0);
+            let removed = Command::new(binary())
+                .arg("remove-tap")
+                .arg(name.to_str().unwrap())
+                .status()
+                .unwrap();
+            assert!(removed.success());
+            // SAFETY: query only.
+            assert_eq!(unsafe { libc::if_nametoindex(name.as_ptr()) }, 0);
+        }
         stop.store(true, Ordering::Relaxed);
         dns.join().unwrap();
     });
@@ -321,16 +332,26 @@ fn start_returns_after_taps_exist_and_reports_failure_before_them() {
     };
     // No peer listens: readiness needs the TAP, not the path.
     let text = config("uq-start", 40300, 40301, "::1", "");
-    assert!(start(&text).success());
-    assert!(present(), "the parent returned before the TAP existed");
-    let pid: i32 = fs::read_to_string(&pid_path)
-        .unwrap()
-        .trim()
-        .parse()
+    for _ in 0..2 {
+        // The second start reattaches the TAP the first left behind.
+        assert!(start(&text).success());
+        assert!(present(), "the parent returned before the TAP existed");
+        let pid: i32 = fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: the PID file names the detached daemon this test started.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        until(|| !pid_path.exists());
+        assert!(present(), "shutdown removed the TAP");
+    }
+    let removed = Command::new(binary())
+        .args(["remove-tap", "uq-start"])
+        .status()
         .unwrap();
-    // SAFETY: the PID file names the detached daemon this test started.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-    until(|| !present() && !pid_path.exists());
+    assert!(removed.success());
+    until(|| !present());
     // Storage over memory_limit fails after the fork and before any TAP exists.
     let failing = format!("[daemon]\nmemory_limit = 4096\n{text}");
     assert_eq!(start(&failing).code(), Some(1));

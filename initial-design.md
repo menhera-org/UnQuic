@@ -553,7 +553,8 @@ handover format before implementing adoption, and retain the original descriptor
 if preparation or exec fails. Preserving TAPs does not itself preserve userspace
 transport state or guarantee uninterrupted forwarding.
 
-**Handover format, version 1 (November 10; defined, not yet implemented).**
+**Handover format, version 1 (November 10; persistence implemented, adoption
+and re-exec not yet).**
 It follows rs-l2tpd's adoption protocol with TAP queues in place of sockets.
 
 - Persistence. Created TAPs are marked persistent (`TUNSETPERSIST`), so closing
@@ -723,7 +724,8 @@ If a comparison already reaches the available underlay ceiling, report that fact
 **Current status:** stage 1 is complete; stage 2 is in progress. Implemented foundations are
 `UnquicUuid` parsing/provisioning, duplicate-checked cookie indexing,
 `MacAddress` validation, IPv6 sockets with separate receive/transmit APIs, and
-nonpersistent multiqueue TAP creation and frame I/O. The version-1 wire codec
+persistent multiqueue TAP creation, reattachment, explicit removal and frame
+I/O. The version-1 wire codec
 validates complete datagrams before dispatch and has fixed byte vectors for all
 eleven record types in tests/vectors/wire-v1. TAP creation accepts an
 optional MAC and leaves administrative state unchanged. Tests cover the public
