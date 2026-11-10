@@ -112,7 +112,9 @@ them by device, so TAPs keep their ifindex, MAC, attachments and upper devices,
 and republishes the PID file once ready. UDP sockets and transport state
 restart. If exec fails, the daemon resumes on the same queues. A container test
 checks the ifindex, MAC, a VLAN upper and the PID across a restart on Linux 6.8
-and 7.0; refused probes and failed execs are not yet tested. Library code no longer calls `unwrap`, `expect`, `panic!` or
+and 7.0, and another checks that a successor answering another adoption
+protocol leaves the daemon running unchanged. A failed exec after a passing
+probe is not tested. Library code no longer calls `unwrap`, `expect`, `panic!` or
 `unreachable!`; implicit indexing and arithmetic overflow are not yet audited.
 These are tracked in Stage 4 of [ROADMAP.md](ROADMAP.md).
 

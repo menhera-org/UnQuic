@@ -381,6 +381,68 @@ fn restart_re_executes_on_the_same_tap_without_a_gap() {
 
 #[test]
 #[ignore = "requires disposable container with tun and network namespace capabilities"]
+fn restart_with_an_incompatible_successor_keeps_the_daemon_running() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // This thread and the daemon it starts use a disposable namespace.
+    check_namespace();
+    let directory = std::env::temp_dir().join(format!("unquic-refuse-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let copy = directory.join("unquic");
+    fs::copy(binary(), &copy).unwrap();
+    let pid_path = directory.join("unquic.pid");
+    let file = ConfigFile::new(&config("uq-refuse", 40500, 40501, "::1", ""));
+    let started = Command::new(&copy)
+        .arg("start")
+        .arg(&file.0)
+        .arg(&pid_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(started.success());
+    let pid: i32 = fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let inode = fs::metadata(&pid_path).unwrap().ino();
+    // The installed binary now answers with another adoption protocol.
+    let script = directory.join("next");
+    fs::write(&script, "#!/bin/sh\necho unquic-adopt 2\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&script, &copy).unwrap();
+    let signalled = Command::new(binary())
+        .arg("restart")
+        .arg(&pid_path)
+        .status()
+        .unwrap();
+    assert!(signalled.success());
+    thread::sleep(Duration::from_millis(500));
+    let environ = fs::read(format!("/proc/{pid}/environ")).unwrap();
+    assert!(
+        !environ
+            .split(|&b| b == 0)
+            .any(|entry| entry.starts_with(b"UNQUIC_REEXEC="))
+    );
+    assert_eq!(fs::metadata(&pid_path).unwrap().ino(), inode);
+    // SAFETY: the PID file names the daemon this test started, still running.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    until(|| !pid_path.exists());
+    let removed = Command::new(binary())
+        .args(["remove-tap", "uq-refuse"])
+        .status()
+        .unwrap();
+    assert!(removed.success());
+    let _ = fs::remove_dir_all(&directory);
+}
+
+fn check_namespace() {
+    // SAFETY: unshare changes only this test thread's network namespace.
+    common::check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+}
+
+#[test]
+#[ignore = "requires disposable container with tun and network namespace capabilities"]
 fn start_returns_after_taps_exist_and_reports_failure_before_them() {
     use common::*;
     // SAFETY: this thread and the daemons it starts use a disposable namespace.

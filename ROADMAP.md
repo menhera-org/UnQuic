@@ -164,8 +164,8 @@ rules apply to all of them.
    ([BENCH.md](BENCH.md#three-quantum-offload-budget-november-10)). The
    busiest left worker is near a full core while two others idle, so lane
    placement and per-frame cost bound it next.
-6. **Stage 4**, as listed in its section: tests for a refused restart probe
-   and a failed exec, the rest of the panic audit (explicit
+6. **Stage 4**, as listed in its section: a test for a failed restart exec
+   after a passing probe, the rest of the panic audit (explicit
    `unwrap`/`expect`/`panic!` sites are gone; implicit indexing and overflow
    remain), OVS in the composition matrix, resource stress, and the remaining
    V03 lifecycle cases. TAP persistence and descriptor handover, double-fork
@@ -1043,7 +1043,8 @@ full expired batches sharing the cleanup budget.
   restart is done: `unquic restart` signals SIGUSR2, the daemon probes the
   binary, hands its queues over through a re-exec and the new image adopts
   them; a container test shows the TAP, its MAC and a VLAN upper surviving on
-  both kernels. Still untested: a refused probe and a failed exec.
+  both kernels, and a refused probe leaves the daemon running. Still untested:
+  a failed exec after a passing probe.
 - Resolved: the routed PMTU test's 1500-byte phase failed in three of five
   local runs on Linux 6.8. The group controller took its maximum datagram
   from whichever lane sent last, so once the busy lane fell to 1500 the send
