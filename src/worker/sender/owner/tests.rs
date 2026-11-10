@@ -128,6 +128,27 @@ fn first_ack_uses_controller_creation_time_at_any_uptime() {
 }
 
 #[test]
+fn the_group_datagram_fits_every_lane_not_only_the_last_sender() {
+    let mut owner = owner(1, 2, &[(0, 1, 0), (0, 2, 0)]);
+    owner.timers.install(0, 1).unwrap();
+    let mut send = |number, mtu, micros| {
+        owner
+            .sent(Sent {
+                mtu,
+                ..sent(lane(number), 1, Duration::from_micros(micros))
+            })
+            .unwrap();
+        owner.groups[0].controller.limits().max_datagram
+    };
+    assert_eq!(send(1, 9000, 1), 9000);
+    assert_eq!(send(2, 9000, 2), 9000);
+    // Lane 1 learns a 1500-byte path; lane 2 still sends 9000-byte datagrams,
+    // so the quantum must keep fitting them or its probes are refused forever.
+    assert_eq!(send(1, 1548, 3), 9000);
+    assert_eq!(send(2, 1548, 4), 1548);
+}
+
+#[test]
 fn acks_report_the_newest_record_across_chunks_and_exclude_other_reports() {
     let mut owner = owner(1, 2, &[(0, 1, 0), (0, 2, 0)]);
     owner.timers.install(0, 1).unwrap();

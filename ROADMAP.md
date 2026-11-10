@@ -1044,12 +1044,13 @@ full expired batches sharing the cleanup budget.
   binary, hands its queues over through a re-exec and the new image adopts
   them; a container test shows the TAP, its MAC and a VLAN upper surviving on
   both kernels. Still untested: a refused probe and a failed exec.
-- Open issue: on Linux 6.8 the routed PMTU test's 1500-byte phase failed in
-  two of four local runs since the three-quantum offload budget, and in none
-  of five before it; Linux 7.0 passed both runs. One lane with little traffic
-  stays confirmed at 9000, because an idle lane learns of a reduction only
-  from a send above the new MTU and the phase allows 15 s. Find what changed
-  how often idle lanes send such a datagram before trusting either result.
+- Resolved: the routed PMTU test's 1500-byte phase failed in three of five
+  local runs on Linux 6.8. The group controller took its maximum datagram
+  from whichever lane sent last, so once the busy lane fell to 1500 the send
+  quantum could shrink below the idle lane's 9000-byte confirmation probe,
+  which was then abandoned on every attempt and never drew a Packet Too Big.
+  The controller now uses the largest datagram any lane of the group sends;
+  four local and two remote runs have passed since.
 - Support foreign TAP renames during operation and across handover. Test unchanged
   ifindex, MAC, upper devices, bridge membership and forwarding, including reuse
   of the old name by an unrelated device. Never rename back or recreate by name.

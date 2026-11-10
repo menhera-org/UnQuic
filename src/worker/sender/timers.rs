@@ -21,6 +21,8 @@ struct Lane {
     outstanding: u32,
     latest: Duration,
     position: usize,
+    // Outer size of this lane's latest datagram; zero before its first send.
+    datagram: u16,
 }
 
 pub(super) struct Timers {
@@ -65,6 +67,7 @@ impl Timers {
                 outstanding: 0,
                 latest: Duration::ZERO,
                 position: ABSENT,
+                datagram: 0,
             });
         }
         let mut heaps = Vec::new();
@@ -246,6 +249,33 @@ impl Timers {
             self.down(group, position);
         }
         Ok(())
+    }
+
+    /// Records a lane's datagram size. When it changes, returns the largest
+    /// size any lane of the group currently uses: the controller's maximum
+    /// datagram must fit every lane, not only the one that sent last.
+    pub(super) fn datagram(
+        &mut self,
+        session: usize,
+        lane: u16,
+        generation: u64,
+        size: u16,
+    ) -> io::Result<Option<u16>> {
+        let index = self
+            .index(session, lane, generation)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        if self.lanes[index].datagram == size {
+            return Ok(None);
+        }
+        self.lanes[index].datagram = size;
+        let group = self.lanes[index].group;
+        // Sizes change only with path MTU, so this scan is rare.
+        Ok(self
+            .lanes
+            .iter()
+            .filter(|lane| lane.group == group)
+            .map(|lane| lane.datagram)
+            .max())
     }
 
     /// Outstanding eliciting transmissions on one installed lane.

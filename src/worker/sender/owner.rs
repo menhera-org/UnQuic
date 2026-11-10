@@ -202,10 +202,15 @@ impl Owner {
             sent.count,
             sent.at,
         )?;
-        state
-            .controller
-            .set_max_datagram(sent.mtu)
-            .map_err(io::Error::other)?;
+        if let Some(largest) =
+            self.timers
+                .datagram(sent.id.session, sent.id.lane, sent.id.generation, sent.mtu)?
+        {
+            state
+                .controller
+                .set_max_datagram(largest)
+                .map_err(io::Error::other)?;
+        }
         if sent.restart {
             let budget = self
                 .budgets
