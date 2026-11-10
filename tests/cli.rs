@@ -436,6 +436,94 @@ fn restart_with_an_incompatible_successor_keeps_the_daemon_running() {
     let _ = fs::remove_dir_all(&directory);
 }
 
+#[test]
+#[ignore = "requires disposable container with tun and network namespace capabilities"]
+fn restart_whose_exec_fails_after_a_passing_probe_resumes_on_the_same_queues() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // This thread and the daemon it starts use a disposable namespace.
+    check_namespace();
+    let net = UdpSocket::bind("[::]:0").unwrap();
+    let directory = std::env::temp_dir().join(format!("unquic-noexec-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let copy = directory.join("unquic");
+    let install = |text: Option<&str>| {
+        let next = directory.join("next");
+        match text {
+            Some(text) => fs::write(&next, text).unwrap(),
+            None => drop(fs::copy(binary(), &next).unwrap()),
+        }
+        fs::set_permissions(&next, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&next, &copy).unwrap();
+    };
+    install(None);
+    let (pid_path, log) = (directory.join("unquic.pid"), directory.join("stderr"));
+    let file = ConfigFile::new(&config("uq-noexec", 40600, 40601, "::1", ""));
+    let started = Command::new(&copy)
+        .arg("start")
+        .arg(&file.0)
+        .arg(&pid_path)
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&log).unwrap())
+        .status()
+        .unwrap();
+    assert!(started.success());
+    let pid: i32 = fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    common::add_vlan(&net, c"uq-noexec", 7);
+    let index = |name: &std::ffi::CStr| {
+        // SAFETY: the name is NUL-terminated; the call only queries this namespace.
+        unsafe { libc::if_nametoindex(name.as_ptr()) }
+    };
+    let devices = (index(c"uq-noexec"), index(c"uq-noexec.7"));
+    assert!(devices.0 != 0 && devices.1 != 0);
+    let inode = || fs::metadata(&pid_path).map(|m| m.ino()).ok();
+    let published = inode();
+    let logged = |line: &str| fs::read_to_string(&log).map_or(0, |text| text.matches(line).count());
+    let reexec = format!("UNQUIC_REEXEC=1:{pid}");
+    let reexecuted = || {
+        fs::read(format!("/proc/{pid}/environ")).is_ok_and(|bytes| {
+            bytes
+                .split(|&b| b == 0)
+                .any(|entry| entry == reexec.as_bytes())
+        })
+    };
+    let restart = || {
+        let signalled = Command::new(binary())
+            .arg("restart")
+            .arg(&pid_path)
+            .status()
+            .unwrap();
+        assert!(signalled.success());
+    };
+    // The successor passes the probe, then vanishes, so the exec itself fails.
+    install(Some("#!/bin/sh\nrm -f \"$0\"\necho unquic-adopt 1\n"));
+    restart();
+    until(|| logged("re-exec failed") == 1);
+    assert!(!copy.exists() && !reexecuted());
+    // The daemon runs again on the queues it kept; the upper device never lost its lower.
+    until(|| logged("TAPs ready") == 2);
+    assert_eq!(inode(), published);
+    assert_eq!((index(c"uq-noexec"), index(c"uq-noexec.7")), devices);
+    // A later restart hands those same queues to a real successor.
+    install(None);
+    restart();
+    until(reexecuted);
+    until(|| inode().is_some_and(|now| Some(now) != published));
+    assert_eq!((index(c"uq-noexec"), index(c"uq-noexec.7")), devices);
+    // SAFETY: the PID file names the daemon this test started.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    until(|| !pid_path.exists());
+    let removed = Command::new(binary())
+        .args(["remove-tap", "uq-noexec"])
+        .status()
+        .unwrap();
+    assert!(removed.success());
+    let _ = fs::remove_dir_all(&directory);
+}
+
 fn check_namespace() {
     // SAFETY: unshare changes only this test thread's network namespace.
     common::check(unsafe { libc::unshare(libc::CLONE_NEWNET) });

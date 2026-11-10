@@ -113,8 +113,10 @@ and republishes the PID file once ready. UDP sockets and transport state
 restart. If exec fails, the daemon resumes on the same queues. A container test
 checks the ifindex, MAC, a VLAN upper and the PID across a restart on Linux 6.8
 and 7.0, and another checks that a successor answering another adoption
-protocol leaves the daemon running unchanged. A failed exec after a passing
-probe is not tested. Library code no longer calls `unwrap`, `expect`, `panic!` or
+protocol leaves the daemon running unchanged. A third removes the binary after
+it passes the probe: the exec fails, the daemon resumes on the queues it kept
+without losing the VLAN upper, and a later restart hands those queues to a real
+successor. Library code no longer calls `unwrap`, `expect`, `panic!` or
 `unreachable!`; implicit indexing and arithmetic overflow are not yet audited.
 These are tracked in Stage 4 of [ROADMAP.md](ROADMAP.md).
 

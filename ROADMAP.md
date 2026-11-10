@@ -24,9 +24,10 @@ Stage 3's remaining work items are done: a netem loss-and-reordering container
 check and the loss sweep, which shows draft 07 collapsing at 5% loss. Stage 4
 gained double-fork readiness, the systemd unit template, VRF and Ethernet
 composition tests, and the removal of every explicit panic call from library
-code. Next, in the order below: stage 4's TAP lifetime and descriptor
-handover, resource stress, the remaining V03 lifecycle cases and implicit
-panics; then stage 5's candidates, led by single-flow striping and lane
+code. TAP persistence, descriptor handover across re-exec (including a failed
+exec) and the overload and memory-ceiling stress tests followed. Next, in the
+order below: stage 4's remaining V03 lifecycle cases and implicit panics; then
+stage 5's candidates, led by single-flow striping and lane
 placement, which bound both the single-flow target and the local gate.
 
 On the single-flow target, draft 07's short-term bounds were the first limit.
@@ -164,11 +165,11 @@ rules apply to all of them.
    ([BENCH.md](BENCH.md#three-quantum-offload-budget-november-10)). The
    busiest left worker is near a full core while two others idle, so lane
    placement and per-frame cost bound it next.
-6. **Stage 4**, as listed in its section: a test for a failed restart exec
-   after a passing probe, the rest of the panic audit (explicit
+6. **Stage 4**, as listed in its section: the rest of the panic audit (explicit
    `unwrap`/`expect`/`panic!` sites are gone; implicit indexing and overflow
    remain), OVS in the composition matrix, resource stress, and the remaining
-   V03 lifecycle cases. TAP persistence and descriptor handover, double-fork
+   V03 lifecycle cases. TAP persistence and descriptor handover, including a
+   failed exec after a passing probe, double-fork
    readiness, the systemd unit and the VRF and composition tests are done.
 7. **Stage 5:** profile what remains and try its candidates behind switches.
 
@@ -1043,8 +1044,11 @@ full expired batches sharing the cleanup budget.
   restart is done: `unquic restart` signals SIGUSR2, the daemon probes the
   binary, hands its queues over through a re-exec and the new image adopts
   them; a container test shows the TAP, its MAC and a VLAN upper surviving on
-  both kernels, and a refused probe leaves the daemon running. Still untested:
-  a failed exec after a passing probe.
+  both kernels, and a refused probe leaves the daemon running. A failed exec
+  after a passing probe is tested too: a successor script that deletes itself
+  once probed makes the exec fail, the daemon resumes on the kept queues with
+  its VLAN upper intact, and a later restart hands them to a real successor
+  (Linux 6.8 and 7.0).
 - Resolved: the routed PMTU test's 1500-byte phase failed in three of five
   local runs on Linux 6.8. The group controller took its maximum datagram
   from whichever lane sent last, so once the busy lane fell to 1500 the send
