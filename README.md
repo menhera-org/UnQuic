@@ -73,8 +73,9 @@ TAPs must survive daemon operation and descriptor-preserving restarts, and may
 be removed only on explicit instruction. UDP sockets may be recreated. External
 TAP renames must be respected without renaming back, recreating the old name or
 changing session identity. Production code must not panic. The current runtime
-still closes nonpersistent TAPs on shutdown, has no descriptor adoption/re-exec
-handover, and has not completed the panic-path audit.
+still closes nonpersistent TAPs on shutdown and has no descriptor adoption/re-exec
+handover. Library code no longer calls `unwrap`, `expect`, `panic!` or
+`unreachable!`; implicit indexing and arithmetic overflow are not yet audited.
 These are tracked in Stage 4 of [ROADMAP.md](ROADMAP.md).
 
 Open TAP descriptors already support foreign renames and network-namespace moves

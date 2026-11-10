@@ -342,7 +342,7 @@ impl Lane {
         Some(Record::Ack {
             lane: self.id,
             delay_us,
-            ranges: AckRanges::new(&output[..count]).unwrap(),
+            ranges: AckRanges::new(&output[..count]).ok()?,
         })
     }
 
@@ -473,7 +473,11 @@ impl Lane {
                         Some(slot) => slot,
                         None if pressure => continue,
                         None => {
-                            let slot = usize::from(self.free.pop().expect("preflight reservation"));
+                            // The preflight reserved a slot; drop the piece as under pressure if not.
+                            let Some(slot) = self.free.pop() else {
+                                continue;
+                            };
+                            let slot = usize::from(slot);
                             self.frames[slot].start(sequence, total_len as u16, now);
                             self.retained_bytes += total_len as usize;
                             self.insert(slot);

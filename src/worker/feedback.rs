@@ -184,13 +184,21 @@ impl Worker {
         Ok(())
     }
 
-    fn control_due(&self, session: usize, now: Duration) -> Duration {
-        let peer = self.shared.config.peer_for_session(session).unwrap();
-        let group = self.shared.config.path_group_for_peer(peer).unwrap();
-        self.control_budgets[group]
+    fn control_due(&self, session: usize, now: Duration) -> io::Result<Duration> {
+        let peer = self
+            .shared
+            .config
+            .peer_for_session(session)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        let group = self
+            .shared
+            .config
+            .path_group_for_peer(peer)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        Ok(self.control_budgets[group]
             .deadline()
             .unwrap_or(now)
-            .max(now)
+            .max(now))
     }
 
     pub(super) fn flush_control(&mut self, now: Duration) -> io::Result<()> {
@@ -210,7 +218,11 @@ impl Worker {
             }
             match job {
                 Pending::Handshake(session) => {
-                    let peer = self.shared.config.peer_for_session(session).unwrap();
+                    let peer = self
+                        .shared
+                        .config
+                        .peer_for_session(session)
+                        .ok_or(io::ErrorKind::InvalidInput)?;
                     if self.shared.peer_bound(peer) && !self.controls[session].barrier.is_active() {
                         self.flush_handshake(session, now)?;
                     } else {
@@ -231,7 +243,7 @@ impl Worker {
                     ..
                 } => {
                     if self.matches(session, tag) {
-                        let due = self.control_due(session, now);
+                        let due = self.control_due(session, now)?;
                         if due > now {
                             self.pending_control.push_back(Pending::Reply {
                                 session,
@@ -262,7 +274,7 @@ impl Worker {
                             .load(Ordering::Acquire)
                             == feedback.origin as u8 + 1
                     {
-                        let due = self.control_due(feedback.session, now);
+                        let due = self.control_due(feedback.session, now)?;
                         if due > now {
                             feedback.due = due;
                             self.pending_control.push_back(Pending::Ack(feedback));
@@ -289,7 +301,7 @@ impl Worker {
                             totals.ack_send_deferred = totals.ack_send_deferred.wrapping_add(1);
                             // take_ack consumed the schedule; retain its snapshot until submitted.
                             feedback.due = self
-                                .control_due(feedback.session, now)
+                                .control_due(feedback.session, now)?
                                 .max(now.saturating_add(RETRY));
                             self.pending_control.push_back(Pending::Ack(feedback));
                             continue;

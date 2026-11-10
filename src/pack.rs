@@ -472,7 +472,7 @@ impl Batch {
         }
         output[0] = &plan.header;
         let mut used = 1;
-        for (index, (frame, range)) in self.pieces(packet).unwrap().enumerate() {
+        for (index, (frame, range)) in self.pieces(packet).ok_or(PackError::Frame)?.enumerate() {
             let frame = frames.get(frame).ok_or(PackError::Frame)?;
             let split = frame.header.len();
             let header = frame

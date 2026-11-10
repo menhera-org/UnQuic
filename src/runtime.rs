@@ -256,7 +256,9 @@ impl Shared {
     }
 
     pub fn peer_bound(&self, peer: usize) -> bool {
-        let endpoint = self.config.endpoint_for_peer(peer).unwrap();
+        let Some(endpoint) = self.config.endpoint_for_peer(peer) else {
+            return false;
+        };
         self.bound[endpoint].load(Ordering::Acquire) == u64::MAX >> (64 - self.workers())
     }
 
@@ -329,12 +331,14 @@ pub fn run(config: Config, control: Control) -> io::Result<()> {
     crate::trace::init(count);
     let transmit_counters = (0..sessions)
         .map(|session| {
-            let peer = config.peer_for_session(session).unwrap();
-            (0..config.config().peers[peer].tx_lanes)
+            let peer = config
+                .peer_for_session(session)
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            Ok((0..config.config().peers[peer].tx_lanes)
                 .map(|_| LaneCounters::new())
-                .collect()
+                .collect())
         })
-        .collect();
+        .collect::<io::Result<_>>()?;
     let shared = Arc::new(Shared {
         config,
         wakes,

@@ -784,13 +784,20 @@ impl Worker {
         let mut sessions = Vec::with_capacity(config.sessions.len());
         let mut controls = Vec::with_capacity(if id == 0 { config.sessions.len() } else { 0 });
         for (index, session) in config.sessions.iter().enumerate() {
-            let peer = shared.config.peer_for_session(index).unwrap();
-            let endpoint = shared.config.endpoint_for_peer(peer).unwrap();
+            let peer = shared
+                .config
+                .peer_for_session(index)
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            let endpoint = shared
+                .config
+                .endpoint_for_peer(peer)
+                .ok_or(io::ErrorKind::InvalidInput)?;
             let mut free = Vec::with_capacity(if id == 0 { LANES } else { 0 });
             if id == 0 {
                 for _ in 0..LANES {
                     free.push(Box::new(
-                        reassembly::Lane::new(1, MAX_FRAME_LEN as u16).unwrap(),
+                        reassembly::Lane::new(1, MAX_FRAME_LEN as u16)
+                            .map_err(|_| io::ErrorKind::InvalidInput)?,
                     ));
                 }
                 controls.push(SessionControl {
@@ -805,7 +812,7 @@ impl Worker {
                         session.inner_mtu + 22,
                     )
                     .map_err(|_| io::ErrorKind::InvalidInput)?,
-                    barrier: Barrier::new(count).unwrap(),
+                    barrier: Barrier::new(count).map_err(|_| io::ErrorKind::InvalidInput)?,
                     effects: Effects::default(),
                     carrier: false,
                     retry: Duration::ZERO,
@@ -925,25 +932,35 @@ impl Worker {
             transmit: config
                 .peers
                 .iter()
-                .map(|peer| PeerPaths {
-                    paths: std::array::from_fn(|slot| Path {
-                        address: if slot == 0 { peer.socket_addr() } else { None },
-                        probe_session: None,
-                        lanes: (0..peer.tx_lanes)
-                            .map(|_| Tx {
-                                socket: None,
-                                blocked: false,
-                                mtu: pmtu::Path::new(peer.outer_payload_limit, Duration::ZERO)
-                                    .unwrap(),
-                                failed_payload: 0,
-                            })
-                            .collect(),
-                    }),
-                    generation: 0,
-                    preparing: None,
-                    totals: Snapshot::default(),
+                .map(|peer| {
+                    let [first, second] = std::array::from_fn(|slot| -> io::Result<Path> {
+                        Ok(Path {
+                            address: if slot == 0 { peer.socket_addr() } else { None },
+                            probe_session: None,
+                            lanes: (0..peer.tx_lanes)
+                                .map(|_| {
+                                    Ok(Tx {
+                                        socket: None,
+                                        blocked: false,
+                                        mtu: pmtu::Path::new(
+                                            peer.outer_payload_limit,
+                                            Duration::ZERO,
+                                        )
+                                        .ok_or(io::ErrorKind::InvalidInput)?,
+                                        failed_payload: 0,
+                                    })
+                                })
+                                .collect::<io::Result<_>>()?,
+                        })
+                    });
+                    Ok(PeerPaths {
+                        paths: [first?, second?],
+                        generation: 0,
+                        preparing: None,
+                        totals: Snapshot::default(),
+                    })
                 })
-                .collect(),
+                .collect::<io::Result<_>>()?,
             mtu_jobs,
             mtu_cursor: 0,
             mtu_start: 0,
@@ -1057,9 +1074,10 @@ impl Worker {
             more |= self.flush_sender_messages(now)?;
             self.flush_notifications()?;
             more |= self.ready.iter().copied().any(|(session, lane)| {
-                let tx = &self.transmit[self.shared.config.peer_for_session(session).unwrap()]
-                    .paths[self.sessions[session].path]
-                    .lanes[lane];
+                let Some(peer) = self.shared.config.peer_for_session(session) else {
+                    return false;
+                };
+                let tx = &self.transmit[peer].paths[self.sessions[session].path].lanes[lane];
                 let batch = self.sessions[session].batches[lane].as_ref();
                 batch.is_some_and(|batch| batch.len == 0 && batch.pending.is_empty())
                     || (!tx.blocked
@@ -1114,8 +1132,9 @@ impl Worker {
                         let lane = token as usize & 63;
                         let tx = &mut self.transmit[peer].paths[path].lanes[lane];
                         if tx.blocked && event.events & libc::EPOLLOUT as u32 != 0 {
-                            self.reactor
-                                .modify(tx.socket.as_ref().unwrap().as_fd(), token, 0)?;
+                            if let Some(socket) = &tx.socket {
+                                self.reactor.modify(socket.as_fd(), token, 0)?;
+                            }
                             tx.blocked = false;
                         }
                         if event.events & libc::EPOLLERR as u32 != 0 {
@@ -1175,20 +1194,25 @@ impl Worker {
 
     fn install_rx_counters(&mut self, session: usize, slot: usize) {
         let local = &mut self.sessions[session];
-        let lane = local.rx[slot].as_ref().unwrap().id();
+        let (Some(lane), Some(installed)) = (local.rx[slot].as_ref(), local.installed) else {
+            return;
+        };
+        let lane = lane.id();
         local.rx_totals[slot] = Snapshot::default();
         local.rx_dirty &= !(1_u64 << slot);
         let index = (session * self.shared.workers() + self.id) * LANES + slot;
         self.shared.receive_counters[index].replace(
             lane,
-            local.installed.unwrap().generation,
+            installed.generation,
             &local.rx_totals[slot],
         );
     }
 
     fn refresh_rx_counters(&mut self, session: usize, slot: usize) {
         let local = &mut self.sessions[session];
-        let lane = local.rx[slot].as_ref().unwrap();
+        let Some(lane) = local.rx[slot].as_ref() else {
+            return;
+        };
         let totals = &mut local.rx_totals[slot];
         let expired = lane.expired_frames().wrapping_sub(totals.expired_frames);
         let incomplete = lane
@@ -1228,13 +1252,13 @@ impl Worker {
 
     fn push(&mut self, worker: usize, event: Event) -> Result<(), Event> {
         debug_assert_ne!(worker, self.id);
-        self.outgoing[worker]
-            .as_mut()
-            .unwrap()
-            .try_push(event)
-            .map(|()| {
-                self.notifications |= 1_u64 << worker;
-            })
+        // A missing queue reads as a full one; the caller keeps the event.
+        let Some(outgoing) = self.outgoing[worker].as_mut() else {
+            return Err(event);
+        };
+        outgoing.try_push(event).map(|()| {
+            self.notifications |= 1_u64 << worker;
+        })
     }
 
     fn release(&mut self, mut buffer: Box<Buffer>) {
@@ -1320,7 +1344,7 @@ impl Worker {
                 self.shared.config.config().peers[change.request.peer].outer_payload_limit,
                 Duration::ZERO,
             )
-            .unwrap();
+            .ok_or(io::ErrorKind::InvalidInput)?;
         }
         path.probe_session = None;
         path.address = Some(change.request.address);
@@ -1383,7 +1407,10 @@ impl Worker {
                 };
                 for session in 0..self.controls.len() {
                     if self.shared.config.peer_for_session(session) == Some(peer) {
-                        self.controls[session].state.cancel_pending(now).unwrap();
+                        self.controls[session]
+                            .state
+                            .cancel_pending(now)
+                            .map_err(io::Error::other)?;
                         self.controls[session].pending_send = None;
                         self.controls[session].handshake_path = self.sessions[session].path;
                         self.controls[session].retry = now + Duration::from_millis(100);
@@ -1425,12 +1452,15 @@ impl Worker {
                         continue;
                     }
                     self.controls[session].handshake_path = change.path;
-                    let mut effects = self.controls[session].state.reconnect(now, None).unwrap();
+                    let mut effects = self.controls[session]
+                        .state
+                        .reconnect(now, None)
+                        .map_err(io::Error::other)?;
                     if effects.needs_tag {
                         effects = self.controls[session]
                             .state
                             .reconnect(now, Tag::generate()?)
-                            .unwrap();
+                            .map_err(io::Error::other)?;
                     }
                     self.effects(session, effects, now)?;
                 }
@@ -1504,16 +1534,14 @@ impl Worker {
                 if failed {
                     continue; // Dropping every member makes a bind retry start a fresh group.
                 }
-                if group[0]
-                    .as_ref()
-                    .unwrap()
-                    .steer_group(shared.workers())
-                    .is_err()
-                {
+                let Some(first) = group[0].take() else {
+                    continue;
+                };
+                if first.steer_group(shared.workers()).is_err() {
                     // Kernel steering is optional; protocol ownership still routes every packet.
                     self.counters.socket_errors += 1;
                 }
-                self.install_receiver(index, group[0].take().unwrap())?;
+                self.install_receiver(index, first)?;
                 for (owner, socket) in group.into_iter().enumerate().skip(1) {
                     if let Some(socket) = socket {
                         self.pending_receive.push_back((owner, index, socket));
@@ -1522,7 +1550,11 @@ impl Worker {
             }
         }
         for index in 0..config.peers.len() {
-            let endpoint = self.shared.config.endpoint_for_peer(index).unwrap();
+            let endpoint = self
+                .shared
+                .config
+                .endpoint_for_peer(index)
+                .ok_or(io::ErrorKind::InvalidInput)?;
             let Some(receiver) = &self.receive[endpoint] else {
                 continue;
             };
@@ -1623,14 +1655,14 @@ impl Worker {
                                 .rx
                                 .iter()
                                 .position(Option::is_none)
-                                .unwrap();
+                                .ok_or(io::ErrorKind::InvalidData)?;
                             self.sessions[session].rx_index[usize::from(id)] = slot as u8 + 1;
                             self.sessions[session].rx[slot] = Some(lane);
                             self.install_rx_counters(session, slot);
                             // Direct receives queued during registration must not overtake its first packet.
                             self.received.push_front(buffer);
                         } else {
-                            self.return_lane(session, lane);
+                            self.return_lane(session, lane)?;
                             if buffer.advance() {
                                 self.received.push_back(buffer);
                             } else {
@@ -1716,7 +1748,7 @@ impl Worker {
             if index >= available {
                 return None;
             }
-            let mut buffer = self.free.pop().unwrap();
+            let mut buffer = self.free.pop()?;
             buffer.rx_reserved = true;
             self.rx_retained += 1;
             Some(buffer)
@@ -1727,13 +1759,13 @@ impl Worker {
         }
         let mut received: [ReceiveDatagram<'_>; RECEIVE_BUFFERS] =
             std::array::from_fn(|_| ReceiveDatagram::new(&mut []));
-        for (output, buffer) in received.iter_mut().zip(&mut buffers).take(available) {
-            output.buffer = &mut buffer.as_mut().unwrap().bytes;
+        for (output, buffer) in received.iter_mut().zip(buffers.iter_mut().flatten()) {
+            output.buffer = &mut buffer.bytes;
         }
-        let result = self.receive[endpoint]
-            .as_ref()
-            .unwrap()
-            .recv_batch(&mut received[..available]);
+        // Without a socket nothing is received, and every reserved buffer is released below.
+        let result = self.receive[endpoint].as_ref().map_or(Ok(0), |socket| {
+            socket.recv_batch(&mut received[..available])
+        });
         let received_at = if result.as_ref().is_ok_and(|&count| count != 0) {
             clock()?
         } else {
@@ -1754,7 +1786,9 @@ impl Worker {
             }
         };
         for (index, buffer) in buffers.iter_mut().enumerate().take(available) {
-            let mut buffer = buffer.take().unwrap();
+            let Some(mut buffer) = buffer.take() else {
+                continue;
+            };
             if index < count
                 && let Some(total) = overflows[index]
             {
@@ -1851,9 +1885,16 @@ impl Worker {
                 }
                 return Ok(None);
             }
-            let peer = self.shared.config.peer_for_session(session).unwrap();
+            let peer = self
+                .shared
+                .config
+                .peer_for_session(session)
+                .ok_or(io::ErrorKind::InvalidInput)?;
             if !self.controls[session].barrier.is_active() && self.shared.peer_bound(peer) {
-                let record = datagram.records().next().unwrap();
+                let record = datagram
+                    .records()
+                    .next()
+                    .ok_or(io::ErrorKind::InvalidData)?;
                 if self.peer_controls[peer].change.is_some()
                     && !active_flight(self.sessions[session].connection, record)
                 {
@@ -1893,12 +1934,13 @@ impl Worker {
                     self.sessions[session].totals.queue_drops.wrapping_add(1);
                 return Ok(Some(buffer));
             };
-            lane.reset(
-                header.lane,
-                self.sessions[session].connection.unwrap().max_frame_len,
-            )
-            .unwrap();
-            let cookie_low = u32::from_be_bytes(header.cookie.as_bytes()[12..].try_into().unwrap());
+            let connection = self.sessions[session]
+                .connection
+                .ok_or(io::ErrorKind::InvalidData)?;
+            lane.reset(header.lane, connection.max_frame_len)
+                .map_err(io::Error::other)?;
+            let [.., a, b, c, d] = *header.cookie.as_bytes();
+            let cookie_low = u32::from_be_bytes([a, b, c, d]);
             let owner = cookie_low.wrapping_add(u32::from(header.lane) - 1) as usize
                 % self.shared.config.config().sessions[session].queue_count;
             // Publication may precede installation; an early packet is dropped without ACK.
@@ -1918,7 +1960,7 @@ impl Worker {
                 .rx
                 .iter()
                 .position(Option::is_none)
-                .unwrap();
+                .ok_or(io::ErrorKind::InvalidData)?;
             self.sessions[session].rx_index[lane_id] = slot as u8 + 1;
             self.sessions[session].rx[slot] = Some(lane);
             self.install_rx_counters(session, slot);
@@ -1941,20 +1983,15 @@ impl Worker {
             .rx_outer_bytes
             .wrapping_add((length + 48) as u64);
         local.rx_dirty |= 1_u64 << slot;
-        let mut admission = local.rx[slot].as_mut().unwrap().admit(&datagram, now);
+        let lane = local.rx[slot].as_mut().ok_or(io::ErrorKind::InvalidData)?;
+        let mut admission = lane.admit(&datagram, now);
         if admission == Admission::Pressure {
-            let retained = local.rx[slot].as_ref().unwrap().retained_frames();
+            let retained = lane.retained_frames();
             self.flush_rx(session, slot, now);
-            if self.sessions[session].rx[slot]
-                .as_ref()
-                .unwrap()
-                .retained_frames()
-                < retained
+            if let Some(lane) = self.sessions[session].rx[slot].as_mut()
+                && lane.retained_frames() < retained
             {
-                admission = self.sessions[session].rx[slot]
-                    .as_mut()
-                    .unwrap()
-                    .admit(&datagram, now);
+                admission = lane.admit(&datagram, now);
             }
         }
         match admission {
@@ -2072,9 +2109,7 @@ impl Worker {
         }
         if self.sessions[session].rx[slot]
             .as_ref()
-            .unwrap()
-            .ready_count()
-            >= 32
+            .is_some_and(|lane| lane.ready_count() >= 32)
         {
             self.flush_rx(session, slot, now);
         }
@@ -2104,7 +2139,7 @@ impl Worker {
         let checksums = self.sessions[session]
             .tap
             .as_ref()
-            .unwrap()
+            .ok_or(io::ErrorKind::InvalidData)?
             .completed_checksums;
         if self.tap_reader.as_ref().is_some_and(|r| r.enabled) {
             let count = self.sessions[session]
@@ -2116,14 +2151,15 @@ impl Worker {
             let mut buffers: [Option<Box<Buffer>>; BATCH_SIZE] =
                 std::array::from_fn(|i| if i < count { self.free.pop() } else { None });
             let mut slices: [&mut [u8]; BATCH_SIZE] = std::array::from_fn(|_| &mut [][..]);
-            for (slice, buffer) in slices.iter_mut().zip(&mut buffers).take(count) {
-                *slice = &mut buffer.as_mut().unwrap().bytes;
+            for (slice, buffer) in slices.iter_mut().zip(buffers.iter_mut().flatten()) {
+                *slice = &mut buffer.bytes;
             }
-            let reader = self.tap_reader.as_mut().unwrap();
-            let batch = reader.read(
-                self.sessions[session].tap.as_mut().unwrap(),
-                &mut slices[..count],
-            );
+            let reader = self.tap_reader.as_mut().ok_or(io::ErrorKind::InvalidData)?;
+            let tap = self.sessions[session]
+                .tap
+                .as_mut()
+                .ok_or(io::ErrorKind::InvalidData)?;
+            let batch = reader.read(tap, &mut slices[..count]);
             let frames = batch.results[..count].iter().filter(|r| r.is_ok()).count() as u64;
             let limit = &mut self.sessions[session].tap_read_limit;
             // A full read limited by pool availability says nothing about TAP occupancy.
@@ -2152,7 +2188,9 @@ impl Worker {
                 .zip(batch.segments)
                 .take(count)
             {
-                let mut buffer = buffer.unwrap();
+                let Some(mut buffer) = buffer else {
+                    continue;
+                };
                 buffer.segments = segments;
                 self.read_tap_result(session, now, buffer, result)?;
             }
@@ -2178,7 +2216,7 @@ impl Worker {
                 let result = self.sessions[session]
                     .tap
                     .as_mut()
-                    .unwrap()
+                    .ok_or(io::ErrorKind::InvalidData)?
                     .read_input(&mut buffer.bytes)
                     .map(|(length, segments)| {
                         buffer.segments = segments;
@@ -2192,7 +2230,7 @@ impl Worker {
         let completed = self.sessions[session]
             .tap
             .as_ref()
-            .unwrap()
+            .ok_or(io::ErrorKind::InvalidData)?
             .completed_checksums
             .wrapping_sub(checksums);
         self.counters.tap_checksums = self.counters.tap_checksums.wrapping_add(completed);
@@ -2264,8 +2302,10 @@ impl Worker {
                     self.sessions[session].totals.tap_errors =
                         self.sessions[session].totals.tap_errors.wrapping_add(1);
                     let local = &mut self.sessions[session];
-                    if local.tap_registered {
-                        self.reactor.remove(local.tap.as_ref().unwrap().as_fd())?;
+                    if local.tap_registered
+                        && let Some(tap) = &local.tap
+                    {
+                        self.reactor.remove(tap.as_fd())?;
                     }
                     local.tap_registered = false;
                     local.tap_retry = now + Duration::from_secs(1);
@@ -2917,8 +2957,12 @@ impl Worker {
         let more = self.expire_frames(now)? | self.cleanup_frames()?;
         let mut visited = 0;
         for _ in 0..self.ready.len().min(BATCH_SIZE) {
-            let (session, lane) = self.ready.pop_front().unwrap();
-            let mut batch = self.sessions[session].batches[lane].take().unwrap();
+            let Some((session, lane)) = self.ready.pop_front() else {
+                break;
+            };
+            let mut batch = self.sessions[session].batches[lane]
+                .take()
+                .ok_or_else(|| io::Error::other("missing transmit batch"))?;
             let refill = self.sender_enabled() && self.sender.job.is_none();
             if refill && !batch.plan.is_empty() {
                 batch.compact().map_err(io::Error::other)?;
@@ -3068,7 +3112,11 @@ impl Worker {
         if batch.len == 0 {
             return Ok(());
         }
-        let peer = self.shared.config.peer_for_session(session).unwrap();
+        let peer = self
+            .shared
+            .config
+            .peer_for_session(session)
+            .ok_or(io::ErrorKind::InvalidInput)?;
         let path = self.sessions[session].path;
         let tx = &self.transmit[peer].paths[path].lanes[lane];
         let limit = tx.mtu.payload_limit();
@@ -3117,7 +3165,9 @@ impl Worker {
         if (batch.plan.is_empty() || (self.sender_enabled() && !self.sender.permitted))
             && batch
                 .prepare(
-                    self.sessions[session].tx[lane].as_mut().unwrap(),
+                    self.sessions[session].tx[lane]
+                        .as_mut()
+                        .ok_or(io::ErrorKind::InvalidData)?,
                     &self.frames,
                     limit,
                 )
@@ -3208,7 +3258,7 @@ impl Worker {
             self.transmit[peer].paths[path].lanes[lane]
                 .socket
                 .as_ref()
-                .unwrap()
+                .ok_or(io::ErrorKind::InvalidData)?
                 .send_batch_checked(&packets[..count], limit, || {
                     let at = clock()?;
                     if at >= deadline {
@@ -3244,7 +3294,10 @@ impl Worker {
                 let tx = &mut self.transmit[peer].paths[path].lanes[lane];
                 let token = TX_TOKEN | ((peer as u64) << 7) | ((path as u64) << 6) | lane as u64;
                 self.reactor.modify(
-                    tx.socket.as_ref().unwrap().as_fd(),
+                    tx.socket
+                        .as_ref()
+                        .ok_or(io::ErrorKind::InvalidData)?
+                        .as_fd(),
                     token,
                     libc::EPOLLOUT as u32,
                 )?;
@@ -3256,9 +3309,10 @@ impl Worker {
             }
             Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => {
                 let attempted = (0..batch.plan.len())
-                    .map(|index| batch.plan.packet(index).unwrap().length)
+                    .filter_map(|index| batch.plan.packet(index))
+                    .map(|packet| packet.length)
                     .max()
-                    .unwrap();
+                    .ok_or(io::ErrorKind::InvalidData)?;
                 self.mtu_send_error(peer, path, lane, attempted, now)?;
                 self.discard_batch(session, lane, batch);
             }
@@ -3287,8 +3341,17 @@ impl Worker {
         let mut fresh = 0;
         let mut repairs = 0;
         for packet in 0..sent {
-            bytes += (batch.plan.packet(packet).unwrap().length + 48) as u64;
-            for (slot, range) in batch.plan.pieces(packet).unwrap() {
+            let length = batch
+                .plan
+                .packet(packet)
+                .ok_or(io::ErrorKind::InvalidData)?
+                .length;
+            bytes += (length + 48) as u64;
+            for (slot, range) in batch
+                .plan
+                .pieces(packet)
+                .ok_or(io::ErrorKind::InvalidData)?
+            {
                 if batch.repair {
                     repairs += 1;
                     batch.selection[slot].start = range.end as u16;
@@ -3337,7 +3400,7 @@ impl Worker {
         Ok(())
     }
 
-    fn return_lane(&mut self, session: usize, mut lane: Box<reassembly::Lane>) {
+    fn return_lane(&mut self, session: usize, mut lane: Box<reassembly::Lane>) -> io::Result<()> {
         lane.retire();
         if self.id == 0 {
             self.sessions[session].free.push(lane);
@@ -3345,10 +3408,15 @@ impl Worker {
             self.push(0, Event::LaneFree { session, lane })
         {
             let local = &mut self.sessions[session];
-            let slot = local.rx.iter().position(Option::is_none).unwrap();
+            let slot = local
+                .rx
+                .iter()
+                .position(Option::is_none)
+                .ok_or(io::ErrorKind::InvalidData)?;
             local.rx[slot] = Some(lane);
             local.returning |= 1_u64 << slot;
         }
+        Ok(())
     }
 
     fn flush_taps(&mut self, now: Duration) -> io::Result<()> {
@@ -3365,7 +3433,9 @@ impl Worker {
                     || self.shared.owners[session][usize::from(lane.id())].load(Ordering::Acquire)
                         == 255
                 {
-                    let lane = local.rx[slot].take().unwrap();
+                    let Some(lane) = local.rx[slot].take() else {
+                        continue;
+                    };
                     local.rx_index[usize::from(lane.id())] = 0;
                     local.returning &= !(1_u64 << slot);
                     local.ack_inflight &= !(1_u64 << slot);
@@ -3373,7 +3443,7 @@ impl Worker {
                     local.rx_dirty &= !(1_u64 << slot);
                     let index = (session * self.shared.workers() + self.id) * LANES + slot;
                     self.shared.receive_counters[index].replace(0, 0, &Snapshot::default());
-                    self.return_lane(session, lane);
+                    self.return_lane(session, lane)?;
                     continue;
                 }
                 lane.expire(now);
@@ -3392,9 +3462,10 @@ impl Worker {
             }
             if local.tap_registered
                 && (local.tap_writable != writable || local.tap_readable != readable)
+                && let Some(tap) = &local.tap
             {
                 self.reactor.modify(
-                    local.tap.as_ref().unwrap().as_fd(),
+                    tap.as_fd(),
                     TAP_TOKEN | session as u64,
                     (if readable { libc::EPOLLIN } else { 0 }
                         | if writable { libc::EPOLLOUT } else { 0 }) as u32,
@@ -3411,7 +3482,9 @@ impl Worker {
         if local.tap_blocked {
             return true;
         }
-        let lane = local.rx[slot].as_mut().unwrap();
+        let Some(lane) = local.rx[slot].as_mut() else {
+            return false;
+        };
         let mut writable = false;
         if let Some(tap) = &mut local.tap {
             let mut budget = BATCH_SIZE;
@@ -3566,7 +3639,7 @@ impl Worker {
         let mut prefix = [0; wire::PROBE_PREFIX_LEN];
         let Ok(piece) = self.sessions[session].tx[lane]
             .as_mut()
-            .unwrap()
+            .ok_or(io::ErrorKind::InvalidData)?
             .probe(length, &mut prefix)
         else {
             self.transmit[peer].paths[path].lanes[lane].mtu.defer(now);
@@ -3574,17 +3647,22 @@ impl Worker {
         };
         let parts = [&prefix[..], piece.bytes];
         let tx = &mut self.transmit[peer].paths[path].lanes[lane];
-        match tx.socket.as_ref().unwrap().send_batch_checked(
-            &[SendDatagram { parts: &parts }],
-            length,
-            clock,
-        ) {
+        match tx
+            .socket
+            .as_ref()
+            .ok_or(io::ErrorKind::InvalidData)?
+            .send_batch_checked(&[SendDatagram { parts: &parts }], length, clock)
+        {
             Ok((1, started)) => {
                 let local = &mut self.sessions[session];
                 if !tx.mtu.submitted(
                     pmtu::ProbeId {
                         session,
-                        tag: local.connection.unwrap().local_tag().get(),
+                        tag: local
+                            .connection
+                            .ok_or(io::ErrorKind::InvalidData)?
+                            .local_tag()
+                            .get(),
                         lane: lane as u16 + 1,
                         packet: piece.packet.number,
                     },
@@ -3683,13 +3761,20 @@ impl Worker {
         now: Duration,
     ) -> io::Result<bool> {
         let tx = &self.transmit[peer].paths[path].lanes[lane];
-        let error = match tx.socket.as_ref().unwrap().recv_mtu_error() {
+        let error = match tx
+            .socket
+            .as_ref()
+            .ok_or(io::ErrorKind::InvalidData)?
+            .recv_mtu_error()
+        {
             Ok(Some(error)) => error,
             Ok(None) => return Ok(false),
             Err(error) if transient(&error) => return Ok(false),
             Err(error) => return Err(error),
         };
-        let address = self.transmit[peer].paths[path].address.unwrap();
+        let address = self.transmit[peer].paths[path]
+            .address
+            .ok_or(io::ErrorKind::InvalidData)?;
         if error.destination.ip() != address.ip() || error.destination.port() != address.port() {
             return Ok(!error.local);
         }
@@ -3803,7 +3888,9 @@ impl Worker {
                 self.sender.fresh[state.group] = true;
             }
         }
-        let peer = self.shared.config.peer_for_session(session).unwrap();
+        let Some(peer) = self.shared.config.peer_for_session(session) else {
+            return;
+        };
         let path = self.sessions[session].path;
         let index = usize::from(lane) - 1;
         let mtu = &mut self.transmit[peer].paths[path].lanes[index].mtu;
@@ -3847,7 +3934,11 @@ impl Worker {
         };
         let mut clock = self.io_clock(now);
         let prepared = clock()?;
-        let peer = self.shared.config.peer_for_session(session).unwrap();
+        let peer = self
+            .shared
+            .config
+            .peer_for_session(session)
+            .ok_or(io::ErrorKind::InvalidInput)?;
         let path =
             if record.is_handshake() && !active_flight(self.sessions[session].connection, record) {
                 self.controls[session].handshake_path
@@ -4016,7 +4107,7 @@ impl Worker {
             self.sessions[session]
                 .tap
                 .as_ref()
-                .unwrap()
+                .ok_or(io::ErrorKind::InvalidData)?
                 .set_carrier(carrier)?;
             self.controls[session].carrier = carrier;
         }
@@ -4034,7 +4125,11 @@ impl Worker {
     }
 
     fn command(&mut self, session: usize, command: Command, path: usize) -> io::Result<()> {
-        let peer = self.shared.config.peer_for_session(session).unwrap();
+        let peer = self
+            .shared
+            .config
+            .peer_for_session(session)
+            .ok_or(io::ErrorKind::InvalidInput)?;
         let probes = self.transmit[peer].paths.each_ref().map(|path| {
             let session = path.probe_session?;
             Some((session, self.sessions[session].connection?.local_tag()))
@@ -4081,7 +4176,9 @@ impl Worker {
                     *lane = command
                         .connection
                         .filter(|_| index % self.shared.workers() == self.id)
-                        .map(|c| pack::Lane::new(cookie, c, index as u16 + 1).unwrap());
+                        .map(|c| pack::Lane::new(cookie, c, index as u16 + 1))
+                        .transpose()
+                        .map_err(io::Error::other)?;
                     if index % self.shared.workers() == self.id {
                         let mtu = &self.transmit[peer].paths[path].lanes[index].mtu;
                         let limit = mtu.payload_limit();
@@ -4168,7 +4265,11 @@ impl Worker {
             if self.sessions[session].retire_pending == 0 {
                 continue;
             }
-            let tag = self.sessions[session].connection.unwrap().local_tag().get();
+            let tag = self.sessions[session]
+                .connection
+                .ok_or(io::ErrorKind::InvalidData)?
+                .local_tag()
+                .get();
             for word in 0..1024 {
                 while self.sessions[session].retirements[word] != 0 {
                     let bit = self.sessions[session].retirements[word].trailing_zeros();
@@ -4260,8 +4361,16 @@ impl Worker {
                 .transmitted(record, started)
                 .map_err(io::Error::other)?;
         } else {
-            let peer = self.shared.config.peer_for_session(session).unwrap();
-            let group = self.shared.config.path_group_for_peer(peer).unwrap();
+            let peer = self
+                .shared
+                .config
+                .peer_for_session(session)
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            let group = self
+                .shared
+                .config
+                .path_group_for_peer(peer)
+                .ok_or(io::ErrorKind::InvalidInput)?;
             self.controls[session].send_due = self.control_budgets[group]
                 .deadline()
                 .filter(|&due| due > now)
@@ -4272,7 +4381,11 @@ impl Worker {
 
     fn timers(&mut self, now: Duration) -> io::Result<()> {
         for session in 0..self.controls.len() {
-            let peer = self.shared.config.peer_for_session(session).unwrap();
+            let peer = self
+                .shared
+                .config
+                .peer_for_session(session)
+                .ok_or(io::ErrorKind::InvalidInput)?;
             if !self.shared.peer_bound(peer)
                 || self.transmit[peer].paths[self.controls[session].handshake_path].lanes[0]
                     .socket
@@ -4287,12 +4400,15 @@ impl Worker {
                 .unwrap_or(Duration::MAX)
                 .max(self.controls[session].retry);
             if now >= due {
-                let mut effects = self.controls[session].state.on_timer(now, None).unwrap();
+                let mut effects = self.controls[session]
+                    .state
+                    .on_timer(now, None)
+                    .map_err(io::Error::other)?;
                 if effects.needs_tag && self.peer_controls[peer].change.is_none() {
                     let next = self.controls[session]
                         .state
                         .on_timer(now, Tag::generate()?)
-                        .unwrap();
+                        .map_err(io::Error::other)?;
                     effects.send = next.send;
                     effects.commit = next.commit;
                     effects.needs_tag = next.needs_tag;
@@ -4343,7 +4459,9 @@ impl Worker {
             due = due.min(feedback);
         }
         for (index, control) in self.controls.iter().enumerate() {
-            let peer = self.shared.config.peer_for_session(index).unwrap();
+            let Some(peer) = self.shared.config.peer_for_session(index) else {
+                continue;
+            };
             if self.shared.peer_bound(peer)
                 && self.transmit[peer].paths[control.handshake_path].lanes[0]
                     .socket

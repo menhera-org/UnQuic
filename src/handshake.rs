@@ -404,9 +404,11 @@ impl Session {
         }
         self.advance(now)?;
         match record {
-            Record::Hello { initiator, params } => {
-                self.hello(Tag::new(initiator).unwrap(), params, fresh)
-            }
+            Record::Hello { initiator, params } => self.hello(
+                Tag::new(initiator).ok_or(HandshakeError::Record)?,
+                params,
+                fresh,
+            ),
             Record::Challenge {
                 initiator,
                 responder,
@@ -418,7 +420,7 @@ impl Session {
                 else {
                     return Ok(Effects::default());
                 };
-                let responder = Tag::new(responder).unwrap();
+                let responder = Tag::new(responder).ok_or(HandshakeError::Record)?;
                 if self.retained_tag(responder) {
                     return Ok(Effects::default());
                 }
@@ -462,15 +464,16 @@ impl Session {
                     return Ok(Effects::default());
                 };
                 let mut effects = self.install(connection);
-                let mut active = self.active.unwrap();
-                effects.send = self.reply(
-                    &mut active.last_ready,
-                    Record::Ready {
-                        initiator,
-                        responder,
-                    },
-                );
-                self.active = Some(active);
+                if let Some(mut active) = self.active {
+                    effects.send = self.reply(
+                        &mut active.last_ready,
+                        Record::Ready {
+                            initiator,
+                            responder,
+                        },
+                    );
+                    self.active = Some(active);
+                }
                 Ok(effects)
             }
             Record::Ready {
@@ -485,7 +488,7 @@ impl Session {
                     None => Effects::default(),
                 },
             ),
-            _ => unreachable!(),
+            _ => Err(HandshakeError::Record),
         }
     }
 
@@ -628,7 +631,9 @@ impl Session {
     }
 
     fn send_pending(&mut self) -> Effects {
-        let mut pending = self.pending.unwrap();
+        let Some(mut pending) = self.pending else {
+            return Effects::default();
+        };
         let initiator = pending.initiator.get();
         let record = match (pending.role, pending.responder) {
             (Role::Initiator, None) => Record::Hello {
@@ -644,7 +649,8 @@ impl Session {
                 responder: responder.get(),
                 params: self.local,
             },
-            (Role::Responder, None) => unreachable!(),
+            // A responder attempt always holds its tag; nothing to send otherwise.
+            (Role::Responder, None) => return Effects::default(),
         };
         let send = self.reply(&mut pending.last_send, record);
         self.pending = Some(pending);
@@ -681,17 +687,17 @@ impl Session {
     }
 
     fn install(&mut self, connection: Connection) -> Effects {
-        let pending = self.pending.take().unwrap();
+        let last_challenge = self
+            .pending
+            .take()
+            .filter(|pending| pending.role == Role::Responder)
+            .and_then(|pending| pending.last_send);
         self.connecting = false;
         let carrier = self.active.is_none().then_some(true);
         self.active = Some(Active {
             connection,
             feedback: self.now,
-            last_challenge: if pending.role == Role::Responder {
-                pending.last_send
-            } else {
-                None
-            },
+            last_challenge,
             last_ready: None,
         });
         self.state = State::Active;

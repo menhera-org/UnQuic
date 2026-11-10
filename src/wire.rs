@@ -60,7 +60,7 @@ impl Header {
             return Err(WireError::Length);
         }
         Ok(Self {
-            cookie: UnquicUuid::from_bytes(input[4..20].try_into().unwrap()),
+            cookie: UnquicUuid::from_bytes(read(input, 4)),
             receive_tag: read128(input, 20),
             lane: read16(input, 36),
             record_area_len,
@@ -570,8 +570,8 @@ impl<'a> Datagram<'a> {
             if remaining.is_empty() {
                 return None;
             }
-            let (record, length) =
-                decode_record(remaining).expect("validated immutable record area");
+            // The area was validated in full, so this never stops early.
+            let (record, length) = decode_record(remaining).ok()?;
             remaining = &remaining[length..];
             Some(record)
         })
@@ -601,7 +601,7 @@ pub fn encode_datagram(
     if output.len() < length {
         return Err(WireError::BufferTooSmall);
     }
-    header.encode((&mut output[..HEADER_LEN]).try_into().unwrap());
+    header.encode(output.first_chunk_mut().ok_or(WireError::BufferTooSmall)?);
     let mut at = HEADER_LEN;
     for &record in records {
         at += record.encode(&mut output[at..])?;
@@ -671,7 +671,7 @@ pub(crate) fn encode_data_prefix_length(
     .validate_context(header, 1)?;
     let length = 20 + piece_len;
     header.record_area_len = length as u16;
-    header.encode((&mut output[..HEADER_LEN]).try_into().unwrap());
+    header.encode(output.first_chunk_mut().ok_or(WireError::BufferTooSmall)?);
     output[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&[1, 0, (length >> 8) as u8, length as u8]);
     encode_data_fields(frame_id, total_len, offset, &mut output[HEADER_LEN + 4..]);
     Ok(DATA_PREFIX_LEN + piece_len)
@@ -691,7 +691,7 @@ pub fn encode_probe_prefix(
     }
     header.record_area_len = u16::try_from(length - HEADER_LEN).map_err(|_| WireError::Length)?;
     Record::Probe.validate_context(header, 2)?;
-    header.encode((&mut output[..HEADER_LEN]).try_into().unwrap());
+    header.encode(output.first_chunk_mut().ok_or(WireError::BufferTooSmall)?);
     output[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&[5, 0, 0, 4]);
     let padding = header.record_area_len - 4;
     output[HEADER_LEN + 4..].copy_from_slice(&[0, 0, (padding >> 8) as u8, padding as u8]);
@@ -801,17 +801,25 @@ const fn validate_pair(initiator: u128, responder: u128) -> Result<(), WireError
         Ok(())
     }
 }
+/// Callers check lengths first; the zero fallback only keeps this panic-free.
+fn read<const N: usize>(input: &[u8], at: usize) -> [u8; N] {
+    input
+        .get(at..)
+        .and_then(<[u8]>::first_chunk)
+        .copied()
+        .unwrap_or([0; N])
+}
 fn read16(input: &[u8], at: usize) -> u16 {
-    u16::from_be_bytes(input[at..at + 2].try_into().unwrap())
+    u16::from_be_bytes(read(input, at))
 }
 fn read32(input: &[u8], at: usize) -> u32 {
-    u32::from_be_bytes(input[at..at + 4].try_into().unwrap())
+    u32::from_be_bytes(read(input, at))
 }
 fn read64(input: &[u8], at: usize) -> u64 {
-    u64::from_be_bytes(input[at..at + 8].try_into().unwrap())
+    u64::from_be_bytes(read(input, at))
 }
 fn read128(input: &[u8], at: usize) -> u128 {
-    u128::from_be_bytes(input[at..at + 16].try_into().unwrap())
+    u128::from_be_bytes(read(input, at))
 }
 
 /// A wire validation or encoding error. No cookie or payload is included.

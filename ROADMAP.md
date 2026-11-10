@@ -142,8 +142,10 @@ rules apply to all of them.
 5. **Close the stage 2 gate:** 20 Gbit/s each direction locally at inner MTU
    1500, plus the small-frame burst rows.
 6. **Stage 4**, as listed in its section: TAP lifetime and descriptor handover,
-   the panic audit, the composition matrix, VRF, resource stress, restart and
-   path changes, double-fork readiness and the systemd unit.
+   the rest of the panic audit (explicit `unwrap`/`expect`/`panic!` sites are
+   gone; implicit indexing and overflow remain), the composition matrix, VRF,
+   resource stress, restart and path changes, double-fork readiness and the
+   systemd unit.
 7. **Stage 5:** profile what remains and try its candidates behind switches.
 
 If evidence shows a gate cannot be reached within the current design, write
@@ -1026,6 +1028,11 @@ full expired batches sharing the cleanup budget.
   library calls that can panic. A passing ordinary Clippy run does not
   close this requirement. The subsequent ancillary-parser cleanup replaces
   its four-byte conversion with `first_chunk`, reducing the count to 95.
+  On November 10 the command below, extended with `clippy::unreachable`,
+  `clippy::todo` and `clippy::unimplemented`, reported 97 sites; all are gone.
+  Broken invariants now return errors, or skip the item where a local
+  fallback is safe. Remaining: implicit indexing, arithmetic overflow,
+  thread startup/join errors and the fault-injection tests.
 
   ```sh
   cargo clippy --release --target x86_64-unknown-linux-musl --lib --all-features -- \
