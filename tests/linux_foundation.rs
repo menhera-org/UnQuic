@@ -239,3 +239,66 @@ fn kernel_socket_and_tap_invariants() {
         "60:a4:34:4d:c9:8a"
     );
 }
+
+#[test]
+#[ignore = "requires isolated container, /dev/net/tun, iproute2, CAP_NET_ADMIN and CAP_NET_RAW"]
+fn handed_over_queues_are_adopted_by_device_not_name() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: unshare changes only this test thread's network namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let control = UdpSocket::bind("[::]:0").unwrap();
+    let tap = Tap::create(c"uq-adopt", 1500, 2, None).unwrap();
+    let mac = mac_address(&control, tap.name());
+    let fds: Vec<OwnedFd> = tap.into_queues().into_iter().map(|q| q.into_fd()).collect();
+    // The device is renamed while a predecessor holds its queues.
+    ip(&["link", "set", "uq-adopt", "name", "uq-adopted"]);
+    let mut adopted = Tap::adopt(fds, 1500).unwrap();
+    assert_eq!(adopted.name(), c"uq-adopted");
+    assert_eq!(adopted.queue_count(), 2);
+    assert_eq!(mac_address(&control, adopted.name()), mac);
+    up(&control, adopted.name());
+    adopted.set_carrier(true).unwrap();
+    let ethernet = raw_socket(adopted.name(), 0x88b5);
+    let mut frame = [0x5a; 100];
+    frame[..12].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 2, 0, 0, 0, 0, 1]);
+    frame[12..14].copy_from_slice(&0x88b5u16.to_be_bytes());
+    let mut buffer = [0; MAX_FRAME_LEN + 1];
+    raw_send(&ethernet, &frame);
+    wait_for(|| {
+        adopted
+            .queues()
+            .iter_mut()
+            .any(|queue| match queue.read_frame(&mut buffer) {
+                Ok(n) => buffer[..n] == frame,
+                Err(e) => {
+                    assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+                    false
+                }
+            })
+    });
+    // A socket, queues of two devices and a TUN device are all refused.
+    let socket = OwnedFd::from(UdpSocket::bind("[::]:0").unwrap());
+    assert!(Tap::adopt(vec![socket], 1500).is_err());
+    let other = Tap::create(c"uq-other", 1500, 1, None).unwrap();
+    let mixed: Vec<OwnedFd> = adopted
+        .into_queues()
+        .into_iter()
+        .chain(other.into_queues())
+        .map(|q| q.into_fd())
+        .collect();
+    assert!(Tap::adopt(mixed, 1500).is_err());
+    // SAFETY: a constant path; open returns a new descriptor owned below.
+    let tun =
+        check(unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) });
+    // SAFETY: open just returned this descriptor.
+    let tun = unsafe { OwnedFd::from_raw_fd(tun) };
+    let mut request = request(c"uq-tun");
+    request.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as i16;
+    // SAFETY: TUNSETIFF reads and writes the initialized ifreq.
+    check(unsafe { libc::ioctl(tun.as_raw_fd(), libc::TUNSETIFF, &mut request) });
+    assert!(Tap::adopt(vec![tun], 1500).is_err());
+    // Rejected descriptors closed; the persistent devices remain until removed.
+    for name in [c"uq-adopted", c"uq-other"] {
+        unquic::tap::remove(name).unwrap();
+    }
+}

@@ -95,8 +95,13 @@ next start to reattach. A start reattaches a persistent multiqueue TAP of the
 configured name only when no process holds one of its queues, keeping its MAC;
 a device in use or of another kind fails startup with EBUSY. Only
 `unquic remove-tap <name>` (or `tap::remove`) deletes one, once its last queue
-closes. Descriptor adoption and re-exec handover, the rest of handover format
-version 1 in design section 11, are not yet implemented. Library code no longer calls `unwrap`, `expect`, `panic!` or
+closes. For handover, `TapQueue::into_fd` releases a queue's descriptor and
+`Tap::adopt` accepts descriptors a predecessor handed over: each must be a
+multiqueue TAP queue with virtio headers and no packet information, all of one
+device, which keeps its current name, so an external rename survives.
+`runtime::run_adopting` runs sessions on adopted TAPs of the configured queue
+count. The daemon's restart and re-exec, the rest of handover format version 1
+in design section 11, are not yet implemented. Library code no longer calls `unwrap`, `expect`, `panic!` or
 `unreachable!`; implicit indexing and arithmetic overflow are not yet audited.
 These are tracked in Stage 4 of [ROADMAP.md](ROADMAP.md).
 

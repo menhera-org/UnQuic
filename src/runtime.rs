@@ -289,6 +289,14 @@ impl Shared {
 /// A shutdown request does not skip validation or device setup. After return,
 /// retained Control clones keep final counters and metadata, but no TAP queues.
 pub fn run(config: Config, control: Control) -> io::Result<()> {
+    run_adopting(config, control, Vec::new())
+}
+
+/// Like [`run`], but session `i` uses `adopted[i]` when it is `Some`, a TAP
+/// handed over by a previous process (see [`Tap::adopt`]), instead of
+/// creating or reattaching one. Each adopted TAP must have the session's
+/// queue count; missing entries mean create.
+pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>) -> io::Result<()> {
     if control.0.started.swap(true, Ordering::AcqRel) {
         return Err(io::ErrorKind::AlreadyExists.into());
     }
@@ -320,7 +328,7 @@ pub fn run(config: Config, control: Control) -> io::Result<()> {
     let sessions = config.config().sessions.len();
     let peers = config.config().peers.len();
     let endpoints = config.config().endpoints.len();
-    if peers > (u32::MAX as usize >> 7) {
+    if peers > (u32::MAX as usize >> 7) || adopted.len() > sessions {
         return Err(io::ErrorKind::InvalidInput.into());
     }
     let (request_tx, request_rx) = spsc::channel();
@@ -373,9 +381,22 @@ pub fn run(config: Config, control: Control) -> io::Result<()> {
             }
         }
     }
+    let mut adopted = adopted.into_iter();
     for (index, session) in shared.config.config().sessions.iter().enumerate() {
-        let name = CString::new(session.tap_name()).map_err(|_| io::ErrorKind::InvalidInput)?;
-        let tap = Tap::create(&name, session.inner_mtu, session.queue_count, session.mac)?;
+        let tap = match adopted.next().flatten() {
+            Some(tap) if tap.queue_count() == session.queue_count => tap,
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "adopted TAP has a different queue count",
+                ));
+            }
+            None => {
+                let name =
+                    CString::new(session.tap_name()).map_err(|_| io::ErrorKind::InvalidInput)?;
+                Tap::create(&name, session.inner_mtu, session.queue_count, session.mac)?
+            }
+        };
         tap.enable_input_offloads()?;
         for (worker, queue) in workers.iter_mut().zip(tap.into_queues()) {
             worker.attach_tap(index, queue)?;

@@ -1036,7 +1036,10 @@ full expired batches sharing the cleanup budget.
   of supplied queues, then the daemon's restart and re-exec. Persistence is
   done: TAPs survive shutdown and failed starts, a start reattaches an idle
   persistent TAP of its name (an rtnetlink query reads the attached-queue
-  count) and `unquic remove-tap` deletes one. Adoption and re-exec remain.
+  count) and `unquic remove-tap` deletes one. Library adoption is done:
+  `Tap::adopt` validates handed-over queues and `runtime::run_adopting` runs
+  sessions on them, with kernel tests on Linux 6.8 and 7.0. The daemon's
+  restart, probe and re-exec remain.
 - Open issue: on Linux 6.8 the routed PMTU test's 1500-byte phase failed in
   two of four local runs since the three-quantum offload budget, and in none
   of five before it; Linux 7.0 passed both runs. One lane with little traffic

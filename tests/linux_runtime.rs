@@ -1413,3 +1413,51 @@ fn endpoints_bound_to_a_vrf_forward_through_its_table() {
     left.stop();
     right.stop();
 }
+
+#[test]
+#[ignore = "requires disposable container with tun and network namespace capabilities"]
+fn runtime_adopts_handed_over_queues_of_the_configured_count() {
+    use unquic::{
+        runtime::{Control, run_adopting},
+        tap::Tap,
+    };
+    // SAFETY: only this test thread and its runtime enter the namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let net = UdpSocket::bind("[::]:0").unwrap();
+    up(&net, c"lo");
+    let mut config = config("uq-adopt-rt", 41500, 41501);
+    config.sessions.truncate(1);
+    config.peers.truncate(1);
+    config.daemon.memory_limit = Daemon::default().memory_limit;
+    config.sessions[0].queue_count = 2;
+    let handed = |count| {
+        let tap = Tap::create(c"uq-adopt-rt", 9000, count, None).unwrap();
+        let fds = tap.into_queues().into_iter().map(|q| q.into_fd()).collect();
+        Tap::adopt(fds, 9000).unwrap()
+    };
+    let refused = |adopted| {
+        run_adopting(config.clone(), Control::new(), adopted)
+            .unwrap_err()
+            .kind()
+    };
+    assert_eq!(refused(vec![Some(handed(1))]), io::ErrorKind::InvalidInput);
+    assert_eq!(refused(vec![None, None]), io::ErrorKind::InvalidInput);
+    // SAFETY: the name is NUL-terminated; the call only queries this namespace.
+    let index = unsafe { libc::if_nametoindex(c"uq-adopt-rt".as_ptr()) };
+    assert_ne!(index, 0);
+    let control = Control::new();
+    let runtime = {
+        let control = control.clone();
+        let adopted = vec![Some(handed(2))];
+        thread::spawn(move || run_adopting(config, control, adopted))
+    };
+    until(Duration::from_secs(5), || control.ready());
+    // SAFETY: as above.
+    assert_eq!(
+        unsafe { libc::if_nametoindex(c"uq-adopt-rt".as_ptr()) },
+        index
+    );
+    control.shutdown();
+    runtime.join().unwrap().unwrap();
+    unquic::tap::remove(c"uq-adopt-rt").unwrap();
+}

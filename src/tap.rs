@@ -199,6 +199,66 @@ impl Tap {
         Ok(tap)
     }
 
+    /// Adopts queue descriptors handed over by a previous process (design
+    /// section 11, handover format version 1). Each must be a multiqueue TAP
+    /// queue with virtio headers and no packet information, all of one device.
+    /// The device keeps its current name, MTU, MAC, carrier and administrative
+    /// state; `mtu` is the configured inner MTU that bounds frames. Rejected
+    /// descriptors are closed, which leaves a persistent device in place.
+    pub fn adopt(queues: Vec<OwnedFd>, mtu: u16) -> io::Result<Self> {
+        if !(1500..=9000).contains(&mtu) || !(1..=64).contains(&queues.len()) {
+            return Err(invalid("TAP requires MTU 1500..9000 and 1..64 queues"));
+        }
+        let wanted = libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_MULTI_QUEUE | libc::IFF_VNET_HDR;
+        let mut name = None;
+        let mut adopted = Vec::with_capacity(queues.len());
+        for fd in queues {
+            // SAFETY: a zeroed ifreq is valid output storage for TUNGETIFF.
+            let mut request: libc::ifreq = unsafe { zeroed() };
+            // SAFETY: TUNGETIFF writes the device name and flags into request.
+            cvt(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNGETIFF, &mut request) })
+                .map_err(|_| invalid("handed-over descriptor is not a TAP queue"))?;
+            // SAFETY: TUNGETIFF filled the flags member.
+            let flags = i32::from(unsafe { request.ifr_ifru.ifru_flags });
+            if flags & (wanted | libc::IFF_TUN) != wanted {
+                return Err(invalid(
+                    "handed-over queue is not a multiqueue TAP with virtio headers",
+                ));
+            }
+            match name {
+                None => name = Some(request.ifr_name),
+                Some(seen) if seen == request.ifr_name => {}
+                Some(_) => return Err(invalid("handed-over queues belong to different devices")),
+            }
+            // SAFETY: plain descriptor flag updates on a descriptor we own.
+            unsafe {
+                let status = cvt(libc::fcntl(fd.as_raw_fd(), libc::F_GETFL))?;
+                cvt(libc::fcntl(
+                    fd.as_raw_fd(),
+                    libc::F_SETFL,
+                    status | libc::O_NONBLOCK,
+                ))?;
+                cvt(libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC))?;
+            }
+            let header_len = 10i32;
+            // SAFETY: TUNSETVNETHDRSZ reads one initialized integer.
+            cvt(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETVNETHDRSZ, &header_len) })?;
+            adopted.push(TapQueue {
+                fd,
+                frame_limit: mtu as usize + 22,
+                vnet: true,
+                uso: true,
+                tso: true,
+                completed_checksums: 0,
+            });
+        }
+        let name = name.ok_or_else(|| invalid("no queues to adopt"))?;
+        Ok(Self {
+            name,
+            queues: adopted,
+        })
+    }
+
     pub(crate) fn enable_input_offloads(&self) -> io::Result<()> {
         let fd = self.queues[0].fd.as_raw_fd();
         // Linux requires both TUN_F_USO4 (0x20) and TUN_F_USO6 (0x40).
@@ -222,6 +282,11 @@ impl Tap {
     pub fn name(&self) -> &CStr {
         // SAFETY: name was zero-filled and holds fewer than IFNAMSIZ input bytes.
         unsafe { CStr::from_ptr(self.name.as_ptr()) }
+    }
+
+    /// Number of queues this handle owns.
+    pub fn queue_count(&self) -> usize {
+        self.queues.len()
     }
 
     /// Returns the nonblocking queues for worker assignment and epoll registration.
@@ -261,6 +326,11 @@ impl TapQueue {
             tso: false,
             completed_checksums: 0,
         }
+    }
+
+    /// Releases the queue descriptor, for handing it to a successor process.
+    pub fn into_fd(self) -> OwnedFd {
+        self.fd
     }
 
     /// Changes carrier for the whole device without removing the TAP or

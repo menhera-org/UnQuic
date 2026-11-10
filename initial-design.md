@@ -553,8 +553,8 @@ handover format before implementing adoption, and retain the original descriptor
 if preparation or exec fails. Preserving TAPs does not itself preserve userspace
 transport state or guarantee uninterrupted forwarding.
 
-**Handover format, version 1 (November 10; persistence implemented, adoption
-and re-exec not yet).**
+**Handover format, version 1 (November 10; persistence and library adoption
+implemented, the daemon's restart and re-exec not yet).**
 It follows rs-l2tpd's adoption protocol with TAP queues in place of sockets.
 
 - Persistence. Created TAPs are marked persistent (`TUNSETPERSIST`), so closing
