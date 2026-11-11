@@ -1,0 +1,51 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index 03a148e..7fb857c 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -1194,25 +1194,29 @@ impl Worker {
+                 publish_due = now + Duration::from_millis(1);
+                 publish_turns = 0;
+             }
+-            #[cfg(feature = "profile")]
+-            let arming = crate::profile::now();
+-            let mut deadline = self.deadline(now);
+-            if self.has_backpressure() {
+-                let due = self.retry_due.get_or_insert(now + RETRY);
+-                if *due <= now {
+-                    *due = now + RETRY;
++            // Deadlines matter only before sleeping; a busy turn polls and loops again.
++            // An armed timer that expired meanwhile is drained by the poll, clearing it.
++            let block = !(more || immediate);
++            if block {
++                #[cfg(feature = "profile")]
++                let arming = crate::profile::now();
++                let mut deadline = self.deadline(now);
++                if self.has_backpressure() {
++                    let due = self.retry_due.get_or_insert(now + RETRY);
++                    if *due <= now {
++                        *due = now + RETRY;
++                    }
++                    deadline = Some(deadline.map_or(*due, |d| d.min(*due)));
++                } else {
++                    self.retry_due = None;
++                }
++                self.reactor.arm(deadline)?;
++                #[cfg(feature = "profile")]
++                {
++                    self.phases[21] =
++                        self.phases[21].wrapping_add(crate::profile::now().wrapping_sub(arming));
+                 }
+-                deadline = Some(deadline.map_or(*due, |d| d.min(*due)));
+-            } else {
+-                self.retry_due = None;
+-            }
+-            self.reactor.arm(deadline)?;
+-            #[cfg(feature = "profile")]
+-            {
+-                self.phases[21] =
+-                    self.phases[21].wrapping_add(crate::profile::now().wrapping_sub(arming));
+             }
+-            let block = !(more || immediate);
+             let count = match phase!(
+                 self,
+                 if block { 22 } else { 27 },

@@ -188,6 +188,23 @@ frees that share of a saturated worker. On the decision workload's CPU-bound
 range, and no direction at any point may fall beyond it. If both hold, the
 change is adopted; otherwise it is reverted and kept as a patch here.
 
+[Three interleaved repeats](benches/tap-lazy-arm.json), both builds with
+balanced lanes, 5G medians with ranges (Gbit/s, L→R / R→L):
+
+| Flows, loss | Base | [Candidate](benches/lazy-arm-rejected.patch) |
+| --- | --- | --- |
+| 16, 0% | 1.677 (1.544–1.994) / 1.887 (1.868–1.962) | 1.853 (1.795–1.968) / 1.836 (1.788–2.076) |
+| 16, 0.1% | 1.795 (1.663–1.836) / 1.665 (1.625–2.066) | 1.869 (1.804–1.937) / 1.886 (1.720–1.906) |
+| 4, 0% | 1.407 (1.358–1.827) / 1.313 (1.167–1.920) | 1.784 (1.631–2.176) / 1.621 (1.324–1.783) |
+| 4, 0.1% | 1.504 (1.495–1.669) / 1.580 (1.474–1.848) | 1.425 (1.255–2.009) / 1.882 (1.691–1.988) |
+
+Six of the eight 5G medians are higher, but only two clear the control's
+range, and two fall below it (sixteen flows without loss R→L, four flows with
+loss L→R). At 0.5G and 2G every direction stays within or above range. The
+bar rejects the change: three repeats cannot separate it from this workload's
+noise. The patch is kept for a later run with more repeats or a less noisy
+workload.
+
 ## Round-robin lanes by default? (November 11)
 
 The November 10 run below rejected `daemon.balance_flows` because, at 5G
