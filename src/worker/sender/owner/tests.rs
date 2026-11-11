@@ -15,6 +15,11 @@ fn owner_at(
     Owner::new(workers, descriptors, now, budgets, false).unwrap()
 }
 
+// Eight slots per worker beyond the room reserved for ACK buffers; gated messages get two each.
+fn queue(workers: usize) -> VecDeque<(usize, Message)> {
+    VecDeque::with_capacity(workers * (ACK_BUFFERS + 8))
+}
+
 fn lane(lane: u16) -> PacketId {
     PacketId {
         session: 0,
@@ -117,7 +122,7 @@ fn first_ack_uses_controller_creation_time_at_any_uptime() {
                 &[entry(1, records[0])],
             ))
             .unwrap();
-        let mut outgoing = VecDeque::with_capacity(8);
+        let mut outgoing = queue(1);
         owner.advance(start + rtt, &mut outgoing).unwrap();
         assert!(matches!(outgoing[0].1, Message::ReportReturn(_)));
         assert_eq!(
@@ -166,7 +171,7 @@ fn acks_report_the_newest_record_across_chunks_and_exclude_other_reports() {
     owner
         .report(report(0, lane(1), ack(true, None), &[entry(1, records[0])]))
         .unwrap();
-    let mut outgoing = VecDeque::with_capacity(16);
+    let mut outgoing = queue(2);
     owner
         .advance(Duration::from_millis(1), &mut outgoing)
         .unwrap();
@@ -221,7 +226,7 @@ fn losses_enter_recovery_once_and_late_acks_still_deliver() {
             &[entry(1, records[0])],
         ))
         .unwrap();
-    let mut outgoing = VecDeque::with_capacity(8);
+    let mut outgoing = queue(1);
     owner
         .advance(Duration::from_millis(1), &mut outgoing)
         .unwrap();
@@ -296,7 +301,7 @@ fn stalled_pto_publishes_a_zero_window_and_its_probe_round() {
     assert_eq!(owner.budgets[0].published().window, 12_800);
     let now = stalled(&mut owner.groups[0]);
     owner.groups[0].epoch = 5;
-    let mut outgoing = VecDeque::with_capacity(8);
+    let mut outgoing = queue(1);
     owner.advance(now, &mut outgoing).unwrap();
     let published = owner.budgets[0].published();
     assert_eq!(published.window, 0);
@@ -320,7 +325,7 @@ fn group_sweeps_preserve_earliest_deadline_then_remove_stale_minimum() {
     let expected = owner.groups[0]
         .pto
         .deadline(&owner.groups[0].rtt, Some(Duration::ZERO));
-    let mut outgoing = VecDeque::with_capacity(8);
+    let mut outgoing = queue(1);
     assert!(owner.advance(Duration::ZERO, &mut outgoing).unwrap());
     assert_eq!(owner.cursor, 64);
     assert!(!owner.advance(Duration::ZERO, &mut outgoing).unwrap());
@@ -340,7 +345,7 @@ fn pending_pto_without_target_survives_install() {
     owner.groups[0].epoch = 7;
     owner.groups[0].probe = Some((None, 2));
     let next = owner.groups[0].pto.deadline(&owner.groups[0].rtt, None);
-    let mut outgoing = VecDeque::with_capacity(8);
+    let mut outgoing = queue(1);
     assert!(!owner.advance(now, &mut outgoing).unwrap());
     assert!(outgoing.is_empty());
     assert_eq!(owner.groups[0].probe, Some((None, 2)));
@@ -382,7 +387,7 @@ fn returned_probe_retargets_replacement_without_resetting_its_epoch() {
     state.probe = Some((None, 2));
     let unbacked = state.rtt.pto_period(0);
     assert!(state.pto.deadline(&state.rtt, Some(now)) > Some(now + unbacked));
-    let mut outgoing = VecDeque::with_capacity(8);
+    let mut outgoing = queue(1);
     owner.advance(now, &mut outgoing).unwrap();
     assert!(matches!(
         outgoing.pop_front().unwrap().1,
@@ -486,7 +491,7 @@ fn ready_reports_do_not_overrun_the_turn_budget() {
             ))
             .unwrap();
     }
-    let mut outgoing = VecDeque::with_capacity(16);
+    let mut outgoing = queue(2);
     assert!(
         owner
             .advance(Duration::from_millis(1), &mut outgoing)
@@ -507,7 +512,7 @@ mod loss_barrier {
         let mut owner = owner(1, 1, &[(0, 1, 0)]);
         owner.timers.install(0, 1).unwrap();
         owner.timers.submitted(0, 1, 1, 1, Duration::ZERO).unwrap();
-        (owner, VecDeque::with_capacity(8))
+        (owner, queue(1))
     }
 
     fn check(
@@ -555,7 +560,7 @@ mod loss_barrier {
         }
         // A probe sent after the forced settlement remains unanswered.
         owner.timers.submitted(0, 1, 1, 2, now).unwrap();
-        let mut outgoing = VecDeque::with_capacity(8);
+        let mut outgoing = queue(1);
         let mut reached = 0;
         for _ in 0..2 {
             let (_, sent) = owner.timers.earliest(0).unwrap();

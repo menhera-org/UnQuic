@@ -344,8 +344,9 @@ impl State {
             .try_reserve_exact(workers * ACK_BUFFERS)
             .map_err(io::Error::other)?;
         let mut outgoing = VecDeque::new();
+        // Beyond `room`'s limit, every ACK buffer in the runtime still fits.
         outgoing
-            .try_reserve_exact(workers * (ACK_BUFFERS + 4))
+            .try_reserve_exact(workers * (2 * ACK_BUFFERS + 4))
             .map_err(io::Error::other)?;
         let mut probes = Vec::new();
         probes
@@ -429,6 +430,16 @@ impl State {
         self.outgoing.push_back((worker, message));
         Ok(())
     }
+}
+
+/// Whether a message other than an ACK handoff or return may queue. Peer ACKs
+/// can occupy every ACK buffer in the runtime at once, so the rest stop short
+/// of room for all of them.
+pub(super) fn room(outgoing: &VecDeque<(usize, Message)>, workers: usize) -> bool {
+    outgoing.len()
+        < outgoing
+            .capacity()
+            .saturating_sub(workers * (ACK_BUFFERS + 6))
 }
 
 fn boxed<T>(value: T) -> io::Result<Box<T>> {
@@ -644,7 +655,7 @@ impl State {
             .checked_add(Records::storage_bytes(RECORDS)?)?
             .checked_add(workers.checked_mul(ACK_BUFFERS * size_of::<Box<Ack>>())?)?
             .checked_add(
-                (workers * (ACK_BUFFERS + 4))
+                (workers * (2 * ACK_BUFFERS + 4))
                     .next_power_of_two()
                     .checked_mul(size_of::<(usize, Message)>())?,
             )?
@@ -1103,12 +1114,7 @@ impl Worker {
                 self.sender.report = Some(report);
             }
             if check.cursor == self.sender.lanes.len()
-                && self.sender.outgoing.len()
-                    < self
-                        .sender
-                        .outgoing
-                        .capacity()
-                        .saturating_sub(6 * self.shared.workers())
+                && room(&self.sender.outgoing, self.shared.workers())
             {
                 self.sender.queue(
                     0,
@@ -1126,23 +1132,13 @@ impl Worker {
                 self.sender.losses[group] = Some(check);
                 // Reports in transit wake us when returned; do not spin waiting for them.
                 more |= self.sender.report.is_some()
-                    && self.sender.outgoing.len()
-                        < self
-                            .sender
-                            .outgoing
-                            .capacity()
-                            .saturating_sub(6 * self.shared.workers());
+                    && room(&self.sender.outgoing, self.shared.workers());
             }
         }
         Ok(more
             || (self.sender.checks_pending != 0
                 && self.sender.report.is_some()
-                && self.sender.outgoing.len()
-                    < self
-                        .sender
-                        .outgoing
-                        .capacity()
-                        .saturating_sub(6 * self.shared.workers())))
+                && room(&self.sender.outgoing, self.shared.workers())))
     }
 
     pub(super) fn service_sender(&mut self, now: Duration) -> io::Result<bool> {
@@ -1153,14 +1149,7 @@ impl Worker {
         let ack_blocked = self.sender.checks_pending != 0 || self.sender.loss_fences != 0;
         self.begin_sender_ack()?;
         for group in 0..self.sender.fresh.len() {
-            if self.sender.fresh[group]
-                && self.sender.outgoing.len()
-                    < self
-                        .sender
-                        .outgoing
-                        .capacity()
-                        .saturating_sub(6 * self.shared.workers())
-            {
+            if self.sender.fresh[group] && room(&self.sender.outgoing, self.shared.workers()) {
                 self.sender.queue(0, Message::ProbeReplied { group })?;
                 self.sender.fresh[group] = false;
             }
@@ -1275,13 +1264,7 @@ impl Worker {
                             self.sender.probes[group] =
                                 (count > 1).then_some((epoch, id, count - 1));
                         }
-                    } else if self.sender.outgoing.len()
-                        < self
-                            .sender
-                            .outgoing
-                            .capacity()
-                            .saturating_sub(6 * self.shared.workers())
-                    {
+                    } else if room(&self.sender.outgoing, self.shared.workers()) {
                         self.sender.queue(
                             0,
                             Message::ProbeReturn {
@@ -1659,13 +1642,7 @@ impl Worker {
             return Ok(Claimed::Abandoned);
         }
         // Every successful send owes the owner one summary; never strand it.
-        if self.sender.outgoing.len()
-            >= self
-                .sender
-                .outgoing
-                .capacity()
-                .saturating_sub(6 * self.shared.workers())
-        {
+        if !room(&self.sender.outgoing, self.shared.workers()) {
             self.sender.retry = Some(now);
             return Ok(Claimed::Waiting);
         }

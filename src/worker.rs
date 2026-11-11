@@ -7613,6 +7613,331 @@ mod tests {
         (shared, workers)
     }
 
+    // Two linked senders with both sessions installed. Packets 1..=200 are
+    // submitted on each local lane, so ACKs can pass validation. Unlike the
+    // ignored fixtures above, this opens no socket or TAP: only eventfd, epoll,
+    // timerfd and io_uring descriptors, so ordinary test runs can use it.
+    fn linked_workers() -> (Arc<Shared>, [Worker; 2]) {
+        let (shared, mut workers) = test_workers();
+        let params = wire::Params {
+            port: 40000,
+            max_frame_len: 9022,
+            mandatory_features: 0,
+            optional_features: 0,
+        };
+        let connection = Connection {
+            role: handshake::Role::Initiator,
+            initiator: Tag::new(1).unwrap(),
+            responder: Tag::new(2).unwrap(),
+            local: params,
+            peer: wire::Params {
+                port: 40001,
+                ..params
+            },
+            max_frame_len: 9022,
+        };
+        for from in 0..2 {
+            let (tx, rx) = crate::spsc::channel();
+            workers[from].outgoing[1 - from] = Some(tx);
+            workers[1 - from].incoming[from] = Some(rx);
+        }
+        let install = Command {
+            generation: 1,
+            phase: Phase::Install,
+            connection: Some(connection),
+        };
+        for worker in &mut workers {
+            for session in 0..2 {
+                worker.command(session, install, 0).unwrap();
+            }
+            worker.unpaced_fixture = false;
+        }
+        Worker::init_senders(&mut workers).unwrap();
+        let mut probe = [0; 64];
+        for worker in &mut workers {
+            let lane = worker.id;
+            for session in 0..2 {
+                worker.install_sender(session, 1, true).unwrap();
+                let index = worker.sender_index(session, lane).unwrap();
+                for _ in 0..200 {
+                    let packet = worker.sessions[session].tx[lane]
+                        .as_mut()
+                        .unwrap()
+                        .record(Record::Probe, &mut probe)
+                        .unwrap();
+                    let state = &mut worker.sender.lanes[index];
+                    state
+                        .history
+                        .reserve(packet.number, (packet.length + 48) as u16, true, true)
+                        .unwrap();
+                    assert!(state.submitted(packet.number, Duration::ZERO, None));
+                }
+            }
+        }
+        (shared, workers)
+    }
+
+    // Worker 1 owns lane 7 of session 0, so its datagrams need no handoff.
+    fn local_receive_lane(shared: &Shared, workers: &mut [Worker; 2]) {
+        let mut lane = workers[0].sessions[0].free.pop().unwrap();
+        lane.reset(7, 9022).unwrap();
+        workers[1].sessions[0].rx[0] = Some(lane);
+        workers[1].sessions[0].rx_index[7] = 1;
+        shared.owners[0][7].store(2, Ordering::Release);
+    }
+
+    fn receive(worker: &mut Worker, bytes: &[u8], segment: usize, now: Duration) -> io::Result<()> {
+        let mut buffer = worker.free.pop().unwrap();
+        buffer.length = bytes.len();
+        buffer.bytes[..bytes.len()].copy_from_slice(bytes);
+        buffer.segment_size = segment;
+        buffer.deadline = now;
+        worker.received.push_back(buffer);
+        while worker.drain_packets(now)? {}
+        Ok(())
+    }
+
+    #[test]
+    fn ack_floods_behind_backed_up_sender_queues_keep_both_workers() {
+        let (shared, mut workers) = linked_workers();
+        local_receive_lane(&shared, &mut workers);
+        let now = Duration::ZERO;
+        // Neither worker drains the other, so sender messages stay queued.
+        for (index, worker) in workers.iter_mut().enumerate() {
+            let filler = || Event::ProbeFeedback {
+                session: 0,
+                tag: 0,
+                lane: 1,
+                packet: 0,
+                length: 0,
+            };
+            while worker.push(1 - index, filler()).is_ok() {}
+            // Sends and other gated messages fill the queue up to their limit.
+            while sender::room(&worker.sender.outgoing, 2) {
+                let message = if index == 0 {
+                    // A stale round: worker 1 discards it.
+                    sender::Message::Probe {
+                        group: 0,
+                        epoch: u64::MAX,
+                        session: 0,
+                        generation: 1,
+                        lane: 2,
+                        count: 1,
+                    }
+                } else {
+                    sender::Message::ProbeReplied { group: 0 }
+                };
+                worker.sender.queue(1 - index, message).unwrap();
+            }
+        }
+        // Every record names lane 1, owned by worker 0, and takes one ACK buffer.
+        let ranges = [wire::AckRange { start: 1, end: 1 }];
+        let ack = Record::Ack {
+            lane: 1,
+            delay_us: 0,
+            ranges: wire::AckRanges::new(&ranges).unwrap(),
+        };
+        let mut bytes = [0; 4096];
+        for number in 1..=2 {
+            let length = receive_bytes(number, &[ack; wire::MAX_RECORDS], &mut bytes);
+            receive(&mut workers[1], &bytes[..length], 0, now).unwrap();
+        }
+        assert!(workers[1].sender.ack_free.is_empty());
+        assert_eq!(workers[1].counters.ack_buffer_drops, 2 * 64 - 32);
+        // Worker 0 applies them and queues every buffer's return behind its own backlog.
+        for _ in 0..64 {
+            workers[0].drain_queues(now).unwrap();
+            workers[0].service_sender(now).unwrap();
+            workers[1].flush_sender_messages(now).unwrap();
+        }
+        let returns = workers[0]
+            .sender
+            .outgoing
+            .iter()
+            .filter(|(_, message)| matches!(message, sender::Message::AckReturn(_)))
+            .count();
+        assert_eq!(returns, 32);
+        for _ in 0..64 {
+            for worker in &mut workers {
+                worker.drain_queues(now).unwrap();
+                worker.service_sender(now).unwrap();
+            }
+        }
+        for worker in &workers {
+            assert_eq!(worker.sender.ack_free.len(), 32);
+        }
+    }
+
+    #[test]
+    fn random_and_mutated_datagrams_never_stop_the_workers() {
+        use crate::tap::test_common::fuzz::{INPUTS, Rng};
+        use wire::{AckRange, AckRanges};
+        let (_, mut workers) = linked_workers();
+        let turn = |workers: &mut [Worker; 2], now: Duration| {
+            for worker in workers.iter_mut() {
+                worker.drain_queues(now).unwrap();
+                while worker.drain_packets(now).unwrap() {}
+                worker.service_sender(now).unwrap();
+                worker.progress_barriers(now).unwrap();
+                worker.flush_taps(now).unwrap();
+                worker.collect_acks(now).unwrap();
+                worker.flush_control(now).unwrap();
+                worker.flush_sender_messages(now).unwrap();
+                worker.flush_returns();
+            }
+        };
+        let mut rng = Rng::new(0x3075_0001);
+        let payload = [0x5a; MAX_FRAME_LEN];
+        let mut output = [0; crate::socket::MAX_UDP_PAYLOAD];
+        let mut bytes = Vec::new();
+        let mut storage = [[AckRange { start: 0, end: 0 }; 4]; 4];
+        let (mut now, mut packet) = (Duration::ZERO, 1_u64);
+        // Each input costs a full turn of both workers; a tenth keeps debug runs near a second.
+        for _ in 0..INPUTS / 10 {
+            // Mostly a few registered lanes, so packets reach admitted lanes.
+            let lane = match rng.below(16) {
+                0 => (rng.bits() as u16).max(1),
+                1 => 60 + rng.below(8) as u16,
+                _ => 1 + rng.below(8) as u16,
+            };
+            let mut counts = [0; 4];
+            for (ranges, count) in storage.iter_mut().zip(&mut counts) {
+                let mut top = 1 + rng.below(260) as u64;
+                for range in ranges.iter_mut() {
+                    let start = top.saturating_sub(rng.below(40) as u64).max(1);
+                    *range = AckRange { start, end: top };
+                    *count += 1;
+                    if start < 3 || rng.below(2) == 0 {
+                        break;
+                    }
+                    top = start - 2 - rng.below(start as usize - 2) as u64 / 4;
+                }
+            }
+            let mut records = [Record::Probe; 4];
+            let count = 1 + rng.below(records.len());
+            for (slot, record) in records[..count].iter_mut().enumerate() {
+                let sequence = 1 + rng.below(300) as u64;
+                *record = match rng.below(8) {
+                    0 | 1 => {
+                        // Mostly one length per frame, so pieces can complete it.
+                        let total = if rng.below(16) == 0 {
+                            14 + rng.below(MAX_FRAME_LEN - 13)
+                        } else {
+                            60 + (sequence as usize * 131) % 3000
+                        };
+                        let offset = rng.below(total);
+                        Record::Data {
+                            frame_id: (u64::from(lane) << 48) | sequence,
+                            total_len: total as u32,
+                            offset: offset as u32,
+                            bytes: &payload[..1 + rng.below((total - offset).min(1400))],
+                        }
+                    }
+                    2 => match AckRanges::new(&storage[slot][..counts[slot]]) {
+                        Ok(ranges) => Record::Ack {
+                            lane: [1, 2, 3, rng.bits() as u16][rng.below(4)],
+                            delay_us: rng.below(1001) as u32,
+                            ranges,
+                        },
+                        Err(_) => Record::Probe,
+                    },
+                    3 => Record::Probe,
+                    4 => Record::ProbeReply {
+                        lane: [0, 1, 2, 3, rng.bits() as u16][rng.below(5)],
+                        packet_number: [sequence, rng.bits()][rng.below(2)],
+                        payload_len: 52 + rng.below(9000) as u16,
+                    },
+                    5 => Record::FrameAbandon {
+                        lane,
+                        origin: 0,
+                        reason: 1 + rng.below(4) as u8,
+                        frame_id: (u64::from(lane) << 48) | sequence,
+                    },
+                    // Mostly unused lanes, so a few registered lanes stay live.
+                    6 if rng.below(16) == 0 => Record::LaneRetire {
+                        lane: 1 + rng.below(8) as u16,
+                    },
+                    6 => Record::LaneRetire {
+                        lane: 9 + rng.below(65_000) as u16,
+                    },
+                    _ => Record::Padding {
+                        length: rng.below(64) as u16,
+                    },
+                };
+            }
+            packet += 1 + rng.below(2) as u64;
+            let packet_number = match rng.below(10) {
+                0 => packet.saturating_sub(rng.below(100_000) as u64).max(1),
+                1 => {
+                    packet += rng.below(70_000) as u64;
+                    packet
+                }
+                2 => rng.bits().max(1),
+                _ => packet,
+            };
+            let cookie = [[9; 16], [1; 16], [2; 16], [2; 16]][rng.below(4)];
+            let header = Header {
+                cookie: crate::UnquicUuid::from_bytes(cookie),
+                receive_tag: if rng.below(16) == 0 { 2 } else { 1 },
+                lane,
+                record_area_len: 0,
+                packet_number,
+            };
+            let Ok(length) = wire::encode_datagram(header, &records[..count], &mut output) else {
+                continue;
+            };
+            bytes.clear();
+            bytes.extend_from_slice(&output[..length]);
+            if rng.below(4) == 0 {
+                rng.mutate(&mut bytes);
+                // Usually keep the session and tag, so mutations reach lane dispatch.
+                if rng.below(2) == 0
+                    && let Some(identity) = bytes.get_mut(4..36)
+                {
+                    identity.copy_from_slice(&output[4..36]);
+                }
+            }
+            if rng.below(64) == 0 {
+                now += Duration::from_millis(rng.below(200) as u64);
+            }
+            turn(&mut workers, now);
+            let worker = &mut workers[rng.below(2)];
+            // Some inputs arrive as a GRO aggregate cut at an arbitrary segment size.
+            let segment = if rng.below(8) == 0 {
+                1 + rng.below(bytes.len().max(1))
+            } else {
+                0
+            };
+            let before = worker.counters.malformed_packets;
+            receive(worker, &bytes, segment, now).unwrap();
+            let counted = worker.counters.malformed_packets - before;
+            if segment == 0 {
+                // Undecodable input counts once; so may an admission refusal.
+                let invalid = bytes.len() > crate::socket::MAX_UDP_PAYLOAD
+                    || Datagram::decode(&bytes).is_err();
+                assert!(if invalid { counted == 1 } else { counted <= 1 });
+            }
+        }
+        for _ in 0..64 {
+            now += Duration::from_millis(50);
+            turn(&mut workers, now);
+        }
+        for worker in &workers {
+            assert_eq!(worker.free.len(), BUFFERS);
+        }
+        // Inputs reached admitted lanes and the ACK path, not only the decoder.
+        let total = |field: fn(&Snapshot) -> u64| -> u64 {
+            workers.iter().map(|w| field(&w.counters)).sum()
+        };
+        assert!(total(|c| c.malformed_packets) != 0);
+        assert!(total(|c| c.duplicate_packets) != 0);
+        assert!(
+            workers
+                .iter()
+                .any(|w| w.sender.lanes.iter().any(|lane| lane.largest_ack != 0))
+        );
+    }
+
     #[test]
     #[ignore = "kernel descriptor test; run in a disposable container"]
     fn receive_only_worker_ignores_empty_mtu_schedule_after_install() {

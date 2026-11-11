@@ -1089,9 +1089,14 @@ full expired batches sharing the cleanup budget.
   ancillary data and rtnetlink replies, as random bytes or mutated valid
   frames. None panicked. The 82 indexing sites on those paths whose bound
   came from a check in another function now use checked access; the rest have
-  a local check or index fixed arrays. Remaining: indexing in internal state
-  (worker tables, encoders, the batch planner), arithmetic overflow (release
-  builds wrap; debug builds check), thread startup/join errors and the
+  a local check or index fixed arrays. Every packet-derived value was then
+  traced through the worker, sender, ACK history, pacing, PMTU and handshake
+  code: none reaches an unchecked index or overflow, but a burst of ACK
+  records while another worker lagged could fill the sender message queue and
+  return an error that stopped the runtime. The queue now reserves room for
+  every ACK buffer, and a randomized test drives 20,000 mutated datagrams
+  through two linked workers' receive paths. Remaining: indexing in internal
+  state (encoders, the batch planner), thread startup/join errors and the
   fault-injection tests.
 
   ```sh

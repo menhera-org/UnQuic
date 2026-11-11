@@ -404,9 +404,7 @@ impl Owner {
             more = true;
         }
         if let Some(check) = &mut self.groups[group].check {
-            if check.unsent != 0
-                && outgoing.len() < outgoing.capacity().saturating_sub(6 * self.workers)
-            {
+            if check.unsent != 0 && room(outgoing, self.workers) {
                 let worker = check.unsent.trailing_zeros() as usize;
                 outgoing.push_back((
                     worker,
@@ -427,7 +425,7 @@ impl Owner {
         if let Some(at) = state.pto.deadline(&state.rtt, latest.map(|(_, at)| at)) {
             self.round_due = Some(self.round_due.map_or(at, |old| old.min(at)));
         }
-        if outgoing.len() < outgoing.capacity().saturating_sub(6 * self.workers)
+        if room(outgoing, self.workers)
             && let Some((target, count)) = state.probe
             && let Some(id) = target
                 .filter(|id| self.timers.matches(*id))
