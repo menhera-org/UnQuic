@@ -1220,10 +1220,17 @@ November 10 evidence for that list, all in BENCH.md:
   default. On the decision workload, against a bar stated first, every 2G
   direction rises 12–89% and every 5G row total 5–30% and weaker direction
   16–86%, and it was briefly the default. But the loopback overload check
-  falls from 6.54 / 2.30 to 1.49 / 1.45 Gbit/s with no thread busy
-  ([BENCH.md](BENCH.md#round-robin-lanes-by-default-november-11)). Find what
-  waits before any lane-placement change is adopted, and judge such changes
-  on both workloads.
+  fell from 6.54 / 2.30 to 1.49 / 1.45 Gbit/s with no thread busy
+  ([BENCH.md](BENCH.md#round-robin-lanes-by-default-november-11)): the window
+  limit the RTT floor later removed. Re-evaluated after the floor
+  ([BENCH.md](BENCH.md#balanced-lanes-after-the-window-floor-november-11)),
+  the single-flow target rises 42–58% and decision medians 17%, but the
+  loopback check and the formerly favoured decision directions still lose up
+  to 14%, so it stays off. Its single-flow gain is incidental striping: tun
+  steers a flow to the queue the daemon last wrote its reverse direction on,
+  so with balanced lanes one flow's reads and sends spread over every worker.
+  A deliberate version that keeps the strong direction is the next
+  lane-placement candidate.
 - FEC or a loss-agnostic response: at 5% random loss draft 07 collapses
   delivery below 11% of even a 0.5 Gbit/s offer.
 - Batching while application-limited: correctly marked light load stays in
