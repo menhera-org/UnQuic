@@ -136,6 +136,33 @@ the off range by more than its width, and the row total falls by no more
 than 10%; (3) single-flow target: every 5G direction median rises beyond the
 off range. If all three hold, the switch becomes the default.
 
+[Three interleaved repeats of each](benches/tap-balance-flows-floor.json):
+
+- Single-flow target: every 5G direction rises beyond the off range, by
+  42–58% (1.46 / 1.45 against 0.98 / 1.02 Gbit/s at 0.5% loss, 1.53 / 1.48
+  against 0.96 / 1.02 at 1%). Condition (3) holds.
+- Loopback check: the total falls 9.9%, inside the allowance, but both
+  directions fall below the off range by more than its width (L→R 5.31
+  against 5.93–6.51, R→L 5.50 against 5.68–5.83). Condition (2) fails.
+- Decision workload: the median change of the sixteen 2G and 5G medians is
+  +17.3%, the formerly starved directions rising up to +121%, but the
+  formerly favoured ones fall up to 14% at 5G (sixteen flows without loss
+  L→R: 1.87 against 2.16–2.18), and one 0.5G cell dips 1.3%. Condition (1)
+  fails.
+
+The switch stays off. It moves capacity from the direction hashing favoured
+to the starved one and raises totals, which the bar, written to protect every
+direction, does not accept.
+
+A profile of the single flow shows where its gain comes from. With hash lanes
+one worker reads the whole flow from the TAP and another sends it all (about
+80% busy) while two workers idle. With balanced lanes all four read and send,
+each 45–55% busy: the tun driver steers a flow's packets to the queue the
+daemon last wrote that flow's reverse direction on, those writes move between
+workers, and each new reader's table gives the flow a new lane. Balanced
+lanes thus stripe a single flow in effect, which is where its 42–58% comes
+from.
+
 ## The queue check from each round's smallest RTT (November 11)
 
 The queue check below uses the largest RTT sample in a loss round, so one
