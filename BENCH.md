@@ -269,7 +269,22 @@ it stays off.
 | 5G weaker direction | 1.335 (1.312–1.366) | 1.672 (1.577–1.783) |
 
 Both 0.5G medians lie within the control's range, and the 2G and 5G points
-again clear it. `daemon.balance_flows` is now on by default.
+again clear it. `daemon.balance_flows` was turned on by default.
+
+It went back off the same morning. The loopback overload check (eight
+workers, sixteen 44-segment GSO flows each way, QinQ, 21 Gbit/s requested,
+[three interleaved repeats](benches/tap-balance-flows-loop.json), one binary)
+was not part of the bar and should have been:
+
+| Lanes | L→R Gbit/s | R→L Gbit/s | Busiest thread L / R |
+| --- | --- | --- | --- |
+| Hash | 6.54 (6.14–6.69) | 2.30 (2.23–2.41) | 93.8% / 76.5% |
+| Balanced | 1.49 (1.42–1.49) | 1.45 (1.44–1.51) | 53.5% / 56.7% |
+
+Balanced lanes cut L→R by 77% and R→L by 37% while no thread is busy, so
+something waits rather than computes; the cause is not yet known. The
+decision workload alone cannot adopt a lane-placement change: such changes
+must also clear the loopback check.
 
 ## Round-robin lanes for new flows (November 10)
 

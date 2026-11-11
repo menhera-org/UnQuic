@@ -36,8 +36,9 @@ pub struct Daemon {
     /// Deviation from BBR draft 07, off by default: outside bandwidth probing,
     /// cut the short-term bounds only after a loss round above 2% loss.
     pub tolerate_random_loss: bool,
-    /// On by default: pin each new flow to the next lane round-robin instead
+    /// Off by default: pin each new flow to the next lane round-robin instead
     /// of its hash lane, so a few heavy flows use separate transmit workers.
+    /// It helps the decision workload but cuts the loopback check by up to 4x.
     pub balance_flows: bool,
 }
 impl Default for Daemon {
@@ -45,7 +46,7 @@ impl Default for Daemon {
         Self {
             memory_limit: 256 * 1024 * 1024,
             tolerate_random_loss: false,
-            balance_flows: true,
+            balance_flows: false,
         }
     }
 }
