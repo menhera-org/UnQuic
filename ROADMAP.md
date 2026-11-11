@@ -221,7 +221,9 @@ rules apply to all of them.
    way, so the per-bit cost must fall by almost half. Sending batches takes
    about 25% of busy cycles (`sendmmsg` alone 11%), TAP writes 15%, receive
    processing 11%, and applying ACK reports to frames (`stage_recovery`)
-   7.6%, which is per-packet bookkeeping and the clearest target
+   7.6%. On the decision workload sending takes 30%, TAP reads and writes
+   15% each and `stage_recovery` 3%, so the per-frame I/O path is the general
+   target and the journal's per-packet bookkeeping a loopback-rate one
    ([BENCH.md](BENCH.md#receive-buffers-for-a-busy-reader-november-11)).
 6. **Stage 4**, as listed in its section: OVS in the composition matrix (the
    test images lack it) and the remaining resource stress. The panic audit is

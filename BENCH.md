@@ -314,6 +314,27 @@ pops the journal, and releases frames whose bytes are all acknowledged.
 Per-packet bookkeeping for frames that usually span one or two packets is
 the next optimisation target, after batch sending and TAP writes.
 
+The same diagnostic build on the decision workload (sixteen flows, without
+and with 0.1% loss, one run each, all four load points;
+[worker lines](benches/tap-decision-profile-split.txt)) delivered 1.94 / 1.54
+and 1.93 / 1.44 Gbit/s at 5G and splits differently:
+
+| Phase | No loss | 0.1% loss |
+| --- | --- | --- |
+| Sending batches (`flush_frames` plus under grants) | 29.9% | 29.3% |
+| `read_tap` | 14.9% | 15.0% |
+| `flush_taps` | 14.7% | 14.5% |
+| `flush_notifications` | 5.8% | 5.8% |
+| `read_socket` | 5.7% | 5.6% |
+| `drain_packets` | 4.1% | 4.2% |
+| `stage_recovery` | 3.2% | 3.2% |
+
+Here individual 1,522-byte frames make TAP reads as costly as TAP writes,
+and `stage_recovery` falls to 3.2%. Across both workloads the per-frame I/O
+path dominates: sending batches takes 25–30% of busy cycles and TAP reads
+and writes another 20–30%. `stage_recovery` matters mainly at loopback
+rates.
+
 ## Balanced lanes after the window floor (November 11)
 
 Balanced lanes went back off because the loopback check fell from 6.54 /
