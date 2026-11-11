@@ -207,8 +207,8 @@ something different at the 21G point:
 - L→R is input-limited. Its senders hold their flight without asking for a
   grant 81% of the time, mostly with nothing queued. BBR is in ProbeBW_CRUISE
   84% of the time with a mean pacing rate of 16.3 Gbit/s; pacing and the
-  window refuse requests only 6% and 2% of the time. The left reader, at 97%,
-  cannot feed them, and it spends a further 19% of the point blocked by a
+  window refuse requests only 6% and 2% of the time. The left reader, the
+  busiest thread at 96%, cannot feed them, and it spends a further 19% of the point blocked by a
   full packet history.
 - R→L is limited by congestion control. The right controller spends 48% of
   the point in ProbeBW_DOWN after 29,345 losses, and its senders are refused
