@@ -335,6 +335,51 @@ path dominates: sending batches takes 25–30% of busy cycles and TAP reads
 and writes another 20–30%. `stage_recovery` matters mainly at loopback
 rates.
 
+## Arming the timer only before blocking (November 11)
+
+A `profile` build that also times `timerfd_settime` shows the loopback check
+re-arming each worker's timer about once per turn: 4.0 million calls over
+the run (1.5 million left, 2.5 million right) at about 3,300 cycles each,
+2.7% of all busy cycles and 70% of the `arm` phase. When work is due at
+once, the next deadline is the turn's start time. The worker arms a timer
+for that instant, blocks in `epoll_wait`, wakes when it fires, reads the
+timerfd and re-arms on the next turn. The candidate polls instead of
+blocking when a deadline is already due, and arms the timer only when it
+will block. In one profiled run it cut `timerfd_settime` calls by 61% and
+44%, the `arm` phase from 3.6% to 2.4% of busy cycles, and `reactor_drain`
+from 3.0% to 2.3%.
+
+Stated before measuring, three interleaved repeats each against the current
+build, with the bars used for waking only sleeping workers: (1) on the
+loopback check the total median rises beyond the control's range and
+neither direction falls below the control's minimum by more than the
+control's range width; (2′) on the decision workload the median relative
+change over the 24 direction-points is no worse than −2%, and no
+direction's delivered share of its offer falls below the control's minimum
+share by more than the control's range of shares or 0.5 percentage points,
+whichever is larger. If both hold and both kernel suites pass, the change
+lands; otherwise the patch is kept in `benches/`.
+
+[Loopback check](benches/tap-arm-only-blocking-loop.json), three interleaved
+repeats, 21G point:
+
+| Build | L→R Gbit/s | R→L Gbit/s | Total Gbit/s |
+| --- | --- | --- | --- |
+| Current | 6.310 (6.165–6.751) | 6.023 (5.990–6.725) | 12.774 (12.155–13.035) |
+| Arm only before blocking | 6.710 (6.553–6.990) | 6.209 (6.189–6.377) | 12.899 (12.762–13.368) |
+
+Both direction medians rise (6.3% and 3.1%), but the total median rises
+only 1.0% and stays inside the control's range, which this time spans 7%.
+Condition (1) fails. Three repeats cannot resolve a gain of a few percent
+against that spread.
+
+A paired design, stated before running it, tests the same builds with more
+data: eight interleaved pairs of loopback runs. The candidate passes if its
+total beats the paired control's total in at least seven of the eight pairs
+(a one-sided sign test, p ≈ 0.035 if the builds were equal), and the median
+paired change in each direction is no worse than −2%. Condition (2′) on the
+decision workload is unchanged. Both results are reported.
+
 ## Waking only sleeping workers (November 11)
 
 `flush_notifications` takes 5–6% of busy cycles on both workloads. After any
