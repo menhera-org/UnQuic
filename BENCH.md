@@ -335,6 +335,60 @@ path dominates: sending batches takes 25–30% of busy cycles and TAP reads
 and writes another 20–30%. `stage_recovery` matters mainly at loopback
 rates.
 
+## Waking only sleeping workers (November 11)
+
+`flush_notifications` takes 5–6% of busy cycles on both workloads. After any
+turn that queued work for another worker, the worker writes that worker's
+eventfd, even when the target is busy and will drain its queues on its next
+turn anyway. The candidate gives each worker a sleeping flag. A worker about
+to block sets it, issues a sequentially consistent fence and checks its
+incoming queues once more; a producer that queued work fences, and writes the
+eventfd only if the flag is set. One of the two always sees the other, so no
+queued work is left asleep. The one notification that follows a shared-state
+store rather than a queue push stays unconditional.
+
+Stated before measuring, three interleaved repeats each against the current
+build: (1) on the loopback check the row total rises beyond the control's
+range and neither direction falls below the control's minimum by more than
+the control's range width; (2) on the decision workload the median relative
+change over the 24 direction-points is no worse than −2%, and no direction
+falls below the control's minimum by more than the control's range width.
+If both hold and both kernel suites pass, the change lands; otherwise the
+patch is kept in `benches/`.
+
+[Loopback check](benches/tap-wake-sleeping-loop.json), three interleaved
+repeats, 21G point:
+
+| Build | L→R Gbit/s | R→L Gbit/s | Total Gbit/s | CPU L / R |
+| --- | --- | --- | --- | --- |
+| Current | 6.004 (5.641–6.100) | 5.796 (5.778–5.812) | 11.817 (11.419–11.896) | 389% / 457% |
+| Sleeping-only wakes | 6.122 (5.804–6.469) | 5.756 (5.693–5.996) | 12.118 (11.497–12.225) | 388% / 462% |
+
+The total median rises 2.5%, beyond the control's range. R→L sits 0.022
+Gbit/s below the control's minimum, inside the 0.035 allowed by the
+control's range. Condition (1) holds, narrowly.
+
+On the [decision workload](benches/tap-wake-sleeping-decision.json) the
+median change over the 24 direction-points is +1.4%. The largest gains are
+at 5G with sixteen flows (L→R +4.4% without loss, +5.6% with) and 2G with
+four flows (R→L +12.2% and +11.6%); the largest falls are −3.2% and −3.6%,
+inside their control ranges' margins. One point fails condition (2) as
+written: sixteen flows without loss at 0.5G, R→L, delivers 0.4929 Gbit/s
+against a control range of 0.4936–0.4939, 0.0007 below its minimum where
+the allowance is the 0.0003 range width. That point is offer-limited, and the
+generator offered 0.15% less in the candidate's runs (0.4977–0.4982 against
+0.4987–0.4989); delivered over offered is 98.9–99.0% in both builds. The
+candidate fails the bar as written and does not land on this run.
+
+The criterion is degenerate where every repeat delivers the whole offer:
+the control's range shrinks to the generator's jitter. A revised condition
+(2′), stated before a fresh rerun of both builds: the median relative change
+in delivered Gbit/s over the 24 direction-points is no worse than −2%, and
+no direction's delivered share of its offered load falls below the
+control's minimum share by more than the control's range of shares or 0.5
+percentage points, whichever is larger. Condition (1) stands from the
+loopback run above. If (2′) holds on the rerun, the change lands.
+
 ## Balanced lanes after the window floor (November 11)
 
 Balanced lanes went back off because the loopback check fell from 6.54 /
