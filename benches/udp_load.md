@@ -131,9 +131,15 @@ come in bursts: above 1, netem's Gilbert model loses every datagram in its bad
 state, which lasts that many datagrams on average, and the loss rate must stay
 below 100%. `OUTER_REORDER_PERMILLE`, 0–1000, sends that share of datagrams
 without the delay, so they overtake earlier ones; it needs a nonzero delay.
+`OUTER_RATE_MBIT` limits each router egress to that rate, making it a shared
+bottleneck, and `OUTER_QUEUE_PACKETS` (default 8192) sets its queue length.
+With `OUTER_ROUTED=1`, `COMPETING_TCP=1` runs one netcat TCP stream from the
+left outer namespace to the right one for each load point, sharing that
+bottleneck with the tunnel; `competing-bytes` holds the bytes received in the
+point's seconds.
 Each snapshot's `memory` file records both daemons' VmHWM and VmRSS.
 `DAEMON_TOML`, when set, starts both daemon configurations, for
-example `[daemon]` options. Netem has an 8192-entry queue on each router egress. Qdisc snapshots
+example `[daemon]` options. Netem has an 8192-entry queue on each router egress unless `OUTER_QUEUE_PACKETS` says otherwise. Qdisc snapshots
 record drops and backlog; drops can include queue overflow as well as the
 configured random loss.
 

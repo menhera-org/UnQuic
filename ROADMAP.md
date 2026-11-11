@@ -1228,7 +1228,15 @@ November 10 evidence for that list, all in BENCH.md:
   delivery below 11% of even a 0.5 Gbit/s offer.
 - Batching while application-limited: correctly marked light load stays in
   Startup and sends about 1.4 frames per claim, costing CPU at equal delivery.
-- `tolerate_random_loss` by default: needs a coexistence measurement first.
+- `tolerate_random_loss` by default: measured on November 11 against one TCP
+  CUBIC flow at a 1 Gbit/s, 7.5 ms bottleneck
+  ([BENCH.md](BENCH.md#coexistence-with-tolerate_random_loss-november-11)).
+  With a one-BDP queue the switch leaves TCP's share unchanged (draft 07
+  already takes about 80%); with a quarter-BDP queue it cuts TCP's median by
+  18%, so it stays off by default. A loss response that separates random loss
+  from congestion (delay-based, or FEC) is still needed for the lossy target.
+  The shallow-queue run also shows both builds delivering only about a third
+  of that bottleneck.
 
 ## Stage 6: protocol freeze
 

@@ -139,6 +139,77 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Coexistence with `tolerate_random_loss` (November 11)
+
+The switch cuts the short-term bounds only after a round above 2% loss.
+Queue overflow at a shared bottleneck often loses less than that, so a
+tolerant sender might keep its rate and starve competing traffic. The
+harness now has an optional rate-limited outer bottleneck
+(`OUTER_RATE_MBIT`, `OUTER_QUEUE_PACKETS`) and an outer TCP flow through it
+(`COMPETING_TCP`).
+
+Stated before measuring: routed 7.5 ms RTT, a 1000 Mbit/s bottleneck each
+way with a 640-datagram queue (about one BDP), no random loss, one bridged
+QinQ flow each way offered 1 Gbit/s through the tunnel (four workers), and
+one Linux TCP CUBIC flow left to right through the same bottleneck. Three
+interleaved repeats with the switch off and on. If the TCP flow's median
+throughput with the switch on falls below the off build's range by more
+than that range's width, the switch harms coexistence and stays off by
+default. Otherwise coexistence is no worse at this bottleneck, and the
+switch becomes a candidate for the default, to be decided with the target
+evidence.
+
+[Three interleaved repeats](benches/tap-coexist.json), Mbit/s of inner
+goodput over 20 s:
+
+| Switch | Tunnel L→R | Tunnel R→L | Competing TCP L→R |
+| --- | --- | --- | --- |
+| Off | 689 (683–690) | 772 (747–784) | 156 (150–159) |
+| On | 696 (693–711) | 766 (753–770) | 160 (144–160) |
+
+The TCP flow's median does not fall, so by the bar coexistence is no worse
+here. Draft 07 itself already takes about 80% of this bottleneck from one
+CUBIC flow; the switch changes neither share. The bottleneck drops
+3,000–8,400 datagrams per run, 0.2–0.6% of the tunnel's traffic, the regime
+where a tolerant sender keeps its rate.
+
+The more adversarial shallow-buffer case was stated before running, with the
+same bar: a 160-datagram queue, a quarter of a BDP, everything else
+unchanged.
+
+| Switch (160-datagram queue) | Tunnel L→R | Tunnel R→L | Competing TCP L→R |
+| --- | --- | --- | --- |
+| Off | 238 (234–239) | 279 (278–284) | 74 (72–79) |
+| On | 259 (237–264) | 287 (285–296) | 61 (56–75) |
+
+With the shallow queue the TCP flow's median falls 18%, below the off build's
+range by more than its width: the switch harms coexistence there and stays
+off by default. Both builds use the bottleneck poorly with this queue (about
+a third of it delivered in total), a separate problem for draft 07 at 7.5 ms
+with a quarter-BDP buffer.
+
+## Arming the worker timer only before sleeping, rerun (November 11)
+
+The first run of this candidate (below) was judged by the flawed criterion.
+This rerun uses the current build, with the window RTT floor, and a bar
+stated before running: three interleaved repeats of the decision workload;
+adopt if the median relative change of the eight 5G direction medians is at
+least +3% and no direction at any point falls below the control's minimum by
+more than the control's own range width. Otherwise the patch stays rejected.
+
+[Three interleaved repeats](benches/tap-lazy-arm-rerun.json). The 5G medians
+change by +6.1% / +2.5% (sixteen flows, no loss), +2.7% / +8.0% (sixteen,
+0.1%), +4.0% / +5.0% (four, no loss) and +0.3% / +1.2% (four, 0.1%): a
+median of +3.3%, which meets the first condition. Every 2G direction is
+within or above the control's range. The second condition fails at 0.5G,
+where the control ranges are 0.3–1.6 Mbit/s wide: four flows with 0.1% loss
+fall to 0.486 / 0.488 Gbit/s against a control of 0.491–0.493, and sixteen
+flows without loss L→R to 0.4934 against 0.4941–0.4944. Each of those
+candidate cells has one repeat that dipped to 0.471–0.475 Gbit/s, the
+bimodal light-load behaviour recorded on November 9, but the bar counts
+them. The patch stays rejected. The rerun overlapped by a few seconds with
+the start of another container at its very end.
+
 ## Sizing windows from at least one ACK delay (November 11)
 
 On the loopback check, traces show the two lane placements differ in BBR's

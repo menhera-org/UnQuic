@@ -14,9 +14,12 @@ case "${OUTER_PAYLOAD_LIMIT:-1232}" in ''|*[!0-9]*) exit 2;; esac
 [ "${OUTER_PAYLOAD_LIMIT:-1232}" -ge 1232 ] && [ "${OUTER_PAYLOAD_LIMIT:-1232}" -le 1452 ] || exit 2
 case "${TAP_TXQUEUELEN:-10000}" in ''|*[!0-9]*) exit 2;; esac
 [ "${TAP_TXQUEUELEN:-10000}" -ge 1 ] && [ "${TAP_TXQUEUELEN:-10000}" -le 10000 ] || exit 2
-for number in "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" "${OUTER_LOSS_BURST:-1}" "${OUTER_REORDER_PERMILLE:-0}"; do
+for number in "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" "${OUTER_LOSS_BURST:-1}" "${OUTER_REORDER_PERMILLE:-0}" "${OUTER_RATE_MBIT:-0}" "${OUTER_QUEUE_PACKETS:-8192}"; do
     case "$number" in ''|*[!0-9]*|0[0-9]*) exit 2;; esac
 done
+[ "${OUTER_QUEUE_PACKETS:-8192}" -ge 1 ] || exit 2
+# A competing outer TCP flow needs the routed outer path it shares.
+case "${COMPETING_TCP:-0}" in 0) ;; 1) [ "${OUTER_ROUTED:-0}" = 1 ] || exit 2;; *) exit 2;; esac
 # Netem reorders by letting datagrams skip the delay, so reordering needs one.
 [ "${OUTER_REORDER_PERMILLE:-0}" -le 1000 ] || exit 2
 [ "${OUTER_REORDER_PERMILLE:-0}" -eq 0 ] || [ "${OUTER_DELAY_US:-0}" -gt 0 ] || exit 2
@@ -81,9 +84,10 @@ left=
 right=
 servers=
 clients=
+competing=
 processes=${GENERATOR_PROCESSES:-1}
 cleanup() {
-    for pid in $clients $servers "$left" "$right"; do
+    for pid in $clients $servers $competing "$left" "$right"; do
         [ -z "$pid" ] || kill "$pid" 2>/dev/null || :
     done
     wait || :
@@ -131,7 +135,7 @@ percent4() {
     printf '%s.%04d%%' "$(($1 / 10000))" "$(($1 % 10000))"
 }
 netem() {
-    if [ "${OUTER_DELAY_US:-0}" -ne 0 ] || [ "${OUTER_LOSS_PERMILLE:-0}" -ne 0 ]; then
+    if [ "${OUTER_DELAY_US:-0}" -ne 0 ] || [ "${OUTER_LOSS_PERMILLE:-0}" -ne 0 ] || [ "${OUTER_RATE_MBIT:-0}" -ne 0 ]; then
         loss=${OUTER_LOSS_PERMILLE:-0}
         burst=${OUTER_LOSS_BURST:-1}
         reorder=${OUTER_REORDER_PERMILLE:-0}
@@ -148,7 +152,9 @@ netem() {
         shift
         # Reordered datagrams skip the delay, so they overtake earlier ones.
         [ "$reorder" -eq 0 ] || set -- "$@" reorder "$((reorder / 10)).$((reorder % 10))%" 50%
-        tc qdisc add dev "$dev" root netem limit 8192 delay "${OUTER_DELAY_US:-0}us" "$@"
+        # A rate turns this direction into a shared bottleneck with a bounded queue.
+        [ "${OUTER_RATE_MBIT:-0}" -eq 0 ] || set -- "$@" rate "${OUTER_RATE_MBIT}mbit"
+        tc qdisc add dev "$dev" root netem limit "${OUTER_QUEUE_PACKETS:-8192}" delay "${OUTER_DELAY_US:-0}us" "$@"
     fi
 }
 ip link set lo up
@@ -359,7 +365,7 @@ printf '%s\n' "${VLAN_DEPTH:-0}" > "$out/vlan-depth"
 printf '%s\n' "${SRV6:-0}" > "$out/srv6"
 printf '%s\n' "${INNER_BRIDGE:-0}" > "$out/inner-bridge"
 printf '%s\n' "$frame" > "$out/frame-bytes"
-printf 'routed=%s\none_way_delay_us=%s\nloss_permille=%s\nloss_burst=%s\nreorder_permille=%s\n' "${OUTER_ROUTED:-0}" "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" "${OUTER_LOSS_BURST:-1}" "${OUTER_REORDER_PERMILLE:-0}" > "$out/outer-path"
+printf 'routed=%s\none_way_delay_us=%s\nloss_permille=%s\nloss_burst=%s\nreorder_permille=%s\nrate_mbit=%s\nqueue_packets=%s\ncompeting_tcp=%s\n' "${OUTER_ROUTED:-0}" "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" "${OUTER_LOSS_BURST:-1}" "${OUTER_REORDER_PERMILLE:-0}" "${OUTER_RATE_MBIT:-0}" "${OUTER_QUEUE_PACKETS:-8192}" "${COMPETING_TCP:-0}" > "$out/outer-path"
 printf '%s\n' "${DAEMON_TOML:-}" > "$out/daemon-toml"
 base=$out
 index=0
@@ -391,9 +397,22 @@ for rate in ${BITRATE:-0}; do
             servers="$servers $!"
             k=$((k + 1))
         done
+        if [ "${COMPETING_TCP:-0}" = 1 ]; then
+            # One outer TCP flow left to right shares the routed bottleneck with the tunnel;
+            # the receiver counts the bytes that arrive.
+            # Kept out of $servers, which snapshots signal with SIGUSR1.
+            nsenter --net="/run/netns/uq-out-right" taskset -c "$RECEIVER_RIGHT_CPUS" sh -c \
+                'nc -6 -l -s fd77:ff:2::1 -p 5201 | wc -c' > "$out/competing-bytes" &
+            competing=$!
+        fi
         sleep 0.2
         for pid in $servers; do kill -0 "$pid" || exit 1; done
         snapshot before
+        if [ "${COMPETING_TCP:-0}" = 1 ]; then
+            nsenter --net="/run/netns/uq-out-left" taskset -c "$GENERATOR_LEFT_CPUS" sh -c \
+                "timeout $seconds sh -c 'nc -6 -N fd77:ff:2::1 5201 < /dev/zero'; true" &
+            clients="$clients $!"
+        fi
         k=0
         while [ "$k" -lt "$processes" ]; do
             suffix=
@@ -428,6 +447,8 @@ for rate in ${BITRATE:-0}; do
     fi
     for pid in $clients; do wait "$pid"; done
     clients=
+    [ -z "$competing" ] || wait "$competing"
+    competing=
     if [ -n "${UDP_LOAD:-}" ]; then snapshot sent; fi
     for pid in $servers; do wait "$pid"; done
     servers=
