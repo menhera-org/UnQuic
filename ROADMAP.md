@@ -1249,7 +1249,7 @@ November 10 evidence for that list, all in BENCH.md:
   ([BENCH.md](BENCH.md#round-robin-lanes-by-default-november-11)): the window
   limit the RTT floor later removed. Re-evaluated after the floor
   ([BENCH.md](BENCH.md#balanced-lanes-after-the-window-floor-november-11)),
-  the single-flow target rises 42–58% and decision medians 17%, but the
+  the single-flow target rises 42–58% and decision medians 19%, but the
   loopback check and the formerly favoured decision directions still lose up
   to 14%, so it stays off. Its single-flow gain is incidental striping: tun
   steers a flow to the queue the daemon last wrote its reverse direction on,

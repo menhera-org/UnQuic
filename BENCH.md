@@ -415,7 +415,8 @@ off range. If all three hold, the switch becomes the default.
   directions fall below the off range by more than its width (L→R 5.31
   against 5.93–6.51, R→L 5.50 against 5.68–5.83). Condition (2) fails.
 - Decision workload: the median change of the sixteen 2G and 5G medians is
-  +17.3%, the formerly starved directions rising up to +121%, but the
+  +19.0% (first reported as +17.3%, the lower of the two middle values), the
+  formerly starved directions rising up to +121%, but the
   formerly favoured ones fall up to 14% at 5G (sixteen flows without loss
   L→R: 1.87 against 2.16–2.18), and one 0.5G cell dips 1.3%. Condition (1)
   fails.
