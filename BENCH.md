@@ -139,6 +139,90 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Arming the worker timer only before sleeping (November 11)
+
+Perf cannot run on either test host (the remote kernel refuses
+`perf_event_open` even to root and locks the sysctl), so a diagnostics-only
+`profile` feature adds timestamp-counter cycles per phase of the worker loop.
+On the remote Linux 7.0 host, one 1522-byte flow at 7.5 ms RTT with two
+workers per daemon, the transmit worker spends 8.6–8.9% of its cycles
+computing the next deadline and re-arming its timer on every turn. The
+deadline walks every queued TAP input and receive lane, so the cost grows
+with the queues it is meant to drain. A busy turn polls with a zero timeout
+and loops again, so the deadline only matters before a blocking wait.
+
+Stated before measuring: computing the deadline only before a blocking wait
+frees that share of a saturated worker. On the decision workload's CPU-bound
+5G points, at least half of the directions should rise beyond the control's
+range, and no direction at any point may fall beyond it. If both hold, the
+change is adopted; otherwise it is reverted and kept as a patch here.
+
+## Round-robin lanes by default? (November 11)
+
+The November 10 run below rejected `daemon.balance_flows` because, at 5G
+where both daemons are CPU-bound, the direction that hashing had favored lost
+4–18% while every row total rose. That bar treated CPU moving from a favored
+direction to a starved one as a loss. This run uses a new bar, stated before
+measuring, on the current build (`0a1e1f4`), one binary with the switch off
+and on, three interleaved repeats of the decision workload:
+
+- Unsaturated points (0.5G and 2G offered): no direction falls beyond the
+  control's range.
+- 5G points: no row's total (L→R plus R→L medians) falls beyond the control's
+  range of totals, and no row's weaker direction falls beyond the control's
+  range for that direction.
+
+If both hold, the switch becomes the default. Otherwise it stays off.
+
+[Three interleaved repeats](benches/tap-balance-flows-default.json), medians
+with ranges, Gbit/s. "Weaker" is each repeat's lower direction:
+
+| Flows, loss | Offered | Hash L→R / R→L | Balanced L→R / R→L |
+| --- | --- | --- | --- |
+| 16, 0% | 0.5G | 0.492 / 0.492 | 0.493 / 0.493 |
+| 16, 0.1% | 0.5G | 0.4914 (0.4913–0.4917) / 0.4921 (0.4919–0.4925) | 0.4907 (0.4729–0.4914) / 0.4902 (0.4721–0.4912) |
+| 4, 0% | 0.5G | 0.475 / 0.475 | 0.492 / 0.491 |
+| 4, 0.1% | 0.5G | 0.491 / 0.491 | 0.490 / 0.487 |
+| 16, 0% | 2G | 1.519 / 1.523 | 1.838 / 1.799 |
+| 16, 0.1% | 2G | 1.540 / 1.506 | 1.728 / 1.800 |
+| 4, 0% | 2G | 1.099 / 1.350 | 1.872 / 1.630 |
+| 4, 0.1% | 2G | 0.992 / 1.383 | 1.799 / 1.721 |
+
+| Flows, loss (5G) | Hash total | Balanced total | Hash weaker | Balanced weaker |
+| --- | --- | --- | --- | --- |
+| 16, 0% | 3.423 (3.315–3.427) | 3.582 (3.382–3.590) | 1.377 (1.326–1.391) | 1.729 (1.638–1.788) |
+| 16, 0.1% | 3.175 (3.171–3.253) | 3.340 (3.300–3.509) | 1.311 (1.304–1.397) | 1.593 (1.439–1.625) |
+| 4, 0% | 2.472 (2.471–2.493) | 2.960 (2.827–3.338) | 0.721 (0.719–0.754) | 1.302 (1.291–1.557) |
+| 4, 0.1% | 2.358 (2.208–2.384) | 3.077 (2.632–3.103) | 0.678 (0.655–0.728) | 1.261 (0.911–1.511) |
+
+Every 2G direction rises beyond the control's range, by 12–89%. At 5G every
+row total rises by 5–30% and every weaker direction by 16–86%, all medians
+above the control's whole range. One point fails the bar: at 0.5G with
+sixteen flows and 0.1% loss, the balanced medians sit 0.1–0.35% below a
+control range only 0.4–0.6 Mbit/s wide, and one balanced repeat lost 4%.
+The switch therefore stays off.
+
+Light load was bimodal in the November 9 noise study, so this point gets a
+follow-up, stated before running: five interleaved repeats of the
+sixteen-flow 0.1%-loss row only. If the balanced 0.5G medians lie within or
+above the control's range in both directions, and the 2G and 5G points of
+that row again meet the bar above, the switch becomes the default; otherwise
+it stays off.
+
+[The follow-up](benches/tap-balance-flows-followup.json), sixteen flows with
+0.1% loss, five interleaved repeats (medians with ranges, Gbit/s):
+
+| Point | Hash | Balanced |
+| --- | --- | --- |
+| 0.5G L→R | 0.4926 (0.4900–0.4934) | 0.4925 (0.4903–0.4932) |
+| 0.5G R→L | 0.4923 (0.4888–0.4928) | 0.4925 (0.4920–0.4930) |
+| 2G L→R / R→L | 1.542 (1.426–1.553) / 1.501 (1.422–1.571) | 1.896 (1.626–1.922) / 1.767 (1.619–1.884) |
+| 5G total | 3.193 (3.168–3.241) | 3.457 (3.343–3.616) |
+| 5G weaker direction | 1.335 (1.312–1.366) | 1.672 (1.577–1.783) |
+
+Both 0.5G medians lie within the control's range, and the 2G and 5G points
+again clear it. `daemon.balance_flows` is now on by default.
+
 ## Round-robin lanes for new flows (November 10)
 
 The section below shows four flows hashing onto two lanes in one direction.

@@ -374,8 +374,9 @@ applies only to new frames: a frame's pieces and repairs stay on its original la
 Any such change must document possible cross-lane reordering and verify overload
 behavior. eBPF is excluded because production hosts may prohibit loading programs.
 
-**Balanced flow lanes (November 10 amendment; `daemon.balance_flows`, off by
-default).** Fixed-key flow hashing can place a few heavy flows on the same
+**Balanced flow lanes (November 10 amendment; `daemon.balance_flows`, on by
+default since November 11, when a decision-workload run met a bar stated
+before it; see BENCH.md).** Fixed-key flow hashing can place a few heavy flows on the same
 transmit worker. With the switch, frames that would use strict hashing go
 through a per-reader four-way table of 4096 flows instead: a flow's first
 frame takes the session's next lane round-robin, and the flow keeps that lane

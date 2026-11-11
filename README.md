@@ -591,6 +591,13 @@ A reader owning no transmit lane also retains hashing and handoffs. Queue and
 lane counts remain independent; peers need not use identical values. eBPF is
 excluded from deployment.
 
+Fixed-key hashing can put a few heavy flows on the same transmit worker. With
+`daemon.balance_flows`, on by default, frames on the strict-hash path go
+through a per-reader table instead: a new flow takes the session's next lane
+round-robin and keeps it while it sends, moving only after a second of
+silence. On the decision workload this raised every 2G direction by 12–89% and
+every 5G row total by 5–30% (BENCH.md).
+
 Flow hashing looks through one unfragmented IPv4, IPv6 or Ethernet
 encapsulation, including an IPv6 segment routing header before the inner
 packet. It retains the outer key and adds the inner addresses, protocol and
