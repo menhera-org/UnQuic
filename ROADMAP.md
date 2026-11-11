@@ -225,6 +225,10 @@ rules apply to all of them.
    15% each and `stage_recovery` 3%, so the per-frame I/O path is the general
    target and the journal's per-packet bookkeeping a loopback-rate one
    ([BENCH.md](BENCH.md#receive-buffers-for-a-busy-reader-november-11)).
+   Waking only sleeping workers removed most of the 5–6% spent writing
+   eventfds and landed: +2.5% on the loopback total, +0.9% median on the
+   decision workload
+   ([BENCH.md](BENCH.md#waking-only-sleeping-workers-november-11)).
 6. **Stage 4**, as listed in its section: OVS in the composition matrix (the
    test images lack it) and the remaining resource stress. The panic audit is
    done except for converting locally bounded indexing in encoders and the

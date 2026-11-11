@@ -215,6 +215,10 @@ have unit tests and Miri coverage. Barrier tests fill command and reply queues
 and check that draining both directions permits replacement to finish without
 losing control messages. Workers now notify destinations through eventfd once per
 handoff batch and keep draining queues while retrying retained control work.
+A worker about to block sets a sleeping flag and rechecks its queues, and a
+producer writes the eventfd only when that flag is set, so a busy destination
+costs no syscall; fences on both sides ensure one of them sees the other
+(BENCH.md).
 
 `reassembly::Lane` now reserves a complete datagram before applying its records,
 with 64 fixed frame slots and separate 65536-entry packet and frame windows.

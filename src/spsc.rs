@@ -132,6 +132,15 @@ impl<T> Consumer<T> {
         self.shared.tail.0.store(self.tail, Ordering::Release);
         Some(value)
     }
+
+    /// Reports whether no published item is waiting, refreshing the cached head.
+    #[inline]
+    pub fn is_empty(&mut self) -> bool {
+        if self.tail == self.cached_head {
+            self.cached_head = self.shared.head.0.load(Ordering::Acquire);
+        }
+        self.tail == self.cached_head
+    }
 }
 
 #[cfg(test)]
@@ -150,14 +159,18 @@ mod tests {
         tx.shared.head.0.store(start, Ordering::Relaxed);
         tx.shared.tail.0.store(start, Ordering::Relaxed);
         for round in 0..4 {
+            assert!(rx.is_empty());
             for i in 0..CAPACITY {
                 assert_eq!(tx.try_push(round * CAPACITY + i), Ok(()));
+                assert!(!rx.is_empty());
             }
             assert!(tx.is_full());
             assert_eq!(tx.try_push(usize::MAX), Err(usize::MAX));
             for i in 0..CAPACITY {
+                assert!(!rx.is_empty());
                 assert_eq!(rx.try_pop(), Some(round * CAPACITY + i));
             }
+            assert!(rx.is_empty());
             assert_eq!(rx.try_pop(), None);
             assert!(!tx.is_full());
         }

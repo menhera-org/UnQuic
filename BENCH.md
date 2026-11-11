@@ -389,6 +389,18 @@ control's minimum share by more than the control's range of shares or 0.5
 percentage points, whichever is larger. Condition (1) stands from the
 loopback run above. If (2′) holds on the rerun, the change lands.
 
+[The rerun](benches/tap-wake-sleeping-decision-rerun.json) passes (2′): no
+direction-point fails, and the median change is +0.9%. Sixteen flows at 5G
+gain 2.9% / 4.8% without loss and 3.3% / 1.1% with it; the largest falls
+are −3.6% and −2.7% (four flows with loss at 5G), inside their control
+ranges. One point relies on the 0.5-point floor: sixteen flows with loss at
+0.5G, L→R, delivers 98.72% of its offer against a control minimum of
+98.98%. Both kernel suites pass with two new tests: a busy owner gets no
+eventfd write, and a producer thread pushing 200,000 items never leaves a
+blocked consumer asleep. The change lands. Its gain is small, about 1% on
+the decision workload and 2.5% on the loopback check, as the 5–6% share of
+`flush_notifications` predicted.
+
 ## Balanced lanes after the window floor (November 11)
 
 Balanced lanes went back off because the loopback check fell from 6.54 /

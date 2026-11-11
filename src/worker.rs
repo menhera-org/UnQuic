@@ -19,14 +19,46 @@ const WAKE_TOKEN: u64 = 0;
 const TIMER_TOKEN: u64 = 1;
 
 /// Nonblocking eventfd shared only for batch notifications.
-pub(crate) struct Wake(OwnedFd);
+pub(crate) struct Wake {
+    fd: OwnedFd,
+    /// Set by the owning worker before it blocks, cleared when it wakes.
+    sleeping: std::sync::atomic::AtomicBool,
+}
 
 impl Wake {
     pub(crate) fn new() -> io::Result<Self> {
         // SAFETY: eventfd has no pointer arguments and returns a new descriptor.
         let fd = cvt(unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) })?;
-        // SAFETY: fd is a newly created descriptor with one owner.
-        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
+        Ok(Self {
+            // SAFETY: fd is a newly created descriptor with one owner.
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            sleeping: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Wakes the owner after work was published to one of its queues, but only
+    /// if it is blocked or about to block; a busy owner drains its queues anyway.
+    ///
+    /// Pairs with [`Wake::sleep`]: either this sees the flag or the owner's
+    /// recheck sees the published work.
+    pub(crate) fn notify_queued(&self) -> io::Result<()> {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if self.sleeping.load(Ordering::Relaxed) {
+            self.notify()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Marks the owner as about to block. The caller must then recheck every
+    /// incoming queue and call [`Wake::awake`] instead of blocking if any has work.
+    fn sleep(&self) {
+        self.sleeping.store(true, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::SeqCst);
+    }
+
+    fn awake(&self) {
+        self.sleeping.store(false, Ordering::Relaxed);
     }
 
     pub(crate) fn notify(&self) -> io::Result<()> {
@@ -35,7 +67,7 @@ impl Wake {
             // SAFETY: value contains exactly the eight bytes eventfd consumes.
             let count = unsafe {
                 libc::write(
-                    self.0.as_raw_fd(),
+                    self.fd.as_raw_fd(),
                     (&value as *const u64).cast(),
                     size_of::<u64>(),
                 )
@@ -57,7 +89,7 @@ impl Wake {
     }
 
     fn drain(&self) -> io::Result<()> {
-        drain_counter(self.0.as_fd())
+        drain_counter(self.fd.as_fd())
     }
 }
 
@@ -90,7 +122,7 @@ impl Reactor {
             wake,
             deadline: None,
         };
-        reactor.add(reactor.wake.0.as_fd(), WAKE_TOKEN, libc::EPOLLIN as u32)?;
+        reactor.add(reactor.wake.fd.as_fd(), WAKE_TOKEN, libc::EPOLLIN as u32)?;
         reactor.add(reactor.timer.as_fd(), TIMER_TOKEN, libc::EPOLLIN as u32)?;
         Ok(reactor)
     }
@@ -1212,12 +1244,19 @@ impl Worker {
                 self.phases[21] =
                     self.phases[21].wrapping_add(crate::profile::now().wrapping_sub(arming));
             }
-            let block = !(more || immediate);
-            let count = match phase!(
+            let mut block = !(more || immediate);
+            if block {
+                self.reactor.wake.sleep();
+                // Work queued before the flag was visible got no wake; take it now.
+                block = self.incoming.iter_mut().flatten().all(Consumer::is_empty);
+            }
+            let waited = phase!(
                 self,
                 if block { 22 } else { 27 },
                 self.reactor.wait(&mut events, if block { -1 } else { 0 })
-            ) {
+            );
+            self.reactor.wake.awake();
+            let count = match waited {
                 Ok(count) => count,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
@@ -1430,7 +1469,7 @@ impl Worker {
         while mask != 0 {
             let worker = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            self.shared.wakes[worker].notify()?;
+            self.shared.wakes[worker].notify_queued()?;
         }
         Ok(())
     }
@@ -1733,7 +1772,8 @@ impl Worker {
                     .store(change.generation, Ordering::Release);
                 paths.preparing = None;
                 if self.id != 0 {
-                    self.notifications |= 1;
+                    // A shared-state store, not a queue push: worker 0's recheck cannot see it.
+                    self.shared.wakes[0].notify()?;
                 }
             }
         }
@@ -8466,6 +8506,74 @@ mod tests {
 
     #[test]
     #[ignore = "kernel polling test; run in a disposable container"]
+    fn queued_notifications_wake_only_a_sleeping_owner() {
+        let wake = Arc::new(Wake::new().unwrap());
+        let mut reactor = Reactor::new(Arc::clone(&wake)).unwrap();
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+        // A busy owner drains its queues on its next turn without a write.
+        wake.notify_queued().unwrap();
+        assert_eq!(reactor.wait(&mut events, 0).unwrap(), 0);
+        wake.sleep();
+        wake.notify_queued().unwrap();
+        assert_eq!(reactor.wait(&mut events, 0).unwrap(), 1);
+        assert_eq!({ events[0].u64 }, WAKE_TOKEN);
+        reactor.drain(WAKE_TOKEN).unwrap();
+        wake.awake();
+        wake.notify_queued().unwrap();
+        assert_eq!(reactor.wait(&mut events, 0).unwrap(), 0);
+        // Unconditional notifications still wake a busy owner.
+        wake.notify().unwrap();
+        assert_eq!(reactor.wait(&mut events, 0).unwrap(), 1);
+    }
+
+    #[test]
+    #[ignore = "kernel polling test; run in a disposable container"]
+    fn queued_notifications_never_leave_published_work_asleep() {
+        const ITEMS: u32 = 200_000;
+        let wake = Arc::new(Wake::new().unwrap());
+        let mut reactor = Reactor::new(Arc::clone(&wake)).unwrap();
+        let (mut tx, mut rx) = crate::spsc::channel::<u32>();
+        let producer = {
+            let wake = Arc::clone(&wake);
+            std::thread::spawn(move || {
+                for value in 0..ITEMS {
+                    let mut value = value;
+                    while let Err(back) = tx.try_push(value) {
+                        value = back;
+                        std::hint::spin_loop();
+                    }
+                    wake.notify_queued().unwrap();
+                }
+            })
+        };
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+        let mut next = 0;
+        let mut slept = 0;
+        while next < ITEMS {
+            while let Some(value) = rx.try_pop() {
+                assert_eq!(value, next);
+                next += 1;
+            }
+            if next == ITEMS {
+                break;
+            }
+            wake.sleep();
+            let block = rx.is_empty();
+            // A lost wake would leave this wait to its one-second timeout.
+            let count = reactor.wait(&mut events, if block { 1000 } else { 0 }).unwrap();
+            wake.awake();
+            assert!(!block || count != 0, "published work was left asleep");
+            slept += usize::from(block);
+            if count != 0 {
+                reactor.drain(WAKE_TOKEN).unwrap();
+            }
+        }
+        producer.join().unwrap();
+        assert!(slept != 0, "the consumer never blocked, so the race went untested");
+    }
+
+    #[test]
+    #[ignore = "kernel polling test; run in a disposable container"]
     fn notifications_timers_and_fd_interests_remain_ready_until_consumed() {
         let wake = Arc::new(Wake::new().unwrap());
         let mut reactor = Reactor::new(Arc::clone(&wake)).unwrap();
@@ -8511,15 +8619,15 @@ mod tests {
         assert_eq!(reactor.wait(&mut events, 0).unwrap(), 0);
         let extra = Wake::new().unwrap();
         reactor
-            .add(extra.0.as_fd(), 2, libc::EPOLLIN as u32)
+            .add(extra.fd.as_fd(), 2, libc::EPOLLIN as u32)
             .unwrap();
         reactor
-            .modify(extra.0.as_fd(), 3, libc::EPOLLIN as u32)
+            .modify(extra.fd.as_fd(), 3, libc::EPOLLIN as u32)
             .unwrap();
         extra.notify().unwrap();
         assert_eq!(reactor.wait(&mut events, 0).unwrap(), 1);
         assert_eq!({ events[0].u64 }, 3);
-        reactor.remove(extra.0.as_fd()).unwrap();
+        reactor.remove(extra.fd.as_fd()).unwrap();
         assert_eq!(reactor.wait(&mut events, 0).unwrap(), 0);
         pin_to_allowed(usize::MAX).unwrap();
     }
