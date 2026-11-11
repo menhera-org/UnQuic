@@ -1,0 +1,40 @@
+diff --git a/src/bbr/controller.rs b/src/bbr/controller.rs
+index 2c7872c..c8e13a9 100644
+--- a/src/bbr/controller.rs
++++ b/src/bbr/controller.rs
+@@ -215,7 +215,7 @@ impl Controller {
+             bw_latest: 0,
+             inflight_latest: 0,
+             tolerate_random_loss: false,
+-            loss_round_rtt: Duration::ZERO,
++            loss_round_rtt: Duration::MAX,
+             extra_filter: [0; 10],
+             extra_index: 0,
+             extra_acked: 0,
+@@ -263,7 +263,7 @@ impl Controller {
+     /// Whether the current loss round's RTT samples show queueing delay: more
+     /// than an eighth of min_rtt, and at least 250 µs, above min_rtt.
+     fn queued_in_round(&self) -> bool {
+-        self.min_rtt.is_some_and(|min| {
++        self.loss_round_rtt != Duration::MAX && self.min_rtt.is_some_and(|min| {
+             let margin = (min / 8).max(Duration::from_micros(250));
+             self.loss_round_rtt > min.saturating_add(margin)
+         })
+@@ -372,7 +372,7 @@ impl Controller {
+ 
+         self.loss_round_start = sample.prior_delivered >= self.loss_round_delivered;
+         if let Some(rtt) = rtt {
+-            self.loss_round_rtt = self.loss_round_rtt.max(rtt);
++            self.loss_round_rtt = self.loss_round_rtt.min(rtt);
+         }
+         self.bw_latest = self.bw_latest.max(rate);
+         self.inflight_latest = self.inflight_latest.max(sample.delivered);
+@@ -564,7 +564,7 @@ impl Controller {
+                         .max(scale(self.inflight_shortterm, 70, 100));
+             }
+             self.loss_in_round = false;
+-            self.loss_round_rtt = Duration::ZERO;
++            self.loss_round_rtt = Duration::MAX;
+         }
+     }
+ 

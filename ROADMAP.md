@@ -1237,9 +1237,8 @@ November 10 evidence for that list, all in BENCH.md:
   max(min_rtt / 8, 250 µs): TCP keeps its share, the lossy target rises 4–26%,
   and the switch is on by default
   ([BENCH.md](BENCH.md#tolerating-random-loss-only-without-queueing-delay-november-11)).
-  Without the check the target reached about 1.5 Gbit/s, so host delay under
-  CPU load probably reads as queueing; a cleaner queue signal could recover
-  that. The 5% loss rows still need FEC or a loss-agnostic response.
+  Checking each round's smallest RTT instead did not help. The 5% loss rows
+  still need FEC or a loss-agnostic response.
 
 ## Stage 6: protocol freeze
 

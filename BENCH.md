@@ -96,40 +96,20 @@ comparison below.
 
 ## Current performance gaps
 
-The sender integration passes forwarding/restart and allocation checks,
-plus control-pressure, stale-feedback and bounded transmit-expiry regressions.
-The recovery build adds successful two-repair delivery checks, but its latest
-rate sweeps still show low throughput and eight-lane reassembly admission
-pressure. The fresh-work bound removes measured single-lane pressure and
-preserves most paced goodput under unlimited load.
-The initial sender-integration sweep already showed low CPU use and poor
-throughput with zero admission pressure or outer socket overflow. Recovery then
-introduced admission pressure; that observation does not explain the earlier
-regression. Grant/feedback scheduling and recovery pressure need separate
-attribution. Moving expiry checks before source expansion establishes no general
-throughput gain. Earlier storage/batching sweeps predate ACK emission.
-Sender-accounting and I/O-timestamp changes have correctness coverage and
-post-integration rate sweeps, but no matched comparison isolates their costs.
-Frame-view allocations now follow actual per-worker quotas instead of reserving
-8192 slots on every worker. This reduces reserved metadata; it does not establish
-a goodput gain or change the session retention limits.
-
-The storage/batching results below use eight workers per daemon,
-16 flows per direction, 500-entry TAP queues, and a 1452-byte outer UDP cap.
-They keep active discovery enabled. L→R / R→L pairs are simultaneous.
-The JSON records actual offered load, CPU and counters for each observation;
-earlier tables retain their original builds and test conditions.
+Updated November 11; the first two rows and the last two are current, the
+others keep earlier evidence. L→R / R→L pairs are simultaneous.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | After the ACK/loss fairness fix, sixty-second QinQ sweep: 1.82 / 1.58 Gbit/s paced, 1.82 / 1.64 unlimited. Earlier pre-integration expiry build: 7.76 / 16.70 paced | Severe integration regression; paced missing fractions are 91.26 / 92.28%. The recovery ascending sweep stays under 1% missing in both directions only at 0.5G offered. Five successful 20G repeats remain unmet. |
-| Goodput must plateau under excess traffic | Bounded fresh work raises matched twenty-second single-lane unlimited delivery to 1.89 / 1.85 Gbit/s from 0.45–0.51, only 0.3 / 2.3% below its 4G point. Eight-lane delivery remains 1.77 / 1.55 with admission pressure | No universal plateau or CPU ceiling is established. The single-lane scheduling failure is reduced; the eight-lane ceiling and original targets remain open. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98% | CPU-bound on the one worker that reads the TAP queue every QinQ flow lands on; needs a cheaper reader or TAP input spread over queues. |
+| Goodput must plateau under excess traffic | Decision workload (four workers, 4.5 ms): sixteen flows deliver 1.4–2.1 Gbit/s per direction at 5G offered without collapse; workers run at 79–99% of a core | Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
 | Small-frame overload must remain efficient | Earlier pre-recovery tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input and output offloads improve matched TCP sweeps; single-stream output coalescing reaches 2.01 / 2.26 Gbit/s, still below the deployment target. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
 | Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Throughput sweeps currently cap outer packets at 1500 bytes. Larger-MTU throughput and real routed-path validation remain open. DATA-quoted PTB validation now has targeted kernel coverage. |
-| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | Routed local-container controls now inject 4.5 ms RTT and 0.1% independent datagram loss. At 0.5G offered, repeated delivery is 0.483 / 0.461 Gbit/s; delay alone delivers 0.450 / 0.476 | No real-path or independent/burst-loss result verifies the target. Recovery is connected; sustained lossy-path performance and complete congestion-control integration remain unverified. |
+| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | One flow at 7.5 ms with 0.5–1% random loss: about 1.0 Gbit/s per direction locally with hash lanes and the default queue-checked loss tolerance, 1.5–2.0 with balanced lanes; 1.6 Gbit/s on the remote host, where a limit downstream of the sender caps it. At 5% loss draft 07 delivers under 11% of a 0.5G offer | Per-frame cost on one transmit worker, the 5% rows (FEC or a loss-agnostic response), and a real-path measurement. |
+| Coexist with other traffic | Against one TCP CUBIC flow at a 1 Gbit/s, 7.5 ms token-bucket bottleneck: an even share with a one-BDP queue; with a quarter-BDP queue the queue-checked tolerance keeps TCP's share | Several competitors, other buffer depths and other TCP algorithms are unmeasured. |
 
 Unlimited loss remains high. TAP ingress drops, bounded worker queue drops,
 outer socket overflows, expired frames and inner UDP receive-buffer errors
@@ -138,6 +118,50 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
+
+## Balanced lanes after the window floor (November 11)
+
+Balanced lanes went back off because the loopback check fell from 6.54 /
+2.30 to 1.49 / 1.45 Gbit/s, but that check was then window-limited, which
+the window RTT floor has since fixed; one exploratory repeat with the floor
+gave 4.63 / 5.40 against 5.39 / 5.92. They also lift the single-flow target
+by 50–100% in one exploratory repeat.
+
+Stated before measuring, the current build with the switch off and on,
+three interleaved repeats of each workload: (1) decision workload: the
+median relative change of the sixteen 2G and 5G direction medians is at
+least +5%, and no direction at any point falls below the off range by more
+than its width; (2) loopback check: neither direction's median falls below
+the off range by more than its width, and the row total falls by no more
+than 10%; (3) single-flow target: every 5G direction median rises beyond the
+off range. If all three hold, the switch becomes the default.
+
+## The queue check from each round's smallest RTT (November 11)
+
+The queue check below uses the largest RTT sample in a loss round, so one
+sample delayed by a busy host is enough to cut. A standing queue raises every
+sample in the round, so the round's smallest sample should separate a queue
+from jitter better. Stated before measuring, the candidate (smallest sample)
+against the current default (largest sample), both with the switch on, three
+interleaved repeats each: (1) at the quarter-BDP bottleneck the competing TCP
+median must not fall below the default's range by more than its width; (2) on
+the single-flow target at least three of the four 5G direction medians must
+rise beyond the default's range and none may fall below it. If both hold the
+candidate replaces the check; otherwise it is kept as a patch.
+
+[Three interleaved repeats](benches/tap-queue-check-minimum.json): the TCP
+median is 185 Mbit/s against the default's 193–222, inside the allowed
+margin, but all four 5G target medians fall inside the default's ranges
+(1.002 / 1.044 at 0.5% loss, 0.939 / 1.010 at 1%). The candidate is rejected
+and kept as [a patch](benches/queue-check-minimum-rejected.patch).
+
+The premise was also wrong. The 1.5 Gbit/s target result for tolerance
+without the check came from the striping control, built while balanced
+lanes were the default, and for one flow balanced lanes choose a different
+lane and transmit worker. One exploratory repeat of the current default
+shows it: hash lanes deliver 0.98 / 1.06 Gbit/s at 0.5% loss and 0.96 / 1.00
+at 1%, balanced lanes 1.50 / 1.45 and 2.01 / 1.62. The queue check gave up
+nothing; the single flow's lane placement is worth 50–100%.
 
 ## Tolerating random loss only without queueing delay (November 11)
 
@@ -173,10 +197,9 @@ Mbit/s over 20 s:
 
 Both conditions hold. The TCP flow keeps its share, which the switch without
 the check took 20% of, and every target direction rises beyond the off range,
-by 4–26%. `tolerate_random_loss` is now on by default. Earlier today the
-switch without the check reached about 1.5 Gbit/s on the same target, so the
-check gives up part of the gain, probably because host delay under CPU load
-also raises RTT samples; a cleaner queue signal may recover it.
+by 4–26%. `tolerate_random_loss` is now on by default. (A 1.5 Gbit/s target
+result earlier today came from balanced lanes, not from the missing check;
+see the section above.)
 
 ## Coexistence with `tolerate_random_loss` (November 11)
 
