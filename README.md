@@ -587,7 +587,12 @@ A frame's pieces and repairs stay on its original lane.
 
 Stacked VLANs, TCP, fragmented IP and other traffic retain strict flow hashing.
 Stacked VLAN traffic can concentrate on one TAP queue; hashing it across all
-lanes avoids stranding the other transmit workers. Sessions with fewer TAP queues than global workers also retain strict flow hashing
+lanes avoids stranding the other transmit workers. For locally routed
+double-tagged frames, tun's flow dissector appears to read the IP header as
+a second tag, so every flow hashes alike and one worker reads them all. On
+the loopback overload check that worker limits both directions: it cannot
+read fast enough for its own, and its receive socket overflows for the
+other (BENCH.md). Sessions with fewer TAP queues than global workers also retain strict flow hashing
 across all transmit lanes, so those workers still provide transmit capacity.
 A reader owning no transmit lane also retains hashing and handoffs. Queue and
 lane counts remain independent; peers need not use identical values. eBPF is
