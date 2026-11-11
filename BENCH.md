@@ -101,7 +101,7 @@ others keep earlier evidence. L→R / R→L pairs are simultaneous.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98% | L→R is input-limited: every QinQ read lands on one worker per side, which runs at 96% while the senders it feeds idle. R→L is congestion-limited: BBR spends half the point in ProbeBW_DOWN after losses of unknown source. Letting tun spread reads (one tag) lowers delivery and costs 23% more CPU per bit ([BENCH.md](#whether-the-single-qinq-reader-limits-the-loopback-check-november-11)). |
+| At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98% | One left worker does two jobs: it reads every L→R frame from the TAP (QinQ input all lands on one queue) and receives the R→L lanes it owns. L→R senders idle for its input; its socket overflows and R→L loses packets, so BBR cuts. More receive buffers move capacity from L→R to R→L (+11% total, L→R −14%); letting tun spread reads costs 23% more CPU per bit ([BENCH.md](#receive-buffers-for-a-busy-reader-november-11)). Next: keep receive work off the TAP reader, or split TAP reading inside the daemon. |
 | Goodput must plateau under excess traffic | Decision workload (four workers, 4.5 ms): sixteen flows deliver 1.4–2.1 Gbit/s per direction at 5G offered without collapse; workers run at 79–99% of a core | Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
 | Small-frame overload must remain efficient | Earlier pre-recovery tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input and output offloads improve matched TCP sweeps; single-stream output coalescing reaches 2.01 / 2.26 Gbit/s, still below the deployment target. |
@@ -219,6 +219,54 @@ something different at the 21G point:
 So the single reader limits its own direction, and tun's spreading costs more
 than it gains. The candidates are a cheaper reader, or spreading inside the
 daemon after one large read, for L→R, and finding the R→L losses.
+
+The R→L losses come from the left reader's own socket. Between the trace
+run's snapshots the outer UDP layer counts about 1,850 receive-buffer errors,
+matching the daemons' socket-overflow counters (1,613 left, 233 right), and
+1,548 of the left's are on worker 3, the TAP reader. Each overflow drops a
+whole GSO batch, about 12–17 packets at the run's mean datagram size, so they
+account for most of the right's 29,345 losses. The right reader receives
+only control traffic and barely overflows. The receive buffer is 416 KiB
+because the container cannot raise the host-wide `rmem_max`, and the right's
+`sendmmsg` calls average about 28 GSO datagrams, roughly 476 KB, per call.
+
+## Receive buffers for a busy reader (November 11)
+
+A worker reads at most eight GRO datagrams per turn from its sockets, and
+holds no more than eight until it has processed them, 64 KB of datagrams per
+turn. While the TAP reader's turns run long, its socket fills and drops whole
+GSO batches. The November 5 audit (item A6) proposed 32 receive buffers. The
+candidate sets `RECEIVE_BUFFERS` to 32 and changes nothing else; the pool
+stays at 128 buffers per worker, so transmit keeps at least 96.
+
+Stated before measuring, three interleaved repeats each against the current
+build: (1) on the loopback check, left socket overflows at the 21G point fall
+by at least half, the R→L median rises beyond the control's range, and L→R
+does not fall below the control's minimum by more than the control's range
+width; (2) on the decision workload, the median relative change over the 24
+direction-points is no worse than −2%, and no direction falls below the
+control's minimum by more than the control's range width. If both hold, 32
+becomes the constant; otherwise the patch is kept in `benches/`.
+
+[Loopback check](benches/tap-receive-buffers-32.json), three interleaved
+repeats, 21G point:
+
+| Build | L→R Gbit/s | R→L Gbit/s | Left socket overflows | Busiest thread L / R |
+| --- | --- | --- | --- | --- |
+| Current (8) | 6.126 (6.023–6.126) | 5.617 (5.524–5.795) | 1,405 (1,094–1,610) | 98% / 84% |
+| 32 receive buffers | 5.293 (5.175–5.376) | 7.702 (7.506–8.003) | 269 (257–356) | 98% / 96% |
+
+Overflows fall 81% and R→L rises 37%, but L→R falls 14%, far beyond the
+control's 0.10 Gbit/s range. Condition (1) fails, so the decision workload
+was not run and the change is
+[rejected](benches/receive-buffers-32-rejected.patch). The total rises 11%,
+from 11.74 to 13.00 Gbit/s. The left TAP reader is one worker doing two
+jobs, reading every L→R frame from the TAP and receiving the R→L lanes it
+owns. With more receive buffers it does more of the second and less of the
+first. Neither buffer sizes nor reader spreading through tun fixes that. The
+next candidate should move receive work off the worker that reads the TAP,
+or split TAP reading inside the daemon, so the two directions stop sharing
+one core.
 
 ## Balanced lanes after the window floor (November 11)
 

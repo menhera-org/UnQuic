@@ -1,0 +1,13 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index 03a148e..9e90bee 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -281,7 +281,7 @@ const RECEIVE_BYTES: usize = 65_536;
+ // Absorb a synchronized GSO burst before bounding fresh work; an oversized source needs an empty lane.
+ const FRESH_BYTES: usize = 2 * 1024 * 1024;
+ // A bounded GRO backlog must not consume the transmit pool (or vice versa).
+-const RECEIVE_BUFFERS: usize = 8;
++const RECEIVE_BUFFERS: usize = 32;
+ const _: () = assert!(RECEIVE_BUFFERS <= BATCH_SIZE && RECEIVE_BUFFERS < BUFFERS);
+ 
+ // Yield at datagram boundaries; one final datagram may exceed the record/byte target.

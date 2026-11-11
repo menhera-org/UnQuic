@@ -19,9 +19,10 @@ loopback direction rose from 2.55 to 5.49 Gbit/s and the busiest thread to
 98% ([BENCH.md](BENCH.md#sizing-windows-from-at-least-one-ack-delay-november-11)).
 That thread reads every QinQ flow because tun's flow dissector, by our
 reading, misparses locally routed double-tagged frames and hashes them all
-alike. That reader starves its own direction's senders, but letting tun
-spread the input (one tag) made the check slower, at 23% more CPU per bit;
-the other direction is held back by BBR after losses not yet explained.
+alike. That reader starves its own direction's senders and also drops the
+other direction's packets at its receive socket. Letting tun spread the
+input (one tag) made the check slower, at 23% more CPU per bit, and more
+receive buffers only moved capacity between the directions.
 
 A `profile` feature counts worker-loop cycles per phase because perf cannot
 run on either test host. On the remote host one flow at 7.5 ms delivers about
@@ -203,13 +204,18 @@ rules apply to all of them.
    direction again, to 5.49 / 5.70 Gbit/s
    ([BENCH.md](BENCH.md#sizing-windows-from-at-least-one-ack-delay-november-11)):
    the busiest threads now run at 98% and 83%. The 98% thread is the one
-   worker that reads every QinQ flow. A trace shows L→R senders idling for
-   want of its input, while R→L is held back by BBR after losses of unknown
-   source. Letting tun spread reads (one tag, distinct ports per direction)
-   lowers delivery and costs 23% more CPU per bit
+   worker that reads every QinQ flow, and it also receives the R→L lanes it
+   owns. A trace shows L→R senders idling for want of its input, while its
+   receive socket overflows and BBR cuts R→L after the losses. Letting tun
+   spread reads (one tag, distinct ports per direction) lowers delivery and
+   costs 23% more CPU per bit
    ([BENCH.md](BENCH.md#whether-the-single-qinq-reader-limits-the-loopback-check-november-11)).
-   Next: a cheaper reader or spreading inside the daemon after one large
-   read, and the source of the R→L losses.
+   Thirty-two receive buffers instead of eight cut its overflows by 81% and
+   raise the total 11%, but move capacity from L→R (−14%) to R→L (+37%) and
+   were rejected
+   ([BENCH.md](BENCH.md#receive-buffers-for-a-busy-reader-november-11)).
+   Next: keep receive work off the worker that reads the TAP, or split TAP
+   reading inside the daemon, so the two directions stop sharing one core.
 6. **Stage 4**, as listed in its section: OVS in the composition matrix (the
    test images lack it) and the remaining resource stress. The panic audit is
    done except for converting locally bounded indexing in encoders and the
