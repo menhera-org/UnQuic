@@ -16,8 +16,11 @@ about a millisecond. Hash lanes hid this by leaving workers idle, which kept
 the group application-limited and BBR in Startup with an unbounded window.
 Windows now use at least the receiver's 1 ms ACK delay as RTT. The weaker
 loopback direction rose from 2.55 to 5.49 Gbit/s and the busiest thread to
-98%, so the stage 2 gate is now bounded by per-frame CPU cost
-([BENCH.md](BENCH.md#sizing-windows-from-at-least-one-ack-delay-november-11)).
+98% ([BENCH.md](BENCH.md#sizing-windows-from-at-least-one-ack-delay-november-11)).
+That thread reads every QinQ flow because tun's flow dissector, by our
+reading, misparses locally routed double-tagged frames and hashes them all
+alike. Spreading the input with one tag made the check slower, not faster, so
+the single reader is not what holds the gate back.
 
 A `profile` feature counts worker-loop cycles per phase because perf cannot
 run on either test host. On the remote host one flow at 7.5 ms delivers about
@@ -198,8 +201,12 @@ rules apply to all of them.
    November 11 the window RTT floor (design section 9) lifted the weaker
    direction again, to 5.49 / 5.70 Gbit/s
    ([BENCH.md](BENCH.md#sizing-windows-from-at-least-one-ack-delay-november-11)):
-   the busiest threads now run at 98% and 83%, so the check is CPU-bound and
-   per-frame cost bounds it next.
+   the busiest threads now run at 98% and 83%. The 98% thread is the one
+   worker that reads every QinQ flow, but it does not set the limit: with one
+   tag tun spreads the input over all readers, and delivery falls while
+   reordering multiplies
+   ([BENCH.md](BENCH.md#whether-the-single-qinq-reader-limits-the-loopback-check-november-11)).
+   The limit is not yet identified.
 6. **Stage 4**, as listed in its section: OVS in the composition matrix (the
    test images lack it) and the remaining resource stress. The panic audit is
    done except for converting locally bounded indexing in encoders and the
