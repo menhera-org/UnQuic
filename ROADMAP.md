@@ -167,12 +167,15 @@ rules apply to all of them.
    ([BENCH.md](BENCH.md#three-quantum-offload-budget-november-10)). The
    busiest left worker is near a full core while two others idle, so lane
    placement and per-frame cost bound it next.
-6. **Stage 4**, as listed in its section: the rest of the panic audit (explicit
-   `unwrap`/`expect`/`panic!` sites are gone; implicit indexing and overflow
-   remain), OVS in the composition matrix, and the remaining resource stress.
-   TAP persistence and descriptor handover, including a failed exec after a
-   passing probe, double-fork readiness, the systemd unit, the VRF and
-   composition tests and the V03 lifecycle cases are done.
+6. **Stage 4**, as listed in its section: OVS in the composition matrix (the
+   test images lack it) and the remaining resource stress. The panic audit is
+   done except for converting locally bounded indexing in encoders and the
+   batch planner: explicit panics are gone, untrusted-input parsers and the
+   worker's packet paths are fuzzed and checked, and seccomp fault injection
+   covers worker and thread-start failures. TAP persistence and descriptor
+   handover, including a failed exec after a passing probe, double-fork
+   readiness, the systemd unit, the VRF and composition tests and the V03
+   lifecycle cases are done.
 7. **Stage 5:** profile what remains and try its candidates behind switches.
 
 If evidence shows a gate cannot be reached within the current design, write
@@ -1095,9 +1098,12 @@ full expired batches sharing the cleanup budget.
   records while another worker lagged could fill the sender message queue and
   return an error that stopped the runtime. The queue now reserves room for
   every ACK buffer, and a randomized test drives 20,000 mutated datagrams
-  through two linked workers' receive paths. Remaining: indexing in internal
-  state (encoders, the batch planner), thread startup/join errors and the
-  fault-injection tests.
+  through two linked workers' receive paths. A fault-injection runtime test
+  uses seccomp to fail a syscall every worker needs (`timerfd_settime`) after
+  the TAP exists, and then thread creation itself: each time the runtime
+  stops with that error and the published TAP keeps its ifindex (Linux 6.8
+  and 7.0). Remaining: indexing in internal state (encoders, the batch
+  planner), reviewed as locally bounded but not converted.
 
   ```sh
   cargo clippy --release --target x86_64-unknown-linux-musl --lib --all-features -- \

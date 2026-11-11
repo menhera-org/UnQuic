@@ -119,8 +119,10 @@ without losing the VLAN upper, and a later restart hands those queues to a real
 successor. Library code no longer calls `unwrap`, `expect`, `panic!` or
 `unreachable!`. Each parser of untrusted bytes takes 200,000 random and
 mutated inputs in a test without panicking, and indexing on those paths is
-checked; indexing in internal state and arithmetic overflow are not yet
-audited.
+checked. Packet-derived values reach no unchecked index in the workers, and a
+seccomp test that fails a worker syscall, then thread creation, shows the
+runtime stopping with the error while its TAP stays published. Indexing in
+encoders and the batch planner is bounded locally but not converted.
 These are tracked in Stage 4 of [ROADMAP.md](ROADMAP.md).
 
 Open TAP descriptors already support foreign renames and network-namespace moves

@@ -1793,6 +1793,87 @@ fn a_flooded_session_neither_allocates_nor_corrupts_its_neighbour() {
     right.stop();
 }
 
+/// Makes `syscalls` fail with `errno` in this thread and every thread it starts later.
+fn deny(syscalls: &[libc::c_long], errno: i32) {
+    let count = syscalls.len();
+    let mut filter = vec![libc::sock_filter {
+        code: 0x20, // BPF_LD | BPF_W | BPF_ABS: the syscall number
+        jt: 0,
+        jf: 0,
+        k: 0,
+    }];
+    for (index, &number) in syscalls.iter().enumerate() {
+        filter.push(libc::sock_filter {
+            code: 0x15, // BPF_JMP | BPF_JEQ | BPF_K
+            jt: (count - index) as u8,
+            jf: 0,
+            k: number as u32,
+        });
+    }
+    for value in [
+        libc::SECCOMP_RET_ALLOW,
+        libc::SECCOMP_RET_ERRNO | errno as u32,
+    ] {
+        filter.push(libc::sock_filter {
+            code: 0x06, // BPF_RET | BPF_K
+            jt: 0,
+            jf: 0,
+            k: value,
+        });
+    }
+    let program = libc::sock_fprog {
+        len: filter.len() as _,
+        filter: filter.as_mut_ptr(),
+    };
+    // SAFETY: the initialized program only denies the listed syscalls of this thread tree.
+    unsafe {
+        assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+        assert_eq!(
+            libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program),
+            0
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires disposable container with tun and network namespace capabilities"]
+fn worker_and_thread_start_failures_stop_the_runtime_but_keep_its_tap() {
+    use unquic::runtime::{self, Control};
+    // SAFETY: only this test thread and its runtimes enter the namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let net = UdpSocket::bind("[::]:0").unwrap();
+    up(&net, c"lo");
+    let single = || {
+        let mut config = config("uq-fault", 41700, 41701);
+        config.sessions.truncate(1);
+        config.peers.truncate(1);
+        config.daemon.memory_limit = Daemon::default().memory_limit;
+        config
+    };
+    let index = || {
+        // SAFETY: the name is NUL-terminated; the call only queries this namespace.
+        unsafe { libc::if_nametoindex(c"uq-fault".as_ptr()) }
+    };
+    // Workers first arm their timer after every TAP exists, so this fails them mid-run.
+    deny(&[libc::SYS_timerfd_settime], libc::EIO);
+    let control = Control::new();
+    let error = runtime::run(single(), control.clone()).unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    assert!(control.stopped());
+    let tap = index();
+    assert_ne!(tap, 0, "a failed worker removed the published TAP");
+    // Thread creation now fails too: the runtime reattaches the idle TAP, then
+    // cannot start a worker, and must still stop cleanly with the TAP kept.
+    deny(&[libc::SYS_clone, libc::SYS_clone3], libc::EAGAIN);
+    let control = Control::new();
+    let error = runtime::run(single(), control.clone()).unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EAGAIN));
+    assert!(control.stopped());
+    assert_eq!(index(), tap, "a failed thread start replaced the TAP");
+    unquic::tap::remove(c"uq-fault").unwrap();
+    assert_eq!(index(), 0);
+}
+
 #[test]
 #[ignore = "requires disposable container with tun and network namespace capabilities"]
 fn many_sessions_start_within_the_memory_ceiling_or_create_nothing() {
