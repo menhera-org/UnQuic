@@ -218,10 +218,10 @@ rules apply to all of them.
    reading inside the daemon, so the two directions stop sharing one core.
    Placement alone cannot close the gate: at about 0.74 of a core per Gbit/s
    (both ends together) sixteen daemon CPUs top out near 10.8 Gbit/s each
-   way, so the per-bit cost must fall by almost half. The sender's grant
-   service, which also sends batches, is the largest phase at 21% of busy
-   cycles, ahead of TAP writes and frame flushing at 15% each; `sendmmsg`
-   alone is 11%
+   way, so the per-bit cost must fall by almost half. Sending batches takes
+   about 25% of busy cycles (`sendmmsg` alone 11%), TAP writes 15%, receive
+   processing 11%, and applying ACK reports to frames (`stage_recovery`)
+   7.6%, which is per-packet bookkeeping and the clearest target
    ([BENCH.md](BENCH.md#receive-buffers-for-a-busy-reader-november-11)).
 6. **Stage 4**, as listed in its section: OVS in the composition matrix (the
    test images lack it) and the remaining resource stress. The panic audit is

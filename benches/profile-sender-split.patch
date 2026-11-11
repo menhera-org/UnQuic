@@ -1,0 +1,125 @@
+diff --git a/src/profile.rs b/src/profile.rs
+index e9b97e9..783ce43 100644
+--- a/src/profile.rs
++++ b/src/profile.rs
+@@ -37,10 +37,19 @@ pub const NAMES: [&str; PHASES] = [
+     "read_socket",
+     "reactor_drain",
+     "poll",
++    "sub_sender_messages",
++    "sub_sender_acks",
++    "sub_sender_owner",
++    "sub_sender_claim",
++    "sub_sender_permit",
++    "sub_sender_begin_ack",
++    "sub_sender_recovery",
++    "sub_sender_probes",
++    "sub_sender_clock",
+ ];
+ 
+ /// Number of accounted worker loop phases.
+-pub const PHASES: usize = 28;
++pub const PHASES: usize = 37;
+ 
+ /// Current timestamp-counter value, or nanoseconds where there is none.
+ #[inline(always)]
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 871952b..119f627 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -1142,12 +1142,25 @@ impl Worker {
+     }
+ 
+     pub(super) fn service_sender(&mut self, now: Duration) -> io::Result<bool> {
++        macro_rules! sub {
++            ($s:ident, $phase:expr, $e:expr) => {{
++                #[cfg(feature = "profile")]
++                let started = crate::profile::now();
++                let result = $e;
++                #[cfg(feature = "profile")]
++                {
++                    $s.phases[$phase] = $s.phases[$phase]
++                        .wrapping_add(crate::profile::now().wrapping_sub(started));
++                }
++                result
++            }};
++        }
+         if !self.sender_enabled() {
+             return Ok(false);
+         }
+-        let mut more = self.flush_sender_messages(now)?;
++        let mut more = sub!(self, 28, self.flush_sender_messages(now))?;
+         let ack_blocked = self.sender.checks_pending != 0 || self.sender.loss_fences != 0;
+-        self.begin_sender_ack()?;
++        sub!(self, 33, self.begin_sender_ack())?;
+         for group in 0..self.sender.fresh.len() {
+             if self.sender.fresh[group] && room(&self.sender.outgoing, self.shared.workers()) {
+                 self.sender.queue(0, Message::ProbeReplied { group })?;
+@@ -1155,6 +1168,8 @@ impl Worker {
+             }
+         }
+         let mut budget = BATCH_SIZE;
++        #[cfg(feature = "profile")]
++        let acks_started = crate::profile::now();
+         if self.sender.acks_pending == 0 {
+             more |= self.advance_loss_checks(now, &mut budget)?;
+         }
+@@ -1215,6 +1230,11 @@ impl Worker {
+                 self.sender.report = Some(report);
+             }
+         }
++        #[cfg(feature = "profile")]
++        {
++            self.phases[29] =
++                self.phases[29].wrapping_add(crate::profile::now().wrapping_sub(acks_started));
++        }
+         more |= budget == 0 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0);
+         // A fully protected final loss pass emits no report to wake queued ACK work.
+         more |= ack_blocked
+@@ -1222,17 +1242,26 @@ impl Worker {
+             && self.sender.loss_fences == 0
+             && !self.sender.incoming.is_empty()
+             && self.sender.report.is_some();
+-        more |= self.stage_recovery()?;
++        more |= sub!(self, 34, self.stage_recovery())?;
+         if self.sender.owner.is_some() {
+             // Apply local feedback before the shared owner considers fresh grants.
+-            more |= self.flush_sender_messages(now)?;
++            more |= sub!(self, 28, self.flush_sender_messages(now))?;
+             // Reports can have arrived after the worker turn's original timestamp.
+-            let observed = self.io_clock(now)()?;
++            let observed = sub!(self, 36, self.io_clock(now)())?;
++            #[cfg(feature = "profile")]
++            let owner_started = crate::profile::now();
+             if let Some(owner) = &mut self.sender.owner {
+                 more |= owner.advance(observed, &mut self.sender.outgoing)?;
+             }
++            #[cfg(feature = "profile")]
++            {
++                self.phases[30] = self.phases[30]
++                    .wrapping_add(crate::profile::now().wrapping_sub(owner_started));
++            }
+         }
+-        more |= self.flush_sender_messages(now)?;
++        more |= sub!(self, 28, self.flush_sender_messages(now))?;
++        #[cfg(feature = "profile")]
++        let probes_started = crate::profile::now();
+         // Probes park an unclaimed DATA plan rather than wait behind it: under
+         // pacing-limited load such a plan almost always occupies the job slot.
+         if self.parkable() {
+@@ -1328,8 +1357,13 @@ impl Worker {
+                 }
+             }
+         }
+-        if self.sender.job.is_some() && self.claim_sender(now)? == Claimed::Ready {
+-            self.use_sender_permit(now)?;
++        #[cfg(feature = "profile")]
++        {
++            self.phases[35] =
++                self.phases[35].wrapping_add(crate::profile::now().wrapping_sub(probes_started));
++        }
++        if self.sender.job.is_some() && sub!(self, 31, self.claim_sender(now))? == Claimed::Ready {
++            sub!(self, 32, self.use_sender_permit(now))?;
+             more = true;
+         }
+         Ok(more)

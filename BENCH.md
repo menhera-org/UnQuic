@@ -289,9 +289,30 @@ cycles only), shows where it goes:
 | everything else | 16.3% |
 
 `sendmmsg` itself takes about 11% of busy cycles (53 billion of 488
-billion). Both `service_sender` and `flush_frames` pack and send batches, so
-this table does not yet separate grant coordination from packing; a finer
-split of `service_sender` is the next profile to take.
+billion). Both `service_sender` and `flush_frames` pack and send batches.
+
+A [diagnostic patch](benches/profile-sender-split.patch), not committed to
+`src`, splits `service_sender` into nested phases; one run of the same
+check delivered 5.94 / 5.92 Gbit/s
+([worker lines](benches/tap-loop-profile-split.txt)). Of all busy cycles in
+both daemons:
+
+| Inside `service_sender` | Share of busy cycles |
+| --- | --- |
+| Packing and sending under a grant (`use_sender_permit`) | 10.8% |
+| Applying ACK and loss reports to frames (`stage_recovery`) | 7.6% |
+| ACK report processing and loss checks | 1.1% |
+| Controller owner (`advance`) | 0.4% |
+| Claims, sender messages, ACK start | 0.7% |
+
+Sending batches thus costs about 25% of busy cycles in total (10.8% under
+grants plus 14.2% in `flush_frames`), and TAP writes another 15%. The
+surprise is `stage_recovery` at 7.6%, as much as reading the outer
+sockets: for each acknowledged packet it copies the packet's journal
+pieces into a zeroed 64-entry array, marks each frame range acknowledged,
+pops the journal, and releases frames whose bytes are all acknowledged.
+Per-packet bookkeeping for frames that usually span one or two packets is
+the next optimisation target, after batch sending and TAP writes.
 
 ## Balanced lanes after the window floor (November 11)
 
