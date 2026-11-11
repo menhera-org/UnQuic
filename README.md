@@ -676,6 +676,10 @@ could end Startup before the load arrived. The daemon-wide
 `tolerate_random_loss` switch, off by default, deviates from draft 07: outside
 bandwidth probing, a loss round cuts the short-term bounds only when it lost
 more than 2%. Coexistence with competing traffic is not yet measured.
+Windows also deviate on sub-millisecond paths: their BDP uses at least the
+receiver's 1 ms maximum ACK delay, because RTT samples exclude that delay
+while the feedback loop does not. This more than doubled the loopback check's
+window-limited direction; paths longer than 1 ms are unchanged.
 PMTU provenance follows each successful probe through delivery sampling.
 An ACK containing only newly delivered PMTU probes cannot establish a bandwidth
 plateau or end Startup on that evidence. Mixed DATA/probe ACKs remain eligible;

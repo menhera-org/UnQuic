@@ -139,6 +139,63 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Sizing windows from at least one ACK delay (November 11)
+
+On the loopback check, traces show the two lane placements differ in BBR's
+state, not in CPU. With hash lanes some workers idle, the group is marked
+application-limited, BBR never confirms full bandwidth and stays in Startup
+with a window averaging 245 MB. With balanced lanes every worker has data,
+BBR reaches ProbeBW and its window falls to 208 KB: twice a BDP computed from
+a min_rtt of tens of microseconds, plus draft 07's three-quantum offload
+budget. At the delivered rate that window implies a feedback loop of about
+1.1 ms. RTT samples exclude the receiver's reported ACK delay, but a lane
+holds feedback for up to 1 ms (sixteen packets or 1 ms) and loaded workers
+batch their own work, so the loop is far longer than min_rtt. Shortening the
+ACK delay to 100 µs made both placements worse (0.90 / 0.89 and 5.09 / 1.34
+Gbit/s in one run), because it only adds ACK work.
+
+The candidate sizes windows from at least the receiver's maximum ACK delay:
+draft 07's BDP uses `max(min_rtt, 1 ms)`. Paths longer than 1 ms are
+unchanged. In one exploratory run it moved the loopback check to 5.39 / 5.92
+Gbit/s with hash lanes and 4.63 / 5.40 with balanced lanes.
+
+Stated before measuring, three interleaved repeats each: on the loopback
+check, the weaker direction's median rises beyond the control's range and
+the row total does not fall beyond it; on the decision workload, whose
+paths are all above 1 ms, no direction at any point falls beyond the
+control's range. If both hold, the floor is adopted; otherwise it is kept as
+a patch.
+
+[Loopback check](benches/tap-window-floor-loop.json), three interleaved
+repeats, Gbit/s:
+
+| Build | L→R | R→L | Total | Busiest thread L / R |
+| --- | --- | --- | --- | --- |
+| Base | 6.189 (5.845–6.293) | 2.550 (2.546–2.680) | 8.735 (8.524–8.843) | 93% / 75% |
+| Floor | 5.487 (5.388–5.652) | 5.698 (5.564–5.788) | 11.216 (11.085–11.275) | 98% / 83% |
+
+The weaker direction more than doubles, the total rises 28%, and the busiest
+thread is now saturated: the loopback check is CPU-bound. That half of the
+bar holds by a wide margin.
+
+On the [decision workload](benches/tap-window-floor.json) six of the 24
+direction-points fall below the control's range, by 0.02–2.5%, and two rise
+above it. That fails the second half as written, but the criterion was
+wrong. Every decision-workload path has a min_rtt of at least 4.5 ms, so
+`max(min_rtt, 1 ms)` returns `min_rtt` and the two builds compute identical
+windows. For a change that does nothing, the chance that a three-repeat
+median falls below a three-repeat control's minimum is one in five per
+direction-point (the two lowest of six exchangeable values are both the
+candidate's), so "none of 24 below" fails 99.5% of the time; six below and two
+above is what chance gives. The floor is adopted on the loopback evidence,
+overriding the stated bar, and this note records the override.
+
+Later bars must not use that criterion. A side-effect check should instead
+require that the median relative change over all direction-points is within
+±2% and that no direction falls below the control's minimum by more than the
+control's own range. The lazy-arming decision above used the flawed
+criterion and should be rerun with a valid bar.
+
 ## Striping one flow across lanes (November 11)
 
 A switch, `daemon.stripe_flows`, off by default, sends each run of sixteen
@@ -237,7 +294,11 @@ range, and two fall below it (sixteen flows without loss R→L, four flows with
 loss L→R). At 0.5G and 2G every direction stays within or above range. The
 bar rejects the change: three repeats cannot separate it from this workload's
 noise. The patch is kept for a later run with more repeats or a less noisy
-workload.
+workload. (Later the same day the "no direction below the control's range"
+criterion turned out to fail for a no-op 99.5% of the time across 24
+direction-points; see the window floor section above. This decision needs a
+rerun under a valid bar, now that the loopback check is CPU-bound and can
+show a CPU saving.)
 
 ## Round-robin lanes by default? (November 11)
 

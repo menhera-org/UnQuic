@@ -384,6 +384,22 @@ fn low_bdp_model_floors_and_saturating_volume_math() {
 }
 
 #[test]
+fn windows_cover_the_receivers_ack_delay_on_sub_millisecond_paths() {
+    let mut c = cruise();
+    let bw = 1_250_000_000 / 8; // bytes per second at 1.25 Gbit/s
+    c.bw = bw;
+    // A 30 µs path: the window still covers one ACK delay of delivery.
+    c.min_rtt = Some(Duration::from_micros(30));
+    let floored = bytes_in(bw, WINDOW_RTT_FLOOR, true);
+    assert_eq!(c.bdp_multiple(200), 2 * floored);
+    assert_eq!(c.bdp, floored);
+    assert_eq!(c.inflight_at(bw, 100), c.quantized(floored));
+    // Paths longer than the floor size windows from their own RTT, as before.
+    c.min_rtt = Some(ms(10));
+    assert_eq!(c.bdp_multiple(100), bytes_in(bw, ms(10), true));
+}
+
+#[test]
 fn invalid_events_leave_model_and_counters_unchanged() {
     let mut c = cruise();
     let before = c.limits();

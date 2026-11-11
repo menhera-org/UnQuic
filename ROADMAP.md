@@ -7,6 +7,36 @@ read that section before writing code. Keep the "Current status" paragraph in
 section 15 of the design and the "Implementation status" section of
 [README.md](README.md) true after every step.
 
+## November 11 checkpoint
+
+The loopback overload check was window-limited, not CPU-limited. BBR sized
+its window from a min_rtt of tens of microseconds while the feedback loop,
+with each lane holding ACKs up to 1 ms and loaded workers batching, took
+about a millisecond. Hash lanes hid this by leaving workers idle, which kept
+the group application-limited and BBR in Startup with an unbounded window.
+Windows now use at least the receiver's 1 ms ACK delay as RTT. The weaker
+loopback direction rose from 2.55 to 5.49 Gbit/s and the busiest thread to
+98%, so the stage 2 gate is now bounded by per-frame CPU cost
+([BENCH.md](BENCH.md#sizing-windows-from-at-least-one-ack-delay-november-11)).
+
+A `profile` feature counts worker-loop cycles per phase because perf cannot
+run on either test host. On the remote host one flow at 7.5 ms delivers about
+1.6 Gbit/s; BBR paces it, and in ProbeBW_UP inflight grows without delivery,
+so a limit downstream of the sender caps it there
+([BENCH.md](BENCH.md#what-limits-one-flow-at-75-ms-november-11)). Striping one
+flow across lanes raised its medians by 24–36% but doubled reordering and
+missed its bar. Balanced lanes cleared their decision-workload bar and became
+the default, then cut the loopback check by up to 77% (the same window
+limit) and went back off; lane-placement changes must clear both workloads.
+Two side-effect bars this day used a criterion that fails for any no-op 99.5%
+of the time; BENCH.md records a valid replacement.
+
+Stage 4 is done except OVS (absent from the test images) and converting
+locally bounded indexing in encoders and the batch planner. Today added
+fuzzing of every untrusted-input parser and of the workers' packet paths,
+which found an ACK burst that could stop the runtime, and seccomp fault
+injection of worker and thread-start failures.
+
 ## November 10 checkpoint
 
 Three performance changes are adopted: coalescing waiting ACKs per lane with
@@ -164,9 +194,12 @@ rules apply to all of them.
    1500, plus the small-frame burst rows. On November 10 the loopback overload
    check delivers 5.77 / 2.81 Gbit/s at 21 Gbit/s requested, after draft 07's
    three-quantum offload budget lifted the window-limited R→L sender by 71%
-   ([BENCH.md](BENCH.md#three-quantum-offload-budget-november-10)). The
-   busiest left worker is near a full core while two others idle, so lane
-   placement and per-frame cost bound it next.
+   ([BENCH.md](BENCH.md#three-quantum-offload-budget-november-10)). On
+   November 11 the window RTT floor (design section 9) lifted the weaker
+   direction again, to 5.49 / 5.70 Gbit/s
+   ([BENCH.md](BENCH.md#sizing-windows-from-at-least-one-ack-delay-november-11)):
+   the busiest threads now run at 98% and 83%, so the check is CPU-bound and
+   per-frame cost bounds it next.
 6. **Stage 4**, as listed in its section: OVS in the composition matrix (the
    test images lack it) and the remaining resource stress. The panic audit is
    done except for converting locally bounded indexing in encoders and the

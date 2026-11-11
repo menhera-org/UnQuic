@@ -5,6 +5,11 @@ use crate::pacing::Limits;
 use std::time::Duration;
 
 const INFINITY: u64 = u64::MAX;
+/// Shortest RTT used to size windows. RTT samples exclude the receiver's ACK
+/// delay, but a lane holds feedback for up to `ack::DELAY` and loaded workers
+/// add their own batching, so on sub-millisecond paths the feedback loop is
+/// far longer than min_rtt. Deviation from draft 07 (design section 9).
+const WINDOW_RTT_FLOOR: Duration = crate::ack::DELAY;
 const RTT_WINDOW: Duration = Duration::from_secs(10);
 const RTT_PROBE: Duration = Duration::from_millis(200);
 
@@ -817,7 +822,7 @@ impl Controller {
         let Some(rtt) = self.min_rtt else {
             return self.initial_cwnd;
         };
-        self.bdp = bytes_in(self.bw, rtt, true);
+        self.bdp = bytes_in(self.bw, rtt.max(WINDOW_RTT_FLOOR), true);
         scale(self.bdp, u128::from(gain), 100)
     }
 
@@ -838,7 +843,11 @@ impl Controller {
 
     fn inflight_at(&self, bw: u64, gain: u64) -> u64 {
         let cap = self.min_rtt.map_or(self.initial_cwnd, |rtt| {
-            scale(bytes_in(bw, rtt, true), u128::from(gain), 100)
+            scale(
+                bytes_in(bw, rtt.max(WINDOW_RTT_FLOOR), true),
+                u128::from(gain),
+                100,
+            )
         });
         self.quantized(cap)
     }

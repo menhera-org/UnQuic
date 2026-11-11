@@ -10,7 +10,8 @@ pub use sent::{
 
 use std::time::Duration;
 
-const DELAY: Duration = Duration::from_millis(1);
+/// Longest a receiver holds feedback for ACK-eliciting packets on one lane.
+pub(crate) const DELAY: Duration = Duration::from_millis(1);
 
 pub(crate) struct Schedule {
     pub highest: u64,
