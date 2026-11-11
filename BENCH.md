@@ -159,34 +159,36 @@ default. Otherwise coexistence is no worse at this bottleneck, and the
 switch becomes a candidate for the default, to be decided with the target
 evidence.
 
-[Three interleaved repeats](benches/tap-coexist.json), Mbit/s of inner
-goodput over 20 s:
-
-| Switch | Tunnel L→R | Tunnel R→L | Competing TCP L→R |
-| --- | --- | --- | --- |
-| Off | 689 (683–690) | 772 (747–784) | 156 (150–159) |
-| On | 696 (693–711) | 766 (753–770) | 160 (144–160) |
-
-The TCP flow's median does not fall, so by the bar coexistence is no worse
-here. Draft 07 itself already takes about 80% of this bottleneck from one
-CUBIC flow; the switch changes neither share. The bottleneck drops
-3,000–8,400 datagrams per run, 0.2–0.6% of the tunnel's traffic, the regime
-where a tolerant sender keeps its rate.
-
 The more adversarial shallow-buffer case was stated before running, with the
 same bar: a 160-datagram queue, a quarter of a BDP, everything else
 unchanged.
 
-| Switch (160-datagram queue) | Tunnel L→R | Tunnel R→L | Competing TCP L→R |
-| --- | --- | --- | --- |
-| Off | 238 (234–239) | 279 (278–284) | 74 (72–79) |
-| On | 259 (237–264) | 287 (285–296) | 61 (56–75) |
+The first runs of both cases were invalid. They set the rate and queue on the
+router's netem, whose `limit` also counts packets waiting out the 3.75 ms
+delay, about 590 at this rate and packet mix. The "one BDP" run therefore had
+about 50 packets of real queue, and the "quarter BDP" run capped the emulated
+link itself near 0.3 Gbit/s, which is why both builds then delivered only
+about a third of it. The harness now puts a token-bucket bottleneck with a
+byte queue on each outer namespace's egress, before the delay line. Alone, the
+tunnel fills it (about 800 Mbit/s of inner goodput each way through 1 Gbit/s
+with a 160-packet queue, 16 drops).
 
-With the shallow queue the TCP flow's median falls 18%, below the off build's
-range by more than its width: the switch harms coexistence there and stays
-off by default. Both builds use the bottleneck poorly with this queue (about
-a third of it delivered in total), a separate problem for draft 07 at 7.5 ms
-with a quarter-BDP buffer.
+[Three interleaved repeats per queue](benches/tap-coexist.json), Mbit/s over
+20 s (tunnel figures are inner goodput):
+
+| Queue | Switch | Tunnel L→R | Tunnel R→L | Competing TCP L→R |
+| --- | --- | --- | --- | --- |
+| 640 (1 BDP) | Off | 417 (403–423) | 754 (753–761) | 475 (473–492) |
+| 640 (1 BDP) | On | 423 (423–425) | 812 (800–821) | 468 (468–470) |
+| 160 (¼ BDP) | Off | 629 (628–653) | 812 (803–814) | 223 (207–226) |
+| 160 (¼ BDP) | On | 689 (680–707) | 820 (814–825) | 179 (156–188) |
+
+With a one-BDP queue draft 07 and CUBIC share the bottleneck about evenly and
+the switch changes nothing. With a quarter-BDP queue the bottleneck drops
+about 1,100–1,500 packets per run, the low-loss regime a tolerant sender
+ignores: the switch moves bandwidth from TCP to the tunnel, and TCP's median
+falls 20%, below the off range by more than its width. The switch harms
+coexistence with shallow buffers and stays off by default.
 
 ## Arming the worker timer only before sleeping, rerun (November 11)
 

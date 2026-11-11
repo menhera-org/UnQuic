@@ -135,7 +135,7 @@ percent4() {
     printf '%s.%04d%%' "$(($1 / 10000))" "$(($1 % 10000))"
 }
 netem() {
-    if [ "${OUTER_DELAY_US:-0}" -ne 0 ] || [ "${OUTER_LOSS_PERMILLE:-0}" -ne 0 ] || [ "${OUTER_RATE_MBIT:-0}" -ne 0 ]; then
+    if [ "${OUTER_DELAY_US:-0}" -ne 0 ] || [ "${OUTER_LOSS_PERMILLE:-0}" -ne 0 ]; then
         loss=${OUTER_LOSS_PERMILLE:-0}
         burst=${OUTER_LOSS_BURST:-1}
         reorder=${OUTER_REORDER_PERMILLE:-0}
@@ -152,9 +152,7 @@ netem() {
         shift
         # Reordered datagrams skip the delay, so they overtake earlier ones.
         [ "$reorder" -eq 0 ] || set -- "$@" reorder "$((reorder / 10)).$((reorder % 10))%" 50%
-        # A rate turns this direction into a shared bottleneck with a bounded queue.
-        [ "${OUTER_RATE_MBIT:-0}" -eq 0 ] || set -- "$@" rate "${OUTER_RATE_MBIT}mbit"
-        tc qdisc add dev "$dev" root netem limit "${OUTER_QUEUE_PACKETS:-8192}" delay "${OUTER_DELAY_US:-0}us" "$@"
+        tc qdisc add dev "$dev" root netem limit 8192 delay "${OUTER_DELAY_US:-0}us" "$@"
     fi
 }
 ip link set lo up
@@ -178,6 +176,12 @@ if [ "${OUTER_ROUTED:-0}" = 1 ]; then
         nsenter --net="/run/netns/uq-out-$side" ethtool -K uq-path gro on
         ethtool -k "uq-r-$side" > "$out/$side.router-offloads"
         grep -q '^tcp-segmentation-offload: off' "$out/$side.router-offloads"
+        if [ "${OUTER_RATE_MBIT:-0}" -ne 0 ]; then
+            # The bottleneck sits before the router's delay line: netem's limit
+            # would also count delayed packets, so a token bucket holds the queue.
+            nsenter --net="/run/netns/uq-out-$side" tc qdisc add dev uq-path root tbf \
+                rate "${OUTER_RATE_MBIT}mbit" burst 32kb limit "$((${OUTER_QUEUE_PACKETS:-8192} * 1500))"
+        fi
         nsenter --net="/run/netns/uq-out-$side" ethtool -k uq-path > "$out/$side.outer-offloads"
         grep -q '^generic-receive-offload: on' "$out/$side.outer-offloads"
         grep -q '^generic-segmentation-offload: off' "$out/$side.outer-offloads"
@@ -334,6 +338,8 @@ snapshot() {
         tc -s -d qdisc show dev uq-r-left > "$out/$1.qdisc-left"
         tc -s -d qdisc show dev uq-r-right > "$out/$1.qdisc-right"
         for side in left right; do
+            # The left outer namespace's uq-path egress is the L→R bottleneck.
+            outer "$side" tc -s -d qdisc show dev uq-path > "$out/$1.bottleneck-$side"
             outer "$side" ethtool -S uq-path > "$out/$1.$side-veth"
             outer "$side" ip -s link show uq-path > "$out/$1.$side-outer-link"
         done
