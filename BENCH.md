@@ -101,7 +101,7 @@ others keep earlier evidence. L→R / R→L pairs are simultaneous.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98% | Unknown. Every QinQ read lands on one worker, but spreading the input over all readers (one tag instead of two) lowers delivery and multiplies reordering, so that reader is not the limit ([BENCH.md](#whether-the-single-qinq-reader-limits-the-loopback-check-november-11)). |
+| At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98% | Not per-thread CPU. Every QinQ read lands on one worker, but spreading reads over the other readers lowers delivery, and with distinct ports per direction the QinQ reader runs at 68% while its direction stays near 5 Gbit/s ([BENCH.md](#whether-the-single-qinq-reader-limits-the-loopback-check-november-11)). Pacing or the loss response is the next suspect. |
 | Goodput must plateau under excess traffic | Decision workload (four workers, 4.5 ms): sixteen flows deliver 1.4–2.1 Gbit/s per direction at 5G offered without collapse; workers run at 79–99% of a core | Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
 | Small-frame overload must remain efficient | Earlier pre-recovery tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input and output offloads improve matched TCP sweeps; single-stream output coalescing reaches 2.01 / 2.26 Gbit/s, still below the deployment target. |
@@ -156,17 +156,49 @@ medians with ranges:
 | One | 4.696 (4.641–5.361) | 5.025 (4.486–5.371) | 1,287,132 / 1,363,218 | 82% / 84% |
 
 With one tag both medians fall instead of rising, and reordering grows 60 to
-600 times. The hypothesis fails: the single reader does not limit the check,
-and the gaps table no longer says it does. Spread input costs more than it
-saves here. In the harness, flow j runs from port 51000 + j to 52000 + j in
-both directions. tun's symmetric hash orders addresses and ports separately,
-so by our reading of the source the two directions of flow j share one hash.
-tun then sends each flow to the queue the daemon last wrote the other
-direction on. Those writes come from whichever worker received the outer
-packet, so without the QinQ misparse a flow's input moves between readers.
-Each reader hashes onto its own lanes, so the flow changes lanes and arrives
-out of order. QinQ input stays put because its hash never matches a written
-flow. What limits the check remains open.
+600 times. The hypothesis fails as stated, but the comparison changed two
+things at once. In the harness, flow j runs from port 51000 + j to 52000 + j
+in both directions. tun's symmetric hash orders addresses and ports
+separately, so by our reading of the source the two directions of flow j
+share one hash. tun then sends each flow to the queue the daemon last wrote
+the other direction on. Those writes come from whichever worker received the
+outer packet, so without the QinQ misparse a flow's input moves between
+readers. Each reader hashes onto its own lanes, so the flow changes lanes and
+arrives out of order. QinQ input stays put because its hash never matches a
+written flow. One tag therefore spread the input and also kept moving every
+flow.
+
+A `profile` build run once on the QinQ check shows the reader (worker 3)
+idle 32% of its lifetime, which includes the warm-up point and setup; its
+thread time at the 21G point is 95–97%. Of its busy cycles, reading the TAP
+takes 18%, sender service 18%, frame flushes 17%, TAP writes 13% and packet
+draining 10%. Worker 0, which runs the controllers, idles 62%, and worker 5
+does nothing.
+
+The harness now takes `REVERSE_PORT_OFFSET`, which moves the right-to-left
+flows to their own ports so each direction hashes on its own. Stated before
+measuring, with an offset of 2000 in both arms, three interleaved repeats:
+if the single reader limits the check, one tag lifts both direction medians
+beyond the QinQ range without multiplying reordering.
+
+[Three interleaved repeats](benches/tap-loop-vlan-depth-ports.json), 21G
+point:
+
+| Tags, offset 2000 | L→R Gbit/s | R→L Gbit/s | Reordered frames L→R / R→L | Busiest thread L / R |
+| --- | --- | --- | --- | --- |
+| Two (QinQ) | 4.798 (4.796–5.006) | 6.125 (5.738–6.151) | 3,010 / 7,032 | 68% / 94% |
+| One | 4.599 (4.410–4.631) | 4.540 (4.440–4.910) | 3,504 / 2,158 | 86% / 86% |
+
+With distinct ports one tag spreads reads over six of the eight readers on
+each side (first repeat) and flows stay put: reordering is as low as with QinQ. Both medians
+still fall below the QinQ range. With QinQ in this run the left reader is
+only 68% busy, yet L→R delivers 4.8 Gbit/s. The hypothesis fails cleanly:
+the single reader does not set the loopback limit. The QinQ arm itself moved
+between the two port layouts (5.85 / 5.79 before, 4.80 / 6.12 here), so the
+check's direction balance depends on placement that the layout changes. No
+thread on the left saturates while L→R stays near 5 Gbit/s, which points at
+the transport's own pacing or loss response, not CPU. That is the next thing
+to measure.
 
 ## Balanced lanes after the window floor (November 11)
 

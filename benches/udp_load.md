@@ -140,6 +140,11 @@ With `OUTER_ROUTED=1`, `COMPETING_TCP=1` runs one netcat TCP stream from the
 left outer namespace to the right one for each load point, sharing that
 bottleneck with the tunnel; `competing-bytes` holds the bytes received in the
 point's seconds.
+Flow j runs from port 51000 + j to 52000 + j in both directions by default.
+tun's symmetric flow hash then gives both directions of flow j the same hash,
+so tun reads a flow on the queue the daemon last wrote its other direction on.
+`REVERSE_PORT_OFFSET`, for example 2000, moves the right-to-left flows to
+other ports so each direction hashes on its own.
 Each snapshot's `memory` file records both daemons' VmHWM and VmRSS.
 `DAEMON_TOML`, when set, starts both daemon configurations, for
 example `[daemon]` options. Netem has an 8192-entry queue on each router egress. Qdisc snapshots

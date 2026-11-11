@@ -389,6 +389,8 @@ for rate in ${BITRATE:-0}; do
         case "$rate" in *[!0-9]*) echo "UDP_LOAD rates must be integer bits/s per flow" >&2; exit 2;; esac
         run=$((index + 1))
         share=$((flows / processes))
+        # tun hashes ports symmetrically, so equal port pairs make flow j share a hash both ways.
+        reverse=${REVERSE_PORT_OFFSET:-0}
         k=0
         while [ "$k" -lt "$processes" ]; do
             # Process k carries flows k*share.. on its own port range; process 0 keeps the original file names.
@@ -399,7 +401,7 @@ for rate in ${BITRATE:-0}; do
                 "$right_address" "$left_address" "$((52000 + offset))" "$((51000 + offset))" "$share" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/server$suffix.json" &
             servers="$servers $!"
             nsenter --net="$left_inner" taskset -c "$(process_cpu "$RECEIVER_LEFT_CPUS" "$k")" "$UDP_LOAD" recv \
-                "$left_address" "$right_address" "$((52000 + offset))" "$((51000 + offset))" "$share" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/reverse-server$suffix.json" &
+                "$left_address" "$right_address" "$((52000 + reverse + offset))" "$((51000 + reverse + offset))" "$share" "$payload" "$((seconds + 2))" 0 "$run" "${SEGMENTS:-64}" > "$out/reverse-server$suffix.json" &
             servers="$servers $!"
             k=$((k + 1))
         done
@@ -428,7 +430,7 @@ for rate in ${BITRATE:-0}; do
                 "$left_address" "$right_address" "$((51000 + offset))" "$((52000 + offset))" "$share" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/client$suffix.json" &
             clients="$clients $!"
             nsenter --net="$right_inner" taskset -c "$(process_cpu "$GENERATOR_RIGHT_CPUS" "$k")" "$UDP_LOAD" send \
-                "$right_address" "$left_address" "$((51000 + offset))" "$((52000 + offset))" "$share" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/reverse-client$suffix.json" &
+                "$right_address" "$left_address" "$((51000 + reverse + offset))" "$((52000 + reverse + offset))" "$share" "$payload" "$seconds" "$rate" "$run" "${SEGMENTS:-64}" > "$out/reverse-client$suffix.json" &
             clients="$clients $!"
             k=$((k + 1))
         done

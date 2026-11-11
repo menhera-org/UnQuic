@@ -19,8 +19,9 @@ loopback direction rose from 2.55 to 5.49 Gbit/s and the busiest thread to
 98% ([BENCH.md](BENCH.md#sizing-windows-from-at-least-one-ack-delay-november-11)).
 That thread reads every QinQ flow because tun's flow dissector, by our
 reading, misparses locally routed double-tagged frames and hashes them all
-alike. Spreading the input with one tag made the check slower, not faster, so
-the single reader is not what holds the gate back.
+alike. Spreading the input with one tag and distinct ports per direction made
+the check slower, not faster, and no left thread saturates, so the single
+reader is not what holds the gate back.
 
 A `profile` feature counts worker-loop cycles per phase because perf cannot
 run on either test host. On the remote host one flow at 7.5 ms delivers about
@@ -202,11 +203,12 @@ rules apply to all of them.
    direction again, to 5.49 / 5.70 Gbit/s
    ([BENCH.md](BENCH.md#sizing-windows-from-at-least-one-ack-delay-november-11)):
    the busiest threads now run at 98% and 83%. The 98% thread is the one
-   worker that reads every QinQ flow, but it does not set the limit: with one
-   tag tun spreads the input over all readers, and delivery falls while
-   reordering multiplies
+   worker that reads every QinQ flow, but it does not set the limit. With one
+   tag and distinct ports per direction, tun spreads reads over most readers
+   without reordering, and delivery still falls; in that port layout the QinQ
+   reader runs at 68% while its direction stays near 5 Gbit/s
    ([BENCH.md](BENCH.md#whether-the-single-qinq-reader-limits-the-loopback-check-november-11)).
-   The limit is not yet identified.
+   Pacing or the loss response is the next suspect.
 6. **Stage 4**, as listed in its section: OVS in the composition matrix (the
    test images lack it) and the remaining resource stress. The panic audit is
    done except for converting locally bounded indexing in encoders and the
