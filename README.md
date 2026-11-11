@@ -597,9 +597,9 @@ Fixed-key hashing can put a few heavy flows on the same transmit worker. With
 `daemon.balance_flows`, off by default, frames on the strict-hash path go
 through a per-reader table instead: a new flow takes the session's next lane
 round-robin and keeps it while it sends, moving only after a second of
-silence. It raises every decision-workload direction at 2G by 12–89%, but cuts
-the loopback overload check by up to 77% for a reason not yet found
-(BENCH.md).
+silence. It lifts one flow at 7.5 ms by 42–58% and the weaker decision-workload
+directions by up to 121%, but the direction hashing favoured loses up to 14%
+and the loopback overload check 10% in total, so it stays off (BENCH.md).
 
 Flow hashing looks through one unfragmented IPv4, IPv6 or Ethernet
 encapsulation, including an IPv6 segment routing header before the inner
