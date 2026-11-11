@@ -369,7 +369,7 @@ Gbit/s below the control's minimum, inside the 0.035 allowed by the
 control's range. Condition (1) holds, narrowly.
 
 On the [decision workload](benches/tap-wake-sleeping-decision.json) the
-median change over the 24 direction-points is +1.4%. The largest gains are
+median change over the 24 direction-points is +0.75%. The largest gains are
 at 5G with sixteen flows (L→R +4.4% without loss, +5.6% with) and 2G with
 four flows (R→L +12.2% and +11.6%); the largest falls are −3.2% and −3.6%,
 inside their control ranges' margins. One point fails condition (2) as
