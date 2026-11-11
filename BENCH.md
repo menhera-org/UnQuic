@@ -268,6 +268,31 @@ next candidate should move receive work off the worker that reads the TAP,
 or split TAP reading inside the daemon, so the two directions stop sharing
 one core.
 
+Placement alone cannot reach the gate. In the control arm the two daemons
+together use 866% of a core for 11.74 Gbit/s, about 0.74 of a core per Gbit/s
+counting both ends. Each daemon runs on eight CPUs, so even with perfect
+balance the check tops out near 21.7 Gbit/s in total, 10.8 each way. Reaching
+20 each way needs the per-bit cost to fall by almost half. The `profile` run
+above, summed over every worker of both daemons (both load points, busy
+cycles only), shows where it goes:
+
+| Phase | Share of busy cycles |
+| --- | --- |
+| `service_sender` (grants, and batches sent under them) | 20.9% |
+| `flush_taps` (TAP writes) | 14.6% |
+| `flush_frames` (packing and `sendmmsg`) | 14.6% |
+| `drain_packets` (receive processing) | 11.4% |
+| `drain_tap_inputs` | 6.4% |
+| `read_socket` | 6.1% |
+| `flush_notifications` | 4.9% |
+| `read_tap` | 4.8% |
+| everything else | 16.3% |
+
+`sendmmsg` itself takes about 11% of busy cycles (53 billion of 488
+billion). Both `service_sender` and `flush_frames` pack and send batches, so
+this table does not yet separate grant coordination from packing; a finer
+split of `service_sender` is the next profile to take.
+
 ## Balanced lanes after the window floor (November 11)
 
 Balanced lanes went back off because the loopback check fell from 6.54 /

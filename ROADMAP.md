@@ -216,6 +216,13 @@ rules apply to all of them.
    ([BENCH.md](BENCH.md#receive-buffers-for-a-busy-reader-november-11)).
    Next: keep receive work off the worker that reads the TAP, or split TAP
    reading inside the daemon, so the two directions stop sharing one core.
+   Placement alone cannot close the gate: at about 0.74 of a core per Gbit/s
+   (both ends together) sixteen daemon CPUs top out near 10.8 Gbit/s each
+   way, so the per-bit cost must fall by almost half. The sender's grant
+   service, which also sends batches, is the largest phase at 21% of busy
+   cycles, ahead of TAP writes and frame flushing at 15% each; `sendmmsg`
+   alone is 11%
+   ([BENCH.md](BENCH.md#receive-buffers-for-a-busy-reader-november-11)).
 6. **Stage 4**, as listed in its section: OVS in the composition matrix (the
    test images lack it) and the remaining resource stress. The panic audit is
    done except for converting locally bounded indexing in encoders and the
