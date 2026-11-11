@@ -101,7 +101,7 @@ others keep earlier evidence. L→R / R→L pairs are simultaneous.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98% | Not per-thread CPU. Every QinQ read lands on one worker, but spreading reads over the other readers lowers delivery, and with distinct ports per direction the QinQ reader runs at 68% while its direction stays near 5 Gbit/s ([BENCH.md](#whether-the-single-qinq-reader-limits-the-loopback-check-november-11)). Pacing or the loss response is the next suspect. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98% | L→R is input-limited: every QinQ read lands on one worker per side, which runs at 96% while the senders it feeds idle. R→L is congestion-limited: BBR spends half the point in ProbeBW_DOWN after losses of unknown source. Letting tun spread reads (one tag) lowers delivery and costs 23% more CPU per bit ([BENCH.md](#whether-the-single-qinq-reader-limits-the-loopback-check-november-11)). |
 | Goodput must plateau under excess traffic | Decision workload (four workers, 4.5 ms): sixteen flows deliver 1.4–2.1 Gbit/s per direction at 5G offered without collapse; workers run at 79–99% of a core | Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
 | Small-frame overload must remain efficient | Earlier pre-recovery tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input and output offloads improve matched TCP sweeps; single-stream output coalescing reaches 2.01 / 2.26 Gbit/s, still below the deployment target. |
@@ -190,15 +190,35 @@ point:
 | One | 4.599 (4.410–4.631) | 4.540 (4.440–4.910) | 3,504 / 2,158 | 86% / 86% |
 
 With distinct ports one tag spreads reads over six of the eight readers on
-each side (first repeat) and flows stay put: reordering is as low as with QinQ. Both medians
-still fall below the QinQ range. With QinQ in this run the left reader is
-only 68% busy, yet L→R delivers 4.8 Gbit/s. The hypothesis fails cleanly:
-the single reader does not set the loopback limit. The QinQ arm itself moved
-between the two port layouts (5.85 / 5.79 before, 4.80 / 6.12 here), so the
-check's direction balance depends on placement that the layout changes. No
-thread on the left saturates while L→R stays near 5 Gbit/s, which points at
-the transport's own pacing or loss response, not CPU. That is the next thing
-to measure.
+each side (first repeat) and flows stay put: reordering is as low as with
+QinQ. Both medians still fall below the QinQ range, so the hypothesis fails:
+spreading reads the way tun does lowers delivery even when flows stay put.
+Spreading costs more CPU per bit: the two daemons together use 909% of a core
+for 9.1 Gbit/s with one tag against 882% for 10.9 with QinQ, about 23% more
+per Gbit/s, probably because each reader's batches are smaller. The QinQ arm
+itself moved between the two port layouts (5.85 / 5.79 before, 4.80 / 6.12
+here), so the direction balance depends on placement.
+
+That does not clear the single reader. A run of the usual layout with a
+`trace` build of the same commit (one run, 5.84 / 5.73 Gbit/s,
+[report](benches/tap-loop-trace.json)) shows each direction limited by
+something different at the 21G point:
+
+- L→R is input-limited. Its senders hold their flight without asking for a
+  grant 81% of the time, mostly with nothing queued. BBR is in ProbeBW_CRUISE
+  84% of the time with a mean pacing rate of 16.3 Gbit/s; pacing and the
+  window refuse requests only 6% and 2% of the time. The left reader, at 97%,
+  cannot feed them, and it spends a further 19% of the point blocked by a
+  full packet history.
+- R→L is limited by congestion control. The right controller spends 48% of
+  the point in ProbeBW_DOWN after 29,345 losses, and its senders are refused
+  by pacing 21% and by the window 20% of the time; 170,927 frames expire
+  unsent. The left side's 1,613 socket overflows explain few of those
+  losses, so their source is not yet known.
+
+So the single reader limits its own direction, and tun's spreading costs more
+than it gains. The candidates are a cheaper reader, or spreading inside the
+daemon after one large read, for L→R, and finding the R→L losses.
 
 ## Balanced lanes after the window floor (November 11)
 
