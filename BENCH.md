@@ -139,14 +139,45 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## What limits one flow at 7.5 ms (November 11)
+
+Perf cannot run on either test host: here `perf_event_paranoid` is 4, and the
+remote Linux 7.0 kernel refuses `perf_event_open` even to root and denies
+writes to the sysctl. Sampling with SIGPROF timers on worker threads crashed
+the daemon through a jump to address zero, which a plain test thread with the
+same timers did not reproduce, so that approach was dropped. Instead a
+diagnostics-only `profile` feature adds timestamp-counter cycles per phase of
+each worker's loop, `sendmmsg` time, and transmit admission drops by cause,
+and prints them when the worker stops.
+
+The workload is the stage 3 target on the remote host: one bridged QinQ flow
+each way, 1522-byte frames, 7.5 ms RTT, `tolerate_random_loss`, 5 Gbit/s
+offered, two workers per daemon because the host has eight CPUs. Each
+direction delivers about 1.5–1.6 Gbit/s at 0.5% loss and 1.6 Gbit/s at none,
+so loss is not the limit. The transmit worker spends its cycles in sending
+(27–30%), `flush_frames` (17–24%), blocking waits (17–21%), deadline
+computation and timer arming (8.6–8.9%), TAP input expansion (8%), buffer
+returns (6%) and queue draining (5%). `sendmmsg` itself takes 24% of the
+worker at 34 datagrams per call.
+
+Almost every refused frame is refused because the transmit worker's 128
+exchange buffers are exhausted (1.5–1.95 million per run, against 28,000–
+194,000 for the frame quota and none for the other causes). A `trace` build
+shows why: at each refusal 96 of the 119 occupied buffers hold queued,
+unexpanded inputs of one frame each, because the lane's 2 MiB unsent backlog
+is full. The sender is waiting on pacing (74,006 pacing refusals against
+4,142 window refusals in 4.6 s). BBR paces at 1.59 Gbit/s on a 1.54 Gbit/s
+bandwidth estimate. In ProbeBW_UP it paces at 1.88 Gbit/s and inflight grows
+from 1.2 to 2.0 MB while the estimate stays at 1.52, so a queue forms beyond
+the sender: on this host the emulated routed path or the receiver caps one
+flow, not the sender's CPU. Giving each worker 512 buffers lowered delivery
+by 24–36%, because the longer input queue makes the per-turn deadline walk
+and buffer scans costlier.
+
 ## Arming the worker timer only before sleeping (November 11)
 
-Perf cannot run on either test host (the remote kernel refuses
-`perf_event_open` even to root and locks the sysctl), so a diagnostics-only
-`profile` feature adds timestamp-counter cycles per phase of the worker loop.
-On the remote Linux 7.0 host, one 1522-byte flow at 7.5 ms RTT with two
-workers per daemon, the transmit worker spends 8.6–8.9% of its cycles
-computing the next deadline and re-arming its timer on every turn. The
+In the single-flow profile above, the transmit worker spends 8.6–8.9% of its
+cycles computing the next deadline and re-arming its timer on every turn. The
 deadline walks every queued TAP input and receive lane, so the cost grows
 with the queues it is meant to drain. A busy turn polls with a zero timeout
 and loops again, so the deadline only matters before a blocking wait.

@@ -743,6 +743,23 @@ pub(crate) struct Worker {
     retry_due: Option<Duration>,
     // Empty unless daemon.balance_flows is set.
     flows: Box<[FlowSlot]>,
+    #[cfg(feature = "profile")]
+    phases: [u64; crate::profile::PHASES],
+}
+
+/// Adds the cycles spent evaluating `$e` to phase `$phase` (feature `profile` only).
+macro_rules! phase {
+    ($self:ident, $phase:expr, $e:expr) => {{
+        #[cfg(feature = "profile")]
+        let started = crate::profile::now();
+        let result = $e;
+        #[cfg(feature = "profile")]
+        {
+            $self.phases[$phase] =
+                $self.phases[$phase].wrapping_add(crate::profile::now().wrapping_sub(started));
+        }
+        result
+    }};
 }
 
 impl Worker {
@@ -1076,6 +1093,8 @@ impl Worker {
             counters,
             setup_due: Duration::ZERO,
             retry_due: None,
+            #[cfg(feature = "profile")]
+            phases: [0; crate::profile::PHASES],
             flows: if config.daemon.balance_flows {
                 vec![FlowSlot::default(); FLOW_SLOTS].into_boxed_slice()
             } else {
@@ -1129,44 +1148,54 @@ impl Worker {
         let mut publish_turns = 0_u8;
         while !self.control.quitting() {
             let now = monotonic_now()?;
-            let mut more = self.drain_queues(now)?;
+            let mut more = phase!(self, 0, self.drain_queues(now))?;
             if now >= self.setup_due {
-                self.setup(now)?;
+                phase!(self, 1, self.setup(now))?;
             }
-            more |= self.distribute_receivers();
-            more |= self.addresses(now)?;
-            more |= self.service_sender(now)?;
-            self.progress_barriers(now)?;
-            self.timers(now)?;
-            more |= self.mtu_timers(now)?;
-            more |= self.drain_packets(now)?;
-            self.drain_tap_inputs(now)?;
-            more |= self.flush_frames(now)?;
-            self.flush_returns();
-            more |= (0..self.sessions.len()).any(|session| self.tap_can_expand(session));
-            self.flush_taps(now)?;
-            self.collect_acks(now)?;
-            self.flush_control(now)?;
-            more |= self.flush_sender_messages(now)?;
-            self.flush_notifications()?;
-            more |= self.ready.iter().copied().any(|(session, lane)| {
-                let Some(peer) = self.shared.config.peer_for_session(session) else {
-                    return false;
-                };
-                let tx = &self.transmit[peer].paths[self.sessions[session].path].lanes[lane];
-                let batch = self.sessions[session].batches[lane].as_ref();
-                batch.is_some_and(|batch| batch.len == 0 && batch.pending.is_empty())
-                    || (!tx.blocked
-                        && tx.mtu.payload_limit() != 0
-                        && (!self.sender_enabled() || self.sender.job.is_none()))
-            });
-            self.receive_interest(more)?;
+            more |= phase!(self, 2, self.distribute_receivers());
+            more |= phase!(self, 3, self.addresses(now))?;
+            more |= phase!(self, 4, self.service_sender(now))?;
+            phase!(self, 5, self.progress_barriers(now))?;
+            phase!(self, 6, self.timers(now))?;
+            more |= phase!(self, 7, self.mtu_timers(now))?;
+            more |= phase!(self, 8, self.drain_packets(now))?;
+            phase!(self, 9, self.drain_tap_inputs(now))?;
+            more |= phase!(self, 10, self.flush_frames(now))?;
+            phase!(self, 11, self.flush_returns());
+            more |= phase!(
+                self,
+                12,
+                (0..self.sessions.len()).any(|session| self.tap_can_expand(session))
+            );
+            phase!(self, 13, self.flush_taps(now))?;
+            phase!(self, 14, self.collect_acks(now))?;
+            phase!(self, 15, self.flush_control(now))?;
+            more |= phase!(self, 16, self.flush_sender_messages(now))?;
+            phase!(self, 17, self.flush_notifications())?;
+            more |= phase!(
+                self,
+                18,
+                self.ready.iter().copied().any(|(session, lane)| {
+                    let Some(peer) = self.shared.config.peer_for_session(session) else {
+                        return false;
+                    };
+                    let tx = &self.transmit[peer].paths[self.sessions[session].path].lanes[lane];
+                    let batch = self.sessions[session].batches[lane].as_ref();
+                    batch.is_some_and(|batch| batch.len == 0 && batch.pending.is_empty())
+                        || (!tx.blocked
+                            && tx.mtu.payload_limit() != 0
+                            && (!self.sender_enabled() || self.sender.job.is_none()))
+                })
+            );
+            phase!(self, 19, self.receive_interest(more))?;
             publish_turns = publish_turns.wrapping_add(1);
             if now >= publish_due || publish_turns == 0 {
-                self.publish_counters();
+                phase!(self, 20, self.publish_counters());
                 publish_due = now + Duration::from_millis(1);
                 publish_turns = 0;
             }
+            #[cfg(feature = "profile")]
+            let arming = crate::profile::now();
             let mut deadline = self.deadline(now);
             if self.has_backpressure() {
                 let due = self.retry_due.get_or_insert(now + RETRY);
@@ -1178,10 +1207,17 @@ impl Worker {
                 self.retry_due = None;
             }
             self.reactor.arm(deadline)?;
-            let count = match self
-                .reactor
-                .wait(&mut events, if more || immediate { 0 } else { -1 })
+            #[cfg(feature = "profile")]
             {
+                self.phases[21] =
+                    self.phases[21].wrapping_add(crate::profile::now().wrapping_sub(arming));
+            }
+            let block = !(more || immediate);
+            let count = match phase!(
+                self,
+                if block { 22 } else { 27 },
+                self.reactor.wait(&mut events, if block { -1 } else { 0 })
+            ) {
                 Ok(count) => count,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
@@ -1199,10 +1235,10 @@ impl Worker {
                             self.sessions[session].tap_blocked = false;
                         }
                         if event.events & libc::EPOLLIN as u32 != 0 {
-                            self.read_tap(session, now)?;
+                            phase!(self, 23, self.read_tap(session, now))?;
                         }
                     }
-                    2 => {
+                    2 => phase!(self, 24, {
                         let peer = ((token as u32) >> 7) as usize;
                         let path = ((token as u32) >> 6 & 1) as usize;
                         let lane = token as usize & 63;
@@ -1216,12 +1252,15 @@ impl Worker {
                         if event.events & libc::EPOLLERR as u32 != 0 {
                             self.mtu_error(peer, path, lane, now)?;
                         }
-                    }
-                    _ if token >= 2 => self.read_socket(token as usize - 2, now)?,
-                    _ => self.reactor.drain(token)?,
+                        Ok::<(), io::Error>(())
+                    })?,
+                    _ if token >= 2 => phase!(self, 25, self.read_socket(token as usize - 2, now))?,
+                    _ => phase!(self, 26, self.reactor.drain(token))?,
                 }
             }
         }
+        #[cfg(feature = "profile")]
+        crate::profile::report(self.id, &self.phases);
         self.publish_counters();
         if self.control.handing_over() {
             // A successor adopts these; closing them is not the device's end anyway.
@@ -2484,6 +2523,17 @@ impl Worker {
                     self.returns.iter().map(Vec::len).sum::<usize>() << 16 | self.rx_retained
                 ]
             );
+            #[cfg(feature = "profile")]
+            crate::profile::ADMISSION[if local.tap_inputs.len() == BUFFERS {
+                0
+            } else if self.free.len() <= RECEIVE_BUFFERS - self.rx_retained + 1 {
+                1
+            } else if local.tx_retained + 3 > frame_quota(local.tx_workers) {
+                2
+            } else {
+                3
+            }]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.queue_drop(session, false, true);
             if self.sender_enabled()
                 && let Ok(index) = self.sender_index(session, lane)

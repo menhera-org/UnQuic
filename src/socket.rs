@@ -639,6 +639,8 @@ fn send_batch(
         first = end;
     }
     let at = before()?;
+    #[cfg(feature = "profile")]
+    let started = crate::profile::now();
     // SAFETY: each header borrows live datagram slices and aligned ancillary
     // storage. All referenced iovecs were initialized above; unused slots are
     // outside msg_iovlen. The kernel reads payloads and writes only message lengths.
@@ -650,6 +652,8 @@ fn send_batch(
             (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as _,
         )
     })? as usize;
+    #[cfg(feature = "profile")]
+    crate::profile::syscall(0, started, if sent == 0 { 0 } else { ends[sent - 1] });
     Ok((if sent == 0 { 0 } else { ends[sent - 1] }, at))
 }
 

@@ -51,6 +51,8 @@ pub mod mac;
 pub mod pacing;
 pub mod pack;
 pub mod pmtu;
+#[cfg(feature = "profile")]
+pub mod profile;
 pub mod reassembly;
 pub mod runtime;
 mod sha256;

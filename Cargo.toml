@@ -22,6 +22,8 @@ uuid-compat = ["dep:uuid"]
 bin = ["dns", "dep:serde", "dep:toml", "iphost/serde"]
 # Diagnostics only: per-worker event rings. Never enable for production or acceptance runs.
 trace = []
+# Diagnostics only: per-phase worker cycle totals printed at shutdown.
+profile = []
 
 [[bin]]
 name = "unquic"
