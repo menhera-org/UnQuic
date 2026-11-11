@@ -293,9 +293,17 @@ fn loss_outside_probing_reduces_shortterm_once_per_loss_round() {
 }
 
 #[test]
-fn tolerated_random_loss_cuts_shortterm_only_above_the_loss_threshold() {
-    // 600 of 30,000 bytes is exactly 2%, which is not too high.
-    for (tolerate, lost, cut) in [(false, 600, true), (true, 600, false), (true, 601, true)] {
+fn tolerated_random_loss_cuts_shortterm_only_above_the_loss_threshold_or_with_a_queue() {
+    // 600 of 30,000 bytes is exactly 2%, which is not too high. With a 10 ms
+    // min_rtt, RTT samples above 11.25 ms show a queue, which still cuts.
+    let rtt = Duration::from_micros;
+    for (tolerate, lost, sampled, cut) in [
+        (false, 600, rtt(10_000), true),
+        (true, 600, rtt(10_000), false),
+        (true, 601, rtt(10_000), true),
+        (true, 600, rtt(11_250), false),
+        (true, 600, rtt(11_251), true),
+    ] {
         let mut c = cruise();
         c.tolerate_random_loss(tolerate);
         c.bw_latest = 0;
@@ -305,7 +313,7 @@ fn tolerated_random_loss_cuts_shortterm_only_above_the_loss_threshold() {
         let mut s = sample(&c, 100_000, 1500);
         s.lost = u64::from(lost);
         s.tx_in_flight = 30000;
-        c.on_ack(s, Some(ms(10)), 15000, false, ms(60)).unwrap();
+        c.on_ack(s, Some(sampled), 15000, false, ms(60)).unwrap();
         let bounds = (c.bw_shortterm, c.inflight_shortterm);
         if cut {
             assert_eq!(bounds, (1_050_000, 31500));

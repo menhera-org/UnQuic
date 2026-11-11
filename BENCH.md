@@ -139,6 +139,45 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Tolerating random loss only without queueing delay (November 11)
+
+Congestion loss arrives with a filled queue and random loss does not. The
+candidate keeps `tolerate_random_loss` but also cuts the short-term bounds
+after a loss round whose RTT samples exceed min_rtt by more than
+max(min_rtt / 8, 250 µs): about 0.94 ms at 7.5 ms, where a full quarter-BDP
+queue adds about 1.9 ms.
+
+Stated before measuring, the switch off (the default) against on with the
+candidate, three interleaved repeats each: (1) at the quarter-BDP
+token-bucket bottleneck below, the competing TCP median with the switch on
+must not fall below the off range by more than its width; (2) on the stage 3
+single-flow target (7.5 ms RTT, 0.5% and 1% random loss, 5G offered, four
+workers), every direction's 5G median with the switch on must rise beyond the
+off build's range. If both hold, the switch becomes the default; otherwise
+it stays off.
+
+[Coexistence](benches/tap-coexist-queued.json), quarter-BDP token bucket,
+Mbit/s over 20 s:
+
+| Switch | Tunnel L→R | Tunnel R→L | Competing TCP L→R |
+| --- | --- | --- | --- |
+| Off | 641 (636–650) | 818 (806–821) | 212 (199–218) |
+| On, with the queue check | 644 (617–664) | 808 (765–827) | 211 (197–213) |
+
+[Single-flow target](benches/tap-tolerate-queued.json), 5G point, Gbit/s:
+
+| Loss | Off L→R / R→L | On L→R / R→L |
+| --- | --- | --- |
+| 0.5% | 0.935 (0.927–0.997) / 0.981 (0.966–0.988) | 1.014 (0.958–1.078) / 1.024 (1.003–1.024) |
+| 1% | 0.817 (0.771–0.832) / 0.810 (0.797–0.818) | 0.966 (0.941–0.995) / 1.024 (0.984–1.029) |
+
+Both conditions hold. The TCP flow keeps its share, which the switch without
+the check took 20% of, and every target direction rises beyond the off range,
+by 4–26%. `tolerate_random_loss` is now on by default. Earlier today the
+switch without the check reached about 1.5 Gbit/s on the same target, so the
+check gives up part of the gain, probably because host delay under CPU load
+also raises RTT samples; a cleaner queue signal may recover it.
+
 ## Coexistence with `tolerate_random_loss` (November 11)
 
 The switch cuts the short-term bounds only after a round above 2% loss.

@@ -33,8 +33,9 @@ pub struct Config {
 pub struct Daemon {
     /// Total transport storage ceiling, including metadata and queues.
     pub memory_limit: usize,
-    /// Deviation from BBR draft 07, off by default: outside bandwidth probing,
-    /// cut the short-term bounds only after a loss round above 2% loss.
+    /// Deviation from BBR draft 07, on by default: outside bandwidth probing,
+    /// cut the short-term bounds only after a loss round above 2% loss or one
+    /// whose RTT samples show queueing delay.
     pub tolerate_random_loss: bool,
     /// Off by default: pin each new flow to the next lane round-robin instead
     /// of its hash lane, so a few heavy flows use separate transmit workers.
@@ -45,7 +46,7 @@ impl Default for Daemon {
     fn default() -> Self {
         Self {
             memory_limit: 256 * 1024 * 1024,
-            tolerate_random_loss: false,
+            tolerate_random_loss: true,
             balance_flows: false,
         }
     }

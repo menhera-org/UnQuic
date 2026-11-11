@@ -673,9 +673,14 @@ admission since the worker last held data starts draft 07's
 application-limited bubble at delivered plus inflight; sends join it until
 delivery passes that point. Without this, ACKs of sparse traffic before a load
 could end Startup before the load arrived. The daemon-wide
-`tolerate_random_loss` switch, off by default, deviates from draft 07: outside
+`tolerate_random_loss` switch, on by default, deviates from draft 07: outside
 bandwidth probing, a loss round cuts the short-term bounds only when it lost
-more than 2%. Coexistence with competing traffic is not yet measured.
+more than 2% or its RTT samples rose more than max(min_rtt / 8, 250 µs) above
+min_rtt, the sign of a queue. Random loss on an unqueued path no longer
+ratchets the rate down, while congestion loss at a shared bottleneck still
+does: against one TCP CUBIC flow at a quarter-BDP queue the switch leaves the
+TCP share unchanged, and on the lossy single-flow target it raises every
+direction by 4–26% (BENCH.md).
 Windows also deviate on sub-millisecond paths: their BDP uses at least the
 receiver's 1 ms maximum ACK delay, because RTT samples exclude that delay
 while the feedback loop does not. This more than doubled the loopback check's

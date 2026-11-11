@@ -122,8 +122,11 @@ pub struct Controller {
     loss_events: u32,
     bw_latest: u64,
     inflight_latest: u64,
-    // Deviation switch: only loss rounds above the 2% threshold cut short-term bounds.
+    // Deviation switch: only loss rounds above the 2% threshold, or with queueing
+    // delay, cut short-term bounds.
     tolerate_random_loss: bool,
+    // Largest RTT sample since the current loss round began.
+    loss_round_rtt: Duration,
 
     extra_filter: [u64; 10],
     extra_index: usize,
@@ -212,6 +215,7 @@ impl Controller {
             bw_latest: 0,
             inflight_latest: 0,
             tolerate_random_loss: false,
+            loss_round_rtt: Duration::ZERO,
             extra_filter: [0; 10],
             extra_index: 0,
             extra_acked: 0,
@@ -248,10 +252,21 @@ impl Controller {
 
     /// Deviation from draft 07, off by default. Outside bandwidth probing, a
     /// loss round then cuts the short-term bounds only when the ACK that ends
-    /// it shows more than the 2% loss that already stops probing, so steady
-    /// random loss below that no longer ratchets the rate down round by round.
+    /// it shows more than the 2% loss that already stops probing, or when an
+    /// RTT sample in that round shows a queue, so steady random loss on an
+    /// unqueued path no longer ratchets the rate down round by round while
+    /// congestion loss still does.
     pub fn tolerate_random_loss(&mut self, on: bool) {
         self.tolerate_random_loss = on;
+    }
+
+    /// Whether the current loss round's RTT samples show queueing delay: more
+    /// than an eighth of min_rtt, and at least 250 µs, above min_rtt.
+    fn queued_in_round(&self) -> bool {
+        self.min_rtt.is_some_and(|min| {
+            let margin = (min / 8).max(Duration::from_micros(250));
+            self.loss_round_rtt > min.saturating_add(margin)
+        })
     }
 
     /// Current phase, for diagnostics and deterministic tests.
@@ -356,6 +371,9 @@ impl Controller {
         let rate = sample.rate.unwrap_or(0);
 
         self.loss_round_start = sample.prior_delivered >= self.loss_round_delivered;
+        if let Some(rtt) = rtt {
+            self.loss_round_rtt = self.loss_round_rtt.max(rtt);
+        }
         self.bw_latest = self.bw_latest.max(rate);
         self.inflight_latest = self.inflight_latest.max(sample.delivered);
         if self.loss_round_start {
@@ -530,7 +548,9 @@ impl Controller {
         if self.loss_round_start {
             if !self.state.probing()
                 && self.loss_in_round
-                && (!self.tolerate_random_loss || too_high(sample.lost, sample.tx_in_flight))
+                && (!self.tolerate_random_loss
+                    || too_high(sample.lost, sample.tx_in_flight)
+                    || self.queued_in_round())
             {
                 if self.bw_shortterm == INFINITY {
                     self.bw_shortterm = self.max_bw;
@@ -544,6 +564,7 @@ impl Controller {
                         .max(scale(self.inflight_shortterm, 70, 100));
             }
             self.loss_in_round = false;
+            self.loss_round_rtt = Duration::ZERO;
         }
     }
 

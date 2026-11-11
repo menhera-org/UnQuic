@@ -61,7 +61,7 @@ cookies and `inner_mtu` remain explicit. Unknown TOML fields are rejected.
 
 | Struct | Fields and constraints |
 | --- | --- |
-| `Daemon` | `memory_limit`: nonzero bytes, default 256 MiB; `tolerate_random_loss`: default false, a deviation from BBR draft 07 that cuts the short-term bounds only after a loss round above 2% loss (design section 9); `balance_flows`: default false (on for a few hours on November 11, until the loopback check regressed), assigns each new flow on the strict-hash path the next lane round-robin and keeps it there while it sends (design section 8) |
+| `Daemon` | `memory_limit`: nonzero bytes, default 256 MiB; `tolerate_random_loss`: default true since November 11, a deviation from BBR draft 07 that cuts the short-term bounds only after a loss round above 2% loss or one whose RTT samples show queueing delay (design section 9); `balance_flows`: default false (on for a few hours on November 11, until the loopback check regressed), assigns each new flow on the strict-hash path the next lane round-robin and keeps it there while it sends (design section 8) |
 | `Endpoint` | Unique nonempty `name`; IPv6 `listen_address` (unspecified allowed); nonzero `listen_port`; numeric `scope_id`; optional interface/VRF `bind_device` |
 | `Peer` | Unique nonempty `name`; existing `endpoint` name; optional unicast IPv6 `address`; nonzero `peer_port`; numeric `scope_id`; `tx_lanes` 1–64; `outer_payload_limit` 1232–8952; optional nonempty `path_group` |
 | `Session` | Unique nonempty `name`; existing `peer` name; unique `UnquicUuid` cookie; optional `tap_name`; `inner_mtu` 1500–9000; optional checked `MacAddress`; `queue_count` 1–64 |
