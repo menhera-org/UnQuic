@@ -1,0 +1,119 @@
+diff --git a/src/bin/unquic/config.rs b/src/bin/unquic/config.rs
+index 1f177a7..c26bc95 100644
+--- a/src/bin/unquic/config.rs
++++ b/src/bin/unquic/config.rs
+@@ -268,11 +268,17 @@ mod tests {
+             assert_eq!(loaded.config.sessions[0].queue_count, 1);
+             assert_eq!(loaded.config.daemon.memory_limit, 256 * 1024 * 1024);
+             assert!(!loaded.config.daemon.tolerate_random_loss);
++            assert!(!loaded.config.daemon.balance_flows);
++            assert!(!loaded.config.daemon.stripe_flows);
+             loaded.config.validate().unwrap();
+         }
+-        let text = format!("[daemon]\ntolerate_random_loss = true\n{}", sample());
++        let text = format!(
++            "[daemon]\ntolerate_random_loss = true\nstripe_flows = true\n{}",
++            sample()
++        );
+         let loaded = Loaded::parse(&text).unwrap();
+         assert!(loaded.config.daemon.tolerate_random_loss);
++        assert!(loaded.config.daemon.stripe_flows);
+         assert_eq!(loaded.config.daemon.memory_limit, 256 * 1024 * 1024);
+         let text = sample().replace("test.example.invalid", "2001:db8::1");
+         let loaded = Loaded::parse(&text).unwrap();
+diff --git a/src/config.rs b/src/config.rs
+index ce4a8c7..ab652b5 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -40,6 +40,10 @@ pub struct Daemon {
+     /// of its hash lane, so a few heavy flows use separate transmit workers.
+     /// It helps the decision workload but cuts the loopback check by up to 4x.
+     pub balance_flows: bool,
++    /// Off by default (stage 5 candidate): send each run of frames on the
++    /// strict-hash path to the session's next lane, so one flow can use every
++    /// transmit worker. Frames of one flow may then arrive out of order.
++    pub stripe_flows: bool,
+ }
+ impl Default for Daemon {
+     fn default() -> Self {
+@@ -47,6 +51,7 @@ impl Default for Daemon {
+             memory_limit: 256 * 1024 * 1024,
+             tolerate_random_loss: false,
+             balance_flows: false,
++            stripe_flows: false,
+         }
+     }
+ }
+diff --git a/src/worker.rs b/src/worker.rs
+index 03a148e..cdde96a 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -380,6 +380,15 @@ fn balanced_lane(
+     lane
+ }
+ 
++/// Consecutive frames a striped session sends on one lane before the next.
++const STRIPE_FRAMES: usize = 16;
++
++/// Under `stripe_flows`, sends each run of STRIPE_FRAMES strict-path frames of
++/// a session to its next lane, whatever their flow.
++fn stripe_lane(cursor: &std::sync::atomic::AtomicUsize, lanes: usize) -> usize {
++    cursor.fetch_add(1, Ordering::Relaxed) / STRIPE_FRAMES % lanes
++}
++
+ /// Whether tap_lane spreads this frame across all lanes by its flow hash.
+ fn strict_lane(frame: &[u8], worker: usize, workers: usize, queues: usize, lanes: usize) -> bool {
+     queues < workers || worker >= lanes || !pack::prefer_local_lane(frame)
+@@ -743,6 +752,8 @@ pub(crate) struct Worker {
+     retry_due: Option<Duration>,
+     // Empty unless daemon.balance_flows is set.
+     flows: Box<[FlowSlot]>,
++    // daemon.stripe_flows.
++    stripe: bool,
+     #[cfg(feature = "profile")]
+     phases: [u64; crate::profile::PHASES],
+ }
+@@ -1100,6 +1111,7 @@ impl Worker {
+             } else {
+                 Box::default()
+             },
++            stripe: config.daemon.stripe_flows,
+             shared,
+         })
+     }
+@@ -2408,6 +2420,11 @@ impl Worker {
+                 let queues = self.shared.config.config().sessions[session].queue_count;
+                 let cursor = self.shared.flow_cursors.get(session);
+                 buffer.lane = if let Some(cursor) = cursor
++                    && self.stripe
++                    && strict_lane(frame, self.id, workers, queues, lanes)
++                {
++                    stripe_lane(cursor, lanes)
++                } else if let Some(cursor) = cursor
+                     && !self.flows.is_empty()
+                     && strict_lane(frame, self.id, workers, queues, lanes)
+                 {
+@@ -5851,6 +5868,23 @@ mod tests {
+         assert_eq!(worker.counters.tap_read_requests, 2);
+     }
+ 
++    #[test]
++    fn striped_frames_take_lanes_in_runs() {
++        use std::sync::atomic::AtomicUsize;
++        let cursor = AtomicUsize::new(0);
++        let lanes: Vec<_> = (0..STRIPE_FRAMES * 5)
++            .map(|_| stripe_lane(&cursor, 4))
++            .collect();
++        for (run, frames) in lanes.chunks(STRIPE_FRAMES).enumerate() {
++            assert!(frames.iter().all(|&lane| lane == run % 4));
++        }
++        // A cursor shared by several readers never yields a lane out of range.
++        let cursor = AtomicUsize::new(usize::MAX - 3);
++        for _ in 0..8 {
++            assert!(stripe_lane(&cursor, 3) < 3);
++        }
++    }
++
+     #[test]
+     fn balanced_flows_take_lanes_in_turn_and_keep_them_while_active() {
+         use std::sync::atomic::AtomicUsize;

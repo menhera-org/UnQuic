@@ -1172,6 +1172,13 @@ November 10 evidence for that list, all in BENCH.md:
 
 - Single-flow striping: one flow stops near 1 Gbit/s per direction because one
   transmit worker carries it and saturates, even with `tolerate_random_loss`.
+  On November 11 the same target reaches about 1.5 Gbit/s without striping.
+  Sixteen-frame runs striped across lanes raise every median by 24–36% to
+  about 1.95 Gbit/s but double reordering and missed their stated bar in one
+  direction, so the switch was not kept
+  ([BENCH.md](BENCH.md#striping-one-flow-across-lanes-november-11)). A
+  profile on the remote host places the next single-flow limit downstream of
+  the sender ([BENCH.md](BENCH.md#what-limits-one-flow-at-75-ms-november-11)).
 - Lane placement for few flows: `flow_hash` uses fixed keys, so four flows
   land on two lanes in one direction and three in the other, every run, and
   leave workers idle. Load-aware assignment must still pin a flow while its

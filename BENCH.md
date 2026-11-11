@@ -139,6 +139,40 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Striping one flow across lanes (November 11)
+
+A switch, `daemon.stripe_flows`, off by default, sends each run of sixteen
+frames on the strict-hash path to the session's next lane, whatever their
+flow, so one flow can use every transmit worker. Frames of one flow then
+complete on several lanes and can arrive out of order; the receiver keeps no
+reorder queue.
+
+Stated before measuring, on the stage 3 single-flow target (7.5 ms RTT,
+0.5% and 1% loss, four workers per daemon, 1G warm-up then 5G offered,
+`tolerate_random_loss` on in both builds, three interleaved repeats on CPUs
+0–19): with striping, both directions at both loss rates should deliver beyond
+the control's range at 5G, with reordering reported. If so the switch is kept
+as a stage 5 option, still off by default because reordering harms inner TCP;
+otherwise it is removed and kept as a patch.
+
+[Three interleaved repeats](benches/tap-stripe-flows.json), 5G point,
+medians with ranges:
+
+| Loss | Direction | Control Gbit/s | [Striped](benches/stripe-flows-rejected.patch) Gbit/s | Reordered frames, control / striped |
+| --- | --- | --- | --- | --- |
+| 0.5% | L→R | 1.537 (1.354–1.826) | 1.952 (1.909–1.992) | 1.17M / 2.80M |
+| 0.5% | R→L | 1.459 (1.237–2.053) | 1.978 (1.926–1.987) | |
+| 1% | L→R | 1.549 (1.539–1.775) | 1.918 (1.746–1.994) | 1.47M / 2.81M |
+| 1% | R→L | 1.437 (1.073–1.734) | 1.897 (1.894–1.931) | |
+
+Striping raises every median by 24–36% and narrows the ranges, but the
+0.5%-loss R→L median stays inside a control range stretched by one 2.05 Gbit/s
+repeat, so the bar rejects it: the switch is removed and kept as a patch.
+Reordering roughly doubles. Even striped, one flow stops near 1.95 Gbit/s
+with the busiest thread at 88–90%, so spreading the flow over four transmit
+workers moves the limit rather than lifting it; the controls already reach
+1.5 Gbit/s, up from about 1 Gbit/s on November 10.
+
 ## What limits one flow at 7.5 ms (November 11)
 
 Perf cannot run on either test host: here `perf_event_paranoid` is 4, and the
