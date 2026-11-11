@@ -33,7 +33,7 @@ case "${VLAN_DEPTH:-0}" in 0|1|2) ;; *) echo "VLAN_DEPTH must be 0, 1 or 2" >&2;
 case "${SRV6:-0}" in 0|1) ;; *) echo "SRV6 must be 0 or 1" >&2; exit 2;; esac
 [ "${SRV6:-0}" = 0 ] || [ -n "${UDP_LOAD:-}" ] || { echo "SRV6 requires UDP_LOAD" >&2; exit 2; }
 [ "$2" -le "$((1514 + 4 * ${VLAN_DEPTH:-0}))" ] || exit 2
-case "${WORKERS:-4}" in 2|4|8) ;; *) echo "WORKERS must be 2, 4 or 8" >&2; exit 2;; esac
+case "${WORKERS:-4}" in 2|4|8|16) ;; *) echo "WORKERS must be 2, 4, 8 or 16" >&2; exit 2;; esac
 case "${UDP_LOAD:-}" in ''|/*) ;; *) echo "UDP_LOAD must be an absolute path" >&2; exit 2;; esac
 case "${IPERF_PROTOCOL:-udp}" in udp|tcp) ;; *) echo "IPERF_PROTOCOL must be udp or tcp" >&2; exit 2;; esac
 [ "${IPERF_PROTOCOL:-udp}" = udp ] || [ -z "${UDP_LOAD:-}" ] || { echo "TCP requires iperf3, not UDP_LOAD" >&2; exit 2; }
@@ -78,6 +78,14 @@ case "$workers" in
         RECEIVER_LEFT_CPUS=${RECEIVER_LEFT_CPUS:-17}
         GENERATOR_RIGHT_CPUS=${GENERATOR_RIGHT_CPUS:-18}
         RECEIVER_RIGHT_CPUS=${RECEIVER_RIGHT_CPUS:-19}
+        ;;
+    16)
+        # Each daemon and its load processes take one 20-core socket.
+        DAEMON_RIGHT_CPUS=${DAEMON_RIGHT_CPUS:-20-35}
+        GENERATOR_LEFT_CPUS=${GENERATOR_LEFT_CPUS:-16-17}
+        RECEIVER_LEFT_CPUS=${RECEIVER_LEFT_CPUS:-18-19}
+        GENERATOR_RIGHT_CPUS=${GENERATOR_RIGHT_CPUS:-36-37}
+        RECEIVER_RIGHT_CPUS=${RECEIVER_RIGHT_CPUS:-38-39}
         ;;
 esac
 left=

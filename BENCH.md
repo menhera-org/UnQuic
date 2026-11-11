@@ -335,6 +335,35 @@ path dominates: sending batches takes 25–30% of busy cycles and TAP reads
 and writes another 20–30%. `stage_recovery` matters mainly at loopback
 rates.
 
+## Sixteen workers per daemon (November 11, exploratory)
+
+The harness now accepts `WORKERS=16`. One run each, current build, 21G
+requested over thirty-two 44-segment flows, distinct ports per direction,
+two generator processes per direction and a 1 GiB `memory_limit` (the
+256 MiB default refuses sixteen workers):
+
+| Workers / tags | L→R | R→L | Total | CPU L / R | Busiest thread L / R |
+| --- | --- | --- | --- | --- | --- |
+| 8 / one | 4.50 | 4.83 | 9.33 | 516% / 500% | 81% / 80% |
+| 16 / one | 6.53 | 6.13 | 12.66 | 724% / 734% | 76% / 81% |
+| 8 / QinQ | 4.71 | 6.05 | 10.76 | 446% / 517% | 64% / 91% |
+| 16 / QinQ | 8.16 | 6.70 | 14.85 | 713% / 711% | 76% / 81% |
+
+Doubling the workers raises the total by 36–38%, and no thread saturates,
+even with every QinQ read on one worker. A trace of the 16-worker QinQ case
+shows both directions held back by BBR (ProbeBW_DOWN 49% and 65% of the
+point) after losses that match the far side's receive-socket overflows.
+Those overflows persist while the workers have slack: profile counters
+show reads almost always finding free buffers and almost never filling
+every buffer offered, so the sockets overflow between reads. In the
+container the receive buffer stays at 416 KiB, because `SO_RCVBUFFORCE`
+needs `CAP_NET_ADMIN` in the initial user namespace and `rmem_max` is
+host-wide; a root deployment gets the 8 MiB the daemon requests. Reading
+the sockets twice more per turn did not reduce overflows or raise
+delivery, and 32 receive buffers made no clear difference at sixteen
+workers. The local gate therefore runs with a receive-buffer limit that a
+privileged deployment does not have.
+
 ## Arming the timer only before blocking (November 11)
 
 A `profile` build that also times `timerfd_settime` shows the loopback check
@@ -378,7 +407,9 @@ data: eight interleaved pairs of loopback runs. The candidate passes if its
 total beats the paired control's total in at least seven of the eight pairs
 (a one-sided sign test, p ≈ 0.035 if the builds were equal), and the median
 paired change in each direction is no worse than −2%. Condition (2′) on the
-decision workload is unchanged. Both results are reported.
+decision workload is unchanged. Both results are reported. The paired run
+started at 09:50 UTC on November 11; the decision workload has not run yet,
+and the change stays out of `src` until both are recorded.
 
 ## Waking only sleeping workers (November 11)
 

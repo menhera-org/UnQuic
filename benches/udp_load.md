@@ -100,7 +100,7 @@ Check actual offered rates: kernel encapsulation can saturate a generator
 before it reaches the requested rate. Compare `SEGMENTS=1` with aggregates
 to distinguish burst losses from sustained capacity.
 
-Use `WORKERS=2`, `4` or `8` to test the deployment core budget as well as
+Use `WORKERS=2`, `4`, `8` or `16` to test the deployment core budget as well as
 the local gate. Snapshots include per-thread voluntary and involuntary context
 switches beside CPU ticks.
 
@@ -171,8 +171,10 @@ over repeats for a `ROOT/BUILD/COMBO/REPEAT/POINT` tree.
 `SESSION_COOKIE` overrides the session UUID for queue-placement controls;
 record it when comparing runs because it affects receive-worker assignment.
 
-`WORKERS=4` is the default; `WORKERS=2` and `WORKERS=8` also change the lane and queue
-counts. `DAEMON_LEFT_CPUS` and `DAEMON_RIGHT_CPUS` override daemon placement.
+`WORKERS=4` is the default; `WORKERS=2`, `8` and `16` also change the lane and queue
+counts. The 16-worker defaults use daemon CPUs 0–15 and 20–35 and load CPUs
+16–19 and 36–39, which assumes two sockets numbered 0–19 and 20–39 so that
+each daemon stays on one socket; override them on other hosts. `DAEMON_LEFT_CPUS` and `DAEMON_RIGHT_CPUS` override daemon placement.
 The existing `GENERATOR_*_CPUS` and `RECEIVER_*_CPUS` variables select the
 four load-process CPU sets. Explicitly choose non-overlapping physical cores
 on one socket. The four-worker defaults use daemon CPUs 0-7 and load CPUs 8-19.

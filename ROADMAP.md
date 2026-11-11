@@ -229,6 +229,13 @@ rules apply to all of them.
    eventfds and landed: +2.5% on the loopback total, +0.9% median on the
    decision workload
    ([BENCH.md](BENCH.md#waking-only-sleeping-workers-november-11)).
+   Arming the worker timer only before blocking cuts `timerfd_settime`
+   calls by about half; its paired loopback test and decision-workload check
+   are pending. Sixteen workers per daemon raise the loopback total 36–38%
+   with no thread saturated; there the limit is receive-socket overflow,
+   which the container's 416 KiB receive buffer (no `CAP_NET_ADMIN` in the
+   initial namespace) makes worse than a root deployment's 8 MiB
+   ([BENCH.md](BENCH.md#sixteen-workers-per-daemon-november-11-exploratory)).
 6. **Stage 4**, as listed in its section: OVS in the composition matrix (the
    test images lack it) and the remaining resource stress. The panic audit is
    done except for converting locally bounded indexing in encoders and the
