@@ -514,8 +514,11 @@ rules apply to all of them.
    history; a refused attempt counts as `ack_send_deferred` and retries
    after `RETRY`. It refuses in two places: when lane 0's sent history
    cannot reserve a number with probe headroom, and when the socket send
-   fails. Which of the two produced the deferrals is not yet measured; busy
-   owners also showed a 5–6% history-full hold on the lossy points. Two shapes are possible: send control records ahead of
+   fails. A diagnostic run with balanced lanes on the loopback check
+   ([counts](benches/control-refusals.txt)) puts about half the deferrals
+   (24,607 of 48,799 and 37,765 of 75,170 per daemon) on lane 0's history
+   headroom; the rest come from the socket or the later reserve check,
+   which that patch did not count. Two shapes are possible: send control records ahead of
    data on lane 0, or give them a lane of their own with its own history.
    Many worker unit tests assume lane 0 for control.
 

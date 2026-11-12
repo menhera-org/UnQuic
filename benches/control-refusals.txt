@@ -1,0 +1,5 @@
+Control-record refusals by lane 0 history headroom (benches/control-refusal-diagnostic.patch, profile build), loopback check, eight workers, one run each, whole run including the 4G warm-up, November 12. history = refused because lane 0 history cannot reserve with probe headroom; deferred_total = ack_send_deferred summed over workers.
+hash left control_refused history/socket [0, 0] deferred_total=0
+hash right control_refused history/socket [130, 0] deferred_total=256
+bal left control_refused history/socket [24607, 0] deferred_total=48799
+bal right control_refused history/socket [37765, 0] deferred_total=75170
