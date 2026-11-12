@@ -1104,6 +1104,14 @@ among themselves; `deadline()` still returns the root frame's exact value.
 Daemon SHA-256:
 `9a8a5a0deffa0125a762c7d943615cee5f8ab8e248356179dc5a4375c9336f22`.
 
+The small-frame rows rerun on `5863120`, which has the heap and the TAP read
+change below, two repeats ([results](benches/tap-small-frames-5863120.json)):
+eight workers deliver 3.24–3.37 / 3.37–3.44 M frames/s unlimited at
+1.85–1.86 cores per M frames/s and 2.86–2.88 / 2.62–2.63 M at 40M; sixteen
+workers 4.52 / 4.53–4.79 M unlimited at 1.98–2.00. Eight workers are
+unchanged from `acef86d` and sixteen slightly better: at overload the busiest
+readers, not the per-frame cost, set the rate.
+
 ### At the offer-limited point, and compact reassembly sequences (rejected)
 
 A profile of `5f2db99` at the same 20 Mbit/s point, with the transmit split
