@@ -265,7 +265,13 @@ at 2G the margin delivers 1.39–1.41 / 1.56–1.60 Gbit/s against 1.20–1.21 /
 1.58–1.73, and at 5G 1.25–1.26 / 1.76–1.78 against 0.84–0.85 / 1.49–1.54.
 The 5G total rises 28% and holds the 2G total, but L→R still loses 10%
 between 2G and 5G, so the second condition fails: with loss the plateau
-holds in total, not yet in each direction.
+holds in total, not yet in each direction. A trace of the margin build at
+those two points ([counts](benches/decision-four-flows-lossy-margin-trace.txt))
+shows the L→R owners' gaps between bursts down from about 700 µs to 230–240
+µs at 5G. What remains coincides with the controller: the left daemon's BBR
+spends 15% of the 5G point in ProbeBW_DOWN against 4% at 2G, and 675,000
+sent frames still expire unacknowledged. That is a congestion-response
+question for the lossy rows, not a buffer one.
 
 TCP through the tunnel (loopback, eight workers, eight streams each way,
 two alternating pairs, [runs](benches/tcp-owner-reserve.txt)) is unchanged:

@@ -1,0 +1,21 @@
+Trace of the lossy four-flow decision workload (0.1% outer loss) at 2G and 5G offered, trace build of 7108623 (read margin), November 12. trace_report counts, pacing and controller shares per daemon, then left workers at 5G:
+== 2g left
+"counts":{"admit_owner_buffers":627982,"admit_owner_frames":23541,"expire_input":306,"expire_partial":14,"expire_sent":824649,"expire_unsent":449,"losses":7790}
+"mean_pacing_gbps":7.3059
+"controller":{"startup":0.0507,"drain":0.0000,"down":0.0358,"cruise":0.4875,"refill":0.0101,"up":0.4050,"probe_rtt":0.0109}
+== 2g right
+"counts":{"admit_owner_buffers":178278,"expire_input":413,"expire_partial":36,"expire_sent":11796,"expire_unsent":1487,"losses":62499}
+"mean_pacing_gbps":2.0831
+"controller":{"startup":0.0109,"drain":0.0001,"down":0.0179,"cruise":0.8343,"refill":0.0141,"up":0.1126,"probe_rtt":0.0101}
+== 5g left
+"counts":{"admit_owner_buffers":2181609,"admit_owner_frames":31106,"expire_input":389,"expire_partial":13,"expire_sent":675002,"expire_unsent":551,"losses":3011}
+"mean_pacing_gbps":5.8241
+"controller":{"startup":0.0137,"drain":0.0038,"down":0.1498,"cruise":0.6078,"refill":0.0129,"up":0.2020,"probe_rtt":0.0100}
+== 5g right
+"counts":{"admit_owner_buffers":422839,"expire_input":526,"expire_partial":27,"expire_sent":19751,"expire_unsent":962,"losses":49687}
+"mean_pacing_gbps":2.3448
+"controller":{"startup":0.0115,"drain":0.0003,"down":0.0376,"cruise":0.8487,"refill":0.0144,"up":0.0774,"probe_rtt":0.0100}
+{"worker":0,"requests_per_s":0,"mean_request_bytes":196,"mean_held_gap_us":363679.0
+{"worker":1,"requests_per_s":0,"mean_request_bytes":208,"mean_held_gap_us":313594.4
+{"worker":2,"requests_per_s":1936,"mean_request_bytes":45518,"mean_held_gap_us":230.8
+{"worker":3,"requests_per_s":1609,"mean_request_bytes":60544,"mean_held_gap_us":240.0
