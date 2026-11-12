@@ -474,9 +474,20 @@ daemon defers 29,000–32,000 ACK sends per point, against 0–97 with hash
 lanes. A deferral means the send attempt submitted no datagram. ACKs and
 other non-handshake control records always go out on lane 0's socket, and
 balanced lanes give lane 0 its round-robin share of the data, so the
-leading hypothesis is ACKs waiting behind data on that socket. It is
-untested; a per-lane socket-busy count, or sending ACKs on the least
-loaded lane, would test it. A production version needs tests,
+leading hypothesis is ACKs waiting behind data on that socket.
+
+An exploratory build that keeps lane 0 out of the balanced rotation
+([patch](benches/balanced-skip-lane0-exploratory.patch), stated beforehand
+as needing an order of magnitude fewer deferrals and 5% more at 21G; one
+pair, balanced lanes in both arms,
+[results](benches/loopback-balanced-skip-lane0.json)) confirms it: ACK
+deferrals fall from 28,636 / 32,346 to zero, expired sent frames from
+322,000 / 277,000 to 221,000 / 44,000, and the 21G total rises from 10.74
+to 13.45 Gbit/s, above any hash-lane run today (11.47–12.31). Balanced
+lanes' loopback cost was ACKs queued behind data on lane 0's socket. A
+proper fix keeps ACKs off a busy data socket for every lane policy (hash
+lanes put data on lane 0 too), and needs tests, both suites and the full
+bars before it lands. A production version needs tests,
 a memory charge for the table and the full bars before it can land.
 
 ## Whether the single QinQ reader limits the loopback check (November 11)

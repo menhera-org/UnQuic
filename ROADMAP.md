@@ -188,7 +188,11 @@ Decisions only the user can make, each blocking a remaining goal:
    building it properly is the next lane-placement step. A trace places that
    loopback cost in the congestion window: with balanced lanes senders wait
    on it 35–37% of the time while hundreds of thousands of sent frames are
-   never acknowledged, so finding where those ACKs go comes first.
+   never acknowledged. The cause is found: ACKs always leave on lane 0's
+   socket and wait behind its data. Keeping lane 0 out of the balanced
+   rotation (exploratory) removes the ACK deferrals and lifts the loopback
+   check from 10.74 to 13.45 Gbit/s, above hash lanes. Next: send ACKs so
+   they never queue behind data, for every lane policy, then re-decide.
    ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB

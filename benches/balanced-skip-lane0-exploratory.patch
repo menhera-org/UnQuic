@@ -1,0 +1,18 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index b59ec02..ebcfd62 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -415,7 +415,12 @@ fn balanced_lane(
+     let Some(way) = free else {
+         return hash as usize % lanes;
+     };
+-    let lane = cursor.fetch_add(1, Ordering::Relaxed) % lanes;
++    // Exploratory: keep lane 0, which carries ACKs and control, out of the rotation.
++    let lane = if lanes > 1 {
++        1 + cursor.fetch_add(1, Ordering::Relaxed) % (lanes - 1)
++    } else {
++        0
++    };
+     set[way] = FlowSlot {
+         key,
+         last_ms: ms,
