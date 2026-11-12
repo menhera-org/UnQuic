@@ -1,0 +1,213 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index fceac78..03164ca 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -319,6 +319,8 @@ const FRESH_BYTES: usize = 2 * 1024 * 1024;
+ // A bounded GRO backlog must not consume the transmit pool (or vice versa).
+ const RECEIVE_BUFFERS: usize = 8;
+ const _: () = assert!(RECEIVE_BUFFERS <= BATCH_SIZE && RECEIVE_BUFFERS < BUFFERS);
++// Longest a TAP stays unread while only other readers' frames are queued.
++const TAP_STARVATION: Duration = Duration::from_millis(10);
+ 
+ // Yield at datagram boundaries; one final datagram may exceed the record/byte target.
+ #[derive(Default)]
+@@ -557,6 +559,8 @@ struct Session {
+     tx_retained: usize,
+     tx_bytes: usize,
+     tap_inputs: VecDeque<usize>,
++    // Last TAP read that returned frames; bounds how long handed inputs stop reads.
++    tap_read_at: Duration,
+     unexpanded_bytes: Vec<usize>,
+     slab: Option<usize>,
+     rx_totals: Vec<Snapshot>,
+@@ -1022,6 +1026,7 @@ impl Worker {
+                 tx_retained: 0,
+                 tx_bytes: 0,
+                 tap_inputs: VecDeque::with_capacity(BUFFERS),
++                tap_read_at: Duration::ZERO,
+                 unexpanded_bytes: vec![0; config.peers[peer].tx_lanes],
+                 slab: None,
+                 rx_totals: vec![Snapshot::default(); LANES],
+@@ -2322,16 +2327,19 @@ impl Worker {
+         Ok(Some(buffer))
+     }
+ 
+-    fn tap_capacity(&self, session: usize) -> usize {
++    fn tap_capacity(&self, session: usize, now: Duration) -> usize {
+         let local = &self.sessions[session];
+-        // Only this worker's own unexpanded reads hold its TAP back. Frames other
+-        // readers hand over use their buffers, and gating on them let a busy
+-        // owner leave its own TAP ring unread, and its frames aging, for seconds.
+-        if local.tap_inputs.iter().any(|&source| {
+-            self.frames
+-                .source(source)
+-                .is_some_and(|input| !input.handed)
+-        }) {
++        // Queued inputs hold reads back, which also keeps buffers free for other
++        // readers' frames. Frames others hand over may do so only briefly: a busy
++        // owner fed by them left its own TAP ring unread, and aging, for seconds.
++        if !local.tap_inputs.is_empty()
++            && (now < local.tap_read_at.saturating_add(TAP_STARVATION)
++                || local.tap_inputs.iter().any(|&source| {
++                    self.frames
++                        .source(source)
++                        .is_some_and(|input| !input.handed)
++                }))
++        {
+             return 0;
+         }
+         let workers = local.tx_workers;
+@@ -2356,7 +2364,7 @@ impl Worker {
+         if self.tap_reader.as_ref().is_some_and(|r| r.enabled) {
+             let count = self.sessions[session]
+                 .tap_read_limit
+-                .min(self.tap_capacity(session));
++                .min(self.tap_capacity(session, now));
+             if count == 0 {
+                 return Ok(());
+             }
+@@ -2373,6 +2381,9 @@ impl Worker {
+                 .ok_or(io::ErrorKind::InvalidData)?;
+             let batch = reader.read(tap, &mut slices[..count]);
+             let frames = batch.results[..count].iter().filter(|r| r.is_ok()).count() as u64;
++            if frames != 0 {
++                self.sessions[session].tap_read_at = now;
++            }
+             let limit = &mut self.sessions[session].tap_read_limit;
+             // A full read limited by pool availability says nothing about TAP occupancy.
+             let maximum = if batch.segments.iter().any(Option::is_some) {
+@@ -2411,7 +2422,7 @@ impl Worker {
+             }
+         } else {
+             for _ in 0..BATCH_SIZE {
+-                if self.tap_capacity(session) == 0 {
++                if self.tap_capacity(session, now) == 0 {
+                     break;
+                 }
+                 let Some(mut buffer) = self.free.pop() else {
+@@ -2434,6 +2445,9 @@ impl Worker {
+                         buffer.segments = segments;
+                         length
+                     });
++                if result.is_ok() {
++                    self.sessions[session].tap_read_at = now;
++                }
+                 if self.read_tap_result(session, now, buffer, result)? {
+                     break;
+                 }
+@@ -3728,7 +3742,7 @@ impl Worker {
+ 
+     fn flush_taps(&mut self, now: Duration) -> io::Result<()> {
+         for session in 0..self.sessions.len() {
+-            let readable = self.tap_capacity(session) != 0;
++            let readable = self.tap_capacity(session, now) != 0;
+             let mut writable = false;
+             for slot in 0..LANES {
+                 let local = &mut self.sessions[session];
+@@ -4798,6 +4812,11 @@ impl Worker {
+                     due = due.min(input.deadline);
+                 }
+             }
++            // Wake to resume reading when queued handed-over inputs stop gating it.
++            let starved = session.tap_read_at.saturating_add(TAP_STARVATION);
++            if !session.tap_inputs.is_empty() && session.tap_registered && starved > now {
++                due = due.min(starved);
++            }
+             for (slot, lane) in session
+                 .rx
+                 .iter()
+@@ -5921,8 +5940,8 @@ mod tests {
+         worker.reactor.drain(WAKE_TOKEN).unwrap();
+ 
+         let mut sent = 0;
+-        while worker.tap_capacity(0) != 0 {
+-            let count = worker.tap_capacity(0).min(BATCH_SIZE);
++        while worker.tap_capacity(0, Duration::ZERO) != 0 {
++            let count = worker.tap_capacity(0, Duration::ZERO).min(BATCH_SIZE);
+             for _ in 0..count {
+                 tap.send(&[0; 60]).unwrap();
+                 sent += 1;
+@@ -6147,7 +6166,7 @@ mod tests {
+                     worker.read_tap(0, Duration::ZERO).unwrap();
+                     let retained = worker.sessions[0].tap_inputs.len();
+                     if retained != 0 {
+-                        assert_eq!(worker.tap_capacity(0), 0);
++                        assert_eq!(worker.tap_capacity(0, Duration::ZERO), 0);
+                         worker.read_tap(0, Duration::ZERO).unwrap();
+                         assert_eq!(worker.sessions[0].tap_inputs.len(), retained);
+                     }
+@@ -7027,18 +7046,29 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn only_own_unexpanded_reads_hold_back_tap_reading() {
++    fn handed_inputs_hold_back_tap_reading_only_briefly() {
+         let (_, [mut worker, _]) = test_workers();
+-        assert_ne!(worker.tap_capacity(0), 0);
++        let read = Duration::from_secs(1);
++        worker.sessions[0].tap_read_at = read;
++        assert_ne!(worker.tap_capacity(0, read), 0);
+         let mut input = worker.free.pop().unwrap();
+         input.session = 0;
+         input.handed = true;
+         let source = worker.frames.insert_source(input).ok().unwrap();
+         worker.sessions[0].tap_inputs.push_back(source);
+-        // Another reader's handed-over frame leaves this worker's TAP readable.
+-        assert_ne!(worker.tap_capacity(0), 0);
++        // Another reader's queued frame stops reading, and the worker wakes to retry,
++        // until the TAP has gone TAP_STARVATION unread.
++        let soon = read + TAP_STARVATION / 2;
++        assert_eq!(worker.tap_capacity(0, soon), 0);
++        assert!(
++            worker
++                .deadline(soon)
++                .is_some_and(|due| due <= read + TAP_STARVATION)
++        );
++        assert_ne!(worker.tap_capacity(0, read + TAP_STARVATION), 0);
++        // The worker's own queued read always does.
+         worker.frames.source_mut(source).unwrap().handed = false;
+-        assert_eq!(worker.tap_capacity(0), 0);
++        assert_eq!(worker.tap_capacity(0, read + Duration::from_secs(1)), 0);
+     }
+ 
+     #[test]
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index 55d4c98..573ff77 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -2773,7 +2773,7 @@ fn fresh_materialization_gates_large_sources_without_losing_order_or_credit() {
+     let materialized =
+         worker.sender.lanes[index].unsent_bytes - worker.sessions[0].unexpanded_bytes[0];
+     assert!(materialized >= limit && materialized < limit + 1522);
+-    assert_eq!(worker.tap_capacity(0), 0);
++    assert_eq!(worker.tap_capacity(0, Duration::ZERO), 0);
+     let sources: Vec<_> = worker.sessions[0].tap_inputs.iter().copied().collect();
+     assert!(!worker.drain_tap_inputs(Duration::ZERO).unwrap());
+     assert_eq!(
+@@ -2825,7 +2825,7 @@ fn fresh_materialization_gates_large_sources_without_losing_order_or_credit() {
+     assert!(worker.returns[reader.id].is_empty());
+     assert_eq!(reader.free.len(), free);
+     assert_eq!(reader.sessions[0].tx_retained, 0);
+-    assert!(worker.tap_capacity(0) > 0);
++    assert!(worker.tap_capacity(0, Duration::ZERO) > 0);
+     assert_eq!(worker.counters.queue_drops, 0);
+ }
+ 
+@@ -2859,7 +2859,7 @@ fn fresh_materialization_tracks_discovered_mtu_and_resumes_on_expiry() {
+         assert!(worker.sender.lanes[index].unsent_bytes < BATCH_SIZE * ceiling + 9022);
+         queue_frame(worker, 60);
+         assert_eq!(worker.sessions[0].unexpanded_bytes[0], 60);
+-        assert_eq!(worker.tap_capacity(0), 0);
++        assert_eq!(worker.tap_capacity(0, Duration::ZERO), 0);
+         assert!(!worker.drain_tap_inputs(Duration::ZERO).unwrap());
+         let now = reassembly::FRAME_LIFETIME;
+         while worker.expire_frames(now).unwrap() {}
+@@ -2867,7 +2867,7 @@ fn fresh_materialization_tracks_discovered_mtu_and_resumes_on_expiry() {
+         worker.drain_tap_inputs(now).unwrap();
+         assert_eq!(worker.sender.lanes[index].unsent_bytes, 0);
+         assert_eq!(worker.sessions[0].unexpanded_bytes[0], 0);
+-        assert!(worker.tap_capacity(0) > 0);
++        assert!(worker.tap_capacity(0, Duration::ZERO) > 0);
+     }
+ }
+ 

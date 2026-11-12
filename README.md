@@ -621,9 +621,10 @@ worker counts as having unsent data for application-limited marking only
 from two datagrams, the most a hold keeps, much as Linux TCP ignores under
 one MSS; otherwise held frames would hide every idle moment from BBR. At
 200 µs it cut CPU per delivered Gbit/s 5.5% at 0.5 Gbit/s on the decision
-workload and left 5 Gbit/s unchanged. One run's missing frames still reached
-0.19% in one direction, above its stated bar, so it stays off (BENCH.md). It
-adds up to the hold to each frame's latency.
+workload and left 5 Gbit/s unchanged, but it adds a small, repeatable loss
+in one direction (a median of 0.15% against 0.07% in the latest run), so it
+stays off (BENCH.md). It adds about 33 µs to the median one-way delay and
+0.2 ms at p99.
 
 Flow hashing looks through one unfragmented IPv4, IPv6 or Ethernet
 encapsulation, including an IPv6 segment routing header before the inner

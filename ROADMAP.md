@@ -1439,8 +1439,10 @@ November 10 evidence for that list, all in BENCH.md:
   ([BENCH.md](BENCH.md#held-data-and-application-limited-marking)).
   `udp_load` now measures one-way delay: at 0.5G the hold adds about 33 µs
   at the median and 0.2 ms at p99, and nothing at 5G
-  ([BENCH.md](BENCH.md#what-the-hold-costs-in-latency)). A default change
-  still needs that last loss explained. The same measurement found frames
+  ([BENCH.md](BENCH.md#what-the-hold-costs-in-latency)). A rerun on the
+  current build repeats the 6% saving but also a small loss: R→L missing
+  median 0.145% against 0.065%, worst run 0.43%. A default change needs
+  that loss removed. The same measurement found frames
   arriving seconds late at 5G overload: a worker owning a busy lane stopped
   reading its own TAP while other readers' handed-over frames filled its
   input queue, so tun's ring aged. Gating reads only on the worker's own

@@ -617,6 +617,15 @@ frame. In the first run three receiver processes reported
 the same 3.240 s maximum. The next section traces this tail to TAP queues
 left unread and removes it.
 
+Rerun on `5863120` (after the TAP read change below), same bar as the
+fixed hold, eight pairs and an A/A in one container
+([results](benches/decision-tx-hold-5863120.json)): CPU per Gbit/s is lower
+in eight of eight pairs (−2.3% to −8.5%, median −6.0%) against an A/A of
+five of eight and −0.7%, and admission drops stay within the control's
+range, but the hold's R→L loss is again higher: median 0.145% against
+0.065%, worst run 0.43% against the 0.22% allowed. The hold costs a small,
+repeatable loss, and the switch stays off.
+
 ## Frames seconds old under overload (November 12)
 
 The tail in the latency measurement above is not a start-up event. With
@@ -666,6 +675,29 @@ is gone; at 5G the L→R median rises about 2.5 ms as the busy worker reads
 its ring instead of leaving it, and the R→L median falls by about 1 ms.
 Candidate daemon SHA-256:
 `376271e953766a9cdff1ceb5bc8bc82f447dcb181826ed9d14e0a34c8cc123dd`.
+
+The bar checked light load only for delivery within 1% of the offer. A
+later hold run on this build showed R→L loss at 0.5G of 0.01–0.21% where
+earlier sessions had about 0.01%, which suggested eager reads were taking
+the buffer headroom foreign admissions need. Two follow-ups settle it:
+
+- A bounded gate ([patch](benches/tap-read-bounded-gate-rejected.patch))
+  restored the old rule but let handed-over inputs stop reads for at most
+  10 ms. Registered before running against both builds
+  ([results](benches/decision-tap-bounded-gate.json)): at 0.5G it matched
+  the old gate (R→L missing median 0.004% against 0.014%, CPU per Gbit/s
+  −0.1%), but at 5G its p99.9 was 222–264 ms against 20–44 ms for the
+  landed gate, far beyond the allowed twofold, though its maxima stayed
+  under 0.4 s. Rejected.
+- In one container, six alternating pairs of the old and landed gates at
+  0.5G ([results](benches/decision-tap-gate-light-load.json)) give R→L
+  missing medians of 0.018% and 0.022% and right-side admission-drop
+  medians of 130 and 183. The higher loss seen earlier was mostly
+  session-to-session variation, so the landed gate shows no clear
+  light-load cost. One landed-gate run lost 0.7% / 0.8%: 14.8 s into the
+  point every receiver in both directions saw a 150–194 ms delay at once,
+  with frames expiring on both daemons, which points at a host-wide stall
+  rather than either gate.
 
 ### TAP queue length and overload delay
 
