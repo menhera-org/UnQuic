@@ -179,8 +179,10 @@ Decisions only the user can make, each blocking a remaining goal:
    ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB
-   `memory_limit` default (which refuses sixteen workers) remains
-   undecided.
+   `memory_limit` default remains undecided. It admits up to eight workers
+   for a session with as many lanes (reserving 260 MB); sixteen need about
+   420 MiB and use about 330 MB at overload
+   ([BENCH.md](BENCH.md#memory-reserved-against-memory-used-november-12)).
 
 ## November 11 checkpoint
 

@@ -124,6 +124,28 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## Memory reserved against memory used (November 12)
+
+The startup check reserves storage from the configuration and refuses to
+start above `daemon.memory_limit` (256 MiB, 268 MB, by default). For one
+session whose queue count and lane count equal the worker count, as in
+every run here, the reservation (`runtime::storage_bytes`, read through a
+temporary test print on `424f4f8`) and the peak RSS the harness records
+under overload compare as follows:
+
+| Workers | Reserved | Peak RSS under overload (run) |
+| --- | --- | --- |
+| 1 | 120 MB | — |
+| 2 | 139 MB | — |
+| 4 | 178 MB | 142 MB (decision workload, 5G) |
+| 8 | 260 MB | 203 MB (loopback check, 21G) |
+| 16 | 439 MB | 330 MB (loopback check, 21G; also the 9000-byte path) |
+| 32 | 859 MB | — |
+
+Each worker adds about 11 MB to the reservation, and the processes use
+75–80% of what they reserve at overload. The default admits up to eight
+workers for such a session; sixteen need a limit of about 420 MiB.
+
 ## Decision workload baseline (November 12, evening)
 
 The full decision matrix on `3178088` (daemon SHA-256 prefix
