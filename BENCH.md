@@ -1187,6 +1187,16 @@ Two earlier traced attempts stopped during the warm-up point with no error
 in the logs; the archived run completed both points. Trace daemon SHA-256:
 `132c39816bcc7ca7aa9da42dc294a84a246d8f0ec3444bc333dce838149a2c9e`.
 
+Later the same day, on `5863120` (after the TAP read change), sixteen
+workers with one tag at 8952 deliver 23.7–25.3 Gbit/s in total at 21G with
+the 500-entry TAP queue, and a 64-entry queue cuts the median one-way delay
+from 172–214 ms to 19–26 ms while delivering 22.5–23.4
+([results](benches/loopback-outer-9000-5863120.json)). Against the morning's
+26–29 Gbit/s this looks like a loss, but an alternating comparison in one
+container of `5f2db99` and `5863120` gives 24.0–24.3 and 24.1–25.5
+([results](benches/loopback-outer-9000-read-gate.json)): the read change
+costs nothing here, and the morning's totals reflect session variation.
+
 This changes what the gate needs. At 1500 bytes the per-bit cost has to
 halve; a 9000-byte outer path halves it. A deployment whose outer path
 carries jumbo frames can expect the larger gain, while the 1500-byte NGN
