@@ -185,7 +185,10 @@ Decisions only the user can make, each blocking a remaining goal:
    1.62–1.64; hash lanes: 1.15–1.19), but leaves the loopback cost (6–16%
    in two rounds)
    ([BENCH.md](BENCH.md#a-flow-table-shared-by-all-readers-exploratory));
-   building it properly is the next lane-placement step.
+   building it properly is the next lane-placement step. A trace places that
+   loopback cost in the congestion window: with balanced lanes senders wait
+   on it 35–37% of the time while hundreds of thousands of sent frames are
+   never acknowledged, so finding where those ACKs go comes first.
    ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB
