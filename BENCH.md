@@ -915,9 +915,9 @@ separate loss sources:
 The hold's measured loss excess sits on top of these two noise sources;
 neither is the hold's doing.
 
-### ProbeRTT's window over min_rtt plus the ACK delay (landed off)
+### ProbeRTT's window over min_rtt plus the ACK delay (now on by default)
 
-`daemon.probe_rtt_ack_delay`, off by default, sizes ProbeRTT's window as
+`daemon.probe_rtt_ack_delay` (first off by default, now on) sizes ProbeRTT's window as
 half of max_bw × (min_rtt + 1 ms), the receiver's maximum ACK delay, instead
 of half of max_bw × min_rtt. At half the bandwidth the bottleneck queue
 still drains. Stated before running: decision workload at 0.5G, hold off,
@@ -944,6 +944,26 @@ Loss outside ProbeRTT varies more between runs than between arms (on r1 and
 r2 dropped 1,680–2,308 frames per direction outside, in bursts such as 1,341
 drops in 250 ms), so this host cannot show a loss difference of this size
 in four pairs. The switch landed off by default.
+
+With the stall-aware loss from `udp_load` bins it was measured again on a
+release build (`3b9e86f`, 0.5G, four alternating pairs,
+[results](benches/decision-probe-rtt-ack-delay-bins.json)), stated
+beforehand as needing the on arm's median and worst missing share outside
+stalls (both directions summed per run) no higher than off's. Off: 0.0111,
+0.0120, 0 and 0%, median 0.0056%. On: 0.0045, 0.0043, 0.0007 and 0%,
+median 0.0025%. Raw loss was lower too (on 0.005–0.009%, off 0.005–0.030%).
+The default then had to cost nothing elsewhere, against the same bar as the
+read margin ([results](benches/probe-rtt-ack-delay-side-effects.json)):
+
+| Check | Off | On | Bar |
+| --- | --- | --- | --- |
+| Sixteen flows, 2G total | 3.25 / 3.37 Gbit/s | 3.24 / 3.35 | within −5%: −0.7% |
+| Sixteen flows, 5G total | 3.70 / 3.79 Gbit/s | 3.66 / 3.68 | within −5%: −1.9% |
+| Loopback check, 21G total | 12.27 / 12.40 Gbit/s | 12.33 / 12.59 | within −5%: +1.0% |
+| Sixteen flows at 0.5G, CPU per Gbit/s | 428 / 463% | 450 / 464% | at most +3%: +2.6% |
+
+One off run at 0.5G delivered only 0.90 Gbit/s, which flatters its CPU
+figure. All pass, and `probe_rtt_ack_delay` is now on by default.
 
 ### The hold's loss without host stalls and ProbeRTT
 

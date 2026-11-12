@@ -102,10 +102,12 @@ The test host stalls system-wide for 10–50 ms every few seconds, and at the
 control's loss. BBR's ProbeRTT window, half of max_bw × min_rtt, can also
 fall below what a 0.5 Gbit/s offer keeps in flight, because those bytes stay
 out for min_rtt plus up to 1 ms of ACK delay.
-`daemon.probe_rtt_ack_delay`, off by default, adds that delay to the
-ProbeRTT window. It kept every ProbeRTT episode off its window, but missed
-its loss bar because a host stall fell inside one episode
-([BENCH.md](BENCH.md#probertts-window-over-min_rtt-plus-the-ack-delay-landed-off)).
+`daemon.probe_rtt_ack_delay` adds that delay to the ProbeRTT window. It kept
+every ProbeRTT episode off its window but first missed its loss bar because
+a host stall fell inside one episode; measured again with stalls counted
+out, it halved the remaining light-load loss, cost nothing elsewhere and is
+now on by default
+([BENCH.md](BENCH.md#probertts-window-over-min_rtt-plus-the-ack-delay-now-on-by-default)).
 With both sources counted out, `tx_hold_us = 200` loses no more than the
 control ([BENCH.md](BENCH.md#the-holds-loss-without-host-stalls-and-probertt)),
 so the hold's only cost is latency. `udp_load` now bins frames by send time
