@@ -643,6 +643,14 @@ about 40–50% of their cycles building and sending batches (`flush_frames`
 plus `service_sender`). `sendmmsg` averages 3.9 datagrams per call at about
 8,900 cycles per datagram.
 
+One flow, same settings at eight workers, two repeats
+([results](benches/tap-small-frames-one-flow.json)): 40M (0.23 M frames/s)
+arrives with no missing frames at 54–58% / 54–56% CPU; unlimited delivers
+0.66–0.67 / 0.61–0.62 M frames/s, 97% missing, with one right-side thread
+at 97–98%. That is about four times the 166–176 thousand frames/s single-flow
+plateau of the [first small-frame rows](#small-frames), and one thread is
+the limit, as expected for a single flow.
+
 Balanced lanes do not help here. Two more alternating repeats at eight
 workers, hash lanes against `balance_flows = true`
 ([results](benches/tap-small-frames-balanced.json)), deliver 3.33–3.43 /

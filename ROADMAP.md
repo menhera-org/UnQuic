@@ -299,7 +299,10 @@ rules apply to all of them.
    per frame, so it was rejected
    ([BENCH.md](BENCH.md#without-udp-lane-locality-exploratory-rejected)).
    What remains is spreading only when the reader saturates and another
-   worker has slack.
+   worker has slack. That needs a saturation signal the per-read handler
+   does not have today, and must not reorder a flow that changes lanes.
+   One small-frame flow reaches 0.61–0.67 M frames/s, limited by one
+   thread.
 6. **Stage 4** is done as of November 12. OVS joined the composition
    matrix, and the panic audit converted the last locally bounded indexing in
    the encoders and the batch planner: explicit panics are gone, untrusted-input
