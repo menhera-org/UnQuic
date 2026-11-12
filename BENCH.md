@@ -340,7 +340,12 @@ decision workload at 5G, sixteen flows, `3b9e86f`, two alternating pairs
 gives a median one-way delay of 3.7 / 4.7 ms and a p99 of 10.7–11.7 /
 13.1–13.6 ms, against 6.4–6.8 / 9.6–9.8 ms and 38–42 / 25 ms with 500
 entries, while delivery stays at 1.91–1.99 / 1.69–1.76 Gbit/s (500 entries:
-1.96–1.97 / 1.67–1.73).
+1.96–1.97 / 1.67–1.73). The gate configuration (loopback check, sixteen
+workers, thirty-two flows, `424f4f8`, two alternating pairs,
+[results](benches/loopback-sixteen-workers-tap-queue-length.json)) agrees:
+at 21G 64 entries give a 4.9–5.1 ms median and a 22 ms p99 against 32–34
+ms and 55–60 ms with 500, and deliver 14.52–14.60 Gbit/s against
+14.33–14.45.
 
 TCP through the tunnel (loopback, eight workers, eight streams each way,
 two alternating pairs, [runs](benches/tcp-owner-reserve.txt)) is unchanged:
