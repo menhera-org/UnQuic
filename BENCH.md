@@ -291,7 +291,13 @@ left worker runs at 95–96% of a core and the other L→R owner at 78–86%. Wi
 hash lanes two of the four flows share one owner, which becomes CPU-bound
 at about 0.6 Gbit/s of 1522-byte frames, with or without loss. That is the
 per-frame cost again, and the reason balanced lanes, which give each flow
-its own owner, deliver more.
+its own owner, deliver more. A `profile` run of the clean 5G point
+([phases](benches/decision-four-flows-profile-margin.txt)) splits that
+owner's cycles into sender service 16% (per-frame ACK and recovery
+bookkeeping), sends 15%, TAP reads 12%, TAP writes 12%, packet processing
+7%, queue draining 5%, expansion 4%, buffer returns 3% and waiting 15%.
+Refusing handoffs costs it only a percent or two, so the lever left is the
+per-frame cost itself.
 
 The overloaded delay the margin raised is mostly the TAP ring again. On the
 decision workload at 5G, sixteen flows, `3b9e86f`, two alternating pairs
