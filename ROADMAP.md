@@ -20,13 +20,28 @@ identical binaries failed the same criterion at one point by a full point, so
 side-effect bars now allow one failing direction-point
 ([BENCH.md](BENCH.md#checked-indexing-in-the-encoders-and-batch-planner-november-12)).
 
-Waking only sleeping workers landed on November 11. Arming the timer only
-before blocking won six of eight loopback pairs and was rejected one pair short
-of its bar. The local 20 Gbit/s gate remains open: with sixteen workers per
-daemon the loopback total reaches about 15 Gbit/s with no thread saturated,
-limited by receive-socket overflow under the container's 416 KiB receive
-buffer, and per-bit cost puts both daemons near the host's core count before
-the gate.
+A/A runs of identical binaries now calibrate the bars. On the loopback check a
+copy run second wins six of eight pairs with a +1.4% median, and single
+directions swing by up to 18%, so throughput at overload cannot show a gain
+of a few percent. Efficiency changes are judged instead by CPU per delivered
+Gbit/s at an offer-limited load, in pairs that alternate order. On that
+metric two changes landed: arming the worker timer only before blocking
+(−2.0% at the loopback check's 4G point) and sweeping only occupied receive
+slots when collecting ACKs (−4.1% at 0.5G on the decision workload).
+Masking the TAP flush and deadline scans missed its bar.
+
+`daemon.loss_threshold_permille` (default 20, draft 07's 2%) landed: at 100
+one flow at 5% loss rises from under 10 Mbit/s to about 0.45 Gbit/s with a
+competing TCP flow's share unchanged, but it costs 3% at 1% loss, so the
+default stays. A trace places the remaining 5% limit in BBR's long-term
+bound, which makes that row a job for FEC.
+
+The local 20 Gbit/s gate remains open: with sixteen workers per daemon the
+loopback check reaches 7.11 / 7.03 Gbit/s with no thread above 75%, limited
+by receive-socket overflow under the container's 416 KiB receive buffer, and
+per-bit cost puts both daemons near the host's core count before the gate.
+Keeping the single QinQ reader off its own lanes cost 45% more CPU and was
+dropped.
 
 ## November 11 checkpoint
 
