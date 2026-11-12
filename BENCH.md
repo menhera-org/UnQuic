@@ -1148,6 +1148,17 @@ in use, so admission's cost lies in the piece copies and index work instead.
 Candidate daemon SHA-256:
 `cb2da037b1b612faaf5f6fc8c468829c451ed0b5fe3b8c92345b3aa369f37b8e`.
 
+The decision workload is different. At 2 Gbit/s each way it saturates near
+1.5 Gbit/s per direction with the busiest worker at 91–94%, and a profile
+with the same splits ([profile](benches/decision-2g-profile.txt)) puts about
+two-thirds of busy cycles in kernel I/O on the emulated path: `sendmmsg`
+16–18% of all worker cycles, TAP reads 11–13%, TAP writes 10% and socket
+reads 3.5%. Bridged individual frames give no GSO on input, so each frame
+pays its own TAP read and, through the routed namespaces and netem, about
+one send. The daemon's own work is a minority: ACK staging and reassembly
+admission about 3% each, cross-worker queues 2.5–2.9%. Per-frame
+bookkeeping is not the lever on this row.
+
 ## A 9000-byte outer path on the loopback check (November 12)
 
 Throughput sweeps had capped outer packets at 1500 bytes, though PMTU
