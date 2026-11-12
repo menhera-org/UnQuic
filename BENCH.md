@@ -335,6 +335,63 @@ path dominates: sending batches takes 25–30% of busy cycles and TAP reads
 and writes another 20–30%. `stage_recovery` matters mainly at loopback
 rates.
 
+## Checked indexing in the encoders and batch planner (November 12)
+
+The last stage 4 panic-audit item converts every indexing site that Clippy's
+`indexing_slicing` lint reports in `wire.rs` (51) and `pack.rs` (42) to
+checked access. Encoders write through a helper that returns
+`BufferTooSmall`, decoders and the flow-key parser use `get` and fixed-size
+chunks, and the batch planner returns `Frame` on a broken invariant. These
+run once per frame or datagram, so a no-regression check, stated before
+measuring: eight interleaved loopback pairs against the current build, where
+the median paired change must be no worse than −2% for the total and for
+each direction; and on the decision workload, three interleaved repeats
+meeting condition (2′) from the sleeping-wake section.
+
+The [first loopback check](benches/tap-checked-indexing-first.json) failed:
+median paired change −4.0% in total, −7.5% L→R and −1.7% R→L, with six of
+eight pairs lower. Its decision-workload run was stopped. A throwaway
+micro-benchmark on an idle core, timing the touched paths against the
+previous commit, found two costs. Building send slices through an
+`Iterator::zip`/`filter` chain was slower than the indexed loop it
+replaced, and the header check compared `Option<&[u8]>` values, which calls
+a generic slice comparison where the original compared three bytes inline.
+After rewriting both as plain loops and fixed-size array reads, `flow_hash`
+(44–46 ns per frame), batch planning with slices (33–42 ns per packet) and
+datagram decoding (22–27 ns) all match the previous commit within noise.
+The same bar is applied to a fresh run of the fixed build.
+
+On the [fresh loopback pairs](benches/tap-checked-indexing-loop.json) the
+median paired change is −1.8% in total, −1.9% L→R and +1.7% R→L, inside
+the −2% bar; single pairs still range from −42% to +51% L→R. On the
+[decision workload](benches/tap-checked-indexing-decision.json) the median
+change over the 24 direction-points is 0.0%, but one point fails (2′): four
+flows with 0.1% loss at 5G, L→R, delivers 15.43% of its offer where the
+allowance ends at 15.46% (control 16.59–17.72%). Before deciding, an A/A run
+of the current build against itself, three interleaved repeats on the same
+workload, measures how often (2′) fails when nothing changed.
+
+[The A/A run](benches/tap-decision-aa.json) also fails (2′) at one point:
+four flows without loss at 5G, L→R, delivers 9.6% less than its identical
+twin and misses the allowance by a full point of share, while the same
+pair's R→L delivers 12.7% more. The median change over the 24 points is
++0.15%, with single points from −9.6% to +12.7%. One failing point, at the
+placement-sensitive four-flow 5G points, is what (2′) produces with no
+change at all, so the checked-indexing run's single failure, by 0.03 points
+of share, is no evidence of a regression. With the micro-benchmark showing
+equal per-frame cost and the loopback pairs inside their bar, the change
+lands. Both kernel suites pass with it.
+
+The A/A run used a load generator rebuilt from the current source, which
+retries sends refused before a receiver binds and includes the November 9
+timer-slack fix. Earlier runs used a build older than that fix; every
+comparison ran both arms with the same generator, so their relative results
+stand, but absolute rates before and after this point are not comparable.
+
+From here on, the side-effect condition (2″) on the decision workload is: the
+median relative change over the 24 direction-points is no worse than −2%,
+and at most one direction-point fails the share criterion of (2′).
+
 ## Sixteen workers per daemon (November 11, exploratory)
 
 The harness now accepts `WORKERS=16`. One run each, current build, 21G

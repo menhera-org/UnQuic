@@ -49,10 +49,11 @@ impl Header {
         if input.len() < HEADER_LEN {
             return Err(WireError::Length);
         }
-        if input[..3] != [0x55, 0x51, 1] {
+        let [magic0, magic1, version, reserved] = read(input, 0);
+        if [magic0, magic1, version] != [0x55, 0x51, 1] {
             return Err(WireError::Header);
         }
-        if input[3] != 0 {
+        if reserved != 0 {
             return Err(WireError::Reserved);
         }
         let record_area_len = read16(input, 38);
@@ -106,11 +107,11 @@ impl Params {
         }
     }
 
-    fn encode(self, output: &mut [u8]) {
-        output[..2].copy_from_slice(&self.port.to_be_bytes());
-        output[2..4].copy_from_slice(&self.max_frame_len.to_be_bytes());
-        output[4..8].copy_from_slice(&self.mandatory_features.to_be_bytes());
-        output[8..12].copy_from_slice(&self.optional_features.to_be_bytes());
+    fn encode(self, output: &mut [u8]) -> Result<(), WireError> {
+        put(output, 0, &self.port.to_be_bytes())?;
+        put(output, 2, &self.max_frame_len.to_be_bytes())?;
+        put(output, 4, &self.mandatory_features.to_be_bytes())?;
+        put(output, 8, &self.optional_features.to_be_bytes())
     }
 }
 
@@ -164,7 +165,11 @@ impl<'a> AckRanges<'a> {
                 start: read64(bytes, i * 16),
                 end: read64(bytes, i * 16 + 8),
             },
-            RangeSource::Values(ranges) => ranges[i],
+            // i < len; the zero fallback only keeps this panic-free.
+            RangeSource::Values(ranges) => ranges
+                .get(i)
+                .copied()
+                .unwrap_or(AckRange { start: 0, end: 0 }),
         })
     }
 
@@ -328,8 +333,9 @@ impl Record<'_> {
             Self::Ready { .. } => 9,
             Self::LaneRetire { .. } => 10,
         };
-        output[..4].copy_from_slice(&[kind, 0, (length >> 8) as u8, length as u8]);
-        let body = &mut output[4..length];
+        // The length check above bounds every write; errors only keep this panic-free.
+        put(output, 0, &[kind, 0, (length >> 8) as u8, length as u8])?;
+        let body = output.get_mut(4..length).ok_or(WireError::BufferTooSmall)?;
         match self {
             Self::Padding { .. } => body.fill(0),
             Self::Data {
@@ -338,40 +344,40 @@ impl Record<'_> {
                 offset,
                 bytes,
             } => {
-                encode_data_fields(frame_id, total_len, offset, body);
-                body[16..].copy_from_slice(bytes);
+                encode_data_fields(
+                    frame_id,
+                    total_len,
+                    offset,
+                    body.first_chunk_mut().ok_or(WireError::BufferTooSmall)?,
+                );
+                put(body, 16, bytes)?;
             }
             Self::Ack {
                 lane,
                 delay_us,
                 ranges,
             } => {
-                body[..2].copy_from_slice(&lane.to_be_bytes());
-                body[2] = ranges.len() as u8;
-                body[3] = 0;
-                body[4..8].copy_from_slice(&delay_us.to_be_bytes());
-                for (bytes, range) in body[8..]
-                    .as_chunks_mut::<16>()
-                    .0
-                    .iter_mut()
-                    .zip(ranges.iter())
-                {
+                put(body, 0, &lane.to_be_bytes())?;
+                put(body, 2, &[ranges.len() as u8, 0])?;
+                put(body, 4, &delay_us.to_be_bytes())?;
+                let chunks = body.get_mut(8..).ok_or(WireError::BufferTooSmall)?;
+                for (bytes, range) in chunks.as_chunks_mut::<16>().0.iter_mut().zip(ranges.iter()) {
                     bytes[..8].copy_from_slice(&range.start.to_be_bytes());
                     bytes[8..].copy_from_slice(&range.end.to_be_bytes());
                 }
             }
             Self::Hello { initiator, params } => {
-                body[..16].copy_from_slice(&initiator.to_be_bytes());
-                params.encode(&mut body[16..]);
+                put(body, 0, &initiator.to_be_bytes())?;
+                params.encode(body.get_mut(16..).ok_or(WireError::BufferTooSmall)?)?;
             }
             Self::Challenge {
                 initiator,
                 responder,
                 params,
             } => {
-                body[..16].copy_from_slice(&initiator.to_be_bytes());
-                body[16..32].copy_from_slice(&responder.to_be_bytes());
-                params.encode(&mut body[32..]);
+                put(body, 0, &initiator.to_be_bytes())?;
+                put(body, 16, &responder.to_be_bytes())?;
+                params.encode(body.get_mut(32..).ok_or(WireError::BufferTooSmall)?)?;
             }
             Self::Probe => {}
             Self::ProbeReply {
@@ -379,11 +385,11 @@ impl Record<'_> {
                 packet_number,
                 payload_len,
             } => {
-                body[..2].copy_from_slice(&lane.to_be_bytes());
-                body[2..4].fill(0);
-                body[4..12].copy_from_slice(&packet_number.to_be_bytes());
-                body[12..14].copy_from_slice(&payload_len.to_be_bytes());
-                body[14..16].fill(0);
+                put(body, 0, &lane.to_be_bytes())?;
+                put(body, 2, &[0, 0])?;
+                put(body, 4, &packet_number.to_be_bytes())?;
+                put(body, 12, &payload_len.to_be_bytes())?;
+                put(body, 14, &[0, 0])?;
             }
             Self::FrameAbandon {
                 lane,
@@ -391,10 +397,9 @@ impl Record<'_> {
                 reason,
                 frame_id,
             } => {
-                body[..2].copy_from_slice(&lane.to_be_bytes());
-                body[2] = origin;
-                body[3] = reason;
-                body[4..12].copy_from_slice(&frame_id.to_be_bytes());
+                put(body, 0, &lane.to_be_bytes())?;
+                put(body, 2, &[origin, reason])?;
+                put(body, 4, &frame_id.to_be_bytes())?;
             }
             Self::Confirm {
                 initiator,
@@ -404,12 +409,12 @@ impl Record<'_> {
                 initiator,
                 responder,
             } => {
-                body[..16].copy_from_slice(&initiator.to_be_bytes());
-                body[16..32].copy_from_slice(&responder.to_be_bytes());
+                put(body, 0, &initiator.to_be_bytes())?;
+                put(body, 16, &responder.to_be_bytes())?;
             }
             Self::LaneRetire { lane } => {
-                body[..2].copy_from_slice(&lane.to_be_bytes());
-                body[2..4].fill(0);
+                put(body, 0, &lane.to_be_bytes())?;
+                put(body, 2, &[0, 0])?;
             }
         }
         Ok(length)
@@ -604,7 +609,7 @@ pub fn encode_datagram(
     header.encode(output.first_chunk_mut().ok_or(WireError::BufferTooSmall)?);
     let mut at = HEADER_LEN;
     for &record in records {
-        at += record.encode(&mut output[at..])?;
+        at += record.encode(output.get_mut(at..).ok_or(WireError::BufferTooSmall)?)?;
     }
     Ok(length)
 }
@@ -672,8 +677,17 @@ pub(crate) fn encode_data_prefix_length(
     let length = 20 + piece_len;
     header.record_area_len = length as u16;
     header.encode(output.first_chunk_mut().ok_or(WireError::BufferTooSmall)?);
-    output[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&[1, 0, (length >> 8) as u8, length as u8]);
-    encode_data_fields(frame_id, total_len, offset, &mut output[HEADER_LEN + 4..]);
+    put(
+        output,
+        HEADER_LEN,
+        &[1, 0, (length >> 8) as u8, length as u8],
+    )?;
+    encode_data_fields(
+        frame_id,
+        total_len,
+        offset,
+        output.last_chunk_mut().ok_or(WireError::BufferTooSmall)?,
+    );
     Ok(DATA_PREFIX_LEN + piece_len)
 }
 
@@ -692,31 +706,42 @@ pub fn encode_probe_prefix(
     header.record_area_len = u16::try_from(length - HEADER_LEN).map_err(|_| WireError::Length)?;
     Record::Probe.validate_context(header, 2)?;
     header.encode(output.first_chunk_mut().ok_or(WireError::BufferTooSmall)?);
-    output[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&[5, 0, 0, 4]);
+    put(output, HEADER_LEN, &[5, 0, 0, 4])?;
     let padding = header.record_area_len - 4;
-    output[HEADER_LEN + 4..].copy_from_slice(&[0, 0, (padding >> 8) as u8, padding as u8]);
-    Ok(())
+    put(
+        output,
+        HEADER_LEN + 4,
+        &[0, 0, (padding >> 8) as u8, padding as u8],
+    )
 }
 
-fn encode_data_fields(frame_id: u64, total_len: u32, offset: u32, body: &mut [u8]) {
+fn encode_data_fields(frame_id: u64, total_len: u32, offset: u32, body: &mut [u8; 16]) {
     body[..8].copy_from_slice(&frame_id.to_be_bytes());
     body[8..12].copy_from_slice(&total_len.to_be_bytes());
     body[12..16].copy_from_slice(&offset.to_be_bytes());
+}
+
+/// Copies `bytes` to `output` at `at`; a short output is an error, never a panic.
+fn put(output: &mut [u8], at: usize, bytes: &[u8]) -> Result<(), WireError> {
+    output
+        .get_mut(at..at.saturating_add(bytes.len()))
+        .ok_or(WireError::BufferTooSmall)?
+        .copy_from_slice(bytes);
+    Ok(())
 }
 
 fn decode_record(input: &[u8]) -> Result<(Record<'_>, usize), WireError> {
     if input.len() < 4 {
         return Err(WireError::Length);
     }
-    if input[1] != 0 {
+    let [kind, reserved] = read(input, 0);
+    if reserved != 0 {
         return Err(WireError::Reserved);
     }
     let length = usize::from(read16(input, 2));
-    if length < 4 || length > input.len() {
-        return Err(WireError::Length);
-    }
-    let body = &input[4..length];
-    let record = match input[0] {
+    // Also rejects lengths below the four-byte record header.
+    let body = input.get(4..length).ok_or(WireError::Length)?;
+    let record = match kind {
         0 => {
             if body.iter().any(|&byte| byte != 0) {
                 return Err(WireError::Reserved);
@@ -729,34 +754,35 @@ fn decode_record(input: &[u8]) -> Result<(Record<'_>, usize), WireError> {
             frame_id: read64(body, 0),
             total_len: read32(body, 8),
             offset: read32(body, 12),
-            bytes: &body[16..],
+            bytes: tail(body, 16),
         },
         2 if body.len() >= 8 => {
-            if body[3] != 0 {
+            let [count, reserved] = read(body, 2);
+            if reserved != 0 {
                 return Err(WireError::Reserved);
             }
-            let count = usize::from(body[2]);
+            let count = usize::from(count);
             if count == 0 || count > MAX_ACK_RANGES || body.len() != 8 + 16 * count {
                 return Err(WireError::Ack);
             }
             Record::Ack {
                 lane: read16(body, 0),
                 delay_us: read32(body, 4),
-                ranges: AckRanges(RangeSource::Wire(&body[8..])),
+                ranges: AckRanges(RangeSource::Wire(tail(body, 8))),
             }
         }
         3 if body.len() == 28 => Record::Hello {
             initiator: read128(body, 0),
-            params: Params::decode(&body[16..]),
+            params: Params::decode(tail(body, 16)),
         },
         4 if body.len() == 44 => Record::Challenge {
             initiator: read128(body, 0),
             responder: read128(body, 16),
-            params: Params::decode(&body[32..]),
+            params: Params::decode(tail(body, 32)),
         },
         5 if body.is_empty() => Record::Probe,
         6 if body.len() == 16 => {
-            if body[2..4] != [0, 0] || body[14..16] != [0, 0] {
+            if read::<2>(body, 2) != [0, 0] || read::<2>(body, 14) != [0, 0] {
                 return Err(WireError::Reserved);
             }
             Record::ProbeReply {
@@ -765,12 +791,15 @@ fn decode_record(input: &[u8]) -> Result<(Record<'_>, usize), WireError> {
                 payload_len: read16(body, 12),
             }
         }
-        7 if body.len() == 12 => Record::FrameAbandon {
-            lane: read16(body, 0),
-            origin: body[2],
-            reason: body[3],
-            frame_id: read64(body, 4),
-        },
+        7 if body.len() == 12 => {
+            let [origin, reason] = read(body, 2);
+            Record::FrameAbandon {
+                lane: read16(body, 0),
+                origin,
+                reason,
+                frame_id: read64(body, 4),
+            }
+        }
         8 if body.len() == 32 => Record::Confirm {
             initiator: read128(body, 0),
             responder: read128(body, 16),
@@ -780,7 +809,7 @@ fn decode_record(input: &[u8]) -> Result<(Record<'_>, usize), WireError> {
             responder: read128(body, 16),
         },
         10 if body.len() == 4 => {
-            if body[2..4] != [0, 0] {
+            if read::<2>(body, 2) != [0, 0] {
                 return Err(WireError::Reserved);
             }
             Record::LaneRetire {
@@ -808,6 +837,10 @@ fn read<const N: usize>(input: &[u8], at: usize) -> [u8; N] {
         .and_then(<[u8]>::first_chunk)
         .copied()
         .unwrap_or([0; N])
+}
+/// Callers check lengths first; the empty fallback only keeps this panic-free.
+fn tail(input: &[u8], at: usize) -> &[u8] {
+    input.get(at..).unwrap_or_default()
 }
 fn read16(input: &[u8], at: usize) -> u16 {
     u16::from_be_bytes(read(input, at))

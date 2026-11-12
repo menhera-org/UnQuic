@@ -150,8 +150,10 @@ impl Lane {
             return Err(PackError::Frame);
         }
         let limit = output.len().min(BASE_UDP_PAYLOAD);
-        let length = encode_datagram(self.header, &[record], &mut output[..limit])
-            .map_err(PackError::Wire)?;
+        let output = output
+            .get_mut(..limit)
+            .ok_or(PackError::Wire(WireError::BufferTooSmall))?;
+        let length = encode_datagram(self.header, &[record], output).map_err(PackError::Wire)?;
         let number = self.header.packet_number;
         self.header.packet_number = number.checked_add(1).unwrap_or(0);
         Ok(Packet { number, length })
@@ -172,12 +174,15 @@ impl Lane {
         if self.header.packet_number == 0 {
             return Err(PackError::Exhausted);
         }
+        let bytes = PROBE_PADDING
+            .get(..length - PROBE_PREFIX_LEN)
+            .ok_or(PackError::Limit)?;
         encode_probe_prefix(self.header, length, prefix).map_err(PackError::Wire)?;
         let number = self.header.packet_number;
         self.header.packet_number = number.checked_add(1).unwrap_or(0);
         Ok(Piece {
             packet: Packet { number, length },
-            bytes: &PROBE_PADDING[..length - PROBE_PREFIX_LEN],
+            bytes,
         })
     }
 }
@@ -217,7 +222,7 @@ impl<'a> Frame<'a> {
             .bytes
             .len()
             .min(self.offset + BASE_UDP_PAYLOAD - DATA_PREFIX_LEN);
-        let bytes = &self.bytes[self.offset..end];
+        let bytes = self.bytes.get(self.offset..end).ok_or(PackError::Frame)?;
         let record = Record::Data {
             frame_id: self.id,
             total_len: self.bytes.len() as u32,
@@ -257,7 +262,7 @@ impl<'a> Frame<'a> {
             frame_id: self.id,
             total_len: self.bytes.len() as u32,
             offset: self.offset as u32,
-            bytes: &self.bytes[self.offset..end],
+            bytes: self.bytes.get(self.offset..end).ok_or(PackError::Frame)?,
         };
         let packet = self.lane.record(record, output)?;
         self.offset = end;
@@ -363,12 +368,14 @@ impl Batch {
     }
 
     /// Prepared identity and payload length, or None past the batch.
-    pub const fn packet(&self, index: usize) -> Option<Packet> {
-        if index < self.len() {
-            Some(self.packets[self.head + index].packet)
-        } else {
-            None
-        }
+    pub fn packet(&self, index: usize) -> Option<Packet> {
+        self.planned(index).map(|plan| plan.packet)
+    }
+
+    fn planned(&self, index: usize) -> Option<&PacketPlan> {
+        (index < self.len())
+            .then(|| self.packets.get(self.head + index))
+            .flatten()
     }
 
     /// Consumes a fully successful attempted prefix, retaining never-attempted packets.
@@ -389,24 +396,26 @@ impl Batch {
         if self.is_empty() {
             return Ok(());
         }
-        let first = usize::from(self.packets[self.head].first);
-        let last = self.packets[self.count - 1];
+        let first = usize::from(self.planned(0).ok_or(PackError::Frame)?.first);
+        let last = *self.planned(self.len() - 1).ok_or(PackError::Frame)?;
         let end = usize::from(last.first) + usize::from(last.count);
-        if self.pieces[first..end]
+        let retained = self.pieces.get(first..end).ok_or(PackError::Frame)?;
+        if retained
             .iter()
             .any(|piece| usize::from(piece.frame) < frames)
         {
             return Err(PackError::Frame);
         }
+        // Every range below lies within the bounds just checked.
         self.packets.copy_within(self.head..self.count, 0);
         self.count -= self.head;
         self.head = 0;
         self.pieces.copy_within(first..end, 0);
         self.prefixes.copy_within(first..end, 0);
-        for packet in &mut self.packets[..self.count] {
+        for packet in self.packets.iter_mut().take(self.count) {
             packet.first -= first as u16;
         }
-        for piece in &mut self.pieces[..end - first] {
+        for piece in self.pieces.iter_mut().take(end - first) {
             piece.frame -= frames as u8;
         }
         Ok(())
@@ -415,7 +424,13 @@ impl Batch {
     /// Replaces unsent packet identities without changing payload spans or sizes.
     pub(crate) fn renumber(&mut self, lane: &mut Lane) -> Result<u64, PackError> {
         let first = lane.allocate_packets(self.len())?;
-        for (offset, plan) in self.packets[self.head..self.count].iter_mut().enumerate() {
+        for (offset, plan) in self
+            .packets
+            .iter_mut()
+            .take(self.count)
+            .skip(self.head)
+            .enumerate()
+        {
             plan.packet.number = first + offset as u64;
             let mut header = lane.header;
             header.packet_number = plan.packet.number;
@@ -435,13 +450,11 @@ impl Batch {
         &self,
         packet: usize,
     ) -> Option<impl Iterator<Item = (usize, std::ops::Range<usize>)> + '_> {
-        if packet >= self.len() {
-            return None;
-        }
-        let plan = &self.packets[self.head + packet];
+        let plan = self.planned(packet)?;
         let first = usize::from(plan.first);
         Some(
-            self.pieces[first..first + usize::from(plan.count)]
+            self.pieces
+                .get(first..first + usize::from(plan.count))?
                 .iter()
                 .map(|piece| {
                     (
@@ -462,15 +475,15 @@ impl Batch {
         frames: &[FrameInput<'a>],
         output: &'out mut [&'a [u8]],
     ) -> Result<&'out [&'a [u8]], PackError> {
-        let plan = self
-            .packets
-            .get(self.head.saturating_add(packet))
-            .filter(|_| packet < self.len())
-            .ok_or(PackError::Frame)?;
+        let plan = self.planned(packet).ok_or(PackError::Frame)?;
         if output.len() < 1 + usize::from(plan.count) * 2 {
             return Err(PackError::Wire(WireError::BufferTooSmall));
         }
-        output[0] = &plan.header;
+        // The length check above guarantees the header slot.
+        let Some(slot) = output.first_mut() else {
+            return Err(PackError::Wire(WireError::BufferTooSmall));
+        };
+        *slot = &plan.header;
         let mut used = 1;
         for (index, (frame, range)) in self.pieces(packet).ok_or(PackError::Frame)?.enumerate() {
             let frame = frames.get(frame).ok_or(PackError::Frame)?;
@@ -487,17 +500,24 @@ impl Batch {
             let slots = output
                 .get_mut(used..used + count)
                 .ok_or(PackError::Wire(WireError::BufferTooSmall))?;
-            slots[0] = &self.prefixes[usize::from(plan.first) + index];
-            let mut part = 1;
-            for span in [header, bytes] {
+            let prefix = self
+                .prefixes
+                .get(usize::from(plan.first) + index)
+                .ok_or(PackError::Frame)?;
+            let mut part = 0;
+            for span in [prefix.as_slice(), header, bytes] {
                 if !span.is_empty() {
-                    slots[part] = span;
+                    if let Some(slot) = slots.get_mut(part) {
+                        *slot = span;
+                    }
                     part += 1;
                 }
             }
             used += count;
         }
-        Ok(&output[..used])
+        output
+            .get(..used)
+            .ok_or(PackError::Wire(WireError::BufferTooSmall))
     }
 
     /// Prepares up to 64 packets from at most 64 frame ranges, without copying payloads.
@@ -556,10 +576,8 @@ impl Batch {
             return Err(PackError::Frame);
         }
         let packet_limit = BATCH_CAPACITY.min(GSO_MAX_BYTES / limit);
-        if self.packets[..self.count]
-            .iter()
-            .any(|p| p.packet.length > limit)
-        {
+        let prepared = self.packets.get(..self.count).ok_or(PackError::Frame)?;
+        if prepared.iter().any(|p| p.packet.length > limit) {
             return Err(PackError::Limit);
         }
         // Exhaustion must not discard an already prepared final packet or its split range.
@@ -568,16 +586,16 @@ impl Batch {
         }
         // A Flight's submission accounting requires consecutive identities. A canceled
         // control/probe can advance the allocator without invalidating this suffix.
-        if self.packets[..self.count].last().is_some_and(|packet| {
+        if prepared.last().is_some_and(|packet| {
             packet.packet.number.checked_add(1) != Some(lane.header.packet_number)
         }) {
             return Ok(());
         }
-        let frame = if self.count == 0 {
-            0
-        } else {
-            let packet = self.packets[self.count - 1];
-            let piece = self.pieces[usize::from(packet.first + packet.count) - 1];
+        let frame = if let Some(packet) = prepared.last() {
+            let piece = usize::from(packet.first + packet.count)
+                .checked_sub(1)
+                .and_then(|last| self.pieces.get(last))
+                .ok_or(PackError::Frame)?;
             let index = usize::from(piece.frame);
             // Prepared ranges finish within the plan except at packet-number exhaustion.
             if frames
@@ -587,6 +605,8 @@ impl Batch {
                 return Err(PackError::Frame);
             }
             index + 1
+        } else {
+            0
         };
         self.fill(lane, frames, limit, frame)
     }
@@ -599,18 +619,19 @@ impl Batch {
         mut frame: usize,
     ) -> Result<(), PackError> {
         let mut offset = frames.get(frame).map_or(0, |frame| frame.offset);
-        let mut pieces = self.packets[..self.count]
-            .last()
+        let mut pieces = self
+            .count
+            .checked_sub(1)
+            .and_then(|last| self.packets.get(last))
             .map_or(0, |p| usize::from(p.first + p.count));
         let packet_limit = BATCH_CAPACITY.min(GSO_MAX_BYTES / limit);
         while frame < frames.len() && self.count < packet_limit && lane.header.packet_number != 0 {
             let first = pieces;
             let mut length = HEADER_LEN;
-            while frame < frames.len()
-                && pieces - first < MAX_RECORDS
-                && length + RECORD_PREFIX_LEN < limit
-            {
-                let input = &frames[frame];
+            while pieces - first < MAX_RECORDS && length + RECORD_PREFIX_LEN < limit {
+                let Some(input) = frames.get(frame) else {
+                    break;
+                };
                 let frame_len = input.header.len() + input.bytes.len();
                 // Keep selected ranges within one GSO aggregate under socket overload.
                 let available = limit - length - RECORD_PREFIX_LEN
@@ -621,7 +642,11 @@ impl Batch {
                 let end = input.end.min(offset + limit - length - RECORD_PREFIX_LEN);
                 let mut prefix = [0; DATA_PREFIX_LEN];
                 // Each piece ends an input or a packet: 64 of each need at most 127 pieces.
-                debug_assert!(pieces < self.pieces.len());
+                let (Some(stored), Some(range)) =
+                    (self.prefixes.get_mut(pieces), self.pieces.get_mut(pieces))
+                else {
+                    return Err(PackError::Frame);
+                };
                 encode_data_prefix_length(
                     lane.header,
                     input.id,
@@ -631,8 +656,10 @@ impl Batch {
                     &mut prefix,
                 )
                 .map_err(PackError::Wire)?;
-                self.prefixes[pieces].copy_from_slice(&prefix[HEADER_LEN..]);
-                self.pieces[pieces] = PieceRange {
+                *stored = *prefix
+                    .last_chunk()
+                    .ok_or(PackError::Wire(WireError::BufferTooSmall))?;
+                *range = PieceRange {
                     frame: frame as u8,
                     start: offset as u16,
                     end: end as u16,
@@ -648,7 +675,8 @@ impl Batch {
             if pieces == first {
                 break;
             }
-            let plan = &mut self.packets[self.count];
+            // count < packet_limit <= BATCH_CAPACITY.
+            let plan = self.packets.get_mut(self.count).ok_or(PackError::Frame)?;
             let mut header = lane.header;
             header.record_area_len = (length - HEADER_LEN) as u16;
             header.encode(&mut plan.header);
@@ -721,25 +749,27 @@ fn hash_ip(hash: &mut DefaultHasher, (addresses, protocol, tail): IpKey<'_>) {
 }
 
 fn flow_key(frame: &[u8]) -> (&[u8], Option<IpKey<'_>>) {
-    if frame.len() < 14 {
+    let Some((link, mut rest)) = frame.split_at_checked(14) else {
         return (frame, None);
-    }
-    let mut offset = 14;
-    let mut protocol = u16::from_be_bytes([frame[12], frame[13]]);
+    };
+    let mut protocol = link
+        .last_chunk()
+        .map_or(0, |&bytes| u16::from_be_bytes(bytes));
+    // The link key is everything before `rest`: Ethernet header and VLAN stack.
+    let link = |rest: &[u8]| frame.get(..frame.len() - rest.len()).unwrap_or(frame);
     while matches!(protocol, 0x8100 | 0x88a8 | 0x9100) {
-        let Some(tag) = frame.get(offset..offset + 4) else {
-            return (&frame[..offset], None);
+        let Some((&[_, _, high, low], after)) = rest.split_first_chunk::<4>() else {
+            return (link(rest), None);
         };
-        protocol = u16::from_be_bytes([tag[2], tag[3]]);
-        offset += 4;
+        protocol = u16::from_be_bytes([high, low]);
+        rest = after;
     }
-    let ip = &frame[offset..];
     let key = match protocol {
-        0x0800 => ipv4(ip),
-        0x86dd => ipv6(ip),
+        0x0800 => ipv4(rest),
+        0x86dd => ipv6(rest),
         _ => None,
     };
-    (&frame[..offset], key)
+    (link(rest), key)
 }
 
 fn flow_tail(protocol: u8, payload: &[u8]) -> Option<&[u8]> {
@@ -753,32 +783,36 @@ fn flow_tail(protocol: u8, payload: &[u8]) -> Option<&[u8]> {
 }
 
 fn ipv4(ip: &[u8]) -> Option<IpKey<'_>> {
-    if ip.len() < 20 || ip[0] >> 4 != 4 {
+    let fixed: &[u8; 20] = ip.first_chunk()?;
+    if fixed[0] >> 4 != 4 {
         return None;
     }
-    let header = usize::from(ip[0] & 15) * 4;
-    let length = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
-    if header < 20 || length < header || length > ip.len() {
+    let header = usize::from(fixed[0] & 15) * 4;
+    let length = usize::from(u16::from_be_bytes([fixed[2], fixed[3]]));
+    if header < 20 || length < header {
         return None;
     }
-    let fragmented = u16::from_be_bytes([ip[6], ip[7]]) & 0x3fff != 0;
+    let fragmented = u16::from_be_bytes([fixed[6], fixed[7]]) & 0x3fff != 0;
+    let payload = ip.get(header..length)?;
     let tail = if fragmented {
         &[][..]
     } else {
-        flow_tail(ip[9], &ip[header..length])?
+        flow_tail(fixed[9], payload)?
     };
-    Some((&ip[12..20], ip[9], tail))
+    Some((ip.get(12..20)?, fixed[9], tail))
 }
 
 fn ipv6(ip: &[u8]) -> Option<IpKey<'_>> {
-    if ip.len() < 40 || ip[0] >> 4 != 6 {
+    let fixed: &[u8; 40] = ip.first_chunk()?;
+    if fixed[0] >> 4 != 6 {
         return None;
     }
-    let length = 40 + usize::from(u16::from_be_bytes([ip[4], ip[5]]));
+    let length = 40 + usize::from(u16::from_be_bytes([fixed[4], fixed[5]]));
     if length > ip.len() {
         return None;
     }
-    let mut next = ip[6];
+    let addresses = ip.get(8..40)?;
+    let mut next = fixed[6];
     let mut offset = 40;
     loop {
         let payload = ip.get(offset..length)?;
@@ -792,10 +826,10 @@ fn ipv6(ip: &[u8]) -> Option<IpKey<'_>> {
                 size
             }
             44 => {
-                let fragment = payload.get(..8)?;
-                return Some((&ip[8..40], fragment[0], &[]));
+                let fragment: &[u8; 8] = payload.first_chunk()?;
+                return Some((addresses, fragment[0], &[]));
             }
-            _ => return Some((&ip[8..40], next, flow_tail(next, payload)?)),
+            _ => return Some((addresses, next, flow_tail(next, payload)?)),
         };
         if size > payload.len() {
             return None;

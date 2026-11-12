@@ -7,6 +7,27 @@ read that section before writing code. Keep the "Current status" paragraph in
 section 15 of the design and the "Implementation status" section of
 [README.md](README.md) true after every step.
 
+## November 12 checkpoint
+
+Stage 4 is done. An OVS system-port test now runs on Linux 6.8 and 7.0, with
+Open vSwitch userspace unpacked into a private tree rather than installed, and
+the encoders and batch planner use checked access everywhere Clippy's
+`indexing_slicing` lint looked. The first no-regression check of that change
+failed; a micro-benchmark traced it to an iterator chain and a slice
+comparison, both rewritten, after which the rerun passed on loopback. On the
+decision workload one point failed by 0.03 points of share. An A/A run of
+identical binaries failed the same criterion at one point by a full point, so
+side-effect bars now allow one failing direction-point
+([BENCH.md](BENCH.md#checked-indexing-in-the-encoders-and-batch-planner-november-12)).
+
+Waking only sleeping workers landed on November 11. Arming the timer only
+before blocking won six of eight loopback pairs and was rejected one pair short
+of its bar. The local 20 Gbit/s gate remains open: with sixteen workers per
+daemon the loopback total reaches about 15 Gbit/s with no thread saturated,
+limited by receive-socket overflow under the container's 416 KiB receive
+buffer, and per-bit cost puts both daemons near the host's core count before
+the gate.
+
 ## November 11 checkpoint
 
 The loopback overload check was window-limited, not CPU-limited. BBR sized
@@ -236,15 +257,14 @@ rules apply to all of them.
    which the container's 416 KiB receive buffer (no `CAP_NET_ADMIN` in the
    initial namespace) makes worse than a root deployment's 8 MiB
    ([BENCH.md](BENCH.md#sixteen-workers-per-daemon-november-11-exploratory)).
-6. **Stage 4**, as listed in its section: OVS in the composition matrix (the
-   test images lack it) and the remaining resource stress. The panic audit is
-   done except for converting locally bounded indexing in encoders and the
-   batch planner: explicit panics are gone, untrusted-input parsers and the
-   worker's packet paths are fuzzed and checked, and seccomp fault injection
-   covers worker and thread-start failures. TAP persistence and descriptor
-   handover, including a failed exec after a passing probe, double-fork
-   readiness, the systemd unit, the VRF and composition tests and the V03
-   lifecycle cases are done.
+6. **Stage 4** is done as of November 12. OVS joined the composition
+   matrix, and the panic audit converted the last locally bounded indexing in
+   the encoders and the batch planner: explicit panics are gone, untrusted-input
+   parsers and the worker's packet paths are fuzzed and checked, and seccomp
+   fault injection covers worker and thread-start failures. TAP persistence
+   and descriptor handover, including a failed exec after a passing probe,
+   double-fork readiness, the systemd unit, the VRF and composition tests and
+   the V03 lifecycle cases are done.
 7. **Stage 5:** profile what remains and try its candidates behind switches.
 
 If evidence shows a gate cannot be reached within the current design, write
@@ -1171,8 +1191,10 @@ full expired batches sharing the cleanup budget.
   uses seccomp to fail a syscall every worker needs (`timerfd_settime`) after
   the TAP exists, and then thread creation itself: each time the runtime
   stops with that error and the published TAP keeps its ifindex (Linux 6.8
-  and 7.0). Remaining: indexing in internal state (encoders, the batch
-  planner), reviewed as locally bounded but not converted.
+  and 7.0). On November 12 the last 93 indexing sites Clippy's
+  `indexing_slicing` lint reported in the encoders and the batch planner
+  (`wire.rs`, `pack.rs`) became checked access, at equal per-frame cost
+  ([BENCH.md](BENCH.md#checked-indexing-in-the-encoders-and-batch-planner-november-12)).
 
   ```sh
   cargo clippy --release --target x86_64-unknown-linux-musl --lib --all-features -- \
