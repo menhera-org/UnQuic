@@ -509,6 +509,12 @@ rules apply to all of them.
    to 11.3–11.9 Gbit/s on the loopback check) and the shared flow table,
    before deciding `balance_flows`
    ([BENCH.md](BENCH.md#a-flow-table-shared-by-all-readers-exploratory)).
+   Scope: the only production site is `Worker::send_record`
+   (`src/worker.rs`), which takes lane 0's socket and lane 0's packet
+   history; a refused attempt counts as `ack_send_deferred` and retries
+   after `RETRY`. Two shapes are possible: send control records ahead of
+   data on lane 0, or give them a lane of their own with its own history.
+   Many worker unit tests assume lane 0 for control.
 
 If evidence shows a gate cannot be reached within the current design, write
 that conclusion with its evidence in BENCH.md and here instead of trying more
