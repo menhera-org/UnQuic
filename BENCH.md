@@ -483,7 +483,9 @@ pair, balanced lanes in both arms,
 [results](benches/loopback-balanced-skip-lane0.json)) confirms it: ACK
 deferrals fall from 28,636 / 32,346 to zero, expired sent frames from
 322,000 / 277,000 to 221,000 / 44,000, and the 21G total rises from 10.74
-to 13.45 Gbit/s, above any hash-lane run today (11.47–12.31). Balanced
+to 13.45 Gbit/s, above any hash-lane run today (11.47–12.31). A second
+pair in reverse order ([results](benches/loopback-balanced-skip-lane0-2.json))
+repeats it: 13.40 against 10.75. Balanced
 lanes' loopback cost was ACKs queued behind data on lane 0's socket. A
 proper fix keeps ACKs off a busy data socket for every lane policy (hash
 lanes put data on lane 0 too), and needs tests, both suites and the full
