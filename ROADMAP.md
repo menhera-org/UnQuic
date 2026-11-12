@@ -512,7 +512,10 @@ rules apply to all of them.
    Scope: the only production site is `Worker::send_record`
    (`src/worker.rs`), which takes lane 0's socket and lane 0's packet
    history; a refused attempt counts as `ack_send_deferred` and retries
-   after `RETRY`. Two shapes are possible: send control records ahead of
+   after `RETRY`. It refuses in two places: when lane 0's sent history
+   cannot reserve a number with probe headroom, and when the socket send
+   fails. Which of the two produced the deferrals is not yet measured; busy
+   owners also showed a 5–6% history-full hold on the lossy points. Two shapes are possible: send control records ahead of
    data on lane 0, or give them a lane of their own with its own history.
    Many worker unit tests assume lane 0 for control.
 
