@@ -12,7 +12,12 @@ extern "C" fn snapshot(_: libc::c_int) {
     SNAPSHOT.store(true, Ordering::Relaxed);
 }
 
-const MAGIC: [u8; 4] = *b"UQL1";
+const MAGIC: [u8; 4] = *b"UQL2";
+// Payloads of at least 22 bytes carry the send time, 48 bits of monotonic ns, in bytes 16..22.
+const STAMP_END: usize = 22;
+const STAMP_MASK: u64 = (1 << 48) - 1;
+// Log-linear latency buckets: exact below 8 ns, then 8 per power of two up to 2^48 ns.
+const LATENCY_BUCKETS: usize = 46 * 8;
 // Cover delayed super-frames across the harness's eight 10,000-entry TAP queues.
 const WORDS: usize = 1 << 18;
 const MAX_BYTES: usize = 65_487;
@@ -125,6 +130,60 @@ impl Window {
     }
 }
 
+fn latency_bucket(ns: u64) -> usize {
+    if ns < 8 {
+        return ns as usize;
+    }
+    let exp = 63 - ns.leading_zeros() as usize;
+    ((exp - 2) * 8 + ((ns >> (exp - 3)) & 7) as usize).min(LATENCY_BUCKETS - 1)
+}
+
+/// Largest latency a bucket holds; examples/sweep_report.rs reports with a copy.
+#[cfg(test)]
+fn latency_upper(bucket: usize) -> u64 {
+    if bucket < 8 {
+        return bucket as u64;
+    }
+    let exp = bucket / 8 + 2;
+    ((8 + bucket as u64 % 8) << (exp - 3)) + (1 << (exp - 3)) - 1
+}
+
+// One-way delay of stamped payloads, from the sender's send call to the receive call.
+struct Latency {
+    counts: [u64; LATENCY_BUCKETS],
+    count: u64,
+    sum_ns: u128,
+    max_ns: u64,
+}
+impl Latency {
+    fn new() -> Self {
+        Self {
+            counts: [0; LATENCY_BUCKETS],
+            count: 0,
+            sum_ns: 0,
+            max_ns: 0,
+        }
+    }
+    fn record(&mut self, ns: u64) {
+        self.counts[latency_bucket(ns)] += 1;
+        self.count += 1;
+        self.sum_ns += u128::from(ns);
+        self.max_ns = self.max_ns.max(ns);
+    }
+}
+
+fn monotonic_ns() -> io::Result<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: ts is a valid output buffer for clock_gettime.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+}
+
 // Integer credits are bit-nanoseconds; retain at most two aggregates of catch-up.
 struct Bucket {
     credit: u128,
@@ -171,6 +230,7 @@ struct Flow {
     overflow: u64,
     overflow_last: u32,
     receive_bytes: i32,
+    latency: Box<Latency>,
 }
 fn option(socket: &UdpSocket, level: i32, name: i32, value: i32) -> io::Result<()> {
     // SAFETY: value is an initialized integer with the option's ABI size.
@@ -245,30 +305,42 @@ fn flows(c: &Config) -> io::Result<Vec<Flow>> {
                 overflow: 0,
                 overflow_last: 0,
                 receive_bytes,
+                latency: Box::new(Latency::new()),
             })
         })
         .collect()
 }
 
-fn fill(bytes: &mut [u8], size: usize, run: u32, sequence: u64) {
+fn fill(bytes: &mut [u8], size: usize, run: u32, sequence: u64, now_ns: u64) {
+    let stamp = (now_ns & STAMP_MASK).to_be_bytes();
     for (i, p) in bytes.chunks_exact_mut(size).enumerate() {
         p[..4].copy_from_slice(&MAGIC);
         p[4..8].copy_from_slice(&run.to_be_bytes());
         p[8..16].copy_from_slice(&(sequence + i as u64).to_be_bytes());
+        if size >= STAMP_END {
+            p[16..STAMP_END].copy_from_slice(&stamp[2..]);
+        }
     }
 }
-fn consume(flow: &mut Flow, bytes: &[u8], segment: usize, size: usize, run: u32) {
+fn consume(flow: &mut Flow, bytes: &[u8], segment: usize, size: usize, run: u32, now_ns: u64) {
     if bytes.is_empty() || segment == 0 || segment > bytes.len() {
         flow.invalid += 1;
         return;
     }
+    let pattern = if size >= STAMP_END { STAMP_END } else { 16 };
     for p in bytes.chunks(segment) {
         if p.len() != size
             || p[..4] != MAGIC
-            || p[16..].iter().fold(0, |bad, &v| bad | (v ^ 0xa5)) != 0
+            || p[pattern..].iter().fold(0, |bad, &v| bad | (v ^ 0xa5)) != 0
         {
             flow.invalid += 1;
             continue;
+        }
+        if size >= STAMP_END {
+            let mut stamp = [0; 8];
+            stamp[2..].copy_from_slice(&p[16..STAMP_END]);
+            let sent = u64::from_be_bytes(stamp);
+            flow.latency.record(now_ns.wrapping_sub(sent) & STAMP_MASK);
         }
         let observed_run = u32::from_be_bytes(p[4..8].try_into().unwrap());
         if observed_run != run {
@@ -307,6 +379,7 @@ fn receive(flow: &mut Flow, bytes: &mut [u8], c: &Config) -> io::Result<bool> {
         }
         Err(e) => return Err(e),
     };
+    let now_ns = monotonic_ns()?;
     for packet in &packets[..received] {
         if packet.truncated {
             flow.invalid += 1;
@@ -327,6 +400,7 @@ fn receive(flow: &mut Flow, bytes: &mut [u8], c: &Config) -> io::Result<bool> {
             },
             c.payload,
             c.run,
+            now_ns,
         );
     }
     Ok(received != 0)
@@ -422,7 +496,13 @@ fn run(c: &Config) -> io::Result<()> {
                     delay = delay.min(wait);
                     continue;
                 }
-                fill(&mut bytes[..length], c.payload, c.run, f.sequence);
+                fill(
+                    &mut bytes[..length],
+                    c.payload,
+                    c.run,
+                    f.sequence,
+                    monotonic_ns()?,
+                );
                 f.calls += 1;
                 match f.socket.send(&bytes[..length]) {
                     Ok(n) if n == length => {
@@ -482,7 +562,27 @@ fn run(c: &Config) -> io::Result<()> {
             if i == 0 { "" } else { "," }
         );
     }
-    println!("]}}");
+    let mut latency = Latency::new();
+    for f in &flows {
+        for (total, count) in latency.counts.iter_mut().zip(f.latency.counts) {
+            *total += count;
+        }
+        latency.count += f.latency.count;
+        latency.sum_ns += f.latency.sum_ns;
+        latency.max_ns = latency.max_ns.max(f.latency.max_ns);
+    }
+    print!(
+        "],\"latency\":{{\"count\":{},\"sum_ns\":{},\"max_ns\":{},\"histogram\":[",
+        latency.count, latency.sum_ns, latency.max_ns
+    );
+    let mut first = true;
+    for (bucket, &count) in latency.counts.iter().enumerate() {
+        if count != 0 {
+            print!("{}[{bucket},{count}]", if first { "" } else { "," });
+            first = false;
+        }
+    }
+    println!("]}}}}");
     Ok(())
 }
 
@@ -546,6 +646,35 @@ mod tests {
         f();
         let counts = ALLOCATIONS.with(|c| c.replace(None));
         assert_eq!(counts, Some((0, 0)));
+    }
+
+    #[test]
+    fn latency_buckets_bound_every_value_within_an_eighth() {
+        let mut previous = 0;
+        for ns in (0..4096).chain((12..48).flat_map(|exp| {
+            let base = 1_u64 << exp;
+            [base - 1, base, base + base / 3, (base << 1) - 1]
+        })) {
+            let bucket = latency_bucket(ns);
+            assert!(bucket >= previous, "monotonic at {ns}");
+            previous = bucket;
+            assert!(ns <= latency_upper(bucket));
+            if bucket > 0 {
+                assert!(ns > latency_upper(bucket - 1));
+            }
+            assert!(latency_upper(bucket) - ns <= ns / 8);
+        }
+        assert_eq!(latency_bucket(STAMP_MASK), LATENCY_BUCKETS - 1);
+        // A stamp taken just before the 48-bit wrap still yields the true delay.
+        let sent = STAMP_MASK - 99;
+        assert_eq!(
+            (sent + 1_000).wrapping_sub(sent & STAMP_MASK) & STAMP_MASK,
+            1_000
+        );
+        assert_eq!(
+            ((sent + 1_000) & STAMP_MASK).wrapping_sub(sent) & STAMP_MASK,
+            1_000
+        );
     }
 
     #[test]
@@ -665,8 +794,9 @@ mod tests {
                     let mut bytes = vec![0xa5; count * payload];
                     let mut storage = vec![0; MAX_BYTES];
                     for (sender, receiver) in senders.iter().zip(&mut receivers) {
+                        let sent_at = monotonic_ns().unwrap();
                         without_allocations(|| {
-                            fill(&mut bytes, payload, c.run, 0);
+                            fill(&mut bytes, payload, c.run, 0, sent_at);
                             sender.socket.send(&bytes).unwrap();
                             while receive(receiver, &mut storage, &c).unwrap() {}
                         });
@@ -678,31 +808,60 @@ mod tests {
                         if count > 1 {
                             assert!(receiver.gro > 0);
                         }
-                        consume(receiver, &bytes, payload, payload, c.run);
+                        // Stamped payloads give one sample each, under a second here.
+                        let stamped = payload >= STAMP_END;
+                        assert_eq!(
+                            receiver.latency.count,
+                            if stamped { count as u64 } else { 0 }
+                        );
+                        assert!(receiver.latency.max_ns < 1_000_000_000);
+                        let now = sent_at + 5_000;
+                        consume(receiver, &bytes, payload, payload, c.run, now);
                         assert_eq!(receiver.window.duplicates, count as u64);
+                        if stamped {
+                            assert_eq!(
+                                receiver.latency.counts[latency_bucket(5_000)],
+                                count as u64
+                            );
+                        }
                         if payload == 1472 && segments == 1 {
                             for i in 16..payload {
                                 bytes[i] ^= 1;
-                                consume(receiver, &bytes[..payload], payload, payload, c.run);
+                                consume(receiver, &bytes[..payload], payload, payload, c.run, now);
                                 bytes[i] ^= 1;
                             }
-                            assert_eq!(receiver.invalid, (payload - 16) as u64);
+                            // The stamp is not part of the checked pattern.
+                            assert_eq!(receiver.invalid, (payload - STAMP_END) as u64);
                             receiver.invalid = 0;
                         }
-                        consume(receiver, &bytes[..payload], payload, payload, c.run + 1);
+                        consume(
+                            receiver,
+                            &bytes[..payload],
+                            payload,
+                            payload,
+                            c.run + 1,
+                            now,
+                        );
                         assert_eq!(receiver.wrong_run, 1);
                         assert_eq!(receiver.first_wrong_run, c.run);
                         bytes[0] ^= 1;
-                        consume(receiver, &bytes[..payload], payload, payload, c.run);
-                        consume(receiver, &bytes[..payload - 1], payload - 1, payload, c.run);
-                        consume(receiver, &[], 0, payload, c.run);
+                        consume(receiver, &bytes[..payload], payload, payload, c.run, now);
+                        consume(
+                            receiver,
+                            &bytes[..payload - 1],
+                            payload - 1,
+                            payload,
+                            c.run,
+                            now,
+                        );
+                        consume(receiver, &[], 0, payload, c.run, now);
                         assert_eq!(receiver.invalid, 4);
                         if payload == 1472 && segments == 1 {
                             storage.resize(MAX_BYTES * 16, 0);
                             let calls = receiver.calls;
                             without_allocations(|| {
                                 for i in 0..3 {
-                                    fill(&mut bytes, payload, c.run, count as u64 + i);
+                                    fill(&mut bytes, payload, c.run, count as u64 + i, sent_at);
                                     let length = payload - usize::from(i == 1);
                                     sender.socket.send(&bytes[..length]).unwrap();
                                 }

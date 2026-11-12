@@ -48,6 +48,19 @@ subset with valid length, magic and payload but another run ID;
 `first_wrong_run` records the first such ID. Both `invalid` and `too_old`
 must be zero for an acceptance run.
 
+Payloads of at least 22 bytes carry their send time: the low 48 bits of the
+sender's `CLOCK_MONOTONIC` nanoseconds, read once per send call, in bytes
+16–21. Receivers subtract it, modulo 2^48, from the time of the receive call,
+so the delay includes waiting in the receiving socket, and sender and
+receiver must share a clock, as they do on one host. Each flow keeps a fixed
+histogram: exact below 8 ns, then eight buckets per power of two, so a value
+is reported at most an eighth above its true size. The JSON's `latency`
+object holds the sample count, sum, maximum and the non-empty buckets;
+`examples/sweep_report.rs` merges every receiver of a direction and reports
+p50, p99, p99.9 and the maximum in microseconds. 60-byte frames (18-byte
+payloads) carry no stamp. The payload magic is `UQL2`; a receiver counts
+packets from an older `UQL1` sender as invalid.
+
 The JSON output includes process CPU time, syscall counts, blocked sends,
 GRO messages, observed socket overflow and the actual receive-buffer limit.
 Per-flow `calls` counts send/receive syscalls; `poll_calls` counts readiness polls.
@@ -116,7 +129,9 @@ topology. Record per-worker input counts: a bridge alone does not guarantee
 that QinQ reaches several TAP readers.
 
 `OUTER_ROUTED=1` puts the daemons in separate network namespaces, joined
-through a private IPv6 router and 1500-byte veth links. The harness disables
+through a private IPv6 router and veth links whose MTU is the outer payload
+limit plus 48, at least 1500 bytes. `OUTER_PAYLOAD_LIMIT` accepts 1232–8952;
+loopback already carries the largest. The harness disables
 UDP segmentation on the endpoint links and GRO on the router links, so netem
 sees individual outer datagrams. It verifies the endpoint offload flags and
 records them. All links, routes, neighbors and forwarding settings belong to

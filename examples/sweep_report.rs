@@ -46,8 +46,51 @@ fn number(text: &str) -> Option<f64> {
     text[..end].parse().ok()
 }
 
+/// Latency histogram buckets; keep in sync with examples/udp_load.rs.
+const LATENCY_BUCKETS: usize = 46 * 8;
+
+/// Largest latency, in ns, a udp_load histogram bucket holds.
+fn latency_upper(bucket: usize) -> u64 {
+    if bucket < 8 {
+        return bucket as u64;
+    }
+    let exp = bucket / 8 + 2;
+    ((8 + bucket as u64 % 8) << (exp - 3)) + (1 << (exp - 3)) - 1
+}
+
+/// Adds a receiver's `"histogram":[[bucket,count],...]` to `counts`.
+fn merge_histogram(text: &str, counts: &mut [u64]) {
+    let Some((_, rest)) = text.split_once("\"histogram\":[") else {
+        return;
+    };
+    let body = rest.split_once("]]").map_or("", |(body, _)| body);
+    for pair in body.split('[') {
+        let mut values = pair.trim_end_matches([',', ']']).split(',');
+        if let (Some(Ok(bucket)), Some(Ok(count))) = (
+            values.next().map(str::parse::<usize>),
+            values.next().map(str::parse::<u64>),
+        ) && let Some(total) = counts.get_mut(bucket)
+        {
+            *total += count;
+        }
+    }
+}
+
+/// Upper bound, in µs, of the bucket holding quantile `q` of the samples.
+fn latency_quantile(counts: &[u64], q: f64) -> f64 {
+    let total: u64 = counts.iter().sum();
+    let target = (total as f64 * q).ceil().max(1.0) as u64;
+    let mut seen = 0;
+    for (bucket, &count) in counts.iter().enumerate() {
+        seen += count;
+        if seen >= target {
+            return latency_upper(bucket) as f64 / 1e3;
+        }
+    }
+    0.0
+}
+
 /// One direction's load files: client(-k).json and server(-k).json.
-#[derive(Default)]
 struct Direction {
     offered_gbps: f64,
     delivered_gbps: f64,
@@ -58,6 +101,25 @@ struct Direction {
     duplicates: f64,
     reordered: f64,
     flows: usize,
+    latency: [u64; LATENCY_BUCKETS],
+    latency_max_ns: f64,
+}
+impl Default for Direction {
+    fn default() -> Self {
+        Self {
+            offered_gbps: 0.0,
+            delivered_gbps: 0.0,
+            sent: 0.0,
+            unique: 0.0,
+            invalid: 0.0,
+            too_old: 0.0,
+            duplicates: 0.0,
+            reordered: 0.0,
+            flows: 0,
+            latency: [0; LATENCY_BUCKETS],
+            latency_max_ns: 0.0,
+        }
+    }
 }
 
 fn direction(point: &Path, client: &str, server: &str) -> Result<Direction> {
@@ -83,6 +145,11 @@ fn direction(point: &Path, client: &str, server: &str) -> Result<Direction> {
         let (flows, samples) = received
             .split_once("\"samples\":")
             .ok_or("missing samples")?;
+        // Older generators wrote no latency; their points report none.
+        if let Some((_, latency)) = samples.split_once("\"latency\":") {
+            merge_histogram(latency, &mut result.latency);
+            result.latency_max_ns = result.latency_max_ns.max(sum_key(latency, "max_ns"));
+        }
         result.unique += sum_key(flows, "unique");
         result.invalid += sum_key(flows, "invalid");
         result.too_old += sum_key(flows, "too_old");
@@ -237,6 +304,15 @@ fn point(path: &Path, build: &str, combo: &str, repeat: &str, index: &str) -> Re
         values.push((format!("{name}_too_old"), d.too_old));
         values.push((format!("{name}_duplicates"), d.duplicates));
         values.push((format!("{name}_reordered"), d.reordered));
+        if d.latency.iter().any(|&count| count != 0) {
+            for (label, q) in [("p50", 0.5), ("p99", 0.99), ("p999", 0.999)] {
+                values.push((
+                    format!("{name}_latency_{label}_us"),
+                    latency_quantile(&d.latency, q),
+                ));
+            }
+            values.push((format!("{name}_latency_max_us"), d.latency_max_ns / 1e3));
+        }
     }
     let cpu = cpu(path)?;
     let busiest = busiest_thread(path)?;
@@ -357,4 +433,28 @@ fn main() -> Result<()> {
     }
     println!("]}}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latency_histograms_merge_and_give_bucket_quantiles() {
+        let mut counts = [0; LATENCY_BUCKETS];
+        merge_histogram(
+            "{\"count\":4,\"max_ns\":9,\"histogram\":[[3,2],[100,1]]}",
+            &mut counts,
+        );
+        merge_histogram("\"histogram\":[[100,1],[999,5]]}", &mut counts);
+        merge_histogram("\"histogram\":[]}", &mut counts);
+        assert_eq!((counts[3], counts[100]), (2, 2));
+        assert_eq!(counts.iter().sum::<u64>(), 4);
+        assert_eq!(latency_quantile(&counts, 0.5), 0.003);
+        assert_eq!(
+            latency_quantile(&counts, 0.99),
+            latency_upper(100) as f64 / 1e3
+        );
+        assert_eq!(latency_quantile(&[0; LATENCY_BUCKETS], 0.5), 0.0);
+    }
 }
