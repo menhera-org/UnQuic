@@ -239,7 +239,12 @@ direction now delivers less at 5G than at 2G; the plateau holds. The price
 is 7% of 2G L→R (the 2G total rises 2%). A 32-buffer margin
 ([patch](benches/owner-reserve-32-rejected.patch),
 [results](benches/decision-four-flows-owner-reserve-32.json)) raised the
-5G total by 35% too but took 25% from 2G L→R, so 16 was kept. Its landing
+5G total by 35% too but took 25% from 2G L→R, so 16 was kept. Two more
+alternating pairs after landing
+([results](benches/decision-four-flows-owner-reserve-repeat.json)) repeat
+it: 5G totals of 3.33 and 3.37 Gbit/s against 2.37 and 2.40, and 2G L→R of
+1.18–1.20 against 1.19–1.35, so over four pairs the 5G total is 3.25–3.37
+against 2.29–2.40. Its landing
 bar, also stated beforehand, required no cost elsewhere, in one container
 with alternating pairs ([results](benches/owner-reserve-side-effects.json)):
 
