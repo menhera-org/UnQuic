@@ -22,3 +22,11 @@ def/r1 L>R=4.64 R>L=4.79 total=9.43 cpu_L=431% cpu_R=514% cpu_per_gbps=100.2% re
 aln/r1 L>R=5.05 R>L=6.18 total=11.23 cpu_L=516% cpu_R=506% cpu_per_gbps=91.0% reorder=0/7
 def/r2 L>R=5.12 R>L=4.50 total=9.62 cpu_L=440% cpu_R=509% cpu_per_gbps=98.7% reorder=14/1
 aln/r2 L>R=4.88 R>L=6.34 total=11.22 cpu_L=494% cpu_R=536% cpu_per_gbps=91.8% reorder=0/1
+
+Decision workload per-thread CPU over the 5G point (percent of a core, worker threads by thread ID; the first two are setup threads, then the left daemon workers, then the right):
+def r1 0 0 89 77 93 94 84 88 85 98 
+def r2 0 0 80 92 87 99 90 77 94 98 
+def r3 0 0 85 92 87 99 90 78 96 98 
+aln r1 0 0 97 51 65 97 88 59 89 95 
+aln r2 0 0 91 97 56 62 70 90 98 97 
+aln r3 0 0 97 60 66 88 61 98 87 98 
