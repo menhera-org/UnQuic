@@ -1,0 +1,21 @@
+Trace build (7108623 tree) of the loopback overload check, eight workers, 21G point, balance_flows false (hash) vs true (bal), one run each, November 12. trace_report counts, pacing, sender-state and controller shares per daemon:
+== hash left
+"counts":{"admit_owner_frames":621,"expire_input":1859,"expire_partial":11,"expire_sent":4824,"expire_unsent":1384,"losses":6700}
+"mean_pacing_gbps":17.1182
+"window":{"worker":{"held":0.8318,"queued":0.0010,"phase":0.0000,"pacing":0.0545,"burst":0.0000,"window":0.0082
+"controller":{"startup":0.0000,"drain":0.0000,"down":0.0055,"cruise":0.8591,"refill":0.0136,"up":0.1119,"probe_rtt":0.0099}
+== hash right
+"counts":{"admit_owner_frames":6119,"expire_input":28352,"expire_partial":415,"expire_sent":111588,"expire_unsent":130313,"losses":71337}
+"mean_pacing_gbps":11.8621
+"window":{"worker":{"held":0.4447,"queued":0.0009,"phase":0.0000,"pacing":0.2741,"burst":0.0000,"window":0.1616
+"controller":{"startup":0.0000,"drain":0.0000,"down":0.4391,"cruise":0.4288,"refill":0.0127,"up":0.1094,"probe_rtt":0.0099}
+== bal left
+"counts":{"admit_owner_frames":4097,"expire_input":13963,"expire_partial":739,"expire_sent":467682,"expire_unsent":155520,"losses":16081}
+"mean_pacing_gbps":16.2186
+"window":{"worker":{"held":0.3146,"queued":0.0009,"phase":0.0000,"pacing":0.1965,"burst":0.0000,"window":0.3686
+"controller":{"startup":0.0000,"drain":0.0000,"down":0.4400,"cruise":0.3982,"refill":0.0115,"up":0.1389,"probe_rtt":0.0114}
+== bal right
+"counts":{"admit_owner_frames":4403,"expire_input":10536,"expire_partial":1092,"expire_sent":385239,"expire_unsent":191703,"losses":15090}
+"mean_pacing_gbps":17.3696
+"window":{"worker":{"held":0.3348,"queued":0.0009,"phase":0.0000,"pacing":0.1900,"burst":0.0000,"window":0.3520
+"controller":{"startup":0.0000,"drain":0.0000,"down":0.3732,"cruise":0.4850,"refill":0.0136,"up":0.1181,"probe_rtt":0.0101}

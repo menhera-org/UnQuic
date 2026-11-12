@@ -459,9 +459,16 @@ balanced lanes in both arms, a 50 ms floor
 ([patch](benches/frame-lifetime-floor-50-exploratory.patch), stated
 beforehand as needing 5% more at 21G, one pair,
 [results](benches/loopback-balanced-lifetime-floor-50.json)) delivers 10.59
-Gbit/s against 10.67 with 20 ms. The expiries are a symptom of whatever
-slows the spread-out workers; turn length and ACK delay remain to be
-measured. A production version needs tests,
+Gbit/s against 10.67 with 20 ms. The expiries are a symptom. A `trace` run
+of each arm at the 21G point
+([counts](benches/loopback-balance-flows-trace.txt)) shows the cause: with
+balanced lanes the senders wait on the congestion window 35–37% of the
+point (hash lanes: 1% left, 16% right) and BBR spends 37–44% in
+ProbeBW_DOWN, while 385,000–468,000 sent frames reach their lifetime
+unacknowledged and only 15,000–16,000 packets are declared lost. In-flight
+space fills with packets that are never acknowledged, so the window, not
+CPU, holds balanced lanes back on this check. Why their ACKs never arrive
+is the next question for lane placement. A production version needs tests,
 a memory charge for the table and the full bars before it can land.
 
 ## Whether the single QinQ reader limits the loopback check (November 11)
