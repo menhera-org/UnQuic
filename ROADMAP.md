@@ -87,6 +87,31 @@ marking and caused admission drops; the fixed version still lost 0.19% of
 one direction in one run, above its bar, so it stays off
 ([BENCH.md](BENCH.md#holding-idle-lanes-for-a-second-datagram-november-12)).
 
+`udp_load` now measures one-way delay. It found frames reaching receivers
+seconds late under overload: a worker owning a busy lane stopped reading its
+own TAP while other readers' frames filled its input queue. Gating reads only
+on the worker's own inputs cut 5G p99.9 from 0.1–0.4 s to 30–66 ms
+([BENCH.md](BENCH.md#frames-seconds-old-under-overload-november-12)). Most
+remaining overload delay is the kernel's TAP ring; README recommends 64
+entries.
+
+Decisions only the user can make, each blocking a remaining goal:
+
+1. FEC for the 5% loss row only helps if packets it recovers are
+   acknowledged as received, which hides their loss from congestion control,
+   congestion losses included. Is that acceptable, and if so, under what
+   limit?
+2. Should the daemon set a short transmit queue (for example 64 entries) on
+   the TAPs it creates, or leave it to the operator as now?
+3. The 20 Gbit/s gate is limited locally by the container's 416 KiB receive
+   buffers, which this host cannot raise and a root deployment does not
+   have. Is a measurement on a host with more CPUs and larger buffers
+   available, or should the gate be judged on the 9000-byte path?
+4. Carried over: the real-path test needs sudo through the endpoint account,
+   which conflicts with this host's no-networking-changes rule; balanced
+   lanes and the 256 MiB `memory_limit` default (which refuses sixteen
+   workers) remain undecided.
+
 ## November 11 checkpoint
 
 The loopback overload check was window-limited, not CPU-limited. BBR sized
