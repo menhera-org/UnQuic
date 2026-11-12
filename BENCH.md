@@ -302,7 +302,11 @@ owner's cycles into sender service 16% (per-frame ACK and recovery
 bookkeeping), sends 15%, TAP reads 12%, TAP writes 12%, packet processing
 7%, queue draining 5%, expansion 4%, buffer returns 3% and waiting 15%.
 Refusing handoffs costs it only a percent or two, so the lever left is the
-per-frame cost itself.
+per-frame cost itself. With the transmit split diagnostic applied, the
+`sendmmsg` calls alone take 18–21% of both owners' cycles, the send after
+each claim 8%, staging ACKs 4–6% and receive admission 4–5%: about half the
+owner's time is syscalls (sends, TAP reads and writes, socket receives),
+whose kernel side here includes the emulated routed path.
 
 The overloaded delay the margin raised is mostly the TAP ring again. On the
 decision workload at 5G, sixteen flows, `3b9e86f`, two alternating pairs
