@@ -191,6 +191,32 @@ their own thread, are also the ones that must read the ACKs for L→R. The
 total across both directions falls from about 3.0 Gbit/s at 2G to 2.3 at
 5G, so the plateau gate fails for four flows.
 
+### Balanced lanes on the decision workload, revisited
+
+Four flows hash onto two of the four lanes in each direction, so two
+workers carry each direction's transmit work. `daemon.balance_flows`
+(off by default; round-robin lanes per new flow) spreads them over all four.
+Stated beforehand: if the decline comes from that concentration, balanced
+lanes keep 5G delivery each way at or above the 2G level. `3178088`, 1 GiB
+`memory_limit`, two alternating pairs per flow count
+([four flows](benches/decision-balance-flows-four.json),
+[sixteen](benches/decision-balance-flows-sixteen.json)):
+
+| Flows, offered | Hash lanes L→R / R→L Gbit/s | Balanced lanes L→R / R→L Gbit/s |
+| --- | --- | --- |
+| 4, 2G | 1.30–1.32 / 1.61–1.72 | 1.47–1.93 / 1.94 |
+| 4, 5G | 0.92 / 1.27–1.32 | 1.90 / 1.59–1.77 |
+| 16, 2G | 1.59–1.68 / 1.68–1.70 | 1.76–1.91 / 1.81–1.93 |
+| 16, 5G | 2.03–2.09 / 1.61–1.66 | 1.70–2.00 / 1.81–1.85 |
+
+With four flows balanced lanes double 5G L→R and lift the 5G total from
+2.2–2.3 to 3.5–3.7 Gbit/s; 5G no longer delivers less than 2G, so the
+plateau holds. With sixteen flows they raise 2G by 10–15% and leave the 5G
+total about level (3.55–3.81 against 3.69–3.70) while moving capacity from
+L→R to R→L. On November 11 balanced lanes cost the loopback overload check
+and the directions hash lanes favoured up to 14%, which is why the switch is
+off; the decision belongs to the user (ROADMAP).
+
 ## Whether the single QinQ reader limits the loopback check (November 11)
 
 On both sides of the loopback check every TAP read lands on one worker, and

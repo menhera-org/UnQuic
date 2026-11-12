@@ -136,6 +136,9 @@ send in bursts with 700 µs gaps while refusing inputs for lack of exchange
 buffers, and doubling the buffers changes nothing. Finding what the owners
 wait for is the next overload item
 ([BENCH.md](BENCH.md#why-four-flows-lose-lr-delivery-past-2g-open)).
+Balanced lanes avoid the decline: spreading four flows over all four lanes
+doubles 5G L→R, so the decline needs two flows sharing a worker's lane
+(decision 5 below).
 
 Decisions only the user can make, each blocking a remaining goal:
 
@@ -153,10 +156,16 @@ Decisions only the user can make, each blocking a remaining goal:
    delivered bit at 0.5 Gbit/s and no longer shows a loss of its own, but it
    adds about 33 µs to the median one-way delay and 0.2 ms at p99 for light
    traffic.
-5. Carried over: the real-path test needs sudo through the endpoint account,
-   which conflicts with this host's no-networking-changes rule; balanced
-   lanes and the 256 MiB `memory_limit` default (which refuses sixteen
-   workers) remain undecided.
+5. Should `daemon.balance_flows` be on by default? On the decision workload
+   it keeps four flows from collapsing at 5G (L→R 1.90 instead of 0.92
+   Gbit/s, total 3.5–3.7 instead of 2.2–2.3) and lifts sixteen flows at 2G
+   by 10–15%, but on November 11 it cost the loopback overload check and the
+   directions hash lanes favoured up to 14%
+   ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
+6. Carried over: the real-path test needs sudo through the endpoint account,
+   which conflicts with this host's no-networking-changes rule; the 256 MiB
+   `memory_limit` default (which refuses sixteen workers) remains
+   undecided.
 
 ## November 11 checkpoint
 
