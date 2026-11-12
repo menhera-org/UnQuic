@@ -270,7 +270,11 @@ holds in total, not yet in each direction.
 TCP through the tunnel (loopback, eight workers, eight streams each way,
 two alternating pairs, [runs](benches/tcp-owner-reserve.txt)) is unchanged:
 9.66 and 9.43 Gbit/s with the margin against 9.47 and 9.41, at 98% of a core
-per Gbit/s in both. Balanced lanes, below, rescue the same four-flow point
+per Gbit/s in both. The loopback check at sixteen workers per daemon with
+thirty-two flows, the gate configuration (two alternating pairs,
+[results](benches/loopback-sixteen-workers-owner-reserve.json)), is
+unchanged too: 14.33 and 14.58 Gbit/s in total at 21G against 14.49 and
+14.54. Balanced lanes, below, rescue the same four-flow point
 by a different route.
 
 ### Balanced lanes on the decision workload, revisited
