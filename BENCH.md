@@ -101,7 +101,7 @@ others keep earlier evidence. L→R / R→L pairs are simultaneous.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98% | One left worker does two jobs: it reads every L→R frame from the TAP (QinQ input all lands on one queue) and receives the R→L lanes it owns. L→R senders idle for its input; its socket overflows and R→L loses packets, so BBR cuts. More receive buffers move capacity from L→R to R→L (+11% total, L→R −14%); letting tun spread reads costs 23% more CPU per bit ([BENCH.md](#receive-buffers-for-a-busy-reader-november-11)). Next: keep receive work off the TAP reader, or split TAP reading inside the daemon. |
+| At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98%. With sixteen workers per daemon and thirty-two flows: 7.11 / 7.03 Gbit/s, no thread above 75%, limited by receive-socket overflow under the container's 416 KiB buffer ([BENCH.md](#sixteen-workers-per-daemon-november-11-exploratory)) | One left worker does two jobs: it reads every L→R frame from the TAP (QinQ input all lands on one queue) and receives the R→L lanes it owns. L→R senders idle for its input; its socket overflows and R→L loses packets, so BBR cuts. More receive buffers move capacity from L→R to R→L (+11% total, L→R −14%); letting tun spread reads costs 23% more CPU per bit ([BENCH.md](#receive-buffers-for-a-busy-reader-november-11)). Next: keep receive work off the TAP reader, or split TAP reading inside the daemon. |
 | Goodput must plateau under excess traffic | Decision workload (four workers, 4.5 ms): sixteen flows deliver 1.4–2.1 Gbit/s per direction at 5G offered without collapse; workers run at 79–99% of a core | Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
 | Small-frame overload must remain efficient | Earlier pre-recovery tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input and output offloads improve matched TCP sweeps; single-stream output coalescing reaches 2.01 / 2.26 Gbit/s, still below the deployment target. |
@@ -405,6 +405,20 @@ two generator processes per direction and a 1 GiB `memory_limit` (the
 | 16 / one | 6.53 | 6.13 | 12.66 | 724% / 734% | 76% / 81% |
 | 8 / QinQ | 4.71 | 6.05 | 10.76 | 446% / 517% | 64% / 91% |
 | 16 / QinQ | 8.16 | 6.70 | 14.85 | 713% / 711% | 76% / 81% |
+
+A follow-up on November 12 repeats the QinQ and one-tag cases at eight and
+sixteen workers, three interleaved repeats each, current build, to give the
+gaps table medians and ranges instead of single runs (no candidate, no bar).
+[Results](benches/tap-sixteen-workers.json), 21G point:
+
+| Workers / tags | L→R Gbit/s | R→L Gbit/s | CPU left | Busiest thread left |
+| --- | --- | --- | --- | --- |
+| 8 / QinQ | 4.40 (4.34–4.53) | 5.94 (5.74–5.95) | 431% | 62% |
+| 16 / QinQ | 7.11 (6.90–7.19) | 7.03 (5.85–7.08) | 687% | 75% |
+| 8 / one | 4.79 (4.71–4.92) | 4.10 (4.02–4.32) | 529% | 83% |
+| 16 / one | 6.33 (6.14–6.33) | 6.19 (6.09–6.33) | 728% | 78% |
+
+Sixteen workers raise the total 36% with QinQ and 40% with one tag.
 
 Doubling the workers raises the total by 36–38%, and no thread saturates,
 even with every QinQ read on one worker. A trace of the 16-worker QinQ case
