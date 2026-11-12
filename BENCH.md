@@ -96,8 +96,12 @@ comparison below.
 
 ## Current performance gaps
 
-Updated November 11; the first two rows and the last two are current, the
-others keep earlier evidence. L→R / R→L pairs are simultaneous.
+Updated November 12; the first two rows and the last two are current, the
+others keep earlier evidence. L→R / R→L pairs are simultaneous. Run-to-run
+noise is large: identical binaries differ by up to 7.5% in loopback total and
+up to 18% in one direction (A/A, November 12), so single differences of a few
+percent mean nothing. Efficiency changes are judged by CPU per delivered
+Gbit/s at an offer-limited load instead.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
