@@ -211,6 +211,8 @@ impl Reactor {
                 tv_nsec: value.subsec_nanos().into(),
             },
         };
+        #[cfg(feature = "profile")]
+        let started = crate::profile::now();
         // SAFETY: spec is initialized; the old value is not requested.
         cvt(unsafe {
             libc::timerfd_settime(
@@ -220,6 +222,8 @@ impl Reactor {
                 std::ptr::null_mut(),
             )
         })?;
+        #[cfg(feature = "profile")]
+        crate::profile::syscall(1, started, 1);
         self.deadline = deadline;
         Ok(())
     }
@@ -1238,13 +1242,15 @@ impl Worker {
             } else {
                 self.retry_due = None;
             }
-            self.reactor.arm(deadline)?;
+            let mut block = should_block(more || immediate, deadline, now);
+            if block {
+                self.reactor.arm(deadline)?;
+            }
             #[cfg(feature = "profile")]
             {
                 self.phases[21] =
                     self.phases[21].wrapping_add(crate::profile::now().wrapping_sub(arming));
             }
-            let mut block = !(more || immediate);
             if block {
                 self.reactor.wake.sleep();
                 // Work queued before the flag was visible got no wake; take it now.
@@ -4701,6 +4707,14 @@ impl Worker {
 
         Some(due.max(now))
     }
+}
+
+/// Whether a turn may block in epoll and therefore needs its timer armed.
+///
+/// Pending work, or a deadline already due at the turn's start, runs on the
+/// next turn without a timer round trip; the timer only matters while blocked.
+fn should_block(pending: bool, deadline: Option<Duration>, now: Duration) -> bool {
+    !pending && deadline.is_none_or(|due| due > now)
 }
 
 fn advance_overflow(previous: &mut u32, total: u32) -> u64 {
@@ -8502,6 +8516,21 @@ mod tests {
             workers[1].sessions[1].rx_totals[0].rx_outer_bytes,
             146 + 130
         );
+    }
+
+    #[test]
+    fn turns_block_only_without_pending_work_or_a_due_deadline() {
+        let now = Duration::from_millis(10);
+        assert!(should_block(false, None, now));
+        assert!(should_block(
+            false,
+            Some(now + Duration::from_nanos(1)),
+            now
+        ));
+        assert!(!should_block(false, Some(now), now));
+        assert!(!should_block(false, Some(Duration::ZERO), now));
+        assert!(!should_block(true, None, now));
+        assert!(!should_block(true, Some(now + Duration::from_secs(1)), now));
     }
 
     #[test]

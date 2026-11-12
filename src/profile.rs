@@ -66,9 +66,9 @@ pub fn now() -> u64 {
 pub static ADMISSION: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// Per-process syscall totals: cycles, calls and items for sendmmsg.
-pub static SYSCALLS: [[std::sync::atomic::AtomicU64; 3]; 1] =
-    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 1];
+/// Per-process syscall totals: cycles, calls and items for sendmmsg, then timerfd_settime.
+pub static SYSCALLS: [[std::sync::atomic::AtomicU64; 3]; 2] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 2];
 
 /// Adds one call of syscall `kind` that started at `started` and moved `items`.
 pub fn syscall(kind: usize, started: u64, items: usize) {
@@ -91,8 +91,12 @@ pub fn report(worker: usize, phases: &[u64; PHASES]) {
     let sendmmsg = SYSCALLS[0]
         .each_ref()
         .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
+    let timer = SYSCALLS[1]
+        .each_ref()
+        .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
     let mut line = format!(
-        "unquic: profile worker {worker} admission inputs/buffers/frames/bytes {admission:?} sendmmsg cycles/calls/datagrams {sendmmsg:?} cycles {total}"
+        "unquic: profile worker {worker} admission inputs/buffers/frames/bytes {admission:?} sendmmsg cycles/calls/datagrams {sendmmsg:?} timerfd_settime cycles/calls {:?} cycles {total}",
+        &timer[..2]
     );
     for index in order.into_iter().filter(|&index| phases[index] != 0) {
         line.push_str(&format!(

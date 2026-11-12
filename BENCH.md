@@ -506,6 +506,12 @@ delivered Gbit/s at 4G is lower in at least seven pairs with a median of
 −1% or better, while the 21G total's median paired change is no worse than
 −2%, and both kernel suites pass.
 
+[The fresh pairs](benches/tap-arm-only-blocking-cpu.json) (image
+`ae7d77ba9538`): CPU per delivered Gbit/s at 4G is lower in seven of eight
+pairs, median −2.0% (−5.2% to +0.3%), against the A/A's 5 of 8 and −0.5%. The
+21G total's median paired change is +2.3%. Both kernel suites pass. The
+change lands, with its blocking decision moved into a tested function.
+
 ## Sixteen workers per daemon (November 11, exploratory)
 
 The harness now accepts `WORKERS=16`. One run each, current build, 21G
