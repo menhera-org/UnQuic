@@ -107,7 +107,7 @@ Gbit/s at an offer-limited load instead.
 | --- | --- | --- |
 | At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98%. With sixteen workers per daemon and thirty-two flows: 7.11 / 7.03 Gbit/s, no thread above 75%, limited by receive-socket overflow under the container's 416 KiB buffer ([BENCH.md](#sixteen-workers-per-daemon-november-11-exploratory)) | One left worker does two jobs: it reads every L→R frame from the TAP (QinQ input all lands on one queue) and receives the R→L lanes it owns. L→R senders idle for its input; its socket overflows and R→L loses packets, so BBR cuts. More receive buffers move capacity from L→R to R→L (+11% total, L→R −14%); letting tun spread reads costs 23% more CPU per bit ([BENCH.md](#receive-buffers-for-a-busy-reader-november-11)). Next: keep receive work off the TAP reader, or split TAP reading inside the daemon. |
 | Goodput must plateau under excess traffic | Decision workload (four workers, 4.5 ms): sixteen flows deliver 1.4–2.1 Gbit/s per direction at 5G offered without collapse; workers run at 79–99% of a core | Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
-| Small-frame overload must remain efficient | Untagged 64-byte frames, sixteen flows, current build: 3.24–3.43 / 3.27–3.48 M frames/s unlimited with eight workers and 4.23–4.53 / 4.16–4.57 M with sixteen, against 5.87 / 5.74 M for the pre-recovery build; QinQ 128-byte frames 2.18–2.31 / 3.32–3.53 M; 1.85–1.95 cores per M frames/s against 1.28–1.33 ([BENCH.md](#small-frame-rows-at-the-current-build-november-12)) | About 45% more CPU per frame since recovery and BBR, and one to one and a half of eight workers per daemon idle because tun's queue hash leaves them no transmit work; balanced lanes do not change this. High ingress loss persists; mixed traffic and non-coalescible frames remain unverified. |
+| Small-frame overload must remain efficient | Untagged 64-byte frames, sixteen flows, current build: 3.24–3.43 / 3.27–3.48 M frames/s unlimited with eight workers and 4.23–4.53 / 4.16–4.57 M with sixteen, against 5.87 / 5.74 M for the pre-recovery build; QinQ 128-byte frames 2.18–2.31 / 3.32–3.53 M; 1.85–1.95 cores per M frames/s against 1.28–1.33 ([BENCH.md](#small-frame-rows-at-the-current-build-november-12)) | About 45% more CPU per frame since recovery and BBR, spread across transmit bookkeeping with no single large target; four candidates cut 0–3% and none cleared its bar ([BENCH.md](#where-the-small-frame-cost-comes-from-november-12)). One to one and a half of eight workers per daemon idle because tun's queue hash leaves them no transmit work; balanced lanes do not change this. High ingress loss persists; mixed traffic and non-coalescible frames remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input and output offloads improve matched TCP sweeps; single-stream output coalescing reaches 2.01 / 2.26 Gbit/s, still below the deployment target. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
@@ -759,6 +759,113 @@ saturation signal from outside the read path, such as how often a read
 finds data at once or the reader's share of busy cycles, with a counter
 showing how often it fires. Patch daemon SHA-256:
 `2ddd8c4ad993888a094bd797c820c315594443a230421b52ccbafc9069451401`.
+
+## Where the small-frame cost comes from (November 12)
+
+The small-frame rows above cost about 45% more CPU per frame than the
+pre-recovery build. These runs locate that cost and test four ways to cut it.
+All use untagged 64-byte frames, sixteen flows, eight workers and one
+container, with cores per M frames/s computed from both daemons' CPU over both
+directions' frames.
+
+### Cost history
+
+Eleven builds from `640adda` (the November 5 build behind the 5.87 / 5.74 M
+row) to `acef86d`, each at 40M and unlimited, two repeats, the second in
+reverse order ([results](benches/tap-small-frames-history.json)). The
+expectation written beforehand was a step at `c999431`, where sender
+histories and pacing grants enter the worker, and another at `d9867fa`,
+where payloads are retained until ACK. Unlimited point:
+
+| Build | Change | Total M frames/s | Cores per M frames/s |
+| --- | --- | --- | --- |
+| `640adda` | before recovery | 9.89–10.02 | 1.34–1.36 |
+| `8ac7608` | ACK and sent histories | 9.59–9.64 | 1.39–1.42 |
+| `c3e31cf` | pacing flight prefixes | 9.41–9.44 | 1.45–1.46 |
+| `c999431` to `d4d45f1` | sender, retention, shared budget | 0.75–1.69 | not comparable |
+| `0a1e1f4` | November 10 | 4.84–4.87 | 2.40–2.43 |
+| `acef86d` | current | 6.46–6.85 | 1.88–1.98 |
+
+The gap is real in today's harness, not drift: `640adda` still delivers
+about 1.5 times as many frames at 70% of the CPU per frame. About 8% of
+the cost arrived before the sender. The builds from `c999431` to `d4d45f1`
+are paced far below saturation (0.01–0.15 Gbit/s per direction), so their
+cost per frame says nothing about the per-frame work, and bisecting inside
+that range cannot help. Daemon SHA-256 values are in the JSON hashes file of
+each run; the eleven builds were rebuilt from their commits.
+
+### Phase cycles per frame
+
+The phase profiler was ported to `640adda`
+([patch](benches/profile-640adda-diagnostic.patch)), and HEAD's profile build
+gained nested phases inside the transmit path
+([patch](benches/profile-transmit-split-diagnostic.patch)). One unlimited run
+each, same container ([profiles](benches/tap-small-frames-cost-profile.txt)),
+cycles per frame for both daemons together at the 2.0 GHz timestamp rate:
+
+| Phase | `640adda` | HEAD |
+| --- | ---: | ---: |
+| Transmit: `flush_frames` and `service_sender` | 760 | 1,383 |
+| Transmit: `drain_tap_inputs` | 292 | 342 |
+| Transmit: `read_tap` | 156 | 134 |
+| Receive: `drain_packets` | 992 | 700 |
+| Receive: `flush_taps` | 158 | 322 |
+| Receive: `read_socket` | 128 | 143 |
+| Loop overhead | about 40 | about 200 |
+| Busy total | 2,541 | 3,255 |
+
+The receive side costs about the same; the growth is on the transmit side.
+Of HEAD's transmit cycles, `sendmmsg` takes about 560 per frame (kernel work,
+including the receiving veth), releasing ACKed frames 280, staging ACKs 180,
+and reserving, settling and planning pieces about 215 together.
+
+### Four candidates, none landed
+
+Each candidate ran against HEAD in alternating pairs, three repeats, at the
+64-byte 40M and unlimited points and a 1514-byte unlimited guard. Bars were
+written before each run. Change in cores per M frames/s, HEAD to candidate:
+
+| Candidate | Unlimited, per pair | Unlimited median | 40M median | 1514-byte median total | Bar | Decision |
+| --- | --- | --- | --- | --- | --- | --- |
+| [Frame layout](benches/frame-layout-rejected.patch) | −4.9, −2.2, −0.1% | −2.2% | +0.9% | 9.71 → 9.80 Gbit/s | all lower, median ≥5% | rejected |
+| [Release without the cleanup queue](benches/hot-release-rejected.patch) | −1.8, +0.4, +1.0% | +0.4% | 0.0% | 9.80 → 9.77 Gbit/s | all lower, median ≥4% | rejected |
+| [Expiry heap](benches/expiry-heap-rejected.patch) | −3.2, −5.6, −1.9% | −3.2% | −3.0% | 10.05 → 10.16 Gbit/s | all lower, median ≥4% | missed |
+| [Heap and coverage order](benches/compact-frame-state-rejected.patch) | −5.3, −2.1, −0.4% | −2.1% | −5.7% | 9.84 → 9.85 Gbit/s | all lower, median ≥4% | missed |
+
+Results: [layout](benches/tap-small-frames-layout.json),
+[release](benches/tap-small-frames-hot-release.json),
+[heap](benches/tap-small-frames-expiry-heap.json),
+[heap and order](benches/tap-small-frames-compact.json).
+
+- The frame layout patch keeps each expiry deadline inside the heap, puts
+  `FrameRecovery`'s counters before its 3.4 KB coverage array, and asks for
+  huge pages on the large stores. Its profile build moved `sub_cleanup` from
+  5.8% to 4.5% of worker cycles and `drain_tap_inputs` down 0.5 points,
+  which matches the small end-to-end change.
+- Releasing a fully ACKed frame at once, instead of queueing it for cleanup,
+  rests on a wrong guess that the cost was cache misses on cold frames. The
+  profile shows the cost moved, not removed: `sub_cleanup` fell from 5.9% to
+  zero and `sub_stage` rose from 3.7% to 9.4%.
+- A release-path split then put about 185 cycles per frame inside
+  `Store::release`, mostly the expiry heap: releases remove the oldest frame,
+  so the newest entry sinks about ten levels past near-equal deadlines. The
+  heap candidate stores nanosecond keys inline and picks the smaller child
+  without a branch. Its profile pair confirms part of the mechanism
+  (`sub_cleanup` 5.85% to 4.54%, `drain_tap_inputs` 7.14% to 6.66%), and it
+  raised unlimited delivery 2.2–6.6%, but its median missed the bar.
+- Adding the counter-first `FrameRecovery` layout to the heap, decided as a
+  last recombination before the run, missed by more.
+
+Over the heap and combined runs, all twelve paired 64-byte points moved
+toward lower cost per frame. The effect is real but 2–3%, below what three
+pairs can confirm against this point's noise. The remaining per-frame cost is
+spread across many small steps of the recovery path, with no single large
+target left. Daemon SHA-256: layout
+`b381a5da7bee7b181ddc05cf86d73fb652ba808bdd6f008f0398b7ad950115f6`, release
+`1ad69a4ee79b9d4f622200647b150765cbf05108b1cce700ee386f8610613b85`, heap
+`9a8a5a0deffa0125a762c7d943615cee5f8ab8e248356179dc5a4375c9336f22`, heap and
+order `3b7fa971c64bdb14e2ad71f1e5e91cfcc7a2931d2434633372a2a9180c9a4e24`,
+`640adda` `79b1225b561254ef27cc3edb495951b6d07ef031b1c869c36cb0bcdc3c1e8979`.
 
 ## Sixteen workers per daemon (November 11, exploratory)
 

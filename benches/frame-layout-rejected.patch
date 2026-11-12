@@ -1,0 +1,209 @@
+diff --git a/src/ack/journal.rs b/src/ack/journal.rs
+index 4c80d81..6de46b4 100644
+--- a/src/ack/journal.rs
++++ b/src/ack/journal.rs
+@@ -282,6 +282,7 @@ fn filled<T: Clone>(length: usize, value: T) -> io::Result<Vec<T>> {
+     values
+         .try_reserve_exact(length)
+         .map_err(|_| io::ErrorKind::OutOfMemory)?;
++    crate::sys::advise_huge_pages(&values);
+     values.resize(length, value);
+     Ok(values)
+ }
+diff --git a/src/loss/repair.rs b/src/loss/repair.rs
+index e8445b6..eb06a6a 100644
+--- a/src/loss/repair.rs
++++ b/src/loss/repair.rs
+@@ -43,11 +43,13 @@ impl Word {
+ /// Selection does not reserve bytes: serialize plans and submission results per
+ /// frame, and never submit overlapping plans for the same repair generation.
+ /// A frame's original deadline still applies, even when no repair is eligible.
++// The counters come first so a small frame's state shares one cache line.
++#[repr(C)]
+ pub struct FrameRecovery {
+-    words: [Word; WORDS],
+     length: u16,
+     sent: u16,
+     unacked: u16,
++    words: [Word; WORDS],
+ }
+ 
+ impl FrameRecovery {
+diff --git a/src/sys.rs b/src/sys.rs
+index 647fd55..6636ec2 100644
+--- a/src/sys.rs
++++ b/src/sys.rs
+@@ -22,6 +22,32 @@ pub(crate) fn udp_socket() -> io::Result<OwnedFd> {
+     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+ }
+ 
++/// Asks for transparent huge pages over a vector's whole capacity; call before
++/// filling it. Advisory only: failure or a non-Linux system keeps ordinary pages.
++pub(crate) fn advise_huge_pages<T>(memory: &Vec<T>) {
++    #[cfg(target_os = "linux")]
++    {
++        const HUGE: usize = 2 * 1024 * 1024;
++        let start = memory.as_ptr() as usize;
++        let end = start.saturating_add(memory.capacity().saturating_mul(size_of::<T>()));
++        let first = start.next_multiple_of(HUGE);
++        let last = end & !(HUGE - 1);
++        if last > first {
++            // SAFETY: the range lies inside the vector's own allocation; the advice
++            // changes no contents and no mapping.
++            unsafe {
++                libc::madvise(
++                    first as *mut libc::c_void,
++                    last - first,
++                    libc::MADV_HUGEPAGE,
++                );
++            }
++        }
++    }
++    #[cfg(not(target_os = "linux"))]
++    let _ = memory;
++}
++
+ pub(crate) fn invalid(message: &'static str) -> io::Error {
+     io::Error::new(io::ErrorKind::InvalidInput, message)
+ }
+diff --git a/src/worker/frames.rs b/src/worker/frames.rs
+index d685ee0..9274556 100644
+--- a/src/worker/frames.rs
++++ b/src/worker/frames.rs
+@@ -201,7 +201,8 @@ pub(super) struct Store {
+     recovery: Vec<FrameRecovery>,
+     free_frames: Vec<usize>,
+     links: Vec<Link>,
+-    expiry: Vec<u16>,
++    // Deadlines live in the heap so sifting never touches frame records.
++    expiry: Vec<(Duration, u16)>,
+     expiry_position: Vec<u16>,
+ }
+ 
+@@ -213,7 +214,8 @@ impl Store {
+                     + size_of::<FrameRecovery>()
+                     + size_of::<usize>()
+                     + size_of::<Link>()
+-                    + 2 * size_of::<u16>())
++                    + size_of::<(Duration, u16)>()
++                    + size_of::<u16>())
+     }
+ 
+     pub fn new(capacity: usize) -> io::Result<Self> {
+@@ -224,14 +226,21 @@ impl Store {
+         recovery
+             .try_reserve_exact(capacity)
+             .map_err(io::Error::other)?;
++        crate::sys::advise_huge_pages(&recovery);
+         for _ in 0..capacity {
+             recovery.push(FrameRecovery::new(14).ok_or(io::ErrorKind::InvalidData)?);
+         }
+         let sources = BUFFERS;
++        let mut frames = Vec::new();
++        frames
++            .try_reserve_exact(capacity)
++            .map_err(io::Error::other)?;
++        crate::sys::advise_huge_pages(&frames);
++        frames.extend(std::iter::repeat_with(|| None).take(capacity));
+         Ok(Self {
+             sources: std::iter::repeat_with(|| None).take(sources).collect(),
+             free_sources: (0..sources).rev().collect(),
+-            frames: std::iter::repeat_with(|| None).take(capacity).collect(),
++            frames,
+             recovery,
+             free_frames: (0..capacity).rev().collect(),
+             links: vec![Link::EMPTY; capacity],
+@@ -309,9 +318,9 @@ impl Store {
+         }
+         source.references = references;
+         self.free_frames.pop();
+-        *slot = Some(frame);
+         self.expiry_position[index] = self.expiry.len() as u16;
+-        self.expiry.push(index as u16);
++        self.expiry.push((frame.deadline, index as u16));
++        *slot = Some(frame);
+         self.sift_expiry(self.expiry.len() - 1);
+         Some(index)
+     }
+@@ -371,8 +380,7 @@ impl Store {
+     }
+ 
+     pub fn deadline(&self) -> Option<Duration> {
+-        self.frame(usize::from(*self.expiry.first()?))
+-            .map(|frame| frame.deadline)
++        self.expiry.first().map(|&(deadline, _)| deadline)
+     }
+ 
+     /// Removes one due frame from the heap, leaving payload/ready ownership intact.
+@@ -380,7 +388,7 @@ impl Store {
+         if self.deadline().is_none_or(|deadline| deadline > now) {
+             return Ok(None);
+         }
+-        let index = usize::from(self.expiry[0]);
++        let index = usize::from(self.expiry[0].1);
+         self.untrack_expiry(index)?;
+         Ok(Some(index))
+     }
+@@ -390,17 +398,13 @@ impl Store {
+     }
+ 
+     fn expiry_before(&self, a: usize, b: usize) -> bool {
+-        let key = |position| {
+-            let index = self.expiry[position];
+-            self.frame(usize::from(index)).map(|frame| frame.deadline)
+-        };
+-        key(a) < key(b)
++        self.expiry[a].0 < self.expiry[b].0
+     }
+ 
+     fn swap_expiry(&mut self, a: usize, b: usize) {
+         self.expiry.swap(a, b);
+-        self.expiry_position[usize::from(self.expiry[a])] = a as u16;
+-        self.expiry_position[usize::from(self.expiry[b])] = b as u16;
++        self.expiry_position[usize::from(self.expiry[a].1)] = a as u16;
++        self.expiry_position[usize::from(self.expiry[b].1)] = b as u16;
+     }
+ 
+     // At most 13 levels, including out-of-order cross-worker admissions.
+@@ -438,7 +442,7 @@ impl Store {
+         if position == END {
+             return Ok(());
+         }
+-        if self.expiry.get(position).copied() != Some(index as u16) {
++        if self.expiry.get(position).map(|&(_, slot)| slot) != Some(index as u16) {
+             return Err(io::Error::other("invalid transmit expiry position"));
+         }
+         self.swap_expiry(position, self.expiry.len() - 1);
+@@ -455,6 +459,7 @@ impl Store {
+         self.frame_mut(index).unwrap().deadline = deadline;
+         let position = usize::from(self.expiry_position[index]);
+         assert!(position < self.expiry.len());
++        self.expiry[position].0 = deadline;
+         self.sift_expiry(position);
+     }
+ 
+@@ -589,7 +594,8 @@ mod tests {
+             + size_of::<FrameRecovery>()
+             + size_of::<usize>()
+             + size_of::<Link>()
+-            + 2 * size_of::<u16>();
++            + size_of::<(Duration, u16)>()
++            + size_of::<u16>();
+         for capacity in [1, 17, CAPACITY] {
+             assert_eq!(
+                 Store::storage_bytes(capacity) - Store::storage_bytes(0),
+@@ -759,11 +765,13 @@ mod tests {
+         expected.sort_unstable();
+         assert_eq!(store.deadline(), expected.first().map(|entry| entry.0));
+         assert_eq!(store.expiry.len(), expected.len());
+-        for (position, &index) in store.expiry.iter().enumerate() {
++        for (position, &(deadline, index)) in store.expiry.iter().enumerate() {
+             assert_eq!(
+                 usize::from(store.expiry_position[usize::from(index)]),
+                 position
+             );
++            // The inline key must match the frame it orders.
++            assert_eq!(store.frame(usize::from(index)).unwrap().deadline, deadline);
+             if position != 0 {
+                 assert!(!store.expiry_before(position, (position - 1) / 2));
+             }

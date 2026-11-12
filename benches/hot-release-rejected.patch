@@ -1,0 +1,97 @@
+diff --git a/src/worker/recovery.rs b/src/worker/recovery.rs
+index 6d6bc4b..5eaf55d 100644
+--- a/src/worker/recovery.rs
++++ b/src/worker/recovery.rs
+@@ -130,6 +130,7 @@ impl Worker {
+         } else if self.recovery.place(index)? != Place::Cleanup {
+             let (session, lane) = self.frame_owner(index)?;
+             let frame = self.frames.frame(index).ok_or(io::ErrorKind::InvalidData)?;
++            let id = frame.id;
+             let sent = self
+                 .frames
+                 .recovery(index)
+@@ -141,6 +142,17 @@ impl Worker {
+                 .ok_or(io::ErrorKind::InvalidData)?;
+             self.release_unsent(session, lane, unsent)?;
+             self.recovery.set(index, Place::Cleanup)?;
++            // No mapping names this frame (the usual state after its last ACK):
++            // release it now, while it is still in cache, instead of queueing it.
++            if self.recovery.journal.frame_empty(index, id) {
++                *self
++                    .recovery
++                    .slots
++                    .get_mut(index)
++                    .ok_or(io::ErrorKind::InvalidData)? = Slot::default();
++                self.release_frame_storage(index);
++                return Ok(());
++            }
+             if self.recovery.cleanup.len() == self.recovery.cleanup.capacity() {
+                 return Err(io::ErrorKind::InvalidData.into());
+             }
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index 2ae1f26..8e352c4 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -1591,6 +1591,62 @@ fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
+     );
+ }
+ 
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn fully_acknowledged_frames_skip_the_cleanup_queue() {
++    let (mut workers, _rx) = workers();
++    let worker = &mut workers[1];
++    for _ in 0..4 {
++        queue_frame(worker, 60);
++    }
++    let slots: Vec<_> = worker.sessions[0].batches[1]
++        .as_ref()
++        .unwrap()
++        .pending
++        .iter(&worker.frames)
++        .collect();
++    let mut pieces = [crate::ack::FramePiece::default(); 4];
++    for (piece, &index) in pieces.iter_mut().zip(&slots) {
++        let frame = worker.frames.frame(index).unwrap();
++        *piece = crate::ack::FramePiece {
++            frame_slot: index as u16,
++            frame_id: frame.id,
++            start: 0,
++            end: 60,
++            attempt: 0,
++        };
++        submit_original(worker, index, 0..60);
++    }
++    assert!(worker.recovery.journal.reserve_packet(0, &pieces));
++    let mut report = worker.sender.report.take().unwrap();
++    report.kind = ReportKind::Ack {
++        received: Duration::from_millis(2),
++        delay_us: 0,
++        first: true,
++        end: None,
++    };
++    assert_eq!(worker.sender.records.take().unwrap().get(), 1);
++    report.count = 1;
++    report.entries[0] = Entry {
++        number: 1,
++        sample: NonZeroU16::new(1),
++        settled: true,
++        ..Entry::default()
++    };
++    worker.recovery.staged = Some(report);
++    assert!(!worker.stage_recovery().unwrap());
++    // The ACK removed each frame's only mapping, so staging released them directly.
++    assert_eq!(worker.counters.recovery_cleanup_peak, 0);
++    assert!(!worker.recovery.has_cleanup());
++    assert!(
++        slots
++            .iter()
++            .all(|&slot| worker.frames.frame(slot).is_none())
++    );
++    assert_eq!(worker.sessions[0].tx_retained, 0);
++    assert!(worker.recovery.journal.packet_empty(0));
++}
++
+ #[test]
+ #[ignore = "kernel descriptor test; run in a disposable container"]
+ fn lost_original_repairs_only_missing_bytes_and_late_ack_cancels_prepared_repair() {

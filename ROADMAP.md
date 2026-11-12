@@ -56,6 +56,15 @@ unfragmented UDP keeps a lane owned by the worker that read it, and
 Dropping that locality spreads paced traffic (+15–19%) but loses 18–20%
 under overload, so it was rejected.
 
+The per-frame cost is on the transmit side. Profiling both builds puts HEAD
+at about 3,250 busy cycles per frame against 2,540, with the receive side
+level and the transmit side about 620 cycles higher: `sendmmsg`, releasing
+ACKed frames, staging ACKs and reserving pieces. Four candidates cut 0–3%
+each (a cheaper expiry heap, a tighter frame layout, releasing frames
+without the cleanup queue), and none cleared its bar
+([BENCH.md](BENCH.md#where-the-small-frame-cost-comes-from-november-12)).
+No single large target remains in the per-frame path.
+
 ## November 11 checkpoint
 
 The loopback overload check was window-limited, not CPU-limited. BBR sized
@@ -310,7 +319,23 @@ rules apply to all of them.
    both measured points already overload the readers (20–28% missing at
    40M), so such a signal would fire at both, and the no-locality run
    already shows that regime losing 18–20% unlimited. The per-frame cost
-   (about 45% above the pre-recovery build) is the better target.
+   (about 45% above the pre-recovery build) was the better target, and it
+   turned out to be spread thin. A cost history shows 8% arriving before
+   the sender and the rest with sender and recovery, where intermediate
+   builds are paced too low to compare. Phase profiles of both builds put
+   the growth in transmit bookkeeping: releasing ACKed frames (about 280
+   cycles per frame), staging ACKs (180) and reserving and settling pieces
+   (215). Four candidates were tested against written bars: a frame
+   layout, releasing ACKed frames without the cleanup queue (which only
+   moved the cost), an expiry heap with inline keys and branchless sifting,
+   and that heap with a counter-first coverage layout. The heap lowered
+   cost per frame in all six of its pairs and raised unlimited delivery
+   2–7%, but no candidate's median reached its 3–5% bar
+   ([BENCH.md](BENCH.md#where-the-small-frame-cost-comes-from-november-12)).
+   Whether a consistent 2–3% win should land under a lower bar is the
+   user's call. A larger lever is giving one worker several TAP queues, so
+   tun's hash leaves no worker idle; today `queue_count` also sets the
+   worker count.
    One small-frame flow reaches 0.61–0.67 M frames/s, limited by one
    thread. 60-byte frames match 64-byte ones; 128-byte frames are lossless
    at 0.92 M frames/s paced, and unlimited R→L trails L→R by a quarter to a

@@ -1,0 +1,176 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 321c4bf..c110965 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -17,6 +17,7 @@ toml = { version = "1.1.8", default-features = false, features = ["parse", "serd
+ uuid = { version = "1.29.0", default-features = false, optional = true }
+ 
+ [features]
++profile = []
+ dns = ["dep:iphost"]
+ uuid-compat = ["dep:uuid"]
+ bin = ["dns", "dep:serde", "dep:toml", "iphost/serde"]
+diff --git a/src/lib.rs b/src/lib.rs
+index 0a4503c..1792004 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,6 +20,8 @@ pub mod counters;
+ pub mod dns;
+ pub mod handshake;
+ pub mod mac;
++#[cfg(feature = "profile")]
++pub mod profile;
+ pub mod pack;
+ pub mod reassembly;
+ pub mod runtime;
+diff --git a/src/worker.rs b/src/worker.rs
+index 33d1abd..0dfeb1e 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -544,6 +544,8 @@ pub(crate) struct Worker {
+     counters: Snapshot,
+     setup_due: Duration,
+     retry_due: Option<Duration>,
++    #[cfg(feature = "profile")]
++    phases: [u64; crate::profile::PHASES],
+ }
+ 
+ impl Worker {
+@@ -762,6 +764,8 @@ impl Worker {
+             counters,
+             setup_due: Duration::ZERO,
+             retry_due: None,
++            #[cfg(feature = "profile")]
++            phases: [0; crate::profile::PHASES],
+             shared,
+         })
+     }
+@@ -794,40 +798,57 @@ impl Worker {
+         let mut event_start = 0;
+         let mut publish_due = Duration::ZERO;
+         let mut publish_turns = 0_u8;
++        macro_rules! phase {
++            ($phase:expr, $e:expr) => {{
++                #[cfg(feature = "profile")]
++                let started = crate::profile::now();
++                let result = $e;
++                #[cfg(feature = "profile")]
++                {
++                    self.phases[$phase] = self.phases[$phase]
++                        .wrapping_add(crate::profile::now().wrapping_sub(started));
++                }
++                result
++            }};
++        }
+         while !self.control.quitting() {
+             let now = monotonic_now()?;
+-            let mut more = self.drain_queues(now)?;
+-            self.flush_returns();
++            let mut more = phase!(0, self.drain_queues(now))?;
++            phase!(11, self.flush_returns());
+             if now >= self.setup_due {
+-                self.setup(now)?;
++                phase!(1, self.setup(now))?;
+             }
+-            more |= self.distribute_receivers();
+-            self.addresses(now)?;
+-            self.progress_barriers(now)?;
+-            self.timers(now)?;
+-            more |= self.drain_packets(now)?;
+-            more |= self.drain_tap_inputs(now)?;
+-            self.flush_frames(now)?;
+-            self.flush_taps(now)?;
+-            self.flush_notifications()?;
+-            more |= self
+-                .pending
+-                .iter()
+-                .map(|b| (b.session, b.lane))
+-                .chain(self.ready.iter().copied())
+-                .any(|(session, lane)| {
+-                    !self.transmit[self.shared.config.peer_for_session(session).unwrap()].paths
+-                        [self.sessions[session].path]
+-                        .lanes[lane]
+-                        .blocked
+-                });
+-            self.receive_interest(more)?;
++            more |= phase!(2, self.distribute_receivers());
++            phase!(3, self.addresses(now))?;
++            phase!(5, self.progress_barriers(now))?;
++            phase!(6, self.timers(now))?;
++            more |= phase!(8, self.drain_packets(now))?;
++            more |= phase!(9, self.drain_tap_inputs(now))?;
++            phase!(10, self.flush_frames(now))?;
++            phase!(13, self.flush_taps(now))?;
++            phase!(17, self.flush_notifications())?;
++            more |= phase!(
++                18,
++                self.pending
++                    .iter()
++                    .map(|b| (b.session, b.lane))
++                    .chain(self.ready.iter().copied())
++                    .any(|(session, lane)| {
++                        !self.transmit[self.shared.config.peer_for_session(session).unwrap()].paths
++                            [self.sessions[session].path]
++                            .lanes[lane]
++                            .blocked
++                    })
++            );
++            phase!(19, self.receive_interest(more))?;
+             publish_turns = publish_turns.wrapping_add(1);
+             if now >= publish_due || publish_turns == 0 {
+-                self.publish_counters();
++                phase!(20, self.publish_counters());
+                 publish_due = now + Duration::from_millis(1);
+                 publish_turns = 0;
+             }
++            #[cfg(feature = "profile")]
++            let arming = crate::profile::now();
+             let mut deadline = self.deadline(now);
+             if self.has_backpressure() {
+                 let due = self.retry_due.get_or_insert(now + RETRY);
+@@ -839,10 +860,17 @@ impl Worker {
+                 self.retry_due = None;
+             }
+             self.reactor.arm(deadline)?;
+-            let count = match self
+-                .reactor
+-                .wait(&mut events, if more || immediate { 0 } else { -1 })
++            #[cfg(feature = "profile")]
+             {
++                self.phases[21] =
++                    self.phases[21].wrapping_add(crate::profile::now().wrapping_sub(arming));
++            }
++            let block = !(more || immediate);
++            let count = match phase!(
++                if block { 22 } else { 27 },
++                self.reactor
++                    .wait(&mut events, if block { -1 } else { 0 })
++            ) {
+                 Ok(count) => count,
+                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                 Err(error) => return Err(error),
+@@ -860,7 +888,7 @@ impl Worker {
+                             self.sessions[session].tap_blocked = false;
+                         }
+                         if event.events & libc::EPOLLIN as u32 != 0 {
+-                            self.read_tap(session, now)?;
++                            phase!(23, self.read_tap(session, now))?;
+                         }
+                     }
+                     2 => {
+@@ -873,11 +901,13 @@ impl Worker {
+                             tx.blocked = false;
+                         }
+                     }
+-                    _ if token >= 2 => self.read_socket(token as usize - 2, now)?,
+-                    _ => self.reactor.drain(token)?,
++                    _ if token >= 2 => phase!(25, self.read_socket(token as usize - 2, now))?,
++                    _ => phase!(26, self.reactor.drain(token))?,
+                 }
+             }
+         }
++        #[cfg(feature = "profile")]
++        crate::profile::report(self.id, &self.phases);
+         self.publish_counters();
+         Ok(())
+     }

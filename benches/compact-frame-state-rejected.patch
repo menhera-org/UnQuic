@@ -1,0 +1,211 @@
+diff --git a/src/loss/repair.rs b/src/loss/repair.rs
+index e8445b6..eb06a6a 100644
+--- a/src/loss/repair.rs
++++ b/src/loss/repair.rs
+@@ -43,11 +43,13 @@ impl Word {
+ /// Selection does not reserve bytes: serialize plans and submission results per
+ /// frame, and never submit overlapping plans for the same repair generation.
+ /// A frame's original deadline still applies, even when no repair is eligible.
++// The counters come first so a small frame's state shares one cache line.
++#[repr(C)]
+ pub struct FrameRecovery {
+-    words: [Word; WORDS],
+     length: u16,
+     sent: u16,
+     unacked: u16,
++    words: [Word; WORDS],
+ }
+ 
+ impl FrameRecovery {
+diff --git a/src/worker/frames.rs b/src/worker/frames.rs
+index d685ee0..4e0db98 100644
+--- a/src/worker/frames.rs
++++ b/src/worker/frames.rs
+@@ -201,10 +201,16 @@ pub(super) struct Store {
+     recovery: Vec<FrameRecovery>,
+     free_frames: Vec<usize>,
+     links: Vec<Link>,
+-    expiry: Vec<u16>,
++    // Min-heap of (deadline key, frame slot); keys live here so sifts stay in one array.
++    expiry: Vec<(u64, u16)>,
+     expiry_position: Vec<u16>,
+ }
+ 
++/// Heap key: nanoseconds, saturating; only deadlines centuries away share a key.
++fn expiry_key(deadline: Duration) -> u64 {
++    u64::try_from(deadline.as_nanos()).unwrap_or(u64::MAX)
++}
++
+ impl Store {
+     pub const fn storage_bytes(capacity: usize) -> usize {
+         BUFFERS * (size_of::<Option<Source>>() + size_of::<usize>())
+@@ -213,7 +219,8 @@ impl Store {
+                     + size_of::<FrameRecovery>()
+                     + size_of::<usize>()
+                     + size_of::<Link>()
+-                    + 2 * size_of::<u16>())
++                    + size_of::<(u64, u16)>()
++                    + size_of::<u16>())
+     }
+ 
+     pub fn new(capacity: usize) -> io::Result<Self> {
+@@ -309,9 +316,9 @@ impl Store {
+         }
+         source.references = references;
+         self.free_frames.pop();
+-        *slot = Some(frame);
+         self.expiry_position[index] = self.expiry.len() as u16;
+-        self.expiry.push(index as u16);
++        self.expiry.push((expiry_key(frame.deadline), index as u16));
++        *slot = Some(frame);
+         self.sift_expiry(self.expiry.len() - 1);
+         Some(index)
+     }
+@@ -371,7 +378,7 @@ impl Store {
+     }
+ 
+     pub fn deadline(&self) -> Option<Duration> {
+-        self.frame(usize::from(*self.expiry.first()?))
++        self.frame(usize::from(self.expiry.first()?.1))
+             .map(|frame| frame.deadline)
+     }
+ 
+@@ -380,7 +387,7 @@ impl Store {
+         if self.deadline().is_none_or(|deadline| deadline > now) {
+             return Ok(None);
+         }
+-        let index = usize::from(self.expiry[0]);
++        let index = usize::from(self.expiry[0].1);
+         self.untrack_expiry(index)?;
+         Ok(Some(index))
+     }
+@@ -389,45 +396,52 @@ impl Store {
+         queue.remove(&mut self.links, index)
+     }
+ 
++    #[cfg(test)]
+     fn expiry_before(&self, a: usize, b: usize) -> bool {
+-        let key = |position| {
+-            let index = self.expiry[position];
+-            self.frame(usize::from(index)).map(|frame| frame.deadline)
+-        };
+-        key(a) < key(b)
++        self.expiry[a].0 < self.expiry[b].0
+     }
+ 
+-    fn swap_expiry(&mut self, a: usize, b: usize) {
+-        self.expiry.swap(a, b);
+-        self.expiry_position[usize::from(self.expiry[a])] = a as u16;
+-        self.expiry_position[usize::from(self.expiry[b])] = b as u16;
++    fn place_expiry(&mut self, position: usize, entry: (u64, u16)) {
++        self.expiry[position] = entry;
++        self.expiry_position[usize::from(entry.1)] = position as u16;
+     }
+ 
+-    // At most 13 levels, including out-of-order cross-worker admissions.
++    // At most 13 levels, including out-of-order cross-worker admissions. The moved
++    // entry waits in a hole; the smaller child is chosen without a branch, since
++    // FIFO releases sink the newest deadline from the root past near-equal pairs.
+     fn sift_expiry(&mut self, mut position: usize) {
++        let Some(&entry) = self.expiry.get(position) else {
++            return;
++        };
+         let start = position;
+         while position != 0 {
+             let parent = (position - 1) / 2;
+-            if !self.expiry_before(position, parent) {
++            let above = self.expiry[parent];
++            if entry.0 >= above.0 {
+                 break;
+             }
+-            self.swap_expiry(position, parent);
++            self.place_expiry(position, above);
+             position = parent;
+         }
+-        if position != start {
+-            return;
+-        }
+-        while position * 2 + 1 < self.expiry.len() {
+-            let mut child = position * 2 + 1;
+-            if child + 1 < self.expiry.len() && self.expiry_before(child + 1, child) {
+-                child += 1;
++        if position == start {
++            let len = self.expiry.len();
++            loop {
++                let mut child = position * 2 + 1;
++                if child >= len {
++                    break;
++                }
++                if child + 1 < len {
++                    child += usize::from(self.expiry[child + 1].0 < self.expiry[child].0);
++                }
++                let below = self.expiry[child];
++                if below.0 >= entry.0 {
++                    break;
++                }
++                self.place_expiry(position, below);
++                position = child;
+             }
+-            if !self.expiry_before(child, position) {
+-                break;
+-            }
+-            self.swap_expiry(position, child);
+-            position = child;
+         }
++        self.place_expiry(position, entry);
+     }
+ 
+     fn untrack_expiry(&mut self, index: usize) -> io::Result<()> {
+@@ -438,13 +452,13 @@ impl Store {
+         if position == END {
+             return Ok(());
+         }
+-        if self.expiry.get(position).copied() != Some(index as u16) {
++        if self.expiry.get(position).map(|&(_, slot)| slot) != Some(index as u16) {
+             return Err(io::Error::other("invalid transmit expiry position"));
+         }
+-        self.swap_expiry(position, self.expiry.len() - 1);
+-        self.expiry.pop();
++        let last = self.expiry.pop().ok_or(io::ErrorKind::InvalidData)?;
+         self.expiry_position[index] = END as u16;
+         if position < self.expiry.len() {
++            self.place_expiry(position, last);
+             self.sift_expiry(position);
+         }
+         Ok(())
+@@ -455,6 +469,7 @@ impl Store {
+         self.frame_mut(index).unwrap().deadline = deadline;
+         let position = usize::from(self.expiry_position[index]);
+         assert!(position < self.expiry.len());
++        self.expiry[position].0 = expiry_key(deadline);
+         self.sift_expiry(position);
+     }
+ 
+@@ -589,7 +604,8 @@ mod tests {
+             + size_of::<FrameRecovery>()
+             + size_of::<usize>()
+             + size_of::<Link>()
+-            + 2 * size_of::<u16>();
++            + size_of::<(u64, u16)>()
++            + size_of::<u16>();
+         for capacity in [1, 17, CAPACITY] {
+             assert_eq!(
+                 Store::storage_bytes(capacity) - Store::storage_bytes(0),
+@@ -759,11 +775,16 @@ mod tests {
+         expected.sort_unstable();
+         assert_eq!(store.deadline(), expected.first().map(|entry| entry.0));
+         assert_eq!(store.expiry.len(), expected.len());
+-        for (position, &index) in store.expiry.iter().enumerate() {
++        for (position, &(key, index)) in store.expiry.iter().enumerate() {
+             assert_eq!(
+                 usize::from(store.expiry_position[usize::from(index)]),
+                 position
+             );
++            // The inline key must match the frame it orders.
++            assert_eq!(
++                expiry_key(store.frame(usize::from(index)).unwrap().deadline),
++                key
++            );
+             if position != 0 {
+                 assert!(!store.expiry_before(position, (position - 1) / 2));
+             }
