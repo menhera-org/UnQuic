@@ -1,0 +1,60 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index 5d02f2d..9f34e08 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -3631,7 +3631,10 @@ impl Worker {
+         for session in 0..self.sessions.len() {
+             let readable = self.tap_capacity(session) != 0;
+             let mut writable = false;
+-            for slot in 0..LANES {
++            let mut occupied = self.sessions[session].rx_occupied;
++            while occupied != 0 {
++                let slot = occupied.trailing_zeros() as usize;
++                occupied &= occupied - 1;
+                 let local = &mut self.sessions[session];
+                 let Some(lane) = &mut local.rx[slot] else {
+                     continue;
+@@ -3661,10 +3664,19 @@ impl Worker {
+                 self.refresh_rx_counters(session, slot);
+             }
+             let local = &mut self.sessions[session];
+-            local.totals.reassembly_frames =
+-                local.rx_totals.iter().map(|s| s.reassembly_frames).sum();
+-            local.totals.reassembly_bytes =
+-                local.rx_totals.iter().map(|s| s.reassembly_bytes).sum();
++            // Empty slots hold default totals: removing a lane resets its slot's.
++            let (mut frames, mut bytes) = (0, 0);
++            let mut occupied = local.rx_occupied;
++            while occupied != 0 {
++                let slot = occupied.trailing_zeros() as usize;
++                occupied &= occupied - 1;
++                if let Some(totals) = local.rx_totals.get(slot) {
++                    frames += totals.reassembly_frames;
++                    bytes += totals.reassembly_bytes;
++                }
++            }
++            local.totals.reassembly_frames = frames;
++            local.totals.reassembly_bytes = bytes;
+             if !writable {
+                 local.tap_blocked = false;
+             }
+@@ -4695,12 +4707,13 @@ impl Worker {
+                     due = due.min(input.deadline);
+                 }
+             }
+-            for (slot, lane) in session
+-                .rx
+-                .iter()
+-                .enumerate()
+-                .filter_map(|(slot, lane)| lane.as_ref().map(|lane| (slot, lane)))
+-            {
++            let mut occupied = session.rx_occupied;
++            while occupied != 0 {
++                let slot = occupied.trailing_zeros() as usize;
++                occupied &= occupied - 1;
++                let Some(Some(lane)) = session.rx.get(slot) else {
++                    continue;
++                };
+                 if !self.feedback_free.is_empty()
+                     && session.ack_inflight & (1 << slot) == 0
+                     && session.returning & (1 << slot) == 0

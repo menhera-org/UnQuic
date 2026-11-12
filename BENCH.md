@@ -377,6 +377,15 @@ with CPU per delivered Gbit/s lower in at least five and a median of −2% or
 better, four alternating loopback pairs with the 21G total's median no worse
 than −2%, and both kernel suites.
 
+[Six light-load pairs](benches/tap-occupied-flush-light.json): lower in four
+of six, median −2.4%; [loopback](benches/tap-occupied-flush-loop.json)
+median +1.3%. Four of six misses the bar, so the follow-up is
+[rejected](benches/occupied-flush-and-deadline-rejected.patch). The pairs
+show an order effect: with the candidate first it used 4.5–6.2% less, and
+with it second between 1.4% less and 1.7% more. Alternating order keeps the
+median fair, but a sign test over six pairs cannot separate a gain of a
+couple of percent from it.
+
 ## A configurable loss threshold for random loss (November 12)
 
 At 5% random loss draft 07 delivers under 11% of a 0.5G offer: any loss
