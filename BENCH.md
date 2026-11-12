@@ -178,6 +178,19 @@ question is what the owners wait for between bursts while inputs are being
 refused, and whether the expired sent frames are lost ACKs (the left
 sockets' overflows) or lost data.
 
+If the left sockets drop the ACKs for L→R because receive work waits for
+buffers, a larger receive reserve should help. Thirty-two receive buffers
+per worker at the 5G point, two alternating pairs
+([results](benches/decision-four-flows-receive-buffers-32.json)), do not:
+L→R falls to 0.84–0.90 Gbit/s (`3178088`: 0.92–0.96) while R→L rises to
+1.75–1.82 (1.34–1.55), and the left sockets overflow 22,000–28,000 times in
+both arms. As on November 11, more receive buffers move capacity from L→R to
+R→L. The two directions compete on the left daemon's workers: those that
+write R→L frames into the TAP, carrying each through the inner stack on
+their own thread, are also the ones that must read the ACKs for L→R. The
+total across both directions falls from about 3.0 Gbit/s at 2G to 2.3 at
+5G, so the plateau gate fails for four flows.
+
 ## Whether the single QinQ reader limits the loopback check (November 11)
 
 On both sides of the loopback check every TAP read lands on one worker, and

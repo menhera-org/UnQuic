@@ -32,3 +32,9 @@ worker 2 reason=4 drops=629090 free=7.7 rx_retained=1.3 tap_inputs=2.1 tx_retain
 worker 2 reason=5 drops=35880 free=21.8 rx_retained=3.1 tap_inputs=0.0 tx_retained=2046
 worker 3 reason=4 drops=2649753 free=5.6 rx_retained=3.4 tap_inputs=0.6 tx_retained=724
 worker 3 reason=5 drops=3501 free=27.1 rx_retained=4.8 tap_inputs=0.0 tx_retained=2046
+
+Thirty-two receive buffers per worker (benches/receive-buffers-32-rejected.patch) at the four-flow 5G point, HEAD 3178088 (base) vs candidate, two alternating pairs; per daemon: socket overflows, repairs, expired sent frames, admission drops (before to after):
+base r1 left overflow=24628 repairs=2398 expired_sent=2272780 admission=6649320 |right overflow=430 repairs=202298 expired_sent=43802 admission=2774366 |
+base r2 left overflow=23060 repairs=4046 expired_sent=2012508 admission=7854228 |right overflow=594 repairs=199516 expired_sent=29730 admission=3357650 |
+cand r1 left overflow=27546 repairs=1390 expired_sent=1487534 admission=8416454 |right overflow=140 repairs=250350 expired_sent=79756 admission=3662154 |
+cand r2 left overflow=22496 repairs=958 expired_sent=1869604 admission=7884234 |right overflow=218 repairs=191228 expired_sent=60478 admission=3737190 |
