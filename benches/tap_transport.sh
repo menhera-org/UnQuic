@@ -11,7 +11,10 @@ for number in "$3" "$4"; do
     [ "$number" -ge 1 ] && [ "$number" -le 60 ] || exit 2
 done
 case "${OUTER_PAYLOAD_LIMIT:-1232}" in ''|*[!0-9]*) exit 2;; esac
-[ "${OUTER_PAYLOAD_LIMIT:-1232}" -ge 1232 ] && [ "${OUTER_PAYLOAD_LIMIT:-1232}" -le 1452 ] || exit 2
+[ "${OUTER_PAYLOAD_LIMIT:-1232}" -ge 1232 ] && [ "${OUTER_PAYLOAD_LIMIT:-1232}" -le 8952 ] || exit 2
+# Routed veths carry the largest configured outer packet; loopback already does.
+outer_mtu=$((${OUTER_PAYLOAD_LIMIT:-1232} + 48))
+[ "$outer_mtu" -ge 1500 ] || outer_mtu=1500
 case "${TAP_TXQUEUELEN:-10000}" in ''|*[!0-9]*) exit 2;; esac
 [ "${TAP_TXQUEUELEN:-10000}" -ge 1 ] && [ "${TAP_TXQUEUELEN:-10000}" -le 10000 ] || exit 2
 for number in "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" "${OUTER_LOSS_BURST:-1}" "${OUTER_REORDER_PERMILLE:-0}" "${OUTER_RATE_MBIT:-0}" "${OUTER_QUEUE_PACKETS:-8192}"; do
@@ -169,10 +172,10 @@ if [ "${OUTER_ROUTED:-0}" = 1 ]; then
         if [ "$side" = left ]; then n=1; peer=2; else n=2; peer=1; fi
         ip netns add "uq-out-$side"
         ip link add "uq-r-$side" type veth peer name uq-path netns "uq-out-$side"
-        ip link set "uq-r-$side" address "02:77:ff:00:0$n:02" mtu 1500 up
+        ip link set "uq-r-$side" address "02:77:ff:00:0$n:02" mtu "$outer_mtu" up
         ip -6 addr add "fd77:ff:$n::2/64" dev "uq-r-$side" nodad
         netip "uq-out-$side" link set lo up
-        netip "uq-out-$side" link set uq-path address "02:77:ff:00:0$n:01" mtu 1500 up
+        netip "uq-out-$side" link set uq-path address "02:77:ff:00:0$n:01" mtu "$outer_mtu" up
         netip "uq-out-$side" -6 addr add "fd77:ff:$n::1/64" dev uq-path nodad
         netip "uq-out-$side" -6 route add "fd77:ff:$peer::/64" via "fd77:ff:$n::2"
         netip "uq-out-$side" -6 neigh add "fd77:ff:$n::2" lladdr "02:77:ff:00:0$n:02" nud permanent dev uq-path

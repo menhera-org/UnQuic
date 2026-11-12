@@ -36,6 +36,14 @@ competing TCP flow's share unchanged, but it costs 3% at 1% loss, so the
 default stays. A trace places the remaining 5% limit in BBR's long-term
 bound, which makes that row a job for FEC.
 
+A 9000-byte outer path nearly halves the per-bit cost. On the loopback check
+at an 8952-byte payload limit the 21G total rises 70–126% (24–29 Gbit/s
+over both directions; one direction reaches 18.4 Gbit/s) at 34–45% less CPU
+per bit, and eight workers do as well as sixteen
+([BENCH.md](BENCH.md#a-9000-byte-outer-path-on-the-loopback-check-november-12)).
+No configuration gives 20 each way, and no thread saturates; reordering and
+socket overflows rise instead. The 1500-byte NGN path cannot use this.
+
 The local 20 Gbit/s gate remains open: with sixteen workers per daemon the
 loopback check reaches 7.11 / 7.03 Gbit/s with no thread above 75%, limited
 by receive-socket overflow under the container's 416 KiB receive buffer, and
@@ -283,6 +291,12 @@ rules apply to all of them.
    15% each and `stage_recovery` 3%, so the per-frame I/O path is the general
    target and the journal's per-packet bookkeeping a loopback-rate one
    ([BENCH.md](BENCH.md#receive-buffers-for-a-busy-reader-november-11)).
+   A 9000-byte outer path does the halving where the path allows it: the
+   loopback check reaches 24–29 Gbit/s in total at 46–61% of a core per
+   Gbit/s, up to 18.4 Gbit/s in one direction, with no thread saturated
+   ([BENCH.md](BENCH.md#a-9000-byte-outer-path-on-the-loopback-check-november-12)).
+   Next on that path: find what holds the weaker direction back when CPU
+   does not, starting from the reordering and socket overflows.
    Waking only sleeping workers removed most of the 5–6% spent writing
    eventfds and landed: +2.5% on the loopback total, +0.9% median on the
    decision workload
