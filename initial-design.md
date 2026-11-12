@@ -738,7 +738,11 @@ If a comparison already reaches the available underlay ceiling, report that fact
 
 # 15 Implementation stages
 
-**Current status:** stage 1 is complete; stage 2 is in progress. Implemented foundations are
+**Current status (November 12):** stages 1 and 4 are complete. Stages 2 and 3
+are implemented, but their performance gates (20 Gbit/s each way locally and
+5 Gbit/s over the lossy access path) remain open, and stage 5 measured
+optimisation is in progress; ROADMAP.md and BENCH.md track both. The record
+below is chronological. Implemented foundations are
 `UnquicUuid` parsing/provisioning, duplicate-checked cookie indexing,
 `MacAddress` validation, IPv6 sockets with separate receive/transmit APIs, and
 persistent multiqueue TAP creation, reattachment, explicit removal and frame

@@ -121,9 +121,9 @@ successor. Library code no longer calls `unwrap`, `expect`, `panic!` or
 mutated inputs in a test without panicking, and indexing on those paths is
 checked. Packet-derived values reach no unchecked index in the workers, and a
 seccomp test that fails a worker syscall, then thread creation, shows the
-runtime stopping with the error while its TAP stays published. Indexing in
-encoders and the batch planner is bounded locally but not converted.
-These are tracked in Stage 4 of [ROADMAP.md](ROADMAP.md).
+runtime stopping with the error while its TAP stays published. The encoders
+and the batch planner use checked access too, at equal per-frame cost. Stage 4
+of [ROADMAP.md](ROADMAP.md) records these.
 
 Open TAP descriptors already support foreign renames and network-namespace moves
 where the kernel permits them. A release runtime test verifies forwarding after
