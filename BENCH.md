@@ -272,7 +272,12 @@ shows the L→R owners' gaps between bursts down from about 700 µs to 230–240
 µs at 5G. What remains coincides with the controller: the left daemon's BBR
 spends 15% of the 5G point in ProbeBW_DOWN against 4% at 2G, and 675,000
 sent frames still expire unacknowledged. That is a congestion-response
-question for the lossy rows, not a buffer one.
+question for the lossy rows, not a buffer one. The busier owner also spends
+5–6% of both lossy points held because its lane's sent history (65,536
+packet numbers) cannot reserve another number: the floor cannot pass a
+packet still charged in flight or holding an unreported delivery sample,
+and under loss those wait for the controller's loss reports. Without loss
+that hold takes 1–1.4%. Larger histories or faster retirement are untried.
 
 The overloaded delay the margin raised is mostly the TAP ring again. On the
 decision workload at 5G, sixteen flows, `3b9e86f`, two alternating pairs
