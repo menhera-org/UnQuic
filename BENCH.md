@@ -639,6 +639,34 @@ inflight cap alone: the controllers' max_bw averages 1.15–1.41 Gbit/s in
 both traces, so ProbeRTT's half-BDP window still allows about 0.6–0.7 Gbit/s
 at 4.5 ms, above the 0.5 Gbit/s offered.
 
+Timelines of both traces in 100 ms buckets settle it, and they show two
+separate loss sources:
+
+- In both arms, frames expire in bursts at a fixed 5.1 s period (4.3, 9.4,
+  14.5 and 19.6 s into the control point). At each burst both daemons stop
+  for about 40–50 ms: no trace record of any kind on any worker of either
+  daemon, then sent and input frames expire. A 1 ms sleep loop run beside
+  a non-trace build in the container sees gaps at the same 5.12 s period,
+  and the same loop on the idle test host does too, with no load and no
+  `incus` polling. The test host stalls periodically; CPU steal time stays
+  zero. With a 4.5 ms RTT the frame lifetime is its 20 ms floor, so each
+  stall expires frames. These bursts account for most of the control's
+  light-load loss (about 600 frames per 20 s point), so light-load loss
+  bars on this host measure the host as much as the daemon.
+- The hold arm's ProbeRTT episode costs frames because its window is too
+  small, not because of the hold. In Startup at 0.5G the group carries
+  320–380 KB in flight: 4.5 ms of RTT plus about 1 ms of ACK delay. ProbeRTT
+  caps the window at half of max_bw × min_rtt. The hold trace's max_bw of
+  1.15 Gbit/s gives 326 KB, just short, and admission drops and expiries
+  follow for the 200 ms episode. The control's max_bw of 1.38 Gbit/s gives
+  390 KB, enough, and its episode costs nothing. In app-limited Startup
+  max_bw comes from bursts and lands at 0.6–2.2 Gbit/s in both arms of the
+  eight-pair rerun, many runs below the 1.23 Gbit/s that a 0.5G offer
+  needs, so either arm can lose frames to ProbeRTT.
+
+The hold's measured loss excess sits on top of these two noise sources;
+neither is the hold's doing.
+
 ## Frames seconds old under overload (November 12)
 
 The tail in the latency measurement above is not a start-up event. With
