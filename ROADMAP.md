@@ -177,7 +177,9 @@ Decisions only the user can make, each blocking a remaining goal:
    3.91–3.95 instead of 3.25–3.29 Gbit/s) and lifts sixteen flows at 2G by
    10–15%, but it still costs the loopback overload check about 12% at 21G
    and more CPU per bit (rechecked on `3178088`). For one lossy flow it lifts
-   5G delivery 25–90% by striping, with millions of reordered frames
+   5G delivery 25–90% by striping, with millions of reordered frames, and on
+   the decision workload it reorders 0.1–1.1 million frames per direction
+   against at most 22,000 with hash lanes, a cost inner TCP or QUIC would pay
    ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB

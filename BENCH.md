@@ -405,6 +405,14 @@ lanes deliver 1.25–1.92 / 1.39–1.93 Gbit/s at 5G offered against 0.96–1.03
 million frames per direction against 35,000–59,000. Reactive traffic inside
 the tunnel would pay for that reordering, which `udp_load` does not.
 
+The same holds on the decision workload. The runs above record 0.39–1.10
+million reordered frames per direction with balanced lanes for four flows
+and 0.10–0.40 million for sixteen, against 0.5–22 thousand with hash lanes.
+Each reader keeps its own flow table and tun moves a flow's reads between
+readers, so a flow pinned by one reader gets another lane from the next:
+part of balanced lanes' gain is striping single flows, at that reordering
+cost.
+
 ## Whether the single QinQ reader limits the loopback check (November 11)
 
 On both sides of the loopback check every TAP read lands on one worker, and
