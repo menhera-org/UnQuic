@@ -1,0 +1,44 @@
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 7377233..557605c 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -1021,8 +1021,9 @@ impl Worker {
+                 self.sender_message(message, now)?;
+                 progress = true;
+             } else {
++                // A pushed message is the target's work, and the push wakes it.
+                 match self.push(worker, Event::Sender(message)) {
+-                    Ok(()) => progress = true,
++                    Ok(()) => {}
+                     Err(Event::Sender(message)) => {
+                         // Keep destination FIFO across partial sweeps and mid-sweep queue relief.
+                         self.sender.outgoing.insert(index, (worker, message));
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index 2ae1f26..fffb4b1 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -868,6 +868,24 @@ fn sender_queue_pressure_preserves_destination_order_across_partial_sweeps() {
+     }
+     assert_eq!(received, (1..=70).collect::<Vec<_>>());
+     assert!(worker.sender.outgoing.is_empty());
++    // A message handed to another worker is its work and asks for no extra turn here.
++    worker
++        .sender
++        .queue(
++            1,
++            Message::CheckLoss {
++                group: 0,
++                token: 71,
++                before: Duration::ZERO,
++                force: false,
++            },
++        )
++        .unwrap();
++    assert!(!worker.flush_sender_messages(Duration::ZERO).unwrap());
++    assert!(matches!(
++        incoming.try_pop(),
++        Some(Event::Sender(Message::CheckLoss { token: 71, .. }))
++    ));
+ }
+ 
+ #[test]

@@ -404,6 +404,17 @@ CPU per delivered Gbit/s lower in at least five and a median of −2% or
 better, four alternating loopback pairs with the 21G total's median no worse
 than −2%, and both kernel suites.
 
+[Six light-load pairs](benches/tap-no-extra-turn-light.json): lower in three,
+median +0.3%; [loopback](benches/tap-no-extra-turn-loop.json) median +1.9%.
+The change is [rejected](benches/no-extra-turn-rejected.patch): an extra
+turn after a remote push costs little, likely because it finds nothing to do
+and the next turn blocks. The order effect from the previous section shows
+again and more plainly: in every pair the build run first used less CPU per
+Gbit/s, by 0.6–5.6% with the candidate first and 1.2–2.2% with the control
+first. Light-load comparisons should treat a first-run advantage of about
+3% as noise; the occupied-slot sweep that landed won all six pairs in both
+orders.
+
 ## A configurable loss threshold for random loss (November 12)
 
 At 5% random loss draft 07 delivers under 11% of a 0.5G offer: any loss
