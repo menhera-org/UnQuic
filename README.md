@@ -800,7 +800,10 @@ may cross the byte target. Sessions take turns, and each session preserves
 input order. Adaptive ring reads allow up to four GSO sources per batch after
 recognizing GSO input; a preceding ordinary batch may discover more. If a
 source needs local expansion, the next read limit returns to one. Pending
-local expansion stops further reads. Expansion normally rewrites only the header and borrows the
+expansion of the worker's own reads stops further reads; inputs other readers
+handed over do not, since a busy owner that waited for them left its own TAP
+ring unread and its frames seconds old under overload (BENCH.md). Expansion
+normally rewrites only the header and borrows the
 payload in place. Ordinary frames and headers larger than 128 bytes use
 bounded payload slabs. Frame and source credits remain charged until release.
 Wire DATA remains ordinary Ethernet frames on the input's selected lane,

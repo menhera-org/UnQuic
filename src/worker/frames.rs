@@ -527,6 +527,7 @@ mod tests {
     fn buffer(length: usize) -> Box<Buffer> {
         Box::new(Buffer {
             origin: 0,
+            handed: false,
             rx_counted: false,
             tx_reserved: false,
             segments: None,

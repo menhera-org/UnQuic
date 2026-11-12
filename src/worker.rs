@@ -438,6 +438,8 @@ fn tap_lane(frame: &[u8], worker: usize, workers: usize, queues: usize, lanes: u
 /// Pool entries move through queues by ownership, including on rejection.
 pub(crate) struct Buffer {
     origin: usize,
+    // Handed over by another TAP reader; such inputs never gate this worker's own reads.
+    handed: bool,
     rx_counted: bool,
     tx_reserved: bool,
     segments: Option<crate::tap::Segments>,
@@ -1033,6 +1035,7 @@ impl Worker {
             .map(|_| {
                 Box::new(Buffer {
                     origin: id,
+                    handed: false,
                     rx_counted: false,
                     tx_reserved: false,
                     segments: None,
@@ -1487,6 +1490,7 @@ impl Worker {
             buffer.offset = 0;
             buffer.segment_size = 0;
             buffer.rx_counted = false;
+            buffer.handed = false;
             self.free.push(buffer);
         } else if self.hold_tx_credit(&buffer) {
             debug_assert!(self.returns[origin].len() < BUFFERS);
@@ -2320,7 +2324,14 @@ impl Worker {
 
     fn tap_capacity(&self, session: usize) -> usize {
         let local = &self.sessions[session];
-        if !local.tap_inputs.is_empty() {
+        // Only this worker's own unexpanded reads hold its TAP back. Frames other
+        // readers hand over use their buffers, and gating on them let a busy
+        // owner leave its own TAP ring unread, and its frames aging, for seconds.
+        if local.tap_inputs.iter().any(|&source| {
+            self.frames
+                .source(source)
+                .is_some_and(|input| !input.handed)
+        }) {
             return 0;
         }
         let workers = local.tx_workers;
@@ -2658,6 +2669,7 @@ impl Worker {
             replacement.rx_reserved = buffer.rx_reserved;
             buffer.tx_reserved = true;
             buffer.rx_reserved = false;
+            buffer.handed = true;
             self.sessions[session].tx_retained += 1;
             self.sessions[session].tx_bytes += buffer.length;
             self.release(replacement);
@@ -7012,6 +7024,21 @@ mod tests {
         let mtu = &mut worker.transmit[0].paths[0].lanes[0].mtu;
         assert!(mtu.reply(fresh, BASE_UDP_PAYLOAD, now + Duration::from_millis(1)));
         assert_eq!(mtu.payload_limit(), BASE_UDP_PAYLOAD);
+    }
+
+    #[test]
+    fn only_own_unexpanded_reads_hold_back_tap_reading() {
+        let (_, [mut worker, _]) = test_workers();
+        assert_ne!(worker.tap_capacity(0), 0);
+        let mut input = worker.free.pop().unwrap();
+        input.session = 0;
+        input.handed = true;
+        let source = worker.frames.insert_source(input).ok().unwrap();
+        worker.sessions[0].tap_inputs.push_back(source);
+        // Another reader's handed-over frame leaves this worker's TAP readable.
+        assert_ne!(worker.tap_capacity(0), 0);
+        worker.frames.source_mut(source).unwrap().handed = false;
+        assert_eq!(worker.tap_capacity(0), 0);
     }
 
     #[test]

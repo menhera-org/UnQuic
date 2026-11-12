@@ -1440,9 +1440,13 @@ November 10 evidence for that list, all in BENCH.md:
   `udp_load` now measures one-way delay: at 0.5G the hold adds about 33 µs
   at the median and 0.2 ms at p99, and nothing at 5G
   ([BENCH.md](BENCH.md#what-the-hold-costs-in-latency)). A default change
-  still needs that last loss explained. The same measurement shows a
-  multi-second tail at 5G overload in both arms, beyond any daemon frame
-  lifetime, not yet explained.
+  still needs that last loss explained. The same measurement found frames
+  arriving seconds late at 5G overload: a worker owning a busy lane stopped
+  reading its own TAP while other readers' handed-over frames filled its
+  input queue, so tun's ring aged. Gating reads only on the worker's own
+  inputs cut p99.9 from 0.1–0.4 s to 30–66 ms and the maximum from up to
+  1.6 s to 161 ms, with throughput within noise
+  ([BENCH.md](BENCH.md#frames-seconds-old-under-overload-november-12)).
   Fixed per-turn work matters here too: sweeping only occupied receive slots
   for ACKs cut light-load CPU per Gbit/s by 4.1%
   ([BENCH.md](BENCH.md#scanning-only-occupied-receive-slots-for-acks-november-12));

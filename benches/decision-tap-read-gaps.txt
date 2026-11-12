@@ -1,0 +1,32 @@
+Decision workload at 5 Gbit/s each way (routed 4.5 ms, bridged individual QinQ 1522-byte frames, four workers, sixteen flows), 5f2db99, November 12.
+Latency fields from udp_load receivers (seconds since each receiver started), TAP_TXQUEUELEN 500 and then 50:
+--- whx/sweep/when-ctl/f16/r1/0
+server-1.json "max_ns":2341954058,"max_at_s":17.292694,"over_100ms":4231,"first_over_100ms_s":0.990002,"last_over_100ms_s":20.397198
+server-2.json "max_ns":2341999949,"max_at_s":17.292750,"over_100ms":8416,"first_over_100ms_s":0.990075,"last_over_100ms_s":20.399366
+server-3.json "max_ns":38302562,"max_at_s":1.736254,"over_100ms":0,"first_over_100ms_s":-1.000000,"last_over_100ms_s":-1.000000
+server.json "max_ns":2341821787,"max_at_s":17.294371,"over_100ms":8459,"first_over_100ms_s":0.993559,"last_over_100ms_s":20.401435
+reverse-server-1.json "max_ns":689159268,"max_at_s":3.234308,"over_100ms":11901,"first_over_100ms_s":1.607961,"last_over_100ms_s":20.397809
+reverse-server-2.json "max_ns":48939743,"max_at_s":8.123813,"over_100ms":0,"first_over_100ms_s":-1.000000,"last_over_100ms_s":-1.000000
+reverse-server-3.json "max_ns":165652891,"max_at_s":10.191242,"over_100ms":176,"first_over_100ms_s":10.121685,"last_over_100ms_s":10.191490
+reverse-server.json "max_ns":46667812,"max_at_s":0.436861,"over_100ms":0,"first_over_100ms_s":-1.000000,"last_over_100ms_s":-1.000000
+--- w50/sweep/q50-ctl/f16/r1/0
+server-1.json "max_ns":1257976956,"max_at_s":14.089957,"over_100ms":497,"first_over_100ms_s":0.831569,"last_over_100ms_s":20.400159
+server-2.json "max_ns":1258704789,"max_at_s":14.090134,"over_100ms":842,"first_over_100ms_s":1.022002,"last_over_100ms_s":20.399372
+server-3.json "max_ns":335250536,"max_at_s":1.042781,"over_100ms":205,"first_over_100ms_s":0.867104,"last_over_100ms_s":1.042781
+server.json "max_ns":1258711947,"max_at_s":14.088859,"over_100ms":895,"first_over_100ms_s":1.020604,"last_over_100ms_s":20.397307
+reverse-server-1.json "max_ns":234728008,"max_at_s":20.400091,"over_100ms":391,"first_over_100ms_s":0.832610,"last_over_100ms_s":20.400130
+reverse-server-2.json "max_ns":56359539,"max_at_s":0.711099,"over_100ms":0,"first_over_100ms_s":-1.000000,"last_over_100ms_s":-1.000000
+reverse-server-3.json "max_ns":327732652,"max_at_s":1.020615,"over_100ms":200,"first_over_100ms_s":1.020615,"last_over_100ms_s":12.066289
+reverse-server.json "max_ns":177224004,"max_at_s":1.047926,"over_100ms":28,"first_over_100ms_s":1.047571,"last_over_100ms_s":1.047936
+
+TAP read gaps from a profile build with benches/tap-read-gaps-diagnostic.patch (diagnostics only), TAP_TXQUEUELEN 500:
+--- left
+unquic: profile worker 1 tap_read max_gap_ms 565.1 gaps_over_100ms 4 off_turns inputs/pool/quota/slots/bytes [10738, 5246, 0, 0, 0]
+unquic: profile worker 2 tap_read max_gap_ms 156.3 gaps_over_100ms 1 off_turns inputs/pool/quota/slots/bytes [29051, 34068, 0, 0, 0]
+unquic: profile worker 3 tap_read max_gap_ms 743.0 gaps_over_100ms 47 off_turns inputs/pool/quota/slots/bytes [236773, 4238, 74, 0, 0]
+unquic: profile worker 0 tap_read max_gap_ms 38.4 gaps_over_100ms 0 off_turns inputs/pool/quota/slots/bytes [6173, 4593, 0, 0, 0]
+--- right
+unquic: profile worker 1 tap_read max_gap_ms 186.5 gaps_over_100ms 1 off_turns inputs/pool/quota/slots/bytes [12430, 96126, 0, 0, 0]
+unquic: profile worker 3 tap_read max_gap_ms 798.9 gaps_over_100ms 35 off_turns inputs/pool/quota/slots/bytes [285337, 13571, 71, 0, 0]
+unquic: profile worker 0 tap_read max_gap_ms 475.2 gaps_over_100ms 3 off_turns inputs/pool/quota/slots/bytes [55373, 124870, 0, 0, 0]
+unquic: profile worker 2 tap_read max_gap_ms 45.6 gaps_over_100ms 0 off_turns inputs/pool/quota/slots/bytes [4111, 91394, 0, 0, 0]

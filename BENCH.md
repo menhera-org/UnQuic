@@ -614,8 +614,58 @@ show a tail no daemon queue can explain: in the first run's receivers 2–8%
 of frames arrived more than 10 ms late and up to 1.2% more than 100 ms, and
 maxima reach 0.46–2.75 s, beyond the 100 ms lifetime the daemons give any
 frame. In the first run three receiver processes reported
-the same 3.240 s maximum, which points to one event in the harness or the
-generator rather than steady queueing; this is not yet explained.
+the same 3.240 s maximum. The next section traces this tail to TAP queues
+left unread and removes it.
+
+## Frames seconds old under overload (November 12)
+
+The tail in the latency measurement above is not a start-up event. With
+the receive time of each receiver's maximum and of its samples over 100 ms
+([output](benches/decision-tap-read-gaps.txt)), a 5G run of `5f2db99`
+shows late frames from 1 s to 20.4 s into the point, thousands per process,
+on the flows of three of four L→R receivers, whose maxima (2.34 s) arrive
+within 2 ms of each other; the fourth sees none. Frames that share a TAP
+queue would behave this way. A TAP queue of 50 entries instead of 500 cut
+the samples over 100 ms about tenfold and p99.9 to 51–68 ms, but left a
+1.26 s maximum: the frames wait in the kernel's TAP ring, and the ring
+sometimes goes unread for over a second.
+
+A profile build with a read-gap diagnostic
+([patch](benches/tap-read-gaps-diagnostic.patch)) confirms it. On each
+daemon one worker, worker 3, pauses 35–47 times per run for more than
+100 ms between reads that return frames, up to 0.74–0.80 s; the others
+pause at most a few times. In the loop turns where its TAP reading is off,
+the cause is a non-empty input queue (237,000–285,000 turns) far more than
+an empty buffer pool (4,000–14,000). `tap_capacity()` returned zero while
+any unexpanded input was queued, and worker 3 owns a busy lane, so other
+readers keep handing it frames: its queue never empties, its own TAP ring
+sits unread, and frames that tun queued there leave seconds later with a
+fresh 100 ms lifetime.
+
+The fix gates a worker's TAP reads only on inputs it read itself; frames
+another reader handed over are marked when admitted and no longer count.
+They occupy the other reader's buffer credit, not this worker's.
+Registered before running: on the decision workload at 5G, three
+alternating pairs, both directions' p99.9 lower than HEAD's in every pair
+and every candidate maximum under 0.5 s; the 5G total no more than 7.5%
+lower; at 0.5G CPU per Gbit/s within ±3%; the loopback overload check's 21G
+total no more than 7.5% lower
+([results](benches/decision-tap-own-reads.json)):
+
+| Point | Measure | HEAD | Own reads |
+| --- | --- | --- | --- |
+| 5G | p99.9 L→R / R→L | 245–428 / 103–210 ms | 48–66 / 30–50 ms |
+| 5G | Maximum | 0.35–1.60 s | 53–161 ms |
+| 5G | p50 L→R / R→L | 6.0–6.7 / 7.1–8.2 ms | 8.5–9.0 / 6.2–7.1 ms |
+| 5G | Total delivered, median | 3.40 Gbit/s | 3.27 Gbit/s (−3.8%) |
+| 0.5G | CPU per delivered Gbit/s, median | 471.8% | 471.4% |
+| Loopback 21G | Total delivered, median | 10.60 Gbit/s | 10.89 Gbit/s |
+
+It meets every condition and lands. The tail of frames delayed by seconds
+is gone; at 5G the L→R median rises about 2.5 ms as the busy worker reads
+its ring instead of leaving it, and the R→L median falls by about 1 ms.
+Candidate daemon SHA-256:
+`376271e953766a9cdff1ceb5bc8bc82f447dcb181826ed9d14e0a34c8cc123dd`.
 
 ## Checked indexing in the encoders and batch planner (November 12)
 
