@@ -667,6 +667,28 @@ its ring instead of leaving it, and the R→L median falls by about 1 ms.
 Candidate daemon SHA-256:
 `376271e953766a9cdff1ceb5bc8bc82f447dcb181826ed9d14e0a34c8cc123dd`.
 
+### TAP queue length and overload delay
+
+Even with the fix, the loopback overload check holds frames for tens of
+milliseconds at 21G: a median one-way delay of 33–52 ms. With GSO input each
+TAP ring entry is a whole super-frame of about 64 KB, so a 500-entry ring
+can hold about 32 MB per queue. Measurement, no candidate, written
+beforehand with the expectation of a several-fold lower median and delivery
+within the A/A swing: `5863120`, `TAP_TXQUEUELEN` 500 against 64, two
+alternating pairs ([results](benches/loopback-tap-queue-length.json)):
+
+| 21G point | 500 entries | 64 entries |
+| --- | --- | --- |
+| p50 L→R / R→L | 48.8–50.3 / 34.1–36.7 ms | 7.5 / 4.4–5.8 ms |
+| p99 L→R / R→L | 95–106 / 62–63 ms | 26–27 / 23 ms |
+| Maximum L→R / R→L | 176–204 / 98–104 ms | 76–94 / 33–40 ms |
+| Total delivered | 10.87–10.88 Gbit/s | 11.13–11.26 Gbit/s |
+
+At the 4G warm-up, where nothing overflows, both lengths give the same
+sub-millisecond medians. Most overload delay is the kernel's TAP ring, not
+the daemon, and a short ring loses no delivery here. The daemon leaves the
+TAP queue length to the operator; README now recommends a short one.
+
 ## Checked indexing in the encoders and batch planner (November 12)
 
 The last stage 4 panic-audit item converts every indexing site that Clippy's

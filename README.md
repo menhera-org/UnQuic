@@ -1077,6 +1077,7 @@ state are available through the library's `Control` API.
 | Carrier drops despite incoming DATA | Fresh matching PROBE_REPLY traffic must return to the configured fixed port; DATA alone does not refresh liveness |
 | Carrier is up but frames expire | Queue drops, TAP write errors, underlay loss and socket errors; small probes do not test DATA-sized delivery |
 | Throughput stays low with many lanes | Flow count, TAP queue placement, worker/receive distribution and CPU use; each frame stays on one lane |
+| Delay grows when the tunnel is overloaded | The TAP's transmit queue length. Under overload frames wait in the kernel's TAP ring before the daemon reads them, and with GSO input each entry can hold a 64 KB super-frame. On the loopback overload check 64 entries instead of 500 cut the median one-way delay from 34–50 ms to 4–8 ms with no loss of delivery (BENCH.md); set it with `ip link set DEV txqueuelen 64` |
 
 Both directions send from dynamic source ports to configured fixed receive
 ports. Replies use the configured peer address and fixed port, never the

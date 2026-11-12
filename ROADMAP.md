@@ -1447,6 +1447,10 @@ November 10 evidence for that list, all in BENCH.md:
   inputs cut p99.9 from 0.1–0.4 s to 30–66 ms and the maximum from up to
   1.6 s to 161 ms, with throughput within noise
   ([BENCH.md](BENCH.md#frames-seconds-old-under-overload-november-12)).
+  Most of the remaining overload delay is the kernel's TAP ring: on the
+  loopback check 64 entries instead of 500 cut the median from 34–50 ms to
+  4–8 ms with delivery unchanged. README recommends a short ring; whether
+  the daemon should set one on the TAPs it creates is the user's call.
   Fixed per-turn work matters here too: sweeping only occupied receive slots
   for ACKs cut light-load CPU per Gbit/s by 4.1%
   ([BENCH.md](BENCH.md#scanning-only-occupied-receive-slots-for-acks-november-12));
