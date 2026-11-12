@@ -1298,6 +1298,12 @@ November 10 evidence for that list, all in BENCH.md:
   delivery below 11% of even a 0.5 Gbit/s offer.
 - Batching while application-limited: correctly marked light load stays in
   Startup and sends about 1.4 frames per claim, costing CPU at equal delivery.
+  On November 12 the decision workload cost about 480% of a core per Gbit/s
+  at 0.5G against 190–220% at 2G and 5G: every frame pays its own TAP read,
+  grant round trip, send and TAP write, with about one frame per syscall
+  ([BENCH.md](BENCH.md#cost-at-light-load-november-12)). Candidates: a short
+  per-lane hold time, aggregation across lanes, or spendable credit that
+  skips the grant round trip, each with its own latency or pacing bar.
 - `tolerate_random_loss` by default: measured on November 11 against one TCP
   CUBIC flow at a 1 Gbit/s, 7.5 ms bottleneck
   ([BENCH.md](BENCH.md#coexistence-with-tolerate_random_loss-november-11)).

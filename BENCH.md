@@ -335,6 +335,34 @@ path dominates: sending batches takes 25–30% of busy cycles and TAP reads
 and writes another 20–30%. `stage_recovery` matters mainly at loopback
 rates.
 
+## Cost at light load (November 12)
+
+On the decision workload the two daemons spend about 480% of a core per
+delivered Gbit/s at 0.5 Gbit/s offered each way, against 190–220% at 2G and
+5G (the A/A run's control, all four combinations). A `profile` build at
+0.5G, sixteen flows, no loss ([worker lines and counters](benches/tap-light-load-profile.txt))
+shows why. Over the 20-second point the left daemon wrote 835,700 TAP
+writes for about 845,000 delivered frames, USO coalescing covered 2% of
+them, each TAP read returned 1.5 frames, each send grant covered 1.45
+frames and each `sendmmsg` call about 1.2. Every frame pays its own read,
+grant round trip, send and write. Workers block 35–75% of the time, and each
+daemon made about a million voluntary context switches, roughly 0.6 per
+frame event. At a few microseconds each that is a quarter of a core, not the
+2.4 cores each daemon uses. The rest is per-frame syscalls whose kernel work
+includes the emulated network: a TAP write carries the frame through the
+inner namespace's stack to the receiving socket on the daemon's thread, and
+a send carries it through the routed namespaces and netem. At high load
+GSO, GRO and USO spread that cost over many frames; at light load each lane
+sees about one frame per turn, so they cannot.
+
+Batching more per syscall at light load needs either a hold time (hundreds
+of microseconds per lane at this rate) or aggregation across lanes, and
+fewer grant round trips needs credit the sender can spend without asking the
+owner. Each is a sender change with a latency or pacing trade-off and its
+own bar; none is attempted here. This harness also charges the emulated
+path's kernel work to the daemons, so the light-load figure overstates what
+a real host would pay.
+
 ## Checked indexing in the encoders and batch planner (November 12)
 
 The last stage 4 panic-audit item converts every indexing site that Clippy's
