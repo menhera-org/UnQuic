@@ -95,16 +95,8 @@ on the worker's own inputs cut 5G p99.9 from 0.1–0.4 s to 30–66 ms
 remaining overload delay is the kernel's TAP ring; README recommends 64
 entries.
 
-TCP through the tunnel looked heavily reordered, but the cause was the
-harness: both iperf3 directions used the same port pair, so tun's symmetric
-hash kept moving mirrored flows between readers. With distinct reverse ports
-reordering falls from 10,000–36,000 SACK events per side to under 300, at
-the same total of about 9.2 Gbit/s. About 1% of TCP segments are still
-retransmitted under unlimited load, matching the frames the daemons expire
-or drop ([BENCH.md](BENCH.md#tap-queue-length-and-overload-delay)).
-
 Light-load loss on the decision workload has two sources outside the hold.
-The test host stalls system-wide for 10–50 ms every 5.12 s, and at the
+The test host stalls system-wide for 10–50 ms every few seconds, and at the
 20 ms frame-lifetime floor each stall expires frames; that is most of the
 control's loss. BBR's ProbeRTT window, half of max_bw × min_rtt, can also
 fall below what a 0.5 Gbit/s offer keeps in flight, because those bytes stay
@@ -116,6 +108,22 @@ its loss bar because a host stall fell inside one episode
 With both sources counted out, `tx_hold_us = 200` loses no more than the
 control ([BENCH.md](BENCH.md#the-holds-loss-without-host-stalls-and-probertt)),
 so the hold's only cost is latency.
+
+TCP through the tunnel turned out to be limited by the harness and then by
+the host. Both iperf3 directions had used the same port pair, so tun's
+symmetric hash moved mirrored flows between readers and reordered whole TSO
+blocks; with distinct ports SACK reordering falls from 10,000–36,000 events
+per side to under 300 at the same total of about 9.2 Gbit/s. About 1% of
+segments are still retransmitted under unlimited load. What remains are
+receive-socket overflows: with UDP GRO each one drops a coalesced batch,
+and the container's 416 KiB buffer holds only a few
+([BENCH.md](BENCH.md#tap-queue-length-and-overload-delay)). Turning GRO off
+made it worse. A cookie that aligns each lane's receive owner with its
+transmit owner lifts TCP 17–19% but costs the decision workload 4–15%, so
+placement stays
+([BENCH.md](BENCH.md#lane-owner-alignment-for-tcp-and-qinq-november-12-exploratory)).
+A candidate for unprivileged hosts is a second receive socket per worker,
+doubling the buffering a worker gets without `CAP_NET_ADMIN`.
 
 Decisions only the user can make, each blocking a remaining goal:
 

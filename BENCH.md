@@ -851,6 +851,16 @@ the owners' frame stores, and admission refuses 9,787 / 3,963 inputs for
 lack of frame slots. TCP through the tunnel on this host is therefore
 limited by the same receive buffers as the 20 Gbit/s gate.
 
+Turning UDP GRO off on the receive sockets, so that an overflow drops one
+datagram instead of a coalesced batch, was tried as an exploratory patch
+([patch](benches/receive-gro-off-exploratory.patch),
+[runs](benches/receive-gro-off.txt)), stated beforehand as needing at least
+5% more TCP goodput. Two alternating pairs: 8.27 and 8.54 Gbit/s without GRO
+against 9.11 and 9.29 with it, at 133–137% of a core per Gbit/s instead of
+99–100%. Without GRO the sockets overflow 22,000–89,000 times per daemon and
+the senders repair up to 167,000 packets; per-datagram receive work fills
+the buffer faster than coarse drops do. Rejected.
+
 The harness now also records each inner namespace's `/proc/net/netstat`.
 One more pair with it ([counters](benches/loopback-tcp-tcpext.txt)) showed
 TCP seeing a lot of reordering: SACK-detected reordering of 12,000–38,000

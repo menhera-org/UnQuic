@@ -1,0 +1,10 @@
+UDP GRO off on the receive sockets (benches/receive-gro-off-exploratory.patch, UNQUIC_NO_GRO=1), November 12, exploratory. TCP on loopback: eight workers, 1514-byte frames, eight iperf3 TCP streams each way, unlimited, 20 s, TAP_TXQUEUELEN 500, REVERSE_PORT_OFFSET 2000, default cookie, same binary, two alternating pairs (gro, nogro, nogro, gro).
+Per run: goodput, daemon CPU, TCP SACK reordering events; then per daemon socket overflows (events), repairs, expired sent frames, admission drops.
+gro/r1 L>R=4.85 R>L=4.26 total=9.11 cpu_L=428% cpu_R=475% cpu_per_gbps=99.1% reorder=34/58
+left overflow=671 repairs=13733 expired_sent=17716 admission=8702 |right overflow=758 repairs=13467 expired_sent=65385 admission=3487 |
+nogro/r1 L>R=4.35 R>L=3.92 total=8.27 cpu_L=574% cpu_R=561% cpu_per_gbps=137.2% reorder=9061/883
+left overflow=27189 repairs=166750 expired_sent=4876 admission=1493 |right overflow=88675 repairs=49240 expired_sent=20176 admission=12452 |
+gro/r2 L>R=4.91 R>L=4.38 total=9.29 cpu_L=426% cpu_R=506% cpu_per_gbps=100.4% reorder=21/16
+left overflow=324 repairs=12259 expired_sent=8032 admission=18247 |right overflow=634 repairs=6324 expired_sent=33332 admission=2647 |
+nogro/r2 L>R=4.51 R>L=4.03 total=8.54 cpu_L=575% cpu_R=562% cpu_per_gbps=133.2% reorder=9321/588
+left overflow=21834 repairs=165810 expired_sent=5666 admission=3499 |right overflow=88189 repairs=39796 expired_sent=18810 admission=10031 |

@@ -1,0 +1,14 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index fceac78..19e515a 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -1689,7 +1689,8 @@ impl Worker {
+             Ok(bytes) => self.counters.receive_buffer_bytes += bytes as u64,
+             Err(_) => self.counters.socket_errors += 1,
+         }
+-        if socket.enable_gro().is_err() {
++        // Exploratory: without UDP GRO an overflow drops one datagram, not a coalesced batch.
++        if std::env::var_os("UNQUIC_NO_GRO").is_none() && socket.enable_gro().is_err() {
+             self.counters.socket_errors += 1;
+         }
+         self.reactor.add(
