@@ -749,6 +749,12 @@ are at most a small part. The long-term bound, lowered by chance rounds and
 regrown only in the short ProbeBW_UP phases, is the likelier limit, which
 makes this row a job for FEC rather than another threshold.
 
+Refreshed in the evening on `424f4f8` (read margin, `probe_rtt_ack_delay`
+on), two alternating pairs ([results](benches/lossy-five-percent-424f4f8.json)):
+with the default threshold one flow at 5% loss delivers 0.009–0.017 Gbit/s
+each way at 1G and 5G offered; with 100, 0.41–0.44 at 1G and 0.45–0.46 at
+5G. Today's other changes leave this row where it was.
+
 ## Cost at light load (November 12)
 
 On the decision workload the two daemons spend about 480% of a core per
