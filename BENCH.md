@@ -386,6 +386,24 @@ with it second between 1.4% less and 1.7% more. Alternating order keeps the
 median fair, but a sign test over six pairs cannot separate a gain of a
 couple of percent from it.
 
+## No extra turn after handing sender messages to other workers (November 12)
+
+A `profile` build that counts which phase asks for another turn at 0.5G
+([diagnostic patch](benches/more-turns-diagnostic.patch)) found 4.57 million
+worker turns on the left daemon, of which sender-message flushing asked for an
+immediate next turn 1.21 million times and sender service 0.71 million; other
+phases almost never did, and due deadlines forced a poll once. Flushing counts
+any moved message as progress, including one pushed to another worker's
+queue, which creates no work here (the push wakes the target), so the worker
+polls and runs every phase again. The candidate counts only messages it
+processes itself. A sender waiting for queue room already sets a due retry,
+which forces a poll on its own.
+
+Stated before measuring, the same bar: six alternating light-load pairs with
+CPU per delivered Gbit/s lower in at least five and a median of −2% or
+better, four alternating loopback pairs with the 21G total's median no worse
+than −2%, and both kernel suites.
+
 ## A configurable loss threshold for random loss (November 12)
 
 At 5% random loss draft 07 delivers under 11% of a 0.5G offer: any loss

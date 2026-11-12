@@ -1,0 +1,141 @@
+diff --git a/src/profile.rs b/src/profile.rs
+index c12610b..b3ce75c 100644
+--- a/src/profile.rs
++++ b/src/profile.rs
+@@ -66,6 +66,11 @@ pub fn now() -> u64 {
+ pub static ADMISSION: [std::sync::atomic::AtomicU64; 4] =
+     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+ 
++/// Turns in which each phase asked for another turn; 30 counts all turns and
++/// 31 turns that polled only because a deadline was already due.
++pub static MORE: [std::sync::atomic::AtomicU64; 32] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 32];
++
+ /// Per-process syscall totals: cycles, calls and items for sendmmsg, then timerfd_settime.
+ pub static SYSCALLS: [[std::sync::atomic::AtomicU64; 3]; 2] =
+     [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 2];
+@@ -94,8 +99,11 @@ pub fn report(worker: usize, phases: &[u64; PHASES]) {
+     let timer = SYSCALLS[1]
+         .each_ref()
+         .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
++    let more = MORE
++        .each_ref()
++        .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
+     let mut line = format!(
+-        "unquic: profile worker {worker} admission inputs/buffers/frames/bytes {admission:?} sendmmsg cycles/calls/datagrams {sendmmsg:?} timerfd_settime cycles/calls {:?} cycles {total}",
++        "unquic: profile worker {worker} admission inputs/buffers/frames/bytes {admission:?} sendmmsg cycles/calls/datagrams {sendmmsg:?} timerfd_settime cycles/calls {:?} more {more:?} cycles {total}",
+         &timer[..2]
+     );
+     for index in order.into_iter().filter(|&index| phases[index] != 0) {
+diff --git a/src/worker.rs b/src/worker.rs
+index 5d02f2d..36e6617 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -1214,44 +1214,51 @@ impl Worker {
+         let mut publish_turns = 0_u8;
+         while !self.control.quitting() {
+             let now = monotonic_now()?;
+-            let mut more = phase!(self, 0, self.drain_queues(now))?;
++            let mut more = note(0, phase!(self, 0, self.drain_queues(now))?);
+             if now >= self.setup_due {
+                 phase!(self, 1, self.setup(now))?;
+             }
+-            more |= phase!(self, 2, self.distribute_receivers());
+-            more |= phase!(self, 3, self.addresses(now))?;
+-            more |= phase!(self, 4, self.service_sender(now))?;
++            more |= note(2, phase!(self, 2, self.distribute_receivers()));
++            more |= note(3, phase!(self, 3, self.addresses(now))?);
++            more |= note(4, phase!(self, 4, self.service_sender(now))?);
+             phase!(self, 5, self.progress_barriers(now))?;
+             phase!(self, 6, self.timers(now))?;
+-            more |= phase!(self, 7, self.mtu_timers(now))?;
+-            more |= phase!(self, 8, self.drain_packets(now))?;
++            more |= note(7, phase!(self, 7, self.mtu_timers(now))?);
++            more |= note(8, phase!(self, 8, self.drain_packets(now))?);
+             phase!(self, 9, self.drain_tap_inputs(now))?;
+-            more |= phase!(self, 10, self.flush_frames(now))?;
++            more |= note(10, phase!(self, 10, self.flush_frames(now))?);
+             phase!(self, 11, self.flush_returns());
+-            more |= phase!(
+-                self,
++            more |= note(
+                 12,
+-                (0..self.sessions.len()).any(|session| self.tap_can_expand(session))
++                phase!(
++                    self,
++                    12,
++                    (0..self.sessions.len()).any(|session| self.tap_can_expand(session))
++                ),
+             );
+             phase!(self, 13, self.flush_taps(now))?;
+             phase!(self, 14, self.collect_acks(now))?;
+             phase!(self, 15, self.flush_control(now))?;
+-            more |= phase!(self, 16, self.flush_sender_messages(now))?;
++            more |= note(16, phase!(self, 16, self.flush_sender_messages(now))?);
+             phase!(self, 17, self.flush_notifications())?;
+-            more |= phase!(
+-                self,
++            more |= note(
+                 18,
+-                self.ready.iter().copied().any(|(session, lane)| {
+-                    let Some(peer) = self.shared.config.peer_for_session(session) else {
+-                        return false;
+-                    };
+-                    let tx = &self.transmit[peer].paths[self.sessions[session].path].lanes[lane];
+-                    let batch = self.sessions[session].batches[lane].as_ref();
+-                    batch.is_some_and(|batch| batch.len == 0 && batch.pending.is_empty())
+-                        || (!tx.blocked
+-                            && tx.mtu.payload_limit() != 0
+-                            && (!self.sender_enabled() || self.sender.job.is_none()))
+-                })
++                phase!(
++                    self,
++                    18,
++                    self.ready.iter().copied().any(|(session, lane)| {
++                        let Some(peer) = self.shared.config.peer_for_session(session) else {
++                            return false;
++                        };
++                        let tx =
++                            &self.transmit[peer].paths[self.sessions[session].path].lanes[lane];
++                        let batch = self.sessions[session].batches[lane].as_ref();
++                        batch.is_some_and(|batch| batch.len == 0 && batch.pending.is_empty())
++                            || (!tx.blocked
++                                && tx.mtu.payload_limit() != 0
++                                && (!self.sender_enabled() || self.sender.job.is_none()))
++                    })
++                ),
+             );
+             phase!(self, 19, self.receive_interest(more))?;
+             publish_turns = publish_turns.wrapping_add(1);
+@@ -1273,6 +1280,14 @@ impl Worker {
+                 self.retry_due = None;
+             }
+             let mut block = should_block(more || immediate, deadline, now);
++            #[cfg(feature = "profile")]
++            {
++                use std::sync::atomic::Ordering::Relaxed;
++                crate::profile::MORE[30].fetch_add(1, Relaxed);
++                if !(more || immediate) && !block {
++                    crate::profile::MORE[31].fetch_add(1, Relaxed);
++                }
++            }
+             if block {
+                 self.reactor.arm(deadline)?;
+             }
+@@ -4724,6 +4739,16 @@ impl Worker {
+     }
+ }
+ 
++/// Diagnostic: counts which phase asked for another turn.
++#[inline(always)]
++fn note(_phase: usize, more: bool) -> bool {
++    #[cfg(feature = "profile")]
++    if more {
++        crate::profile::MORE[_phase].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    }
++    more
++}
++
+ /// Whether a turn may block in epoll and therefore needs its timer armed.
+ ///
+ /// Pending work, or a deadline already due at the turn's start, runs on the
