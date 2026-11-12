@@ -310,6 +310,12 @@ about 7% more CPU. The trade holds: balanced lanes rescue few flows on the
 routed path and cost the loopback check. The decision belongs to the user
 (ROADMAP).
 
+After the read margin landed, balanced lanes still add delivery for four
+flows, now by spreading rather than by rescue (`3b9e86f`, two alternating
+pairs, [results](benches/decision-balance-flows-four-margin.json)): totals
+of 3.63–3.91 Gbit/s at 2G against 3.08–3.11 with hash lanes, and 3.91–3.95
+at 5G against 3.25–3.29, about 20% more, at more CPU.
+
 ## Whether the single QinQ reader limits the loopback check (November 11)
 
 On both sides of the loopback check every TAP read lands on one worker, and

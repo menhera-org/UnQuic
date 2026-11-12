@@ -164,11 +164,10 @@ Decisions only the user can make, each blocking a remaining goal:
    adds about 33 µs to the median one-way delay and 0.2 ms at p99 for light
    traffic.
 5. Should `daemon.balance_flows` be on by default? On the decision workload
-   before the read margin it kept four flows from collapsing at 5G (L→R 1.90
-   instead of 0.92 Gbit/s, total 3.5–3.7 instead of 2.2–2.3; the margin now
-   gives 3.25–3.29) and lifts sixteen flows at 2G by 10–15%, but it still
-   costs the loopback overload check about 12% at 21G and more CPU per bit
-   (rechecked on `3178088`)
+   it adds about 20% for four flows even with the read margin (5G total
+   3.91–3.95 instead of 3.25–3.29 Gbit/s) and lifts sixteen flows at 2G by
+   10–15%, but it still costs the loopback overload check about 12% at 21G
+   and more CPU per bit (rechecked on `3178088`)
    ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB
