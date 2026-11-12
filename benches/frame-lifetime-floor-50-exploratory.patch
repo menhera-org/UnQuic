@@ -1,0 +1,13 @@
+diff --git a/src/loss.rs b/src/loss.rs
+index e6921d2..5e5dda0 100644
+--- a/src/loss.rs
++++ b/src/loss.rs
+@@ -147,7 +147,7 @@ impl Rtt {
+     pub fn frame_lifetime(&self) -> Duration {
+         self.smoothed
+             .saturating_mul(4)
+-            .clamp(Duration::from_millis(20), Duration::from_millis(100))
++            .clamp(Duration::from_millis(50), Duration::from_millis(100))
+     }
+ }
+ 

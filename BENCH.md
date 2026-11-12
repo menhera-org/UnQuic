@@ -454,8 +454,14 @@ left side (the hash right side, the direction hash lanes leave weaker,
 expires 124,000–186,000 sent and 98,000–180,000 unsent). Balanced lanes cut
 socket overflows (470–970 against 380–4,080) and repairs. So with every
 worker transmitting and receiving, frames wait past their 20 ms lifetime
-floor in queues and for ACKs; whether turn length or ACK delay sets that
-wait is the next question. A production version needs tests,
+floor in queues and for ACKs. The floor itself is not the limit: with
+balanced lanes in both arms, a 50 ms floor
+([patch](benches/frame-lifetime-floor-50-exploratory.patch), stated
+beforehand as needing 5% more at 21G, one pair,
+[results](benches/loopback-balanced-lifetime-floor-50.json)) delivers 10.59
+Gbit/s against 10.67 with 20 ms. The expiries are a symptom of whatever
+slows the spread-out workers; turn length and ACK delay remain to be
+measured. A production version needs tests,
 a memory charge for the table and the full bars before it can land.
 
 ## Whether the single QinQ reader limits the loopback check (November 11)
