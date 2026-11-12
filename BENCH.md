@@ -634,7 +634,10 @@ admission drops, the busiest owner holds about 100 unexpanded inputs and
 about 100 buffers awaiting return: its lane stops sending while ProbeRTT
 caps inflight, expansion stalls behind it, and with a 20 ms frame lifetime
 (four RTTs) frames expire within the episode. Why the hold makes ProbeRTT
-episodes cost frames and the control does not is still open.
+episodes cost frames and the control does not is still open. It is not the
+inflight cap alone: the controllers' max_bw averages 1.15–1.41 Gbit/s in
+both traces, so ProbeRTT's half-BDP window still allows about 0.6–0.7 Gbit/s
+at 4.5 ms, above the 0.5 Gbit/s offered.
 
 ## Frames seconds old under overload (November 12)
 
