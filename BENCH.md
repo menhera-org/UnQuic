@@ -407,9 +407,17 @@ data: eight interleaved pairs of loopback runs. The candidate passes if its
 total beats the paired control's total in at least seven of the eight pairs
 (a one-sided sign test, p ≈ 0.035 if the builds were equal), and the median
 paired change in each direction is no worse than −2%. Condition (2′) on the
-decision workload is unchanged. Both results are reported. The paired run
-started at 09:50 UTC on November 11; the decision workload has not run yet,
-and the change stays out of `src` until both are recorded.
+decision workload is unchanged. Both results are reported.
+
+[Eight interleaved pairs](benches/tap-arm-only-blocking-paired.json): the
+candidate's total beats its paired control in six of the eight, short of
+the seven required. The median paired change is +2.5% in total, +3.5% L→R
+and +2.7% R→L; the two lost pairs fell 2.1% and 1.0%. The change is
+[rejected](benches/arm-only-blocking-rejected.patch) as stated, and the
+decision workload was not run. The patch also carries the `profile`
+counter for `timerfd_settime`. The likely gain is real but no larger than a
+few percent, which this harness cannot separate from run-to-run spread
+without many more pairs.
 
 ## Waking only sleeping workers (November 11)
 

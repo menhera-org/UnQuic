@@ -230,8 +230,8 @@ rules apply to all of them.
    decision workload
    ([BENCH.md](BENCH.md#waking-only-sleeping-workers-november-11)).
    Arming the worker timer only before blocking cuts `timerfd_settime`
-   calls by about half; its paired loopback test and decision-workload check
-   are pending. Sixteen workers per daemon raise the loopback total 36–38%
+   calls by about half and won six of eight paired loopback runs (median
+   +2.5%), one short of its stated bar, so it was rejected. Sixteen workers per daemon raise the loopback total 36–38%
    with no thread saturated; there the limit is receive-socket overflow,
    which the container's 416 KiB receive buffer (no `CAP_NET_ADMIN` in the
    initial namespace) makes worse than a root deployment's 8 MiB
