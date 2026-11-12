@@ -53,6 +53,8 @@ the busiest readers run at 96–98%. Balanced lanes do not change this:
 unfragmented UDP keeps a lane owned by the worker that read it, and
 `balance_flows` never sees those frames
 ([BENCH.md](BENCH.md#small-frame-rows-at-the-current-build-november-12)).
+Dropping that locality spreads paced traffic (+15–19%) but loses 18–20%
+under overload, so it was rejected.
 
 ## November 11 checkpoint
 
@@ -291,10 +293,13 @@ rules apply to all of them.
    build, and transmit work tied to tun's uneven queue hash, which leaves
    some workers idle while the busiest readers saturate
    ([BENCH.md](BENCH.md#small-frame-rows-at-the-current-build-november-12)).
-   UDP lane locality keeps transmit work on the reading worker, so the
-   next candidate is to let local-lane frames spread when tun's queues are
-   uneven, measured against the cross-worker handoff cost that locality
-   was added to avoid.
+   UDP lane locality keeps transmit work on the reading worker. Dropping
+   it in an exploratory patch, with balanced lanes, delivers 15–19% more
+   at the paced point but 18–20% less under overload, at 21–26% more CPU
+   per frame, so it was rejected
+   ([BENCH.md](BENCH.md#without-udp-lane-locality-exploratory-rejected)).
+   What remains is spreading only when the reader saturates and another
+   worker has slack.
 6. **Stage 4** is done as of November 12. OVS joined the composition
    matrix, and the panic audit converted the last locally bounded indexing in
    the encoders and the batch planner: explicit panics are gone, untrusted-input

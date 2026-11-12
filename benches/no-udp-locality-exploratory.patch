@@ -1,0 +1,14 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index 5d02f2d..bead56e 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -418,7 +418,8 @@ fn balanced_lane(
+ 
+ /// Whether tap_lane spreads this frame across all lanes by its flow hash.
+ fn strict_lane(frame: &[u8], worker: usize, workers: usize, queues: usize, lanes: usize) -> bool {
+-    queues < workers || worker >= lanes || !pack::prefer_local_lane(frame)
++    let _ = (frame, worker, workers, queues, lanes);
++    true
+ }
+ 
+ fn tap_lane(frame: &[u8], worker: usize, workers: usize, queues: usize, lanes: usize) -> usize {

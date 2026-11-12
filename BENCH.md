@@ -661,6 +661,34 @@ of eight workers per daemon idle because transmit work follows tun's queue
 hash. Daemon SHA-256 for the release runs:
 `4bb2375fc9c50e33fcf9d0c2591502d4404e1231cbd9c73d2ecd17407a9ab031`.
 
+### Without UDP lane locality (exploratory, rejected)
+
+The obvious candidate is to drop locality so `balance_flows` can spread
+these frames. An exploratory patch makes every frame take the strict path
+([patch](benches/no-udp-locality-exploratory.patch)). The bar was written
+before the run: a switch is worth building only if the patch with balanced
+lanes raises the unlimited total by more than 10% in both repeats, above
+the A/A swing of ±7.5%. Same eight-worker point, three builds alternating,
+two repeats ([results](benches/tap-small-frames-no-locality.json)), total
+M frames/s over both directions and cores per M frames/s:
+
+| Build | 40M total | 40M cores per M | Unlimited total | Unlimited cores per M |
+| --- | --- | --- | --- | --- |
+| `acef86d`, hash lanes | 5.44–5.45 | 1.92–1.95 | 6.87–6.89 | 1.84 |
+| No locality, hash lanes | 5.55–5.68 | 2.13 | 5.11–5.56 | 2.37–2.48 |
+| No locality, balanced lanes | 6.25–6.48 | 1.96–1.97 | 5.55–5.64 | 2.22–2.31 |
+
+It misses the bar. Balanced lanes without locality do what the profile
+suggested at the paced point: 15–19% more frames at the same cost per
+frame, with the busiest thread down from 95–97% to 87–92%. Under overload
+the cross-worker handoff costs more than the idle workers return: the
+unlimited total falls 18–20%, L→R to 2.17–2.33 M frames/s, and each frame
+costs 21–26% more CPU. That is the trade the UDP locality change was made
+for, and it still holds at overload. A version that spreads only when
+the reader is the bottleneck and the receiving worker has slack might keep
+the paced gain; it is not tried here. Patch daemon SHA-256:
+`83a619c380b222c8e73ba3221c7832d7cf13ec3c39df92da8ce75797a172b299`.
+
 ## Sixteen workers per daemon (November 11, exploratory)
 
 The harness now accepts `WORKERS=16`. One run each, current build, 21G
