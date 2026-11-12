@@ -19,3 +19,9 @@ Trace build (7108623 tree) of the loopback overload check, eight workers, 21G po
 "mean_pacing_gbps":17.3696
 "window":{"worker":{"held":0.3348,"queued":0.0009,"phase":0.0000,"pacing":0.1900,"burst":0.0000,"window":0.3520
 "controller":{"startup":0.0000,"drain":0.0000,"down":0.3732,"cruise":0.4850,"refill":0.0136,"up":0.1181,"probe_rtt":0.0101}
+
+ACK counters from the release runs (benches/loopback-balance-flows-3178088.json, 21G point, before to sent), per daemon: ACK-buffer drops, ACK sends deferred (attempt submitted no datagram), ACKs coalesced, send grants, expired and cancelled grants:
+hash r1 left ackdrop=5 deferred=0 coalesced=171551 grants=647274 expired=0 cancelled=1 |right ackdrop=0 deferred=0 coalesced=187910 grants=696178 expired=500 cancelled=6 |
+hash r2 left ackdrop=0 deferred=0 coalesced=170841 grants=667235 expired=2 cancelled=0 |right ackdrop=0 deferred=97 coalesced=205048 grants=716957 expired=427 cancelled=4 |
+bal r1 left ackdrop=0 deferred=31566 coalesced=199733 grants=733776 expired=1528 cancelled=322 |right ackdrop=0 deferred=29612 coalesced=178862 grants=758918 expired=1772 cancelled=502 |
+bal r2 left ackdrop=5 deferred=31534 coalesced=200544 grants=754190 expired=1408 cancelled=423 |right ackdrop=7 deferred=29003 coalesced=188832 grants=768633 expired=2052 cancelled=457 |

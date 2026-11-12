@@ -467,8 +467,16 @@ point (hash lanes: 1% left, 16% right) and BBR spends 37–44% in
 ProbeBW_DOWN, while 385,000–468,000 sent frames reach their lifetime
 unacknowledged and only 15,000–16,000 packets are declared lost. In-flight
 space fills with packets that are never acknowledged, so the window, not
-CPU, holds balanced lanes back on this check. Why their ACKs never arrive
-is the next question for lane placement. A production version needs tests,
+CPU, holds balanced lanes back on this check. The release runs' counters
+(appended to the same file) narrow down why the ACKs never arrive: ACK-buffer
+drops and coalescing look alike in both arms, but with balanced lanes each
+daemon defers 29,000–32,000 ACK sends per point, against 0–97 with hash
+lanes. A deferral means the send attempt submitted no datagram. ACKs and
+other non-handshake control records always go out on lane 0's socket, and
+balanced lanes give lane 0 its round-robin share of the data, so the
+leading hypothesis is ACKs waiting behind data on that socket. It is
+untested; a per-lane socket-busy count, or sending ACKs on the least
+loaded lane, would test it. A production version needs tests,
 a memory charge for the table and the full bars before it can land.
 
 ## Whether the single QinQ reader limits the loopback check (November 11)
