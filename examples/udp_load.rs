@@ -159,21 +159,41 @@ struct Latency {
     count: u64,
     sum_ns: u128,
     max_ns: u64,
+    // Receive times (monotonic ns) of the maximum and of the first and last
+    // sample over 100 ms, to place a late tail within the run.
+    max_at_ns: u64,
+    late: u64,
+    first_late_ns: u64,
+    last_late_ns: u64,
 }
 impl Latency {
+    const LATE_NS: u64 = 100_000_000;
+
     fn new() -> Self {
         Self {
             counts: [0; LATENCY_BUCKETS],
             count: 0,
             sum_ns: 0,
             max_ns: 0,
+            max_at_ns: 0,
+            late: 0,
+            first_late_ns: u64::MAX,
+            last_late_ns: 0,
         }
     }
-    fn record(&mut self, ns: u64) {
+    fn record(&mut self, ns: u64, now_ns: u64) {
         self.counts[latency_bucket(ns)] += 1;
         self.count += 1;
         self.sum_ns += u128::from(ns);
-        self.max_ns = self.max_ns.max(ns);
+        if ns > self.max_ns {
+            self.max_ns = ns;
+            self.max_at_ns = now_ns;
+        }
+        if ns > Self::LATE_NS {
+            self.late += 1;
+            self.first_late_ns = self.first_late_ns.min(now_ns);
+            self.last_late_ns = self.last_late_ns.max(now_ns);
+        }
     }
 }
 
@@ -361,7 +381,8 @@ fn consume(flow: &mut Flow, bytes: &[u8], segment: usize, size: usize, run: u32,
             let mut stamp = [0; 8];
             stamp[2..].copy_from_slice(&p[16..STAMP_END]);
             let sent = u64::from_be_bytes(stamp);
-            flow.latency.record(now_ns.wrapping_sub(sent) & STAMP_MASK);
+            flow.latency
+                .record(now_ns.wrapping_sub(sent) & STAMP_MASK, now_ns);
         }
     }
 }
@@ -467,6 +488,7 @@ fn run(c: &Config) -> io::Result<()> {
     let mut poll_calls = 0u64;
     let start_cpu = cpu_ns()?;
     let start = Instant::now();
+    let start_ns = monotonic_ns()?;
     let end = Duration::from_secs(c.seconds);
     let length = c.count() * c.payload;
     while start.elapsed() < end {
@@ -575,11 +597,31 @@ fn run(c: &Config) -> io::Result<()> {
         }
         latency.count += f.latency.count;
         latency.sum_ns += f.latency.sum_ns;
-        latency.max_ns = latency.max_ns.max(f.latency.max_ns);
+        if f.latency.max_ns > latency.max_ns {
+            latency.max_ns = f.latency.max_ns;
+            latency.max_at_ns = f.latency.max_at_ns;
+        }
+        latency.late += f.latency.late;
+        latency.first_late_ns = latency.first_late_ns.min(f.latency.first_late_ns);
+        latency.last_late_ns = latency.last_late_ns.max(f.latency.last_late_ns);
     }
+    // Times are seconds since this receiver started; -1 means no such sample.
+    let since = |at: u64| {
+        if at == 0 || at == u64::MAX {
+            -1.0
+        } else {
+            at.saturating_sub(start_ns) as f64 / 1e9
+        }
+    };
     print!(
-        "],\"latency\":{{\"count\":{},\"sum_ns\":{},\"max_ns\":{},\"histogram\":[",
-        latency.count, latency.sum_ns, latency.max_ns
+        "],\"latency\":{{\"count\":{},\"sum_ns\":{},\"max_ns\":{},\"max_at_s\":{:.6},\"over_100ms\":{},\"first_over_100ms_s\":{:.6},\"last_over_100ms_s\":{:.6},\"histogram\":[",
+        latency.count,
+        latency.sum_ns,
+        latency.max_ns,
+        since(latency.max_at_ns),
+        latency.late,
+        since(latency.first_late_ns),
+        since(latency.last_late_ns)
     );
     let mut first = true;
     for (bucket, &count) in latency.counts.iter().enumerate() {
