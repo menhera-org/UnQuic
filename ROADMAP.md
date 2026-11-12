@@ -43,6 +43,17 @@ per-bit cost puts both daemons near the host's core count before the gate.
 Keeping the single QinQ reader off its own lanes cost 45% more CPU and was
 dropped.
 
+The small-frame rows, rerun at the current build, fell behind the
+pre-recovery build: untagged 64-byte frames over sixteen flows deliver about
+3.3 M frames/s per direction unlimited with eight workers (5.87 / 5.74 M
+before) and 4.2–4.5 M with sixteen. Two costs add up. Each frame takes about
+45% more CPU than before recovery and BBR, and tun's queue hash leaves one
+to one and a half of eight workers per daemon without transmit work, while
+the busiest readers run at 96–98%. Balanced lanes do not change this:
+unfragmented UDP keeps a lane owned by the worker that read it, and
+`balance_flows` never sees those frames
+([BENCH.md](BENCH.md#small-frame-rows-at-the-current-build-november-12)).
+
 ## November 11 checkpoint
 
 The loopback overload check was window-limited, not CPU-limited. BBR sized
@@ -275,6 +286,15 @@ rules apply to all of them.
    which the container's 416 KiB receive buffer (no `CAP_NET_ADMIN` in the
    initial namespace) makes worse than a root deployment's 8 MiB
    ([BENCH.md](BENCH.md#sixteen-workers-per-daemon-november-11-exploratory)).
+   The small-frame rows were rerun on November 12. They show the same two
+   limits in another form: per-frame cost about 45% above the pre-recovery
+   build, and transmit work tied to tun's uneven queue hash, which leaves
+   some workers idle while the busiest readers saturate
+   ([BENCH.md](BENCH.md#small-frame-rows-at-the-current-build-november-12)).
+   UDP lane locality keeps transmit work on the reading worker, so the
+   next candidate is to let local-lane frames spread when tun's queues are
+   uneven, measured against the cross-worker handoff cost that locality
+   was added to avoid.
 6. **Stage 4** is done as of November 12. OVS joined the composition
    matrix, and the panic audit converted the last locally bounded indexing in
    the encoders and the batch planner: explicit panics are gone, untrusted-input

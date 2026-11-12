@@ -96,7 +96,7 @@ comparison below.
 
 ## Current performance gaps
 
-Updated November 12; the first two rows and the last two are current, the
+Updated November 12; the first three rows and the last two are current, the
 others keep earlier evidence. L→R / R→L pairs are simultaneous. Run-to-run
 noise is large: identical binaries differ by up to 7.5% in loopback total and
 up to 18% in one direction (A/A, November 12), so single differences of a few
@@ -107,7 +107,7 @@ Gbit/s at an offer-limited load instead.
 | --- | --- | --- |
 | At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98%. With sixteen workers per daemon and thirty-two flows: 7.11 / 7.03 Gbit/s, no thread above 75%, limited by receive-socket overflow under the container's 416 KiB buffer ([BENCH.md](#sixteen-workers-per-daemon-november-11-exploratory)) | One left worker does two jobs: it reads every L→R frame from the TAP (QinQ input all lands on one queue) and receives the R→L lanes it owns. L→R senders idle for its input; its socket overflows and R→L loses packets, so BBR cuts. More receive buffers move capacity from L→R to R→L (+11% total, L→R −14%); letting tun spread reads costs 23% more CPU per bit ([BENCH.md](#receive-buffers-for-a-busy-reader-november-11)). Next: keep receive work off the TAP reader, or split TAP reading inside the daemon. |
 | Goodput must plateau under excess traffic | Decision workload (four workers, 4.5 ms): sixteen flows deliver 1.4–2.1 Gbit/s per direction at 5G offered without collapse; workers run at 79–99% of a core | Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
-| Small-frame overload must remain efficient | Earlier pre-recovery tagged 64-byte runs range from 2.65–3.69M to 4.74–5.28M frames/s per direction with different placements. QinQ 128-byte reverse goodput falls from 2.48M to 2.19M under unlimited load | Worker utilization is uneven and placement-sensitive. High loss persists; mixed traffic, non-coalescible frames and repeated matched placement remain unverified. |
+| Small-frame overload must remain efficient | Untagged 64-byte frames, sixteen flows, current build: 3.24–3.43 / 3.27–3.48 M frames/s unlimited with eight workers and 4.23–4.53 / 4.16–4.57 M with sixteen, against 5.87 / 5.74 M for the pre-recovery build; 1.85–1.95 cores per M frames/s against 1.28–1.33 ([BENCH.md](#small-frame-rows-at-the-current-build-november-12)) | About 45% more CPU per frame since recovery and BBR, and one to one and a half of eight workers per daemon idle because tun's queue hash leaves them no transmit work; balanced lanes do not change this. High ingress loss persists; mixed traffic and non-coalescible frames remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input and output offloads improve matched TCP sweeps; single-stream output coalescing reaches 2.01 / 2.26 Gbit/s, still below the deployment target. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
@@ -601,6 +601,65 @@ delivered Gbit/s at 4G is lower in at least seven pairs with a median of
 pairs, median −2.0% (−5.2% to +0.3%), against the A/A's 5 of 8 and −0.5%. The
 21G total's median paired change is +2.3%. Both kernel suites pass. The
 change lands, with its blocking decision moved into a tested function.
+
+## Small-frame rows at the current build (November 12)
+
+Stage 2 asks for small-frame burst rows as well as the 20 Gbit/s gate. The
+last ones predate recovery and BBR, so this reruns them at `acef86d`: one
+container, untagged 64-byte frames (22-byte UDP payloads, 64 segments per
+send), sixteen flows, distinct ports per direction, 20-second points at 40
+Mbit/s of payload per flow and then unlimited, eight and sixteen workers
+alternating, two repeats, 1 GiB `memory_limit`. No candidate, so no bar; the
+expectation written beforehand was delivery near the earlier build's 3.49 /
+3.35 M frames/s at 40M and 5.87 / 5.74 M unlimited (eight workers,
+[UDP lane locality](#udp-controls-and-remaining-declines)), possibly lower
+under BBR.
+[Results](benches/tap-small-frames.json), frames/s L→R / R→L, CPU left /
+right:
+
+| Workers | Request | Offered M frames/s | Delivered M frames/s | Missing % | Daemon CPU | Cores per M frames/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8 | 40M | 3.59 / 3.59 | 2.82–2.83 / 2.52–2.62 | 20 / 26–29 | 534–544% / 497–499% | 1.89–1.95 |
+| 8 | unlimited | 18.7–19.1 / 18.3–18.4 | 3.24–3.39 / 3.27–3.34 | 82–83 / 82 | 610–638% / 591–612% | 1.85–1.86 |
+| 16 | 40M | 3.62 / 3.62–3.63 | 3.31 / 3.50–3.55 | 7.5 / 0.9–2.0 | 750–761% / 693–695% | 2.12 |
+| 16 | unlimited | 17.7–18.8 / 18.3–19.1 | 4.23–4.53 / 4.16–4.57 | 76 / 76–77 | 931–961% / 833–873% | 2.02–2.10 |
+
+The expectation failed. Eight workers deliver about 19% less than the
+pre-recovery build at 40M and 43% less unlimited, and each frame now costs
+1.85–1.95 cores per million frames/s against 1.28–1.33 then (both
+daemons' CPU over both directions' frames, from the two earlier unlimited
+runs). No queue, admission, handoff or ACK-buffer drops and almost no
+socket overflow appear; the missing frames are TAP ingress drops at the
+generator side, which the overload rows have always shown. Sixteen workers
+add 30–35% unlimited at about 10% more CPU per frame.
+
+A profile build at the eight-worker unlimited point
+([profile](benches/tap-small-frames-profile.txt)) shows the per-frame cost
+is not the whole story. tun's hash spreads sixteen flows over eight TAP
+queues unevenly, and a worker with no queue gets no transmit work: on the
+left, workers 5 and 6 only receive and wait 65–67% of their cycles; on the
+right, worker 4 waits 100% and worker 2 59%. Transmitting workers spend
+about 40–50% of their cycles building and sending batches (`flush_frames`
+plus `service_sender`). `sendmmsg` averages 3.9 datagrams per call at about
+8,900 cycles per datagram.
+
+Balanced lanes do not help here. Two more alternating repeats at eight
+workers, hash lanes against `balance_flows = true`
+([results](benches/tap-small-frames-balanced.json)), deliver 3.33–3.43 /
+3.44–3.48 M frames/s unlimited with hash lanes and 3.30–3.36 / 3.44–3.51 M
+balanced, at 643–656% / 622–630% CPU either way, with the busiest thread at
+96–98% in every run. That follows from the code: unfragmented UDP with at
+most one tag takes a lane owned by the worker that read it
+(`prefer_local_lane`, from the UDP lane-locality change), and
+`balance_flows` only applies to frames that would otherwise hash across
+all lanes. These frames never reach it, so the busiest readers stay the
+limit.
+
+So the small-frame rows have two separate costs: about 45% more CPU per
+frame than before recovery and congestion control, and one to one and a half
+of eight workers per daemon idle because transmit work follows tun's queue
+hash. Daemon SHA-256 for the release runs:
+`4bb2375fc9c50e33fcf9d0c2591502d4404e1231cbd9c73d2ecd17407a9ab031`.
 
 ## Sixteen workers per daemon (November 11, exploratory)
 
