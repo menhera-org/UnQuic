@@ -518,7 +518,10 @@ rules apply to all of them.
    ([counts](benches/control-refusals.txt)) puts about half the deferrals
    (24,607 of 48,799 and 37,765 of 75,170 per daemon) on lane 0's history
    headroom; the rest come from the socket or the later reserve check,
-   which that patch did not count. Two shapes are possible: send control records ahead of
+   which that patch did not count. The headroom is only 64 of 65,536
+   numbers, so those refusals mean lane 0's history is full, its floor
+   pinned by unacknowledged data. That favours a control lane with its own
+   history over merely ordering control ahead of data on lane 0. Two shapes are possible: send control records ahead of
    data on lane 0, or give them a lane of their own with its own history.
    Many worker unit tests assume lane 0 for control.
 
