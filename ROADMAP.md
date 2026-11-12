@@ -142,6 +142,9 @@ That restores the plateau: four flows at 5G deliver 1.21–1.23 / 2.02–2.05
 Gbit/s instead of 0.92–0.93 / 1.36–1.46 (+40% in total), for 7% of 2G
 L→R, with sixteen flows, the loopback check and light-load CPU unchanged
 ([BENCH.md](BENCH.md#owners-refusing-each-other-a-read-margin-landed)).
+Across the whole decision matrix every 5G total now matches or exceeds its
+2G total, at 6–19% less CPU per bit; lossy four-flow L→R still loses 10%
+from 2G to 5G, and overloaded p99 delay rose with the extra delivery.
 Balanced lanes rescue the same point differently (decision 5 below).
 
 Decisions only the user can make, each blocking a remaining goal:
