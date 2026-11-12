@@ -302,7 +302,9 @@ rules apply to all of them.
    worker has slack. That needs a saturation signal the per-read handler
    does not have today, and must not reorder a flow that changes lanes.
    One small-frame flow reaches 0.61–0.67 M frames/s, limited by one
-   thread.
+   thread. 60-byte frames match 64-byte ones; 128-byte frames are lossless
+   at 0.92 M frames/s paced, and unlimited R→L trails L→R by a quarter to a
+   third.
 6. **Stage 4** is done as of November 12. OVS joined the composition
    matrix, and the panic audit converted the last locally bounded indexing in
    the encoders and the batch planner: explicit panics are gone, untrusted-input

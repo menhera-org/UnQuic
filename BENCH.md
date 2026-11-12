@@ -643,6 +643,21 @@ about 40–50% of their cycles building and sending batches (`flush_frames`
 plus `service_sender`). `sendmmsg` averages 3.9 datagrams per call at about
 8,900 cycles per datagram.
 
+The other two frame sizes Stage 2 names, same settings at eight workers,
+two repeats ([results](benches/tap-small-frames-sizes.json)):
+
+| Frame bytes | Request | Offered M frames/s | Delivered M frames/s | Missing % | Daemon CPU | Cores per M frames/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| 60 | 40M | 4.39–4.42 / 4.41–4.43 | 3.19–3.24 / 2.58–2.60 | 26–27 / 40–41 | 577% / 523–526% | 1.89–1.90 |
+| 60 | unlimited | 17.8–18.5 / 17.5–18.1 | 3.41–3.42 / 3.46–3.47 | 81 / 80–81 | 636–638% / 617% | 1.82 |
+| 128 | 40M | 0.93 / 0.93 | 0.92 / 0.92 | 0.0 / 0.0 | 212–213% / 195–200% | 2.22–2.24 |
+| 128 | unlimited | 16.1–16.9 / 15.4–16.7 | 2.88–3.38 / 2.08–2.23 | 80–82 / 86 | 530–564% / 478–492% | 1.93–1.97 |
+
+Cost is per frame, as expected: 60-byte frames behave like 64-byte ones.
+At 128 bytes the reverse direction delivers a quarter to a third less than
+the forward one under overload, which the 64-byte rows do not show. Two
+repeats cannot say whether that is placement or a real asymmetry.
+
 One flow, same settings at eight workers, two repeats
 ([results](benches/tap-small-frames-one-flow.json)): 40M (0.23 M frames/s)
 arrives with no missing frames at 54–58% / 54–56% CPU; unlimited delivers
