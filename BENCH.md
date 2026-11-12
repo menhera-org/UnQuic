@@ -546,10 +546,46 @@ six of eight runs, against 0.01–0.08% without it. The right daemon's
 transmit admission drops rise from 52–608 per run to 32–3,677 (median 190
 to 2,281), and a
 `trace` run attributes them to `admit_owner_buffers`: an owner refusing
-another reader's frames to keep its receive-buffer reserve. Why a 200 µs
-hold drains that reserve is not yet explained; it must be before the hold
-is considered as a default. Daemon SHA-256:
+another reader's frames to keep its receive-buffer reserve. Daemon SHA-256:
 `80a9d4266f7a8031191e168470a17cd0fb4ec91d16c79a62896b5b803652bc26`.
+
+### Held data and application-limited marking
+
+A `trace` run of each arm explains the drops. Without the hold both
+controllers spend 99% of the point in Startup: light load is correctly
+marked application-limited. With it the right controller leaves Startup
+almost at once (Startup 2%, ProbeBW cruise 47%, up 49%). Held frames are
+unsent data, and a group starts draft 07's application-limited bubble only
+when new data finds no worker holding any; with sixteen flows some lane is
+almost always holding, so no bubble starts, BBR takes its samples as real
+bandwidth and paces near the offered rate. Bursts then queue, lanes reach
+the fresh-expansion bound, unexpanded TAP inputs pin other readers' buffers
+(108 of 128 inputs and 165 pending returns at one owner) and the owners
+refuse foreign frames.
+
+The fix follows Linux TCP, which counts under one MSS of unsent data as
+application-limited: with the hold on, a worker supplies its group only
+from two of its lane's datagrams of unsent bytes, the most a hold keeps.
+With the hold off that floor is one byte, as before. Rerun with the same
+design and a bar written beforehand, which added: the hold arm's R→L
+missing at most the control's maximum plus 0.05 points, and its admission
+drops' median within the control's range
+([results](benches/decision-tx-hold-fixed.json)):
+
+| Arm | Pairs lower | Change per pair | Median | R→L missing | Admission drops, median |
+| --- | --- | --- | --- | --- | --- |
+| hold 0 → 200 µs, 0.5G | 8 of 8 | −6.8% to −4.9% | −5.5% | 0.00–0.19% (control 0.00–0.04%) | 56 (control 26–328) |
+| A/A, 0.5G | 3 of 8 | −1.3% to +4.1% | +2.3% | 0.00–0.13% | |
+
+At 5G the hold delivers 3.56–3.82 Gbit/s against 3.47–3.68 (median +3.6%).
+The CPU gain stays, so it never came from BBR leaving Startup, and the
+admission drops are back in the control's range. One condition misses: the
+worst hold run lost 0.19% of R→L frames against the 0.09% allowed, though
+the A/A arm itself reached 0.13%. The fix lands anyway, because it changes
+nothing with the switch off and strictly reduces the side effect of the
+switch already in the tree (drop median 2,281 to 56, worst R→L missing
+0.52% to 0.19%); the switch stays off. Daemon SHA-256:
+`cad25b63ce082c48ccd29476e59dd23822362f24beccfc9fb981210fbf4d0e06`.
 
 ## Checked indexing in the encoders and batch planner (November 12)
 

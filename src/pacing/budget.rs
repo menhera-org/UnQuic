@@ -302,6 +302,11 @@ impl Budget {
         self.rare.unsent.fetch_or(1 << worker, Ordering::AcqRel) == 0
     }
 
+    /// Whether no worker currently supplies unsent data for this group.
+    pub fn unsupplied(&self) -> bool {
+        self.rare.unsent.load(Ordering::Acquire) == 0
+    }
+
     /// Notes that `worker` sent or discarded all its unsent data for this group.
     pub fn drained(&self, worker: usize) {
         self.rare.unsent.fetch_and(!(1 << worker), Ordering::AcqRel);

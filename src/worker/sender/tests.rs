@@ -195,6 +195,41 @@ fn only_new_data_in_an_idle_group_marks_application_limited_sends() {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
+fn held_data_below_two_datagrams_leaves_the_group_idle() {
+    let (mut workers, _rx) = workers();
+    for worker in &mut workers {
+        worker.hold = Duration::from_micros(200);
+    }
+    let limit = workers[1].transmit[0].paths[0].lanes[1].mtu.payload_limit();
+    assert_ne!(limit, 0);
+    // Worker 1 keeps less than two datagrams unsent, as much as a hold may
+    // keep, so new data on worker 0 still finds the group idle.
+    queue_frame(&mut workers[1], 60);
+    queue_frame(&mut workers[0], 60);
+    assert_eq!(workers[0].counters.app_limited_marks, 1);
+    assert_eq!(workers[1].counters.app_limited_marks, 1);
+    // Two datagrams unsent on worker 1 supply the group: no bubble for worker 0.
+    let index = workers[1].sender_index(0, 1).unwrap();
+    while workers[1].sender.lanes[index].unsent_bytes < 2 * limit {
+        queue_frame(&mut workers[1], 1514);
+    }
+    let index = workers[0].sender_index(0, 0).unwrap();
+    let unsent = workers[0].sender.lanes[index].unsent_bytes;
+    workers[0].remove_unsent(index, unsent).unwrap();
+    queue_frame(&mut workers[0], 60);
+    assert_eq!(workers[0].counters.app_limited_marks, 1);
+    // Back under the floor, worker 1 stops supplying.
+    let index = workers[1].sender_index(0, 1).unwrap();
+    let unsent = workers[1].sender.lanes[index].unsent_bytes;
+    workers[1].remove_unsent(index, unsent - 60).unwrap();
+    let index = workers[0].sender_index(0, 0).unwrap();
+    workers[0].remove_unsent(index, 60).unwrap();
+    queue_frame(&mut workers[0], 60);
+    assert_eq!(workers[0].counters.app_limited_marks, 2);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
 fn local_ack_releases_the_shared_charge_in_the_same_turn() {
     let (mut workers, rx) = workers();
     frame(&mut workers[0]);

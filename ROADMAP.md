@@ -1419,9 +1419,13 @@ November 10 evidence for that list, all in BENCH.md:
   hold landed on November 12 as `daemon.tx_hold_us`, off by default: at 200
   µs it cut CPU per Gbit/s at 0.5G by 5.1% (eight of eight pairs) with 5G
   unchanged, but one direction's missing frames rose from about 0.03% to
-  0.4% through owner-buffer admission drops
-  ([BENCH.md](BENCH.md#holding-idle-lanes-for-a-second-datagram-november-12)).
-  Explain those drops before any default change.
+  0.4% through owner-buffer admission drops. Traces tied those to held
+  data hiding idle moments from application-limited marking; counting a
+  worker as supplying its group only from two datagrams (as Linux TCP
+  ignores under one MSS) keeps the 5.5% gain and returns the drops to the
+  control's range, though one run still missed 0.19% of a direction
+  ([BENCH.md](BENCH.md#held-data-and-application-limited-marking)). A
+  default change needs that last loss explained and a latency measurement.
   Fixed per-turn work matters here too: sweeping only occupied receive slots
   for ACKs cut light-load CPU per Gbit/s by 4.1%
   ([BENCH.md](BENCH.md#scanning-only-occupied-receive-slots-for-acks-november-12));

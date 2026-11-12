@@ -764,6 +764,7 @@ impl Worker {
     /// the group's mask but only its own repairs; a refused admission since its
     /// last unsent data also rules the bubble out.
     pub(super) fn add_unsent(&mut self, index: usize, bytes: usize) -> io::Result<()> {
+        let floor = self.supply_floor(index);
         let lane = self
             .sender
             .lanes
@@ -779,15 +780,20 @@ impl Worker {
             .unsent
             .get_mut(group)
             .ok_or(io::ErrorKind::InvalidData)?;
-        let idle = unsent.bytes == 0 && bytes != 0;
+        let idle = unsent.bytes < floor && bytes != 0;
         unsent.bytes = unsent
             .bytes
             .checked_add(bytes)
             .ok_or(io::ErrorKind::InvalidData)?;
+        let supplies = unsent.bytes >= floor;
         if idle {
             let pressed = std::mem::take(&mut unsent.pressed);
             if let Some(budget) = self.sender.budgets.get(group)
-                && budget.supply(self.id)
+                && if supplies {
+                    budget.supply(self.id)
+                } else {
+                    budget.unsupplied()
+                }
                 && !pressed
                 && self.recovery.repairs() == 0
                 && budget.application_limited(&budget.published())
@@ -798,8 +804,33 @@ impl Worker {
         Ok(())
     }
 
+    /// Unsent bytes from which this worker supplies its group: one byte, or
+    /// with daemon.tx_hold_us two of the lane's datagrams, the most a hold
+    /// keeps. Like Linux TCP's under-one-MSS rule, held data then still counts
+    /// as application-limited instead of hiding every idle moment.
+    fn supply_floor(&self, index: usize) -> usize {
+        if self.hold.is_zero() {
+            return 1;
+        }
+        let Some(lane) = self.sender.lanes.get(index) else {
+            return 1;
+        };
+        let limit = self
+            .shared
+            .config
+            .peer_for_session(lane.session)
+            .and_then(|peer| self.transmit.get(peer))
+            .zip(self.sessions.get(lane.session))
+            .and_then(|(peer, local)| peer.paths.get(local.path))
+            .zip(usize::from(lane.lane).checked_sub(1))
+            .and_then(|(path, lane)| path.lanes.get(lane))
+            .map_or(0, |tx| tx.mtu.payload_limit());
+        limit.saturating_mul(2).max(1)
+    }
+
     /// Removes a lane's sent or discarded fresh bytes.
     pub(super) fn remove_unsent(&mut self, index: usize, bytes: usize) -> io::Result<()> {
+        let floor = self.supply_floor(index);
         let lane = self
             .sender
             .lanes
@@ -819,7 +850,8 @@ impl Worker {
             .bytes
             .checked_sub(bytes)
             .ok_or(io::ErrorKind::InvalidData)?;
-        if unsent.bytes == 0 && bytes != 0 {
+        // Clearing on every removal below the floor survives a path MTU change.
+        if unsent.bytes < floor && bytes != 0 {
             unsent.pressed = false;
             if let Some(budget) = self.sender.budgets.get(group) {
                 budget.drained(self.id);
