@@ -144,7 +144,9 @@ L→R, with sixteen flows, the loopback check and light-load CPU unchanged
 ([BENCH.md](BENCH.md#owners-refusing-each-other-a-read-margin-landed)).
 Across the whole decision matrix every 5G total now matches or exceeds its
 2G total, at 6–19% less CPU per bit; lossy four-flow L→R still loses 10%
-from 2G to 5G, and overloaded p99 delay rose with the extra delivery.
+from 2G to 5G, held by the one owner hashing gives two flows, which runs at
+95–96% of a core. Overloaded p99 delay rose with the extra delivery; a
+64-entry TAP ring removes most of it (decision 2).
 Balanced lanes rescue the same point differently (decision 5 below).
 
 Decisions only the user can make, each blocking a remaining goal:
