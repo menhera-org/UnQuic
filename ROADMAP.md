@@ -34,7 +34,10 @@ Masking the TAP flush and deadline scans missed its bar.
 one flow at 5% loss rises from under 10 Mbit/s to about 0.45 Gbit/s with a
 competing TCP flow's share unchanged, but it costs 3% at 1% loss, so the
 default stays. A trace places the remaining 5% limit in BBR's long-term
-bound, which makes that row a job for FEC.
+bound, which makes that row a job for FEC. FEC only lifts it if packets it
+recovers are acknowledged as received, hiding their loss from congestion
+control, congestion losses included; whether that is acceptable is a
+policy decision still open.
 
 A 9000-byte outer path nearly halves the per-bit cost. On the loopback check
 at an 8952-byte payload limit the 21G total rises 70–126% (24–29 Gbit/s
@@ -74,6 +77,15 @@ project's efficiency method: −4.2% CPU per frame at an offer-limited
 small-frame point, eight of eight pairs, against an A/A median of +0.2%
 ([BENCH.md](BENCH.md#the-expiry-heap-at-an-offer-limited-point-landed)).
 No single large target remains in the per-frame path.
+
+At light load each lane sends one frame at a time, so a 1514-byte frame's
+130-byte tail takes a datagram of its own. `daemon.tx_hold_us`, off by
+default, lets an idle lane wait for a second datagram's worth of frames; at
+200 µs it cuts CPU per delivered Gbit/s 5.5% at 0.5G on the decision
+workload. Its first version hid idle moments from application-limited
+marking and caused admission drops; the fixed version still lost 0.19% of
+one direction in one run, above its bar, so it stays off
+([BENCH.md](BENCH.md#holding-idle-lanes-for-a-second-datagram-november-12)).
 
 ## November 11 checkpoint
 
