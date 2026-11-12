@@ -419,6 +419,31 @@ reads follow. Part of balanced lanes' gain is therefore striping single
 flows, at that reordering cost. A flow table shared by a session's readers
 would keep each flow on one lane.
 
+### A flow table shared by all readers (exploratory)
+
+An exploratory patch ([patch](benches/shared-flow-table-exploratory.patch),
+behind an environment variable, a process-wide direct-mapped table of
+atomic slots claimed by compare-and-swap) gives every reader the same flow
+table. Stated beforehand: if per-reader tables cause the striping, the
+shared table cuts reordering and reader changes by an order of magnitude.
+Profile build with the reader-change counter, four flows at 5G, two rounds
+of three arms ([results](benches/shared-flow-table-four-flows.json),
+[reader changes](benches/shared-flow-table-reader-changes.txt)):
+
+| Four flows, 5G | L→R / R→L Gbit/s | Reordered frames per direction | Reader changes (left, 20 s) |
+| --- | --- | --- | --- |
+| Hash lanes | 1.15–1.19 / 1.92–2.00 | 1,240–23,600 | 26 |
+| Balanced, per-reader tables | 1.62–1.64 / 1.92–1.99 | 258,000–699,000 | 54,764 |
+| Balanced, shared table | 1.98–2.00 / 1.92–1.94 | 1,330–3,010 | 24 |
+
+The shared table keeps flows on their readers and lanes, removes the
+striping, and delivers the most L→R of the three. On the loopback overload
+check (one run each, [results](benches/shared-flow-table-loopback.json)) it
+does not remove balanced lanes' cost: 10.83 Gbit/s at 21G against 11.47
+with hash lanes and 10.68 with per-reader tables, with little reordering in
+any arm. That cost comes from elsewhere. A production version needs tests,
+a memory charge for the table and the full bars before it can land.
+
 ## Whether the single QinQ reader limits the loopback check (November 11)
 
 On both sides of the loopback check every TAP read lands on one worker, and

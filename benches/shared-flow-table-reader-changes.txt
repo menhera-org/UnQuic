@@ -1,0 +1,4 @@
+Reader changes per flow, four flows at 5G, worker-0 line of the left daemon (inputs / handed / changes):
+hash profile worker 0 readers inputs/handed/changes [4176876, 4176630, 26]
+perreader profile worker 0 readers inputs/handed/changes [3907354, 2859733, 54764]
+shared profile worker 0 readers inputs/handed/changes [5195030, 5195025, 24]

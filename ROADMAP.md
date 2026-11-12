@@ -180,8 +180,11 @@ Decisions only the user can make, each blocking a remaining goal:
    5G delivery 25–90% by striping, with millions of reordered frames, and on
    the decision workload it reorders 0.1–1.1 million frames per direction
    against at most 22,000 with hash lanes, a cost inner TCP or QUIC would pay.
-   The next lane-placement candidate is a flow table shared by a session's
-   readers, so a balanced flow keeps its lane when tun moves its reads.
+   An exploratory flow table shared by all readers removes that reordering
+   and raises four-flow L→R at 5G to 1.98–2.00 Gbit/s (per-reader tables:
+   1.62–1.64; hash lanes: 1.15–1.19), but leaves the loopback cost
+   ([BENCH.md](BENCH.md#a-flow-table-shared-by-all-readers-exploratory));
+   building it properly is the next lane-placement step.
    ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB

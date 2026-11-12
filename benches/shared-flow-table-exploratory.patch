@@ -1,0 +1,42 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index b59ec02..1748211 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -386,6 +386,10 @@ const FLOW_IDLE_MS: u32 = 1000;
+ /// Pins a flow to the lane it first received, assigning new flows round-robin
+ /// across the session's lanes so a few heavy flows do not share one transmit
+ /// worker. A full table set falls back to the flow hash.
++// Exploratory: one direct-mapped table shared by every reader; key tag, lane, 24-bit ms.
++static SHARED_FLOWS: [std::sync::atomic::AtomicU64; 16384] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 16384];
++
+ fn balanced_lane(
+     slots: &mut [FlowSlot],
+     cursor: &std::sync::atomic::AtomicUsize,
+@@ -394,6 +398,26 @@ fn balanced_lane(
+     lanes: usize,
+     ms: u32,
+ ) -> usize {
++    if std::env::var_os("UNQUIC_SHARED_FLOWS").is_some() {
++        let slot = &SHARED_FLOWS[key as usize % SHARED_FLOWS.len()];
++        let tag = (key >> 32) | 1;
++        let now = u64::from(ms) & 0xff_ffff;
++        let mut old = slot.load(Ordering::Acquire);
++        loop {
++            let (old_tag, old_lane, old_ms) = (old >> 32, (old >> 24) & 0xff, old & 0xff_ffff);
++            if old_tag == tag && now.wrapping_sub(old_ms) & 0xff_ffff < u64::from(FLOW_IDLE_MS) && (old_lane as usize) < lanes {
++                if old_ms != now {
++                    let _ = slot.compare_exchange(old, tag << 32 | old_lane << 24 | now, Ordering::AcqRel, Ordering::Acquire);
++                }
++                return old_lane as usize;
++            }
++            let lane = cursor.fetch_add(1, Ordering::Relaxed) % lanes;
++            match slot.compare_exchange(old, tag << 32 | (lane as u64) << 24 | now, Ordering::AcqRel, Ordering::Acquire) {
++                Ok(_) => return lane,
++                Err(current) => old = current,
++            }
++        }
++    }
+     let sets = slots.len() / FLOW_WAYS;
+     let Some(set) = (sets != 0)
+         .then(|| (key as usize % sets) * FLOW_WAYS)
