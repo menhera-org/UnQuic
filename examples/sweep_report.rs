@@ -47,15 +47,17 @@ fn number(text: &str) -> Option<f64> {
 }
 
 /// Latency histogram buckets; keep in sync with examples/udp_load.rs.
-const LATENCY_BUCKETS: usize = 46 * 8;
+const SUB_BITS: usize = 6;
+const LATENCY_BUCKETS: usize = (48 - SUB_BITS + 1) << SUB_BITS;
 
 /// Largest latency, in ns, a udp_load histogram bucket holds.
 fn latency_upper(bucket: usize) -> u64 {
-    if bucket < 8 {
+    let sub = 1 << SUB_BITS;
+    if bucket < sub {
         return bucket as u64;
     }
-    let exp = bucket / 8 + 2;
-    ((8 + bucket as u64 % 8) << (exp - 3)) + (1 << (exp - 3)) - 1
+    let shift = (bucket >> SUB_BITS) - 1;
+    (((sub + bucket % sub) as u64) << shift) + (1 << shift) - 1
 }
 
 /// Adds a receiver's `"histogram":[[bucket,count],...]` to `counts`.
@@ -446,7 +448,7 @@ mod tests {
             "{\"count\":4,\"max_ns\":9,\"histogram\":[[3,2],[100,1]]}",
             &mut counts,
         );
-        merge_histogram("\"histogram\":[[100,1],[999,5]]}", &mut counts);
+        merge_histogram("\"histogram\":[[100,1],[9999,5]]}", &mut counts);
         merge_histogram("\"histogram\":[]}", &mut counts);
         assert_eq!((counts[3], counts[100]), (2, 2));
         assert_eq!(counts.iter().sum::<u64>(), 4);

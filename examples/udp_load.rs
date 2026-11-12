@@ -16,8 +16,10 @@ const MAGIC: [u8; 4] = *b"UQL2";
 // Payloads of at least 22 bytes carry the send time, 48 bits of monotonic ns, in bytes 16..22.
 const STAMP_END: usize = 22;
 const STAMP_MASK: u64 = (1 << 48) - 1;
-// Log-linear latency buckets: exact below 8 ns, then 8 per power of two up to 2^48 ns.
-const LATENCY_BUCKETS: usize = 46 * 8;
+// Log-linear latency buckets: exact below 64 ns, then 64 per power of two up to 2^48 ns,
+// fine enough (1.6%) to resolve 40 us near a 2.5 ms path delay.
+const SUB_BITS: usize = 6;
+const LATENCY_BUCKETS: usize = (48 - SUB_BITS + 1) << SUB_BITS;
 // Cover delayed super-frames across the harness's eight 10,000-entry TAP queues.
 const WORDS: usize = 1 << 18;
 const MAX_BYTES: usize = 65_487;
@@ -131,21 +133,24 @@ impl Window {
 }
 
 fn latency_bucket(ns: u64) -> usize {
-    if ns < 8 {
+    let sub = 1 << SUB_BITS;
+    if ns < sub as u64 {
         return ns as usize;
     }
     let exp = 63 - ns.leading_zeros() as usize;
-    ((exp - 2) * 8 + ((ns >> (exp - 3)) & 7) as usize).min(LATENCY_BUCKETS - 1)
+    (((exp - SUB_BITS + 1) << SUB_BITS) + ((ns >> (exp - SUB_BITS)) as usize & (sub - 1)))
+        .min(LATENCY_BUCKETS - 1)
 }
 
 /// Largest latency a bucket holds; examples/sweep_report.rs reports with a copy.
 #[cfg(test)]
 fn latency_upper(bucket: usize) -> u64 {
-    if bucket < 8 {
+    let sub = 1 << SUB_BITS;
+    if bucket < sub {
         return bucket as u64;
     }
-    let exp = bucket / 8 + 2;
-    ((8 + bucket as u64 % 8) << (exp - 3)) + (1 << (exp - 3)) - 1
+    let shift = (bucket >> SUB_BITS) - 1;
+    (((sub + bucket % sub) as u64) << shift) + (1 << shift) - 1
 }
 
 // One-way delay of stamped payloads, from the sender's send call to the receive call.
@@ -662,7 +667,7 @@ mod tests {
             if bucket > 0 {
                 assert!(ns > latency_upper(bucket - 1));
             }
-            assert!(latency_upper(bucket) - ns <= ns / 8);
+            assert!(latency_upper(bucket) - ns <= ns >> SUB_BITS);
         }
         assert_eq!(latency_bucket(STAMP_MASK), LATENCY_BUCKETS - 1);
         // A stamp taken just before the 48-bit wrap still yields the true delay.

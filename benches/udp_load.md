@@ -53,8 +53,8 @@ sender's `CLOCK_MONOTONIC` nanoseconds, read once per send call, in bytes
 16–21. Receivers subtract it, modulo 2^48, from the time of the receive call,
 so the delay includes waiting in the receiving socket, and sender and
 receiver must share a clock, as they do on one host. Each flow keeps a fixed
-histogram: exact below 8 ns, then eight buckets per power of two, so a value
-is reported at most an eighth above its true size. The JSON's `latency`
+histogram: exact below 64 ns, then 64 buckets per power of two, so a value
+is reported at most 1.6% above its true size. The JSON's `latency`
 object holds the sample count, sum, maximum and the non-empty buckets;
 `examples/sweep_report.rs` merges every receiver of a direction and reports
 p50, p99, p99.9 and the maximum in microseconds. 60-byte frames (18-byte
