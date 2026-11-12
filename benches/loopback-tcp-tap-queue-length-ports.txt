@@ -1,0 +1,14 @@
+TCP through the tunnel on loopback with distinct reverse ports, November 12: 1dd3a4c, eight workers, untagged 1514-byte frames, eight iperf3 TCP streams each way, unlimited, 20 s, 1 GiB memory_limit, REVERSE_PORT_OFFSET 2000, TAP_TXQUEUELEN 500 vs 64, two alternating pairs (500, 64, 64, 500).
+Per run: each direction received Gbit/s, mean of the streams mean_rtt, largest max_rtt, sender retransmits; then totals, daemon CPU and TCP SACK reordering events (left/right); then TAP qdisc drops (left, right).
+TAP_TXQUEUELEN=500 r1 L>R Gbit/s 5.59 mean_rtt_ms 6.4 max_rtt_ms 38.3 retransmits 85865 | R>L Gbit/s 4.28 mean_rtt_ms 5.6 max_rtt_ms 190.2 retransmits 104754
+q500/r1 L>R=5.59 R>L=4.28 total=9.87 cpu_L=470% cpu_R=491% cpu_per_gbps=97.4% reorder=112/42
+dropped 0 dropped 0 
+TAP_TXQUEUELEN=64 r1 L>R Gbit/s 5.13 mean_rtt_ms 2.7 max_rtt_ms 50.5 retransmits 93872 | R>L Gbit/s 4.62 mean_rtt_ms 6.4 max_rtt_ms 126.3 retransmits 90812
+q64/r1 L>R=5.13 R>L=4.62 total=9.76 cpu_L=455% cpu_R=513% cpu_per_gbps=99.3% reorder=0/5
+dropped 0 dropped 0 
+TAP_TXQUEUELEN=500 r2 L>R Gbit/s 4.99 mean_rtt_ms 6.1 max_rtt_ms 39.5 retransmits 86239 | R>L Gbit/s 4.60 mean_rtt_ms 6.7 max_rtt_ms 86.4 retransmits 101431
+q500/r2 L>R=4.99 R>L=4.60 total=9.60 cpu_L=431% cpu_R=492% cpu_per_gbps=96.2% reorder=1/68
+dropped 0 dropped 0 
+TAP_TXQUEUELEN=64 r2 L>R Gbit/s 5.12 mean_rtt_ms 2.7 max_rtt_ms 20.7 retransmits 85862 | R>L Gbit/s 4.60 mean_rtt_ms 28.6 max_rtt_ms 359.1 retransmits 86460
+q64/r2 L>R=5.12 R>L=4.59 total=9.71 cpu_L=444% cpu_R=507% cpu_per_gbps=97.9% reorder=0/62
+dropped 0 dropped 0 

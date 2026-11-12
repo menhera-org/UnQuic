@@ -825,7 +825,17 @@ worst RTTs. The UDP overload case is where it matters. The TAP statistics
 show the price of a short ring for TCP: 467 and 172 dropped TSO aggregates
 per run with 64 entries, none with 500. In both, TCP's retransmissions run
 several times the frames the daemons drop (for example 78,000 against about
-7,400 expired or refused L→R frames).
+7,400 expired or refused L→R frames). These TCP runs used colliding iperf3
+ports (explained below), whose reordering held TCP's windows down.
+
+Rerun with distinct ports on `1dd3a4c`, two alternating pairs
+([summary](benches/loopback-tcp-tap-queue-length-ports.txt)): with 500
+entries the total is 9.60–9.87 Gbit/s, mean RTT 5.6–6.7 ms and largest
+38–190 ms; with 64 entries 9.71–9.76 Gbit/s, 2.7–28.6 ms and 21–359 ms.
+Neither ring drops anything. Without the reordering TCP builds deeper
+queues, but they sit in the daemons' transmit queues (frames may wait up
+to their 100 ms lifetime in each direction), not in the TAP ring, so the
+ring length makes no consistent difference for TCP.
 
 The harness now also records each inner namespace's `/proc/net/netstat`.
 One more pair with it ([counters](benches/loopback-tcp-tcpext.txt)) showed
