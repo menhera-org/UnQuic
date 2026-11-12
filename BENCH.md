@@ -837,6 +837,20 @@ queues, but they sit in the daemons' transmit queues (frames may wait up
 to their 100 ms lifetime in each direction), not in the TAP ring, so the
 ring length makes no consistent difference for TCP.
 
+A `trace` run of the same TCP case (500 entries, distinct ports, one run,
+9.29 Gbit/s) puts the losses at the receive sockets, not in a send queue.
+The left daemon's workers wait for input 75% of the time (right: 58%), on
+pacing 8–9% and on the window 3%. Meanwhile 16,646 / 33,127 sent frames
+reach their lifetime unacknowledged, and no acknowledgement for them ever
+arrives late, so they were lost: the senders declare 2,596 / 2,055 packets
+lost and make 3,969 / 3,408 repairs. The receive sockets overflow 178 / 227
+times, and with UDP GRO each overflow drops a whole coalesced batch of up
+to 64 datagrams, which matches that scale; the container's 416 KiB receive
+buffer holds only a few such batches. Frames waiting for repair then fill
+the owners' frame stores, and admission refuses 9,787 / 3,963 inputs for
+lack of frame slots. TCP through the tunnel on this host is therefore
+limited by the same receive buffers as the 20 Gbit/s gate.
+
 The harness now also records each inner namespace's `/proc/net/netstat`.
 One more pair with it ([counters](benches/loopback-tcp-tcpext.txt)) showed
 TCP seeing a lot of reordering: SACK-detected reordering of 12,000–38,000
