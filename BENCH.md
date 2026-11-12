@@ -495,6 +495,17 @@ The second position may carry a small advantage, which would have favoured
 every candidate tested second so far. Later paired designs alternate the
 order (control first in half the pairs).
 
+Throughput at overload is the wrong metric for an efficiency change. At the
+loopback check's 4G warm-up point both arms deliver the whole offer, so
+daemon CPU per delivered Gbit/s measures efficiency directly. In the A/A
+pairs it spreads from −3.4% to +1.8%. Looking back at the rejected timer
+change's pairs (exploratory, not a decision), all eight used less CPU per
+Gbit/s at 4G, median −2.3%. A fresh, pre-registered test of that patch on
+this metric: eight pairs with alternating order; it lands if its CPU per
+delivered Gbit/s at 4G is lower in at least seven pairs with a median of
+−1% or better, while the 21G total's median paired change is no worse than
+−2%, and both kernel suites pass.
+
 ## Sixteen workers per daemon (November 11, exploratory)
 
 The harness now accepts `WORKERS=16`. One run each, current build, 21G
