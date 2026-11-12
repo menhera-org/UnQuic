@@ -234,7 +234,16 @@ unlimited and 5% CPU per frame paced, on the small-frame rows (untagged
 64-byte frames, sixteen flows, eight workers, two alternating pairs,
 [results](benches/small-frames-owner-reserve.json)): unlimited 6.90–7.03 M
 frames/s in total against 6.93–7.20, and 190–195% of a core per M frames/s
-at the paced point against 187–194%. Both within noise. Balanced lanes, below, rescue the same four-flow point
+at the paced point against 187–194%. Both within noise.
+
+The lossy four-flow rows (0.1% outer loss), stated beforehand as needing a
+5G total at least 20% above `3178088` and neither direction lower at 5G
+than at 2G ([results](benches/decision-four-flows-lossy-owner-reserve.json)):
+at 2G the margin delivers 1.39–1.41 / 1.56–1.60 Gbit/s against 1.20–1.21 /
+1.58–1.73, and at 5G 1.25–1.26 / 1.76–1.78 against 0.84–0.85 / 1.49–1.54.
+The 5G total rises 28% and holds the 2G total, but L→R still loses 10%
+between 2G and 5G, so the second condition fails: with loss the plateau
+holds in total, not yet in each direction. Balanced lanes, below, rescue the same four-flow point
 by a different route.
 
 ### Balanced lanes on the decision workload, revisited
