@@ -587,6 +587,36 @@ switch already in the tree (drop median 2,281 to 56, worst R→L missing
 0.52% to 0.19%); the switch stays off. Daemon SHA-256:
 `cad25b63ce082c48ccd29476e59dd23822362f24beccfc9fb981210fbf4d0e06`.
 
+### What the hold costs in latency
+
+`udp_load` now stamps each payload of at least 22 bytes with its send time
+and reports one-way delay ([udp_load.md](benches/udp_load.md)). Measurement,
+no candidate, same binary and workload: hold 0 against 200 µs, four pairs at
+0.5G and two at 5G, written beforehand with the expectation of up to about
+100 µs more at p50 and up to 200 µs at p99 under light load and no change at
+5G ([results](benches/decision-tx-hold-latency.json)). A first run used
+histogram buckets 300 µs wide near the path's 2.25 ms one-way delay and
+could not resolve the hold; the generator now uses 64 buckets per power of
+two (about 37 µs there) and the run was repeated. One-way delay over each
+arm's eight direction-runs:
+
+| Point | Arm | p50 | p99, median (range) | p99.9 range |
+| --- | --- | --- | --- | --- |
+| 0.5G | hold 0 | 2.39 ms in all | 3.36 ms (3.28–4.59) | 7.1–17.0 ms |
+| 0.5G | hold 200 µs | 2.42 ms in seven, 2.39 in one | 3.59 ms (3.41–4.52) | 7.0–14.5 ms |
+| 5G | hold 0 | 5.70–6.68 ms | 23–41 ms | 0.21–0.78 s |
+| 5G | hold 200 µs | 5.77–6.49 ms | 21–39 ms | 0.25–0.85 s |
+
+At 0.5G the hold adds one bucket, about 33 µs, at the median and about
+0.2 ms at p99, as expected, and repeats the CPU saving (−5.2% CPU per
+delivered Gbit/s across these pairs). At 5G it changes nothing. Both 5G arms
+show a tail no daemon queue can explain: in the first run's receivers 2–8%
+of frames arrived more than 10 ms late and up to 1.2% more than 100 ms, and
+maxima reach 0.46–2.75 s, beyond the 100 ms lifetime the daemons give any
+frame. In the first run three receiver processes reported
+the same 3.240 s maximum, which points to one event in the harness or the
+generator rather than steady queueing; this is not yet explained.
+
 ## Checked indexing in the encoders and batch planner (November 12)
 
 The last stage 4 panic-audit item converts every indexing site that Clippy's

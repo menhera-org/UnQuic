@@ -1436,8 +1436,13 @@ November 10 evidence for that list, all in BENCH.md:
   worker as supplying its group only from two datagrams (as Linux TCP
   ignores under one MSS) keeps the 5.5% gain and returns the drops to the
   control's range, though one run still missed 0.19% of a direction
-  ([BENCH.md](BENCH.md#held-data-and-application-limited-marking)). A
-  default change needs that last loss explained and a latency measurement.
+  ([BENCH.md](BENCH.md#held-data-and-application-limited-marking)).
+  `udp_load` now measures one-way delay: at 0.5G the hold adds about 33 µs
+  at the median and 0.2 ms at p99, and nothing at 5G
+  ([BENCH.md](BENCH.md#what-the-hold-costs-in-latency)). A default change
+  still needs that last loss explained. The same measurement shows a
+  multi-second tail at 5G overload in both arms, beyond any daemon frame
+  lifetime, not yet explained.
   Fixed per-turn work matters here too: sweeping only occupied receive slots
   for ACKs cut light-load CPU per Gbit/s by 4.1%
   ([BENCH.md](BENCH.md#scanning-only-occupied-receive-slots-for-acks-november-12));
