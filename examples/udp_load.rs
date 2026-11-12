@@ -981,11 +981,13 @@ mod tests {
                         );
                         assert!(receiver.latency.max_ns < 1_000_000_000);
                         let now = sent_at + 5_000;
+                        // A real delay can already sit in this bucket on a fast host.
+                        let before = receiver.latency.counts[latency_bucket(5_000)];
                         consume(receiver, &mut bins, &bytes, payload, payload, c.run, now);
                         assert_eq!(receiver.window.duplicates, count as u64);
                         if stamped {
                             assert_eq!(
-                                receiver.latency.counts[latency_bucket(5_000)],
+                                receiver.latency.counts[latency_bucket(5_000)] - before,
                                 count as u64
                             );
                         }

@@ -106,7 +106,7 @@ Gbit/s at an offer-limited load instead.
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
 | At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98%. With sixteen workers per daemon and thirty-two flows: 7.11 / 7.03 Gbit/s, no thread above 75%, limited by receive-socket overflow under the container's 416 KiB buffer ([BENCH.md](#sixteen-workers-per-daemon-november-11-exploratory)). Over a 9000-byte outer path: 10.27 / 13.90 Gbit/s with QinQ and 10.78 / 17.82 with one tag at sixteen workers, 13.36 / 11.77 with QinQ at eight, at 34–45% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)) | At a 1500-byte outer path the per-bit cost must roughly halve; a 9000-byte path halves it but no thread then saturates, and reordering and overflows rise. One left worker does two jobs: it reads every L→R frame from the TAP (QinQ input all lands on one queue) and receives the R→L lanes it owns. L→R senders idle for its input; its socket overflows and R→L loses packets, so BBR cuts. More receive buffers move capacity from L→R to R→L (+11% total, L→R −14%); letting tun spread reads costs 23% more CPU per bit ([BENCH.md](#receive-buffers-for-a-busy-reader-november-11)). Next: keep receive work off the TAP reader, or split TAP reading inside the daemon. |
-| Goodput must plateau under excess traffic | Decision workload (four workers, 4.5 ms), `3178088`: sixteen flows deliver 1.62 / 1.64 Gbit/s at 2G offered and 2.03 / 1.58 at 5G; four flows 1.31 / 1.73 and 0.92 / 1.38, so four flows decline past 2G in L→R. Workers run at 77–99% of a core ([BENCH.md](#decision-workload-baseline-november-12-evening)) | Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
+| Goodput must plateau under excess traffic | Decision workload (four workers, 4.5 ms), `3178088`: sixteen flows deliver 1.62 / 1.64 Gbit/s at 2G offered and 2.03 / 1.58 at 5G; four flows 1.31 / 1.73 and 0.92 / 1.38 ([BENCH.md](#decision-workload-baseline-november-12-evening)). With the read margin four flows hold at 5G: 1.21–1.23 / 2.02–2.05 ([BENCH.md](#owners-refusing-each-other-a-read-margin-landed)). Workers run at 77–99% of a core | Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
 | TCP through the tunnel | Loopback, eight workers, eight iperf3 streams each way: 9.2–9.9 Gbit/s in total at about 1 core per Gbit/s, about 1% of segments retransmitted ([BENCH.md](#tap-queue-length-and-overload-delay)) | Losses come from receive-socket overflows under the container's 416 KiB buffers; the daemon cannot raise them without `CAP_NET_ADMIN`. |
 | Small-frame overload must remain efficient | Untagged 64-byte frames, sixteen flows, current build: 3.24–3.43 / 3.27–3.48 M frames/s unlimited with eight workers and 4.23–4.53 / 4.16–4.57 M with sixteen, against 5.87 / 5.74 M for the pre-recovery build; QinQ 128-byte frames 2.18–2.31 / 3.32–3.53 M; 1.85–1.95 cores per M frames/s against 1.28–1.33 ([BENCH.md](#small-frame-rows-at-the-current-build-november-12)) | About 45% more CPU per frame since recovery and BBR, spread across transmit bookkeeping with no single large target; four candidates cut 0–3% at overload, and the expiry heap landed at −4.2% CPU per frame offer-limited ([BENCH.md](#where-the-small-frame-cost-comes-from-november-12)). One to one and a half of eight workers per daemon idle because tun's queue hash leaves them no transmit work; balanced lanes do not change this. High ingress loss persists; mixed traffic and non-coalescible frames remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input and output offloads improve matched TCP sweeps; single-stream output coalescing reaches 2.01 / 2.26 Gbit/s, still below the deployment target. |
@@ -151,12 +151,13 @@ the same share outside 100 ms bins whose delay spiked (benches/udp_load.md):
 Every 0.5G point delivers its offer; capacity on four workers is about
 1.6 Gbit/s per direction with sixteen flows, and less in the direction four
 flows hash unevenly. Four flows lose L→R delivery between 2G and 5G
-(1.31 → 0.92 Gbit/s), so goodput does not yet plateau for few flows. At
+(1.31 → 0.92 Gbit/s), so goodput did not plateau for few flows; the read
+margin below fixes that. At
 0.1% outer loss and 0.5G nearly every missing frame lies in a stalled bin:
 frames still waiting for a repair when the host stalls expire. Stall bins
 number one to five per direction at every 0.5G point, lossy or not.
 
-### Why four flows lose L→R delivery past 2G (open)
+### Why four flows lose L→R delivery past 2G
 
 A trace of both four-flow points ([counts](benches/decision-four-flows-trace.txt))
 rules out CPU and the controller. At 5G the left daemon's workers run
@@ -190,6 +191,46 @@ write R→L frames into the TAP, carrying each through the inner stack on
 their own thread, are also the ones that must read the ACKs for L→R. The
 total across both directions falls from about 3.0 Gbit/s at 2G to 2.3 at
 5G, so the plateau gate fails for four flows.
+
+### Owners refusing each other: a read margin (landed)
+
+The refusals at about 5 free buffers come from the read budget. A worker
+reads its TAP until its free buffers fall to the receive reserve, and
+admission refuses handed-over frames at that same level. Each active L→R
+owner also reads a TAP queue, mostly carrying the other owner's flow, so
+its own reads use up the buffers it would need to accept the other owner's
+frames. Both owners then refuse each other while idle, and more buffers
+only feed more reads, which is why 256 buffers changed nothing. The fix
+stops TAP reads `BUFFERS / 8` (16) buffers earlier when other workers
+transmit for the session, leaving owners room to accept. Stated beforehand
+as an exploratory test (four flows, 2G and 5G, two alternating pairs
+against `3178088`; [results](benches/decision-four-flows-owner-reserve.json)):
+
+| Four flows | HEAD L→R / R→L Gbit/s | 16-buffer margin L→R / R→L |
+| --- | --- | --- |
+| 2G | 1.29–1.30 / 1.73–1.75 | 1.19–1.20 / 1.92 |
+| 5G | 0.92–0.93 / 1.36–1.46 | 1.21–1.23 / 2.02–2.05 |
+
+The 5G total rises from 2.29–2.37 to 3.25–3.29 Gbit/s (+40%), and neither
+direction now delivers less at 5G than at 2G; the plateau holds. The price
+is 7% of 2G L→R (the 2G total rises 2%). A 32-buffer margin
+([patch](benches/owner-reserve-32-rejected.patch),
+[results](benches/decision-four-flows-owner-reserve-32.json)) raised the
+5G total by 35% too but took 25% from 2G L→R, so 16 was kept. Its landing
+bar, also stated beforehand, required no cost elsewhere, in one container
+with alternating pairs ([results](benches/owner-reserve-side-effects.json)):
+
+| Check | HEAD | Margin | Bar |
+| --- | --- | --- | --- |
+| Sixteen flows, 2G total | 3.25 / 3.29 Gbit/s | 3.22 / 3.28 | within −5%: −0.6% |
+| Sixteen flows, 5G total | 3.55 / 3.62 Gbit/s | 3.67 / 3.69 | within −5%: +2.7% |
+| Loopback check, 21G total | 11.86 / 12.20 Gbit/s | 11.94 / 12.33 | within −5%: +0.8% |
+| Sixteen flows at 0.5G, CPU per Gbit/s | 460 / 462% | 453 / 459% | at most +3%: −1.1% |
+
+All pass, and the margin landed. The measured binary computed the margin
+inline in `tap_capacity`; the landed code moves it into `owner_reserve`
+with the same value. Balanced lanes, below, rescue the same four-flow point
+by a different route.
 
 ### Balanced lanes on the decision workload, revisited
 

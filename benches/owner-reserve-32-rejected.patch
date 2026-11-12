@@ -1,0 +1,20 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index fceac78..0ba3f65 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -2335,10 +2335,14 @@ impl Worker {
+             return 0;
+         }
+         let workers = local.tx_workers;
++        // Reads stop before admission does, so frames other readers hand this
++        // owner still find exchange buffers; otherwise two owners reading each
++        // other's lanes can fill their pools and refuse each other.
++        let owner_reserve = if workers > 1 { BUFFERS / 4 } else { 0 };
+         // Leave a slab, a frame view and byte credit so queued inputs can progress.
+         self.free
+             .len()
+-            .saturating_sub(RECEIVE_BUFFERS - self.rx_retained + 1)
++            .saturating_sub(RECEIVE_BUFFERS - self.rx_retained + 1 + owner_reserve)
+             .min(frame_quota(workers).saturating_sub(local.tx_retained + 2))
+             .min(self.frames.available().saturating_sub(1))
+             .min(

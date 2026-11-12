@@ -341,6 +341,14 @@ const fn frame_quota(workers: usize) -> usize {
     frames::CAPACITY / workers
 }
 
+/// Free buffers TAP reads leave beyond the receive reserve when other workers
+/// transmit for the session. Reads then stop before admission does, so frames
+/// other readers hand this owner still find exchange buffers; otherwise two
+/// owners reading each other's lanes fill their pools and refuse each other.
+const fn owner_reserve(workers: usize) -> usize {
+    if workers > 1 { BUFFERS / 8 } else { 0 }
+}
+
 // A worker can retain frames only for sessions where it reads TAP or owns TX lanes.
 fn frame_capacity(config: &crate::config::Config, workers: usize, id: usize) -> Option<usize> {
     if workers == 0 || id >= workers {
@@ -2338,7 +2346,7 @@ impl Worker {
         // Leave a slab, a frame view and byte credit so queued inputs can progress.
         self.free
             .len()
-            .saturating_sub(RECEIVE_BUFFERS - self.rx_retained + 1)
+            .saturating_sub(RECEIVE_BUFFERS - self.rx_retained + 1 + owner_reserve(workers))
             .min(frame_quota(workers).saturating_sub(local.tx_retained + 2))
             .min(self.frames.available().saturating_sub(1))
             .min(
@@ -6191,17 +6199,18 @@ mod tests {
                 assert_eq!(worker.counters.queue_drops, 0);
 
                 // Borrowed children need no output buffers and keep their source alive.
-                let held = worker.free.split_off(RECEIVE_BUFFERS + 2);
+                let reserve = owner_reserve(worker.sessions[0].tx_workers);
+                let held = worker.free.split_off(RECEIVE_BUFFERS + 2 + reserve);
                 sender.send(&input).unwrap();
                 worker.read_tap(0, Duration::ZERO).unwrap();
                 assert!(!worker.drain_tap_inputs(Duration::ZERO).unwrap());
                 assert_eq!(pending(&worker).len(), count);
-                assert_eq!(worker.free.len(), RECEIVE_BUFFERS + 1);
+                assert_eq!(worker.free.len(), RECEIVE_BUFFERS + 1 + reserve);
                 for _ in 0..2 {
                     let output = pop_pending(&mut worker).unwrap();
                     worker.release_frame(output).unwrap();
                 }
-                assert_eq!(worker.free.len(), RECEIVE_BUFFERS + 1);
+                assert_eq!(worker.free.len(), RECEIVE_BUFFERS + 1 + reserve);
                 assert!(worker.sessions[0].tap_inputs.is_empty());
                 worker.free.extend(held);
                 let expiry = reassembly::FRAME_LIFETIME;
@@ -6564,12 +6573,13 @@ mod tests {
         assert!(worker.tap_reader.as_ref().unwrap().enabled);
         worker.sessions[0].tx.truncate(1);
         worker.sessions[0].tap_read_limit = BATCH_SIZE;
-        let held = worker.free.split_off(RECEIVE_BUFFERS + 2);
+        let reserve = owner_reserve(worker.sessions[0].tx_workers);
+        let held = worker.free.split_off(RECEIVE_BUFFERS + 2 + reserve);
         tap.send(&[0; 60]).unwrap();
         worker.read_tap(0, Duration::ZERO).unwrap();
         assert_eq!(worker.sessions[0].tap_read_limit, BATCH_SIZE);
         assert_eq!(pending(&worker).len(), 1);
-        assert_eq!(worker.free.len(), RECEIVE_BUFFERS + 1);
+        assert_eq!(worker.free.len(), RECEIVE_BUFFERS + 1 + reserve);
         worker.free.extend(held);
         for _ in 0..BATCH_SIZE {
             tap.send(&[0; 60]).unwrap();
@@ -7039,6 +7049,28 @@ mod tests {
         assert_ne!(worker.tap_capacity(0), 0);
         worker.frames.source_mut(source).unwrap().handed = false;
         assert_eq!(worker.tap_capacity(0), 0);
+    }
+
+    #[test]
+    fn tap_reads_leave_owners_room_to_accept_handed_frames() {
+        let (_, [mut worker, _]) = test_workers();
+        assert!(worker.sessions[0].tx_workers > 1);
+        let receive = RECEIVE_BUFFERS - worker.rx_retained + 1;
+        assert_eq!(owner_reserve(worker.sessions[0].tx_workers), BUFFERS / 8);
+        assert_eq!(owner_reserve(1), 0);
+        let mut held = Vec::new();
+        while worker.free.len() > receive + BUFFERS / 8 + 1 {
+            held.push(worker.free.pop().unwrap());
+        }
+        assert_eq!(worker.tap_capacity(0), 1);
+        held.push(worker.free.pop().unwrap());
+        // Reading stops here, while admission of handed-over frames, which
+        // only keeps the receive reserve, still has buffers to exchange.
+        assert_eq!(worker.tap_capacity(0), 0);
+        assert!(worker.free.len() > receive);
+        // A session no other worker transmits for keeps only the receive reserve.
+        worker.sessions[0].tx_workers = 1;
+        assert_eq!(worker.tap_capacity(0), BUFFERS / 8);
     }
 
     #[test]

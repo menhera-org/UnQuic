@@ -456,7 +456,12 @@ messages and pending lane retirements remain bounded and retry.
 Startup reserves 128 packet/frame buffers per worker, each with 64 KiB of
 payload storage for GRO, and 64 receive-lane tables per session. Eight pool
 entries are reserved for socket receive work; receive work cannot borrow the
-other 120 entries, and TAP reads cannot consume the receive reserve. Reservations
+other 120 entries, and TAP reads cannot consume the receive reserve. When
+other workers also transmit for a session, TAP reads also leave 16 further
+entries free, so a lane owner can still accept frames other readers hand it;
+without that margin, two owners reading each other's lanes filled their
+pools and refused each other, and four flows delivered less at 5 Gbit/s
+offered than at 2. Reservations
 stay charged until a buffer returns to its originating worker. This prevents
 receive backlog from starving transmit batches. Each lane has
 64 frame slots. The memory check includes these stores, handoff rings, indices,

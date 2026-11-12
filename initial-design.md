@@ -476,7 +476,11 @@ source exchanges ownership with an empty owner buffer; the empty buffer
 returns the reader's credit without copying payload. Keep transfer credits
 charged until the return is consumed. Bound each owner's input queue to 128
 entries and reject excess; source handoff must not create a second independent
-reservation budget.
+reservation budget. When other workers also transmit for the session, a
+reader stops reading its TAP an eighth of its pool before admission would
+refuse foreign sources (November 12 amendment): otherwise two owners that
+read each other's flows fill their pools with those reads and refuse each
+other's handoffs, and few flows deliver less as the offer rises (BENCH.md).
 
 **Local TAP coalescing.** Within a bounded receive flush, combine compatible complete UDP frames into a USO write or consecutive TCP data frames into a TSO write by borrowing their payloads. Preserve up to two 802.1Q/802.1ad tags, including VID and PCP/DEI, and require identical tag stacks within a group. Validate original checksums and exact header/length relationships. IPv4 requires DF and consecutive IDs. UDP permits no IP options or extensions. TCP permits IPv4 options and IPv6 hop-by-hop, destination and type-4 routing headers within a 128-byte header bound; active SRH checksum validation uses Segment List[0]. TCP requires matching ACK numbers, windows, options and flags, with consecutive sequence numbers. ECE is preserved; PSH closes the group. Other control/reserved flags, empty payloads and noncanonical zero checksums retain ordinary writes. Preserve per-flow order, including barriers at incompatible frames in that flow. Keep every selected slot on transient write failure and release only selected slots on success or permanent failure. Do not wait for more frames. Disable only the rejected offload on a queue after EINVAL/EOPNOTSUPP and retain ordinary writes. This changes neither packet admission nor the 100 ms receive deadline.
 

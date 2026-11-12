@@ -131,15 +131,18 @@ doubling the buffering a worker gets without `CAP_NET_ADMIN`.
 
 A fresh decision-workload baseline
 ([BENCH.md](BENCH.md#decision-workload-baseline-november-12-evening)) shows
-the plateau gate failing for few flows: four flows deliver 1.31 Gbit/s L→R
-at 2G offered but 0.92 at 5G. A trace rules out CPU and BBR; the lane owners
-send in bursts with 700 µs gaps while refusing inputs for lack of exchange
-buffers, and doubling the buffers changes nothing. Finding what the owners
-wait for is the next overload item
-([BENCH.md](BENCH.md#why-four-flows-lose-lr-delivery-past-2g-open)).
-Balanced lanes avoid the decline: spreading the four flows over all four
-lanes, instead of the two their hashes pick, doubles 5G L→R (decision 5
-below).
+the plateau gate failing for few flows: four flows delivered 1.31 Gbit/s L→R
+at 2G offered but 0.92 at 5G. A trace ruled out CPU and BBR: the two lane
+owners also read each other's flows from their TAP queues, and reading
+until the receive reserve left neither with exchange buffers to accept the
+other's frames, so both refused each other while idle
+([BENCH.md](BENCH.md#why-four-flows-lose-lr-delivery-past-2g)). TAP reads
+now stop 16 buffers earlier when other workers transmit for the session.
+That restores the plateau: four flows at 5G deliver 1.21–1.23 / 2.02–2.05
+Gbit/s instead of 0.92–0.93 / 1.36–1.46 (+40% in total), for 7% of 2G
+L→R, with sixteen flows, the loopback check and light-load CPU unchanged
+([BENCH.md](BENCH.md#owners-refusing-each-other-a-read-margin-landed)).
+Balanced lanes rescue the same point differently (decision 5 below).
 
 Decisions only the user can make, each blocking a remaining goal:
 
@@ -158,10 +161,11 @@ Decisions only the user can make, each blocking a remaining goal:
    adds about 33 µs to the median one-way delay and 0.2 ms at p99 for light
    traffic.
 5. Should `daemon.balance_flows` be on by default? On the decision workload
-   it keeps four flows from collapsing at 5G (L→R 1.90 instead of 0.92
-   Gbit/s, total 3.5–3.7 instead of 2.2–2.3) and lifts sixteen flows at 2G
-   by 10–15%, but it still costs the loopback overload check about 12% at
-   21G and more CPU per bit (rechecked on `3178088`)
+   before the read margin it kept four flows from collapsing at 5G (L→R 1.90
+   instead of 0.92 Gbit/s, total 3.5–3.7 instead of 2.2–2.3; the margin now
+   gives 3.25–3.29) and lifts sixteen flows at 2G by 10–15%, but it still
+   costs the loopback overload check about 12% at 21G and more CPU per bit
+   (rechecked on `3178088`)
    ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB
