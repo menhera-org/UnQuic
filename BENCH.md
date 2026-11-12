@@ -626,6 +626,16 @@ range, but the hold's R→L loss is again higher: median 0.145% against
 0.065%, worst run 0.43% against the 0.22% allowed. The hold costs a small,
 repeatable loss, and the switch stays off.
 
+A `trace` run of the fixed hold on `5863120` gives the next lead. Both
+controllers stay in Startup 99% of the point, as without the hold, and
+spend 1% (one 200 ms episode) in ProbeRTT; yet 33–43% of the frames that
+expire do so during ProbeRTT, against none in a control trace. At the
+admission drops, the busiest owner holds about 100 unexpanded inputs and
+about 100 buffers awaiting return: its lane stops sending while ProbeRTT
+caps inflight, expansion stalls behind it, and with a 20 ms frame lifetime
+(four RTTs) frames expire within the episode. Why the hold makes ProbeRTT
+episodes cost frames and the control does not is still open.
+
 ## Frames seconds old under overload (November 12)
 
 The tail in the latency measurement above is not a start-up event. With
