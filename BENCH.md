@@ -734,6 +734,15 @@ sub-millisecond medians. Most overload delay is the kernel's TAP ring, not
 the daemon, and a short ring loses no delivery here. The daemon leaves the
 TAP queue length to the operator; README now recommends a short one.
 
+TCP fills the ring far less. Eight iperf3 TCP streams each way through the
+tunnel on loopback, eight workers, two alternating pairs
+([summary](benches/loopback-tcp-tap-queue-length.txt)): with 500 entries the
+total is 8.6–9.3 Gbit/s, the streams' mean RTT 3.1–6.6 ms and the largest RTT
+28–72 ms; with 64 entries 9.1–9.7 Gbit/s, 3.1–4.0 ms and 21–28 ms. TCP backs
+off on the tunnel's losses (50,000–140,000 retransmissions per direction in
+20 s) before it builds a deep ring queue, so the short ring mainly trims the
+worst RTTs. The UDP overload case is where it matters.
+
 ## Checked indexing in the encoders and batch planner (November 12)
 
 The last stage 4 panic-audit item converts every indexing site that Clippy's

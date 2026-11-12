@@ -1,0 +1,10 @@
+TCP through the tunnel on loopback, November 12: 6bd024c (sha256 376271e953766a9cdff1ceb5bc8bc82f447dcb181826ed9d14e0a34c8cc123dd), eight workers, untagged 1514-byte frames, eight iperf3 3.20 TCP streams each way (iperf3 copied from the host into the disposable container), unlimited, 20 s, 1 GiB memory_limit.
+Per run and direction: received Gbit/s, mean of the streams mean_rtt, largest max_rtt, sender retransmits.
+TAP_TXQUEUELEN=500/r1 client Gbit/s 3.50 mean_rtt_ms 3.1 max_rtt_ms 28.2 retransmits 94797
+TAP_TXQUEUELEN=500/r1 reverse-client Gbit/s 5.05 mean_rtt_ms 3.1 max_rtt_ms 30.3 retransmits 109235
+TAP_TXQUEUELEN=500/r2 client Gbit/s 2.91 mean_rtt_ms 6.6 max_rtt_ms 56.6 retransmits 47381
+TAP_TXQUEUELEN=500/r2 reverse-client Gbit/s 6.36 mean_rtt_ms 6.1 max_rtt_ms 72.0 retransmits 127441
+TAP_TXQUEUELEN=64/r1 client Gbit/s 3.77 mean_rtt_ms 4.0 max_rtt_ms 25.0 retransmits 78001
+TAP_TXQUEUELEN=64/r1 reverse-client Gbit/s 5.97 mean_rtt_ms 3.4 max_rtt_ms 27.1 retransmits 137603
+TAP_TXQUEUELEN=64/r2 client Gbit/s 3.54 mean_rtt_ms 3.6 max_rtt_ms 27.7 retransmits 77260
+TAP_TXQUEUELEN=64/r2 reverse-client Gbit/s 5.60 mean_rtt_ms 3.1 max_rtt_ms 21.2 retransmits 123449
