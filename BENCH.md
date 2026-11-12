@@ -376,6 +376,19 @@ where the default collapses, at a cost of a few percent at 1%. Even at 10%
 the 5% row reaches under a tenth of the 5G offer, so that row still needs
 FEC or a different response.
 
+A [`trace` build](benches/tap-loss-threshold-trace.json) with the 10% threshold at 5% loss (one run, 0.39 / 0.41
+Gbit/s) shows what holds it there. BBR spends 91% of the point in
+ProbeBW_CRUISE and 5% in ProbeBW_UP, with `max_bw` near 790 Mbit/s but the
+short-term bounds in force: `bw_shortterm` about 475 Mbit/s sets the pacing
+rate, `inflight_shortterm` about 490 KB, and `inflight_longterm` 825 KB,
+against a bandwidth-delay product near 4.7 MB. The smoothed RTT is 7.66 ms
+against a 7.55 ms minimum, so no queue builds. Two mechanisms fit. Losing 5%
+of ACKs delays the acknowledgement of whole groups of packets by up to the
+1 ms ACK interval, which can lift a round's largest RTT sample past the queue
+check's 0.94 ms margin and cut the short-term bounds. And with small flights
+some rounds exceed 10% loss by chance and lower the long-term bound. A queue
+signal robust to lost ACKs, or FEC, is the next step for this row.
+
 ## Cost at light load (November 12)
 
 On the decision workload the two daemons spend about 480% of a core per
