@@ -111,7 +111,7 @@ Gbit/s at an offer-limited load instead.
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input and output offloads improve matched TCP sweeps; single-stream output coalescing reaches 2.01 / 2.26 Gbit/s, still below the deployment target. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
-| Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Loopback throughput at an 8952-byte limit is measured: the 21G total rises 70–126% ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)). Routed and real-path throughput at larger MTUs remain open. DATA-quoted PTB validation now has targeted kernel coverage. |
+| Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Loopback throughput at an 8952-byte limit is measured: the 21G total rises 70–126%; on the routed decision workload at 5G delivery rises 50–56% at 36% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)). Real-path throughput at larger MTUs remains open. DATA-quoted PTB validation now has targeted kernel coverage. |
 | At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | One flow at 7.5 ms with 0.5–1% random loss: about 1.0 Gbit/s per direction locally with hash lanes and the default queue-checked loss tolerance, 1.5–2.0 with balanced lanes; 1.6 Gbit/s on the remote host, where a limit downstream of the sender caps it. At 5% loss draft 07 delivers under 10 Mbit/s of a 5G offer; `loss_threshold_permille = 100` raises that to about 0.45 Gbit/s ([BENCH.md](#a-configurable-loss-threshold-for-random-loss-november-12)) | Per-frame cost on one transmit worker, the 5% rows (still under a tenth of the offer; FEC or a different response), and a real-path measurement. |
 | Coexist with other traffic | Against one TCP CUBIC flow at a 1 Gbit/s, 7.5 ms token-bucket bottleneck: an even share with a one-BDP queue; with a quarter-BDP queue the queue-checked tolerance keeps TCP's share | Several competitors, other buffer depths and other TCP algorithms are unmeasured. |
 
@@ -1217,6 +1217,24 @@ from 172–214 ms to 19–26 ms while delivering 22.5–23.4
 container of `5f2db99` and `5863120` gives 24.0–24.3 and 24.1–25.5
 ([results](benches/loopback-outer-9000-read-gate.json)): the read change
 costs nothing here, and the morning's totals reflect session variation.
+
+The routed decision workload (4.5 ms through private routers with netem,
+bridged individual QinQ frames, four workers, sixteen flows, 5G offered)
+gains as much, written beforehand with the expectation of a large rise
+because per-datagram kernel work dominates that row. Two alternating pairs
+on `bce6bfe` ([results](benches/decision-outer-9000.json)); the first 1452
+run failed at start-up with no error in its logs, so that limit has one run:
+
+| Outer limit | L→R Gbit/s | R→L Gbit/s | Daemon CPU | CPU per delivered Gbit/s |
+| --- | --- | --- | --- | --- |
+| 1452 | 1.96 | 1.56 | 679% | 193% |
+| 8952 | 2.80–2.89 | 2.50–2.63 | 650–669% | 123–125% |
+
+Delivery rises 50–56% and CPU per bit falls about 36%, with the busiest
+worker still at 95–97%, matching earlier sessions' 3.5–3.7 Gbit/s totals at
+1452. Two first runs in fresh containers failed today without log errors
+(here and in the traced 9000-byte run); later runs in the same container
+succeed.
 
 This changes what the gate needs. At 1500 bytes the per-bit cost has to
 halve; a 9000-byte outer path halves it. A deployment whose outer path
