@@ -386,8 +386,13 @@ against a 7.55 ms minimum, so no queue builds. Two mechanisms fit. Losing 5%
 of ACKs delays the acknowledgement of whole groups of packets by up to the
 1 ms ACK interval, which can lift a round's largest RTT sample past the queue
 check's 0.94 ms margin and cut the short-term bounds. And with small flights
-some rounds exceed 10% loss by chance and lower the long-term bound. A queue
-signal robust to lost ACKs, or FEC, is the next step for this row.
+some rounds exceed 10% loss by chance and lower the long-term bound. An
+exploratory run tested the first: the queue check computed from each round's
+smallest RTT sample (the patch rejected on November 11) moved the row from
+0.425 / 0.468 to 0.470 / 0.479 Gbit/s, about 5% in one run each. Lost ACKs
+are at most a small part. The long-term bound, lowered by chance rounds and
+regrown only in the short ProbeBW_UP phases, is the likelier limit, which
+makes this row a job for FEC rather than another threshold.
 
 ## Cost at light load (November 12)
 
