@@ -1,0 +1,13 @@
+diff --git a/src/ack/sent.rs b/src/ack/sent.rs
+index 219c289..8a79df7 100644
+--- a/src/ack/sent.rs
++++ b/src/ack/sent.rs
+@@ -4,7 +4,7 @@ use crate::wire::{AckRange, AckRanges, MAX_ACK_RANGES};
+ use std::{collections::TryReserveError, num::NonZeroU16, time::Duration};
+ 
+ /// Maximum retained packet-number span per lane.
+-pub const SENT_CAPACITY: usize = 65_536;
++pub const SENT_CAPACITY: usize = 131_072;
+ const WORDS: usize = SENT_CAPACITY / 64;
+ const ELICITING: u16 = 1 << 14;
+ const CHARGED: u16 = 1 << 15;

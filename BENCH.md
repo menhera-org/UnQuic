@@ -277,7 +277,12 @@ question for the lossy rows, not a buffer one. The busier owner also spends
 packet numbers) cannot reserve another number: the floor cannot pass a
 packet still charged in flight or holding an unreported delivery sample,
 and under loss those wait for the controller's loss reports. Without loss
-that hold takes 1–1.4%. Larger histories or faster retirement are untried.
+that hold takes 1–1.4%. Doubling the history to 131,072 numbers
+([patch](benches/sent-history-2x-exploratory.patch),
+[results](benches/decision-four-flows-lossy-history-2x.json); stated
+beforehand as needing 5% more 5G L→R) changes nothing: 1.27 and 1.27 Gbit/s
+against 1.24 and 1.28, two alternating pairs. Rejected; the hold is not
+what limits delivery there.
 
 The overloaded delay the margin raised is mostly the TAP ring again. On the
 decision workload at 5G, sixteen flows, `3b9e86f`, two alternating pairs
