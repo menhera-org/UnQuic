@@ -306,7 +306,11 @@ rules apply to all of them.
    no read starts while inputs are pending. A real test needs a signal
    from outside the read path, such as how often reads find data at once
    or the reader's busy share, a counter showing how often it fires, and
-   no reordering for a flow that changes lanes.
+   no reordering for a flow that changes lanes. Expect little from it:
+   both measured points already overload the readers (20–28% missing at
+   40M), so such a signal would fire at both, and the no-locality run
+   already shows that regime losing 18–20% unlimited. The per-frame cost
+   (about 45% above the pre-recovery build) is the better target.
    One small-frame flow reaches 0.61–0.67 M frames/s, limited by one
    thread. 60-byte frames match 64-byte ones; 128-byte frames are lossless
    at 0.92 M frames/s paced, and unlimited R→L trails L→R by a quarter to a
