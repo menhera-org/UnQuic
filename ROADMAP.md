@@ -523,9 +523,11 @@ rules apply to all of them.
    pinned by unacknowledged data. That favours a control lane with its own
    history over merely ordering control ahead of data on lane 0. `tx_lanes`
    may reach 64, so a control lane needs a 65th lane ID. The wire's 16-bit
-   lane field and the receive-owner table (65,536 entries) allow it; the
-   limit is the 64 receive-lane slots each worker holds per session, which
-   only a single worker owning all 64 data lanes would exhaust. Two shapes are possible: send control records ahead of
+   lane field and the receive-owner table (65,536 entries) allow it. It
+   needs a 65th receive-lane table in each session's pool (startup reserves
+   64) with its memory charge, and room in its receive owner's 64 slots
+   (a `u64` occupancy mask), which only a worker owning all 64 data lanes
+   would lack. Two shapes are possible: send control records ahead of
    data on lane 0, or give them a lane of their own with its own history.
    Many worker unit tests assume lane 0 for control.
 
