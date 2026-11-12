@@ -61,6 +61,19 @@ p50, p99, p99.9 and the maximum in microseconds. 60-byte frames (18-byte
 payloads) carry no stamp. The payload magic is `UQL2`; a receiver counts
 packets from an older `UQL1` sender as invalid.
 
+Stamped frames are also counted in 100 ms bins of their send time. The bins
+are numbered from the stamp itself, so a sender's and a receiver's bins line
+up without a shared start. The JSON's `bins` object lists, as
+`[bin, frames]`, the frames each sender sent, and, as
+`[bin, frames, largest delay ns]`, the first copies each receiver got. A
+host that stalls for tens of milliseconds expires frames in a light-load
+run no matter what the daemon does; `sweep_report` therefore marks a bin
+whose largest delay exceeds 20 ms, or three times the median bin's largest
+delay, as stalled, leaves it and the following bin out, and reports
+`{lr,rl}_stall_bins` and `{lr,rl}_missing_outside_stalls_pct`. Under
+overload, when every bin is slow, few bins count as stalled and the figure
+approaches the plain missing share.
+
 The JSON output includes process CPU time, syscall counts, blocked sends,
 GRO messages, observed socket overflow and the actual receive-buffer limit.
 Per-flow `calls` counts send/receive syscalls; `poll_calls` counts readiness polls.

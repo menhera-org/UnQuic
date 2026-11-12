@@ -719,6 +719,29 @@ this point. Its remaining cost is latency, about 33 µs at the median and
 0.2 ms at p99 at 0.5G, for 5–6% less CPU per delivered bit there. That is a
 policy trade, so the default stays off until the user decides.
 
+### Leaving out stalls without a trace build
+
+`udp_load` now also counts stamped frames in 100 ms bins of send time, with
+each bin's largest delay, and `sweep_report` reports the missing share
+outside bins where a delay spike shows a stall
+(`{lr,rl}_missing_outside_stalls_pct`; benches/udp_load.md). Checked on a
+release build, stated beforehand as the tool showing stall bins and the
+hold staying within the control's loss range at lower CPU: decision
+workload at 0.5G, `probe_rtt_ack_delay` on in both arms, hold 0 against 200
+µs, four alternating pairs ([results](benches/decision-tx-hold-bins.json)).
+
+| 0.5G, four pairs | Control | Hold 200 µs |
+| --- | --- | --- |
+| Both daemons, % of a core | 447–460 | 421–422 |
+| Missing L→R, all / outside stalls | 0.0002–0.0129% / 0–0.0130% | 0–0.0070% / 0% |
+| Missing R→L, all / outside stalls | 0.0146–0.0180% / 0–0.0180% | 0.0069–0.0206% / 0.0069–0.0208% |
+| Stall bins per direction | 0–2 | 0–2 |
+
+The hold uses 6% less CPU in all four pairs and loses no more outside
+stalls; this session's host stalled less and lost an order of magnitude
+fewer frames than the earlier ones. In six of sixteen direction-runs every
+missing frame sat in a stall bin.
+
 ## Frames seconds old under overload (November 12)
 
 The tail in the latency measurement above is not a start-up event. With

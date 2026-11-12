@@ -92,6 +92,68 @@ fn latency_quantile(counts: &[u64], q: f64) -> f64 {
     0.0
 }
 
+/// Rows of `"bins":{..."KEY":[[bin,a,...],...]...}` from one udp_load report.
+fn bin_rows(text: &str, key: &str) -> Vec<Vec<f64>> {
+    let Some((_, bins)) = text.split_once("\"bins\":{") else {
+        return Vec::new();
+    };
+    let Some((_, rest)) = bins.split_once(&format!("\"{key}\":[")) else {
+        return Vec::new();
+    };
+    // An empty list must not borrow a later list's rows.
+    if rest.starts_with(']') {
+        return Vec::new();
+    }
+    let body = rest.split_once("]]").map_or("", |(body, _)| body);
+    body.split('[')
+        .map(|row| {
+            row.trim_end_matches([',', ']'])
+                .split(',')
+                .filter_map(|value| value.parse::<f64>().ok())
+                .collect::<Vec<f64>>()
+        })
+        .filter(|row| !row.is_empty())
+        .collect()
+}
+
+/// A delay above this, or above three times the median bin's largest delay,
+/// marks a bin a stall touched; that bin and the next are left out.
+const STALL_NS: f64 = 20e6;
+
+/// Stall bins and percent missing among frames sent outside them.
+fn missing_outside_stalls(
+    sent: &BTreeMap<u64, f64>,
+    received: &BTreeMap<u64, (f64, f64)>,
+) -> Option<(f64, f64)> {
+    if sent.is_empty() || received.is_empty() {
+        return None;
+    }
+    let mut maxima: Vec<f64> = received.values().map(|&(_, max)| max).collect();
+    maxima.sort_by(f64::total_cmp);
+    let threshold = STALL_NS.max(3.0 * maxima[maxima.len() / 2]);
+    let stalls: Vec<u64> = received
+        .iter()
+        .filter(|(_, (_, max))| *max > threshold)
+        .map(|(&bin, _)| bin)
+        .collect();
+    let (mut total, mut missing) = (0.0, 0.0);
+    for (&bin, &count) in sent {
+        if stalls.contains(&bin) || bin.checked_sub(1).is_some_and(|b| stalls.contains(&b)) {
+            continue;
+        }
+        total += count;
+        missing += (count - received.get(&bin).map_or(0.0, |&(got, _)| got)).max(0.0);
+    }
+    Some((
+        stalls.len() as f64,
+        if total > 0.0 {
+            missing / total * 100.0
+        } else {
+            0.0
+        },
+    ))
+}
+
 /// One direction's load files: client(-k).json and server(-k).json.
 struct Direction {
     offered_gbps: f64,
@@ -105,6 +167,8 @@ struct Direction {
     flows: usize,
     latency: [u64; LATENCY_BUCKETS],
     latency_max_ns: f64,
+    sent_bins: BTreeMap<u64, f64>,
+    received_bins: BTreeMap<u64, (f64, f64)>,
 }
 impl Default for Direction {
     fn default() -> Self {
@@ -120,6 +184,8 @@ impl Default for Direction {
             flows: 0,
             latency: [0; LATENCY_BUCKETS],
             latency_max_ns: 0.0,
+            sent_bins: BTreeMap::new(),
+            received_bins: BTreeMap::new(),
         }
     }
 }
@@ -144,6 +210,19 @@ fn direction(point: &Path, client: &str, server: &str) -> Result<Direction> {
         let seconds = sum_key(&sent_text, "seconds");
         result.offered_gbps += sent * payload * 8.0 / seconds / 1e9;
         result.sent += sent;
+        // Generators from before November 12 wrote no bins.
+        for row in bin_rows(&sent_text, "sent") {
+            if let [bin, count] = row[..] {
+                *result.sent_bins.entry(bin as u64).or_insert(0.0) += count;
+            }
+        }
+        for row in bin_rows(&received, "received") {
+            if let [bin, count, max] = row[..] {
+                let entry = result.received_bins.entry(bin as u64).or_insert((0.0, 0.0));
+                entry.0 += count;
+                entry.1 = entry.1.max(max);
+            }
+        }
         let (flows, samples) = received
             .split_once("\"samples\":")
             .ok_or("missing samples")?;
@@ -315,6 +394,10 @@ fn point(path: &Path, build: &str, combo: &str, repeat: &str, index: &str) -> Re
             }
             values.push((format!("{name}_latency_max_us"), d.latency_max_ns / 1e3));
         }
+        if let Some((stalls, missing)) = missing_outside_stalls(&d.sent_bins, &d.received_bins) {
+            values.push((format!("{name}_stall_bins"), stalls));
+            values.push((format!("{name}_missing_outside_stalls_pct"), missing));
+        }
     }
     let cpu = cpu(path)?;
     let busiest = busiest_thread(path)?;
@@ -440,6 +523,34 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_time_bins_leave_out_stalls_and_the_bin_after_them() {
+        let report = "{\"flows\":[],\"bins\":{\"width_ns\":100000000,\"sent\":[[10,100],[11,100],[12,100],[13,100],[14,100]],\"received\":[[10,99,3000000],[11,50,45000000],[12,60,3000000],[13,100,2000000],[14,98,4000000]]},\"samples\":[]}";
+        let rows = bin_rows(report, "sent");
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0], [10.0, 100.0]);
+        assert_eq!(bin_rows(report, "received")[1], [11.0, 50.0, 45e6]);
+        assert!(bin_rows("{\"bins\":{\"sent\":[],\"received\":[[1,2,3]]}}", "sent").is_empty());
+        assert!(bin_rows("{\"flows\":[]}", "sent").is_empty());
+        let sent: BTreeMap<u64, f64> = rows.iter().map(|r| (r[0] as u64, r[1])).collect();
+        let received: BTreeMap<u64, (f64, f64)> = bin_rows(report, "received")
+            .iter()
+            .map(|r| (r[0] as u64, (r[1], r[2])))
+            .collect();
+        // Bin 11 stalled (45 ms), so bins 11 and 12 are left out: 3 of 300 missing.
+        assert_eq!(missing_outside_stalls(&sent, &received), Some((1.0, 1.0)));
+        assert_eq!(missing_outside_stalls(&BTreeMap::new(), &received), None);
+        // Under overload every bin is slow; only bins far above the median count as stalls.
+        let slow: BTreeMap<u64, (f64, f64)> = received
+            .iter()
+            .map(|(&b, &(n, m))| (b, (n, m + 30e6)))
+            .collect();
+        assert_eq!(
+            missing_outside_stalls(&sent, &slow).map(|(s, _)| s),
+            Some(0.0)
+        );
+    }
 
     #[test]
     fn latency_histograms_merge_and_give_bucket_quantiles() {

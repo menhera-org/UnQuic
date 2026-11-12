@@ -109,11 +109,12 @@ impl Window {
             too_old: 0,
         }
     }
-    fn record(&mut self, seq: u64) {
+    /// True when `seq` arrives for the first time.
+    fn record(&mut self, seq: u64) -> bool {
         let word = seq / 64;
         if self.next != 0 && (self.next - 1) / 64 >= word + WORDS as u64 {
             self.too_old += 1;
-            return;
+            return false;
         }
         let index = word as usize % WORDS;
         if self.tags[index] != word {
@@ -123,12 +124,13 @@ impl Window {
         let bit = 1 << (seq % 64);
         if self.bits[index] & bit != 0 {
             self.duplicates += 1;
-            return;
+            return false;
         }
         self.bits[index] |= bit;
         self.unique += 1;
         self.reordered += u64::from(seq < self.next);
         self.next = self.next.max(seq + 1);
+        true
     }
 }
 
@@ -194,6 +196,73 @@ impl Latency {
             self.first_late_ns = self.first_late_ns.min(now_ns);
             self.last_late_ns = self.last_late_ns.max(now_ns);
         }
+    }
+}
+
+/// Frames per 100 ms of send time, keyed by the absolute bin of the 48-bit
+/// stamp so senders and receivers agree without a shared start. Receivers
+/// also keep each bin's largest delay, which marks bins a stall touched.
+struct Bins {
+    base: u64,
+    sent: Vec<u64>,
+    received: Vec<u64>,
+    max_ns: Vec<u64>,
+}
+impl Bins {
+    const WIDTH_NS: u64 = 100_000_000;
+
+    /// Bins from 2 s before `start_ns` to 4 s after the run.
+    fn new(start_ns: u64, seconds: u64) -> Self {
+        let base = ((start_ns & STAMP_MASK) / Self::WIDTH_NS).saturating_sub(20);
+        let len = (seconds as usize + 6) * 10;
+        Self {
+            base,
+            sent: vec![0; len],
+            received: vec![0; len],
+            max_ns: vec![0; len],
+        }
+    }
+    fn slot(&self, stamp_ns: u64) -> Option<usize> {
+        let bin = (stamp_ns & STAMP_MASK) / Self::WIDTH_NS;
+        let index = usize::try_from(bin.checked_sub(self.base)?).ok()?;
+        (index < self.sent.len()).then_some(index)
+    }
+    fn add_sent(&mut self, stamp_ns: u64, frames: u64) {
+        if let Some(index) = self.slot(stamp_ns) {
+            self.sent[index] += frames;
+        }
+    }
+    /// Counts first copies only; duplicates still raise the bin's delay.
+    fn add_received(&mut self, stamp_ns: u64, delay_ns: u64, first: bool) {
+        if let Some(index) = self.slot(stamp_ns) {
+            self.received[index] += u64::from(first);
+            self.max_ns[index] = self.max_ns[index].max(delay_ns);
+        }
+    }
+    /// `"bins":{...}` with absolute bin numbers and only nonzero bins.
+    fn json(&self) -> String {
+        let mut sent = String::new();
+        let mut received = String::new();
+        for (index, (&s, (&r, &m))) in self
+            .sent
+            .iter()
+            .zip(self.received.iter().zip(&self.max_ns))
+            .enumerate()
+        {
+            let bin = self.base + index as u64;
+            if s != 0 {
+                let comma = if sent.is_empty() { "" } else { "," };
+                sent.push_str(&format!("{comma}[{bin},{s}]"));
+            }
+            if r != 0 {
+                let comma = if received.is_empty() { "" } else { "," };
+                received.push_str(&format!("{comma}[{bin},{r},{m}]"));
+            }
+        }
+        format!(
+            "\"bins\":{{\"width_ns\":{},\"sent\":[{sent}],\"received\":[{received}]}}",
+            Self::WIDTH_NS
+        )
     }
 }
 
@@ -347,7 +416,15 @@ fn fill(bytes: &mut [u8], size: usize, run: u32, sequence: u64, now_ns: u64) {
         }
     }
 }
-fn consume(flow: &mut Flow, bytes: &[u8], segment: usize, size: usize, run: u32, now_ns: u64) {
+fn consume(
+    flow: &mut Flow,
+    bins: &mut Bins,
+    bytes: &[u8],
+    segment: usize,
+    size: usize,
+    run: u32,
+    now_ns: u64,
+) {
     if bytes.is_empty() || segment == 0 || segment > bytes.len() {
         flow.invalid += 1;
         return;
@@ -375,19 +452,20 @@ fn consume(flow: &mut Flow, bytes: &[u8], segment: usize, size: usize, run: u32,
             flow.invalid += 1;
             continue;
         }
-        flow.window.record(seq);
+        let first = flow.window.record(seq);
         // Only this run's valid packets give latency samples.
         if size >= STAMP_END {
             let mut stamp = [0; 8];
             stamp[2..].copy_from_slice(&p[16..STAMP_END]);
             let sent = u64::from_be_bytes(stamp);
-            flow.latency
-                .record(now_ns.wrapping_sub(sent) & STAMP_MASK, now_ns);
+            let delay = now_ns.wrapping_sub(sent) & STAMP_MASK;
+            flow.latency.record(delay, now_ns);
+            bins.add_received(sent, delay, first);
         }
     }
 }
 
-fn receive(flow: &mut Flow, bytes: &mut [u8], c: &Config) -> io::Result<bool> {
+fn receive(flow: &mut Flow, bins: &mut Bins, bytes: &mut [u8], c: &Config) -> io::Result<bool> {
     let count = bytes.len().div_ceil(MAX_BYTES).min(16);
     let mut chunks = bytes.chunks_mut(MAX_BYTES);
     let mut packets: [unquic::socket::ReceiveDatagram<'_>; 16] = std::array::from_fn(|_| {
@@ -419,6 +497,7 @@ fn receive(flow: &mut Flow, bytes: &mut [u8], c: &Config) -> io::Result<bool> {
         flow.gro += u64::from(packet.segment_size != 0);
         consume(
             flow,
+            bins,
             &packet.buffer[..packet.length],
             if packet.segment_size == 0 {
                 packet.length
@@ -491,6 +570,7 @@ fn run(c: &Config) -> io::Result<()> {
     let start_cpu = cpu_ns()?;
     let start = Instant::now();
     let start_ns = monotonic_ns()?;
+    let mut bins = Bins::new(start_ns, c.seconds);
     let end = Duration::from_secs(c.seconds);
     let length = c.count() * c.payload;
     while start.elapsed() < end {
@@ -526,17 +606,13 @@ fn run(c: &Config) -> io::Result<()> {
                     delay = delay.min(wait);
                     continue;
                 }
-                fill(
-                    &mut bytes[..length],
-                    c.payload,
-                    c.run,
-                    f.sequence,
-                    monotonic_ns()?,
-                );
+                let sent_at = monotonic_ns()?;
+                fill(&mut bytes[..length], c.payload, c.run, f.sequence, sent_at);
                 f.calls += 1;
                 match f.socket.send(&bytes[..length]) {
                     Ok(n) if n == length => {
                         f.sequence += c.count() as u64;
+                        bins.add_sent(sent_at, c.count() as u64);
                         f.bucket.sent(c.rate);
                         progress = true;
                     }
@@ -545,7 +621,7 @@ fn run(c: &Config) -> io::Result<()> {
                     Err(e) => return Err(e),
                 }
             } else if polls[index].revents != 0 {
-                receive(f, &mut bytes, c)?;
+                receive(f, &mut bins, &mut bytes, c)?;
             }
         }
         if c.send && !progress {
@@ -585,7 +661,7 @@ fn run(c: &Config) -> io::Result<()> {
             f.receive_bytes
         );
     }
-    print!("],\"samples\":[");
+    print!("],{},\"samples\":[", bins.json());
     for (i, (seconds, unique)) in samples[..sample_count].iter().enumerate() {
         print!(
             "{}{{\"seconds\":{seconds:.9},\"unique\":{unique}}}",
@@ -646,6 +722,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bins_count_by_send_time_and_keep_each_bins_largest_delay() {
+        let width = Bins::WIDTH_NS;
+        let start = 1_000 * width + 5;
+        let mut bins = Bins::new(start, 1);
+        assert_eq!(bins.base, 980);
+        assert_eq!(bins.sent.len(), 70);
+        // Two seconds before the start and up to six seconds after it fit.
+        assert_eq!(bins.slot(980 * width), Some(0));
+        assert_eq!(bins.slot(980 * width - 1), None);
+        assert_eq!(bins.slot(1_049 * width), Some(69));
+        assert_eq!(bins.slot(1_050 * width), None);
+        // Stamps keep 48 bits, so a full counter maps like its masked value.
+        assert_eq!(bins.slot(start | (1 << 48)), bins.slot(start));
+        bins.add_sent(start, 3);
+        bins.add_sent(start + width, 2);
+        bins.add_sent(0, 9);
+        bins.add_received(start, 4_000, true);
+        bins.add_received(start + 1, 9_000, false);
+        bins.add_received(start + 2, 1_000, true);
+        assert_eq!(
+            bins.json(),
+            format!(
+                "\"bins\":{{\"width_ns\":{width},\"sent\":[[1000,3],[1001,2]],\"received\":[[1000,2,9000]]}}"
+            )
+        );
+        assert_eq!(Bins::new(0, 1).base, 0, "the base saturates at zero");
+    }
 
     #[test]
     fn sends_retry_on_full_queues_and_unbound_receivers_but_stop_on_other_errors() {
@@ -845,12 +950,22 @@ mod tests {
                     let mut storage = vec![0; MAX_BYTES];
                     for (sender, receiver) in senders.iter().zip(&mut receivers) {
                         let sent_at = monotonic_ns().unwrap();
+                        let mut bins = Bins::new(sent_at, 1);
                         without_allocations(|| {
                             fill(&mut bytes, payload, c.run, 0, sent_at);
                             sender.socket.send(&bytes).unwrap();
-                            while receive(receiver, &mut storage, &c).unwrap() {}
+                            while receive(receiver, &mut bins, &mut storage, &c).unwrap() {}
                         });
                         assert_eq!(receiver.window.unique, count as u64);
+                        let binned = bins.slot(sent_at).map_or(0, |i| bins.received[i]);
+                        assert_eq!(
+                            binned,
+                            if payload >= STAMP_END {
+                                count as u64
+                            } else {
+                                0
+                            }
+                        );
                         assert_eq!(
                             (receiver.invalid, receiver.window.too_old, receiver.overflow),
                             (0, 0, 0)
@@ -866,7 +981,7 @@ mod tests {
                         );
                         assert!(receiver.latency.max_ns < 1_000_000_000);
                         let now = sent_at + 5_000;
-                        consume(receiver, &bytes, payload, payload, c.run, now);
+                        consume(receiver, &mut bins, &bytes, payload, payload, c.run, now);
                         assert_eq!(receiver.window.duplicates, count as u64);
                         if stamped {
                             assert_eq!(
@@ -877,7 +992,15 @@ mod tests {
                         if payload == 1472 && segments == 1 {
                             for i in 16..payload {
                                 bytes[i] ^= 1;
-                                consume(receiver, &bytes[..payload], payload, payload, c.run, now);
+                                consume(
+                                    receiver,
+                                    &mut bins,
+                                    &bytes[..payload],
+                                    payload,
+                                    payload,
+                                    c.run,
+                                    now,
+                                );
                                 bytes[i] ^= 1;
                             }
                             // The stamp is not part of the checked pattern.
@@ -887,6 +1010,7 @@ mod tests {
                         let samples = receiver.latency.count;
                         consume(
                             receiver,
+                            &mut bins,
                             &bytes[..payload],
                             payload,
                             payload,
@@ -897,16 +1021,25 @@ mod tests {
                         assert_eq!(receiver.latency.count, samples, "another run's packet");
                         assert_eq!(receiver.first_wrong_run, c.run);
                         bytes[0] ^= 1;
-                        consume(receiver, &bytes[..payload], payload, payload, c.run, now);
                         consume(
                             receiver,
+                            &mut bins,
+                            &bytes[..payload],
+                            payload,
+                            payload,
+                            c.run,
+                            now,
+                        );
+                        consume(
+                            receiver,
+                            &mut bins,
                             &bytes[..payload - 1],
                             payload - 1,
                             payload,
                             c.run,
                             now,
                         );
-                        consume(receiver, &[], 0, payload, c.run, now);
+                        consume(receiver, &mut bins, &[], 0, payload, c.run, now);
                         assert_eq!(receiver.invalid, 4);
                         if payload == 1472 && segments == 1 {
                             storage.resize(MAX_BYTES * 16, 0);
@@ -917,7 +1050,7 @@ mod tests {
                                     let length = payload - usize::from(i == 1);
                                     sender.socket.send(&bytes[..length]).unwrap();
                                 }
-                                assert!(receive(receiver, &mut storage, &c).unwrap());
+                                assert!(receive(receiver, &mut bins, &mut storage, &c).unwrap());
                             });
                             assert_eq!(receiver.calls, calls + 1);
                             assert_eq!(receiver.window.unique, count as u64 + 2);

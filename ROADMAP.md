@@ -107,7 +107,10 @@ its loss bar because a host stall fell inside one episode
 ([BENCH.md](BENCH.md#probertts-window-over-min_rtt-plus-the-ack-delay-landed-off)).
 With both sources counted out, `tx_hold_us = 200` loses no more than the
 control ([BENCH.md](BENCH.md#the-holds-loss-without-host-stalls-and-probertt)),
-so the hold's only cost is latency.
+so the hold's only cost is latency. `udp_load` now bins frames by send time
+so `sweep_report` can leave stalls out without a trace build; a release
+repeat confirms the hold at 6% less CPU with no extra loss
+([BENCH.md](BENCH.md#leaving-out-stalls-without-a-trace-build)).
 
 TCP through the tunnel turned out to be limited by the harness and then by
 the host. Both iperf3 directions had used the same port pair, so tun's
