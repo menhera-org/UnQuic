@@ -435,6 +435,16 @@ own bar; none is attempted here. This harness also charges the emulated
 path's kernel work to the daemons, so the light-load figure overstates what
 a real host would pay.
 
+A descriptive comparison, no bar ([three repeats](benches/tap-light-load-today.json)):
+the build before November 11's efficiency work (`927fe18`) against the
+current one (`2af674d`, with sleeping-only wakes and arming the timer only
+before blocking), 0.5G each way. With sixteen flows CPU per delivered Gbit/s
+fell from 490–498% to 459–473%, about 7%; with four flows it stayed within
+noise (739–797% against 749–795%). These runs use the rebuilt generator,
+which paces frames evenly instead of in timer-slack bursts. That leaves the
+daemons fewer frames per turn, which is the likely reason four flows now
+cost more than the 491% the A/A run measured with the old generator.
+
 ## Checked indexing in the encoders and batch planner (November 12)
 
 The last stage 4 panic-audit item converts every indexing site that Clippy's
