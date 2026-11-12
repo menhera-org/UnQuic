@@ -442,7 +442,11 @@ check (two rounds, [first](benches/shared-flow-table-loopback.json),
 [second](benches/shared-flow-table-loopback-2.json)) it does not remove
 balanced lanes' cost: 10.83 and 10.30 Gbit/s at 21G against 11.47 and 12.31
 with hash lanes and 10.68 and 11.14 with per-reader tables, with little
-reordering in any arm. That cost, 6–16%, comes from elsewhere. A production version needs tests,
+reordering in any arm. That cost, 6–16%, comes from elsewhere, and not
+from CPU: in the release runs above
+([results](benches/loopback-balance-flows-3178088.json)) the busiest thread
+with balanced lanes runs at 76–81% of a core against 97% with hash lanes,
+yet delivers less. What limits balanced lanes there is the next question. A production version needs tests,
 a memory charge for the table and the full bars before it can land.
 
 ## Whether the single QinQ reader limits the loopback check (November 11)
