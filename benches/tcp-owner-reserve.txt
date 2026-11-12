@@ -1,0 +1,5 @@
+Read margin (3b9e86f, patch) vs 3178088 (base) on TCP through the tunnel, November 12: loopback, eight workers, 1514-byte frames, eight iperf3 TCP streams each way, unlimited, 20 s, TAP_TXQUEUELEN 500, REVERSE_PORT_OFFSET 2000, default cookie, two alternating pairs.
+base/r1 L>R=5.06 R>L=4.41 total=9.47 cpu_L=433% cpu_R=492% cpu_per_gbps=97.7% reorder=26/20
+patch/r1 L>R=5.44 R>L=4.22 total=9.66 cpu_L=451% cpu_R=494% cpu_per_gbps=97.8% reorder=69/0
+base/r2 L>R=5.21 R>L=4.21 total=9.41 cpu_L=438% cpu_R=487% cpu_per_gbps=98.3% reorder=613/0
+patch/r2 L>R=4.74 R>L=4.68 total=9.43 cpu_L=408% cpu_R=520% cpu_per_gbps=98.5% reorder=81/17

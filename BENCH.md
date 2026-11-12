@@ -243,7 +243,12 @@ at 2G the margin delivers 1.39–1.41 / 1.56–1.60 Gbit/s against 1.20–1.21 /
 1.58–1.73, and at 5G 1.25–1.26 / 1.76–1.78 against 0.84–0.85 / 1.49–1.54.
 The 5G total rises 28% and holds the 2G total, but L→R still loses 10%
 between 2G and 5G, so the second condition fails: with loss the plateau
-holds in total, not yet in each direction. Balanced lanes, below, rescue the same four-flow point
+holds in total, not yet in each direction.
+
+TCP through the tunnel (loopback, eight workers, eight streams each way,
+two alternating pairs, [runs](benches/tcp-owner-reserve.txt)) is unchanged:
+9.66 and 9.43 Gbit/s with the margin against 9.47 and 9.41, at 98% of a core
+per Gbit/s in both. Balanced lanes, below, rescue the same four-flow point
 by a different route.
 
 ### Balanced lanes on the decision workload, revisited
