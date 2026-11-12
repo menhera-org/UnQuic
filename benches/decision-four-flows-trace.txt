@@ -1,0 +1,34 @@
+Trace of the four-flow decision workload at 2G and 5G offered (trace build of 1dd3a4c, defaults), November 12. trace_report counts, controller shares and sender-state shares per daemon:
+== 2g left
+"counts":{"admit_owner_buffers":1209078,"admit_owner_frames":4450,"expire_input":581,"expire_partial":3,"expire_sent":116972,"expire_unsent":243,"losses":51}
+"mean_pacing_gbps":3.1407
+"mean_cwnd_bytes":4939350
+== 2g right
+"counts":{"admit_owner_buffers":700633,"expire_input":584,"expire_partial":4,"expire_sent":5913,"expire_unsent":502,"losses":28176}
+"mean_pacing_gbps":2.1102
+"mean_cwnd_bytes":1477626
+== 5g left
+"counts":{"admit_owner_buffers":3278843,"admit_owner_frames":39381,"expire_input":720,"expire_partial":5,"expire_sent":1059982,"expire_unsent":342,"losses":2158}
+"mean_pacing_gbps":8.5343
+"mean_cwnd_bytes":15887144
+== 5g right
+"counts":{"admit_owner_buffers":1362590,"expire_input":661,"expire_partial":12,"expire_sent":17308,"expire_unsent":702,"losses":52264}
+"mean_pacing_gbps":1.6761
+"mean_cwnd_bytes":1400862
+
+Left (L->R sender) at 5G, per worker:
+{"worker":0,"requests_per_s":0,"mean_request_bytes":193,"mean_held_gap_us":401139.5,"never_sent_expired":0
+{"worker":1,"requests_per_s":0,"mean_request_bytes":228,"mean_held_gap_us":209453.0,"never_sent_expired":0
+{"worker":2,"requests_per_s":1201,"mean_request_bytes":56811,"mean_held_gap_us":667.5,"never_sent_expired":205
+{"worker":3,"requests_per_s":1074,"mean_request_bytes":58490,"mean_held_gap_us":738.7,"never_sent_expired":857
+
+Admission drops on the left by worker and reason (4 = owner exchange buffers, 5 = owner frame quota), with means of the recorded state at each drop:
+== 2g
+worker 2 reason=4 drops=469938 free=6.6 rx_retained=2.4 tap_inputs=76.3 tx_retained=616
+worker 2 reason=5 drops=4450 free=47.2 rx_retained=3.0 tap_inputs=0.9 tx_retained=2046
+worker 3 reason=4 drops=739140 free=3.5 rx_retained=5.5 tap_inputs=1.7 tx_retained=567
+== 5g
+worker 2 reason=4 drops=629090 free=7.7 rx_retained=1.3 tap_inputs=2.1 tx_retained=321
+worker 2 reason=5 drops=35880 free=21.8 rx_retained=3.1 tap_inputs=0.0 tx_retained=2046
+worker 3 reason=4 drops=2649753 free=5.6 rx_retained=3.4 tap_inputs=0.6 tx_retained=724
+worker 3 reason=5 drops=3501 free=27.1 rx_retained=4.8 tap_inputs=0.0 tx_retained=2046

@@ -156,6 +156,28 @@ flows hash unevenly. Four flows lose L→R delivery between 2G and 5G
 frames still waiting for a repair when the host stalls expire. Stall bins
 number one to five per direction at every 0.5G point, lossy or not.
 
+### Why four flows lose L→R delivery past 2G (open)
+
+A trace of both four-flow points ([counts](benches/decision-four-flows-trace.txt))
+rules out CPU and the controller. At 5G the left daemon's workers run
+at 37–84% of a core, less than at 2G, and BBR paces at 8.5 Gbit/s with a
+16 MB window. The two workers that own the active L→R lanes send in
+57–58 KB bursts, about 1,100–1,200 a second, and wait about 700 µs between
+them. Meanwhile they refuse 3.28 million handed-over inputs for lack of
+exchange buffers (about 5 of 128 free at each refusal, with 1–3 unexpanded
+inputs queued), and 1.06 million sent frames expire unacknowledged against
+117,000 at 2G. The left receive sockets overflow 12,866 times.
+
+Doubling the buffers per worker to 256
+([patch](benches/buffers-256-exploratory.patch),
+[results](benches/decision-four-flows-buffers-256.json)) changes nothing:
+5G L→R delivers 0.91 Gbit/s against 0.90–0.99 for `3178088` (two
+alternating pairs; 2G 1.24 against 1.23–1.25). The buffer count is not the
+limit; the refusals follow from whatever keeps those buffers busy. The open
+question is what the owners wait for between bursts while inputs are being
+refused, and whether the expired sent frames are lost ACKs (the left
+sockets' overflows) or lost data.
+
 ## Whether the single QinQ reader limits the loopback check (November 11)
 
 On both sides of the loopback check every TAP read lands on one worker, and

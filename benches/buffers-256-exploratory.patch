@@ -1,0 +1,13 @@
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 84adb96..3b72278 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -22,7 +22,7 @@ use std::{
+     },
+ };
+ 
+-pub(crate) const BUFFERS: usize = 128;
++pub(crate) const BUFFERS: usize = 256;
+ pub(crate) const LANES: usize = 64;
+ pub(crate) const STACK_BYTES: usize = 512 * 1024;
+ 

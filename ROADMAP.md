@@ -128,6 +128,15 @@ placement stays
 A candidate for unprivileged hosts is a second receive socket per worker,
 doubling the buffering a worker gets without `CAP_NET_ADMIN`.
 
+A fresh decision-workload baseline
+([BENCH.md](BENCH.md#decision-workload-baseline-november-12-evening)) shows
+the plateau gate failing for few flows: four flows deliver 1.31 Gbit/s L→R
+at 2G offered but 0.92 at 5G. A trace rules out CPU and BBR; the lane owners
+send in bursts with 700 µs gaps while refusing inputs for lack of exchange
+buffers, and doubling the buffers changes nothing. Finding what the owners
+wait for is the next overload item
+([BENCH.md](BENCH.md#why-four-flows-lose-lr-delivery-past-2g-open)).
+
 Decisions only the user can make, each blocking a remaining goal:
 
 1. FEC for the 5% loss row only helps if packets it recovers are
