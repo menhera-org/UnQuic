@@ -343,6 +343,15 @@ fn cpu_ns() -> io::Result<u64> {
     }
     Ok(t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64)
 }
+/// Send errors that leave the datagram unsent for a later retry. A receiver that
+/// has not bound yet answers with port unreachable, which surfaces as ConnectionRefused.
+fn retry_send(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::ConnectionRefused
+    ) || error.raw_os_error() == Some(libc::ENOBUFS)
+}
+
 fn run(c: &Config) -> io::Result<()> {
     c.validate()?;
     let mut flows = flows(c)?;
@@ -422,14 +431,7 @@ fn run(c: &Config) -> io::Result<()> {
                         progress = true;
                     }
                     Ok(_) => return Err(io::Error::other("partial UDP send")),
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        ) || e.raw_os_error() == Some(libc::ENOBUFS) =>
-                    {
-                        f.blocked += 1
-                    }
+                    Err(e) if retry_send(&e) => f.blocked += 1,
                     Err(e) => return Err(e),
                 }
             } else if polls[index].revents != 0 {
@@ -494,6 +496,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sends_retry_on_full_queues_and_unbound_receivers_but_stop_on_other_errors() {
+        for kind in [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionRefused,
+        ] {
+            assert!(retry_send(&kind.into()));
+        }
+        assert!(retry_send(&io::Error::from_raw_os_error(libc::ENOBUFS)));
+        assert!(!retry_send(&io::Error::from_raw_os_error(libc::EMSGSIZE)));
+        assert!(!retry_send(&io::ErrorKind::PermissionDenied.into()));
+    }
 
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
