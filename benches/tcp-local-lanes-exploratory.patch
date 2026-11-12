@@ -1,0 +1,13 @@
+diff --git a/src/pack.rs b/src/pack.rs
+index 1d6d505..9965311 100644
+--- a/src/pack.rs
++++ b/src/pack.rs
+@@ -735,7 +735,7 @@ pub fn flow_hash(frame: &[u8]) -> u64 {
+ pub(crate) fn prefer_local_lane(frame: &[u8]) -> bool {
+     // Stacked VLAN traffic can enter one TAP queue; spread it across all lanes.
+     let (link, ip) = flow_key(frame);
+-    link.len() <= 18 && matches!(ip, Some((_, 17, ports)) if ports.len() == 4)
++    link.len() <= 18 && matches!(ip, Some((_, 6 | 17, ports)) if ports.len() == 4)
+ }
+ 
+ type IpKey<'a> = (&'a [u8], u8, &'a [u8]);

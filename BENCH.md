@@ -849,6 +849,36 @@ segments under unlimited load, and those drops, not reordering, are the
 open item. The UDP decision workload uses `udp_load`, whose port layout this
 does not change.
 
+## Lane-owner alignment for TCP and QinQ (November 12, exploratory)
+
+With distinct ports, 85–94% of TCP inputs still reach their lane's owner
+through another worker: tun reads a TCP flow on the queue the daemon last
+wrote its ACKs on, and that writer is the receive owner of the ACKs' lane,
+`(cookie_low32 + lane − 1) mod n`, while the data's transmit owner is
+`(lane − 1) mod n`. A cookie whose low 32 bits are a multiple of the
+worker count makes each lane's receive owner its transmit owner on both
+ends (the November 8 audit's section 9). Exploratory, two questions, no
+landing decision ([runs](benches/lane-owner-alignment.txt)):
+
+| Loopback TCP, eight streams each way, eight workers | Default cookie | Aligned cookie |
+| --- | --- | --- |
+| Total Gbit/s, two pairs in one session | 9.43, 9.62 | 11.23, 11.22 |
+| Both daemons, % of a core per Gbit/s | 100.2, 98.7 | 91.0, 91.8 |
+
+Alignment lifts TCP 17–19% at 8–9% less CPU per bit. Letting TCP use
+reader-local lanes like UDP on top of it
+([patch](benches/tcp-local-lanes-exploratory.patch)) gave 9.61 and 9.65
+Gbit/s at 96–97% per Gbit/s, worse than alignment alone, and is rejected.
+On the decision workload at 5G (three alternating pairs, same binary) the
+aligned cookie loses instead: 1.66–1.78 / 1.48–1.54 Gbit/s against
+2.00–2.06 / 1.55–1.62 with the default cookie, at about the same CPU per
+bit. There one worker reads every QinQ frame, and alignment probably also
+gives that worker its own lanes' receive work, which the default cookie's
+offset moves elsewhere. Placement helps one workload and hurts the other, so
+the receive-owner formula stays. A version that aligns only where the
+reader is not the bottleneck would need a signal neither workload offers
+yet.
+
 ## Checked indexing in the encoders and batch planner (November 12)
 
 The last stage 4 panic-audit item converts every indexing site that Clippy's

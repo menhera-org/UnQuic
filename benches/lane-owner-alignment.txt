@@ -1,0 +1,24 @@
+Lane-owner alignment, November 12, exploratory. Base 1dd3a4c (release, bin feature).
+
+TCP on loopback: eight workers, 1514-byte frames, eight iperf3 TCP streams each way, unlimited, 20 s, TAP_TXQUEUELEN 500, REVERSE_PORT_OFFSET 2000. SESSION_COOKIE ...-aabbccddeef0 (low 32 bits a multiple of 16, so each lane is received by the worker that sends it). Two alternating pairs, base vs benches/tcp-local-lanes-exploratory.patch. CPU is both daemons, percent of a core.
+base/r1 L>R=5.29 R>L=6.07 total=11.36 cpu_L=530% cpu_R=509% cpu_per_gbps=91.5% reorder=0/5
+patch/r1 L>R=4.57 R>L=5.03 total=9.61 cpu_L=475% cpu_R=456% cpu_per_gbps=96.8% reorder=0/67
+base/r2 L>R=5.40 R>L=6.20 total=11.60 cpu_L=539% cpu_R=533% cpu_per_gbps=92.4% reorder=2/0
+patch/r2 L>R=4.68 R>L=4.97 total=9.65 cpu_L=476% cpu_R=448% cpu_per_gbps=95.7% reorder=1/47
+Same setup with the default cookie (...-aabbccddeeff), from benches/loopback-tcp-port-offset.txt runs at offset 2000:
+o2000/r1 L>R=4.75 R>L=4.25 total=8.99 cpu_L=419% cpu_R=509% cpu_per_gbps=103.2% reorder=288/20
+o2000/r2 L>R=5.13 R>L=4.20 total=9.33 cpu_L=436% cpu_R=501% cpu_per_gbps=100.4% reorder=20/28
+
+Decision workload at 5G (routed 4.5 ms, bridged QinQ 1522-byte frames, four workers, sixteen flows), same binary, default cookie vs aligned cookie, three alternating pairs (sweep_report):
+aln rr1 L>R=1.6597 R>L=1.5438 cpu_pct=327.8437/306.182 missing_pct=65.8408/68.1414
+aln rr2 L>R=1.7843 R>L=1.5411 cpu_pct=336.0356/316.3618 missing_pct=63.1925/68.1809
+aln rr3 L>R=1.7114 R>L=1.4753 cpu_pct=330.9594/318.002 missing_pct=65.1157/69.7553
+def rr1 L>R=2.0539 R>L=1.6125 cpu_pct=349.1844/351.1616 missing_pct=57.5699/66.4842
+def rr2 L>R=2.0597 R>L=1.5494 cpu_pct=355.3412/354.4016 missing_pct=58.1329/68.2054
+def rr3 L>R=1.9992 R>L=1.6247 cpu_pct=358.7247/359.8616 missing_pct=59.3696/66.6655
+
+TCP on loopback, in one session: default cookie (def) vs aligned cookie (aln), base binary, two alternating pairs:
+def/r1 L>R=4.64 R>L=4.79 total=9.43 cpu_L=431% cpu_R=514% cpu_per_gbps=100.2% reorder=28/35
+aln/r1 L>R=5.05 R>L=6.18 total=11.23 cpu_L=516% cpu_R=506% cpu_per_gbps=91.0% reorder=0/7
+def/r2 L>R=5.12 R>L=4.50 total=9.62 cpu_L=440% cpu_R=509% cpu_per_gbps=98.7% reorder=14/1
+aln/r2 L>R=4.88 R>L=6.34 total=11.22 cpu_L=494% cpu_R=536% cpu_per_gbps=91.8% reorder=0/1
