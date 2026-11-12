@@ -884,6 +884,14 @@ against 9.11 and 9.29 with it, at 133–137% of a core per Gbit/s instead of
 the senders repair up to 167,000 packets; per-datagram receive work fills
 the buffer faster than coarse drops do. Rejected.
 
+Thirty-two receive buffers per worker instead of eight, rejected on
+November 11 for moving capacity between directions on the single-reader
+check, were retried on this TCP case with the same 5% bar
+([runs](benches/receive-buffers-32-tcp.txt)): overflows fall in three of
+four daemon-runs, but the total is 8.91 and 9.47 Gbit/s against 9.20 and
+9.96. Draining more datagrams per call does not lift TCP here. Rejected
+again.
+
 The harness now also records each inner namespace's `/proc/net/netstat`.
 One more pair with it ([counters](benches/loopback-tcp-tcpext.txt)) showed
 TCP seeing a lot of reordering: SACK-detected reordering of 12,000–38,000

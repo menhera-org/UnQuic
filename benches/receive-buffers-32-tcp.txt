@@ -1,0 +1,9 @@
+Retest of 32 receive buffers per worker (benches/receive-buffers-32-rejected.patch) on TCP, November 12. Loopback, eight workers, 1514-byte frames, eight iperf3 TCP streams each way, unlimited, 20 s, TAP_TXQUEUELEN 500, REVERSE_PORT_OFFSET 2000, default cookie. HEAD 3178088 daemon (base) vs the same with RECEIVE_BUFFERS = 32 (patch), two alternating pairs.
+base/r1 L>R=5.02 R>L=4.18 total=9.20 cpu_L=435% cpu_R=476% cpu_per_gbps=99.1% reorder=76/39
+left overflow=386 repairs=19339 expired_sent=29425 admission=9048 |right overflow=862 repairs=6956 expired_sent=48085 admission=4190 |
+patch/r1 L>R=4.28 R>L=4.63 total=8.91 cpu_L=404% cpu_R=504% cpu_per_gbps=101.9% reorder=36/6
+left overflow=221 repairs=13629 expired_sent=20490 admission=16579 |right overflow=582 repairs=4568 expired_sent=35313 admission=2361 |
+base/r2 L>R=5.63 R>L=4.33 total=9.96 cpu_L=463% cpu_R=494% cpu_per_gbps=96.0% reorder=40/0
+left overflow=27 repairs=15272 expired_sent=14957 admission=12000 |right overflow=727 repairs=637 expired_sent=34943 admission=5227 |
+patch/r2 L>R=5.43 R>L=4.04 total=9.47 cpu_L=463% cpu_R=478% cpu_per_gbps=99.4% reorder=0/9
+left overflow=37 repairs=9246 expired_sent=10814 admission=12549 |right overflow=401 repairs=839 expired_sent=35639 admission=5698 |
