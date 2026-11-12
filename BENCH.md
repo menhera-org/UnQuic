@@ -348,6 +348,21 @@ path dominates: sending batches takes 25–30% of busy cycles and TAP reads
 and writes another 20–30%. `stage_recovery` matters mainly at loopback
 rates.
 
+## Scanning only occupied receive slots for ACKs (November 12)
+
+At 0.5G a `profile` build puts `collect_acks` at 6.0% of busy cycles, of which
+building ACKs (`take_ack`) is 0.3%: the rest is the per-turn sweep over all
+64 receive slots of each session, most of them empty, with an outgoing-queue
+check on each. The candidate keeps a per-session bitmask of occupied slots,
+changed only through two `Session` methods, and the sweep jumps over empty
+slots while still covering every position once per turn.
+
+Stated before measuring, against the current build: on the decision workload
+with sixteen flows, no loss, 0.5G each way, six pairs in alternating order,
+CPU per delivered Gbit/s is lower in at least five pairs with a median of −2%
+or better; and on the loopback check, four alternating pairs, the 21G total's
+median paired change is no worse than −2%. Both kernel suites must pass.
+
 ## A configurable loss threshold for random loss (November 12)
 
 At 5% random loss draft 07 delivers under 11% of a 0.5G offer: any loss
