@@ -500,6 +500,15 @@ rules apply to all of them.
    double-fork readiness, the systemd unit, the VRF and composition tests and
    the V03 lifecycle cases are done.
 7. **Stage 5:** profile what remains and try its candidates behind switches.
+   First, as of November 12: ACK and control records always leave on lane
+   0's socket and queue behind its data under overload (29,000–32,000
+   deferred ACK sends per point with balanced lanes, up to 12,590 with hash
+   lanes). Send them so they never wait behind data, with tests and both
+   suites, then re-measure hash and balanced lanes (an exploratory version
+   that keeps lane 0 out of the balanced rotation leads hash lanes 14.4–14.6
+   to 11.3–11.9 Gbit/s on the loopback check) and the shared flow table,
+   before deciding `balance_flows`
+   ([BENCH.md](BENCH.md#a-flow-table-shared-by-all-readers-exploratory)).
 
 If evidence shows a gate cannot be reached within the current design, write
 that conclusion with its evidence in BENCH.md and here instead of trying more
