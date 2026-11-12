@@ -272,6 +272,15 @@ next candidate should move receive work off the worker that reads the TAP,
 or split TAP reading inside the daemon, so the two directions stop sharing
 one core.
 
+An exploratory build on November 12 ([patch](benches/reader-skips-own-lanes-exploratory.patch),
+[four alternating pairs](benches/tap-reader-skips-own-lanes.json)) made a
+worker hash strict-path frames only onto lanes other workers own, so the
+single QinQ reader sends nothing itself. Its busiest thread fell from 88–98%
+to 81–86%, but L→R moved only from a 5.87 to a 6.01 Gbit/s median, R→L fell
+from 6.20 to 5.36, and the left daemon used about 45% more CPU (560% against
+390%): handing every frame to another worker costs more than the reader
+saves. Not pursued.
+
 Placement alone cannot reach the gate. In the control arm the two daemons
 together use 866% of a core for 11.74 Gbit/s, about 0.74 of a core per Gbit/s
 counting both ends. Each daemon runs on eight CPUs, so even with perfect

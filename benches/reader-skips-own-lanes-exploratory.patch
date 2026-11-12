@@ -1,0 +1,31 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index 7667db0..9ea8bb7 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -424,7 +424,25 @@ fn strict_lane(frame: &[u8], worker: usize, workers: usize, queues: usize, lanes
+ fn tap_lane(frame: &[u8], worker: usize, workers: usize, queues: usize, lanes: usize) -> usize {
+     // A session with fewer TAP queues still needs its other transmit workers.
+     if strict_lane(frame, worker, workers, queues, lanes) {
+-        return pack::flow_hash(frame) as usize % lanes;
++        // EXPLORATORY: the reader keeps no strict-hash frames for its own lanes.
++        let hash = pack::flow_hash(frame) as usize;
++        let own = if worker < lanes {
++            (lanes - 1 - worker) / workers + 1
++        } else {
++            0
++        };
++        if own != 0 && lanes > own {
++            let mut k = hash % (lanes - own);
++            for lane in 0..lanes {
++                if lane % workers != worker {
++                    if k == 0 {
++                        return lane;
++                    }
++                    k -= 1;
++                }
++            }
++        }
++        return hash % lanes;
+     }
+     let count = (lanes - 1 - worker) / workers + 1;
+     let slot = if count == 1 {
