@@ -1313,6 +1313,10 @@ November 10 evidence for that list, all in BENCH.md:
   ([BENCH.md](BENCH.md#cost-at-light-load-november-12)). Candidates: a short
   per-lane hold time, aggregation across lanes, or spendable credit that
   skips the grant round trip, each with its own latency or pacing bar.
+  Fixed per-turn work matters here too: sweeping only occupied receive slots
+  for ACKs cut light-load CPU per Gbit/s by 4.1%
+  ([BENCH.md](BENCH.md#scanning-only-occupied-receive-slots-for-acks-november-12));
+  `flush_taps` and the deadline scan still visit all 64 slots per session.
 - `tolerate_random_loss` by default: measured on November 11 against one TCP
   CUBIC flow at a 1 Gbit/s, 7.5 ms bottleneck
   ([BENCH.md](BENCH.md#coexistence-with-tolerate_random_loss-november-11)).

@@ -363,6 +363,13 @@ CPU per delivered Gbit/s is lower in at least five pairs with a median of −2%
 or better; and on the loopback check, four alternating pairs, the 21G total's
 median paired change is no worse than −2%. Both kernel suites must pass.
 
+[Six light-load pairs](benches/tap-occupied-slots-light.json): CPU per
+delivered Gbit/s is lower in all six, median −4.1% (−6.3% to −2.4%).
+[Four loopback pairs](benches/tap-occupied-slots-loop.json): the 21G total's
+median paired change is +8.9%. Both kernel suites pass, including a check
+that a sweep starting near the end wraps to an occupied slot. The change
+lands.
+
 ## A configurable loss threshold for random loss (November 12)
 
 At 5% random loss draft 07 delivers under 11% of a 0.5G offer: any loss

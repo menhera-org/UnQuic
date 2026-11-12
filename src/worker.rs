@@ -533,7 +533,10 @@ struct Session {
     connection: Option<Connection>,
     path: usize,
     rx_index: Box<[u8]>,
+    // Change only through put_rx and take_rx, which keep rx_occupied in step.
     rx: Vec<Option<Box<reassembly::Lane>>>,
+    // One bit per rx slot holding a lane, so per-turn scans skip empty slots.
+    rx_occupied: u64,
     free: Vec<Box<reassembly::Lane>>,
     returning: u64,
     retirements: Box<[u64]>,
@@ -557,6 +560,32 @@ struct Session {
     ack_inflight: u64,
     rx_dirty: u64,
     tx_dirty: u64,
+}
+
+impl Session {
+    /// Installs a receive lane in an empty slot, returning the slot.
+    fn put_rx(&mut self, lane: Box<reassembly::Lane>) -> io::Result<usize> {
+        let slot = self
+            .rx
+            .iter()
+            .position(Option::is_none)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        self.put_rx_at(slot, lane)?;
+        Ok(slot)
+    }
+
+    fn put_rx_at(&mut self, slot: usize, lane: Box<reassembly::Lane>) -> io::Result<()> {
+        let entry = self.rx.get_mut(slot).ok_or(io::ErrorKind::InvalidData)?;
+        *entry = Some(lane);
+        self.rx_occupied |= 1_u64 << slot;
+        Ok(())
+    }
+
+    fn take_rx(&mut self, slot: usize) -> Option<Box<reassembly::Lane>> {
+        let lane = self.rx.get_mut(slot)?.take();
+        self.rx_occupied &= !(1_u64 << slot);
+        lane
+    }
 }
 
 struct SessionControl {
@@ -961,6 +990,7 @@ impl Worker {
                 path: 0,
                 rx_index: vec![0; 65_536].into_boxed_slice(),
                 rx: (0..LANES).map(|_| None).collect(),
+                rx_occupied: 0,
                 free,
                 returning: 0,
                 retirements: vec![0; 1024].into_boxed_slice(),
@@ -1820,13 +1850,8 @@ impl Worker {
                         let session = buffer.session;
                         if self.matches(session, buffer.tag) {
                             let id = lane.id();
-                            let slot = self.sessions[session]
-                                .rx
-                                .iter()
-                                .position(Option::is_none)
-                                .ok_or(io::ErrorKind::InvalidData)?;
+                            let slot = self.sessions[session].put_rx(lane)?;
                             self.sessions[session].rx_index[usize::from(id)] = slot as u8 + 1;
-                            self.sessions[session].rx[slot] = Some(lane);
                             self.install_rx_counters(session, slot);
                             // Direct receives queued during registration must not overtake its first packet.
                             self.received.push_front(buffer);
@@ -2125,13 +2150,8 @@ impl Worker {
                 }
                 return Ok(None);
             }
-            let slot = self.sessions[session]
-                .rx
-                .iter()
-                .position(Option::is_none)
-                .ok_or(io::ErrorKind::InvalidData)?;
+            let slot = self.sessions[session].put_rx(lane)?;
             self.sessions[session].rx_index[lane_id] = slot as u8 + 1;
-            self.sessions[session].rx[slot] = Some(lane);
             self.install_rx_counters(session, slot);
         } else if usize::from(owner - 1) != self.id {
             if let Err(Event::Packet(buffer)) =
@@ -3601,12 +3621,7 @@ impl Worker {
             self.push(0, Event::LaneFree { session, lane })
         {
             let local = &mut self.sessions[session];
-            let slot = local
-                .rx
-                .iter()
-                .position(Option::is_none)
-                .ok_or(io::ErrorKind::InvalidData)?;
-            local.rx[slot] = Some(lane);
+            let slot = local.put_rx(lane)?;
             local.returning |= 1_u64 << slot;
         }
         Ok(())
@@ -3626,7 +3641,7 @@ impl Worker {
                     || self.shared.owners[session][usize::from(lane.id())].load(Ordering::Acquire)
                         == 255
                 {
-                    let Some(lane) = local.rx[slot].take() else {
+                    let Some(lane) = local.take_rx(slot) else {
                         continue;
                     };
                     local.rx_index[usize::from(lane.id())] = 0;
@@ -5319,7 +5334,7 @@ mod tests {
             .unwrap();
         let mut lane = worker.sessions[0].free.pop().unwrap();
         lane.reset(7, 9022).unwrap();
-        worker.sessions[0].rx[0] = Some(lane);
+        worker.sessions[0].put_rx_at(0, lane).unwrap();
         worker.sessions[0].rx_index[7] = 1;
         shared.owners[0][7].store(1, Ordering::Release);
         worker.install_rx_counters(0, 0);
@@ -7785,7 +7800,7 @@ mod tests {
     fn local_receive_lane(shared: &Shared, workers: &mut [Worker; 2]) {
         let mut lane = workers[0].sessions[0].free.pop().unwrap();
         lane.reset(7, 9022).unwrap();
-        workers[1].sessions[0].rx[0] = Some(lane);
+        workers[1].sessions[0].put_rx_at(0, lane).unwrap();
         workers[1].sessions[0].rx_index[7] = 1;
         shared.owners[0][7].store(2, Ordering::Release);
     }
@@ -8188,7 +8203,7 @@ mod tests {
         }
         let mut lane = workers[0].sessions[0].free.pop().unwrap();
         lane.reset(7, 9022).unwrap();
-        workers[1].sessions[0].rx[2] = Some(lane);
+        workers[1].sessions[0].put_rx_at(2, lane).unwrap();
         workers[1].sessions[0].rx_index[7] = 3;
         shared.owners[0][7].store(2, Ordering::Release);
         let replacement = Connection {
@@ -8396,7 +8411,9 @@ mod tests {
         for (session, id, owner, slot) in [(0, 7, 0, 0), (0, 8, 1, 0), (1, 7, 1, 0)] {
             let mut lane = workers[0].sessions[session].free.pop().unwrap();
             lane.reset(id, 9022).unwrap();
-            workers[owner].sessions[session].rx[slot] = Some(lane);
+            workers[owner].sessions[session]
+                .put_rx_at(slot, lane)
+                .unwrap();
             workers[owner].sessions[session].rx_index[usize::from(id)] = slot as u8 + 1;
             shared.owners[session][usize::from(id)].store(owner as u8 + 1, Ordering::Release);
             workers[owner].install_rx_counters(session, slot);

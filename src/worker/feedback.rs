@@ -113,17 +113,32 @@ impl Worker {
             return Ok(());
         }
         let slots = self.sessions.len() * LANES;
-        for _ in 0..slots.min(BATCH_SIZE) {
+        // Positions examined this turn, empty ones included, as one sweep at most.
+        let mut examined = 0;
+        while examined < slots.min(BATCH_SIZE) {
             if self.feedback_free.is_empty() {
                 break;
+            }
+            let index = self.feedback_cursor;
+            let (session, slot) = (index / LANES, index % LANES);
+            // Jump over empty slots to this session's next lane, or past its end.
+            let ahead = self.sessions[session].rx_occupied >> slot;
+            let skip = if ahead == 0 {
+                LANES - slot
+            } else {
+                ahead.trailing_zeros() as usize
+            };
+            if skip != 0 {
+                examined += skip;
+                self.feedback_cursor = (index + skip) % slots;
+                continue;
             }
             if self.id != 0 && self.outgoing[0].as_mut().is_none_or(Producer::is_full) {
                 self.feedback_retry = now.saturating_add(RETRY);
                 break;
             }
-            let index = self.feedback_cursor;
+            examined += 1;
             self.feedback_cursor = (index + 1) % slots;
-            let (session, slot) = (index / LANES, index % LANES);
             let local = &mut self.sessions[session];
             if local.ack_inflight & (1 << slot) != 0 || local.returning & (1 << slot) != 0 {
                 continue;
@@ -587,7 +602,8 @@ mod tests {
         let mut bytes = [0; BASE_UDP_PAYLOAD];
         let length = receive_bytes(1, &[receive_piece(1, 0, &[0; 60])], &mut bytes);
         lane.admit(&Datagram::decode(&bytes[..length]).unwrap(), Duration::ZERO);
-        workers[1].sessions[0].rx[3] = Some(lane);
+        workers[1].sessions[0].put_rx_at(3, lane).unwrap();
+        assert_eq!(workers[1].sessions[0].rx_occupied, 1 << 3);
         workers[1].sessions[0].rx_index[7] = 4;
         shared.owners[0][7].store(2, Ordering::Release);
         let rx = socket(&mut workers[0]);
@@ -618,6 +634,8 @@ mod tests {
         );
         assert_eq!(workers[1].feedback_retry, now + RETRY);
         while workers[0].incoming[1].as_mut().unwrap().try_pop().is_some() {}
+        // A cursor near the end wraps over the empty slots within one sweep.
+        workers[1].feedback_cursor = workers[1].sessions.len() * LANES - 10;
         workers[1].collect_acks(now + RETRY).unwrap();
         assert_eq!(workers[1].feedback_free.len(), BUFFERS - 1);
         workers[0].drain_queues(now + RETRY).unwrap();
