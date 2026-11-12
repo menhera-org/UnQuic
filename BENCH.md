@@ -286,7 +286,12 @@ what limits delivery there. Nor is BBR's loss threshold: with
 `loss_threshold_permille = 100` (stated beforehand as needing 5% more 5G
 L→R; [results](benches/decision-four-flows-lossy-threshold-100.json)) L→R
 stays at 1.24–1.25 Gbit/s (default: 1.26–1.28) while R→L rises to 1.85–1.95
-(1.65–1.67). What holds lossy L→R at about 1.25 Gbit/s remains open.
+(1.65–1.67). Per-thread CPU answers it: in all these 5G runs the busiest
+left worker runs at 95–96% of a core and the other L→R owner at 78–86%. With
+hash lanes two of the four flows share one owner, which becomes CPU-bound
+at about 0.6 Gbit/s of 1522-byte frames, with or without loss. That is the
+per-frame cost again, and the reason balanced lanes, which give each flow
+its own owner, deliver more.
 
 The overloaded delay the margin raised is mostly the TAP ring again. On the
 decision workload at 5G, sixteen flows, `3b9e86f`, two alternating pairs
