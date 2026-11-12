@@ -5,6 +5,8 @@ use crate::pacing::Limits;
 use std::time::Duration;
 
 const INFINITY: u64 = u64::MAX;
+/// Draft 07's BBRLossThresh, 2%, in permille.
+const LOSS_THRESHOLD: u16 = 20;
 /// Shortest RTT used to size windows. RTT samples exclude the receiver's ACK
 /// delay, but a lane holds feedback for up to `ack::DELAY` and loaded workers
 /// add their own batching, so on sub-millisecond paths the feedback loop is
@@ -127,6 +129,8 @@ pub struct Controller {
     tolerate_random_loss: bool,
     // Largest RTT sample since the current loss round began.
     loss_round_rtt: Duration,
+    // Loss-rate threshold in permille while random loss is tolerated.
+    loss_threshold: u16,
 
     extra_filter: [u64; 10],
     extra_index: usize,
@@ -216,6 +220,7 @@ impl Controller {
             inflight_latest: 0,
             tolerate_random_loss: false,
             loss_round_rtt: Duration::ZERO,
+            loss_threshold: LOSS_THRESHOLD,
             extra_filter: [0; 10],
             extra_index: 0,
             extra_acked: 0,
@@ -252,12 +257,29 @@ impl Controller {
 
     /// Deviation from draft 07, off by default. Outside bandwidth probing, a
     /// loss round then cuts the short-term bounds only when the ACK that ends
-    /// it shows more than the 2% loss that already stops probing, or when an
+    /// it shows more than the loss threshold that already stops probing (2%
+    /// unless set by [`Controller::set_loss_threshold`]), or when an
     /// RTT sample in that round shows a queue, so steady random loss on an
     /// unqueued path no longer ratchets the rate down round by round while
     /// congestion loss still does.
     pub fn tolerate_random_loss(&mut self, on: bool) {
         self.tolerate_random_loss = on;
+    }
+
+    /// Deviation from draft 07: the loss rate, in permille, above which a
+    /// round counts as too lossy while `tolerate_random_loss` is on. It
+    /// replaces BBRLossThresh (20) in every loss-rate test; values outside
+    /// 20..=200 are clamped. The queue check still cuts regardless of rate.
+    pub fn set_loss_threshold(&mut self, permille: u16) {
+        self.loss_threshold = permille.clamp(LOSS_THRESHOLD, 200);
+    }
+
+    fn loss_threshold(&self) -> u16 {
+        if self.tolerate_random_loss {
+            self.loss_threshold
+        } else {
+            LOSS_THRESHOLD
+        }
     }
 
     /// Whether the current loss round's RTT samples show queueing delay: more
@@ -455,11 +477,14 @@ impl Controller {
         }
         self.loss_in_round = true;
         self.loss_events = self.loss_events.saturating_add(1);
-        if self.check_probe_loss && too_high(sample.lost, sample.tx_in_flight) {
+        let threshold = self.loss_threshold();
+        if self.check_probe_loss && too_high(sample.lost, sample.tx_in_flight, threshold) {
             let prior_inflight = sample.tx_in_flight - u64::from(sample.bytes);
             let prior_loss = sample.lost - u64::from(sample.bytes);
-            let prefix =
-                u128::from(prior_inflight).saturating_sub(50 * u128::from(prior_loss)) / 49;
+            // Draft 07's inflight at the loss threshold, with the threshold in permille.
+            let prefix = (u128::from(prior_inflight) * u128::from(threshold))
+                .saturating_sub(1000 * u128::from(prior_loss))
+                / (1000 - u128::from(threshold));
             let inflight = prior_inflight.saturating_add(prefix.min(u128::from(u64::MAX)) as u64);
             self.prev_probe_too_high = true;
             self.check_probe_loss = false;
@@ -549,7 +574,7 @@ impl Controller {
             if !self.state.probing()
                 && self.loss_in_round
                 && (!self.tolerate_random_loss
-                    || too_high(sample.lost, sample.tx_in_flight)
+                    || too_high(sample.lost, sample.tx_in_flight, self.loss_threshold())
                     || self.queued_in_round())
             {
                 if self.bw_shortterm == INFINITY {
@@ -613,7 +638,7 @@ impl Controller {
             && self.loss_round_start
             && self.recovering
             && self.loss_events >= 6
-            && too_high(sample.lost, sample.tx_in_flight)
+            && too_high(sample.lost, sample.tx_in_flight, self.loss_threshold())
         {
             self.undo_state = Some(State::Startup);
             self.full_bw_reached = true;
@@ -695,7 +720,7 @@ impl Controller {
                 return true;
             }
         }
-        if !too_high(sample.lost, sample.tx_in_flight) {
+        if !too_high(sample.lost, sample.tx_in_flight, self.loss_threshold()) {
             if self.inflight_longterm == INFINITY {
                 return false;
             }
@@ -916,8 +941,9 @@ impl Controller {
     }
 }
 
-fn too_high(lost: u64, in_flight: u64) -> bool {
-    u128::from(lost) * 50 > u128::from(in_flight)
+/// Whether `lost` exceeds `permille` thousandths of `in_flight`; draft 07 uses 20.
+fn too_high(lost: u64, in_flight: u64, permille: u16) -> bool {
+    u128::from(lost) * 1000 > u128::from(in_flight) * u128::from(permille)
 }
 
 fn scale(value: u64, multiplier: u128, divisor: u128) -> u64 {

@@ -268,6 +268,7 @@ mod tests {
             assert_eq!(loaded.config.sessions[0].queue_count, 1);
             assert_eq!(loaded.config.daemon.memory_limit, 256 * 1024 * 1024);
             assert!(loaded.config.daemon.tolerate_random_loss);
+            assert_eq!(loaded.config.daemon.loss_threshold_permille, 20);
             assert!(!loaded.config.daemon.balance_flows);
             loaded.config.validate().unwrap();
         }
@@ -275,6 +276,11 @@ mod tests {
         let loaded = Loaded::parse(&text).unwrap();
         assert!(!loaded.config.daemon.tolerate_random_loss);
         assert_eq!(loaded.config.daemon.memory_limit, 256 * 1024 * 1024);
+        let text = format!("[daemon]\nloss_threshold_permille = 100\n{}", sample());
+        let loaded = Loaded::parse(&text).unwrap();
+        assert_eq!(loaded.config.daemon.loss_threshold_permille, 100);
+        assert!(loaded.config.daemon.tolerate_random_loss);
+        loaded.config.validate().unwrap();
         let text = sample().replace("test.example.invalid", "2001:db8::1");
         let loaded = Loaded::parse(&text).unwrap();
         assert!(loaded.lookups.is_empty());
@@ -385,17 +391,29 @@ mod tests {
             let config = Loaded::parse(&text.replace(from, to)).unwrap().config;
             assert_eq!(config.validate().err().unwrap().field, field, "{field}");
         }
-        let bad = format!("[daemon]\nmemory_limit = 0\n{text}");
-        assert_eq!(
-            Loaded::parse(&bad)
-                .unwrap()
-                .config
-                .validate()
-                .err()
-                .unwrap()
-                .field,
-            "daemon.memory_limit"
-        );
+        for (setting, field) in [
+            ("memory_limit = 0", "daemon.memory_limit"),
+            (
+                "loss_threshold_permille = 19",
+                "daemon.loss_threshold_permille",
+            ),
+            (
+                "loss_threshold_permille = 201",
+                "daemon.loss_threshold_permille",
+            ),
+        ] {
+            let bad = format!("[daemon]\n{setting}\n{text}");
+            assert_eq!(
+                Loaded::parse(&bad)
+                    .unwrap()
+                    .config
+                    .validate()
+                    .err()
+                    .unwrap()
+                    .field,
+                field
+            );
+        }
         let loaded = Loaded::parse(&text).unwrap();
         let mut config = loaded.config;
         config.sessions.push(config.sessions[0].clone());

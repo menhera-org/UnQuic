@@ -731,6 +731,7 @@ impl Worker {
             now,
             Arc::clone(&budgets),
             first.shared.config.config().daemon.tolerate_random_loss,
+            first.shared.config.config().daemon.loss_threshold_permille,
         )?;
         for worker in workers.iter_mut() {
             worker.sender.budgets = Arc::clone(&budgets);

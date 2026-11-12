@@ -37,9 +37,14 @@ pub struct Daemon {
     /// cut the short-term bounds only after a loss round above 2% loss or one
     /// whose RTT samples show queueing delay.
     pub tolerate_random_loss: bool,
+    /// Loss rate, in permille, above which a loss round counts as too lossy
+    /// while `tolerate_random_loss` is on; 20–200, default 20 (draft 07's 2%).
+    /// Raising it keeps throughput on lossy unqueued paths; the queue check
+    /// still cuts whenever RTT samples show queueing.
+    pub loss_threshold_permille: u16,
     /// Off by default: pin each new flow to the next lane round-robin instead
     /// of its hash lane, so a few heavy flows use separate transmit workers.
-    /// It helps the decision workload but cuts the loopback check by up to 4x.
+    /// It lifts weaker directions and single flows but costs the favoured ones.
     pub balance_flows: bool,
 }
 impl Default for Daemon {
@@ -47,6 +52,7 @@ impl Default for Daemon {
         Self {
             memory_limit: 256 * 1024 * 1024,
             tolerate_random_loss: true,
+            loss_threshold_permille: 20,
             balance_flows: false,
         }
     }
@@ -229,6 +235,13 @@ impl Config {
                 field: "daemon.memory_limit",
                 index: None,
                 reason: "must be nonzero",
+            });
+        }
+        if !(20..=200).contains(&self.daemon.loss_threshold_permille) {
+            return Err(ConfigError {
+                field: "daemon.loss_threshold_permille",
+                index: None,
+                reason: "must be 20 through 200",
             });
         }
         let endpoints = names(

@@ -274,6 +274,42 @@ fn probe_loss_reacts_once_and_does_not_reduce_cap_for_app_limited_samples() {
 }
 
 #[test]
+fn a_raised_loss_threshold_bounds_probing_only_while_random_loss_is_tolerated() {
+    // 1500 of 15000 bytes is 10%: too high for draft 07's 2%, not above 10%.
+    for (tolerate, reacts) in [(false, true), (true, false)] {
+        let mut c = cruise();
+        c.tolerate_random_loss(tolerate);
+        c.set_loss_threshold(100);
+        c.start_refill();
+        c.start_up(1_500_000);
+        c.check_probe_loss = true;
+        c.enter_recovery(c.now, 15000, false).unwrap();
+        loss(&mut c, 1500, 1500, 15000, false);
+        assert_eq!(c.check_probe_loss, !reacts);
+        assert_eq!(c.inflight_longterm, if reacts { 13775 } else { INFINITY });
+    }
+    // Above it, the bound is the inflight at which loss reached 10%:
+    // 13500 + (13500 * 100 - 1000 * 100) / 900 = 14888.
+    let mut c = cruise();
+    c.tolerate_random_loss(true);
+    c.set_loss_threshold(100);
+    c.start_refill();
+    c.start_up(1_500_000);
+    c.check_probe_loss = true;
+    c.enter_recovery(c.now, 15000, false).unwrap();
+    loss(&mut c, 100, 100, 15000, false);
+    assert!(c.check_probe_loss);
+    loss(&mut c, 1500, 1600, 15000, false);
+    assert_eq!(c.state(), State::Down);
+    assert_eq!(c.inflight_longterm, 14888);
+    // Settings outside 2%..=20% are clamped.
+    c.set_loss_threshold(5);
+    assert_eq!(c.loss_threshold, 20);
+    c.set_loss_threshold(1000);
+    assert_eq!(c.loss_threshold, 200);
+}
+
+#[test]
 fn loss_outside_probing_reduces_shortterm_once_per_loss_round() {
     let mut c = cruise();
     c.bw_latest = 0;
@@ -295,17 +331,23 @@ fn loss_outside_probing_reduces_shortterm_once_per_loss_round() {
 #[test]
 fn tolerated_random_loss_cuts_shortterm_only_above_the_loss_threshold_or_with_a_queue() {
     // 600 of 30,000 bytes is exactly 2%, which is not too high. With a 10 ms
-    // min_rtt, RTT samples above 11.25 ms show a queue, which still cuts.
+    // min_rtt, RTT samples above 11.25 ms show a queue, which still cuts. A
+    // 10% threshold moves the boundary to 3,000 bytes only while tolerating.
     let rtt = Duration::from_micros;
-    for (tolerate, lost, sampled, cut) in [
-        (false, 600, rtt(10_000), true),
-        (true, 600, rtt(10_000), false),
-        (true, 601, rtt(10_000), true),
-        (true, 600, rtt(11_250), false),
-        (true, 600, rtt(11_251), true),
+    for (tolerate, threshold, lost, sampled, cut) in [
+        (false, 20, 600, rtt(10_000), true),
+        (true, 20, 600, rtt(10_000), false),
+        (true, 20, 601, rtt(10_000), true),
+        (true, 20, 600, rtt(11_250), false),
+        (true, 20, 600, rtt(11_251), true),
+        (true, 100, 3000, rtt(10_000), false),
+        (true, 100, 3001, rtt(10_000), true),
+        (true, 100, 1500, rtt(11_251), true),
+        (false, 100, 601, rtt(10_000), true),
     ] {
         let mut c = cruise();
         c.tolerate_random_loss(tolerate);
+        c.set_loss_threshold(threshold);
         c.bw_latest = 0;
         c.inflight_latest = 0;
         c.enter_recovery(c.now, 30000, false).unwrap();
@@ -382,8 +424,8 @@ fn low_bdp_model_floors_and_saturating_volume_math() {
     assert_eq!(bytes_in(u64::MAX, Duration::MAX, true), u64::MAX);
     assert_eq!(bytes_in(1, Duration::from_nanos(1), true), 1);
     assert_eq!(bytes_in(1, Duration::from_nanos(1), false), 0);
-    assert!(!too_high(u64::MAX / 50, u64::MAX));
-    assert!(too_high(u64::MAX / 50 + 1, u64::MAX));
+    assert!(!too_high(u64::MAX / 50, u64::MAX, 20));
+    assert!(too_high(u64::MAX / 50 + 1, u64::MAX, 20));
     c.probe_up_rounds = 30;
     for _ in 0..100 {
         c.raise_slope();

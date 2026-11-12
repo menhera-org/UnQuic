@@ -1295,7 +1295,13 @@ November 10 evidence for that list, all in BENCH.md:
   A deliberate version that keeps the strong direction is the next
   lane-placement candidate.
 - FEC or a loss-agnostic response: at 5% random loss draft 07 collapses
-  delivery below 11% of even a 0.5 Gbit/s offer.
+  delivery below 11% of even a 0.5 Gbit/s offer. On November 12
+  `daemon.loss_threshold_permille` (default 20, draft 07's 2%) landed: at 100
+  one flow at 5% loss rises from under 10 Mbit/s to about 0.45 Gbit/s with a
+  competing TCP flow's share unchanged, but costs 3% at 1% loss, so it stays
+  at the draft's default
+  ([BENCH.md](BENCH.md#a-configurable-loss-threshold-for-random-loss-november-12)).
+  The 5% row still reaches under a tenth of its offer.
 - Batching while application-limited: correctly marked light load stays in
   Startup and sends about 1.4 frames per claim, costing CPU at equal delivery.
   On November 12 the decision workload cost about 480% of a core per Gbit/s

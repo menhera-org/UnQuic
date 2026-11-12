@@ -335,6 +335,47 @@ path dominates: sending batches takes 25–30% of busy cycles and TAP reads
 and writes another 20–30%. `stage_recovery` matters mainly at loopback
 rates.
 
+## A configurable loss threshold for random loss (November 12)
+
+At 5% random loss draft 07 delivers under 11% of a 0.5G offer: any loss
+round above 2% (BBRLossThresh) bounds inflight while probing, cuts the
+short-term bounds, ends Startup and stops ProbeBW_UP. The candidate adds
+`daemon.loss_threshold_permille`, default 20 (draft 07's 2%), applied to all
+four tests only while `tolerate_random_loss` is on; the queue check still
+cuts any loss round whose RTT samples show queueing. The default leaves
+behaviour unchanged, so the switch can land on its tests alone; the bar
+decides whether the documentation recommends raising it on lossy paths.
+
+Stated before measuring, threshold 100 (10%) against the default, three
+interleaved repeats each: (1) on the single-flow target (7.5 ms RTT, 5G
+offered) at 5% loss both direction medians at least double and rise beyond
+the default's range; (2) at 0.5% and 1% loss no direction median falls
+below the default's minimum by more than the default's range width; (3)
+against one TCP CUBIC flow at the 1 Gbit/s token bucket with a quarter-BDP
+queue (160 packets) and no injected loss, the TCP median does not fall
+below the default's minimum by more than the default's range width.
+
+Both arms ran the same binary with different `[daemon]` settings
+([target](benches/tap-loss-threshold-target.json),
+[coexistence](benches/tap-loss-threshold-coexist.json)), 5G point, Gbit/s:
+
+| Loss | Default (2%) L→R | Default R→L | 10% L→R | 10% R→L |
+| --- | --- | --- | --- | --- |
+| 5% | 0.0086 (0.0082–0.0096) | 0.0094 (0.0089–0.0097) | 0.449 (0.391–0.485) | 0.457 (0.456–0.459) |
+| 0.5% | 0.923 (0.919–0.938) | 0.975 (0.851–0.977) | 0.927 (0.926–0.948) | 0.976 (0.931–0.988) |
+| 1% | 0.928 (0.922–0.939) | 0.949 (0.870–0.989) | 0.900 (0.857–0.907) | 0.923 (0.825–0.934) |
+
+At 5% loss the default collapses to under 10 Mbit/s and the 10% threshold
+delivers about 50 times more, so (1) holds. Against TCP CUBIC at the
+quarter-BDP bottleneck TCP receives 204 Mbit/s with the 10% threshold
+against 205 (195–214) with the default, so (3) holds: the queue check still
+yields. Condition (2) fails narrowly: at 1% loss L→R falls 3.0% to 0.900,
+0.004 below the allowance of 0.905. The switch lands with the draft's
+default; raising it is recommended only where random loss exceeds 2%,
+where the default collapses, at a cost of a few percent at 1%. Even at 10%
+the 5% row reaches under a tenth of the 5G offer, so that row still needs
+FEC or a different response.
+
 ## Cost at light load (November 12)
 
 On the decision workload the two daemons spend about 480% of a core per

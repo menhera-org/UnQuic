@@ -689,7 +689,14 @@ min_rtt, the sign of a queue. Random loss on an unqueued path no longer
 ratchets the rate down, while congestion loss at a shared bottleneck still
 does: against one TCP CUBIC flow at a quarter-BDP queue the switch leaves the
 TCP share unchanged, and on the lossy single-flow target it raises every
-direction by 4–26% (BENCH.md).
+direction by 4–26% (BENCH.md). While it is on, `daemon.loss_threshold_permille`
+(20–200, default 20, draft 07's 2%) sets the loss rate above which a round
+counts as too lossy, in every loss-rate test: the probe-time inflight bound,
+the short-term cut, Startup's loss exit and ProbeBW_UP. The queue check still
+cuts regardless of rate. At 5% random loss the default collapses one flow to
+under 10 Mbit/s and 100 (10%) delivers about 0.45 Gbit/s, with the TCP share
+at a quarter-BDP bottleneck unchanged; at 1% loss it costs one direction 3%,
+so raise it only where random loss exceeds 2% (BENCH.md).
 Windows also deviate on sub-millisecond paths: their BDP uses at least the
 receiver's 1 ms maximum ACK delay, because RTT samples exclude that delay
 while the feedback loop does not. This more than doubled the loopback check's

@@ -606,8 +606,15 @@ fn crossed_group_acks_finish_before_loss_checks_use_the_only_report() {
     let (mut workers, _rx) = workers();
     let descriptors = [(0, 1, 0), (0, 2, 0), (1, 1, 1), (1, 2, 1)];
     let budgets: Arc<[Budget]> = (0..2).map(|_| Budget::new()).collect();
-    let mut owner =
-        Owner::new(2, &descriptors, Duration::ZERO, Arc::clone(&budgets), false).unwrap();
+    let mut owner = Owner::new(
+        2,
+        &descriptors,
+        Duration::ZERO,
+        Arc::clone(&budgets),
+        false,
+        20,
+    )
+    .unwrap();
     for session in 0..2 {
         owner.timers.install(session, 1).unwrap();
     }
