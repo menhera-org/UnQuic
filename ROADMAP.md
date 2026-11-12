@@ -113,6 +113,9 @@ out for min_rtt plus up to 1 ms of ACK delay.
 ProbeRTT window. It kept every ProbeRTT episode off its window, but missed
 its loss bar because a host stall fell inside one episode
 ([BENCH.md](BENCH.md#probertts-window-over-min_rtt-plus-the-ack-delay-landed-off)).
+With both sources counted out, `tx_hold_us = 200` loses no more than the
+control ([BENCH.md](BENCH.md#the-holds-loss-without-host-stalls-and-probertt)),
+so the hold's only cost is latency.
 
 Decisions only the user can make, each blocking a remaining goal:
 
@@ -126,7 +129,11 @@ Decisions only the user can make, each blocking a remaining goal:
    buffers, which this host cannot raise and a root deployment does not
    have. Is a measurement on a host with more CPUs and larger buffers
    available, or should the gate be judged on the 9000-byte path?
-4. Carried over: the real-path test needs sudo through the endpoint account,
+4. Should `daemon.tx_hold_us` default to 200? It saves 5–6% of CPU per
+   delivered bit at 0.5 Gbit/s and no longer shows a loss of its own, but it
+   adds about 33 µs to the median one-way delay and 0.2 ms at p99 for light
+   traffic.
+5. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; balanced
    lanes and the 256 MiB `memory_limit` default (which refuses sixteen
    workers) remain undecided.

@@ -621,10 +621,10 @@ worker counts as having unsent data for application-limited marking only
 from two datagrams, the most a hold keeps, much as Linux TCP ignores under
 one MSS; otherwise held frames would hide every idle moment from BBR. At
 200 µs it cut CPU per delivered Gbit/s 5.5% at 0.5 Gbit/s on the decision
-workload and left 5 Gbit/s unchanged, but it adds a small, repeatable loss
-in one direction (a median of 0.15% against 0.07% in the latest run), so it
-stays off (BENCH.md). It adds about 33 µs to the median one-way delay and
-0.2 ms at p99.
+workload and left 5 Gbit/s unchanged. Its apparent extra loss turned out to
+come from test-host stalls and BBR's ProbeRTT, not from the hold (BENCH.md).
+It adds about 33 µs to the median one-way delay and 0.2 ms at p99, so it
+stays off until that trade is decided.
 
 BBR's ProbeRTT halves the window to half of max_bw × min_rtt for 200 ms. A
 steady offer's bytes stay in flight for min_rtt plus the receiver's ACK delay

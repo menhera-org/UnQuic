@@ -697,6 +697,28 @@ r2 dropped 1,680–2,308 frames per direction outside, in bursts such as 1,341
 drops in 250 ms), so this host cannot show a loss difference of this size
 in four pairs. The switch landed off by default.
 
+### The hold's loss without host stalls and ProbeRTT
+
+Stated before running: with `probe_rtt_ack_delay` on in both arms, hold 0
+against 200 µs, four alternating pairs of trace runs at 0.5G, count loss
+(admission drops and expired never-sent frames) outside host stalls (any
+gap of 10 ms or more without a trace record from that daemon, plus 60 ms)
+and outside ProbeRTT (plus 50 ms). If the hold's median per run lies within
+the control's range, its earlier loss excess was those two sources
+([per run](benches/decision-tx-hold-clean-loss.txt)).
+
+| Frames per run, both daemons | Control | Hold 200 µs |
+| --- | --- | --- |
+| Outside stalls and ProbeRTT | 16, 134, 294, 760 | 13, 87, 112, 390 |
+| All | 411, 515, 1,171, 1,328 | 517, 517, 615, 717 |
+
+Each daemon stalls 3–10 times per point for 215–403 ms in total. The hold's
+median outside those windows (about 100 frames) lies within the control's
+range, and its total loss is no higher. The hold has no loss of its own at
+this point. Its remaining cost is latency, about 33 µs at the median and
+0.2 ms at p99 at 0.5G, for 5–6% less CPU per delivered bit there. That is a
+policy trade, so the default stays off until the user decides.
+
 ## Frames seconds old under overload (November 12)
 
 The tail in the latency measurement above is not a start-up event. With

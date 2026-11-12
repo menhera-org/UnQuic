@@ -1,0 +1,18 @@
+daemon.tx_hold_us 0 (ctl) vs 200 (hold), November 12. Decision workload at 0.5 Gbit/s per direction, trace build of the d8c1a37 tree, probe_rtt_ack_delay = true in both arms, four alternating pairs, 20 s points.
+Loss = admission drops + expired never-sent frames (input, unsent, partial) from trace records. stalls = gaps of 10 ms or more with no record from any worker of that daemon; loss within a stall to 60 ms after it, or within a ProbeRTT episode to 50 ms after it, is excluded_loss; the rest is clean_loss.
+ctl r1 left stalls=6 stalled_ms=301 probe_rtt=1 clean_loss=83 excluded_loss=118
+ctl r1 right stalls=7 stalled_ms=286 probe_rtt=1 clean_loss=51 excluded_loss=1076
+hold r1 left stalls=8 stalled_ms=340 probe_rtt=1 clean_loss=16 excluded_loss=419
+hold r1 right stalls=3 stalled_ms=237 probe_rtt=1 clean_loss=71 excluded_loss=109
+ctl r2 left stalls=6 stalled_ms=403 probe_rtt=0 clean_loss=0 excluded_loss=145
+ctl r2 right stalls=4 stalled_ms=310 probe_rtt=1 clean_loss=294 excluded_loss=76
+hold r2 left stalls=6 stalled_ms=381 probe_rtt=1 clean_loss=0 excluded_loss=296
+hold r2 right stalls=6 stalled_ms=258 probe_rtt=1 clean_loss=390 excluded_loss=31
+ctl r3 left stalls=8 stalled_ms=362 probe_rtt=1 clean_loss=152 excluded_loss=177
+ctl r3 right stalls=7 stalled_ms=344 probe_rtt=1 clean_loss=608 excluded_loss=234
+hold r3 left stalls=6 stalled_ms=215 probe_rtt=0 clean_loss=13 excluded_loss=47
+hold r3 right stalls=6 stalled_ms=318 probe_rtt=1 clean_loss=0 excluded_loss=457
+ctl r4 left stalls=9 stalled_ms=347 probe_rtt=1 clean_loss=11 excluded_loss=26
+ctl r4 right stalls=10 stalled_ms=386 probe_rtt=1 clean_loss=5 excluded_loss=369
+hold r4 left stalls=4 stalled_ms=322 probe_rtt=0 clean_loss=112 excluded_loss=150
+hold r4 right stalls=6 stalled_ms=241 probe_rtt=0 clean_loss=0 excluded_loss=256
