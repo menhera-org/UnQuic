@@ -83,8 +83,9 @@ At light load each lane sends one frame at a time, so a 1514-byte frame's
 default, lets an idle lane wait for a second datagram's worth of frames; at
 200 µs it cuts CPU per delivered Gbit/s 5.5% at 0.5G on the decision
 workload. Its first version hid idle moments from application-limited
-marking and caused admission drops; the fixed version still lost 0.19% of
-one direction in one run, above its bar, so it stays off
+marking and caused admission drops; the fixed version appeared to lose
+0.19% of one direction in one run, which later turned out to be host stalls
+and ProbeRTT (below). It stays off until decision 4
 ([BENCH.md](BENCH.md#holding-idle-lanes-for-a-second-datagram-november-12)).
 
 `udp_load` now measures one-way delay. It found frames reaching receivers
@@ -136,9 +137,9 @@ send in bursts with 700 µs gaps while refusing inputs for lack of exchange
 buffers, and doubling the buffers changes nothing. Finding what the owners
 wait for is the next overload item
 ([BENCH.md](BENCH.md#why-four-flows-lose-lr-delivery-past-2g-open)).
-Balanced lanes avoid the decline: spreading four flows over all four lanes
-doubles 5G L→R, so the decline needs two flows sharing a worker's lane
-(decision 5 below).
+Balanced lanes avoid the decline: spreading the four flows over all four
+lanes, instead of the two their hashes pick, doubles 5G L→R (decision 5
+below).
 
 Decisions only the user can make, each blocking a remaining goal:
 
