@@ -741,7 +741,13 @@ total is 8.6–9.3 Gbit/s, the streams' mean RTT 3.1–6.6 ms and the largest RT
 28–72 ms; with 64 entries 9.1–9.7 Gbit/s, 3.1–4.0 ms and 21–28 ms. TCP backs
 off on the tunnel's losses (50,000–140,000 retransmissions per direction in
 20 s) before it builds a deep ring queue, so the short ring mainly trims the
-worst RTTs. The UDP overload case is where it matters.
+worst RTTs. The UDP overload case is where it matters. The TAP statistics
+show the price of a short ring for TCP: 467 and 172 dropped TSO aggregates
+per run with 64 entries, none with 500. In both, TCP's retransmissions run
+several times the frames the daemons drop (for example 78,000 against about
+7,400 expired or refused L→R frames), which points to spurious
+retransmissions, perhaps from reordering by repairs; this is not yet
+checked.
 
 ## Checked indexing in the encoders and batch planner (November 12)
 
