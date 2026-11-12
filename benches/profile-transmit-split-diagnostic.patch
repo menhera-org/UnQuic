@@ -1,8 +1,8 @@
 diff --git a/src/profile.rs b/src/profile.rs
-index c12610b..9fcf0ba 100644
+index c12610b..6fc48aa 100644
 --- a/src/profile.rs
 +++ b/src/profile.rs
-@@ -37,10 +37,30 @@ pub const NAMES: [&str; PHASES] = [
+@@ -37,10 +37,36 @@ pub const NAMES: [&str; PHASES] = [
      "read_socket",
      "reactor_drain",
      "poll",
@@ -24,17 +24,23 @@ index c12610b..9fcf0ba 100644
 +    "sub_rel_buffer",
 +    "sub_rel_owner",
 +    "sub_rel_journal",
++    "sub_rx_decode",
++    "sub_rx_admit",
++    "sub_rx_records",
++    "sub_rx_flush",
++    "sub_rx_counters",
++    "sub_rx_release",
  ];
  
 +/// Loop phases; the rest are nested inside them and excluded from the total.
 +pub const LOOP_PHASES: usize = 28;
  /// Number of accounted worker loop phases.
 -pub const PHASES: usize = 28;
-+pub const PHASES: usize = 46;
++pub const PHASES: usize = 52;
  
  /// Current timestamp-counter value, or nanoseconds where there is none.
  #[inline(always)]
-@@ -82,7 +102,7 @@ pub fn syscall(kind: usize, started: u64, items: usize) {
+@@ -82,7 +108,7 @@ pub fn syscall(kind: usize, started: u64, items: usize) {
  
  /// Prints one worker's phase totals, largest first, as shares of their sum.
  pub fn report(worker: usize, phases: &[u64; PHASES]) {
@@ -44,10 +50,74 @@ index c12610b..9fcf0ba 100644
      order.sort_by_key(|&index| std::cmp::Reverse(phases[index]));
      let admission = ADMISSION
 diff --git a/src/worker.rs b/src/worker.rs
-index 5d02f2d..96e6fef 100644
+index cbaad40..119b68a 100644
 --- a/src/worker.rs
 +++ b/src/worker.rs
-@@ -3068,15 +3068,18 @@ impl Worker {
+@@ -2039,7 +2039,7 @@ impl Worker {
+                 if buffer.advance() {
+                     self.received.push_front(buffer);
+                 } else {
+-                    self.release(buffer);
++                    phase!(self, 51, self.release(buffer));
+                 }
+             }
+         }
+@@ -2064,7 +2064,8 @@ impl Worker {
+             self.counters.malformed_packets = self.counters.malformed_packets.wrapping_add(1);
+             return Ok(Some(buffer));
+         }
+-        let Ok(datagram) = Datagram::decode(&buffer.bytes[buffer.offset..end]) else {
++        let Ok(datagram) = phase!(self, 46, Datagram::decode(&buffer.bytes[buffer.offset..end]))
++        else {
+             budget.records += wire::MAX_RECORDS;
+             self.counters.malformed_packets = self.counters.malformed_packets.wrapping_add(1);
+             return Ok(Some(buffer));
+@@ -2185,7 +2186,14 @@ impl Worker {
+             .wrapping_add((length + 48) as u64);
+         local.rx_dirty |= 1_u64 << slot;
+         let lane = local.rx[slot].as_mut().ok_or(io::ErrorKind::InvalidData)?;
++        #[cfg(feature = "profile")]
++        let admit_started = crate::profile::now();
+         let mut admission = lane.admit(&datagram, now);
++        #[cfg(feature = "profile")]
++        {
++            self.phases[47] =
++                self.phases[47].wrapping_add(crate::profile::now().wrapping_sub(admit_started));
++        }
+         if admission == Admission::Pressure {
+             let retained = lane.retained_frames();
+             self.flush_rx(session, slot, now);
+@@ -2195,6 +2203,8 @@ impl Worker {
+                 admission = lane.admit(&datagram, now);
+             }
+         }
++        #[cfg(feature = "profile")]
++        let records_started = crate::profile::now();
+         match admission {
+             Admission::Fresh => {
+                 for record in datagram.records() {
+@@ -2308,13 +2318,18 @@ impl Worker {
+                     .wrapping_add(1);
+             }
+         }
++        #[cfg(feature = "profile")]
++        {
++            self.phases[48] =
++                self.phases[48].wrapping_add(crate::profile::now().wrapping_sub(records_started));
++        }
+         if self.sessions[session].rx[slot]
+             .as_ref()
+             .is_some_and(|lane| lane.ready_count() >= 32)
+         {
+-            self.flush_rx(session, slot, now);
++            phase!(self, 49, self.flush_rx(session, slot, now));
+         }
+-        self.refresh_rx_counters(session, slot);
++        phase!(self, 50, self.refresh_rx_counters(session, slot));
+         Ok(Some(buffer))
+     }
+ 
+@@ -3080,15 +3095,18 @@ impl Worker {
      }
  
      fn release_frame_storage(&mut self, index: usize) {
@@ -72,17 +142,17 @@ index 5d02f2d..96e6fef 100644
          }
          if let Some((session, source)) = owner
              && self.sessions[session].slab == Some(source)
-@@ -3167,7 +3170,8 @@ impl Worker {
+@@ -3179,7 +3197,8 @@ impl Worker {
      }
  
      fn flush_frames(&mut self, now: Duration) -> io::Result<bool> {
 -        let more = self.expire_frames(now)? | self.cleanup_frames()?;
 +        let more =
 +            phase!(self, 28, self.expire_frames(now))? | phase!(self, 29, self.cleanup_frames())?;
+         self.release_holds(now);
          let mut visited = 0;
          for _ in 0..self.ready.len().min(BATCH_SIZE) {
-             let Some((session, lane)) = self.ready.pop_front() else {
-@@ -3376,15 +3380,18 @@ impl Worker {
+@@ -3463,15 +3482,18 @@ impl Worker {
              }
          }
          if (batch.plan.is_empty() || (self.sender_enabled() && !self.sender.permitted))
@@ -104,7 +174,7 @@ index 5d02f2d..96e6fef 100644
          {
              trace_hold!(
                  self.id,
-@@ -3402,7 +3409,11 @@ impl Worker {
+@@ -3489,7 +3511,11 @@ impl Worker {
                      .job
                      .is_none_or(|job| job.session != session || job.lane != lane))
          {
@@ -117,7 +187,7 @@ index 5d02f2d..96e6fef 100644
              if self.sender.job.is_none() {
                  if !keep {
                      self.discard_batch(session, lane, batch);
-@@ -3410,7 +3421,7 @@ impl Worker {
+@@ -3497,7 +3523,7 @@ impl Worker {
                  return Ok(());
              }
              // Claim immediately before the syscall; a refused plan waits for its retry.
@@ -126,7 +196,7 @@ index 5d02f2d..96e6fef 100644
                  sender::Claimed::Ready => {
                      // A retained plan overtaken by a later send is renumbered by the
                      // permit path before submission, never sent with stale numbers.
-@@ -3432,11 +3443,13 @@ impl Worker {
+@@ -3519,11 +3545,13 @@ impl Worker {
          } else {
              batch.plan.len()
          };
@@ -141,7 +211,7 @@ index 5d02f2d..96e6fef 100644
          let result = {
              let frames = std::array::from_fn::<_, { pack::BATCH_CAPACITY }, _>(|index| {
                  batch.frames[index]
-@@ -3481,15 +3494,24 @@ impl Worker {
+@@ -3568,15 +3596,24 @@ impl Worker {
                      Ok(at)
                  })
          };
@@ -173,7 +243,7 @@ index 5d02f2d..96e6fef 100644
              )?;
          }
          if expired {
-@@ -3500,9 +3522,11 @@ impl Worker {
+@@ -3587,9 +3624,11 @@ impl Worker {
              return Ok(());
          }
          match result {
@@ -215,10 +285,10 @@ index 6d6bc4b..bdc025f 100644
                  continue;
              }
 diff --git a/src/worker/sender.rs b/src/worker/sender.rs
-index 7377233..898a970 100644
+index 570b6c7..24d3b28 100644
 --- a/src/worker/sender.rs
 +++ b/src/worker/sender.rs
-@@ -1143,10 +1143,23 @@ impl Worker {
+@@ -1175,10 +1175,23 @@ impl Worker {
      }
  
      pub(super) fn service_sender(&mut self, now: Duration) -> io::Result<bool> {
@@ -243,7 +313,7 @@ index 7377233..898a970 100644
          let ack_blocked = self.sender.checks_pending != 0 || self.sender.loss_fences != 0;
          self.begin_sender_ack()?;
          for group in 0..self.sender.fresh.len() {
-@@ -1156,6 +1169,8 @@ impl Worker {
+@@ -1188,6 +1201,8 @@ impl Worker {
              }
          }
          let mut budget = BATCH_SIZE;
@@ -252,7 +322,7 @@ index 7377233..898a970 100644
          if self.sender.acks_pending == 0 {
              more |= self.advance_loss_checks(now, &mut budget)?;
          }
-@@ -1216,6 +1231,11 @@ impl Worker {
+@@ -1248,6 +1263,11 @@ impl Worker {
                  self.sender.report = Some(report);
              }
          }
@@ -264,7 +334,7 @@ index 7377233..898a970 100644
          more |= budget == 0 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0);
          // A fully protected final loss pass emits no report to wake queued ACK work.
          more |= ack_blocked
-@@ -1223,17 +1243,24 @@ impl Worker {
+@@ -1255,17 +1275,24 @@ impl Worker {
              && self.sender.loss_fences == 0
              && !self.sender.incoming.is_empty()
              && self.sender.report.is_some();
@@ -292,7 +362,7 @@ index 7377233..898a970 100644
          // Probes park an unclaimed DATA plan rather than wait behind it: under
          // pacing-limited load such a plan almost always occupies the job slot.
          if self.parkable() {
-@@ -1329,8 +1356,8 @@ impl Worker {
+@@ -1361,8 +1388,8 @@ impl Worker {
                  }
              }
          }

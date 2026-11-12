@@ -970,6 +970,32 @@ among themselves; `deadline()` still returns the root frame's exact value.
 Daemon SHA-256:
 `9a8a5a0deffa0125a762c7d943615cee5f8ab8e248356179dc5a4375c9336f22`.
 
+### At the offer-limited point, and compact reassembly sequences (rejected)
+
+A profile of `5f2db99` at the same 20 Mbit/s point, with the transmit split
+and a new receive split ([profile](benches/tap-small-frames-offer-limited-profile.txt),
+[patch](benches/profile-transmit-split-diagnostic.patch)), has workers busy
+about 40% of their cycles. Of that busy time, receive processing takes 21%
+(`drain_packets` 8.3% of all cycles: handing ready frames to the TAP 3.8%,
+reassembly admission 3.1%, decoding and the record walk 1.2%), `sendmmsg`
+17%, `flush_taps` 9%, TAP input expansion 9%, and releasing and staging
+ACKed frames 11% together. TAP writes in both phases make up about a fifth
+of busy time, kernel work the daemon issues once per frame.
+
+Reassembly admission is about 280 cycles per 64-byte frame. Once a lane has
+seen 65,536 frames, each datagram with new frames moves the terminal
+window, and `advance_frames` then reads the sequence of all 64 slots, which
+sit inside 10 KB frame buffers; each DATA record's two hash lookups read a
+slot's sequence too. A candidate kept the 64 sequences in one 512-byte
+array ([patch](benches/compact-reassembly-sequences-rejected.patch)). Same
+method and bar as the heap, registered before running
+([results](benches/tap-small-frames-compact-sequences.json)): six of eight
+pairs lower, median −0.5% (−4.9% to +3.1%), against an A/A of one of eight
+and +0.9%. Rejected: the scans evidently stay in cache while the slots are
+in use, so admission's cost lies in the piece copies and index work instead.
+Candidate daemon SHA-256:
+`cb2da037b1b612faaf5f6fc8c468829c451ed0b5fe3b8c92345b3aa369f37b8e`.
+
 ## A 9000-byte outer path on the loopback check (November 12)
 
 Throughput sweeps had capped outer packets at 1500 bytes, though PMTU
