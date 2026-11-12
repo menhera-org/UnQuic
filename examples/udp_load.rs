@@ -341,12 +341,6 @@ fn consume(flow: &mut Flow, bytes: &[u8], segment: usize, size: usize, run: u32,
             flow.invalid += 1;
             continue;
         }
-        if size >= STAMP_END {
-            let mut stamp = [0; 8];
-            stamp[2..].copy_from_slice(&p[16..STAMP_END]);
-            let sent = u64::from_be_bytes(stamp);
-            flow.latency.record(now_ns.wrapping_sub(sent) & STAMP_MASK);
-        }
         let observed_run = u32::from_be_bytes(p[4..8].try_into().unwrap());
         if observed_run != run {
             flow.invalid += 1;
@@ -359,8 +353,15 @@ fn consume(flow: &mut Flow, bytes: &[u8], segment: usize, size: usize, run: u32,
         let seq = u64::from_be_bytes(p[8..16].try_into().unwrap());
         if seq >= 1 << 63 {
             flow.invalid += 1;
-        } else {
-            flow.window.record(seq);
+            continue;
+        }
+        flow.window.record(seq);
+        // Only this run's valid packets give latency samples.
+        if size >= STAMP_END {
+            let mut stamp = [0; 8];
+            stamp[2..].copy_from_slice(&p[16..STAMP_END]);
+            let sent = u64::from_be_bytes(stamp);
+            flow.latency.record(now_ns.wrapping_sub(sent) & STAMP_MASK);
         }
     }
 }
@@ -839,6 +840,7 @@ mod tests {
                             assert_eq!(receiver.invalid, (payload - STAMP_END) as u64);
                             receiver.invalid = 0;
                         }
+                        let samples = receiver.latency.count;
                         consume(
                             receiver,
                             &bytes[..payload],
@@ -848,6 +850,7 @@ mod tests {
                             now,
                         );
                         assert_eq!(receiver.wrong_run, 1);
+                        assert_eq!(receiver.latency.count, samples, "another run's packet");
                         assert_eq!(receiver.first_wrong_run, c.run);
                         bytes[0] ^= 1;
                         consume(receiver, &bytes[..payload], payload, payload, c.run, now);
