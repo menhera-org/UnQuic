@@ -270,8 +270,13 @@ mod tests {
             assert!(loaded.config.daemon.tolerate_random_loss);
             assert_eq!(loaded.config.daemon.loss_threshold_permille, 20);
             assert!(!loaded.config.daemon.balance_flows);
+            assert_eq!(loaded.config.daemon.tx_hold_us, 0);
             loaded.config.validate().unwrap();
         }
+        let text = format!("[daemon]\ntx_hold_us = 1000\n{}", sample());
+        let loaded = Loaded::parse(&text).unwrap();
+        assert_eq!(loaded.config.daemon.tx_hold_us, 1000);
+        loaded.config.validate().unwrap();
         let text = format!("[daemon]\ntolerate_random_loss = false\n{}", sample());
         let loaded = Loaded::parse(&text).unwrap();
         assert!(!loaded.config.daemon.tolerate_random_loss);
@@ -401,6 +406,7 @@ mod tests {
                 "loss_threshold_permille = 201",
                 "daemon.loss_threshold_permille",
             ),
+            ("tx_hold_us = 1001", "daemon.tx_hold_us"),
         ] {
             let bad = format!("[daemon]\n{setting}\n{text}");
             assert_eq!(

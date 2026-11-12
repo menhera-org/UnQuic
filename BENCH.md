@@ -512,6 +512,45 @@ which paces frames evenly instead of in timer-slack bursts. That leaves the
 daemons fewer frames per turn, which is the likely reason four flows now
 cost more than the 491% the A/A run measured with the old generator.
 
+## Holding idle lanes for a second datagram (November 12)
+
+The light-load profile above puts `sendmmsg` at about 10% of all worker
+cycles at 0.5G, about 12,000 cycles per datagram on the emulated routed
+path, and each 1522-byte frame takes two datagrams when a lane sends one
+frame at a time: 1,384 bytes, then a 130-byte tail alone. A new switch,
+`daemon.tx_hold_us` (0, off, by default; at most 1000), lets an idle lane
+whose pending frames add up to less than two datagrams wait that long for
+more. Held lanes leave the ready queue and their earliest expiry joins the
+worker's timer, so a waiting worker sleeps.
+
+Written before running: the decision workload (routed 4.5 ms, bridged
+individual QinQ 1522-byte frames, four workers, sixteen flows), one binary,
+0.5 Gbit/s each way, hold 0 against 200 µs in eight pairs of alternating
+order, then an A/A of 0 against 0, then 5 Gbit/s in three pairs. Bar to keep
+the switch: every 0.5G run within 1% of its offer; the hold lower in at
+least seven of eight pairs with a median of −5% or better (light-load pairs
+show a 3% order effect); the A/A at most six of eight and no better than
+−3%; at 5G the median total no more than 7.5% lower
+([results](benches/decision-tx-hold.json)). CPU per delivered Gbit/s,
+both daemons:
+
+| Arm | Pairs lower | Change per pair | Median | Missing L→R / R→L |
+| --- | --- | --- | --- | --- |
+| hold 0 → 200 µs, 0.5G | 8 of 8 | −6.7% to −3.2% | −5.1% | 0.00–0.01 / 0.00–0.52% |
+| A/A, 0.5G | 2 of 8 | −2.8% to +2.0% | +0.4% | 0.00–0.05 / 0.00–0.23% |
+
+At 5G the hold delivers 3.62–3.67 Gbit/s in total against 3.60–3.71
+(median −0.8%). The switch meets its bar and stays, off by default. The bar
+did not foresee one cost: with the hold, R→L misses 0.29–0.52% of frames in
+six of eight runs, against 0.01–0.08% without it. The right daemon's
+transmit admission drops rise from 52–608 per run to 32–3,677 (median 190
+to 2,281), and a
+`trace` run attributes them to `admit_owner_buffers`: an owner refusing
+another reader's frames to keep its receive-buffer reserve. Why a 200 µs
+hold drains that reserve is not yet explained; it must be before the hold
+is considered as a default. Daemon SHA-256:
+`80a9d4266f7a8031191e168470a17cd0fb4ec91d16c79a62896b5b803652bc26`.
+
 ## Checked indexing in the encoders and batch planner (November 12)
 
 The last stage 4 panic-audit item converts every indexing site that Clippy's

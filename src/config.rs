@@ -46,6 +46,10 @@ pub struct Daemon {
     /// of its hash lane, so a few heavy flows use separate transmit workers.
     /// It lifts weaker directions and single flows but costs the favoured ones.
     pub balance_flows: bool,
+    /// Off (0) by default: an idle lane holding less than two datagrams of
+    /// frames waits up to this many microseconds (at most 1000) for more, so
+    /// light traffic packs frame tails together at the cost of that latency.
+    pub tx_hold_us: u32,
 }
 impl Default for Daemon {
     fn default() -> Self {
@@ -54,6 +58,7 @@ impl Default for Daemon {
             tolerate_random_loss: true,
             loss_threshold_permille: 20,
             balance_flows: false,
+            tx_hold_us: 0,
         }
     }
 }
@@ -242,6 +247,13 @@ impl Config {
                 field: "daemon.loss_threshold_permille",
                 index: None,
                 reason: "must be 20 through 200",
+            });
+        }
+        if self.daemon.tx_hold_us > 1000 {
+            return Err(ConfigError {
+                field: "daemon.tx_hold_us",
+                index: None,
+                reason: "must be at most 1000",
             });
         }
         let endpoints = names(

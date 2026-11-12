@@ -612,6 +612,16 @@ silence. It lifts one flow at 7.5 ms by 42–58% and the weaker decision-workloa
 directions by up to 121%, but the direction hashing favoured loses up to 14%
 and the loopback overload check 10% in total, so it stays off (BENCH.md).
 
+At light load each lane tends to send one frame at a time, and at a
+1452-byte payload limit a 1514-byte frame takes two datagrams, the second
+holding only its tail. `daemon.tx_hold_us`, 0 (off) by default and at most
+1000, lets an idle lane with less than two datagrams of frames wait that long
+for more, so tails share datagrams with the next frame. At 200 µs it cut CPU
+per delivered Gbit/s 5% at 0.5 Gbit/s on the decision workload and left 5
+Gbit/s unchanged, but one direction's missing frames rose from about 0.03% to
+0.4% through buffer admission drops not yet explained, so it stays off
+(BENCH.md). It adds up to the hold to each frame's latency.
+
 Flow hashing looks through one unfragmented IPv4, IPv6 or Ethernet
 encapsulation, including an IPv6 segment routing header before the inner
 packet. It retains the outer key and adds the inner addresses, protocol and

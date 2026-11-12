@@ -251,6 +251,23 @@ impl Store {
         self.free_frames.len()
     }
 
+    /// Unsent bytes of a queue's frames, counted until `cap` is reached.
+    pub fn queued_bytes(&self, queue: &Queue, cap: usize) -> usize {
+        let mut bytes = 0;
+        let mut index = queue.head;
+        for _ in 0..queue.len {
+            let Some(frame) = self.frame(index).filter(|_| bytes < cap) else {
+                break;
+            };
+            bytes += frame.length().saturating_sub(frame.offset);
+            index = self
+                .links
+                .get(index)
+                .map_or(END, |link| usize::from(link.next));
+        }
+        bytes
+    }
+
     /// Sources and slabs holding a buffer, for diagnostics only.
     #[cfg(feature = "trace")]
     pub fn trace_sources(&self) -> usize {

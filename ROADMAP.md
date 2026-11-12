@@ -355,9 +355,9 @@ rules apply to all of them.
    Giving one worker several TAP queues would not help the
    idle workers: under a random hash, a worker owning two of sixteen queues
    is as likely to get no flow as one owning one of eight (about 12% each
-   with sixteen flows). Only flow-aware steering, such as a tun steering
-   program, would even them out, and with many flows the gap mostly closes
-   on its own.
+   with sixteen flows). Only flow-aware steering would even them out, and
+   tun's steering programs are eBPF, which deployment excludes; with many
+   flows the gap mostly closes on its own.
    One small-frame flow reaches 0.61–0.67 M frames/s, limited by one
    thread. 60-byte frames match 64-byte ones; 128-byte frames are lossless
    at 0.92 M frames/s paced, and unlimited R→L trails L→R by a quarter to a
@@ -1415,7 +1415,13 @@ November 10 evidence for that list, all in BENCH.md:
   grant round trip, send and TAP write, with about one frame per syscall
   ([BENCH.md](BENCH.md#cost-at-light-load-november-12)). Candidates: a short
   per-lane hold time, aggregation across lanes, or spendable credit that
-  skips the grant round trip, each with its own latency or pacing bar.
+  skips the grant round trip, each with its own latency or pacing bar. The
+  hold landed on November 12 as `daemon.tx_hold_us`, off by default: at 200
+  µs it cut CPU per Gbit/s at 0.5G by 5.1% (eight of eight pairs) with 5G
+  unchanged, but one direction's missing frames rose from about 0.03% to
+  0.4% through owner-buffer admission drops
+  ([BENCH.md](BENCH.md#holding-idle-lanes-for-a-second-datagram-november-12)).
+  Explain those drops before any default change.
   Fixed per-turn work matters here too: sweeping only occupied receive slots
   for ACKs cut light-load CPU per Gbit/s by 4.1%
   ([BENCH.md](BENCH.md#scanning-only-occupied-receive-slots-for-acks-november-12));

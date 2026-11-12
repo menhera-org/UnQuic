@@ -544,6 +544,8 @@ struct Session {
     tx: Vec<Option<pack::Lane>>,
     batches: Vec<Option<Box<TxBatch>>>,
     tx_ready: u64,
+    // Lanes waiting out daemon.tx_hold_us in Worker::held, outside the ready queue.
+    tx_held: u64,
     command: Option<Command>,
     acknowledged: Option<Command>,
     installed: Option<Command>,
@@ -619,6 +621,8 @@ struct TxBatch {
     repair: bool,
     repair_next: bool,
     selection: [Selection; pack::BATCH_CAPACITY],
+    // When this idle lane began waiting for more frames (daemon.tx_hold_us).
+    hold_since: Option<Duration>,
 }
 
 impl TxBatch {
@@ -632,6 +636,7 @@ impl TxBatch {
             repair: false,
             repair_next: true,
             selection: [Selection::default(); pack::BATCH_CAPACITY],
+            hold_since: None,
         }
     }
 
@@ -802,6 +807,9 @@ pub(crate) struct Worker {
     recovery: recovery::Recovery,
     received: VecDeque<Box<Buffer>>,
     ready: VecDeque<(usize, usize)>,
+    // Lanes in tx_held, and how long an idle lane may wait (daemon.tx_hold_us).
+    held: Vec<(usize, usize)>,
+    hold: Duration,
     notifications: u64,
     counters: Snapshot,
     setup_due: Duration,
@@ -880,8 +888,9 @@ impl Worker {
         for session in &config.sessions {
             let peer = config.peers.iter().find(|p| p.name == session.peer)?;
             batches = batches.checked_add(
+                // One ready and one held entry per lane.
                 peer.tx_lanes
-                    .checked_mul(size_of::<TxBatch>() + size_of::<(usize, usize)>())?,
+                    .checked_mul(size_of::<TxBatch>() + 2 * size_of::<(usize, usize)>())?,
             )?;
             per_worker = per_worker
                 .checked_add(size_of::<Session>() + 65_536 + 8192 + LANES * size_of::<Snapshot>())?
@@ -1000,6 +1009,7 @@ impl Worker {
                     .map(|lane| (lane % count == id).then(|| Box::new(TxBatch::new())))
                     .collect(),
                 tx_ready: 0,
+                tx_held: 0,
                 command: None,
                 acknowledged: None,
                 installed: None,
@@ -1155,6 +1165,8 @@ impl Worker {
             )?,
             received: VecDeque::with_capacity(count * BUFFERS),
             ready: VecDeque::with_capacity(batch_count),
+            held: Vec::with_capacity(batch_count),
+            hold: Duration::from_micros(config.daemon.tx_hold_us.into()),
             notifications: 0,
             counters,
             setup_due: Duration::ZERO,
@@ -3168,6 +3180,7 @@ impl Worker {
 
     fn flush_frames(&mut self, now: Duration) -> io::Result<bool> {
         let more = self.expire_frames(now)? | self.cleanup_frames()?;
+        self.release_holds(now);
         let mut visited = 0;
         for _ in 0..self.ready.len().min(BATCH_SIZE) {
             let Some((session, lane)) = self.ready.pop_front() else {
@@ -3176,6 +3189,16 @@ impl Worker {
             let mut batch = self.sessions[session].batches[lane]
                 .take()
                 .ok_or_else(|| io::Error::other("missing transmit batch"))?;
+            if self.hold_lane(session, lane, &mut batch, now) {
+                let local = &mut self.sessions[session];
+                local.batches[lane] = Some(batch);
+                local.tx_ready &= !(1_u64 << lane);
+                if local.tx_held & (1_u64 << lane) == 0 {
+                    local.tx_held |= 1_u64 << lane;
+                    self.held.push((session, lane));
+                }
+                continue;
+            }
             let refill = self.sender_enabled() && self.sender.job.is_none();
             if refill && !batch.plan.is_empty() {
                 batch.compact().map_err(io::Error::other)?;
@@ -3281,6 +3304,70 @@ impl Worker {
             }
         }
         Ok(more)
+    }
+
+    /// True keeps an idle lane with under two datagrams of fresh frames waiting,
+    /// for at most daemon.tx_hold_us, so later frames can share its datagrams.
+    fn hold_lane(&self, session: usize, lane: usize, batch: &mut TxBatch, now: Duration) -> bool {
+        let limit = self
+            .shared
+            .config
+            .peer_for_session(session)
+            .and_then(|peer| self.transmit.get(peer))
+            .and_then(|peer| peer.paths.get(self.sessions[session].path))
+            .and_then(|path| path.lanes.get(lane))
+            .map_or(0, |tx| tx.mtu.payload_limit());
+        let idle = !self.hold.is_zero()
+            && limit != 0
+            && batch.len == 0
+            && batch.plan.is_empty()
+            && batch.repairs.is_empty()
+            && !batch.pending.is_empty()
+            && self
+                .sender
+                .job
+                .is_none_or(|job| job.session != session || job.lane != lane);
+        if !idle || self.frames.queued_bytes(&batch.pending, 2 * limit) >= 2 * limit {
+            batch.hold_since = None;
+            return false;
+        }
+        let since = *batch.hold_since.get_or_insert(now);
+        if now >= since.saturating_add(self.hold) {
+            batch.hold_since = None;
+            return false;
+        }
+        true
+    }
+
+    /// Returns lanes whose hold has run out to the ready queue.
+    fn release_holds(&mut self, now: Duration) {
+        let mut index = 0;
+        while let Some(&(session, lane)) = self.held.get(index) {
+            let due = self.sessions[session].batches[lane]
+                .as_ref()
+                .and_then(|batch| batch.hold_since)
+                .is_none_or(|since| now >= since.saturating_add(self.hold));
+            if due {
+                self.held.swap_remove(index);
+                self.sessions[session].tx_held &= !(1_u64 << lane);
+                self.ready_lane(session, lane);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// Earliest end of a lane's hold.
+    fn hold_deadline(&self) -> Option<Duration> {
+        self.held
+            .iter()
+            .filter_map(|&(session, lane)| {
+                self.sessions[session].batches[lane]
+                    .as_ref()?
+                    .hold_since
+                    .map(|since| since.saturating_add(self.hold))
+            })
+            .min()
     }
 
     fn flush_batch(
@@ -4522,6 +4609,7 @@ impl Worker {
                 && sender_idle
                 && local.rx.iter().all(Option::is_none)
                 && local.tx_ready == 0
+                && local.tx_held == 0
                 && local.tap_inputs.is_empty()
             {
                 local.command = None;
@@ -4665,6 +4753,9 @@ impl Worker {
         }
         if let Some(feedback) = self.feedback_deadline() {
             due = due.min(feedback);
+        }
+        if let Some(hold) = self.hold_deadline() {
+            due = due.min(hold);
         }
         for (index, control) in self.controls.iter().enumerate() {
             let Some(peer) = self.shared.config.peer_for_session(index) else {
@@ -6921,6 +7012,103 @@ mod tests {
         let mtu = &mut worker.transmit[0].paths[0].lanes[0].mtu;
         assert!(mtu.reply(fresh, BASE_UDP_PAYLOAD, now + Duration::from_millis(1)));
         assert_eq!(mtu.payload_limit(), BASE_UDP_PAYLOAD);
+    }
+
+    #[test]
+    fn tx_hold_waits_for_a_second_datagram_and_releases_on_time() {
+        let (_, [mut worker, _]) = test_workers();
+        let params = wire::Params {
+            port: 40000,
+            max_frame_len: 9022,
+            mandatory_features: 0,
+            optional_features: 0,
+        };
+        let connection = Connection {
+            role: handshake::Role::Initiator,
+            initiator: Tag::new(1).unwrap(),
+            responder: Tag::new(2).unwrap(),
+            local: params,
+            peer: wire::Params {
+                port: 40001,
+                ..params
+            },
+            max_frame_len: 9022,
+        };
+        let install = Command {
+            generation: 1,
+            phase: Phase::Install,
+            connection: Some(connection),
+        };
+        worker.command(0, install, 0).unwrap();
+        let mtu = &mut worker.transmit[0].paths[0].lanes[0].mtu;
+        *mtu = pmtu::Path::new(1452, Duration::ZERO).unwrap();
+        let length = mtu.poll(Duration::ZERO).unwrap();
+        let id = pmtu::ProbeId {
+            session: 0,
+            tag: 1,
+            lane: 1,
+            packet: 1,
+        };
+        assert!(mtu.submitted(id, length, Duration::ZERO));
+        assert!(mtu.reply(id, length, Duration::from_millis(1)));
+        let limit = mtu.payload_limit();
+        assert!(limit != 0);
+        let hold = Duration::from_micros(200);
+        worker.hold = hold;
+        let input = |worker: &mut Worker, now: Duration| {
+            let mut frame = worker.free.pop().unwrap();
+            frame.length = 1522;
+            frame.session = 0;
+            frame.lane = 0;
+            frame.tag = 1;
+            frame.deadline = now + Duration::from_millis(100);
+            worker.input_frame(frame, now).unwrap();
+        };
+        let pending = |worker: &Worker| {
+            let batch = worker.sessions[0].batches[0].as_ref().unwrap();
+            worker.frames.queued_bytes(&batch.pending, usize::MAX)
+        };
+
+        // One frame is under two datagrams: the lane waits, off the ready queue.
+        let now = Duration::from_millis(2);
+        input(&mut worker, now);
+        worker.flush_frames(now).unwrap();
+        assert_eq!(pending(&worker), 1522);
+        assert_eq!(worker.sessions[0].tx_held, 1);
+        assert_eq!(worker.sessions[0].tx_ready, 0);
+        assert!(worker.ready.is_empty());
+        assert_eq!(worker.hold_deadline(), Some(now + hold));
+        assert!(worker.deadline(now).is_some_and(|due| due <= now + hold));
+        // Short of the deadline it keeps waiting; at the deadline it is sent.
+        worker.flush_frames(now + hold / 2).unwrap();
+        assert_eq!(pending(&worker), 1522);
+        worker.flush_frames(now + hold).unwrap();
+        assert_eq!(pending(&worker), 0);
+        assert_eq!(worker.sessions[0].tx_held, 0);
+        assert_eq!(worker.hold_deadline(), None);
+
+        // A second frame fills two datagrams and goes at once.
+        let now = Duration::from_millis(3);
+        input(&mut worker, now);
+        worker.flush_frames(now).unwrap();
+        assert_eq!(pending(&worker), 1522);
+        input(&mut worker, now);
+        worker.flush_frames(now).unwrap();
+        assert!(3044 >= 2 * limit);
+        assert_eq!(pending(&worker), 0);
+        assert_eq!(
+            worker.sessions[0].batches[0].as_ref().unwrap().hold_since,
+            None
+        );
+
+        // Without the switch nothing waits.
+        worker.hold = Duration::ZERO;
+        let now = Duration::from_millis(4);
+        worker.flush_frames(now).unwrap();
+        input(&mut worker, now);
+        worker.flush_frames(now).unwrap();
+        assert_eq!(pending(&worker), 0);
+        assert_eq!(worker.sessions[0].tx_held, 0);
     }
 
     #[test]
