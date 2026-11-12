@@ -955,6 +955,12 @@ stalls; this session's host stalled less and lost an order of magnitude
 fewer frames than the earlier ones. In six of sixteen direction-runs every
 missing frame sat in a stall bin.
 
+At 2G, sixteen flows, with the read margin (`3b9e86f`, two alternating
+pairs, [results](benches/decision-tx-hold-2g.json)), the hold uses 196–198%
+of a core per delivered Gbit/s against 201–208% without it, about 3% less,
+with delivery (3.23–3.31 against 3.25–3.34 Gbit/s in total) and p99 delay
+unchanged.
+
 ## Frames seconds old under overload (November 12)
 
 The tail in the latency measurement above is not a start-up event. With

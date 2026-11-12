@@ -163,7 +163,8 @@ Decisions only the user can make, each blocking a remaining goal:
    have. Is a measurement on a host with more CPUs and larger buffers
    available, or should the gate be judged on the 9000-byte path?
 4. Should `daemon.tx_hold_us` default to 200? It saves 5–6% of CPU per
-   delivered bit at 0.5 Gbit/s and no longer shows a loss of its own, but it
+   delivered bit at 0.5 Gbit/s and about 3% at 2G, leaves 5G unchanged and
+   no longer shows a loss of its own, but it
    adds about 33 µs to the median one-way delay and 0.2 ms at p99 for light
    traffic.
 5. Should `daemon.balance_flows` be on by default? On the decision workload
