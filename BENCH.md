@@ -479,6 +479,22 @@ From here on, the side-effect condition (2″) on the decision workload is: the
 median relative change over the 24 direction-points is no worse than −2%,
 and at most one direction-point fails the share criterion of (2′).
 
+A loopback A/A follows the same idea for the paired loopback bars: eight
+interleaved pairs of the current build against a byte-identical copy,
+counting how many pairs the copy wins and the median paired change, to show
+what the seven-of-eight sign test and the −2% median allowance face with no
+change.
+
+[The loopback A/A](benches/tap-loop-aa.json): the copy, always run second in
+its pair, wins six of eight on the total with a median paired change of
++1.4% (−3.0% to +7.5%), and single directions swing from −11.6% to +18.3%.
+Six of eight wins and +2.5%, the result that rejected arming the timer only
+before blocking, is what no change produces here, so that rejection stands.
+The −1.8% median of the checked-indexing pairs also lies inside this noise.
+The second position may carry a small advantage, which would have favoured
+every candidate tested second so far. Later paired designs alternate the
+order (control first in half the pairs).
+
 ## Sixteen workers per daemon (November 11, exploratory)
 
 The harness now accepts `WORKERS=16`. One run each, current build, 21G
