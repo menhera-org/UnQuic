@@ -218,11 +218,12 @@ total across both directions falls from about 3.0 Gbit/s at 2G to 2.3 at
 
 The refusals at about 5 free buffers come from the read budget. A worker
 reads its TAP until its free buffers fall to the receive reserve, and
-admission refuses handed-over frames at that same level. Each active L→R
-owner also reads a TAP queue, mostly carrying the other owner's flow, so
-its own reads use up the buffers it would need to accept the other owner's
-frames. Both owners then refuse each other while idle, and more buffers
-only feed more reads, which is why 256 buffers changed nothing. The fix
+admission refuses handed-over frames at that same level. Both active L→R
+owners also read TAP queues (about 1.5 million frames each at 5G; a third
+worker reads 2.0 million and transmits nothing), so an owner's own reads use
+up the buffers it would need to accept frames the other readers hand it.
+The owners then refuse handoffs while idle, and more buffers only feed more
+reads, which is why 256 buffers changed nothing. The fix
 stops TAP reads `BUFFERS / 8` (16) buffers earlier when other workers
 transmit for the session, leaving owners room to accept. Stated beforehand
 as an exploratory test (four flows, 2G and 5G, two alternating pairs

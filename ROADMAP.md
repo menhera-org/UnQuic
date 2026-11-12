@@ -133,9 +133,9 @@ A fresh decision-workload baseline
 ([BENCH.md](BENCH.md#decision-workload-baseline-november-12-evening)) shows
 the plateau gate failing for few flows: four flows delivered 1.31 Gbit/s L→R
 at 2G offered but 0.92 at 5G. A trace ruled out CPU and BBR: the two lane
-owners also read each other's flows from their TAP queues, and reading
-until the receive reserve left neither with exchange buffers to accept the
-other's frames, so both refused each other while idle
+owners also read TAP queues, and reading until the receive reserve left them
+no exchange buffers to accept frames other readers handed them, so they
+refused handoffs while idle
 ([BENCH.md](BENCH.md#why-four-flows-lose-lr-delivery-past-2g)). TAP reads
 now stop 16 buffers earlier when other workers transmit for the session.
 That restores the plateau: four flows at 5G deliver 1.21–1.23 / 2.02–2.05

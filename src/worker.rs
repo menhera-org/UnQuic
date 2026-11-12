@@ -343,8 +343,9 @@ const fn frame_quota(workers: usize) -> usize {
 
 /// Free buffers TAP reads leave beyond the receive reserve when other workers
 /// transmit for the session. Reads then stop before admission does, so frames
-/// other readers hand this owner still find exchange buffers; otherwise two
-/// owners reading each other's lanes fill their pools and refuse each other.
+/// other readers hand this owner still find exchange buffers; otherwise
+/// owners that also read fill their pools with their own reads and refuse
+/// every handoff.
 const fn owner_reserve(workers: usize) -> usize {
     if workers > 1 { BUFFERS / 8 } else { 0 }
 }
