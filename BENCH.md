@@ -928,9 +928,9 @@ Gbit/s at 96–97% per Gbit/s, worse than alignment alone, and is rejected.
 On the decision workload at 5G (three alternating pairs, same binary) the
 aligned cookie loses instead: 1.66–1.78 / 1.48–1.54 Gbit/s against
 2.00–2.06 / 1.55–1.62 with the default cookie, at about the same CPU per
-bit. Per-thread CPU shows why: with alignment two workers per daemon run at
-95–98% and the other two at 51–70%, against 77–99% for all four with the
-default cookie. Alignment puts each lane's receive work on the worker that
+bit. Per-thread CPU shows why: with alignment one or two workers per daemon
+sit at 51–70% while the rest run at 87–98%, against 77–99% for every worker
+with the default cookie. Alignment puts each lane's receive work on the worker that
 transmits it, so when sixteen flows hash unevenly onto four lanes the busy
 lanes' workers carry both directions' load; the default cookie's offset
 moves a busy lane's receive work to another worker. On TCP each lane
