@@ -1,0 +1,5 @@
+Reader changes per flow (benches/tap-reader-changes-diagnostic.patch on de9f3c6, profile build), four-flow decision workload at 5G, one run per arm, November 12. Worker-0 line of each daemon: owner inputs / handed over / reader changes. base = balance_flows false, cand = true.
+base left profile worker 0 readers inputs/handed/changes [4278513, 4278241, 23]
+base right profile worker 0 readers inputs/handed/changes [3786512, 3786508, 30]
+cand left profile worker 0 readers inputs/handed/changes [3668386, 948866, 102977]
+cand right profile worker 0 readers inputs/handed/changes [4733771, 4733266, 75304]

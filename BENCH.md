@@ -409,10 +409,15 @@ The same holds on the decision workload. The runs above record 0.39–1.10
 million reordered frames per direction with balanced lanes for four flows
 and 0.10–0.40 million for sixteen, against 0.5–22 thousand with hash lanes.
 Each reader keeps its own flow table, so when tun moves a flow's reads
-between readers, which these counts suggest but no trace here shows, the
-next reader gives the flow another lane: part of balanced lanes' gain is
-probably striping single flows, at that reordering cost. A flow table
-shared by a session's readers would test that.
+between readers, the next reader gives the flow another lane. The
+reader-change diagnostic ([patch](benches/tap-reader-changes-diagnostic.patch),
+[counts](benches/balance-flows-reader-changes.txt); four flows, 5G, one
+run each) shows tun doing exactly that: a flow's reader changes 23–30 times
+in 20 s with hash lanes and 75,000–103,000 times with balanced lanes, whose
+changing lanes keep moving the reverse direction's writes, which tun's
+reads follow. Part of balanced lanes' gain is therefore striping single
+flows, at that reordering cost. A flow table shared by a session's readers
+would keep each flow on one lane.
 
 ## Whether the single QinQ reader limits the loopback check (November 11)
 
