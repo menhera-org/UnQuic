@@ -359,6 +359,8 @@ snapshot() {
     fi
     for side in left right; do
         inner "$side" cat /proc/net/snmp > "$out/$1.$side-ipv4"
+        # TcpExt counters (DSACKs, reordering, loss probes) for TCP rows.
+        inner "$side" cat /proc/net/netstat > "$out/$1.$side-netstat"
         inner "$side" cat /proc/net/snmp6 > "$out/$1.$side-ipv6"
         inner "$side" ip -s -6 route show > "$out/$1.$side-routes"
     done

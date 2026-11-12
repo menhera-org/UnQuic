@@ -745,9 +745,18 @@ worst RTTs. The UDP overload case is where it matters. The TAP statistics
 show the price of a short ring for TCP: 467 and 172 dropped TSO aggregates
 per run with 64 entries, none with 500. In both, TCP's retransmissions run
 several times the frames the daemons drop (for example 78,000 against about
-7,400 expired or refused L→R frames), which points to spurious
-retransmissions, perhaps from reordering by repairs; this is not yet
-checked.
+7,400 expired or refused L→R frames).
+
+The harness now also records each inner namespace's `/proc/net/netstat`.
+One more pair with it ([counters](benches/loopback-tcp-tcpext.txt)) shows
+TCP seeing a lot of reordering, not mainly spurious retransmissions: over
+20 s the senders make 77,000–134,000 fast retransmissions but receive only
+2,000–5,900 DSACKs, while SACK-detected reordering counts 12,000–38,000
+events per side and the receivers queue 23,000–64,000 segments out of
+order, with either ring length. The daemons repair only about 2,000 frames
+each, and each TCP flow keeps one lane, so where TCP traffic is reordered
+and lost inside the tunnel is not yet explained. TCP through the tunnel is
+a separate open item from the UDP rows.
 
 ## Checked indexing in the encoders and batch planner (November 12)
 
