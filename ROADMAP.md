@@ -521,7 +521,11 @@ rules apply to all of them.
    which that patch did not count. The headroom is only 64 of 65,536
    numbers, so those refusals mean lane 0's history is full, its floor
    pinned by unacknowledged data. That favours a control lane with its own
-   history over merely ordering control ahead of data on lane 0. Two shapes are possible: send control records ahead of
+   history over merely ordering control ahead of data on lane 0. Lane IDs
+   leave no spare slot today: `tx_lanes` may reach 64, equal to `LANES`, the
+   size of each session's receive tables, so a control lane needs either
+   a 65th ID with larger tables (the wire's 16-bit lane field allows it) or
+   a 63-lane cap on data. Two shapes are possible: send control records ahead of
    data on lane 0, or give them a lane of their own with its own history.
    Many worker unit tests assume lane 0 for control.
 
