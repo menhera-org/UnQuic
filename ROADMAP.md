@@ -95,6 +95,14 @@ on the worker's own inputs cut 5G p99.9 from 0.1–0.4 s to 30–66 ms
 remaining overload delay is the kernel's TAP ring; README recommends 64
 entries.
 
+TCP through the tunnel looked heavily reordered, but the cause was the
+harness: both iperf3 directions used the same port pair, so tun's symmetric
+hash kept moving mirrored flows between readers. With distinct reverse ports
+reordering falls from 10,000–36,000 SACK events per side to under 300, at
+the same total of about 9.2 Gbit/s. About 1% of TCP segments are still
+retransmitted under unlimited load, matching the frames the daemons expire
+or drop ([BENCH.md](BENCH.md#tap-queue-length-and-overload-delay)).
+
 Decisions only the user can make, each blocking a remaining goal:
 
 1. FEC for the 5% loss row only helps if packets it recovers are
