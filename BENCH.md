@@ -408,10 +408,11 @@ the tunnel would pay for that reordering, which `udp_load` does not.
 The same holds on the decision workload. The runs above record 0.39–1.10
 million reordered frames per direction with balanced lanes for four flows
 and 0.10–0.40 million for sixteen, against 0.5–22 thousand with hash lanes.
-Each reader keeps its own flow table and tun moves a flow's reads between
-readers, so a flow pinned by one reader gets another lane from the next:
-part of balanced lanes' gain is striping single flows, at that reordering
-cost.
+Each reader keeps its own flow table, so when tun moves a flow's reads
+between readers, which these counts suggest but no trace here shows, the
+next reader gives the flow another lane: part of balanced lanes' gain is
+probably striping single flows, at that reordering cost. A flow table
+shared by a session's readers would test that.
 
 ## Whether the single QinQ reader limits the loopback check (November 11)
 
