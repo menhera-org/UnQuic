@@ -446,7 +446,16 @@ reordering in any arm. That cost, 6–16%, comes from elsewhere, and not
 from CPU: in the release runs above
 ([results](benches/loopback-balance-flows-3178088.json)) the busiest thread
 with balanced lanes runs at 77–81% of a core against 97% with hash lanes,
-yet delivers less. What limits balanced lanes there is the next question. A production version needs tests,
+yet delivers less. The same runs' counters (21G point, per daemon) point
+at frame lifetimes instead: with balanced lanes each side expires
+329,000–377,000 sent frames before their ACK and 181,000–208,000 frames
+before sending them, against 4,000–5,000 sent and none unsent on the hash
+left side (the hash right side, the direction hash lanes leave weaker,
+expires 124,000–186,000 sent and 98,000–180,000 unsent). Balanced lanes cut
+socket overflows (470–970 against 380–4,080) and repairs. So with every
+worker transmitting and receiving, frames wait past their 20 ms lifetime
+floor in queues and for ACKs; whether turn length or ACK delay sets that
+wait is the next question. A production version needs tests,
 a memory charge for the table and the full bars before it can land.
 
 ## Whether the single QinQ reader limits the loopback check (November 11)
