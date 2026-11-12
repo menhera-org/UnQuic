@@ -900,6 +900,22 @@ rises to 15–71 thousand frames per direction (1–22 thousand at 1452) and
 receive-socket overflows stay at one to four thousand. The single direction reaching 18.4 Gbit/s is
 the closest the local gate has come, but no configuration gives 20 each way.
 
+A `trace` build of the sixteen-worker one-tag case at 8952
+([report](benches/loopback-outer-9000-trace.json); this run delivered
+9.07 / 12.75 Gbit/s) shows the same limit as the November 11 trace at 1452.
+Both controllers spend about half of the 21G point in ProbeBW_DOWN (0.50 /
+0.50, cruise 0.38 / 0.38), and workers wait on pacing 53% / 45% of the time
+and on the window 15% / 11%. The senders count 13,327 / 7,822 lost packets,
+against 2,180 / 3,416 receive-socket overflows on the far side, and
+349,000 / 197,000 frames expire after they were sent. That fits losses
+arriving in bursts at overflowing 416 KiB receive buffers, which a root
+deployment raises to the 8 MiB the daemon requests. This host cannot raise
+them for a test (`rmem_max` is global on Linux 6.8 and not visible inside a
+container), and the remote test host has eight CPUs, too few for this check.
+Two earlier traced attempts stopped during the warm-up point with no error
+in the logs; the archived run completed both points. Trace daemon SHA-256:
+`132c39816bcc7ca7aa9da42dc294a84a246d8f0ec3444bc333dce838149a2c9e`.
+
 This changes what the gate needs. At 1500 bytes the per-bit cost has to
 halve; a 9000-byte outer path halves it. A deployment whose outer path
 carries jumbo frames can expect the larger gain, while the 1500-byte NGN
