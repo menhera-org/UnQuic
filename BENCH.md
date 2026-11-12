@@ -494,7 +494,9 @@ off busy data sockets is therefore an overload fix for every lane policy.
 On the decision workload the lane-0 exclusion keeps balanced lanes' gain
 even with three lanes left for four flows: at 5G it delivers 2.10 / 2.05
 Gbit/s against 2.09 / 1.79 with lane 0 in the rotation (one pair,
-[results](benches/decision-balanced-skip-lane0.json)). Balanced
+[results](benches/decision-balanced-skip-lane0.json)). With sixteen flows at
+5G it is level: 1.85 / 1.97 against 1.89 / 1.86 (one pair,
+[results](benches/decision-balanced-skip-lane0-sixteen.json)). Balanced
 lanes' loopback cost was ACKs queued behind data on lane 0's socket. A
 proper fix keeps ACKs off a busy data socket for every lane policy (hash
 lanes put data on lane 0 too), and needs tests, both suites and the full
