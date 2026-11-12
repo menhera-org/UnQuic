@@ -68,9 +68,11 @@ The per-frame cost is on the transmit side. Profiling both builds puts HEAD
 at about 3,250 busy cycles per frame against 2,540, with the receive side
 level and the transmit side about 620 cycles higher: `sendmmsg`, releasing
 ACKed frames, staging ACKs and reserving pieces. Four candidates cut 0–3%
-each (a cheaper expiry heap, a tighter frame layout, releasing frames
-without the cleanup queue), and none cleared its bar
-([BENCH.md](BENCH.md#where-the-small-frame-cost-comes-from-november-12)).
+each at overloaded points, where none cleared its bar. The cheapest, an
+expiry heap with inline keys and branchless sifting, then landed on the
+project's efficiency method: −4.2% CPU per frame at an offer-limited
+small-frame point, eight of eight pairs, against an A/A median of +0.2%
+([BENCH.md](BENCH.md#the-expiry-heap-at-an-offer-limited-point-landed)).
 No single large target remains in the per-frame path.
 
 ## November 11 checkpoint
@@ -344,10 +346,13 @@ rules apply to all of them.
    moved the cost), an expiry heap with inline keys and branchless sifting,
    and that heap with a counter-first coverage layout. The heap lowered
    cost per frame in all six of its pairs and raised unlimited delivery
-   2–7%, but no candidate's median reached its 3–5% bar
-   ([BENCH.md](BENCH.md#where-the-small-frame-cost-comes-from-november-12)).
-   Whether a consistent 2–3% win should land under a lower bar is the
-   user's call. Giving one worker several TAP queues would not help the
+   2–7%, but no candidate's median reached its 3–5% bar at those overloaded
+   points ([BENCH.md](BENCH.md#where-the-small-frame-cost-comes-from-november-12)).
+   Retested once with the project's efficiency method (offer-limited
+   point, eight alternating pairs, an A/A run alongside), the heap cut CPU
+   per frame 4.2% and landed
+   ([BENCH.md](BENCH.md#the-expiry-heap-at-an-offer-limited-point-landed)).
+   Giving one worker several TAP queues would not help the
    idle workers: under a random hash, a worker owning two of sixteen queues
    is as likely to get no flow as one owning one of eight (about 12% each
    with sixteen flows). Only flow-aware steering, such as a tun steering
