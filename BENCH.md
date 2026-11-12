@@ -499,7 +499,9 @@ Gbit/s against 2.09 / 1.79 with lane 0 in the rotation (one pair,
 [results](benches/decision-balanced-skip-lane0-sixteen.json)). Against hash
 lanes directly on the loopback check (one pair in one container,
 [results](benches/loopback-hash-vs-balanced-skip-lane0.json)) it delivers
-14.43 Gbit/s at 21G against 11.32, at 1,017% of a core against 773%: the
+14.43 Gbit/s at 21G against 11.32, at 1,017% of a core against 773%, and a
+reverse-order pair repeats it, 14.61 against 11.92
+([results](benches/loopback-hash-vs-balanced-skip-lane0-2.json)): the
 old loopback objection to balanced lanes turns into a 27% lead once ACKs
 stay off the busy lane. Balanced
 lanes' loopback cost was ACKs queued behind data on lane 0's socket. A
