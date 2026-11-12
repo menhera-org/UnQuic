@@ -107,7 +107,7 @@ Gbit/s at an offer-limited load instead.
 | --- | --- | --- |
 | At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98%. With sixteen workers per daemon and thirty-two flows: 7.11 / 7.03 Gbit/s, no thread above 75%, limited by receive-socket overflow under the container's 416 KiB buffer ([BENCH.md](#sixteen-workers-per-daemon-november-11-exploratory)) | One left worker does two jobs: it reads every L→R frame from the TAP (QinQ input all lands on one queue) and receives the R→L lanes it owns. L→R senders idle for its input; its socket overflows and R→L loses packets, so BBR cuts. More receive buffers move capacity from L→R to R→L (+11% total, L→R −14%); letting tun spread reads costs 23% more CPU per bit ([BENCH.md](#receive-buffers-for-a-busy-reader-november-11)). Next: keep receive work off the TAP reader, or split TAP reading inside the daemon. |
 | Goodput must plateau under excess traffic | Decision workload (four workers, 4.5 ms): sixteen flows deliver 1.4–2.1 Gbit/s per direction at 5G offered without collapse; workers run at 79–99% of a core | Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
-| Small-frame overload must remain efficient | Untagged 64-byte frames, sixteen flows, current build: 3.24–3.43 / 3.27–3.48 M frames/s unlimited with eight workers and 4.23–4.53 / 4.16–4.57 M with sixteen, against 5.87 / 5.74 M for the pre-recovery build; 1.85–1.95 cores per M frames/s against 1.28–1.33 ([BENCH.md](#small-frame-rows-at-the-current-build-november-12)) | About 45% more CPU per frame since recovery and BBR, and one to one and a half of eight workers per daemon idle because tun's queue hash leaves them no transmit work; balanced lanes do not change this. High ingress loss persists; mixed traffic and non-coalescible frames remain unverified. |
+| Small-frame overload must remain efficient | Untagged 64-byte frames, sixteen flows, current build: 3.24–3.43 / 3.27–3.48 M frames/s unlimited with eight workers and 4.23–4.53 / 4.16–4.57 M with sixteen, against 5.87 / 5.74 M for the pre-recovery build; QinQ 128-byte frames 2.18–2.31 / 3.32–3.53 M; 1.85–1.95 cores per M frames/s against 1.28–1.33 ([BENCH.md](#small-frame-rows-at-the-current-build-november-12)) | About 45% more CPU per frame since recovery and BBR, and one to one and a half of eight workers per daemon idle because tun's queue hash leaves them no transmit work; balanced lanes do not change this. High ingress loss persists; mixed traffic and non-coalescible frames remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input and output offloads improve matched TCP sweeps; single-stream output coalescing reaches 2.01 / 2.26 Gbit/s, still below the deployment target. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
@@ -657,6 +657,17 @@ Cost is per frame, as expected: 60-byte frames behave like 64-byte ones.
 At 128 bytes the reverse direction delivers a quarter to a third less than
 the forward one under overload, which the 64-byte rows do not show. Two
 repeats cannot say whether that is placement or a real asymmetry.
+
+QinQ adds one more row. The harness needs 16 payload bytes, so with two
+tags the smallest frame it can send is the 128-byte size (78-byte payload).
+Same settings, `VLAN_DEPTH=2`, two repeats
+([results](benches/tap-small-frames-qinq.json)): 40M (1.01–1.02 M
+frames/s) arrives with 0.1–0.6% missing at 217–235% CPU, and unlimited
+delivers 2.18–2.31 / 3.32–3.53 M frames/s at 562% / 593–598% CPU (2.03–2.05
+cores per M frames/s), busiest thread 97–98%. The expectation written
+beforehand, lower than untagged in both directions, was wrong: the total
+(5.63–5.71 M) matches the untagged 128-byte total (5.11–5.47 M), and only
+the split differs, with L→R the weaker side here.
 
 One flow, same settings at eight workers, two repeats
 ([results](benches/tap-small-frames-one-flow.json)): 40M (0.23 M frames/s)
