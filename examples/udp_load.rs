@@ -455,6 +455,19 @@ fn retry_send(error: &io::Error) -> bool {
 
 fn run(c: &Config) -> io::Result<()> {
     c.validate()?;
+    if !c.send {
+        // Before any setup: the harness signals receivers 0.2 s after starting
+        // them, and SIGUSR1's default action killed slow-starting ones.
+        // SAFETY: sigaction contains a plain function handler and an initialized empty mask.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = snapshot as *const () as usize;
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
     let mut flows = flows(c)?;
     if c.send {
         // The default 50 µs sleep slack starves the two-aggregate bucket above ~40k sends/s per flow.
@@ -472,17 +485,6 @@ fn run(c: &Config) -> io::Result<()> {
             revents: 0,
         })
         .collect();
-    if !c.send {
-        // SAFETY: sigaction contains a plain function handler and an initialized empty mask.
-        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction = snapshot as *const () as usize;
-        unsafe {
-            libc::sigemptyset(&mut action.sa_mask);
-            if libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-    }
     let mut samples = [(0.0f64, 0u64); 2];
     let mut sample_count = 0;
     let mut poll_calls = 0u64;

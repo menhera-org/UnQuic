@@ -1233,8 +1233,13 @@ run failed at start-up with no error in its logs, so that limit has one run:
 Delivery rises 50–56% and CPU per bit falls about 36%, with the busiest
 worker still at 95–97%, matching earlier sessions' 3.5–3.7 Gbit/s totals at
 1452. Two first runs in fresh containers failed today without log errors
-(here and in the traced 9000-byte run); later runs in the same container
-succeed.
+(here and in the traced 9000-byte run). In the failed run every sender
+finished but all eight receivers left empty output and the harness could
+not signal them: the harness sends receivers SIGUSR1 0.2 s after starting
+them, and `udp_load` installed its handler only after allocating its
+sequence windows, so a cold start let the default action kill them.
+Receivers now install the handler first; two fresh-container first runs
+then succeeded.
 
 This changes what the gate needs. At 1500 bytes the per-bit cost has to
 halve; a 9000-byte outer path halves it. A deployment whose outer path
