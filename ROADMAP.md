@@ -176,7 +176,8 @@ Decisions only the user can make, each blocking a remaining goal:
    it adds about 20% for four flows even with the read margin (5G total
    3.91–3.95 instead of 3.25–3.29 Gbit/s) and lifts sixteen flows at 2G by
    10–15%, but it still costs the loopback overload check about 12% at 21G
-   and more CPU per bit (rechecked on `3178088`)
+   and more CPU per bit (rechecked on `3178088`). For one lossy flow it lifts
+   5G delivery 25–90% by striping, with millions of reordered frames
    ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB

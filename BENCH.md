@@ -398,6 +398,13 @@ pairs, [results](benches/decision-balance-flows-four-margin.json)): totals
 of 3.63–3.91 Gbit/s at 2G against 3.08–3.11 with hash lanes, and 3.91–3.95
 at 5G against 3.25–3.29, about 20% more, at more CPU.
 
+For one flow at 7.5 ms with 1% loss (`424f4f8`, two alternating pairs,
+[results](benches/lossy-one-flow-balance-flows-424f4f8.json)), balanced
+lanes deliver 1.25–1.92 / 1.39–1.93 Gbit/s at 5G offered against 0.96–1.03 /
+0.98–1.04 with hash lanes, but by striping the flow: they reorder 0.88–2.46
+million frames per direction against 35,000–59,000. Reactive traffic inside
+the tunnel would pay for that reordering, which `udp_load` does not.
+
 ## Whether the single QinQ reader limits the loopback check (November 11)
 
 On both sides of the loopback check every TAP read lands on one worker, and
