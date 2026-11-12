@@ -327,7 +327,9 @@ per Gbit/s in both. The loopback check at sixteen workers per daemon with
 thirty-two flows, the gate configuration (two alternating pairs,
 [results](benches/loopback-sixteen-workers-owner-reserve.json)), is
 unchanged too: 14.33 and 14.58 Gbit/s in total at 21G against 14.49 and
-14.54. Balanced lanes, below, rescue the same four-flow point
+14.54. So is the 9000-byte outer path with sixteen workers and one tag
+([results](benches/loopback-outer-9000-owner-reserve.json)): 25.30 and 25.31
+Gbit/s against 25.21 and 24.58, no direction above 13.8. Balanced lanes, below, rescue the same four-flow point
 by a different route.
 
 ### Balanced lanes on the decision workload, revisited
