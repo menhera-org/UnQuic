@@ -1,0 +1,46 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index 5d02f2d..11fe588 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -808,6 +808,8 @@ pub(crate) struct Worker {
+     retry_due: Option<Duration>,
+     // Empty unless daemon.balance_flows is set.
+     flows: Box<[FlowSlot]>,
++    // Exploratory: the current TAP read filled a whole maximum-size batch.
++    spread: bool,
+     #[cfg(feature = "profile")]
+     phases: [u64; crate::profile::PHASES],
+ }
+@@ -1166,6 +1168,7 @@ impl Worker {
+             } else {
+                 Box::default()
+             },
++            spread: false,
+             shared,
+         })
+     }
+@@ -2357,6 +2360,7 @@ impl Worker {
+             } else {
+                 BATCH_SIZE
+             };
++            self.spread = count == maximum && frames as usize == count;
+             *limit = if frames as usize == count {
+                 (*limit * 2).min(maximum)
+             } else {
+@@ -2383,6 +2387,7 @@ impl Worker {
+                 buffer.segments = segments;
+                 self.read_tap_result(session, now, buffer, result)?;
+             }
++            self.spread = false;
+             if maximum == 4 && !self.sessions[session].tap_inputs.is_empty() {
+                 self.sessions[session].tap_read_limit = 1;
+             }
+@@ -2475,7 +2480,7 @@ impl Worker {
+                 let cursor = self.shared.flow_cursors.get(session);
+                 buffer.lane = if let Some(cursor) = cursor
+                     && !self.flows.is_empty()
+-                    && strict_lane(frame, self.id, workers, queues, lanes)
++                    && (self.spread || strict_lane(frame, self.id, workers, queues, lanes))
+                 {
+                     let hash = pack::flow_hash(frame);
+                     balanced_lane(

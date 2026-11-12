@@ -298,9 +298,12 @@ rules apply to all of them.
    at the paced point but 18–20% less under overload, at 21–26% more CPU
    per frame, so it was rejected
    ([BENCH.md](BENCH.md#without-udp-lane-locality-exploratory-rejected)).
-   What remains is spreading only when the reader saturates and another
-   worker has slack. That needs a saturation signal the per-read handler
-   does not have today, and must not reorder a flow that changes lanes.
+   Spreading only the frames of reads that filled a whole batch changed
+   nothing measurable
+   ([BENCH.md](BENCH.md#spreading-only-after-a-full-tap-read-exploratory-rejected));
+   a next try needs a counter showing how often the signal fires, a
+   signal that tracks the reader's backlog rather than one read, and no
+   reordering for a flow that changes lanes.
    One small-frame flow reaches 0.61–0.67 M frames/s, limited by one
    thread. 60-byte frames match 64-byte ones; 128-byte frames are lossless
    at 0.92 M frames/s paced, and unlimited R→L trails L→R by a quarter to a

@@ -720,8 +720,30 @@ unlimited total falls 18–20%, L→R to 2.17–2.33 M frames/s, and each frame
 costs 21–26% more CPU. That is the trade the UDP locality change was made
 for, and it still holds at overload. A version that spreads only when
 the reader is the bottleneck and the receiving worker has slack might keep
-the paced gain; it is not tried here. Patch daemon SHA-256:
+the paced gain. Patch daemon SHA-256:
 `83a619c380b222c8e73ba3221c7832d7cf13ec3c39df92da8ce75797a172b299`.
+
+### Spreading only after a full TAP read (exploratory, rejected)
+
+A second exploratory patch tries that narrower version
+([patch](benches/spread-on-full-read-exploratory.patch)). Frames from a
+TAP read that filled a whole maximum-size batch take the balanced path;
+other reads keep locality. The bar, written beforehand: unlimited total up
+more than 10% in every repeat, 40M not lower, reordering under 0.1%. HEAD
+with hash lanes against the patch with `balance_flows = true`, alternating,
+three repeats ([results](benches/tap-small-frames-spread-on-full-read.json)):
+
+| Build | 40M total M frames/s | Unlimited total M frames/s | Unlimited cores per M | Reordered (unlimited) |
+| --- | --- | --- | --- | --- |
+| `acef86d`, hash lanes | 5.42–5.54 | 6.38–6.80 | 1.89–1.90 | 0 |
+| Spread after full reads | 5.42–5.46 | 6.65–6.75 | 1.83–1.85 | 0–704 |
+
+It misses the bar: both points are within the A/A swing, and the busiest
+thread only drops from 96–98% to 95%. No counter recorded how often a read
+qualified, so this does not show whether full reads are rare under this
+load (UDP super-frames cap the batch at four reads) or whether spreading
+them simply does not relieve the reader. Patch daemon SHA-256:
+`70ff19038031db542c7f702d3e80228f76b240905c71995d8f7e3d157bf6d942`.
 
 ## Sixteen workers per daemon (November 11, exploratory)
 
