@@ -748,15 +748,48 @@ several times the frames the daemons drop (for example 78,000 against about
 7,400 expired or refused L→R frames).
 
 The harness now also records each inner namespace's `/proc/net/netstat`.
-One more pair with it ([counters](benches/loopback-tcp-tcpext.txt)) shows
-TCP seeing a lot of reordering, not mainly spurious retransmissions: over
-20 s the senders make 77,000–134,000 fast retransmissions but receive only
-2,000–5,900 DSACKs, while SACK-detected reordering counts 12,000–38,000
-events per side and the receivers queue 23,000–64,000 segments out of
-order, with either ring length. The daemons repair only about 2,000 frames
-each, and each TCP flow keeps one lane, so where TCP traffic is reordered
-and lost inside the tunnel is not yet explained. TCP through the tunnel is
-a separate open item from the UDP rows.
+One more pair with it ([counters](benches/loopback-tcp-tcpext.txt)) showed
+TCP seeing a lot of reordering: SACK-detected reordering of 12,000–38,000
+events per side in 20 s, and 23,000–64,000 segments queued out of order at
+the receivers, with either ring length.
+
+The reordering comes from the harness, not the daemon. Header captures on
+both TAPs (new `TAP_CAPTURE` switch, 5 s, counted with
+[tcp_reorder.sh](benches/tcp_reorder.sh)) show whole 64 KB TSO blocks
+overtaking each other: 2,834 events L→R, most under 1 ms late. A diagnostic
+`profile` build
+([patch](benches/tap-reader-changes-diagnostic.patch)) counts, at each
+frame's owner, how often a flow arrives from a different TAP reader than
+last time: 129,486 and 116,131 changes in 20 s, about one input in eight.
+The iperf3 path ran both directions from client port 51000 to server port
+5201. tun's symmetric hash then gives a forward flow and its mirror the same
+key, the same collision the UDP path already avoids with
+`REVERSE_PORT_OFFSET` (see "Whether the single QinQ reader limits the
+loopback check" above). tun keeps moving both flows to
+the queue last written for either, the frames take different handoff paths
+to the owner, and whole blocks pass each other. The iperf3 reverse client
+now honours `REVERSE_PORT_OFFSET` too. Two alternating pairs at 500 entries
+with offsets 0 and 2000, `6bd024c`
+([summary](benches/loopback-tcp-port-offset.txt)):
+
+| 20 s, eight streams each way | Offset 0 | Offset 2000 |
+| --- | --- | --- |
+| L→R / R→L Gbit/s | 3.30–3.52 / 5.73–5.88 | 4.75–5.13 / 4.20–4.24 |
+| Total Gbit/s | 9.03–9.40 | 8.99–9.33 |
+| SACK reordering events, left / right | 33,381–36,058 / 10,413–13,107 | 20–288 / 20–28 |
+| Out-of-order segments queued, left / right | 21,659–23,993 / 54,122–58,111 | 6,554–6,729 / 7,734–11,356 |
+| Fast retransmissions, left / right | 75,211–80,656 / 116,851–123,080 | 81,771–83,004 / 51,103–76,284 |
+| Segments DSACKed as spurious, left / right | 26,494–31,244 / 8,858–9,940 | 9,004–13,969 / 1,572–1,985 |
+
+With distinct ports the diagnostic counts 19 and 28 reader changes, and
+reordering all but disappears. The total stays the same; only the split
+between directions moves. Retransmissions stay high, so they are real
+losses: with offset 2000 the daemons expire or refuse about 26,000 L→R
+frames (22,769 of them worker queue drops) and 53,000 R→L, the same order
+as TCP's retransmissions. TCP through the tunnel loses about 1% of its
+segments under unlimited load, and those drops, not reordering, are the
+open item. The UDP decision workload uses `udp_load`, whose port layout this
+does not change.
 
 ## Checked indexing in the encoders and batch planner (November 12)
 

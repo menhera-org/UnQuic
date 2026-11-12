@@ -1,0 +1,11 @@
+TCP through the tunnel on loopback, November 12: 6bd024c, eight workers, untagged 1514-byte frames, TAP_TXQUEUELEN=500, eight iperf3 TCP streams each way, unlimited, 20 s. Runs alternate REVERSE_PORT_OFFSET 0 and 2000. Goodput is the iperf3 server sum_received; TcpExt values are after-minus-before deltas of each inner namespace (left sends L->R).
+o0/r1 L>R=3.30 R>L=5.73 |left TCPFastRetrans=80656 TCPDSACKRecvSegs=26494 TCPSACKReorder=33381 TCPOFOQueue=21659 TCPTimeouts=148 |right TCPFastRetrans=116851 TCPDSACKRecvSegs=8858 TCPSACKReorder=10413 TCPOFOQueue=54122 TCPTimeouts=78
+o2000/r1 L>R=4.75 R>L=4.24 |left TCPFastRetrans=83004 TCPDSACKRecvSegs=13969 TCPSACKReorder=288 TCPOFOQueue=6729 TCPTimeouts=78 |right TCPFastRetrans=51103 TCPDSACKRecvSegs=1572 TCPSACKReorder=20 TCPOFOQueue=11356 TCPTimeouts=81
+o0/r2 L>R=3.52 R>L=5.88 |left TCPFastRetrans=75211 TCPDSACKRecvSegs=31244 TCPSACKReorder=36058 TCPOFOQueue=23993 TCPTimeouts=83 |right TCPFastRetrans=123080 TCPDSACKRecvSegs=9940 TCPSACKReorder=13107 TCPOFOQueue=58111 TCPTimeouts=57
+o2000/r2 L>R=5.13 R>L=4.20 |left TCPFastRetrans=81771 TCPDSACKRecvSegs=9004 TCPSACKReorder=20 TCPOFOQueue=6554 TCPTimeouts=82 |right TCPFastRetrans=76284 TCPDSACKRecvSegs=1985 TCPSACKReorder=28 TCPOFOQueue=7734 TCPTimeouts=115
+
+Diagnostic profile build (benches/tap-reader-changes-diagnostic.patch on 6bd024c), owner inputs / handed over / reader changes per flow, worker-0 line of each daemon:
+offset 0 (TcpExt pair run): left changes [1026247, 969912, 129486] right changes [970699, 830133, 116131]
+offset 2000: left changes [1034169, 958946, 19] right changes [997043, 915310, 28]
+
+TAP header capture, offset 0, 5 s (reorder.awk): L->R 2834 reordering events, 5734 reordered original segments, lag <0.1 ms 2330, 0.1-1 ms 2651, 1-10 ms 740, >=10 ms 13; R->L 1372 events, 2749 segments.

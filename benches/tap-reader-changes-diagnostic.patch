@@ -1,0 +1,53 @@
+diff --git a/src/profile.rs b/src/profile.rs
+index c12610b..60c044e 100644
+--- a/src/profile.rs
++++ b/src/profile.rs
+@@ -66,6 +66,14 @@ pub fn now() -> u64 {
+ pub static ADMISSION: [std::sync::atomic::AtomicU64; 4] =
+     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+ 
++/// Diagnostic: owner inputs, inputs handed over by another reader, and reader changes per flow.
++pub static READERS: [std::sync::atomic::AtomicU64; 3] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
++
++/// Diagnostic: last reader worker plus one for each flow-hash slot.
++pub static LAST_READER: [std::sync::atomic::AtomicU8; 4096] =
++    [const { std::sync::atomic::AtomicU8::new(0) }; 4096];
++
+ /// Per-process syscall totals: cycles, calls and items for sendmmsg, then timerfd_settime.
+ pub static SYSCALLS: [[std::sync::atomic::AtomicU64; 3]; 2] =
+     [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 2];
+@@ -94,8 +102,11 @@ pub fn report(worker: usize, phases: &[u64; PHASES]) {
+     let timer = SYSCALLS[1]
+         .each_ref()
+         .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
++    let readers = READERS
++        .each_ref()
++        .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
+     let mut line = format!(
+-        "unquic: profile worker {worker} admission inputs/buffers/frames/bytes {admission:?} sendmmsg cycles/calls/datagrams {sendmmsg:?} timerfd_settime cycles/calls {:?} cycles {total}",
++        "unquic: profile worker {worker} readers inputs/handed/changes {readers:?} admission inputs/buffers/frames/bytes {admission:?} sendmmsg cycles/calls/datagrams {sendmmsg:?} timerfd_settime cycles/calls {:?} cycles {total}",
+         &timer[..2]
+     );
+     for index in order.into_iter().filter(|&index| phases[index] != 0) {
+diff --git a/src/worker.rs b/src/worker.rs
+index fceac78..5362ee7 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -2584,6 +2584,16 @@ impl Worker {
+         }
+         let local = &self.sessions[session];
+         let foreign = buffer.origin != self.id;
++        #[cfg(feature = "profile")]
++        {
++            use std::sync::atomic::Ordering::Relaxed;
++            let slot = pack::flow_hash(&buffer.bytes[..buffer.length]) as usize % 4096;
++            let last = crate::profile::LAST_READER[slot].swap(buffer.origin as u8 + 1, Relaxed);
++            crate::profile::READERS[0].fetch_add(1, Relaxed);
++            crate::profile::READERS[1].fetch_add(u64::from(foreign), Relaxed);
++            crate::profile::READERS[2]
++                .fetch_add(u64::from(last != 0 && last != buffer.origin as u8 + 1), Relaxed);
++        }
+         if local.tap_inputs.len() == BUFFERS
+             || (foreign
+                 && (self.free.len() <= RECEIVE_BUFFERS - self.rx_retained + 1

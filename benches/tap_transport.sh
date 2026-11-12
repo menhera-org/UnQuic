@@ -37,6 +37,7 @@ case "${WORKERS:-4}" in 2|4|8|16) ;; *) echo "WORKERS must be 2, 4, 8 or 16" >&2
 case "${UDP_LOAD:-}" in ''|/*) ;; *) echo "UDP_LOAD must be an absolute path" >&2; exit 2;; esac
 case "${IPERF_PROTOCOL:-udp}" in udp|tcp) ;; *) echo "IPERF_PROTOCOL must be udp or tcp" >&2; exit 2;; esac
 [ "${IPERF_PROTOCOL:-udp}" = udp ] || [ -z "${UDP_LOAD:-}" ] || { echo "TCP requires iperf3, not UDP_LOAD" >&2; exit 2; }
+case "${TAP_CAPTURE:-0}" in 0) ;; 1) [ "${IPERF_PROTOCOL:-udp}" = tcp ] || { echo "TAP_CAPTURE requires TCP" >&2; exit 2; };; *) exit 2;; esac
 if [ -n "${UDP_LOAD:-}" ]; then
     [ "$2" -ge "$((58 + 4 * ${VLAN_DEPTH:-0} + 84 * ${SRV6:-0}))" ] || { echo "UDP_LOAD needs 16 payload bytes after headers" >&2; exit 2; }
 fi
@@ -93,9 +94,10 @@ right=
 servers=
 clients=
 competing=
+captures=
 processes=${GENERATOR_PROCESSES:-1}
 cleanup() {
-    for pid in $clients $servers $competing "$left" "$right"; do
+    for pid in $clients $servers $competing $captures "$left" "$right"; do
         [ -z "$pid" ] || kill "$pid" 2>/dev/null || :
     done
     wait || :
@@ -366,6 +368,10 @@ snapshot() {
     done
     netip uq-left -s link show uq-left > "$out/$1.left-link"
     netip uq-right -s link show uq-right > "$out/$1.right-link"
+    # Ring overflow drops appear only in the TAP's qdisc counters.
+    for side in left right; do
+        nsenter --net="/run/netns/uq-$side" tc -s qdisc show dev "uq-$side" > "$out/$1.$side-tapqdisc"
+    done
 }
 uname -srvm > "$out/kernel"
 sed -n '/model name/p' /proc/cpuinfo | head -n 1 > "$out/cpu-model"
@@ -459,10 +465,19 @@ for rate in ${BITRATE:-0}; do
         else
             set -- -u --dont-fragment -l "$payload"
         fi
+        if [ "${TAP_CAPTURE:-0}" = 1 ]; then
+            # TCP headers on both TAPs show where segments are reordered.
+            # Call nsenter directly so $! is tcpdump itself, not a subshell.
+            nsenter --net="$left_inner" tcpdump -Z root -i uq-left -s 96 -B 262144 -w "$out/left.pcap" tcp 2> "$out/left.tcpdump" &
+            captures="$captures $!"
+            nsenter --net="$right_inner" tcpdump -Z root -i uq-right -s 96 -B 262144 -w "$out/right.pcap" tcp 2> "$out/right.tcpdump" &
+            captures="$captures $!"
+            sleep 1
+        fi
         nsenter --net="$left_inner" taskset -c "$GENERATOR_LEFT_CPUS" iperf3 -c 10.77.0.2 -b "$rate" "$@" -P "$flows" --cport 51000 -t "$seconds" -J \
             --connect-timeout 3000 > "$out/client.json" &
         clients="$clients $!"
-        nsenter --net="$right_inner" taskset -c "$GENERATOR_RIGHT_CPUS" iperf3 -c 10.77.0.1 -b "$rate" "$@" -P "$flows" --cport 51000 -t "$seconds" -J \
+        nsenter --net="$right_inner" taskset -c "$GENERATOR_RIGHT_CPUS" iperf3 -c 10.77.0.1 -b "$rate" "$@" -P "$flows" --cport "$((51000 + ${REVERSE_PORT_OFFSET:-0}))" -t "$seconds" -J \
             --connect-timeout 3000 > "$out/reverse-client.json" &
         clients="$clients $!"
     fi
@@ -473,6 +488,8 @@ for rate in ${BITRATE:-0}; do
     if [ -n "${UDP_LOAD:-}" ]; then snapshot sent; fi
     for pid in $servers; do wait "$pid"; done
     servers=
+    for pid in $captures; do kill -INT "$pid"; wait "$pid" || :; done
+    captures=
     snapshot after
     index=$((index + 1))
 done

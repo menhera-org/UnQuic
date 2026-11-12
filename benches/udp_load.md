@@ -159,7 +159,14 @@ Flow j runs from port 51000 + j to 52000 + j in both directions by default.
 tun's symmetric flow hash then gives both directions of flow j the same hash,
 so tun reads a flow on the queue the daemon last wrote its other direction on.
 `REVERSE_PORT_OFFSET`, for example 2000, moves the right-to-left flows to
-other ports so each direction hashes on its own.
+other ports so each direction hashes on its own. iperf3 runs have the same
+collision (both directions use client ports from 51000 to server port 5201),
+and the offset moves the reverse client's ports there too. Without it TCP
+rows show heavy reordering that the daemon does not cause.
+With `IPERF_PROTOCOL=tcp`, `TAP_CAPTURE=1` records TCP headers on both TAPs
+as `left.pcap` and `right.pcap`; `benches/tcp_reorder.sh` counts reordered
+segments from such a pair. Snapshots also keep each inner namespace's
+`/proc/net/netstat` and each TAP's qdisc counters.
 Each snapshot's `memory` file records both daemons' VmHWM and VmRSS.
 `DAEMON_TOML`, when set, starts both daemon configurations, for
 example `[daemon]` options. Netem has an 8192-entry queue on each router egress. Qdisc snapshots
