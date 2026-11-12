@@ -12,9 +12,6 @@ for number in "$3" "$4"; do
 done
 case "${OUTER_PAYLOAD_LIMIT:-1232}" in ''|*[!0-9]*) exit 2;; esac
 [ "${OUTER_PAYLOAD_LIMIT:-1232}" -ge 1232 ] && [ "${OUTER_PAYLOAD_LIMIT:-1232}" -le 8952 ] || exit 2
-# Routed veths carry the largest configured outer packet; loopback already does.
-outer_mtu=$((${OUTER_PAYLOAD_LIMIT:-1232} + 48))
-[ "$outer_mtu" -ge 1500 ] || outer_mtu=1500
 case "${TAP_TXQUEUELEN:-10000}" in ''|*[!0-9]*) exit 2;; esac
 [ "${TAP_TXQUEUELEN:-10000}" -ge 1 ] && [ "${TAP_TXQUEUELEN:-10000}" -le 10000 ] || exit 2
 for number in "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" "${OUTER_LOSS_BURST:-1}" "${OUTER_REORDER_PERMILLE:-0}" "${OUTER_RATE_MBIT:-0}" "${OUTER_QUEUE_PACKETS:-8192}"; do
@@ -167,6 +164,9 @@ netem() {
     fi
 }
 ip link set lo up
+# Routed veths carry the largest configured outer packet; loopback already does.
+outer_mtu=$((${OUTER_PAYLOAD_LIMIT:-1232} + 48))
+[ "$outer_mtu" -ge 1500 ] || outer_mtu=1500
 if [ "${OUTER_ROUTED:-0}" = 1 ]; then
     for side in left right; do
         if [ "$side" = left ]; then n=1; peer=2; else n=2; peer=1; fi
