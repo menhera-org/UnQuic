@@ -191,8 +191,10 @@ Decisions only the user can make, each blocking a remaining goal:
    never acknowledged. The cause is found: ACKs always leave on lane 0's
    socket and wait behind its data. Keeping lane 0 out of the balanced
    rotation (exploratory) removes the ACK deferrals and lifts the loopback
-   check from 10.74 to 13.45 Gbit/s, above hash lanes. Next: send ACKs so
-   they never queue behind data, for every lane policy, then re-decide.
+   check from 10.74 to 13.45 Gbit/s; against hash lanes in one container it
+   leads 14.43 to 11.32. Next: send ACKs so they never queue behind data,
+   for every lane policy (hash lanes defer them too at overload), then
+   re-decide.
    ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB
