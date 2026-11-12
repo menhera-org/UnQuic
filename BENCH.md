@@ -215,7 +215,14 @@ plateau holds. With sixteen flows they raise 2G by 10–15% and leave the 5G
 total about level (3.55–3.81 against 3.69–3.70) while moving capacity from
 L→R to R→L. On November 11 balanced lanes cost the loopback overload check
 and the directions hash lanes favoured up to 14%, which is why the switch is
-off; the decision belongs to the user (ROADMAP).
+off. Rerun on `3178088` (QinQ, eight workers, sixteen 44-segment flows, two
+alternating pairs, [results](benches/loopback-balance-flows-3178088.json)):
+at 21G hash lanes deliver 5.54–5.86 / 6.30–6.43 Gbit/s and balanced lanes
+5.07–5.33 / 5.42–5.57, about 12% less in total, at 920–935% of a core
+against 810–850%. Both deliver the 4G warm-up in full, balanced lanes at
+about 7% more CPU. The trade holds: balanced lanes rescue few flows on the
+routed path and cost the loopback check. The decision belongs to the user
+(ROADMAP).
 
 ## Whether the single QinQ reader limits the loopback check (November 11)
 

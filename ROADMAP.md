@@ -159,8 +159,8 @@ Decisions only the user can make, each blocking a remaining goal:
 5. Should `daemon.balance_flows` be on by default? On the decision workload
    it keeps four flows from collapsing at 5G (L→R 1.90 instead of 0.92
    Gbit/s, total 3.5–3.7 instead of 2.2–2.3) and lifts sixteen flows at 2G
-   by 10–15%, but on November 11 it cost the loopback overload check and the
-   directions hash lanes favoured up to 14%
+   by 10–15%, but it still costs the loopback overload check about 12% at
+   21G and more CPU per bit (rechecked on `3178088`)
    ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB
