@@ -306,7 +306,11 @@ per-frame cost itself. With the transmit split diagnostic applied, the
 `sendmmsg` calls alone take 18–21% of both owners' cycles, the send after
 each claim 8%, staging ACKs 4–6% and receive admission 4–5%: about half the
 owner's time is syscalls (sends, TAP reads and writes, socket receives),
-whose kernel side here includes the emulated routed path.
+whose kernel side here includes the emulated routed path. Each `sendmmsg`
+call already carries about 30 datagrams as UDP GSO messages, yet costs about
+220,000 cycles, some 7,300 per datagram (12,300 at 0.5G with 2.5 per call):
+the routed namespaces and netem segment and forward every datagram in
+software on the sending thread, which a host with GSO-capable NICs would not.
 
 The overloaded delay the margin raised is mostly the TAP ring again. On the
 decision workload at 5G, sixteen flows, `3b9e86f`, two alternating pairs
