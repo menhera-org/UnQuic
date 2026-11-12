@@ -154,7 +154,10 @@ Decisions only the user can make, each blocking a remaining goal:
    congestion losses included. Is that acceptable, and if so, under what
    limit?
 2. Should the daemon set a short transmit queue (for example 64 entries) on
-   the TAPs it creates, or leave it to the operator as now?
+   the TAPs it creates, or leave it to the operator as now? On the decision
+   workload at 5G, 64 entries instead of 500 cut p99 delay from 25–42 ms to
+   11–14 ms with delivery unchanged
+   ([BENCH.md](BENCH.md#why-four-flows-lose-lr-delivery-past-2g)).
 3. The 20 Gbit/s gate is limited locally by the container's 416 KiB receive
    buffers, which this host cannot raise and a root deployment does not
    have. Is a measurement on a host with more CPUs and larger buffers

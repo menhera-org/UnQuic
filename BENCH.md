@@ -274,6 +274,14 @@ spends 15% of the 5G point in ProbeBW_DOWN against 4% at 2G, and 675,000
 sent frames still expire unacknowledged. That is a congestion-response
 question for the lossy rows, not a buffer one.
 
+The overloaded delay the margin raised is mostly the TAP ring again. On the
+decision workload at 5G, sixteen flows, `3b9e86f`, two alternating pairs
+([results](benches/decision-tap-queue-length-3b9e86f.json)): a 64-entry ring
+gives a median one-way delay of 3.7 / 4.7 ms and a p99 of 10.7–11.7 /
+13.1–13.6 ms, against 6.4–6.8 / 9.6–9.8 ms and 38–42 / 25 ms with 500
+entries, while delivery stays at 1.91–1.99 / 1.69–1.76 Gbit/s (500 entries:
+1.96–1.97 / 1.67–1.73).
+
 TCP through the tunnel (loopback, eight workers, eight streams each way,
 two alternating pairs, [runs](benches/tcp-owner-reserve.txt)) is unchanged:
 9.66 and 9.43 Gbit/s with the margin against 9.47 and 9.41, at 98% of a core
