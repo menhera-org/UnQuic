@@ -1332,7 +1332,10 @@ November 10 evidence for that list, all in BENCH.md:
   for ACKs cut light-load CPU per Gbit/s by 4.1%
   ([BENCH.md](BENCH.md#scanning-only-occupied-receive-slots-for-acks-november-12));
   masking the TAP flush and deadline scans too gave a −2.4% median but missed
-  its five-of-six bar and was rejected.
+  its five-of-six bar and was rejected, and skipping the extra turn after
+  handing sender messages to other workers changed nothing. Light-load pairs
+  show a first-run advantage of about 3%, so light-load bars need alternating
+  order and effects clearly larger than that.
 - `tolerate_random_loss` by default: measured on November 11 against one TCP
   CUBIC flow at a 1 Gbit/s, 7.5 ms bottleneck
   ([BENCH.md](BENCH.md#coexistence-with-tolerate_random_loss-november-11)).
