@@ -445,7 +445,7 @@ with hash lanes and 10.68 and 11.14 with per-reader tables, with little
 reordering in any arm. That cost, 6–16%, comes from elsewhere, and not
 from CPU: in the release runs above
 ([results](benches/loopback-balance-flows-3178088.json)) the busiest thread
-with balanced lanes runs at 76–81% of a core against 97% with hash lanes,
+with balanced lanes runs at 77–81% of a core against 97% with hash lanes,
 yet delivers less. What limits balanced lanes there is the next question. A production version needs tests,
 a memory charge for the table and the full bars before it can land.
 
