@@ -8560,7 +8560,9 @@ mod tests {
             wake.sleep();
             let block = rx.is_empty();
             // A lost wake would leave this wait to its one-second timeout.
-            let count = reactor.wait(&mut events, if block { 1000 } else { 0 }).unwrap();
+            let count = reactor
+                .wait(&mut events, if block { 1000 } else { 0 })
+                .unwrap();
             wake.awake();
             assert!(!block || count != 0, "published work was left asleep");
             slept += usize::from(block);
@@ -8569,7 +8571,10 @@ mod tests {
             }
         }
         producer.join().unwrap();
-        assert!(slept != 0, "the consumer never blocked, so the race went untested");
+        assert!(
+            slept != 0,
+            "the consumer never blocked, so the race went untested"
+        );
     }
 
     #[test]
