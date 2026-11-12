@@ -438,10 +438,11 @@ of three arms ([results](benches/shared-flow-table-four-flows.json),
 
 The shared table keeps flows on their readers and lanes, removes the
 striping, and delivers the most L→R of the three. On the loopback overload
-check (one run each, [results](benches/shared-flow-table-loopback.json)) it
-does not remove balanced lanes' cost: 10.83 Gbit/s at 21G against 11.47
-with hash lanes and 10.68 with per-reader tables, with little reordering in
-any arm. That cost comes from elsewhere. A production version needs tests,
+check (two rounds, [first](benches/shared-flow-table-loopback.json),
+[second](benches/shared-flow-table-loopback-2.json)) it does not remove
+balanced lanes' cost: 10.83 and 10.30 Gbit/s at 21G against 11.47 and 12.31
+with hash lanes and 10.68 and 11.14 with per-reader tables, with little
+reordering in any arm. That cost, 6–16%, comes from elsewhere. A production version needs tests,
 a memory charge for the table and the full bars before it can land.
 
 ## Whether the single QinQ reader limits the loopback check (November 11)

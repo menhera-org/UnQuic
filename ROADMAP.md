@@ -182,7 +182,8 @@ Decisions only the user can make, each blocking a remaining goal:
    against at most 22,000 with hash lanes, a cost inner TCP or QUIC would pay.
    An exploratory flow table shared by all readers removes that reordering
    and raises four-flow L→R at 5G to 1.98–2.00 Gbit/s (per-reader tables:
-   1.62–1.64; hash lanes: 1.15–1.19), but leaves the loopback cost
+   1.62–1.64; hash lanes: 1.15–1.19), but leaves the loopback cost (6–16%
+   in two rounds)
    ([BENCH.md](BENCH.md#a-flow-table-shared-by-all-readers-exploratory));
    building it properly is the next lane-placement step.
    ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
