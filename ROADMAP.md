@@ -302,9 +302,11 @@ rules apply to all of them.
    under this load every read returns one UDP super-frame with the read
    limit at one, so it never fired
    ([BENCH.md](BENCH.md#spreading-only-after-a-full-tap-read-exploratory-never-fired)).
-   A real test needs a signal that works with super-frame reads, such as
-   the reader's pending input or busy share, a counter showing how often
-   it fires, and no reordering for a flow that changes lanes.
+   A second try keyed on pending TAP inputs cannot fire either, because
+   no read starts while inputs are pending. A real test needs a signal
+   from outside the read path, such as how often reads find data at once
+   or the reader's busy share, a counter showing how often it fires, and
+   no reordering for a flow that changes lanes.
    One small-frame flow reaches 0.61–0.67 M frames/s, limited by one
    thread. 60-byte frames match 64-byte ones; 128-byte frames are lossless
    at 0.92 M frames/s paced, and unlimited R→L trails L→R by a quarter to a

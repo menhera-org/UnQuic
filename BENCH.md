@@ -744,10 +744,21 @@ The worker counters from the unlimited runs show why: each daemon made
 one UDP super-frame (`tap_gso_reads` equals the batch count). While
 super-frames are pending the read limit drops to one, so no batch ever
 filled and the patch never took the balanced path; the comparison was in
-effect an A/A run. A real test needs a saturation signal that works with
-super-frame reads, such as the reader's pending input or its share of busy
-cycles. Patch daemon SHA-256:
+effect an A/A run. Patch daemon SHA-256:
 `70ff19038031db542c7f702d3e80228f76b240905c71995d8f7e3d157bf6d942`.
+
+A second patch used the session's pending TAP inputs as the signal
+([patch](benches/spread-on-pending-input-exploratory.patch), same design,
+three repeats, [results](benches/tap-small-frames-spread-on-pending-input.json)):
+unlimited totals 6.56–6.80 M frames/s against HEAD's 6.65–6.88 M, 40M
+totals 5.46–5.61 M against 5.41–5.45 M. It cannot fire either:
+`tap_capacity` returns zero while inputs are pending, so `read_tap` stops
+before the check whenever the backlog is non-empty. By construction a
+reader is never behind at the moment it reads. A real test needs a
+saturation signal from outside the read path, such as how often a read
+finds data at once or the reader's share of busy cycles, with a counter
+showing how often it fires. Patch daemon SHA-256:
+`2ddd8c4ad993888a094bd797c820c315594443a230421b52ccbafc9069451401`.
 
 ## Sixteen workers per daemon (November 11, exploratory)
 

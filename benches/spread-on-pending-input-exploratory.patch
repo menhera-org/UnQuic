@@ -1,0 +1,46 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index 5d02f2d..ade79f9 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -808,6 +808,8 @@ pub(crate) struct Worker {
+     retry_due: Option<Duration>,
+     // Empty unless daemon.balance_flows is set.
+     flows: Box<[FlowSlot]>,
++    // Exploratory: the current TAP read found earlier TAP inputs still pending.
++    spread: bool,
+     #[cfg(feature = "profile")]
+     phases: [u64; crate::profile::PHASES],
+ }
+@@ -1166,6 +1168,7 @@ impl Worker {
+             } else {
+                 Box::default()
+             },
++            spread: false,
+             shared,
+         })
+     }
+@@ -2350,6 +2353,7 @@ impl Worker {
+                 .ok_or(io::ErrorKind::InvalidData)?;
+             let batch = reader.read(tap, &mut slices[..count]);
+             let frames = batch.results[..count].iter().filter(|r| r.is_ok()).count() as u64;
++            self.spread = !self.sessions[session].tap_inputs.is_empty();
+             let limit = &mut self.sessions[session].tap_read_limit;
+             // A full read limited by pool availability says nothing about TAP occupancy.
+             let maximum = if batch.segments.iter().any(Option::is_some) {
+@@ -2383,6 +2387,7 @@ impl Worker {
+                 buffer.segments = segments;
+                 self.read_tap_result(session, now, buffer, result)?;
+             }
++            self.spread = false;
+             if maximum == 4 && !self.sessions[session].tap_inputs.is_empty() {
+                 self.sessions[session].tap_read_limit = 1;
+             }
+@@ -2475,7 +2480,7 @@ impl Worker {
+                 let cursor = self.shared.flow_cursors.get(session);
+                 buffer.lane = if let Some(cursor) = cursor
+                     && !self.flows.is_empty()
+-                    && strict_lane(frame, self.id, workers, queues, lanes)
++                    && (self.spread || strict_lane(frame, self.id, workers, queues, lanes))
+                 {
+                     let hash = pack::flow_hash(frame);
+                     balanced_lane(
