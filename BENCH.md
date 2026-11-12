@@ -229,7 +229,12 @@ with alternating pairs ([results](benches/owner-reserve-side-effects.json)):
 
 All pass, and the margin landed. The measured binary computed the margin
 inline in `tap_capacity`; the landed code moves it into `owner_reserve`
-with the same value. Balanced lanes, below, rescue the same four-flow point
+with the same value. A check after landing, stated beforehand as within 10%
+unlimited and 5% CPU per frame paced, on the small-frame rows (untagged
+64-byte frames, sixteen flows, eight workers, two alternating pairs,
+[results](benches/small-frames-owner-reserve.json)): unlimited 6.90–7.03 M
+frames/s in total against 6.93–7.20, and 190–195% of a core per M frames/s
+at the paced point against 187–194%. Both within noise. Balanced lanes, below, rescue the same four-flow point
 by a different route.
 
 ### Balanced lanes on the decision workload, revisited
