@@ -106,7 +106,7 @@ Gbit/s at an offer-limited load instead.
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
 | At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98%. With sixteen workers per daemon and thirty-two flows: 7.11 / 7.03 Gbit/s, no thread above 75%, limited by receive-socket overflow under the container's 416 KiB buffer ([BENCH.md](#sixteen-workers-per-daemon-november-11-exploratory)). Over a 9000-byte outer path: 10.27 / 13.90 Gbit/s with QinQ and 10.78 / 17.82 with one tag at sixteen workers, 13.36 / 11.77 with QinQ at eight, at 34–45% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)) | At a 1500-byte outer path the per-bit cost must roughly halve; a 9000-byte path halves it but no thread then saturates, and reordering and overflows rise. One left worker does two jobs: it reads every L→R frame from the TAP (QinQ input all lands on one queue) and receives the R→L lanes it owns. L→R senders idle for its input; its socket overflows and R→L loses packets, so BBR cuts. More receive buffers move capacity from L→R to R→L (+11% total, L→R −14%); letting tun spread reads costs 23% more CPU per bit ([BENCH.md](#receive-buffers-for-a-busy-reader-november-11)). Next: keep receive work off the TAP reader, or split TAP reading inside the daemon. |
-| Goodput must plateau under excess traffic | Decision workload (four workers, 4.5 ms), `3178088`: sixteen flows deliver 1.62 / 1.64 Gbit/s at 2G offered and 2.03 / 1.58 at 5G; four flows 1.31 / 1.73 and 0.92 / 1.38 ([BENCH.md](#decision-workload-baseline-november-12-evening)). With the read margin four flows hold at 5G: 1.21–1.23 / 2.02–2.05 ([BENCH.md](#owners-refusing-each-other-a-read-margin-landed)). Workers run at 77–99% of a core | Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
+| Goodput must plateau under excess traffic | Decision workload (four workers, 4.5 ms), `3178088`: sixteen flows deliver 1.62 / 1.64 Gbit/s at 2G offered and 2.03 / 1.58 at 5G; four flows 1.31 / 1.73 and 0.92 / 1.38 ([BENCH.md](#decision-workload-baseline-november-12-evening)). With the read margin (`3b9e86f`) every 5G total matches or exceeds its 2G total: four flows 1.21 / 2.07 at 5G, sixteen 2.03 / 1.77 ([BENCH.md](#owners-refusing-each-other-a-read-margin-landed)). Workers run at 77–99% of a core | Lossy four-flow L→R still falls 10% from 2G to 5G, and overloaded p99 delay rose with the extra delivery. Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
 | TCP through the tunnel | Loopback, eight workers, eight iperf3 streams each way: 9.2–9.9 Gbit/s in total at about 1 core per Gbit/s, about 1% of segments retransmitted ([BENCH.md](#tap-queue-length-and-overload-delay)) | Losses come from receive-socket overflows under the container's 416 KiB buffers; the daemon cannot raise them without `CAP_NET_ADMIN`. |
 | Small-frame overload must remain efficient | Untagged 64-byte frames, sixteen flows, current build: 3.24–3.43 / 3.27–3.48 M frames/s unlimited with eight workers and 4.23–4.53 / 4.16–4.57 M with sixteen, against 5.87 / 5.74 M for the pre-recovery build; QinQ 128-byte frames 2.18–2.31 / 3.32–3.53 M; 1.85–1.95 cores per M frames/s against 1.28–1.33 ([BENCH.md](#small-frame-rows-at-the-current-build-november-12)) | About 45% more CPU per frame since recovery and BBR, spread across transmit bookkeeping with no single large target; four candidates cut 0–3% at overload, and the expiry heap landed at −4.2% CPU per frame offer-limited ([BENCH.md](#where-the-small-frame-cost-comes-from-november-12)). One to one and a half of eight workers per daemon idle because tun's queue hash leaves them no transmit work; balanced lanes do not change this. High ingress loss persists; mixed traffic and non-coalescible frames remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input and output offloads improve matched TCP sweeps; single-stream output coalescing reaches 2.01 / 2.26 Gbit/s, still below the deployment target. |
@@ -156,6 +156,28 @@ margin below fixes that. At
 0.1% outer loss and 0.5G nearly every missing frame lies in a stalled bin:
 frames still waiting for a repair when the host stalls expire. Stall bins
 number one to five per direction at every 0.5G point, lossy or not.
+
+The same matrix after the read margin below landed (`3b9e86f`, daemon
+SHA-256 prefix `0ae1641dec3e417a`; [results](benches/decision-baseline-3b9e86f.json)),
+medians:
+
+| Flows, outer loss, offered | Delivered L→R / R→L Gbit/s | Total, before → after | CPU per Gbit/s | p99 delay L→R / R→L |
+| --- | --- | --- | --- | --- |
+| 16, 0, 2G | 1.64 / 1.68 | 3.26 → 3.32 | 206% | 26.0 / 15.1 ms |
+| 16, 0, 5G | 2.03 / 1.77 | 3.61 → 3.80 | 183% | 41.4 / 22.8 ms |
+| 16, 0.1%, 2G | 1.65 / 1.71 | 3.35 → 3.36 | 193% | 22.3 / 14.7 ms |
+| 16, 0.1%, 5G | 1.84 / 1.76 | 3.31 → 3.60 | 181% | 34.1 / 22.5 ms |
+| 4, 0, 2G | 1.20 / 1.86 | 3.04 → 3.06 | 193% | 18.1 / 15.9 ms |
+| 4, 0, 5G | 1.21 / 2.07 | 2.30 → 3.28 | 162% | 24.9 / 21.5 ms |
+| 4, 0.1%, 2G | 1.43 / 1.58 | 2.95 → 3.01 | 178% | 18.9 / 26.5 ms |
+| 4, 0.1%, 5G | 1.28 / 1.76 | 2.38 → 3.04 | 167% | 20.2 / 26.7 ms |
+
+Every 5G total now matches or exceeds its 2G total, and CPU per delivered
+bit at 5G falls 6–19%. The 0.5G points are unchanged (all delivered,
+453–471% of a core per Gbit/s). One direction still declines: lossy
+four-flow L→R, 1.43 to 1.28 Gbit/s. Delay at the overloaded points rises
+on several rows (sixteen flows at 5G L→R: p99 28.8 → 41.4 ms) because more
+frames now get through the same queues instead of being refused.
 
 ### Why four flows lose L→R delivery past 2G
 
