@@ -333,9 +333,12 @@ rules apply to all of them.
    2–7%, but no candidate's median reached its 3–5% bar
    ([BENCH.md](BENCH.md#where-the-small-frame-cost-comes-from-november-12)).
    Whether a consistent 2–3% win should land under a lower bar is the
-   user's call. A larger lever is giving one worker several TAP queues, so
-   tun's hash leaves no worker idle; today `queue_count` also sets the
-   worker count.
+   user's call. Giving one worker several TAP queues would not help the
+   idle workers: under a random hash, a worker owning two of sixteen queues
+   is as likely to get no flow as one owning one of eight (about 12% each
+   with sixteen flows). Only flow-aware steering, such as a tun steering
+   program, would even them out, and with many flows the gap mostly closes
+   on its own.
    One small-frame flow reaches 0.61–0.67 M frames/s, limited by one
    thread. 60-byte frames match 64-byte ones; 128-byte frames are lossless
    at 0.92 M frames/s paced, and unlimited R→L trails L→R by a quarter to a
