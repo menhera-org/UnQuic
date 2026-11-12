@@ -1575,6 +1575,301 @@ fn bridge_vlan_qinq_macvlan_and_non_ip_frames_cross_unchanged() {
     right.stop();
 }
 
+/// Open vSwitch daemons private to one test namespace, killed on drop.
+struct Ovs {
+    vsctl: std::path::PathBuf,
+    db: String,
+    env: Vec<(&'static str, std::ffi::OsString)>,
+    dir: std::path::PathBuf,
+    children: Vec<std::process::Child>,
+}
+
+impl Ovs {
+    /// Starts ovsdb-server and ovs-vswitchd from `UNQUIC_OVS_ROOT` (default `/`),
+    /// or returns None when that tree has no Open vSwitch userspace.
+    fn start() -> Option<Self> {
+        use std::{path::PathBuf, process::Command};
+        let root = PathBuf::from(std::env::var_os("UNQUIC_OVS_ROOT").unwrap_or("/".into()));
+        let tool = root.join("usr/bin/ovsdb-tool");
+        let server = root.join("usr/sbin/ovsdb-server");
+        let vswitchd = [
+            "usr/lib/openvswitch-switch/ovs-vswitchd",
+            "usr/sbin/ovs-vswitchd",
+        ]
+        .iter()
+        .map(|path| root.join(path))
+        .find(|path| path.exists())?;
+        let vsctl = root.join("usr/bin/ovs-vsctl");
+        let schema = root.join("usr/share/openvswitch/vswitch.ovsschema");
+        if ![&tool, &server, &vsctl, &schema]
+            .iter()
+            .all(|path| path.exists())
+        {
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!("unquic-ovs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let mut env = vec![
+            ("OVS_RUNDIR", dir.clone().into_os_string()),
+            ("OVS_LOGDIR", dir.clone().into_os_string()),
+            ("OVS_DBDIR", dir.clone().into_os_string()),
+            ("OVS_SYSCONFDIR", dir.clone().into_os_string()),
+            (
+                "OVS_PKGDATADIR",
+                root.join("usr/share/openvswitch").into_os_string(),
+            ),
+        ];
+        if root != std::path::Path::new("/") {
+            env.push((
+                "LD_LIBRARY_PATH",
+                root.join("usr/lib/x86_64-linux-gnu").into_os_string(),
+            ));
+        }
+        let run = |program: &std::path::Path, args: &[&std::ffi::OsStr]| {
+            let output = Command::new(program)
+                .args(args)
+                .envs(env.iter().cloned())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} failed: {}",
+                program.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let database = dir.join("conf.db");
+        run(
+            &tool,
+            &["create".as_ref(), database.as_os_str(), schema.as_os_str()],
+        );
+        let socket = dir.join("db.sock");
+        let db = format!("unix:{}", socket.display());
+        let mut ovs = Self {
+            vsctl,
+            db: db.clone(),
+            env: env.clone(),
+            dir: dir.clone(),
+            children: Vec::new(),
+        };
+        let spawn = |program: &std::path::Path, args: Vec<std::ffi::OsString>| {
+            Command::new(program)
+                .args(args)
+                .envs(env.iter().cloned())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        ovs.children.push(spawn(
+            &server,
+            vec![
+                database.into_os_string(),
+                format!("--remote=punix:{}", socket.display()).into(),
+                format!("--unixctl={}", dir.join("ovsdb.ctl").display()).into(),
+                format!("--log-file={}", dir.join("ovsdb.log").display()).into(),
+            ],
+        ));
+        // The socket file can exist before the server accepts connections.
+        until(Duration::from_secs(5), || {
+            ovs.run_vsctl(&["--no-wait", "init"]).status.success()
+        });
+        ovs.children.push(spawn(
+            &vswitchd,
+            vec![
+                db.into(),
+                format!("--unixctl={}", dir.join("vswitchd.ctl").display()).into(),
+                format!("--log-file={}", dir.join("vswitchd.log").display()).into(),
+            ],
+        ));
+        Some(ovs)
+    }
+
+    fn run_vsctl(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(&self.vsctl)
+            .arg(format!("--db={}", self.db))
+            .arg("--timeout=10")
+            .args(args)
+            .envs(self.env.iter().cloned())
+            .output()
+            .unwrap()
+    }
+
+    fn vsctl(&self, args: &[&str]) {
+        let output = self.run_vsctl(args);
+        assert!(
+            output.status.success(),
+            "ovs-vsctl {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+impl Drop for Ovs {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            let show = |program: &std::path::Path, args: &[&str]| {
+                let output = std::process::Command::new(program)
+                    .args(args)
+                    .envs(self.env.iter().cloned())
+                    .output();
+                if let Ok(output) = output {
+                    eprintln!(
+                        "--- {args:?}\n{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            };
+            let db = format!("--db={}", self.db);
+            show(&self.vsctl, &[&db, "show"]);
+            let control = format!("{}", self.dir.join("vswitchd.ctl").display());
+            show(
+                &self.vsctl.with_file_name("ovs-appctl"),
+                &["-t", &control, "dpctl/dump-flows"],
+            );
+            show(std::path::Path::new("ip"), &["-s", "link"]);
+            for log in ["ovsdb.log", "vswitchd.log"] {
+                let text = std::fs::read_to_string(self.dir.join(log)).unwrap_or_default();
+                eprintln!("--- {log}\n{text}");
+            }
+        }
+        for child in self.children.iter_mut().rev() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[test]
+#[ignore = "requires disposable container with tun, iproute2, Open vSwitch userspace (UNQUIC_OVS_ROOT) and the openvswitch module"]
+fn ovs_system_port_forwards_frames_unchanged_both_ways() {
+    // SAFETY: only this test thread, its runtimes and its OVS daemons use the namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let Some(ovs) = Ovs::start() else {
+        eprintln!("skipped: no Open vSwitch userspace under UNQUIC_OVS_ROOT");
+        return;
+    };
+    let net = UdpSocket::bind("[::]:0").unwrap();
+    up(&net, c"lo");
+    let single = |name, listen, remote| {
+        let mut config = config(name, listen, remote);
+        config.sessions.truncate(1);
+        config.peers.truncate(1);
+        config.daemon.memory_limit = Daemon::default().memory_limit;
+        config.sessions[0].queue_count = 1;
+        config.peers[0].tx_lanes = 1;
+        config
+    };
+    let mut left = Running::start(single("uqo-l", 41420, 41421));
+    let mut right = Running::start(single("uqo-r", 41421, 41420));
+    until(Duration::from_secs(5), || {
+        left.control.ready() && right.control.ready()
+    });
+    // Left: the TAP is an OVS system port next to a veth whose peer injects and reads frames.
+    ip(&[
+        "link", "add", "uqo-v0", "mtu", "9000", "type", "veth", "peer", "name", "uqo-v1", "mtu",
+        "9000",
+    ]);
+    ovs.vsctl(&["add-br", "uqo-br"]);
+    ovs.vsctl(&["add-port", "uqo-br", "uqo-v0"]);
+    ovs.vsctl(&["add-port", "uqo-br", "uqo-l"]);
+    for device in ["uqo-v0", "uqo-v1", "uqo-l", "uqo-r"] {
+        ip(&["link", "set", device, "up"]);
+    }
+    until(Duration::from_secs(5), || {
+        left.control.session(0).unwrap().carrier && right.control.session(0).unwrap().carrier
+    });
+    const ALL: u16 = libc::ETH_P_ALL as u16;
+    let frame = |destination: [u8; 6], source: u8, kind: &[u8], length: usize| {
+        let mut frame = vec![0; length];
+        frame[..6].copy_from_slice(&destination);
+        frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, source]);
+        frame[12..12 + kind.len()].copy_from_slice(kind);
+        for (index, byte) in frame.iter_mut().enumerate().skip(12 + kind.len()) {
+            *byte = (index as u8) ^ source;
+        }
+        frame
+    };
+    let ethertype = 0x88b5_u16.to_be_bytes();
+    let cases = |base: u8, unknown: [u8; 6]| {
+        let mut cases = Vec::new();
+        for source in [base, base + 1, base + 2] {
+            cases.push(frame(unknown, source, &ethertype, 100));
+        }
+        cases.push(frame([0xff; 6], base + 3, &ethertype, 60));
+        cases.push(frame([1, 0, 0x5e, 0, 0, 0xfb], base + 4, &ethertype, 200));
+        // 802.3 length 38 with an LLC header, padded to the minimum frame.
+        cases.push(frame(unknown, base + 5, &[0, 38, 0x42, 0x42, 0x03], 60));
+        cases.push(frame(unknown, base + 6, &ethertype, 9014));
+        cases
+    };
+    // Receive moves one VLAN tag into packet metadata, so stacked frames are
+    // checked where an 802.1ad/802.1Q upper stack delivers them untagged.
+    for device in ["uqo-r", "uqo-v1"] {
+        let outer = format!("{device}.200");
+        let inner = format!("{device}.200.300");
+        ip(&[
+            "link", "add", "link", device, "name", &outer, "type", "vlan", "proto", "802.1ad",
+            "id", "200",
+        ]);
+        ip(&[
+            "link", "add", "link", &outer, "name", &inner, "type", "vlan", "id", "300",
+        ]);
+        ip(&["link", "set", &outer, "up"]);
+        ip(&["link", "set", &inner, "up"]);
+    }
+    let stacked = |unknown: [u8; 6], source: u8| {
+        let mut stacked = frame(
+            unknown,
+            source,
+            &[0x88, 0xa8, 0, 200, 0x81, 0, 1, 0x2c],
+            1522,
+        );
+        stacked[20..22].copy_from_slice(&ethertype);
+        let mut untagged = stacked.clone();
+        untagged.drain(12..20);
+        (stacked, untagged)
+    };
+    let mut bytes = [0; 9100];
+    let switch = raw_socket(c"uqo-v1", ALL);
+    let far = raw_socket(c"uqo-r", ALL);
+    // First through the switch into the transport and out of the far TAP, then back.
+    for (base, unknown, from, to, upper) in [
+        (0x21, [2, 0, 0, 0, 0xbb, 1], &switch, &far, c"uqo-r.200.300"),
+        (
+            0x31,
+            [2, 0, 0, 0, 0xbb, 2],
+            &far,
+            &switch,
+            c"uqo-v1.200.300",
+        ),
+    ] {
+        let (tagged, untagged) = stacked(unknown, base + 7);
+        let upper = raw_socket(upper, ALL);
+        let checks = cases(base, unknown)
+            .into_iter()
+            .map(|sent| (sent.clone(), to, sent))
+            .chain([(tagged, &upper, untagged)]);
+        for (sent, output, expected) in checks {
+            until(Duration::from_secs(5), || {
+                raw_send(from, &sent);
+                while let Some(n) = raw_read(output, &mut bytes) {
+                    if bytes[..n] == expected[..] {
+                        return true;
+                    }
+                }
+                false
+            });
+        }
+    }
+    left.stop();
+    right.stop();
+    drop(ovs);
+}
+
 #[test]
 #[ignore = "requires disposable container with tun, iproute2, the vrf module and network capabilities"]
 fn endpoints_bound_to_a_vrf_forward_through_its_table() {

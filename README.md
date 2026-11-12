@@ -1158,6 +1158,14 @@ from three source MACs, broadcast, multicast and an 802.3 LLC frame cross
 unchanged; a 9018-byte single-tagged frame and a 1522-byte QinQ frame arrive at
 their uppers without the tags, which covers the TAP-read direction for both.
 
+An Open vSwitch test makes one TAP a system port of an OVS bridge beside a
+veth. It starts its own ovsdb-server and ovs-vswitchd inside the test's network
+namespace, using the userspace tree named by `UNQUIC_OVS_ROOT` (default `/`),
+and skips when that tree has no OVS. Unicast from three source MACs,
+broadcast, multicast, LLC and 9014-byte frames cross unchanged in both
+directions, and a 1522-byte 802.1ad/802.1Q frame arrives intact at a stacked
+upper on the far side. The test needs the openvswitch kernel module.
+
 An overload test floods one session's TAP with full-size frames for two seconds
 while a second session on the same peer carries numbered frames. Every frame
 the quiet session delivers matches what was sent and arrives once, the
@@ -1166,7 +1174,7 @@ quiet session delivers every frame again. Sixteen sessions on one peer start
 under a sufficient `memory_limit` with every TAP present; under 64 MiB startup
 fails with OutOfMemory before creating any.
 
-OVS, real RA/DHCPv6 resolver networks, physical-NIC offload qualification,
+Real RA/DHCPv6 resolver networks, physical-NIC offload qualification,
 Linux 5.0 qualification and performance acceptance remain open.
 
 ## License

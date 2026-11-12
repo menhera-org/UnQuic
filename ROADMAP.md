@@ -1182,9 +1182,14 @@ full expired batches sharing the cleanup budget.
 - Container tests for Linux bridge, OVS system port where OVS is available,
   VLAN and QinQ uppers, macvlan, multiple MACs, multicast, broadcast and LLC
   frames, as section 14.1 V04 lists. Each test creates and deletes its own
-  devices. Done except OVS, which the test images lack: one runtime test
-  covers a bridge port, 802.1Q and QinQ uppers at full size, a macvlan, three
-  source MACs, broadcast, multicast and LLC on Linux 6.8 and 7.0.
+  devices. Done: one runtime test covers a bridge port, 802.1Q and QinQ
+  uppers at full size, a macvlan, three source MACs, broadcast, multicast and
+  LLC on Linux 6.8 and 7.0. A second makes a TAP an OVS system port beside a
+  veth, with its own ovsdb-server and ovs-vswitchd in the test namespace
+  (Open vSwitch 3.7.1 unpacked from Ubuntu packages into a private tree, not
+  installed), and checks the same frame kinds, 9014-byte frames and a
+  full-size 802.1ad/802.1Q stack in both directions on Linux 6.8 and 7.0. It
+  skips when `UNQUIC_OVS_ROOT` has no OVS userspace.
 - VRF binding test with a VRF device created in the namespace. Done: two
   runtimes bound to a VRF that holds both outer addresses, which the main
   table cannot reach, forward frames both ways on Linux 6.8 and 7.0.
