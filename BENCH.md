@@ -894,12 +894,11 @@ Gbit/s at 96–97% per Gbit/s, worse than alignment alone, and is rejected.
 On the decision workload at 5G (three alternating pairs, same binary) the
 aligned cookie loses instead: 1.66–1.78 / 1.48–1.54 Gbit/s against
 2.00–2.06 / 1.55–1.62 with the default cookie, at about the same CPU per
-bit. There one worker reads every QinQ frame, and alignment probably also
-gives that worker its own lanes' receive work, which the default cookie's
-offset moves elsewhere. Placement helps one workload and hurts the other, so
-the receive-owner formula stays. A version that aligns only where the
-reader is not the bottleneck would need a signal neither workload offers
-yet.
+bit. Its bridged QinQ reads spread over all four workers but unevenly (the
+busiest reads 40–50% of frames in both arms), and why alignment costs it is
+not known; where receive work lands relative to the busiest reader is one
+candidate. Placement helps one workload and hurts the other, so the
+receive-owner formula stays.
 
 ## Checked indexing in the encoders and batch planner (November 12)
 
