@@ -50,6 +50,10 @@ pub struct Daemon {
     /// frames waits up to this many microseconds (at most 1000) for more, so
     /// light traffic packs frame tails together at the cost of that latency.
     pub tx_hold_us: u32,
+    /// Off by default: BBR's ProbeRTT window covers half the bandwidth over
+    /// min_rtt plus the receiver's 1 ms ACK delay, not over min_rtt alone,
+    /// so a steady offer below half the bandwidth is not cut during the probe.
+    pub probe_rtt_ack_delay: bool,
 }
 impl Default for Daemon {
     fn default() -> Self {
@@ -59,6 +63,7 @@ impl Default for Daemon {
             loss_threshold_permille: 20,
             balance_flows: false,
             tx_hold_us: 0,
+            probe_rtt_ack_delay: false,
         }
     }
 }

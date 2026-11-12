@@ -667,6 +667,36 @@ separate loss sources:
 The hold's measured loss excess sits on top of these two noise sources;
 neither is the hold's doing.
 
+### ProbeRTT's window over min_rtt plus the ACK delay (landed off)
+
+`daemon.probe_rtt_ack_delay`, off by default, sizes ProbeRTT's window as
+half of max_bw × (min_rtt + 1 ms), the receiver's maximum ACK delay, instead
+of half of max_bw × min_rtt. At half the bandwidth the bottleneck queue
+still drains. Stated before running: decision workload at 0.5G, hold off,
+trace builds, four alternating pairs; frames lost inside ProbeRTT episodes
+(plus 50 ms) with the switch on at most 10% of the off arm's, with loss
+outside and delivery within the off arm's range
+([per run](benches/decision-probe-rtt-ack-delay.txt)).
+
+| 0.5G, eight direction-runs per arm | Off | On |
+| --- | --- | --- |
+| ProbeRTT episodes | 7 | 6 |
+| ProbeRTT windows | 342–558 KB | 407–572 KB |
+| Episodes with over 100 controller records at the window | 4 | 0 |
+| Episodes losing frames | 2 | 1 |
+| Admission drops inside episodes | 356 | 72 |
+
+It misses its bar: 72 drops is 20% of 356. The mechanism works: off, four
+of seven episodes ran at the window (113–233 records at it, windows of
+342–361 KB) and two of those lost frames; on, no episode spent more than 36
+records at its window. The one on-arm loss came 120 ms into an episode whose
+451 KB window stood above its 353–424 KB inflight, together with 151 sent
+frames expiring at once, which matches a host stall rather than the window.
+Loss outside ProbeRTT varies more between runs than between arms (on r1 and
+r2 dropped 1,680–2,308 frames per direction outside, in bursts such as 1,341
+drops in 250 ms), so this host cannot show a loss difference of this size
+in four pairs. The switch landed off by default.
+
 ## Frames seconds old under overload (November 12)
 
 The tail in the latency measurement above is not a start-up event. With

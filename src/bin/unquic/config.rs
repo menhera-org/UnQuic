@@ -271,11 +271,16 @@ mod tests {
             assert_eq!(loaded.config.daemon.loss_threshold_permille, 20);
             assert!(!loaded.config.daemon.balance_flows);
             assert_eq!(loaded.config.daemon.tx_hold_us, 0);
+            assert!(!loaded.config.daemon.probe_rtt_ack_delay);
             loaded.config.validate().unwrap();
         }
         let text = format!("[daemon]\ntx_hold_us = 1000\n{}", sample());
         let loaded = Loaded::parse(&text).unwrap();
         assert_eq!(loaded.config.daemon.tx_hold_us, 1000);
+        loaded.config.validate().unwrap();
+        let text = format!("[daemon]\nprobe_rtt_ack_delay = true\n{}", sample());
+        let loaded = Loaded::parse(&text).unwrap();
+        assert!(loaded.config.daemon.probe_rtt_ack_delay);
         loaded.config.validate().unwrap();
         let text = format!("[daemon]\ntolerate_random_loss = false\n{}", sample());
         let loaded = Loaded::parse(&text).unwrap();

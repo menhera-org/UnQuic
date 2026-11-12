@@ -103,6 +103,17 @@ the same total of about 9.2 Gbit/s. About 1% of TCP segments are still
 retransmitted under unlimited load, matching the frames the daemons expire
 or drop ([BENCH.md](BENCH.md#tap-queue-length-and-overload-delay)).
 
+Light-load loss on the decision workload has two sources outside the hold.
+The test host stalls system-wide for 10–50 ms every 5.12 s, and at the
+20 ms frame-lifetime floor each stall expires frames; that is most of the
+control's loss. BBR's ProbeRTT window, half of max_bw × min_rtt, can also
+fall below what a 0.5 Gbit/s offer keeps in flight, because those bytes stay
+out for min_rtt plus up to 1 ms of ACK delay.
+`daemon.probe_rtt_ack_delay`, off by default, adds that delay to the
+ProbeRTT window. It kept every ProbeRTT episode off its window, but missed
+its loss bar because a host stall fell inside one episode
+([BENCH.md](BENCH.md#probertts-window-over-min_rtt-plus-the-ack-delay-landed-off)).
+
 Decisions only the user can make, each blocking a remaining goal:
 
 1. FEC for the 5% loss row only helps if packets it recovers are

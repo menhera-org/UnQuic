@@ -626,6 +626,14 @@ in one direction (a median of 0.15% against 0.07% in the latest run), so it
 stays off (BENCH.md). It adds about 33 µs to the median one-way delay and
 0.2 ms at p99.
 
+BBR's ProbeRTT halves the window to half of max_bw × min_rtt for 200 ms. A
+steady offer's bytes stay in flight for min_rtt plus the receiver's ACK delay
+(up to 1 ms), so on a 4.5 ms path ProbeRTT can cut an offer well below half
+the estimated bandwidth, and frames expire. `daemon.probe_rtt_ack_delay`,
+off by default, sizes that window over min_rtt plus 1 ms instead. On the
+decision workload at 0.5 Gbit/s it kept every ProbeRTT episode off its
+window, but host stalls hid any loss difference (BENCH.md).
+
 Flow hashing looks through one unfragmented IPv4, IPv6 or Ethernet
 encapsulation, including an IPv6 segment routing header before the inner
 packet. It retains the outer key and adds the inner addresses, protocol and

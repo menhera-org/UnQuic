@@ -648,6 +648,7 @@ fn crossed_group_acks_finish_before_loss_checks_use_the_only_report() {
         Arc::clone(&budgets),
         false,
         20,
+        false,
     )
     .unwrap();
     for session in 0..2 {

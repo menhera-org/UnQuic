@@ -1,0 +1,36 @@
+daemon.probe_rtt_ack_delay off vs on, November 12. Decision workload (routed 4.5 ms, bridged QinQ 1522-byte frames, four workers, sixteen flows), 0.5 Gbit/s per direction, tx_hold_us 0, trace build of the candidate tree, four alternating pairs (off/on, on/off, ...), 20 s points.
+Losses by trace record inside ProbeRTT episodes (plus 50 ms after) and outside: admission drops (records), expired never-sent frames, expired sent frames.
+off r1 left probe_rtt_ms=200 episodes=1 in: drops=0 expired_unsent=0 expired_sent=0 | out: drops=259 expired_unsent=42 expired_sent=1093
+off r1 right probe_rtt_ms=201 episodes=1 in: drops=155 expired_unsent=0 expired_sent=17 | out: drops=384 expired_unsent=211 expired_sent=608
+on r1 left probe_rtt_ms=200 episodes=1 in: drops=72 expired_unsent=0 expired_sent=151 | out: drops=1680 expired_unsent=475 expired_sent=2214
+on r1 right probe_rtt_ms=200 episodes=1 in: drops=0 expired_unsent=0 expired_sent=0 | out: drops=2159 expired_unsent=372 expired_sent=2782
+off r2 left probe_rtt_ms=0 episodes=0 in: drops=0 expired_unsent=0 expired_sent=0 | out: drops=54 expired_unsent=95 expired_sent=883
+off r2 right probe_rtt_ms=200 episodes=1 in: drops=0 expired_unsent=0 expired_sent=0 | out: drops=359 expired_unsent=435 expired_sent=1014
+on r2 left probe_rtt_ms=0 episodes=0 in: drops=0 expired_unsent=0 expired_sent=0 | out: drops=0 expired_unsent=50 expired_sent=687
+on r2 right probe_rtt_ms=200 episodes=1 in: drops=0 expired_unsent=0 expired_sent=0 | out: drops=2308 expired_unsent=889 expired_sent=1205
+off r3 left probe_rtt_ms=200 episodes=1 in: drops=0 expired_unsent=0 expired_sent=0 | out: drops=333 expired_unsent=337 expired_sent=905
+off r3 right probe_rtt_ms=200 episodes=1 in: drops=0 expired_unsent=0 expired_sent=0 | out: drops=1482 expired_unsent=406 expired_sent=778
+on r3 left probe_rtt_ms=200 episodes=1 in: drops=0 expired_unsent=0 expired_sent=0 | out: drops=106 expired_unsent=127 expired_sent=583
+on r3 right probe_rtt_ms=0 episodes=0 in: drops=0 expired_unsent=0 expired_sent=0 | out: drops=185 expired_unsent=27 expired_sent=540
+off r4 left probe_rtt_ms=201 episodes=1 in: drops=201 expired_unsent=0 expired_sent=22 | out: drops=239 expired_unsent=160 expired_sent=1177
+off r4 right probe_rtt_ms=200 episodes=1 in: drops=0 expired_unsent=0 expired_sent=0 | out: drops=512 expired_unsent=213 expired_sent=897
+on r4 left probe_rtt_ms=0 episodes=1 in: drops=0 expired_unsent=0 expired_sent=0 | out: drops=66 expired_unsent=18 expired_sent=609
+on r4 right probe_rtt_ms=200 episodes=1 in: drops=0 expired_unsent=0 expired_sent=0 | out: drops=122 expired_unsent=98 expired_sent=953
+
+Window and inflight during ProbeRTT (controller records in the episode):
+off r1 left window=505KB max_bw=1.78G records_at_window=0 of 549
+off r1 right window=354KB max_bw=1.25G records_at_window=210 of 535
+on r1 left window=451KB max_bw=1.31G records_at_window=36 of 463
+on r1 right window=572KB max_bw=1.65G records_at_window=5 of 534
+off r2 left no ProbeRTT
+off r2 right window=357KB max_bw=1.26G records_at_window=187 of 510
+on r2 left no ProbeRTT
+on r2 right window=439KB max_bw=1.27G records_at_window=0 of 652
+off r3 left window=558KB max_bw=1.97G records_at_window=0 of 606
+off r3 right window=375KB max_bw=1.33G records_at_window=12 of 632
+on r3 left window=430KB max_bw=1.24G records_at_window=0 of 643
+on r3 right no ProbeRTT
+off r4 left window=342KB max_bw=1.21G records_at_window=233 of 449
+off r4 right window=361KB max_bw=1.27G records_at_window=113 of 574
+on r4 left window=470KB max_bw=1.36G records_at_window=0 of 4
+on r4 right window=407KB max_bw=1.18G records_at_window=1 of 683

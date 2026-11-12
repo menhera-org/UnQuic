@@ -204,6 +204,26 @@ fn probe_rtt_requires_expiry_low_inflight_a_round_and_strict_duration() {
 }
 
 #[test]
+fn probe_rtt_window_can_cover_the_ack_delay() {
+    let mut c = cruise();
+    c.probe_rtt_ack_delay(true);
+    ack(&mut c, ms(10000), 15000);
+    assert!(ack(&mut c, ms(10001), 15000));
+    assert_eq!(c.state(), State::ProbeRtt);
+    // Half of 1.5 MB/s over 10 ms plus the 1 ms ACK delay, not 7500.
+    assert_eq!(c.cwnd, 8250);
+    assert_eq!(c.bdp, 15000, "other windows keep min_rtt's BDP");
+    c.bw = 1_250_000_000 / 8;
+    c.min_rtt = Some(Duration::from_micros(30));
+    c.probe_rtt_cwnd = INFINITY;
+    let expected = bytes_in(c.bw, Duration::from_micros(1030), true) / 2;
+    assert_eq!(c.probe_rtt_window(), expected);
+    c.probe_rtt_ack_delay(false);
+    let floored = bytes_in(c.bw, WINDOW_RTT_FLOOR, true) / 2;
+    assert_eq!(c.probe_rtt_window(), floored);
+}
+
+#[test]
 fn idle_restart_skips_rtt_probe_and_can_finish_an_existing_probe() {
     let mut c = cruise();
     c.on_transmit(ms(11000), 0, true).unwrap();

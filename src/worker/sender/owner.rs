@@ -113,6 +113,7 @@ impl Owner {
         budgets: Arc<[Budget]>,
         tolerate_random_loss: bool,
         loss_threshold_permille: u16,
+        probe_rtt_ack_delay: bool,
     ) -> io::Result<Self> {
         let groups = budgets.len();
         if !(1..=64).contains(&workers) {
@@ -125,6 +126,7 @@ impl Owner {
                 Controller::new(1280, None, now, group as u64 + 1).map_err(io::Error::other)?;
             controller.tolerate_random_loss(tolerate_random_loss);
             controller.set_loss_threshold(loss_threshold_permille);
+            controller.probe_rtt_ack_delay(probe_rtt_ack_delay);
             states.push(Group {
                 controller,
                 sampler: Sampler::default(),

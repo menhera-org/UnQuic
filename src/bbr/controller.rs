@@ -131,6 +131,8 @@ pub struct Controller {
     loss_round_rtt: Duration,
     // Loss-rate threshold in permille while random loss is tolerated.
     loss_threshold: u16,
+    // ProbeRTT's BDP spans min_rtt plus the maximum ACK delay.
+    probe_rtt_ack_delay: bool,
 
     extra_filter: [u64; 10],
     extra_index: usize,
@@ -221,6 +223,7 @@ impl Controller {
             tolerate_random_loss: false,
             loss_round_rtt: Duration::ZERO,
             loss_threshold: LOSS_THRESHOLD,
+            probe_rtt_ack_delay: false,
             extra_filter: [0; 10],
             extra_index: 0,
             extra_acked: 0,
@@ -272,6 +275,14 @@ impl Controller {
     /// 20..=200 are clamped. The queue check still cuts regardless of rate.
     pub fn set_loss_threshold(&mut self, permille: u16) {
         self.loss_threshold = permille.clamp(LOSS_THRESHOLD, 200);
+    }
+
+    /// Deviation from draft 07, off by default: ProbeRTT's window covers half
+    /// of max_bw over min_rtt plus the receiver's maximum ACK delay, the time
+    /// a steady offer's bytes actually stay in flight, instead of over min_rtt
+    /// alone. Sending at half the bandwidth still drains the bottleneck queue.
+    pub fn probe_rtt_ack_delay(&mut self, on: bool) {
+        self.probe_rtt_ack_delay = on;
     }
 
     fn loss_threshold(&self) -> u16 {
@@ -786,7 +797,7 @@ impl Controller {
     fn update_min_rtt(&mut self, rtt: Option<Duration>) -> bool {
         let expired = self.now.saturating_sub(self.min_rtt_stamp) > RTT_WINDOW;
         if expired {
-            self.probe_rtt_cwnd = self.bdp_multiple(50);
+            self.probe_rtt_cwnd = self.probe_rtt_bdp();
         }
         if let Some(rtt) = rtt
             && (self.min_rtt.is_none_or(|old| rtt < old) || expired)
@@ -909,9 +920,22 @@ impl Controller {
     }
 
     fn probe_rtt_window(&mut self) -> u64 {
-        self.bdp_multiple(50)
+        self.probe_rtt_bdp()
             .min(self.probe_rtt_cwnd)
             .max(self.min_cwnd())
+    }
+
+    /// Half a BDP, over min_rtt plus the ACK delay when probe_rtt_ack_delay is on.
+    fn probe_rtt_bdp(&mut self) -> u64 {
+        let half = self.bdp_multiple(50);
+        match self.min_rtt {
+            Some(rtt) if self.probe_rtt_ack_delay => scale(
+                bytes_in(self.bw, rtt.saturating_add(crate::ack::DELAY), true),
+                50,
+                100,
+            ),
+            _ => half,
+        }
     }
 
     fn set_cwnd(&mut self, newly_acked: u64) {
