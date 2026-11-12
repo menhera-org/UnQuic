@@ -282,7 +282,11 @@ that hold takes 1–1.4%. Doubling the history to 131,072 numbers
 [results](benches/decision-four-flows-lossy-history-2x.json); stated
 beforehand as needing 5% more 5G L→R) changes nothing: 1.27 and 1.27 Gbit/s
 against 1.24 and 1.28, two alternating pairs. Rejected; the hold is not
-what limits delivery there.
+what limits delivery there. Nor is BBR's loss threshold: with
+`loss_threshold_permille = 100` (stated beforehand as needing 5% more 5G
+L→R; [results](benches/decision-four-flows-lossy-threshold-100.json)) L→R
+stays at 1.24–1.25 Gbit/s (default: 1.26–1.28) while R→L rises to 1.85–1.95
+(1.65–1.67). What holds lossy L→R at about 1.25 Gbit/s remains open.
 
 The overloaded delay the margin raised is mostly the TAP ring again. On the
 decision workload at 5G, sixteen flows, `3b9e86f`, two alternating pairs
