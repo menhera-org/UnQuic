@@ -370,6 +370,13 @@ median paired change is +8.9%. Both kernel suites pass, including a check
 that a sweep starting near the end wraps to an occupied slot. The change
 lands.
 
+A follow-up uses the same mask in the two other per-turn sweeps, the TAP
+flush and the next-deadline scan, which still visit all 64 slots per
+session. Same bar, stated before measuring: six alternating light-load pairs
+with CPU per delivered Gbit/s lower in at least five and a median of −2% or
+better, four alternating loopback pairs with the 21G total's median no worse
+than −2%, and both kernel suites.
+
 ## A configurable loss threshold for random loss (November 12)
 
 At 5% random loss draft 07 delivers under 11% of a 0.5G offer: any loss
