@@ -31,6 +31,9 @@ queues, and the worst decision-workload reordering falls from 1.03 million
 frames per direction to 45,000 with delivery level or higher. It also ends
 the lift balanced lanes gave one lossy flow, which came only from that flow
 changing lanes; one flow is back near 0.9 Gbit/s on one transmit worker.
+That worker holds one flow near 1 Gbit/s even without loss, and its
+userspace share is only about a quarter, so the single-flow 5 Gbit/s gate
+needs a design decision (decision 7) rather than more small changes.
 
 ## November 12 checkpoint
 
@@ -221,6 +224,17 @@ Decisions only the user can make, each blocking a remaining goal:
    for a session with as many lanes (reserving 260 MB); sixteen need about
    420 MiB and use about 330 MB at overload
    ([BENCH.md](BENCH.md#memory-reserved-against-memory-used-november-12)).
+7. How should one flow reach 5 Gbit/s on a 1500-byte path? One flow runs
+   on one transmit worker so its frames arrive in order, and that worker
+   delivers about 1 Gbit/s on this host with or without loss: a third of
+   it is the kernel sending through the emulated path, and removing all
+   userspace bookkeeping would reach perhaps 1.4
+   ([BENCH.md](BENCH.md#what-holds-one-flow-near-1-gbits-november-13)).
+   The options are to stripe a flow across transmit workers and add a
+   receive-side reorder stage so inner TCP still sees order (a design
+   change the design names as a later experiment), to rely on a larger
+   outer MTU where the path allows, or to judge the gate on hardware that
+   segments datagrams itself.
 
 ## November 11 checkpoint
 
@@ -527,7 +541,10 @@ rules apply to all of them.
    reordering from 1.03 million frames per direction to 45,000 with
    delivery level or higher, and stays within 2% on the loopback check.
    Decision 5 (`balance_flows` and `control_lane` together) now waits on the
-   user. Next: the sender's per-frame cost. A peer with one lane keeps ACKs and
+   user. One flow's ceiling is one transmit worker, about a quarter of it
+   userspace bookkeeping, so the single-flow gate waits on decision 7;
+   per-frame cost still matters for small frames and CPU per bit. A peer
+   with one lane keeps ACKs and
    data on lane 0 and can still defer ACKs under loss; a separate number
    space for control (a 65th lane ID with its own receive table) would cover
    it if that case matters.

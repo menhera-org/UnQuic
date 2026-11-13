@@ -113,7 +113,7 @@ Gbit/s at an offer-limited load instead.
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
 | Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Loopback throughput at an 8952-byte limit is measured: the 21G total rises 70–126%; on the routed decision workload at 5G delivery rises 50–56% at 36% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)). Real-path throughput at larger MTUs remains open. DATA-quoted PTB validation now has targeted kernel coverage. |
-| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | One flow at 7.5 ms with 0.5–1% random loss: about 1.0 Gbit/s per direction locally with hash lanes and the default queue-checked loss tolerance (0.91–1.05 at 1G and 5G offered on `424f4f8`, busiest thread 76–98%, [results](benches/lossy-one-flow-424f4f8.json)), 1.5–2.0 with the old per-reader balanced-lane tables only because the flow kept changing lanes, which the shared flow table ends (0.7–0.9 since November 13, [BENCH.md](#a-control-lane-for-acks-november-13)); 1.6 Gbit/s on the remote host, where a limit downstream of the sender caps it. At 5% loss draft 07 delivers under 10 Mbit/s of a 5G offer; `loss_threshold_permille = 100` raises that to about 0.45 Gbit/s ([BENCH.md](#a-configurable-loss-threshold-for-random-loss-november-12)) | Per-frame cost on one transmit worker, the 5% rows (still under a tenth of the offer; FEC or a different response), and a real-path measurement. |
+| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | One flow at 7.5 ms with 0.5–1% random loss: about 1.0 Gbit/s per direction locally with hash lanes and the default queue-checked loss tolerance (0.91–1.05 at 1G and 5G offered on `424f4f8`, busiest thread 76–98%, [results](benches/lossy-one-flow-424f4f8.json)), 1.5–2.0 with the old per-reader balanced-lane tables only because the flow kept changing lanes, which the shared flow table ends (0.7–0.9 since November 13, [BENCH.md](#a-control-lane-for-acks-november-13)); 1.6 Gbit/s on the remote host, where a limit downstream of the sender caps it. At 5% loss draft 07 delivers under 10 Mbit/s of a 5G offer; `loss_threshold_permille = 100` raises that to about 0.45 Gbit/s ([BENCH.md](#a-configurable-loss-threshold-for-random-loss-november-12)) | One transmit worker caps one flow near 1 Gbit/s here even without loss, a third of it the kernel's software send path and a quarter userspace, so the gate needs striping with a receive reorder stage, a larger outer MTU or segmenting hardware ([BENCH.md](#what-holds-one-flow-near-1-gbits-november-13); ROADMAP decision 7); the 5% rows (still under a tenth of the offer; FEC or a different response), and a real-path measurement. |
 | Coexist with other traffic | Against one TCP CUBIC flow at a 1 Gbit/s, 7.5 ms token-bucket bottleneck: an even share with a one-BDP queue; with a quarter-BDP queue the queue-checked tolerance keeps TCP's share | Several competitors, other buffer depths and other TCP algorithms are unmeasured. |
 
 Unlimited loss remains high. TAP ingress drops, bounded worker queue drops,
@@ -276,6 +276,39 @@ another TAP queue, the same striping the November 11 bar rejected as
 again runs on one transmit worker (the busiest thread at 76–90%). Lifting
 one flow needs striping with a receive-side reorder queue, or a cheaper
 per-frame path, not accidental lane changes.
+
+## What holds one flow near 1 Gbit/s (November 13)
+
+One flow at 7.5 ms delivers 1.00–1.07 Gbit/s per direction at 5G offered
+even without loss (two runs, hash lanes,
+[results](benches/one-flow-lossless.json)), with the busiest thread at
+92–96% and 1.2–1.7% of frames lost already at 1G. With 1% loss it delivers
+about 10% less. So loss and BBR's response to it are not what holds the
+row; one transmit worker is. A profile with the transmit split
+([counts](benches/one-flow-profile-split.txt)) puts that worker's loop at:
+
+| Part | Share |
+| --- | --- |
+| Sends (`sendmmsg` itself 33.6%) | 35.7% |
+| Waiting | 16.9% |
+| Sender permit and planning, beyond its sends | about 7% |
+| Recovery staging for acknowledged packets | 8.3% |
+| Queue draining and TAP input expansion | 11.1% |
+| ACK application, finishing, piece reservation and the rest | 1–3% each |
+
+The kernel's share is the routed namespaces and netem segmenting every
+datagram in software on the sending thread, which GSO-capable hardware would
+take off it. Userspace bookkeeping is about a quarter of the thread, so even
+removing all of it would lift one flow on this host to perhaps 1.4 Gbit/s,
+not 5. The November 11 controls reached 1.5 Gbit/s only because the flow
+changed lanes as the kernel moved it between TAP queues, and the per-reader
+balanced tables 1.55–1.82 the same way; both reordered over a million frames
+per direction. Within the current design, where one flow's frames stay on
+one lane so they arrive in order, the 5 Gbit/s single-flow gate cannot be
+reached on a 1500-byte path on this host. Reaching it needs one of: striping
+a flow across transmit workers with a receive-side reorder stage so inner
+TCP sees order (a design change), a larger outer MTU (the 9000-byte path
+nearly halves the per-bit cost), or a host whose NIC segments in hardware.
 
 ## Memory reserved against memory used (November 12)
 
