@@ -1,0 +1,247 @@
+diff --git a/src/ack/sent.rs b/src/ack/sent.rs
+index 219c289..c848208 100644
+--- a/src/ack/sent.rs
++++ b/src/ack/sent.rs
+@@ -250,7 +250,7 @@ impl History {
+ 
+     /// Diagnostics: floor, highest allocated number, live sample handles, and why
+     /// the floor cannot retire (0 retirable, 1 reserved, 2 inflight, 3 above allocated, 4 pending ACK).
+-    #[cfg(feature = "trace")]
++    #[cfg(any(feature = "trace", feature = "profile"))]
+     pub fn trace_floor(&self) -> [u64; 4] {
+         let (word, bit) = location(self.floor);
+         let state = if self.pending.is_some() {
+diff --git a/src/profile.rs b/src/profile.rs
+index c12610b..c86b8cc 100644
+--- a/src/profile.rs
++++ b/src/profile.rs
+@@ -66,6 +66,52 @@ pub fn now() -> u64 {
+ pub static ADMISSION: [std::sync::atomic::AtomicU64; 4] =
+     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+ 
++/// Diagnostic: control sends refused by lane 0's history headroom, by the
++/// control budget before any send, by the socket, and refused otherwise.
++pub static CONTROL_REFUSED: [std::sync::atomic::AtomicU64; 4] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
++
++/// Diagnostic: lane 0 history at each history refusal. Floor state counts
++/// (retirable, reserved, in flight, above allocated, pending ACK), then
++/// refusals with live samples, the sum of live samples, the sum and maximum
++/// of allocated minus floor.
++pub static FLOOR: [std::sync::atomic::AtomicU64; 9] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 9];
++
++/// Records one history refusal from `History::trace_floor`.
++pub fn floor_refusal([floor, allocated, samples, state]: [u64; 4]) {
++    use std::sync::atomic::Ordering::Relaxed;
++    if let Some(count) = FLOOR.get(state as usize) {
++        count.fetch_add(1, Relaxed);
++    }
++    if samples != 0 {
++        FLOOR[5].fetch_add(1, Relaxed);
++        FLOOR[6].fetch_add(samples, Relaxed);
++    }
++    let span = allocated.saturating_sub(floor);
++    FLOOR[7].fetch_add(span, Relaxed);
++    FLOOR[8].fetch_max(span, Relaxed);
++}
++
++/// Diagnostic: lane 0 sender state at each history refusal, counting refusals
++/// with retire due, report pending, ACK in progress, loss passes left,
++/// reclaim requested, and ACKs pending on the worker.
++pub static LANE: [std::sync::atomic::AtomicU64; 6] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
++
++/// Diagnostic: ACK application on wire lane 0, then on all other lanes:
++/// completed ACKs, passes, packets acknowledged, passes that sent a report to
++/// the owner, and bitmap words the admitted ranges span above the floor.
++pub static ACKSTAT: [[std::sync::atomic::AtomicU64; 5]; 2] =
++    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 5] }; 2];
++
++/// Records one history refusal's sender lane flags.
++pub fn lane_refusal(flags: [bool; 6]) {
++    for (count, flag) in LANE.iter().zip(flags) {
++        count.fetch_add(u64::from(flag), std::sync::atomic::Ordering::Relaxed);
++    }
++}
++
+ /// Per-process syscall totals: cycles, calls and items for sendmmsg, then timerfd_settime.
+ pub static SYSCALLS: [[std::sync::atomic::AtomicU64; 3]; 2] =
+     [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 2];
+@@ -94,8 +140,22 @@ pub fn report(worker: usize, phases: &[u64; PHASES]) {
+     let timer = SYSCALLS[1]
+         .each_ref()
+         .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
++    let refused = CONTROL_REFUSED
++        .each_ref()
++        .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
++    let floor = FLOOR
++        .each_ref()
++        .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
++    let lane = LANE
++        .each_ref()
++        .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
++    let ackstat = ACKSTAT.each_ref().map(|class| {
++        class
++            .each_ref()
++            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
++    });
+     let mut line = format!(
+-        "unquic: profile worker {worker} admission inputs/buffers/frames/bytes {admission:?} sendmmsg cycles/calls/datagrams {sendmmsg:?} timerfd_settime cycles/calls {:?} cycles {total}",
++        "unquic: profile worker {worker} ackstat lane0/others acks/passes/packets/reports/words {ackstat:?} control_refused history/budget/socket/other {refused:?} floor retirable/reserved/inflight/above/pending/sampled/samples/span_sum/span_max {floor:?} lane retire_due/report_pending/ack/loss_passes/reclaim/acks_pending {lane:?} admission inputs/buffers/frames/bytes {admission:?} sendmmsg cycles/calls/datagrams {sendmmsg:?} timerfd_settime cycles/calls {:?} cycles {total}",
+         &timer[..2]
+     );
+     for index in order.into_iter().filter(|&index| phases[index] != 0) {
+diff --git a/src/worker.rs b/src/worker.rs
+index b59ec02..cc977cd 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -4233,6 +4233,19 @@ impl Worker {
+         }
+     }
+ 
++    #[cfg(feature = "profile")]
++    fn lane_refusal(&self, index: usize) {
++        let lane = &self.sender.lanes[index];
++        crate::profile::lane_refusal([
++            lane.retire_due,
++            lane.report_pending,
++            lane.ack.is_some(),
++            lane.loss_passes != 0,
++            self.sender.reclaim.is_some(),
++            self.sender.acks_pending != 0,
++        ]);
++    }
++
+     fn send_record(
+         &mut self,
+         session: usize,
+@@ -4288,6 +4301,13 @@ impl Worker {
+                         .can_reserve(lane.next_packet().saturating_add(sender::PROBE_HEADROOM))
+                 })
+             {
++                #[cfg(feature = "profile")]
++                {
++                    crate::profile::CONTROL_REFUSED[0]
++                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                    crate::profile::floor_refusal(self.sender.lanes[index].history.trace_floor());
++                    self.lane_refusal(index);
++                }
+                 return Ok(None);
+             }
+             self.sessions[session].tx[0]
+@@ -4295,6 +4315,8 @@ impl Worker {
+                 .and_then(|lane| lane.record(record, bytes).ok())
+         };
+         let Some(packet) = packet else {
++            #[cfg(feature = "profile")]
++            crate::profile::CONTROL_REFUSED[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+             return Ok(None);
+         };
+         if let Some(index) = history {
+@@ -4305,14 +4327,27 @@ impl Worker {
+                 false,
+             ) {
+                 Ok(()) => {}
+-                Err(crate::ack::HistoryError::Full) => return Ok(None),
++                Err(crate::ack::HistoryError::Full) => {
++                    #[cfg(feature = "profile")]
++                    {
++                        crate::profile::CONTROL_REFUSED[0]
++                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                        crate::profile::floor_refusal(
++                            self.sender.lanes[index].history.trace_floor(),
++                        );
++                        self.lane_refusal(index);
++                    }
++                    return Ok(None);
++                }
+                 Err(error) => return Err(io::Error::other(error)),
+             }
+         }
+         let mut handshake = record
+             .is_handshake()
+             .then(|| &mut self.controls[session].state);
++        let attempted = std::cell::Cell::new(false);
+         let mut send = || {
++            attempted.set(true);
+             let at = clock()?;
+             if let Some(state) = handshake.as_mut()
+                 && !state.prepare_send(record, at).map_err(io::Error::other)?
+@@ -4353,6 +4388,11 @@ impl Worker {
+                 .ok_or_else(|| io::Error::other("control transmission on a non-owner worker"))?;
+             budget.send(packet.length + 48, prepared, send)
+         };
++        #[cfg(feature = "profile")]
++        if result.is_err() {
++            crate::profile::CONTROL_REFUSED[if attempted.get() { 2 } else { 1 }]
++                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
+         if let Some(index) = history {
+             match &result {
+                 Ok(started)
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index a8f1a2b..78cc402 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -264,13 +264,13 @@ pub(super) struct State {
+     pub(super) owner: Option<Owner>,
+     pub(super) fresh: Vec<bool>,
+     pub(super) unsent: Vec<Unsent>,
+-    reclaim: Option<usize>,
++    pub(super) reclaim: Option<usize>,
+     pub(super) permitted: bool,
+     pub(super) probes: Vec<Option<(u64, PacketId, u8)>>,
+     losses: Vec<Option<LossCheck>>,
+     loss_cursor: usize,
+     checks_pending: usize,
+-    acks_pending: usize,
++    pub(super) acks_pending: usize,
+     loss_fences: usize,
+     pub(super) offsets: Vec<usize>,
+     pub(super) lanes: Vec<Lane>,
+diff --git a/src/worker/sender/history.rs b/src/worker/sender/history.rs
+index acfdb0a..144bb4b 100644
+--- a/src/worker/sender/history.rs
++++ b/src/worker/sender/history.rs
+@@ -66,6 +66,17 @@ impl Lane {
+         if self.history.begin_ack(ranges).is_err() {
+             return false;
+         }
++        #[cfg(feature = "profile")]
++        {
++            let floor = self.history.floor();
++            let words: u64 = ranges
++                .iter()
++                .filter(|range| range.end >= floor)
++                .map(|range| (range.end >> 6) - (range.start.max(floor) >> 6) + 1)
++                .sum();
++            crate::profile::ACKSTAT[usize::from(self.lane != 1)][4]
++                .fetch_add(words, std::sync::atomic::Ordering::Relaxed);
++        }
+         self.largest_ack = self
+             .largest_ack
+             .max(ranges.iter().map(|r| r.end).max().unwrap_or(0));
+@@ -186,6 +197,22 @@ impl Lane {
+                 };
+                 report.count += 1;
+             });
++            #[cfg(feature = "profile")]
++            {
++                let class = &crate::profile::ACKSTAT[usize::from(self.lane != 1)];
++                class[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                class[3].fetch_add(
++                    u64::from(report.count != 0),
++                    std::sync::atomic::Ordering::Relaxed,
++                );
++                if let Some(progress) = end {
++                    class[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                    class[2].fetch_add(
++                        u64::from(progress.packets),
++                        std::sync::atomic::Ordering::Relaxed,
++                    );
++                }
++            }
+             if let Some(progress) = end {
+                 // Keep reservation headroom so later sends can expose an unacknowledged tail.
+                 self.history.retire_unsampled(BATCH_SIZE);

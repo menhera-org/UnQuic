@@ -1,0 +1,21 @@
+diff --git a/src/worker/sender/history.rs b/src/worker/sender/history.rs
+index acfdb0a..e1d187f 100644
+--- a/src/worker/sender/history.rs
++++ b/src/worker/sender/history.rs
+@@ -178,10 +178,15 @@ impl Lane {
+             );
+             *budget -= allowance;
+             let end = self.history.advance_ack(allowance, |ack| {
++                let settled = ack.was_in_flight && ack.packet.eliciting;
++                // The owner ignores an entry with neither, such as an ACK-only packet.
++                if ack.packet.sample_slot.is_none() && !settled {
++                    return;
++                }
+                 report.entries[report.count] = Entry {
+                     number: ack.packet.number,
+                     sample: ack.packet.sample_slot,
+-                    settled: ack.was_in_flight && ack.packet.eliciting,
++                    settled,
+                     ..Entry::default()
+                 };
+                 report.count += 1;

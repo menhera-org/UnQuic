@@ -8,6 +8,25 @@ hash right control_refused history/budget/socket/other [0, 0, 0, 0] deferred=0
 bal left control_refused history/budget/socket/other [21585, 8, 0, 0] deferred=21488
 bal right control_refused history/budget/socket/other [36552, 4, 0, 0] deferred=36403
 
+November 13, floor state at each history refusal (benches/control-floor-diagnostic.patch on top of the patch above, same check, one run each).
+floor = counts by the floor entry's state (retirable = resolved, reserved, inflight, above allocated, pending validated ACK), then refusals with live sample handles, the sum of live handles, the sum and maximum of allocated minus floor.
+hash left control_refused [0, 0, 0, 0] floor [0, 0, 0, 0, 0, 0, 0, 0, 0]
+hash right control_refused [0, 0, 0, 0] floor [0, 0, 0, 0, 0, 0, 0, 0, 0]
+bal left control_refused [17747, 14, 0, 0] floor [11961, 0, 0, 0, 5786, 17649, 11929629, 1161948127, 65535] deferred=17692
+bal right control_refused [35895, 0, 0, 0] floor [28967, 0, 0, 0, 6928, 35615, 3302624, 2351181759, 65535] deferred=35757
+
+November 13, lane 0 sender state at each history refusal (the floor patch as committed adds these flags; balanced lanes only, one run).
+lane = refusals with retire due, report pending at the owner, ACK in progress, loss passes left, reclaim requested, ACKs pending on the worker.
+bal left control_refused [22324, 0, 0, 0] floor [16322, 0, 0, 0, 6002, 22132, 2359300, 1461914740, 65535] lane [22324, 21783, 21934, 22190, 22324, 21934] deferred=22229
+bal right control_refused [33481, 0, 0, 0] floor [22875, 0, 0, 0, 10606, 33210, 3811307, 2192365351, 65535] lane [33481, 32223, 32752, 33257, 33481, 32752] deferred=33331
+
+November 13, ACK application by lane (the floor patch as committed adds these; one run of each policy).
+ackstat = wire lane 0, then all other lanes: completed ACKs, application passes, packets acknowledged, passes that sent a report to the owner, bitmap words the admitted ranges span above the floor.
+hash left ackstat [[44017, 48989, 1726012, 48294, 1506256], [360132, 476458, 18098405, 475200, 54571357]] control_refused [0, 0, 0, 0]
+hash right ackstat [[30132, 47028, 1928663, 46593, 740959], [254521, 414162, 17822442, 413322, 64071931]] control_refused [235, 0, 0, 0]
+bal left ackstat [[38973, 62751, 2509569, 61422, 1071683], [277817, 406564, 16042735, 406076, 35515269]] control_refused [33480, 12, 0, 0]
+bal right ackstat [[38026, 61756, 2483415, 60842, 452396], [272352, 404161, 16080739, 403721, 35933802]] control_refused [35345, 0, 0, 0]
+
 November 12 (history headroom and socket only):
 hash left control_refused history/socket [0, 0] deferred=0
 hash right control_refused history/socket [130, 0] deferred=128

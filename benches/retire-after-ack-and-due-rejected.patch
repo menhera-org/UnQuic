@@ -1,0 +1,26 @@
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index a8f1a2b..f80c93d 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -1204,6 +1204,7 @@ impl Worker {
+             self.sender.cursor = (index + 1) % self.sender.lanes.len();
+             let lane = &mut self.sender.lanes[index];
+             if lane.ack.is_none()
++                && !lane.retire_due
+                 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0)
+             {
+                 self.sender.report = Some(report);
+diff --git a/src/worker/sender/history.rs b/src/worker/sender/history.rs
+index acfdb0a..4491e8d 100644
+--- a/src/worker/sender/history.rs
++++ b/src/worker/sender/history.rs
+@@ -188,7 +188,8 @@ impl Lane {
+             });
+             if let Some(progress) = end {
+                 // Keep reservation headroom so later sends can expose an unacknowledged tail.
+-                self.history.retire_unsampled(BATCH_SIZE);
++                self.history
++                    .retire_unsampled(BATCH_SIZE.max(progress.packets as usize));
+                 self.retire_due = retire_due(&self.history);
+                 if let Some(sent) = progress.rtt_sent_at {
+                     self.rtt.sample(sent, ack.received, ack.delay_us);

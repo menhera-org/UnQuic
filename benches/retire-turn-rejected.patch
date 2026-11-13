@@ -1,0 +1,71 @@
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index a8f1a2b..9c359a1 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -190,6 +190,8 @@ pub(super) struct Lane {
+     pub(super) probes: [Option<(u64, u16)>; 2],
+     // Retained loss handles pin more than half the history; retire them before DATA is refused.
+     pub(super) retire_due: bool,
++    // Exploratory: one retire report runs before the next ACK is admitted.
++    pub(super) retire_turn: bool,
+ }
+ 
+ impl Lane {
+@@ -214,6 +216,7 @@ impl Lane {
+             loss_passes: 0,
+             probes: [None; 2],
+             retire_due: false,
++            retire_turn: false,
+         })
+     }
+ }
+@@ -606,7 +609,7 @@ impl Worker {
+             let Some(lane) = self.sender.lanes.get_mut(index) else {
+                 return Err(io::Error::other("missing sender lane"));
+             };
+-            if lane.ack.is_some() || lane.report_pending {
++            if lane.ack.is_some() || lane.report_pending || lane.retire_turn {
+                 self.sender.incoming.push_back(ack);
+                 continue;
+             }
+@@ -1204,6 +1207,7 @@ impl Worker {
+             self.sender.cursor = (index + 1) % self.sender.lanes.len();
+             let lane = &mut self.sender.lanes[index];
+             if lane.ack.is_none()
++                && !lane.retire_turn
+                 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0)
+             {
+                 self.sender.report = Some(report);
+diff --git a/src/worker/sender/history.rs b/src/worker/sender/history.rs
+index acfdb0a..103bccb 100644
+--- a/src/worker/sender/history.rs
++++ b/src/worker/sender/history.rs
+@@ -119,7 +119,11 @@ impl Lane {
+     pub(in crate::worker) fn deadline(&self) -> Option<Duration> {
+         if self.report_pending {
+             None
+-        } else if self.ack.is_some() || self.scan.is_some() || self.forced_before.is_some() {
++        } else if self.ack.is_some()
++            || self.retire_turn
++            || self.scan.is_some()
++            || self.forced_before.is_some()
++        {
+             Some(Duration::ZERO)
+         } else {
+             self.loss_due
+@@ -190,6 +194,7 @@ impl Lane {
+                 // Keep reservation headroom so later sends can expose an unacknowledged tail.
+                 self.history.retire_unsampled(BATCH_SIZE);
+                 self.retire_due = retire_due(&self.history);
++                self.retire_turn = self.retire_due;
+                 if let Some(sent) = progress.rtt_sent_at {
+                     self.rtt.sample(sent, ack.received, ack.delay_us);
+                 }
+@@ -283,6 +288,7 @@ impl Lane {
+         if self.report_pending || self.ack.is_some() || *budget == 0 {
+             return Ok(false);
+         }
++        self.retire_turn = false;
+         self.prepare_report(report, ReportKind::Retire);
+         #[cfg(feature = "trace")]
+         let worker = (usize::from(self.lane) - 1) % crate::trace::workers().max(1);
