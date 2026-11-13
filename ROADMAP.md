@@ -576,9 +576,11 @@ rules apply to all of them.
    (decision 7). The kernel figures can only be confirmed on an R86S-class
    box with real NICs. The kernel test
    `tap::read::tests::real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch`
-   failed once on Linux 6.8 with `WouldBlock` and passed on rerun: it reads
-   right after raw-socket sends, so delivery into the TAP can lag; it needs
-   to wait for readability. `foreground_readiness_dns_refresh_forwarding_and_signal_shutdown`
+   failed in 3–5% of runs: the TAP's queueing discipline dropped some of its
+   raw sends, and a read finding the queue empty could leave a gap before a
+   later read in the same batch. It now replaces the qdisc with `noqueue`
+   and accepts in-order reads with gaps, and passed 150 of 150 runs.
+   `foreground_readiness_dns_refresh_forwarding_and_signal_shutdown`
    (tests/cli.rs) also timed out once on 6.8 with its 10 s wait and passed
    on rerun; its waits span a DNS refresh and two daemon starts. A peer
    with one lane keeps ACKs and
