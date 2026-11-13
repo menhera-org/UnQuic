@@ -373,6 +373,19 @@ median of −0.7% here, and 5 of 8 pairs at −0.6% on the small-frame point
 rejected alone. It later landed inside a larger receive-admission change
 ([below](#receive-admission-without-slot-scans-november-13-landed)).
 
+## Progress against the per-frame budget (November 13)
+
+The three cuts landed today (coverage planes, one-pass piece reservation,
+receive admission without slot scans) together lower CPU per delivered
+Gbit/s on the full-size efficiency point by 8.8% against the morning's
+`a665423`, lower in five of six rounds; the sixth `bf04810` round lost 7.9%
+of its frames and is not comparable. Against a byte copy of `a665423` the
+change is −8.2%, and the copy against `a665423` itself +0.2%
+([results](benches/full-size-cumulative-bf04810.json)). That is about 600
+of the roughly 4,400 cycles per frame event the 20 Gbit/s budget still
+needs removed ([design 13.1](initial-design.md)); the remaining cuts are
+structural.
+
 ## Receive admission without slot scans (November 13, landed)
 
 A split of receive admission
