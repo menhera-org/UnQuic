@@ -208,6 +208,35 @@ A PROBE_REPLY echoes the received probe's lane, packet number and actual UDP pay
 
 FRAME_ABANDON origin 0 means the frame sender stopped sending; origin 1 means the receiver discarded the frame. Reasons are deadline (1), resource limit (2), lane retirement (3), or TAP failure (4). Its frame ID must name its body lane. Origin 0 must travel on that same sender lane; if the lane has failed, use LANE_RETIRE instead. Origin 1 may travel through any local lane. Route origin 0 to the remote lane's reassembly owner and origin 1 to the local lane's transmit owner. A frame already written to TAP is never undone. Retire pending state and stop repairs. For origin 0, mark the frame sequence terminal even if its first piece has not arrived, advancing the receive frame window if necessary without allocating payload storage. This prevents reordered data from recreating a cancelled frame. For origin 1, unknown or already retired transmit frames are a no-op. Duplicates and sequences below the window floor never reopen state. Control retries use at most two retransmissions and a 100 ms lifetime. Abandonment is advisory: loss of this record does not prevent local expiry or release of buffers.
 
+**Offload frames (November 13 amendment; not yet implemented).** Optional
+feature bit 0, `OFFLOAD_FRAMES`, lets a peer send one TAP GSO super-frame,
+or one frame with a partial checksum, as a single DATA frame. It applies
+only when both endpoints advertise it in their handshake parameters; a peer
+without it keeps today's frames and complete checksums, so an old peer
+interoperates by ignoring the unknown bit.
+
+- A DATA record whose flags byte has bit 0 set carries a piece of an
+  offload frame. Every piece of one frame must carry the same bit; a
+  mismatch is rejected like an inconsistent total length.
+- An offload frame's bytes begin with a 10-byte descriptor, then one
+  Ethernet frame: checksum flags (1; bit 0 means the transport checksum is
+  partial), segmentation type (1: none, TCP over IPv4, TCP over IPv6, UDP,
+  plus an ECN bit), header length (2), segment size (2), checksum start
+  (2) and checksum offset (2), all big-endian and validated against the
+  frame before delivery. The total frame length includes the descriptor
+  and is at most 10 + 65,535 bytes.
+- The receiver writes the frame to its TAP with the equivalent virtio-net
+  header when the TAP accepts that offload. Otherwise it segments the frame
+  in software and completes any partial checksum, as TAP input expansion
+  does today. A frame with a partial checksum skips the receiver's
+  pre-coalescing checksum check; nothing has been computed to check.
+- Repair, abandonment, lifetime and per-byte coverage are unchanged. A lost
+  datagram repairs only its pieces. Senders and receivers keep offload
+  frames in their own bounded slot pools, charged to `memory_limit`, so
+  ordinary frames keep their slots.
+- Integrity of a partial-checksum frame in transit rests on the outer UDP
+  checksum, as for any tunnel carrying offloaded traffic.
+
 With a 1500-byte outer IP ceiling and no extension headers, the UDP payload ceiling is `1500 - 40 - 8 = 1452`. One DATA record holds `1452 - 48 - 20 = 1384` frame bytes. A 1514-byte Ethernet frame splits into 1384 and 130 bytes before packing. At the 1280-byte IPv6 baseline, the equivalent frame-piece ceiling is 1164 bytes.
 
 # 7 Packing and segmentation
