@@ -387,6 +387,17 @@ to another TAP queue meets another reader's table and can change lanes,
 reordering at most the frames in flight then, as reader-local lanes already
 allow.
 
+**Control lane (November 13 amendment; `daemon.control_lane`, off by
+default).** ACKs and other non-handshake control records take packet numbers
+from lane 0's sent history. That history spans at most 65,536 numbers, and
+under loss its floor waits behind lost data packets until they are retired,
+which a steady ACK stream postpones. Lane 0's data can then fill the history,
+and ACKs wait for numbers, which causes more loss (BENCH.md). With the
+switch, a peer with more than one transmit lane keeps lane 0 for ACKs and
+control: balanced lanes rotate over lanes 1 and up, and a frame whose hash
+or reader-local choice is lane 0 takes lane 1 + hash mod (lanes − 1)
+instead. The wire format is unchanged, and so is a peer with one lane.
+
 The flow key includes one unfragmented IPv4, IPv6 or Ethernet encapsulation
 (IP protocol numbers 4, 41 and 143). Retain the outer key and add the inner
 addresses, protocol and available transport ports, plus inner MAC addresses

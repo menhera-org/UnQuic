@@ -617,6 +617,16 @@ silence. It lifts one flow at 7.5 ms by 42–58% and the weaker decision-workloa
 directions by up to 121%, but the direction hashing favoured loses up to 14%
 and the loopback overload check 10% in total, so it stays off (BENCH.md).
 
+ACKs and other control records always leave on lane 0 and take their packet
+numbers from its history, which spans 65,536 numbers. Under loss, lane 0's
+data can fill that history while lost packets wait to be retired, and then
+ACKs wait for numbers, which causes more loss. `daemon.control_lane`, off by
+default, keeps lane 0 for ACKs and control when a peer has more than one
+transmit lane; data uses the others. On the loopback overload check it
+removed every deferred ACK send. With balanced lanes it delivered 13.7–15.9
+Gbit/s at 21 Gbit/s offered, against 10.7–10.8 without it and 12.3 with hash
+lanes. With hash lanes it changed little (BENCH.md).
+
 At light load each lane tends to send one frame at a time, and at a
 1452-byte payload limit a 1514-byte frame takes two datagrams, the second
 holding only its tail. `daemon.tx_hold_us`, 0 (off) by default and at most

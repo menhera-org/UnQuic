@@ -384,13 +384,14 @@ const FLOW_WAYS: usize = 4;
 const FLOW_IDLE_MS: u32 = 1000;
 
 /// Pins a flow to the lane it first received, assigning new flows round-robin
-/// across the session's lanes so a few heavy flows do not share one transmit
-/// worker. A full table set falls back to the flow hash.
+/// across lanes `first..lanes` so a few heavy flows do not share one transmit
+/// worker. A full table set falls back to the flow hash over all lanes.
 fn balanced_lane(
     slots: &mut [FlowSlot],
     cursor: &std::sync::atomic::AtomicUsize,
     key: u64,
     hash: u64,
+    first: usize,
     lanes: usize,
     ms: u32,
 ) -> usize {
@@ -415,7 +416,7 @@ fn balanced_lane(
     let Some(way) = free else {
         return hash as usize % lanes;
     };
-    let lane = cursor.fetch_add(1, Ordering::Relaxed) % lanes;
+    let lane = first + cursor.fetch_add(1, Ordering::Relaxed) % (lanes - first);
     set[way] = FlowSlot {
         key,
         last_ms: ms,
@@ -423,6 +424,21 @@ fn balanced_lane(
         used: true,
     };
     lane
+}
+
+/// First lane that carries data: 1 under `daemon.control_lane` when another
+/// lane exists, so lane 0 keeps ACKs and control off data's packet history.
+fn first_data_lane(control: bool, lanes: usize) -> usize {
+    usize::from(control && lanes > 1)
+}
+
+/// Moves a frame that chose a control-only lane 0 to a data lane by its hash.
+fn data_lane(lane: usize, first: usize, lanes: usize, hash: impl FnOnce() -> u64) -> usize {
+    if lane < first {
+        first + hash() as usize % (lanes - first)
+    } else {
+        lane
+    }
 }
 
 /// Whether tap_lane spreads this frame across all lanes by its flow hash.
@@ -2505,7 +2521,8 @@ impl Worker {
                 let (workers, lanes) = (self.shared.workers(), self.sessions[session].tx.len());
                 let queues = self.shared.config.config().sessions[session].queue_count;
                 let cursor = self.shared.flow_cursors.get(session);
-                buffer.lane = if let Some(cursor) = cursor
+                let first = first_data_lane(self.shared.config.config().daemon.control_lane, lanes);
+                let lane = if let Some(cursor) = cursor
                     && !self.flows.is_empty()
                     && strict_lane(frame, self.id, workers, queues, lanes)
                 {
@@ -2515,12 +2532,14 @@ impl Worker {
                         cursor,
                         hash ^ (session as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
                         hash,
+                        first,
                         lanes,
                         now.as_millis() as u32,
                     )
                 } else {
                     tap_lane(frame, self.id, workers, queues, lanes)
                 };
+                buffer.lane = data_lane(lane, first, lanes, || pack::flow_hash(frame));
                 buffer.deadline = now + reassembly::FRAME_LIFETIME;
                 if buffer.segments.is_some() {
                     self.counters.tap_gso_reads = self.counters.tap_gso_reads.wrapping_add(1);
@@ -6039,27 +6058,51 @@ mod tests {
         let cursor = AtomicUsize::new(0);
         // Four new flows spread across four lanes whatever their hashes.
         let lanes: Vec<_> = (1..=4)
-            .map(|key| balanced_lane(&mut slots, &cursor, key, 0, 4, 10))
+            .map(|key| balanced_lane(&mut slots, &cursor, key, 0, 0, 4, 10))
             .collect();
         assert_eq!(lanes, [0, 1, 2, 3]);
         // An active flow keeps its lane.
-        assert_eq!(balanced_lane(&mut slots, &cursor, 2, 0, 4, 900), 1);
+        assert_eq!(balanced_lane(&mut slots, &cursor, 2, 0, 0, 4, 900), 1);
         // After a full idle period a flow may move: none of its frames remain.
         assert_eq!(
-            balanced_lane(&mut slots, &cursor, 2, 0, 4, 900 + FLOW_IDLE_MS),
+            balanced_lane(&mut slots, &cursor, 2, 0, 0, 4, 900 + FLOW_IDLE_MS),
             0
         );
         // Five active flows in one set: the fifth falls back to its hash lane.
         let sets = (FLOW_SLOTS / FLOW_WAYS) as u64;
         let mut slots = vec![FlowSlot::default(); FLOW_SLOTS];
         for way in 0..FLOW_WAYS as u64 {
-            balanced_lane(&mut slots, &cursor, 7 + way * sets, 0, 4, 0);
+            balanced_lane(&mut slots, &cursor, 7 + way * sets, 0, 0, 4, 0);
         }
-        assert_eq!(balanced_lane(&mut slots, &cursor, 7 + 4 * sets, 6, 4, 0), 2);
+        assert_eq!(
+            balanced_lane(&mut slots, &cursor, 7 + 4 * sets, 6, 0, 4, 0),
+            2
+        );
         // A lane that no longer exists is reassigned.
-        let lane = balanced_lane(&mut slots, &cursor, 7, 0, 2, 1);
+        let lane = balanced_lane(&mut slots, &cursor, 7, 0, 0, 2, 1);
         assert!(lane < 2);
-        assert_eq!(balanced_lane(&mut [], &cursor, 1, 5, 4, 0), 1);
+        assert_eq!(balanced_lane(&mut [], &cursor, 1, 5, 0, 4, 0), 1);
+    }
+
+    #[test]
+    fn control_lane_keeps_data_off_lane_zero() {
+        use std::sync::atomic::AtomicUsize;
+        assert_eq!(first_data_lane(false, 4), 0);
+        assert_eq!(first_data_lane(true, 1), 0);
+        assert_eq!(first_data_lane(true, 4), 1);
+        // Round-robin starts at the first data lane and never returns to lane 0.
+        let mut slots = vec![FlowSlot::default(); FLOW_SLOTS];
+        let cursor = AtomicUsize::new(0);
+        let lanes: Vec<_> = (1..=4)
+            .map(|key| balanced_lane(&mut slots, &cursor, key, 0, 1, 4, 10))
+            .collect();
+        assert_eq!(lanes, [1, 2, 3, 1]);
+        // A lane-0 choice moves to a data lane by hash; others and single lanes stay.
+        assert_eq!(data_lane(0, 1, 4, || 0), 1);
+        assert_eq!(data_lane(0, 1, 4, || 5), 3);
+        assert_eq!(data_lane(2, 1, 4, || unreachable!()), 2);
+        assert_eq!(data_lane(0, 0, 1, || unreachable!()), 0);
+        assert_eq!(data_lane(0, 0, 4, || unreachable!()), 0);
     }
 
     #[test]

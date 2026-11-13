@@ -272,8 +272,13 @@ mod tests {
             assert!(!loaded.config.daemon.balance_flows);
             assert_eq!(loaded.config.daemon.tx_hold_us, 0);
             assert!(loaded.config.daemon.probe_rtt_ack_delay);
+            assert!(!loaded.config.daemon.control_lane);
             loaded.config.validate().unwrap();
         }
+        let text = format!("[daemon]\ncontrol_lane = true\n{}", sample());
+        let loaded = Loaded::parse(&text).unwrap();
+        assert!(loaded.config.daemon.control_lane);
+        loaded.config.validate().unwrap();
         let text = format!("[daemon]\ntx_hold_us = 1000\n{}", sample());
         let loaded = Loaded::parse(&text).unwrap();
         assert_eq!(loaded.config.daemon.tx_hold_us, 1000);

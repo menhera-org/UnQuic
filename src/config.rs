@@ -55,6 +55,10 @@ pub struct Daemon {
     /// receiver's 1 ms ACK delay, not over min_rtt alone, so a steady offer
     /// below half the bandwidth is not cut during the probe.
     pub probe_rtt_ack_delay: bool,
+    /// Off by default: with more than one transmit lane, lane 0 carries only
+    /// ACKs and control, so data never fills the packet history they number
+    /// from. Data uses the other lanes.
+    pub control_lane: bool,
 }
 impl Default for Daemon {
     fn default() -> Self {
@@ -65,6 +69,7 @@ impl Default for Daemon {
             balance_flows: false,
             tx_hold_us: 0,
             probe_rtt_ack_delay: true,
+            control_lane: false,
         }
     }
 }

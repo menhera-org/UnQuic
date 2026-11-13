@@ -124,6 +124,78 @@ many frames, so these counters cannot be summed into an exact frame-loss total.
 Stage 5 must return to the original performance targets after work on later
 stages. No performance gate is waived.
 
+## A control lane for ACKs (November 13)
+
+The loopback overload check (QinQ, eight workers, sixteen 44-segment GSO
+flows, 21 Gbit/s requested) defers 17,000–37,000 ACK sends per daemon with
+balanced lanes ([counts](benches/control-refusals.txt)). Every deferral is a
+refusal by lane 0's sent history: control records number from it, and it
+cannot take another number. The socket never refuses, and the control budget
+refuses a handful. A diagnostic that records the history's state at each
+refusal ([patch](benches/control-floor-diagnostic.patch), profile build)
+shows what pins it:
+
+- The span from floor to highest number averages 65,474–65,501 of 65,536.
+- The floor entry is never in flight or reserved. It is resolved (67–81%) or
+  covered by an ACK being applied (19–33%).
+- Sample handles are live at 99% of refusals, and while any are live the
+  history will not slide its floor on its own.
+- The sender lane is mid-ACK at 98% of refusals, waiting on an owner report
+  at 97%, with retirement due at 100%.
+
+Lost packets keep their sample handle for a late ACK, so the cheap retirement
+that follows each completed ACK stops at the first lost packet. Only a retire
+report moves past it, and that waits until no ACK is being applied, which a
+steady ACK stream postpones. Lane 0's data then fills the history, ACKs wait
+for numbers, and the resulting loss pins the floor further. Lane 0 does no
+more ACK work than any other lane (about 39,000 ACKs and 2.5 million packets
+per run, against 39,700 and 2.3 million per other lane), and with hash lanes
+it refuses nothing, because far fewer packets are lost.
+
+Four changes to retirement were tried first. Each was required to cut
+deferrals tenfold and add 5% at 21G with balanced lanes, without costing hash
+lanes more than 3%. All four missed:
+
+| Change | Balanced 21G total, Gbit/s | Deferrals |
+| --- | --- | --- |
+| None (base, every run below) | 10.45–10.90 | 17,000–36,500 |
+| A: retire as many unsampled entries per ACK as it acknowledged ([patch](benches/retire-after-ack-rejected.patch)) | 10.02–10.04 | 32,000–54,000 |
+| A + B: also service a lane with retirement due while ACKs wait ([patch](benches/retire-after-ack-and-due-rejected.patch)) | 9.88–10.18 (hash lanes 9.62–10.17 against 12.05–12.39) | 4,000–84,000 |
+| C: leave ACK report entries the owner ignores out of the report ([patch](benches/ack-report-skip-noop-rejected.patch)) | 10.63–11.11 | 26,000–40,000 |
+| D: one retire report after each ACK while retirement is due ([patch](benches/retire-turn-rejected.patch)) | 10.90–10.98 | 29,000–35,000 |
+
+Results: [A, B](benches/loopback-retire-after-ack-rejected.json),
+[C](benches/loopback-ack-report-skip-noop-rejected.json),
+[D](benches/loopback-retire-turn-rejected.json); two passes each, arms in
+order then reversed, one container per change.
+
+Control records need numbers that data cannot pin. The wire requires every
+non-handshake packet to carry a lane and a nonzero number, and an ACK
+covering a number the history never recorded is rejected as unsent, so ACKs
+cannot skip the history. Keeping data off lane 0 needs neither change. An
+exploratory build ([patch](benches/control-lane-zero-exploratory.patch),
+[results](benches/loopback-control-lane-zero-exploratory.json)), stated
+beforehand as needing deferrals near zero under both policies, hash lanes
+within 3% and balanced lanes 5% above hash lanes, met all three. The landed
+version, `daemon.control_lane`, does the same and stays off by default. Two
+passes in one container, release build
+([results](benches/loopback-control-lane.json)):
+
+| Arm | 21G total, Gbit/s | Deferrals per daemon |
+| --- | --- | --- |
+| Hash lanes | 9.00, 12.33 | 0–22 |
+| Hash lanes, control lane | 10.38, 12.09 | 0 |
+| Balanced lanes, control lane | 13.69, 15.86 | 0 |
+| Balanced lanes | 10.79, 10.74 | 30,700–35,100 |
+
+The first arm in each container runs low (hash lanes at 9.00 here and 10.21
+in the exploratory run, against 11.3–12.4 elsewhere), so the fair hash-lane
+figure is the second pass. Against it, balanced lanes with the control lane
+deliver 11–29% more, at 1,004–1,021% of a core against 849%. With hash lanes
+the control lane moves capacity from L→R to R→L and changes the total by −2%
+to +15%. The decision workload and the lossy one-flow rows are not yet
+measured with it.
+
 ## Memory reserved against memory used (November 12)
 
 The startup check reserves storage from the configuration and refuses to

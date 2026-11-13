@@ -1,0 +1,40 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index b59ec02..aee7dad 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -415,7 +415,12 @@ fn balanced_lane(
+     let Some(way) = free else {
+         return hash as usize % lanes;
+     };
+-    let lane = cursor.fetch_add(1, Ordering::Relaxed) % lanes;
++    // Exploratory: keep lane 0, which carries ACKs and control, out of the rotation.
++    let lane = if lanes > 1 {
++        1 + cursor.fetch_add(1, Ordering::Relaxed) % (lanes - 1)
++    } else {
++        0
++    };
+     set[way] = FlowSlot {
+         key,
+         last_ms: ms,
+@@ -2505,7 +2510,7 @@ impl Worker {
+                 let (workers, lanes) = (self.shared.workers(), self.sessions[session].tx.len());
+                 let queues = self.shared.config.config().sessions[session].queue_count;
+                 let cursor = self.shared.flow_cursors.get(session);
+-                buffer.lane = if let Some(cursor) = cursor
++                let lane = if let Some(cursor) = cursor
+                     && !self.flows.is_empty()
+                     && strict_lane(frame, self.id, workers, queues, lanes)
+                 {
+@@ -2521,6 +2526,12 @@ impl Worker {
+                 } else {
+                     tap_lane(frame, self.id, workers, queues, lanes)
+                 };
++                // Exploratory: lane 0 carries only ACKs and control when another lane exists.
++                buffer.lane = if lanes > 1 && lane == 0 {
++                    1 + pack::flow_hash(frame) as usize % (lanes - 1)
++                } else {
++                    lane
++                };
+                 buffer.deadline = now + reassembly::FRAME_LIFETIME;
+                 if buffer.segments.is_some() {
+                     self.counters.tap_gso_reads = self.counters.tap_gso_reads.wrapping_add(1);

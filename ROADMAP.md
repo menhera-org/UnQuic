@@ -7,6 +7,22 @@ read that section before writing code. Keep the "Current status" paragraph in
 section 15 of the design and the "Implementation status" section of
 [README.md](README.md) true after every step.
 
+## November 13 checkpoint
+
+Balanced lanes' loopback loss came from ACKs waiting for packet numbers.
+ACKs and other control records number from lane 0's sent history, which
+spans 65,536 numbers. Under loss its floor waits behind lost data packets,
+which keep their sample handles until a retire report, and retire reports
+wait until no ACK is being applied. With balanced lanes a steady ACK stream
+keeps it that way, lane 0's data fills the history, ACKs wait, and the
+added loss pins the floor further
+([BENCH.md](BENCH.md#a-control-lane-for-acks-november-13)). Four changes to
+retirement missed their bars. Keeping data off lane 0 met its bar: the
+`daemon.control_lane` switch, off by default, removes every deferred ACK
+send on the loopback check, and with balanced lanes the 21G total rises
+to 13.7–15.9 Gbit/s, 11–29% above hash lanes. Hash lanes change little with
+it. The decision workload with the switch is next, then decision 5.
+
 ## November 12 checkpoint
 
 Stage 4 is done. An OVS system-port test now runs on Linux 6.8 and 7.0, with
@@ -188,13 +204,14 @@ Decisions only the user can make, each blocking a remaining goal:
    building it properly is the next lane-placement step. A trace places that
    loopback cost in the congestion window: with balanced lanes senders wait
    on it 35–37% of the time while hundreds of thousands of sent frames are
-   never acknowledged. The cause is found: ACKs always leave on lane 0's
-   socket and wait behind its data. Keeping lane 0 out of the balanced
-   rotation (exploratory) removes the ACK deferrals and lifts the loopback
-   check from 10.74 to 13.45 Gbit/s; against hash lanes in one container it
-   leads 14.43 to 11.32. Next: send ACKs so they never queue behind data,
-   for every lane policy (hash lanes defer them too at overload), then
-   re-decide.
+   never acknowledged. The cause was ACKs numbered from lane 0's packet
+   history, which lane 0's data fills under loss. `daemon.control_lane`
+   (landed November 13, off by default) keeps data off lane 0. With it,
+   balanced lanes deliver 13.7–15.9 Gbit/s on the loopback check against
+   12.3 with hash lanes and 10.7–10.8 without it
+   ([BENCH.md](BENCH.md#a-control-lane-for-acks-november-13)). The
+   decision workload with the control lane is measured next, and then this
+   decision becomes whether to turn on both switches.
    ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB
@@ -500,39 +517,16 @@ rules apply to all of them.
    double-fork readiness, the systemd unit, the VRF and composition tests and
    the V03 lifecycle cases are done.
 7. **Stage 5:** profile what remains and try its candidates behind switches.
-   First, as of November 13: ACK and control records always take numbers
-   from lane 0's packet history and wait when its data fills it under
-   overload (29,000–32,000 deferred ACK sends per point with balanced lanes,
-   up to 12,590 with hash lanes). Send them so they never wait on data, with tests and both
-   suites, then re-measure hash and balanced lanes (an exploratory version
-   that keeps lane 0 out of the balanced rotation leads hash lanes 14.4–14.6
-   to 11.3–11.9 Gbit/s on the loopback check) and the shared flow table,
-   before deciding `balance_flows`
-   ([BENCH.md](BENCH.md#a-flow-table-shared-by-all-readers-exploratory)).
-   Scope: the only production site is `Worker::send_record`
-   (`src/worker.rs`), which takes lane 0's socket and lane 0's packet
-   history; a refused attempt counts as `ack_send_deferred` and retries
-   after `RETRY`. It refuses when lane 0's sent history cannot reserve a
-   number (with probe headroom, or at the reserve itself), when the
-   per-worker control budget is full, and when the socket send fails.
-   Diagnostic runs with balanced lanes on the loopback check
-   ([counts](benches/control-refusals.txt)) put nearly every deferral on
-   lane 0's history: 21,585 history refusals against 21,488 deferrals in
-   one daemon and 36,552 against 36,403 in the other, with 8 and 4 budget
-   refusals and no socket failures. (An earlier reading of "about half"
-   summed a snapshot that each log prints twice.) The headroom is only 64
-   of 65,536 numbers, but `can_reserve` also refuses to slide the floor
-   while any delivery sample or validated ACK is pending, so a refusal does
-   not by itself mean 65,536 unacknowledged packets; recording the floor
-   state at each refusal comes next. Either way the cause is lane 0's
-   history, not its socket, so ordering control ahead of data on lane 0
-   would not help, and a control lane with its own history would. `tx_lanes`
-   may reach 64, so a control lane needs a 65th lane ID. The wire's 16-bit
-   lane field and the receive-owner table (65,536 entries) allow it. It
-   needs a 65th receive-lane table in each session's pool (startup reserves
-   64) with its memory charge, and room in its receive owner's 64 slots
-   (a `u64` occupancy mask), which only a worker owning all 64 data lanes
-   would lack. Many worker unit tests assume lane 0 for control.
+   As of November 13 the ACK-path fix has landed as `daemon.control_lane`,
+   off by default
+   ([BENCH.md](BENCH.md#a-control-lane-for-acks-november-13)). Next:
+   measure it on the decision workload (four and sixteen flows, 2G and 5G,
+   hash and balanced lanes) and on the lossy one-flow row, then re-measure
+   the shared flow table with it before deciding `balance_flows` and
+   `control_lane` together (decision 5). A peer with one lane keeps ACKs and
+   data on lane 0 and can still defer ACKs under loss; a separate number
+   space for control (a 65th lane ID with its own receive table) would cover
+   it if that case matters.
 
 If evidence shows a gate cannot be reached within the current design, write
 that conclusion with its evidence in BENCH.md and here instead of trying more
