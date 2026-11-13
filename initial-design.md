@@ -781,7 +781,12 @@ offer-limited point, in rotating rounds with an A/A copy:
 4. Deferred checksums: a frame whose transport checksum the sender left
    partial carries its checksum start and offset, and the receiver asks the
    kernel to complete it, which a NIC with checksum offload does for free.
-   Peers without the feature keep complete checksums.
+   Peers without the feature keep complete checksums. Today each frame is
+   summed twice per hop, about 150 cycles each for 1,500 bytes: the sender
+   completes every GSO segment's checksum, and the receiver verifies every
+   frame's checksum before coalescing so that a coalesced write cannot
+   launder a corrupted frame. A frame marked partial needs neither, since
+   its payload has not left the kernels that hold it.
 5. Fewer cross-worker wakes: batch handoffs per turn and keep frames on
    reader-local lanes where flow balance allows.
 6. One flow striped across transmit workers with a receive-side reorder
