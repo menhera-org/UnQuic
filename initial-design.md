@@ -702,6 +702,93 @@ At an assumed 90 percent effective encapsulation efficiency, delivering 5 Gbit/s
 
 The local container acceptance requirement is at least 20 Gbit/s of delivered inner goodput in each direction simultaneously at inner MTU 1500, with CPU use reported. This requirement provides processing headroom for the 5 Gbit/s real-access target. Both require measurements through the complete transport; codec or socket microbenchmarks cannot establish either result. Existing WireGuard implementations already use substantial batching and offload optimization. [S18]
 
+## 13.1 Top-down budget for 20 Gbit/s on a low-power box (November 13 amendment)
+
+Targets include four-core boxes of the R86S class. This budget starts from
+what such a box supplies and divides it among the operations each frame
+needs. The hardware figures are assumptions until measured on the box
+itself: four cores at 2.0 GHz base and 2.9 GHz burst, and single-socket
+LPDDR4x memory.
+
+**Supply.** Four cores give 8.0–11.6 billion cycles a second, between base
+and burst clocks. Keeping a tenth for the kernel's housekeeping, interrupts
+and management leaves 7.2–10.4 billion.
+
+**Demand.** 20 Gbit/s of 1514-byte frames each way is 1.65 million frames a
+second each way. Each box sends one stream and receives the other: 3.3
+million frame events a second. At a 1452-byte outer payload, frames take
+1.06 datagrams each when packed fully and 1.14 as measured, so 1.75–1.88
+million datagrams a second each way.
+
+**Budget per frame event: 2,200–3,150 cycles, kernel and userspace
+together.** That covers the inner side (NIC, bridge and TAP), the outer
+side (UDP send or receive), and everything the daemon does.
+
+**Where it goes today.** Measured per frame event at `f1788ab`, on an
+offer-limited loopback run whose emulated outer path segments in software
+(BENCH.md):
+
+| Operation | Kernel now | Userspace now | Target, both | How |
+| --- | --- | --- | --- | --- |
+| Outer UDP send (`sendmmsg`) | 850 | 150 | 350 | NIC segmentation; `MSG_ZEROCOPY` for large sends |
+| Outer UDP receive (`recvmmsg`) | 460 | – | 250 | GRO |
+| TAP read and input expansion | 300 | 370 | 150 | Large frames: one read and no expansion per super-frame |
+| TAP write and output coalescing | 640 | 350 | 200 | Large frames: one write per super-frame |
+| Wakes, polls, timers, eventfd reads | 880 | – | 250 | Fewer cross-worker handoffs, batched wakes |
+| ACK and control sends | 200 | – | 100 | Fewer, larger ACKs |
+| Transmit planning, claim, finish, submit | – | 600 | 200 | One compact per-packet record |
+| Recovery staging of acknowledged packets | – | 330 | 80 | Pieces inline, staged during ACK application |
+| ACK application and controller reports | – | 200 | 80 | One summary per ACK |
+| Receive admission and dispatch | – | 890 | 300 | One decode pass, compact slot index, no reassembly copy |
+| Queues and the rest | – | 260 | 100 | |
+| **Total** | **3,330** | **3,150** | **2,060** | |
+
+The inner side's NIC and bridge work is not in these figures and comes out
+of the same budget; with GRO on the inner NIC it might take a few hundred
+cycles per frame event, which has to be measured. The target column then
+fits the 3,150-cycle budget at burst clock with margin, and comes close to
+the 2,200-cycle budget at base clock. The large-frame lines carry most of
+the reduction: per-frame work (input expansion, output coalescing, frame
+records) is then paid once per GSO super-frame of up to 44 segments rather
+than per frame. Small or non-GSO traffic keeps the per-frame costs, so its
+rate in frames a second, not bytes, sets that limit.
+
+**Memory bandwidth.** Each payload byte is copied five times by the CPU
+across the two boxes: the sender's TAP read and UDP send, then the
+receiver's UDP receive, reassembly copy and TAP write. Per box that is 12.5
+GB/s of copying at 20 Gbit/s each way, about 25 GB/s of memory traffic when
+the data is not cache-resident. That is at or above what a single-socket
+LPDDR4x box sustains. The reassembly copy has to go: the receiver writes a
+frame to the TAP from the receive buffers that carry it. Large sends can use
+`MSG_ZEROCOPY`.
+
+**Order of work**, each change judged as CPU per delivered bit at an
+offer-limited point, in rotating rounds with an A/A copy:
+
+1. One compact per-packet record on the transmit owner, holding the
+   packet's frame pieces inline in the common case and replacing journal
+   nodes, send records and repeated plan-piece passes; recovery staged
+   during ACK application; one ACK summary per ACK. No wire change.
+2. Receive without the reassembly copy, and one decode pass per datagram.
+   No wire change.
+3. Large frames: an optional handshake feature lets a DATA frame carry a TAP
+   GSO super-frame (TCP or UDP segmentation, up to 64 KiB) with its
+   segmentation metadata. The receiver writes it with a virtio-net header
+   when its TAP accepts that offload and segments it in software otherwise.
+   Repair, lifetime and coverage keep their per-byte semantics. Large-frame
+   reassembly slots come from their own bounded pool charged to
+   `memory_limit`.
+4. Deferred checksums: a frame whose transport checksum the sender left
+   partial carries its checksum start and offset, and the receiver asks the
+   kernel to complete it, which a NIC with checksum offload does for free.
+   Peers without the feature keep complete checksums.
+5. Fewer cross-worker wakes: batch handoffs per turn and keep frames on
+   reader-local lanes where flow balance allows.
+6. One flow striped across transmit workers with a receive-side reorder
+   stage (decision 7), built on the large-frame identity.
+
+The kernel columns can only be confirmed on the box itself, with real NICs.
+
 # 14 Validation and acceptance
 
 Freeze a repeatable acceptance profile before declaring the performance requirements met. It must name the endpoint hardware and core budget, inner MTU, frame mix, flow count, traffic direction, attachment topology, loss profile, and contemporaneous direct-underlay capacity.

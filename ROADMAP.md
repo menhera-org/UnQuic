@@ -561,16 +561,20 @@ rules apply to all of them.
    Both switches are on by default (decision 5). The per-frame budget
    ([BENCH.md](BENCH.md#the-per-frame-cost-budget-november-13)) is about
    7,000 busy cycles per frame event per daemon, spread over ten parts, so a
-   four-core R86S-class box could carry only about 10 Gbit/s. Coverage
-   planes landed (3–6%). Next, each judged on the full-size efficiency
-   point (`effbig`-style rotating rounds with an A/A copy): one ACK summary
-   per ACK instead of a report round trip per 64 packets; a compact
-   per-packet record holding its frame pieces inline, replacing five
-   passes over plan pieces; per-syscall delivery samples. Then, with design
-   amendments because the wire or frame model changes: carrying TAP GSO
-   super-frames as one unit end to end, leaving segment checksums to the
-   receiving kernel or NIC, and striping one flow with a receive-side
-   reorder stage (decision 7). The kernel test
+   four-core R86S-class box could carry only about 10 Gbit/s. The top-down
+   budget for 20 Gbit/s each way is in design section 13.1: 2,200–3,150
+   cycles per frame event for kernel and userspace together, against about
+   6,480 now, with a per-operation target that sums to about 2,060, and a
+   memory-bandwidth limit that rules out the receive-side reassembly copy.
+   Coverage planes (3–6%) and a merged piece-reservation pass (about 2%)
+   landed. Next, in the section's order, each judged on the full-size
+   efficiency point (rotating rounds with an A/A copy): the compact
+   per-packet record with staging during ACK application and one ACK
+   summary per ACK; receive without the reassembly copy; large frames
+   carrying TAP GSO super-frames; deferred checksums; fewer cross-worker
+   wakes; then one flow striped with a receive-side reorder stage
+   (decision 7). The kernel figures can only be confirmed on an R86S-class
+   box with real NICs. The kernel test
    `tap::read::tests::real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch`
    failed once on Linux 6.8 with `WouldBlock` and passed on rerun: it reads
    right after raw-socket sends, so delivery into the TAP can lag; it needs
