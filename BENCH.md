@@ -474,7 +474,8 @@ daemon defers 29,000–32,000 ACK sends per point, against 0–97 with hash
 lanes. A deferral means the send attempt submitted no datagram. ACKs and
 other non-handshake control records always go out on lane 0's socket, and
 balanced lanes give lane 0 its round-robin share of the data, so the
-leading hypothesis is ACKs waiting behind data on that socket.
+leading hypothesis was ACKs waiting behind data on that socket; the refusal
+diagnostic below places the wait in lane 0's packet history instead.
 
 An exploratory build that keeps lane 0 out of the balanced rotation
 ([patch](benches/balanced-skip-lane0-exploratory.patch), stated beforehand
@@ -504,11 +505,23 @@ reverse-order pair repeats it, 14.61 against 11.92
 ([results](benches/loopback-hash-vs-balanced-skip-lane0-2.json)): the
 old loopback objection to balanced lanes turns into a 27% lead once ACKs
 stay off the busy lane. Balanced
-lanes' loopback cost was ACKs queued behind data on lane 0's socket. A
-proper fix keeps ACKs off a busy data socket for every lane policy (hash
-lanes put data on lane 0 too), and needs tests, both suites and the full
-bars before it lands. A production version needs tests,
-a memory charge for the table and the full bars before it can land.
+lanes' loopback cost was ACKs held back by data on lane 0.
+
+The socket is not where they wait. A diagnostic that counts each refusal
+cause in `Worker::send_record`
+([patch](benches/control-refusal-diagnostic.patch), profile build, one run
+of each arm, [counts](benches/control-refusals.txt)) finds no socket
+failures in any arm. With balanced lanes it records 21,585 and 36,552
+refusals by lane 0's sent history against 21,488 and 36,403 deferred ACK
+sends, and 8 and 4 refusals by the control budget. Hash lanes refuse
+nothing on that run. Control records take their packet numbers from lane
+0's history, so when data fills that history up to its unacknowledged
+floor, ACKs cannot be numbered. Sending control ahead of data on lane 0
+would not help; control records need a history that data cannot fill. A
+proper fix does that for every lane policy (hash lanes put data on lane 0
+too), and needs tests, both suites and the full bars before it lands. The
+shared flow table needs tests, a memory charge for the table and the full
+bars before it can land.
 
 ## Whether the single QinQ reader limits the loopback check (November 11)
 

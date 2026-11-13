@@ -1,19 +1,20 @@
 diff --git a/src/profile.rs b/src/profile.rs
-index c12610b..7f09041 100644
+index c12610b..b39ac1f 100644
 --- a/src/profile.rs
 +++ b/src/profile.rs
-@@ -66,6 +66,10 @@ pub fn now() -> u64 {
+@@ -66,6 +66,11 @@ pub fn now() -> u64 {
  pub static ADMISSION: [std::sync::atomic::AtomicU64; 4] =
      [const { std::sync::atomic::AtomicU64::new(0) }; 4];
  
-+/// Diagnostic: control sends refused by lane 0's history, then by the socket.
-+pub static CONTROL_REFUSED: [std::sync::atomic::AtomicU64; 2] =
-+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
++/// Diagnostic: control sends refused by lane 0's history headroom, by the
++/// control budget before any send, by the socket, and refused otherwise.
++pub static CONTROL_REFUSED: [std::sync::atomic::AtomicU64; 4] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 +
  /// Per-process syscall totals: cycles, calls and items for sendmmsg, then timerfd_settime.
  pub static SYSCALLS: [[std::sync::atomic::AtomicU64; 3]; 2] =
      [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 2];
-@@ -94,8 +98,11 @@ pub fn report(worker: usize, phases: &[u64; PHASES]) {
+@@ -94,8 +99,11 @@ pub fn report(worker: usize, phases: &[u64; PHASES]) {
      let timer = SYSCALLS[1]
          .each_ref()
          .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
@@ -22,12 +23,12 @@ index c12610b..7f09041 100644
 +        .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
      let mut line = format!(
 -        "unquic: profile worker {worker} admission inputs/buffers/frames/bytes {admission:?} sendmmsg cycles/calls/datagrams {sendmmsg:?} timerfd_settime cycles/calls {:?} cycles {total}",
-+        "unquic: profile worker {worker} control_refused history/socket {refused:?} admission inputs/buffers/frames/bytes {admission:?} sendmmsg cycles/calls/datagrams {sendmmsg:?} timerfd_settime cycles/calls {:?} cycles {total}",
++        "unquic: profile worker {worker} control_refused history/budget/socket/other {refused:?} admission inputs/buffers/frames/bytes {admission:?} sendmmsg cycles/calls/datagrams {sendmmsg:?} timerfd_settime cycles/calls {:?} cycles {total}",
          &timer[..2]
      );
      for index in order.into_iter().filter(|&index| phases[index] != 0) {
 diff --git a/src/worker.rs b/src/worker.rs
-index b59ec02..0045915 100644
+index b59ec02..1518e4d 100644
 --- a/src/worker.rs
 +++ b/src/worker.rs
 @@ -4288,6 +4288,9 @@ impl Worker {
@@ -40,3 +41,47 @@ index b59ec02..0045915 100644
                  return Ok(None);
              }
              self.sessions[session].tx[0]
+@@ -4295,6 +4298,8 @@ impl Worker {
+                 .and_then(|lane| lane.record(record, bytes).ok())
+         };
+         let Some(packet) = packet else {
++            #[cfg(feature = "profile")]
++            crate::profile::CONTROL_REFUSED[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+             return Ok(None);
+         };
+         if let Some(index) = history {
+@@ -4305,14 +4310,21 @@ impl Worker {
+                 false,
+             ) {
+                 Ok(()) => {}
+-                Err(crate::ack::HistoryError::Full) => return Ok(None),
++                Err(crate::ack::HistoryError::Full) => {
++                    #[cfg(feature = "profile")]
++                    crate::profile::CONTROL_REFUSED[0]
++                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                    return Ok(None);
++                }
+                 Err(error) => return Err(io::Error::other(error)),
+             }
+         }
+         let mut handshake = record
+             .is_handshake()
+             .then(|| &mut self.controls[session].state);
++        let attempted = std::cell::Cell::new(false);
+         let mut send = || {
++            attempted.set(true);
+             let at = clock()?;
+             if let Some(state) = handshake.as_mut()
+                 && !state.prepare_send(record, at).map_err(io::Error::other)?
+@@ -4353,6 +4365,11 @@ impl Worker {
+                 .ok_or_else(|| io::Error::other("control transmission on a non-owner worker"))?;
+             budget.send(packet.length + 48, prepared, send)
+         };
++        #[cfg(feature = "profile")]
++        if result.is_err() {
++            crate::profile::CONTROL_REFUSED[if attempted.get() { 2 } else { 1 }]
++                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
+         if let Some(index) = history {
+             match &result {
+                 Ok(started)

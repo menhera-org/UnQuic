@@ -500,10 +500,10 @@ rules apply to all of them.
    double-fork readiness, the systemd unit, the VRF and composition tests and
    the V03 lifecycle cases are done.
 7. **Stage 5:** profile what remains and try its candidates behind switches.
-   First, as of November 12: ACK and control records always leave on lane
-   0's socket and queue behind its data under overload (29,000–32,000
-   deferred ACK sends per point with balanced lanes, up to 12,590 with hash
-   lanes). Send them so they never wait behind data, with tests and both
+   First, as of November 13: ACK and control records always take numbers
+   from lane 0's packet history and wait when its data fills it under
+   overload (29,000–32,000 deferred ACK sends per point with balanced lanes,
+   up to 12,590 with hash lanes). Send them so they never wait on data, with tests and both
    suites, then re-measure hash and balanced lanes (an exploratory version
    that keeps lane 0 out of the balanced rotation leads hash lanes 14.4–14.6
    to 11.3–11.9 Gbit/s on the loopback check) and the shared flow table,
@@ -512,24 +512,27 @@ rules apply to all of them.
    Scope: the only production site is `Worker::send_record`
    (`src/worker.rs`), which takes lane 0's socket and lane 0's packet
    history; a refused attempt counts as `ack_send_deferred` and retries
-   after `RETRY`. It refuses in two places: when lane 0's sent history
-   cannot reserve a number with probe headroom, and when the socket send
-   fails. A diagnostic run with balanced lanes on the loopback check
-   ([counts](benches/control-refusals.txt)) puts about half the deferrals
-   (24,607 of 48,799 and 37,765 of 75,170 per daemon) on lane 0's history
-   headroom; the rest come from the socket or the later reserve check,
-   which that patch did not count. The headroom is only 64 of 65,536
-   numbers, so those refusals mean lane 0's history is full, its floor
-   pinned by unacknowledged data. That favours a control lane with its own
-   history over merely ordering control ahead of data on lane 0. `tx_lanes`
+   after `RETRY`. It refuses when lane 0's sent history cannot reserve a
+   number (with probe headroom, or at the reserve itself), when the
+   per-worker control budget is full, and when the socket send fails.
+   Diagnostic runs with balanced lanes on the loopback check
+   ([counts](benches/control-refusals.txt)) put nearly every deferral on
+   lane 0's history: 21,585 history refusals against 21,488 deferrals in
+   one daemon and 36,552 against 36,403 in the other, with 8 and 4 budget
+   refusals and no socket failures. (An earlier reading of "about half"
+   summed a snapshot that each log prints twice.) The headroom is only 64
+   of 65,536 numbers, but `can_reserve` also refuses to slide the floor
+   while any delivery sample or validated ACK is pending, so a refusal does
+   not by itself mean 65,536 unacknowledged packets; recording the floor
+   state at each refusal comes next. Either way the cause is lane 0's
+   history, not its socket, so ordering control ahead of data on lane 0
+   would not help, and a control lane with its own history would. `tx_lanes`
    may reach 64, so a control lane needs a 65th lane ID. The wire's 16-bit
    lane field and the receive-owner table (65,536 entries) allow it. It
    needs a 65th receive-lane table in each session's pool (startup reserves
    64) with its memory charge, and room in its receive owner's 64 slots
    (a `u64` occupancy mask), which only a worker owning all 64 data lanes
-   would lack. Two shapes are possible: send control records ahead of
-   data on lane 0, or give them a lane of their own with its own history.
-   Many worker unit tests assume lane 0 for control.
+   would lack. Many worker unit tests assume lane 0 for control.
 
 If evidence shows a gate cannot be reached within the current design, write
 that conclusion with its evidence in BENCH.md and here instead of trying more

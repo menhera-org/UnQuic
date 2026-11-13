@@ -1,5 +1,15 @@
-Control-record refusals by lane 0 history headroom (benches/control-refusal-diagnostic.patch, profile build), loopback check, eight workers, one run each, whole run including the 4G warm-up, November 12. history = refused because lane 0 history cannot reserve with probe headroom; deferred_total = ack_send_deferred summed over workers.
-hash left control_refused history/socket [0, 0] deferred_total=0
-hash right control_refused history/socket [130, 0] deferred_total=256
-bal left control_refused history/socket [24607, 0] deferred_total=48799
-bal right control_refused history/socket [37765, 0] deferred_total=75170
+Control-record refusals (benches/control-refusal-diagnostic.patch, profile build), loopback check, eight workers, one run each, whole run including the 4G warm-up.
+history = lane 0's sent history refused (probe headroom or reserve Full); budget = control budget full before any send; socket = send attempted and failed; other = no packet built.
+deferred = ack_send_deferred in worker 0's last snapshot (only worker 0 defers). Each log prints that snapshot twice; an earlier version of this file summed both and so doubled it. The refusal counters are read when the daemon stops, a little after the last snapshot.
+
+November 13 (four causes):
+hash left control_refused history/budget/socket/other [0, 0, 0, 0] deferred=0
+hash right control_refused history/budget/socket/other [0, 0, 0, 0] deferred=0
+bal left control_refused history/budget/socket/other [21585, 8, 0, 0] deferred=21488
+bal right control_refused history/budget/socket/other [36552, 4, 0, 0] deferred=36403
+
+November 12 (history headroom and socket only):
+hash left control_refused history/socket [0, 0] deferred=0
+hash right control_refused history/socket [130, 0] deferred=128
+bal left control_refused history/socket [24607, 0] deferred=24474
+bal right control_refused history/socket [37765, 0] deferred=37585
