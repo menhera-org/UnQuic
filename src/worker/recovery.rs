@@ -1,6 +1,7 @@
 //! Payload coverage stays local; sampler handles name packet mappings until settlement.
 use super::*;
 use crate::ack::{FramePiece, PieceJournal};
+use crate::wire::MAX_RECORDS;
 
 const MAPPINGS_PER_FRAME: usize = 32;
 const PACKETS: usize = u16::MAX as usize;
@@ -31,6 +32,8 @@ pub(super) struct Recovery {
     pub quiesce: Option<usize>,
     // Frames waiting in a repair queue: unrepaired loss for application-limited checks.
     repairs: usize,
+    // One packet's pieces while reserving, kept so no turn refills 64 entries.
+    pieces: [FramePiece; MAX_RECORDS],
 }
 
 impl Recovery {
@@ -64,6 +67,7 @@ impl Recovery {
             cursor: 0,
             quiesce: None,
             repairs: 0,
+            pieces: [FramePiece::default(); MAX_RECORDS],
         })
     }
 
@@ -453,89 +457,13 @@ impl Worker {
                 return Ok(false);
             }
         }
-        let flight = &self.sender.flight;
+        // One pass validates each packet's pieces and reserves them; any failure
+        // rolls back the packets already reserved, so nothing is left half-linked.
         for ordinal in 0..count {
-            let sample = flight.handle(ordinal).ok_or(io::ErrorKind::InvalidData)?;
-            if !self
-                .recovery
-                .journal
-                .packet_empty(usize::from(sample.get()) - 1)
-            {
-                return Err(io::Error::other("live packet mapping reused"));
-            }
-            let packet = batch
-                .plan
-                .packet(ordinal)
-                .ok_or(io::ErrorKind::InvalidData)?;
-            let mut bytes = 0;
-            for (slot, range) in batch
-                .plan
-                .pieces(ordinal)
-                .ok_or(io::ErrorKind::InvalidData)?
-            {
-                let index = batch
-                    .frames
-                    .get(slot)
-                    .copied()
-                    .flatten()
-                    .ok_or(io::ErrorKind::InvalidData)?;
-                let frame = self.frames.frame(index).ok_or(io::ErrorKind::InvalidData)?;
-                let selected = batch
-                    .selection
-                    .get(slot)
-                    .ok_or(io::ErrorKind::InvalidData)?;
-                let allowed = if batch.repair {
-                    usize::from(selected.start)..usize::from(selected.end)
-                } else {
-                    frame.offset..frame.length()
-                };
-                if range.is_empty() || range.start < allowed.start || range.end > allowed.end {
-                    return Err(io::Error::other("DATA mapping exceeds selected range"));
-                }
-                bytes += range.len();
-            }
-            if bytes > packet.length || packet.length > 8952 {
-                return Err(io::Error::other("DATA mapping exceeds datagram"));
-            }
-        }
-        for ordinal in 0..count {
-            let packet = batch
-                .plan
-                .packet(ordinal)
-                .ok_or(io::ErrorKind::InvalidData)?;
-            let sample = flight.handle(ordinal).ok_or(io::ErrorKind::InvalidData)?;
-            let mut pieces = [FramePiece::default(); 64];
-            let mut length = 0;
-            let mut n = 0;
-            for (slot, range) in batch
-                .plan
-                .pieces(ordinal)
-                .ok_or(io::ErrorKind::InvalidData)?
-            {
-                if n == pieces.len() {
-                    return Err(io::ErrorKind::InvalidData.into());
-                }
-                let index = batch.frames[slot].ok_or(io::ErrorKind::InvalidData)?;
-                let frame = self.frames.frame(index).ok_or(io::ErrorKind::InvalidData)?;
-                length += range.len();
-                pieces[n] = FramePiece {
-                    frame_slot: index as u16,
-                    frame_id: frame.id,
-                    start: range.start as u16,
-                    end: range.end as u16,
-                    attempt: batch.selection[slot].attempt,
-                };
-                n += 1;
-            }
-            if length > packet.length
-                || packet.length > 8952
-                || !self
-                    .recovery
-                    .journal
-                    .reserve_packet(usize::from(sample.get()) - 1, &pieces[..n])
-            {
+            let reserved = self.reserve_packet_pieces(batch, ordinal);
+            if let Err(error) = reserved {
                 for prior in 0..ordinal {
-                    if let Some(sample) = flight.handle(prior) {
+                    if let Some(sample) = self.sender.flight.handle(prior) {
                         while self
                             .recovery
                             .journal
@@ -544,10 +472,76 @@ impl Worker {
                         {}
                     }
                 }
-                return Err(io::Error::other("invalid reserved DATA mappings"));
+                return Err(error);
             }
         }
         Ok(true)
+    }
+
+    /// Validates one planned packet's pieces against their selected ranges and
+    /// reserves them in the journal, or changes nothing.
+    fn reserve_packet_pieces(&mut self, batch: &TxBatch, ordinal: usize) -> io::Result<()> {
+        let sample = self
+            .sender
+            .flight
+            .handle(ordinal)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let slot = usize::from(sample.get()) - 1;
+        if !self.recovery.journal.packet_empty(slot) {
+            return Err(io::Error::other("live packet mapping reused"));
+        }
+        let packet = batch
+            .plan
+            .packet(ordinal)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let mut length = 0;
+        let mut n = 0;
+        for (piece, range) in batch
+            .plan
+            .pieces(ordinal)
+            .ok_or(io::ErrorKind::InvalidData)?
+        {
+            let index = batch
+                .frames
+                .get(piece)
+                .copied()
+                .flatten()
+                .ok_or(io::ErrorKind::InvalidData)?;
+            let frame = self.frames.frame(index).ok_or(io::ErrorKind::InvalidData)?;
+            let selected = batch
+                .selection
+                .get(piece)
+                .ok_or(io::ErrorKind::InvalidData)?;
+            let allowed = if batch.repair {
+                usize::from(selected.start)..usize::from(selected.end)
+            } else {
+                frame.offset..frame.length()
+            };
+            if range.is_empty() || range.start < allowed.start || range.end > allowed.end {
+                return Err(io::Error::other("DATA mapping exceeds selected range"));
+            }
+            *self
+                .recovery
+                .pieces
+                .get_mut(n)
+                .ok_or(io::ErrorKind::InvalidData)? = FramePiece {
+                frame_slot: index as u16,
+                frame_id: frame.id,
+                start: range.start as u16,
+                end: range.end as u16,
+                attempt: selected.attempt,
+            };
+            n += 1;
+            length += range.len();
+        }
+        if length > packet.length || packet.length > 8952 {
+            return Err(io::Error::other("DATA mapping exceeds datagram"));
+        }
+        let recovery = &mut self.recovery;
+        if !recovery.journal.reserve_packet(slot, &recovery.pieces[..n]) {
+            return Err(io::Error::other("invalid reserved DATA mappings"));
+        }
+        Ok(())
     }
 
     /// Call before completing the flight, while every prepared packet is visible.

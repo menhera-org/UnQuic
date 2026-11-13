@@ -372,6 +372,19 @@ median of −0.7% here, and 5 of 8 pairs at −0.6% on the small-frame point
 ([results](benches/small-frames-compact-sequences-rejected.json)), so it is
 rejected.
 
+## One pass to validate and reserve DATA pieces (November 13, landed)
+
+Reserving a send plan's piece mappings walked every packet's pieces three
+times (count, validate ranges, build and reserve) and zero-filled a 64-entry
+piece array for each packet. Validation now happens while building each
+packet's pieces, failure rolls back the packets already reserved as before,
+and the piece array is kept between packets. Stated beforehand as needing
+five of six rounds lower than both HEAD and its A/A copy with a median of
+−1% or better against the copy, on the full-size efficiency point
+([results](benches/full-size-reserve-pass.json)): lower in 6 of 6 rounds
+against both, −1.6% against HEAD and −2.5% against the copy, two of whose
+runs lost 0.8–2.2% of frames. HEAD against its copy: 3 of 6, −0.9%.
+
 ## What holds one flow near 1 Gbit/s (November 13)
 
 One flow at 7.5 ms delivers 1.00–1.07 Gbit/s per direction at 5G offered
