@@ -228,6 +228,7 @@ impl<'a> Frame<'a> {
             total_len: self.bytes.len() as u32,
             offset: self.offset as u32,
             bytes,
+            offload: false,
         };
         let length =
             encode_data_prefix(self.lane.header, record, prefix).map_err(PackError::Wire)?;
@@ -263,6 +264,7 @@ impl<'a> Frame<'a> {
             total_len: self.bytes.len() as u32,
             offset: self.offset as u32,
             bytes: self.bytes.get(self.offset..end).ok_or(PackError::Frame)?,
+            offload: false,
         };
         let packet = self.lane.record(record, output)?;
         self.offset = end;
@@ -653,6 +655,7 @@ impl Batch {
                     frame_len as u32,
                     offset as u32,
                     end - offset,
+                    false,
                     &mut prefix,
                 )
                 .map_err(PackError::Wire)?;
@@ -1209,6 +1212,7 @@ mod refill_tests {
                         total_len,
                         offset,
                         bytes,
+                        ..
                     } = record
                     else {
                         panic!()

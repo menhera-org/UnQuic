@@ -28,6 +28,7 @@ fn main() {
                     total_len: length as u32,
                     offset: offset as u32,
                     bytes: &frame[offset..end],
+                    offload: false,
                 }],
                 &mut bytes,
             )

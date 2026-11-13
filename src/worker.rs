@@ -5690,6 +5690,7 @@ mod tests {
             total_len: 60,
             offset,
             bytes,
+            offload: false,
         }
     }
 
@@ -5793,6 +5794,7 @@ mod tests {
                     total_len: 60,
                     offset: 0,
                     bytes: &[sequence as u8; 60],
+                    offload: false,
                 }],
                 &mut buffer.bytes,
             )
@@ -5867,6 +5869,7 @@ mod tests {
                     total_len: 60,
                     offset: 0,
                     bytes: &[5; 30],
+                    offload: false,
                 }],
                 &mut buffer.bytes,
             )
@@ -6714,6 +6717,7 @@ mod tests {
                         total_len: 1514,
                         offset: 0,
                         bytes: &[3; 1164],
+                        offload: false,
                     }],
                     &mut buffer.bytes[buffer.length..],
                 );
@@ -8249,6 +8253,7 @@ mod tests {
                             total_len: total as u32,
                             offset: offset as u32,
                             bytes: &payload[..1 + rng.below((total - offset).min(1400))],
+                            offload: false,
                         }
                     }
                     2 => match AckRanges::new(&storage[slot][..counts[slot]]) {
@@ -8589,6 +8594,7 @@ mod tests {
                     total_len: 60,
                     offset: 0,
                     bytes: &[5; 30],
+                    offload: false,
                 }],
                 &mut buffer.bytes,
             )
@@ -8755,6 +8761,7 @@ mod tests {
                     total_len: if short { 14 } else { 60 },
                     offset: 0,
                     bytes: if short { &[5; 14] } else { &[5; 30] },
+                    offload: false,
                 }],
                 &mut buffer.bytes[start..],
             )

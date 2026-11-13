@@ -868,6 +868,7 @@ fn scattered_headers_match_contiguous_frames_across_boundaries_and_retries() {
                                 total_len,
                                 offset,
                                 bytes,
+                                ..
                             } = record
                             else {
                                 panic!("unexpected record")
@@ -947,6 +948,7 @@ fn selected_ranges_preserve_total_length_across_spans_and_partial_sends() {
                         total_len,
                         offset,
                         bytes: payload,
+                        ..
                     } = record
                     else {
                         panic!("unexpected record");

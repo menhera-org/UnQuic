@@ -566,6 +566,7 @@ fn partial_batches_with_feedback(feedback: bool) {
                     total_len,
                     offset,
                     bytes,
+                    ..
                 } = record
                 {
                     let sequence = (frame_id & ((1 << 48) - 1)) as usize;

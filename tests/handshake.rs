@@ -467,10 +467,35 @@ fn negotiation_enforces_required_size_and_ignores_unknown_optional_bits() {
     let connection = effects.commit.unwrap();
     assert_eq!(connection.max_frame_len, 3000);
     assert_eq!(connection.peer, peer);
+    // Offload frames need both sides; the peer's bit alone is not enough.
+    assert!(!connection.offload_frames());
+    let mut offloading = Session::new(
+        Params {
+            optional_features: unquic::wire::OFFLOAD_FRAMES,
+            ..B
+        },
+        A.port,
+        2422,
+    )
+    .unwrap();
+    receive(&mut offloading, ha_for(1, peer), 0, 2);
+    let connection = receive(
+        &mut offloading,
+        Record::Confirm {
+            initiator: 1,
+            responder: 2,
+        },
+        0,
+        3,
+    )
+    .commit
+    .unwrap();
+    assert!(connection.offload_frames());
+    // Unknown local bits are still refused.
     assert!(
         Session::new(
             Params {
-                optional_features: 1,
+                optional_features: 2,
                 ..A
             },
             B.port,
@@ -866,6 +891,7 @@ fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
         total_len: 60,
         offset: 0,
         bytes: &[3; 60],
+        offload: false,
     };
     let len = encode_datagram(header, &[record], &mut packet).unwrap();
     let datagram = Datagram::decode(&packet[..len]).unwrap();
@@ -892,6 +918,7 @@ fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
         let record = Record::Data {
             frame_id: (1 << 48) | sequence,
             bytes: &[3; 30],
+            offload: false,
             total_len: 60,
             offset: 0,
         };
@@ -915,12 +942,14 @@ fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
             total_len: 60,
             offset: 30,
             bytes: &[3; 30],
+            offload: false,
         },
         Record::Data {
             frame_id: (1 << 48) | 65,
             total_len: 60,
             offset: 0,
             bytes: &[3; 30],
+            offload: false,
         },
     ];
     let len = encode_datagram(

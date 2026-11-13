@@ -96,6 +96,7 @@ fn record(kind: usize) -> Record<'static> {
             total_len: 14,
             offset: 10,
             bytes: &[0xde, 0xad, 0xbe, 0xef],
+            offload: false,
         },
         2 => Record::Ack {
             lane: 0x5678,
@@ -203,6 +204,7 @@ fn data_and_ack_borrow_input_and_preserve_semantics() {
         total_len,
         offset,
         bytes: piece,
+        ..
     } = Datagram::decode(&bytes).unwrap().records().next().unwrap()
     else {
         panic!("expected DATA")
@@ -257,9 +259,15 @@ fn rejects_bad_header_length_magic_version_and_reserved_flags() {
 fn rejects_bad_record_types_lengths_flags_and_reserved_bodies() {
     for kind in 0..VECTORS.len() {
         let good = vector(kind);
-        let mut bad = good.clone();
-        bad[49] = 1;
-        assert_eq!(Datagram::decode(&bad).unwrap_err(), WireError::Reserved);
+        // DATA defines flag 1 (offload); every other value and record reserves it.
+        for flags in [1, 2, 3, 0x80] {
+            if kind == 1 && flags == 1 {
+                continue;
+            }
+            let mut bad = good.clone();
+            bad[49] = flags;
+            assert_eq!(Datagram::decode(&bad).unwrap_err(), WireError::Reserved);
+        }
         for length in [0u16, 1, 2, 3, u16::MAX] {
             let mut bad = good.clone();
             bad[50..52].copy_from_slice(&length.to_be_bytes());
@@ -371,11 +379,52 @@ fn rejects_data_identity_and_range_errors_without_overflow() {
             total_len: length as u32,
             offset: 0,
             bytes: &payload,
+            offload: false,
         };
         let mut output = vec![0; HEADER_LEN + record.encoded_len()];
         encode_datagram(header(false), &[record], &mut output).unwrap();
         roundtrip(&output);
     }
+}
+
+#[test]
+fn offload_flag_round_trips_and_moves_the_frame_length_bounds() {
+    let payload = [0x5a; 100];
+    let data = |total_len: u32, length: usize, offload: bool| Record::Data {
+        frame_id: FRAME,
+        total_len,
+        offset: 0,
+        bytes: &payload[..length],
+        offload,
+    };
+    for (total_len, length) in [(24, 24), (9023, 100), (65_535, 100)] {
+        let mut output = vec![0; HEADER_LEN + data(total_len, length, true).encoded_len()];
+        encode_datagram(header(false), &[data(total_len, length, true)], &mut output).unwrap();
+        assert_eq!(output[49], 1);
+        roundtrip(&output);
+        let Some(Record::Data { offload, .. }) =
+            Datagram::decode(&output).unwrap().records().next()
+        else {
+            panic!("expected DATA")
+        };
+        assert!(offload);
+        // The same bytes without the flag are an ordinary frame, whose ceiling is lower.
+        output[49] = 0;
+        assert_eq!(Datagram::decode(&output).is_ok(), total_len <= 9022);
+    }
+    // An offload frame must hold an Ethernet header after its descriptor.
+    let mut output = [0; 1024];
+    assert_eq!(
+        encode_datagram(header(false), &[data(23, 23, true)], &mut output),
+        Err(WireError::Data)
+    );
+    let mut prefix = [0; unquic::wire::DATA_PREFIX_LEN];
+    assert_eq!(
+        unquic::wire::encode_data_prefix(header(false), data(23, 23, true), &mut prefix),
+        Err(WireError::Data)
+    );
+    unquic::wire::encode_data_prefix(header(false), data(65_535, 100, true), &mut prefix).unwrap();
+    assert_eq!(prefix[HEADER_LEN + 1], 1);
 }
 
 #[test]
@@ -534,6 +583,7 @@ fn encoder_errors_never_modify_output() {
             total_len: 14,
             offset: 0,
             bytes: &[],
+            offload: false,
         }],
         vec![Record::Padding { length: u16::MAX }],
         vec![Record::Padding { length: 40000 }; 2],

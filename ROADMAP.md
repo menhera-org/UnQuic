@@ -580,8 +580,12 @@ rules apply to all of them.
    the full-size efficiency point (rotating rounds with an A/A copy):
    offload frames carrying TAP GSO super-frames with deferred checksums
    (design section 6), which divide per-frame work by up to 44 for GSO
-   traffic; then receive without the reassembly copy; fewer cross-worker
-   wakes; one flow striped with a receive-side reorder stage (decision 7).
+   traffic. They land in four steps behind the optional handshake bit, and
+   nothing changes on the wire until the last one advertises it. Step 1, the
+   DATA offload flag, its length bounds and the negotiated bit, has landed;
+   receivers still refuse offload pieces. The receiver, the sender and the
+   measurement follow. After them come receive without the reassembly
+   copy; fewer cross-worker wakes; one flow striped with a receive-side reorder stage (decision 7).
    The kernel figures can only be confirmed on an R86S-class box with real
    NICs; the remote 7.0 host stands in until then. The kernel test
    `tap::read::tests::real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch`

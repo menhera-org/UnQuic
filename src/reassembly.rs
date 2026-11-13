@@ -425,6 +425,8 @@ impl Lane {
         for record in datagram.records() {
             eliciting |= record.ack_eliciting();
             match record {
+                // Offload frames are not received yet; a peer must not send them.
+                Record::Data { offload: true, .. } => return Admission::Invalid,
                 Record::Data {
                     frame_id,
                     total_len,
@@ -480,6 +482,7 @@ impl Lane {
                     total_len,
                     offset,
                     bytes,
+                    ..
                 } => {
                     let sequence = frame_id & SEQUENCE_MASK;
                     if self.terminal.old(sequence) {
@@ -753,6 +756,7 @@ mod tests {
                     total_len: 60,
                     offset: 0,
                     bytes: &payload,
+                    offload: false,
                 }],
                 &mut bytes,
             )
@@ -826,6 +830,7 @@ mod tests {
                         total_len: total as u32,
                         offset: offset as u32,
                         bytes: &payload[..length],
+                        offload: false,
                     }
                 };
             }

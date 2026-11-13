@@ -83,6 +83,12 @@ impl Connection {
             Role::Responder => self.initiator,
         }
     }
+
+    /// Whether both endpoints advertised offload frames.
+    pub const fn offload_frames(self) -> bool {
+        self.local.optional_features & self.peer.optional_features & crate::wire::OFFLOAD_FRAMES
+            != 0
+    }
 }
 
 /// Session lifecycle, independent of TAP existence and daemon readiness.
@@ -183,14 +189,14 @@ pub struct Session {
 }
 
 impl Session {
-    /// Validates configuration; local optional feature bits must be zero in v1.
+    /// Validates configuration; local optional feature bits must be known ones.
     pub fn new(
         local: Params,
         peer_port: u16,
         required_frame_len: u16,
     ) -> Result<Self, HandshakeError> {
         local.validate().map_err(|_| HandshakeError::Parameters)?;
-        if local.optional_features != 0
+        if local.optional_features & !crate::wire::OFFLOAD_FRAMES != 0
             || peer_port == 0
             || !(1514..=local.max_frame_len).contains(&required_frame_len)
         {

@@ -17,6 +17,12 @@ pub const PROBE_PREFIX_LEN: usize = HEADER_LEN + 4 + 4;
 pub const MAX_RECORDS: usize = 64;
 /// Maximum number of ranges in one ACK record.
 pub const MAX_ACK_RANGES: usize = 32;
+/// Optional handshake feature bit 0: DATA may carry offload frames.
+pub const OFFLOAD_FRAMES: u32 = 1;
+/// Bytes of the descriptor that starts every offload frame.
+pub const DESCRIPTOR_LEN: usize = 10;
+/// Largest offload frame, descriptor included.
+pub const MAX_OFFLOAD_FRAME_LEN: usize = u16::MAX as usize;
 
 /// The 48-byte common header. Magic, version and flags are fixed by the codec.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,12 +209,16 @@ pub enum Record<'a> {
     Data {
         /// Lane in the high 16 bits, nonzero sequence in the low 48.
         frame_id: u64,
-        /// Complete Ethernet frame length.
+        /// Complete frame length, including an offload descriptor.
         total_len: u32,
         /// Byte offset of this piece.
         offset: u32,
         /// Borrowed frame bytes.
         bytes: &'a [u8],
+        /// Record flag bit 0: a piece of an offload frame, which starts with a
+        /// DESCRIPTOR_LEN-byte descriptor and may reach MAX_OFFLOAD_FRAME_LEN.
+        /// Valid only on connections that negotiated OFFLOAD_FRAMES.
+        offload: bool,
     },
     /// Transport acceptance of packets on the explicitly named sender lane.
     Ack {
@@ -333,8 +343,9 @@ impl Record<'_> {
             Self::Ready { .. } => 9,
             Self::LaneRetire { .. } => 10,
         };
+        let flags = u8::from(matches!(self, Self::Data { offload: true, .. }));
         // The length check above bounds every write; errors only keep this panic-free.
-        put(output, 0, &[kind, 0, (length >> 8) as u8, length as u8])?;
+        put(output, 0, &[kind, flags, (length >> 8) as u8, length as u8])?;
         let body = output.get_mut(4..length).ok_or(WireError::BufferTooSmall)?;
         match self {
             Self::Padding { .. } => body.fill(0),
@@ -343,6 +354,7 @@ impl Record<'_> {
                 total_len,
                 offset,
                 bytes,
+                ..
             } => {
                 encode_data_fields(
                     frame_id,
@@ -431,7 +443,8 @@ impl Record<'_> {
                 total_len,
                 offset,
                 bytes,
-            } => validate_data(frame_id, total_len, offset, bytes.len())?,
+                offload,
+            } => validate_data(frame_id, total_len, offset, bytes.len(), offload)?,
             Self::Ack {
                 lane,
                 delay_us,
@@ -629,11 +642,20 @@ pub fn encode_data_prefix(
         total_len,
         offset,
         bytes,
+        offload,
     } = data
     else {
         return Err(WireError::Data);
     };
-    encode_data_prefix_length(header, frame_id, total_len, offset, bytes.len(), output)
+    encode_data_prefix_length(
+        header,
+        frame_id,
+        total_len,
+        offset,
+        bytes.len(),
+        offload,
+        output,
+    )
 }
 
 fn validate_data(
@@ -641,13 +663,19 @@ fn validate_data(
     total_len: u32,
     offset: u32,
     length: usize,
+    offload: bool,
 ) -> Result<(), WireError> {
     if length > u16::MAX as usize - 20 {
         return Err(WireError::Length);
     }
+    let lengths = if offload {
+        (14 + DESCRIPTOR_LEN) as u32..=MAX_OFFLOAD_FRAME_LEN as u32
+    } else {
+        14..=MAX_FRAME_LEN as u32
+    };
     if frame_id >> 48 == 0
         || frame_id & 0x0000_ffff_ffff_ffff == 0
-        || !(14..=MAX_FRAME_LEN as u32).contains(&total_len)
+        || !lengths.contains(&total_len)
         || length == 0
         || offset > total_len
         || length > (total_len - offset) as usize
@@ -664,14 +692,16 @@ pub(crate) fn encode_data_prefix_length(
     total_len: u32,
     offset: u32,
     piece_len: usize,
+    offload: bool,
     output: &mut [u8; DATA_PREFIX_LEN],
 ) -> Result<usize, WireError> {
-    validate_data(frame_id, total_len, offset, piece_len)?;
+    validate_data(frame_id, total_len, offset, piece_len, offload)?;
     Record::Data {
         frame_id,
         total_len,
         offset,
         bytes: &[],
+        offload,
     }
     .validate_context(header, 1)?;
     let length = 20 + piece_len;
@@ -680,7 +710,7 @@ pub(crate) fn encode_data_prefix_length(
     put(
         output,
         HEADER_LEN,
-        &[1, 0, (length >> 8) as u8, length as u8],
+        &[1, u8::from(offload), (length >> 8) as u8, length as u8],
     )?;
     encode_data_fields(
         frame_id,
@@ -734,8 +764,9 @@ fn decode_record(input: &[u8]) -> Result<(Record<'_>, usize), WireError> {
     if input.len() < 4 {
         return Err(WireError::Length);
     }
-    let [kind, reserved] = read(input, 0);
-    if reserved != 0 {
+    let [kind, flags] = read(input, 0);
+    // Only DATA defines a flag: bit 0 marks an offload frame's piece.
+    if flags != 0 && (kind != 1 || flags != 1) {
         return Err(WireError::Reserved);
     }
     let length = usize::from(read16(input, 2));
@@ -755,6 +786,7 @@ fn decode_record(input: &[u8]) -> Result<(Record<'_>, usize), WireError> {
             total_len: read32(body, 8),
             offset: read32(body, 12),
             bytes: tail(body, 16),
+            offload: flags == 1,
         },
         2 if body.len() >= 8 => {
             let [count, reserved] = read(body, 2);
@@ -927,7 +959,7 @@ fn scattered_data_prefix_rejects_invalid_lengths_before_writing() {
     ] {
         let mut output = [0xa5; DATA_PREFIX_LEN];
         assert_eq!(
-            encode_data_prefix_length(header, id, total, offset, length, &mut output),
+            encode_data_prefix_length(header, id, total, offset, length, false, &mut output),
             Err(expected)
         );
         assert_eq!(output, [0xa5; DATA_PREFIX_LEN]);
@@ -961,6 +993,7 @@ fn random_and_mutated_datagrams_never_panic_decoding() {
         total_len: 100,
         offset: 10,
         bytes: &[7; 50],
+        offload: false,
     };
     let ack = Record::Ack {
         lane: 2,
