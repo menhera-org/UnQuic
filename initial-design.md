@@ -789,6 +789,50 @@ offer-limited point, in rotating rounds with an A/A copy:
 
 The kernel columns can only be confirmed on the box itself, with real NICs.
 
+**The compact per-packet record (item 1).** Today one sent DATA datagram
+touches five structures on its transmit owner: the flight plan, a 64-byte
+send record for delivery sampling, a 16-byte sent-history entry with four
+bitmaps, one journal node per frame piece linked into both a packet list
+and a frame list, and each frame's coverage planes. ACK application then
+fills an 80-byte report entry per packet, the owner reads it, and staging
+walks the journal again. The replacement:
+
+- A packet record per send-record handle, one 64-byte cache line: batch
+  reference, ordinal in its batch, outer bytes, flags, and up to three
+  inline pieces (frame slot, slot generation, start, end, attempt).
+  Packets with more pieces, which only small frames produce, keep using
+  the journal for the rest.
+- A delivery sample per `sendmmsg` call rather than per packet: send order
+  base, send time, first-sent time, delivered time, delivered and lost
+  bytes, in-flight before the call, and the application-limited,
+  host-limited and path-MTU flags. A packet's sample is rebuilt from its
+  batch and ordinal, bit for bit what the per-packet record holds today.
+  Batches are reference-counted in a ring sized at startup.
+- Frame slots carry a generation. An inline piece whose generation no
+  longer matches is skipped, so frame expiry and cleanup no longer walk
+  per-frame journal lists; the frame list stays only for overflow pieces.
+- ACK application settles coverage and releases records in the same pass
+  over newly acknowledged packets, and sends the controller owner one
+  summary per ACK: newly acknowledged bytes, the newest delivery sample,
+  settled count, path-MTU-only flag and timing. Loss reports keep
+  per-packet entries; losses are rare.
+
+Invariants that must survive: no allocation, lock or panic on the hot
+path; packet numbers are claimed before I/O and canceled numbers never
+reused; a lost packet keeps its record and pieces until a late ACK or
+retirement, and a late ACK never releases in-flight bytes twice; a pending
+validated ACK protects the packets it covers from loss; an ACK covering an
+unsent or future number is rejected before any change; a frame is freed
+only when fully acknowledged or at its deadline; BBR's samples and ACK
+timing are unchanged; history reset and quiescence drain batch references.
+
+Landing order, each measured on its own: delivery samples per call (with a
+test that rebuilt samples equal per-packet ones); inline pieces with slot
+generations; ACK application that stages coverage in the same pass; the
+per-ACK summary. Expected together: transmit planning 600 → about 200,
+staging 330 → about 80, ACK application 200 → about 80 cycles per frame
+event.
+
 # 14 Validation and acceptance
 
 Freeze a repeatable acceptance profile before declaring the performance requirements met. It must name the endpoint hardware and core budget, inner MTU, frame mix, flow count, traffic direction, attachment topology, loss profile, and contemporaneous direct-underlay capacity.
