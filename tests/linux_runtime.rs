@@ -120,10 +120,12 @@ fn storm_frame(bytes: &mut [u8; 1514], direction: usize, sequence: usize) -> usi
     length
 }
 
+/// Sends 512 frames singly, then as USO super-frames of `segments` frames.
 fn uso_delivery_allocates_nothing(
     net: &UdpSocket,
     left: &unquic::runtime::Control,
     right: &unquic::runtime::Control,
+    segments: usize,
 ) {
     let control = UdpSocket::bind("0.0.0.0:0").unwrap();
     let mut req = request(c"uq-right");
@@ -208,7 +210,7 @@ fn uso_delivery_allocates_nothing(
     assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
     // AF_PACKET's virtio metadata makes the host TAP receive actual USO inputs.
     let batches: Vec<_> = frames
-        .chunks(32)
+        .chunks(segments)
         .map(|batch| {
             let payload: Vec<_> = batch.iter().flat_map(|f| f[42..].iter().copied()).collect();
             let id = u16::from_be_bytes([batch[0][18], batch[0][19]]);
@@ -241,6 +243,7 @@ fn uso_delivery_allocates_nothing(
             unsafe { libc::send(source.as_raw_fd(), batch.as_ptr().cast(), batch.len(), 0) },
             batch.len() as isize
         );
+        let expected = (batch.len() - 52) / 1472;
         let mut received = 0;
         until(Duration::from_secs(2), || match receiver.recv(&mut input) {
             Ok(n) => {
@@ -252,7 +255,7 @@ fn uso_delivery_allocates_nothing(
                     seen[sequence] = true;
                     received += 1;
                 }
-                received == 32
+                received == expected
             }
             Err(e) => {
                 assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
@@ -517,7 +520,7 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
                 && right.control.session(session).unwrap().carrier
         })
     });
-    uso_delivery_allocates_nothing(&net, &left.control, &right.control);
+    uso_delivery_allocates_nothing(&net, &left.control, &right.control, 32);
     tso_delivery_allocates_nothing(&net);
     until(Duration::from_secs(2), || {
         (0..2)
@@ -799,6 +802,61 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
     assert!(!waiting.control.session(0).unwrap().carrier);
     assert_eq!(flags(&net, c"uq-wait") & libc::IFF_UP as i16, 0);
     waiting.stop();
+}
+
+#[test]
+#[ignore = "requires disposable container with tun and network namespace capabilities"]
+fn offload_frames_carry_tap_super_frames_whole() {
+    // SAFETY: this test thread and its subsequently spawned workers use a fresh namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let net = UdpSocket::bind("[::]:0").unwrap();
+    up(&net, c"lo");
+    let mut left_config = config("uq-left", 40130, 40131);
+    let mut right_config = config("uq-right", 40131, 40130);
+    left_config.daemon.offload_frames = true;
+    right_config.daemon.offload_frames = true;
+    let mut left = Running::start(left_config);
+    let mut right = Running::start(right_config);
+    until(Duration::from_secs(5), || {
+        left.control.ready() && right.control.ready()
+    });
+    for name in [
+        c"uq-left",
+        c"uq-right",
+        c"uq-left-b",
+        c"uq-left-c",
+        c"uq-right-b",
+        c"uq-right-c",
+    ] {
+        up(&net, name);
+    }
+    until(Duration::from_secs(5), || {
+        (0..3).all(|session| {
+            left.control.session(session).unwrap().carrier
+                && right.control.session(session).unwrap().carrier
+        })
+    });
+    for segments in [32, 44, 13] {
+        uso_delivery_allocates_nothing(&net, &left.control, &right.control, segments);
+    }
+    tso_delivery_allocates_nothing(&net);
+    let (offload, gso) = (0..2)
+        .map(|worker| left.control.worker_counters(worker).unwrap())
+        .fold((0, 0), |(offload, gso), counters| {
+            (
+                offload + counters.tx_offload_frames,
+                gso + counters.tap_gso_frames,
+            )
+        });
+    // Offload frames hold runs of 12 segments (WIDE_FRAME_LEN): three per
+    // 32-segment super-frame, four per 44-segment one, three for the final
+    // 28 segments, one per 13-segment one and one for the final 5, and three
+    // per TSO super-frame. Only each 13-segment read's last segment travels
+    // as an ordinary frame.
+    let runs = 16 * 3 + (11 * 4 + 3) + (39 + 1) + 16 * 3;
+    assert_eq!((offload, gso), (runs, 39));
+    left.stop();
+    right.stop();
 }
 
 #[test]

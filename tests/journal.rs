@@ -70,7 +70,7 @@ fn invalid_and_exhausted_reservations_preserve_every_existing_list() {
     assert!(!journal.bind_frame(1, 0, 60));
     assert!(!journal.bind_frame(1, 1, 60));
     assert!(!journal.bind_frame(1, 1 << 48, 60));
-    assert!(!journal.bind_frame(1, id(2), 9023));
+    assert!(!journal.bind_frame(1, id(2), 65_536));
     assert_eq!(journal.pop_packet(0), Some(first));
     assert_eq!(journal.pop_packet(0), None);
     assert_eq!(journal.available(), 2);

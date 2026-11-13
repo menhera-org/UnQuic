@@ -502,6 +502,55 @@ HEAD, above both in 2 of 6 rounds, with HEAD against its copy again at
 a cost of about half a percent stays within this noise and cannot be ruled
 out.
 
+## Sending offload frames (November 13, landed)
+
+Offload frames step 3 makes the sender build them: with both peers
+advertising `daemon.offload_frames`, a TAP GSO super-frame leaves as offload
+frames instead of one frame per segment. On the full-size efficiency point
+nearly every TAP read is a 44-segment USO super-frame (47.2 million frames
+from 1.08 million reads per run), so the switch removes most per-frame
+work there. Two bars were stated beforehand; the switched-on arm passes
+`offload_frames = true` to both daemons through bench.sh's `DAEMON_TOML`.
+With the switch off, the new build had to stay within 1% of HEAD's A/A copy and not
+sit above both HEAD and the copy in five of six rounds. With it on, it had
+to be lower than the same build with it off in five of six rounds, with a
+median of −5% or better.
+
+The first build sent each super-frame whole, up to 64,828 bytes in one
+frame ([results](benches/full-size-offload-whole-frames.json)). It was
+lower than the same build switched off in 6 of 6 rounds at −23.1%, but one
+round lost 19% of frames and another 0.4%. The receiving daemons logged
+187,145 and 16,848 datagrams refused for want of reassembly slots in that
+round, and none in any ordinary arm. A whole super-frame takes eight of a
+lane's 64 slots, so a lane holds eight. After a loss burst those eight waited
+for repairs, every datagram of the next frame was refused without an ACK,
+and frames expired 44 segments at a time. The switched-off build also
+failed its bar at +1.3%: releasing every frame read the end of its 3.4 KiB
+coverage state to look for wide planes, which only offload frames hold.
+
+The landed build cuts each super-frame into runs of whole segments of at
+most two slots (18,044 bytes, 12 segments here), so a lane holds 32, and
+sends a one-segment run as an ordinary frame. Each run gets rewritten
+headers and its own pseudo-header checksum seed. Its first benchmark build
+stopped a daemon within seconds: a one-segment run, ten bytes longer than
+the segment it replaced, broke the unsent-byte count. A named-error build
+found it, and the kernel test now sends 13-segment super-frames to cover
+it. Results ([results](benches/full-size-offload-runs.json)):
+
+| Arm | Rounds lower | Median |
+| --- | --- | --- |
+| Switched off, against HEAD's copy | 2 of 6 (above both in 1) | +0.7% |
+| HEAD against its copy | 3 of 6 | +0.6% |
+| Switched on, against the same build off | 6 of 6 | −14.7% |
+| Switched on, against HEAD's copy | 6 of 6 | −14.4% |
+
+Both bars pass. The switched-on arm lost at most 0.011% of frames in any
+round, the least of the four arms, and no datagram was refused for want of
+slots. Each daemon sent about 1.23 million offload frames in place of 13.6
+million ordinary ones. The runs give up about a third of the whole-frame
+saving; three- or four-slot runs may recover part of it while a lane still
+holds 16 or 21.
+
 ## What holds one flow near 1 Gbit/s (November 13)
 
 One flow at 7.5 ms delivers 1.00–1.07 Gbit/s per direction at 5G offered

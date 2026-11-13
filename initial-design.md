@@ -208,13 +208,13 @@ A PROBE_REPLY echoes the received probe's lane, packet number and actual UDP pay
 
 FRAME_ABANDON origin 0 means the frame sender stopped sending; origin 1 means the receiver discarded the frame. Reasons are deadline (1), resource limit (2), lane retirement (3), or TAP failure (4). Its frame ID must name its body lane. Origin 0 must travel on that same sender lane; if the lane has failed, use LANE_RETIRE instead. Origin 1 may travel through any local lane. Route origin 0 to the remote lane's reassembly owner and origin 1 to the local lane's transmit owner. A frame already written to TAP is never undone. Retire pending state and stop repairs. For origin 0, mark the frame sequence terminal even if its first piece has not arrived, advancing the receive frame window if necessary without allocating payload storage. This prevents reordered data from recreating a cancelled frame. For origin 1, unknown or already retired transmit frames are a no-op. Duplicates and sequences below the window floor never reopen state. Control retries use at most two retransmissions and a 100 ms lifetime. Abandonment is advisory: loss of this record does not prevent local expiry or release of buffers.
 
-**Offload frames (November 13 amendment; receiving implemented, sending
-not yet).** Optional
-feature bit 0, `OFFLOAD_FRAMES`, lets a peer send one TAP GSO super-frame,
-or one frame with a partial checksum, as a single DATA frame. It applies
-only when both endpoints advertise it in their handshake parameters; a peer
-without it keeps today's frames and complete checksums, so an old peer
-interoperates by ignoring the unknown bit.
+**Offload frames (November 13 amendment; implemented behind
+`daemon.offload_frames`).** Optional feature bit 0, `OFFLOAD_FRAMES`, lets
+a peer send a run of a TAP GSO super-frame's segments, or one frame with a
+partial checksum, as a single DATA frame. It applies only when both
+endpoints advertise it in their handshake parameters; a peer without it
+keeps today's frames and complete checksums, so an old peer interoperates
+by ignoring the unknown bit.
 
 - A DATA record whose flags byte has bit 0 set carries a piece of an
   offload frame. Every piece of one frame must carry the same bit; a
@@ -227,8 +227,15 @@ interoperates by ignoring the unknown bit.
   checksum start (2) and checksum offset (2). It is validated against the
   frame before delivery, as a TAP read's header is, and a frame that fails
   is discarded like a failed TAP write. The total frame length includes
-  the descriptor and is at most 65,535 bytes; a larger super-frame is
-  segmented by its sender.
+  the descriptor and is at most 65,535 bytes.
+- A sender cuts a super-frame into runs of whole segments of at most two
+  reassembly slots (18,044 bytes), each with its own rewritten headers
+  (lengths, TCP sequence and flags, IPv4 identification) and the run's
+  pseudo-header checksum seed, so a receiving lane holds 32 offload frames.
+  Whole super-frames, up to eight slots, left a lane only eight; under a
+  loss burst those eight waited for repairs and every new frame's
+  datagrams were refused, which in one measured round lost 19% of frames.
+  A run of one segment goes as an ordinary frame.
 - The receiver writes the frame to its TAP with the equivalent virtio-net
   header when the TAP accepts that offload. Otherwise it segments the frame
   in software and completes any partial checksum, as TAP input expansion
@@ -239,8 +246,9 @@ interoperates by ignoring the unknown bit.
   a run of consecutive ordinary reassembly slots, at most eight for the
   largest, so receiving needs no memory beyond today's; ordinary frames
   take the lowest free slots and offload frames the highest free run.
-  Senders keep offload frames in their own bounded slot pool, charged to
-  `memory_limit`.
+  Senders keep offload frames' coverage in a bounded pool of wide planes,
+  64 per worker, charged to `memory_limit`; when it runs out, segments go
+  as ordinary frames.
 - Integrity of a partial-checksum frame in transit rests on the outer UDP
   checksum, as for any tunnel carrying offloaded traffic.
 
@@ -802,7 +810,10 @@ frame to the TAP from the receive buffers that carry it. Large sends can use
 offer-limited point, in rotating rounds with an A/A copy. (November 13:
 inline packet pieces, the first part of item 1, showed no gain, because the
 remaining per-packet costs are mostly per frame; offload frames, items 3
-and 4, now come first.)
+and 4, now come first. Later that day they landed behind
+`daemon.offload_frames`, as runs of up to two reassembly slots rather than
+whole super-frames, and cut CPU per delivered bit 14.7% with both daemons
+on.)
 
 1. One compact per-packet record on the transmit owner, holding the
    packet's frame pieces inline in the common case and replacing journal
@@ -933,10 +944,12 @@ If a comparison already reaches the available underlay ceiling, report that fact
 
 # 15 Implementation stages
 
-**Current status (November 12):** stages 1 and 4 are complete. Stages 2 and 3
+**Current status (November 13):** stages 1 and 4 are complete. Stages 2 and 3
 are implemented, but their performance gates (20 Gbit/s each way locally and
 5 Gbit/s over the lossy access path) remain open, and stage 5 measured
-optimisation is in progress; ROADMAP.md and BENCH.md track both. The record
+optimisation is in progress; ROADMAP.md and BENCH.md track both. Offload
+frames (section 6) are implemented behind `daemon.offload_frames`, off by
+default. The record
 below is chronological. Implemented foundations are
 `UnquicUuid` parsing/provisioning, duplicate-checked cookie indexing,
 `MacAddress` validation, IPv6 sockets with separate receive/transmit APIs, and

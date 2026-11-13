@@ -1008,6 +1008,7 @@ fn segmentation_and_flow_selection_allocate_nothing() {
             bytes: &frames[index][42..],
             offset: 0,
             end: frames[index].len(),
+            offload: false,
         });
     let mut batch = pack::Batch::new();
     for (start, end) in [(0, 60), (40, 44)] {

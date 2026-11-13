@@ -10,8 +10,9 @@ use crate::{
     handshake::Connection,
     socket::{GSO_MAX_BYTES, MAX_UDP_PAYLOAD},
     wire::{
-        DATA_PREFIX_LEN, HEADER_LEN, Header, MAX_RECORDS, PROBE_PREFIX_LEN, Record, WireError,
-        encode_data_prefix, encode_data_prefix_length, encode_datagram, encode_probe_prefix,
+        DATA_PREFIX_LEN, DESCRIPTOR_LEN, HEADER_LEN, Header, MAX_OFFLOAD_FRAME_LEN, MAX_RECORDS,
+        PROBE_PREFIX_LEN, Record, WireError, encode_data_prefix, encode_data_prefix_length,
+        encode_datagram, encode_probe_prefix,
     },
 };
 use std::{collections::hash_map::DefaultHasher, fmt, hash::Hasher};
@@ -62,6 +63,8 @@ pub struct Packet {
 pub struct Lane {
     header: Header,
     frame_limit: u16,
+    // Whether the connection negotiated offload frames.
+    offload: bool,
     next_frame: u64,
 }
 impl Lane {
@@ -84,8 +87,19 @@ impl Lane {
                 packet_number: 1,
             },
             frame_limit: connection.max_frame_len,
+            offload: connection.offload_frames(),
             next_frame: 1,
         })
+    }
+
+    /// Whether this lane may send offload frames.
+    pub const fn offload_frames(&self) -> bool {
+        self.offload
+    }
+
+    /// The negotiated ceiling for ordinary frames.
+    pub const fn frame_limit(&self) -> usize {
+        self.frame_limit as usize
     }
 
     /// The packet identity the next allocation returns; zero after exhaustion.
@@ -124,6 +138,19 @@ impl Lane {
         if !(14..=usize::from(self.frame_limit)).contains(&length) {
             return Err(PackError::Frame);
         }
+        self.next_frame_id()
+    }
+
+    /// Allocates one frame identity for an offload frame; the connection must
+    /// have negotiated them.
+    pub fn start_offload_frame(&mut self, length: usize) -> Result<u64, PackError> {
+        if !self.offload || !(14 + DESCRIPTOR_LEN..=MAX_OFFLOAD_FRAME_LEN).contains(&length) {
+            return Err(PackError::Frame);
+        }
+        self.next_frame_id()
+    }
+
+    fn next_frame_id(&mut self) -> Result<u64, PackError> {
         if self.next_frame == 0 || self.header.packet_number == 0 {
             return Err(PackError::Exhausted);
         }
@@ -293,6 +320,8 @@ pub struct FrameInput<'a> {
     /// Exclusive selected end; use the complete frame length for fresh DATA.
     /// Repairs keep the original source spans and restrict this range.
     pub end: usize,
+    /// An offload frame, started by Lane::start_offload_frame.
+    pub offload: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -553,7 +582,15 @@ impl Batch {
         if frames.len() > BATCH_CAPACITY
             || frames.iter().any(|frame| {
                 let length = frame.header.len().saturating_add(frame.bytes.len());
-                !(14..=usize::from(lane.frame_limit)).contains(&length)
+                let lengths = if frame.offload {
+                    if !lane.offload {
+                        return true;
+                    }
+                    14 + DESCRIPTOR_LEN..=MAX_OFFLOAD_FRAME_LEN
+                } else {
+                    14..=usize::from(lane.frame_limit)
+                };
+                !lengths.contains(&length)
                     || frame.offset >= frame.end
                     || frame.end > length
                     || frame.id >> 48 != u64::from(lane.header.lane)
@@ -655,7 +692,7 @@ impl Batch {
                     frame_len as u32,
                     offset as u32,
                     end - offset,
-                    false,
+                    input.offload,
                     &mut prefix,
                 )
                 .map_err(PackError::Wire)?;
@@ -980,6 +1017,7 @@ mod tests {
             bytes: &[1; 1514],
             offset: 0,
             end: 1514,
+            offload: false,
         }];
         lane.header.packet_number = u64::MAX;
         let mut batch = Batch::new();
@@ -1003,6 +1041,50 @@ mod tests {
             Err(PackError::Frame)
         );
         assert_eq!(batch.packets[0].header, before);
+    }
+
+    #[test]
+    fn offload_frames_need_negotiation_and_flag_every_piece() {
+        let mut plain = lane();
+        assert_eq!(plain.start_offload_frame(18_044), Err(PackError::Frame));
+        plain.start_frame(1514).unwrap();
+        let mut lane = lane();
+        lane.offload = true;
+        for length in [23, 65_536] {
+            assert_eq!(lane.start_offload_frame(length), Err(PackError::Frame));
+        }
+        let id = lane.start_offload_frame(18_044).unwrap();
+        let bytes = vec![7; 18_034];
+        let input = FrameInput {
+            id,
+            header: &[9; 10],
+            bytes: &bytes,
+            offset: 0,
+            end: 18_044,
+            offload: true,
+        };
+        let mut batch = Batch::new();
+        assert_eq!(
+            batch.prepare(&mut plain, &[input], 1452),
+            Err(PackError::Frame)
+        );
+        batch.prepare(&mut lane, &[input], 1452).unwrap();
+        let ranges: Vec<_> = (0..batch.len())
+            .flat_map(|packet| batch.pieces(packet).unwrap().map(|(_, range)| range))
+            .collect();
+        assert_eq!(ranges.last().unwrap().end, 18_044);
+        for index in 0..ranges.len() {
+            assert_eq!(batch.prefixes[index][1], 1, "offload flag on every piece");
+        }
+        // Ordinary frames keep the negotiated ceiling on an offload lane.
+        let ordinary = FrameInput {
+            offload: false,
+            ..input
+        };
+        assert_eq!(
+            batch.prepare(&mut lane, &[ordinary], 1452),
+            Err(PackError::Frame)
+        );
     }
 
     #[test]
@@ -1061,6 +1143,7 @@ mod renumber_tests {
             bytes: &[7; 1514],
             offset: 0,
             end: 1514,
+            offload: false,
         }];
         batch.prepare(&mut lane, &frames, BASE_UDP_PAYLOAD).unwrap();
         assert_eq!(batch.len(), 2);
@@ -1103,6 +1186,7 @@ mod retained_prefix_tests {
                 bytes: &payload,
                 offset: 0,
                 end: payload.len(),
+                offload: false,
             })
             .collect();
         let mut batch = Batch::new();
@@ -1179,6 +1263,7 @@ mod refill_tests {
                         bytes: &data[30..length],
                         offset: 0,
                         end: length,
+                        offload: false,
                     });
                     lengths.push(length);
                     accepted.push(0);
@@ -1259,6 +1344,7 @@ mod refill_tests {
                 bytes: &data,
                 offset: 0,
                 end: data.len(),
+                offload: false,
             })
             .collect();
         let mut batch = Batch::new();

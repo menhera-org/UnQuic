@@ -5,7 +5,7 @@
 //! to the shared path-group owner, not to individual lanes.
 
 mod repair;
-pub use repair::FrameRecovery;
+pub use repair::{FrameRecovery, WIDE_FRAME_LEN, WidePlanes};
 
 use std::time::Duration;
 

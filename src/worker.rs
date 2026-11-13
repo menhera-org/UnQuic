@@ -300,6 +300,7 @@ use crate::{
         self, Connection, Effects, Tag,
         barrier::{Barrier, Command, Phase, Progress},
     },
+    loss::WIDE_FRAME_LEN,
     pacing, pack, pmtu,
     reassembly::{self, Admission},
     runtime::{AddressRequest, BUFFERS, Control, LANES, Shared},
@@ -369,6 +370,19 @@ fn frame_capacity(config: &crate::config::Config, workers: usize, id: usize) -> 
             slots
         })
     })
+}
+
+/// Offload frames one worker can retain at once under `daemon.offload_frames`,
+/// each with 24 KiB of coverage planes: about 4 MiB of super-frames, several
+/// round trips of one worker's share at tens of Gbit/s on a short path.
+const OFFLOAD_SLOTS: usize = 64;
+
+fn offload_slots(config: &crate::config::Config, capacity: usize) -> usize {
+    if config.daemon.offload_frames {
+        OFFLOAD_SLOTS.min(capacity)
+    } else {
+        0
+    }
 }
 
 /// Entries in the `balance_flows` table every TAP reader shares: 128 KiB.
@@ -683,6 +697,7 @@ impl TxBatch {
             bytes: &[],
             offset: 0,
             end: 0,
+            offload: false,
         }; pack::BATCH_CAPACITY];
         for (index, (input, frame)) in inputs.iter_mut().zip(&self.frames[..self.len]).enumerate() {
             *input = frame
@@ -930,6 +945,9 @@ impl Worker {
             let capacity = frame_capacity(config, workers, id)?;
             bytes
                 .checked_add(frames::Store::storage_bytes(capacity))?
+                .checked_add(
+                    offload_slots(config, capacity).checked_mul(frames::Store::WIDE_BYTES)?,
+                )?
                 .checked_add(recovery::Recovery::storage_bytes(capacity)?)
         })?;
         per_worker
@@ -1185,9 +1203,13 @@ impl Worker {
             feedback_retry: Duration::ZERO,
             free,
             returns: (0..count).map(|_| Vec::with_capacity(BUFFERS)).collect(),
-            frames: frames::Store::new(
-                frame_capacity(config, count, id).ok_or(io::ErrorKind::InvalidInput)?,
-            )?,
+            frames: {
+                let capacity =
+                    frame_capacity(config, count, id).ok_or(io::ErrorKind::InvalidInput)?;
+                let mut store = frames::Store::new(capacity)?;
+                store.reserve_wide(offload_slots(config, capacity))?;
+                store
+            },
             recovery: recovery::Recovery::new(
                 frame_capacity(config, count, id).ok_or(io::ErrorKind::InvalidInput)?,
             )?,
@@ -2879,12 +2901,39 @@ impl Worker {
             input.segments,
             input.length,
         );
-        let length = segments.map_or(input_length, |s| s.next_len(input_length));
         let Some(sender) = self.sessions[session].tx[lane].as_mut() else {
             self.discard_input(source)?;
             return Ok(Some(0));
         };
-        let Ok(id) = sender.start_frame(length) else {
+        // A run of whole segments travels as one offload frame when the
+        // connection negotiated them and coverage planes are free for it.
+        let before = segments;
+        let mut header = [0; frames::HEADER_BYTES];
+        let run = match segments.as_mut() {
+            Some(cursor)
+                if sender.offload_frames()
+                    && cursor.next_len(input_length) <= sender.frame_limit()
+                    && self.frames.wide_available() != 0 =>
+            {
+                let input = self
+                    .frames
+                    .source(source)
+                    .ok_or_else(|| io::Error::other("missing transmit input"))?;
+                cursor.write_offload(&input.bytes[..input_length], &mut header, WIDE_FRAME_LEN)
+            }
+            _ => None,
+        };
+        let header_len = wire::DESCRIPTOR_LEN + segments.map_or(0, |s| s.header_len());
+        let length = match &run {
+            Some(range) => header_len + range.len(),
+            None => segments.map_or(input_length, |s| s.next_len(input_length)),
+        };
+        let started = if run.is_some() {
+            sender.start_offload_frame(length)
+        } else {
+            sender.start_frame(length)
+        };
+        let Ok(id) = started else {
             self.discard_input(source)?;
             return Ok(Some(0));
         };
@@ -2898,8 +2947,13 @@ impl Worker {
             lane,
             header_len: 0,
             header: [0; frames::HEADER_BYTES],
+            offload: run.is_some(),
         };
-        if let Some(cursor) = segments
+        if let Some(range) = run.clone() {
+            frame.header = header;
+            frame.header_len = header_len;
+            frame.range = range;
+        } else if let Some(cursor) = segments
             .as_mut()
             .filter(|s| s.header_len() <= frames::HEADER_BYTES)
         {
@@ -2929,10 +2983,23 @@ impl Worker {
             .ok_or_else(|| io::Error::other("transmit frame capacity exhausted"))?;
         self.sessions[session].tx_retained += 1;
         if self.sender_enabled() {
+            // Input counted the super-frame as its segments; an offload run is shorter.
+            let counted = match (run.is_some(), before, segments) {
+                (true, Some(before), Some(after)) => before
+                    .remaining_bytes(input_length)
+                    .zip(after.remaining_bytes(input_length))
+                    .and_then(|(before, after)| before.checked_sub(after))
+                    .ok_or(io::ErrorKind::InvalidData)?,
+                _ => length,
+            };
             self.sessions[session].unexpanded_bytes[lane] = self.sessions[session].unexpanded_bytes
                 [lane]
+                .checked_sub(counted)
+                .ok_or(io::ErrorKind::InvalidData)?;
+            let saved = counted
                 .checked_sub(length)
                 .ok_or(io::ErrorKind::InvalidData)?;
+            self.release_unsent(session, lane, saved)?;
             self.recovery.bind(
                 frame,
                 self.frames.frame(frame).ok_or(io::ErrorKind::InvalidData)?,
@@ -2950,8 +3017,12 @@ impl Worker {
         }
         if let Some(cursor) = segments {
             for totals in [&mut self.counters, &mut self.sessions[session].totals] {
-                totals.tap_gso_frames = totals.tap_gso_frames.wrapping_add(1);
-                totals.tap_checksums = totals.tap_checksums.wrapping_add(1);
+                if run.is_some() {
+                    totals.tx_offload_frames = totals.tx_offload_frames.wrapping_add(1);
+                } else {
+                    totals.tap_gso_frames = totals.tap_gso_frames.wrapping_add(1);
+                    totals.tap_checksums = totals.tap_checksums.wrapping_add(1);
+                }
             }
             if cursor.done(input_length) {
                 self.close_source(source);
@@ -3570,6 +3641,7 @@ impl Worker {
                         bytes: &[],
                         offset: 0,
                         end: 0,
+                        offload: false,
                     })
             });
             let mut slices = [&[][..]; pack::BATCH_SLICES];

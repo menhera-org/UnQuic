@@ -1,5 +1,6 @@
-//! Checked UDP/TCP super-frame expansion; no wire-format change.
+//! Checked UDP/TCP super-frame expansion, and runs of it as offload frames.
 use super::uso::{fold, sum, word};
+use crate::wire::DESCRIPTOR_LEN;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Segments {
@@ -107,6 +108,50 @@ impl Segments {
         })
     }
 
+    /// Writes an offload frame's descriptor and the header for the next run of
+    /// whole segments that fits `limit` bytes with both (design section 6),
+    /// and returns the run's payload range in the unchanged source. The header
+    /// keeps the run's pseudo-header checksum seed, as a TAP read delivers it.
+    pub(crate) fn write_offload(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        limit: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        let run = limit.checked_sub(DESCRIPTOR_LEN + self.header)? / self.size * self.size;
+        let count = run.min(input.len().checked_sub(self.next)?);
+        // One segment gains nothing; it goes as an ordinary frame. Longer runs
+        // are always shorter than the segments they stand for.
+        if count <= self.size {
+            return None;
+        }
+        let (descriptor, output) = output.split_at_mut_checked(DESCRIPTOR_LEN)?;
+        let range = self.write_run(input, output, count, count.div_ceil(self.size), false)?;
+        // Only the run that keeps CWR is marked ECN.
+        let ecn = self.tcp && output.get(self.transport + 13)? & 0x80 != 0;
+        descriptor.copy_from_slice(&self.descriptor(ecn));
+        Some(range)
+    }
+
+    /// The offload descriptor: this source's virtio-net header with
+    /// big-endian fields.
+    fn descriptor(&self, ecn: bool) -> [u8; DESCRIPTOR_LEN] {
+        let kind = match (self.tcp, self.v6) {
+            (false, _) => 5,
+            (true, v6) => (if v6 { 4 } else { 1 }) | if ecn { 0x80 } else { 0 },
+        };
+        let mut descriptor = [1, kind, 0, 0, 0, 0, 0, 0, 0, 0];
+        for (at, value) in [
+            (2, self.header),
+            (4, self.size),
+            (6, self.transport),
+            (8, if self.tcp { 16 } else { 6 }),
+        ] {
+            descriptor[at..at + 2].copy_from_slice(&(value as u16).to_be_bytes());
+        }
+        descriptor
+    }
+
     /// Writes one complete frame. The immutable input stays alive until exhausted.
     pub(crate) fn write(&mut self, input: &[u8], output: &mut [u8]) -> usize {
         if output.len() < self.header_len() + self.size.min(input.len().saturating_sub(self.next)) {
@@ -139,11 +184,24 @@ impl Segments {
         input: &[u8],
         output: &mut [u8],
     ) -> Option<std::ops::Range<usize>> {
+        let count = self.size.min(input.len().checked_sub(self.next)?);
+        self.write_run(input, output, count, 1, true)
+    }
+
+    /// Writes the header for the next `count` payload bytes, `segments` whole
+    /// segments except at the end, with a complete transport checksum or its seed.
+    fn write_run(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        count: usize,
+        segments: usize,
+        complete: bool,
+    ) -> Option<std::ops::Range<usize>> {
         let header = self.header_len();
-        if output.len() < header || input.len() <= self.next {
+        if output.len() < header || count == 0 {
             return None;
         }
-        let count = self.size.min(input.len() - self.next);
         let length = header + count;
         let range = self.next..self.next + count;
         // Parse put every offset below inside the header; checked access only
@@ -181,16 +239,18 @@ impl Segments {
         output
             .get_mut(checksum_field.clone())?
             .copy_from_slice(&seed.to_be_bytes());
-        // Both transport headers preserve payload word alignment.
-        let checksum = !fold(sum(output.get(at..)?) + sum(input.get(range.clone())?));
-        let checksum = if !self.tcp && checksum == 0 {
-            65535
-        } else {
-            checksum
-        };
-        output
-            .get_mut(checksum_field)?
-            .copy_from_slice(&checksum.to_be_bytes());
+        if complete {
+            // Both transport headers preserve payload word alignment.
+            let checksum = !fold(sum(output.get(at..)?) + sum(input.get(range.clone())?));
+            let checksum = if !self.tcp && checksum == 0 {
+                65535
+            } else {
+                checksum
+            };
+            output
+                .get_mut(checksum_field)?
+                .copy_from_slice(&checksum.to_be_bytes());
+        }
         let ip = self.network;
         if self.v6 {
             let payload_length = (length - ip - 40) as u16;
@@ -210,7 +270,8 @@ impl Segments {
             output
                 .get_mut(ip + 10..ip + 12)?
                 .copy_from_slice(&checksum.to_be_bytes());
-            self.id = self.id.wrapping_add(1);
+            // Each segment of the run takes the next identification.
+            self.id = self.id.wrapping_add(segments as u16);
         }
         self.next = range.end;
         Some(range)
@@ -244,6 +305,60 @@ pub(super) mod tests {
         header[1] = 5;
         header[4..6].copy_from_slice(&(size as u16).to_ne_bytes());
         (bytes, header)
+    }
+
+    /// An offload run's native-endian header and frame.
+    type Run = ([u8; 10], Vec<u8>);
+
+    /// Cuts a super-frame into offload runs of at most `limit` bytes as a
+    /// sender does, each rebuilt as its native-endian header and frame, and
+    /// returns them with every frame a receiver then segments, including a
+    /// one-segment tail the sender sends as an ordinary frame.
+    fn offload_runs(
+        header: &[u8; 10],
+        input: &[u8],
+        limit: usize,
+        frame_limit: usize,
+    ) -> (Vec<Run>, Vec<Vec<u8>>) {
+        let mut segments = Segments::parse(header, input, frame_limit).unwrap();
+        let mut runs = Vec::new();
+        let mut frames = Vec::new();
+        let mut output = [0xa5; 256];
+        // Too little room for one segment writes nothing.
+        let mut borrowed = segments;
+        let tight = DESCRIPTOR_LEN + segments.header_len() + segments.size - 1;
+        assert!(borrowed.write_offload(input, &mut output, tight).is_none());
+        assert!(
+            borrowed
+                .write_offload(input, &mut output[..9], limit)
+                .is_none()
+        );
+        assert_eq!(output, [0xa5; 256]);
+        while let Some(range) = segments.write_offload(input, &mut output, limit) {
+            let length = segments.header_len();
+            let mut decoded: [u8; 10] = output[..10].try_into().unwrap();
+            for at in [2, 4, 6, 8] {
+                let value = u16::from_be_bytes([decoded[at], decoded[at + 1]]);
+                decoded[at..at + 2].copy_from_slice(&value.to_ne_bytes());
+            }
+            assert!(DESCRIPTOR_LEN + length + range.len() <= limit);
+            assert!(range.len() > segments.size);
+            let frame = [&output[10..10 + length], &input[range]].concat();
+            let mut run = Segments::parse(&decoded, &frame, frame_limit).unwrap();
+            while !run.done(frame.len()) {
+                let mut segment = [0; crate::MAX_FRAME_LEN];
+                let n = run.write(&frame, &mut segment);
+                frames.push(segment[..n].to_vec());
+            }
+            runs.push((decoded, frame));
+        }
+        assert!(segments.remaining(input.len()) <= 1);
+        while !segments.done(input.len()) {
+            let mut segment = [0; crate::MAX_FRAME_LEN];
+            let n = segments.write(input, &mut segment);
+            frames.push(segment[..n].to_vec());
+        }
+        (runs, frames)
     }
 
     /// Drives a parsed source through bounded writes into undersized and full outputs.
@@ -325,6 +440,14 @@ pub(super) mod tests {
                                 header[at..at + 2].copy_from_slice(&offset.to_ne_bytes());
                             }
                             let mut segments = Segments::parse(&header, &input, 1600).unwrap();
+                            // A run holding the whole super-frame repeats the read
+                            // header, ECN bit included; shorter runs re-segment into
+                            // the same frames.
+                            let (whole, _) = offload_runs(&header, &input, 65_535, 1600);
+                            assert_eq!(whole, [(header, input.clone())]);
+                            let limit = DESCRIPTOR_LEN + segments.header_len() + 3 * size;
+                            let (_, runs) = offload_runs(&header, &input, limit, 1600);
+                            assert_eq!(runs.len(), count);
                             let mut output = [0; 1600];
                             for (i, data) in payload.chunks(size).enumerate() {
                                 let flags = flags
@@ -359,6 +482,7 @@ pub(super) mod tests {
                                 let remaining = segments.remaining_bytes(input.len()).unwrap();
                                 let n = segments.write(&input, &mut output);
                                 assert_eq!(&output[..n], expected);
+                                assert_eq!(runs[i], expected);
                                 assert_eq!(
                                     segments.remaining_bytes(input.len()),
                                     Some(remaining - n)
@@ -477,6 +601,11 @@ pub(super) mod tests {
                         let (input, header) = packet(v6, count, size, short);
                         let payload = if v6 { 62 } else { 42 };
                         let mut segments = Segments::parse(&header, &input, 1514 + 20).unwrap();
+                        // Offload runs of up to five segments re-segment into the same frames.
+                        let limit = DESCRIPTOR_LEN + payload + 5 * size;
+                        let (whole, runs) = offload_runs(&header, &input, limit, 1534);
+                        assert!(whole.iter().all(|(header, _)| header[1] == 5));
+                        assert_eq!(whole.len(), count / 5 + usize::from(count % 5 > 1));
                         let mut output = [0u8; crate::MAX_FRAME_LEN];
                         let mut remaining = input[payload..]
                             .chunks(size)
@@ -499,6 +628,7 @@ pub(super) mod tests {
                             assert_eq!(&input[range], &expected[payload..]);
                             let n = segments.write(&input, &mut output);
                             assert_eq!(&output[..n], expected);
+                            assert_eq!(runs[i], expected);
                             remaining -= n;
                             assert_eq!(segments.remaining_bytes(input.len()), Some(remaining));
                             assert_eq!(

@@ -1,6 +1,6 @@
 //! Bounded packet-to-frame mappings; packet charges and payload storage are separate.
 
-use crate::{MAX_FRAME_LEN, wire::MAX_RECORDS};
+use crate::wire::{MAX_OFFLOAD_FRAME_LEN, MAX_RECORDS};
 use std::io;
 
 const END: u32 = u32::MAX;
@@ -128,7 +128,10 @@ impl PieceJournal {
     ///
     /// False leaves it unchanged. The caller must first retire old prepared plans.
     pub fn bind_frame(&mut self, slot: usize, id: u64, length: usize) -> bool {
-        if id >> 48 == 0 || id & ((1 << 48) - 1) == 0 || !(14..=MAX_FRAME_LEN).contains(&length) {
+        if id >> 48 == 0
+            || id & ((1 << 48) - 1) == 0
+            || !(14..=MAX_OFFLOAD_FRAME_LEN).contains(&length)
+        {
             return false;
         }
         let Some(frame) = self.frames.get_mut(slot).filter(|frame| frame.head == END) else {

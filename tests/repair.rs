@@ -1,5 +1,8 @@
 use std::ops::Range;
-use unquic::{MAX_FRAME_LEN, loss::FrameRecovery};
+use unquic::{
+    MAX_FRAME_LEN,
+    loss::{FrameRecovery, WIDE_FRAME_LEN, WidePlanes},
+};
 
 #[test]
 fn lost_originals_repair_only_missing_bytes_and_stop_after_two_attempts() {
@@ -49,7 +52,7 @@ fn late_ack_cancels_a_repair_plan_and_preserves_other_copies_accounting_boundary
 
 #[test]
 fn boundaries_exhaustion_and_invalid_mappings_leave_state_consistent() {
-    assert_eq!(size_of::<FrameRecovery>(), 3400);
+    assert_eq!(size_of::<FrameRecovery>(), 3408);
     for length in [0, 13, MAX_FRAME_LEN + 1, usize::MAX] {
         assert!(FrameRecovery::new(length).is_none());
     }
@@ -131,9 +134,29 @@ fn word_masks_match_a_byte_model_through_reordered_partial_transmissions() {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         (seed >> 32) as usize
     };
-    for length in [14, 63, 64, 65, 1514, MAX_FRAME_LEN] {
-        for _ in 0..16 {
-            let mut frame = FrameRecovery::new(length).unwrap();
+    // One frame and one set of wide planes serve every round, alternating wide
+    // and inline, so bits a detach or attach left behind would surface here.
+    let mut frame = FrameRecovery::new(14).unwrap();
+    let mut wide = Some(WidePlanes::new());
+    for length in [
+        14,
+        63,
+        64,
+        65,
+        1514,
+        MAX_FRAME_LEN,
+        MAX_FRAME_LEN + 1,
+        12_000,
+        WIDE_FRAME_LEN,
+    ] {
+        let rounds = if length > MAX_FRAME_LEN { 2 } else { 16 };
+        for round in 0..rounds {
+            if length > MAX_FRAME_LEN || round % 2 == 1 {
+                assert!(frame.attach(wide.take().unwrap()).is_ok());
+            } else {
+                assert!(!frame.reset(length.max(MAX_FRAME_LEN + 1)));
+            }
+            assert!(frame.reset(length));
             let mut model = Model {
                 generation: vec![0; length],
                 pending: vec![false; length],
@@ -201,6 +224,16 @@ fn word_masks_match_a_byte_model_through_reordered_partial_transmissions() {
                 );
                 assert_eq!(frame.sent(), model.sent);
                 assert_eq!(frame.next_repair(usize::MAX), model.next(usize::MAX));
+            }
+            if let Some(planes) = frame.detach() {
+                // A second set cannot be attached over the first.
+                let planes = match frame.attach(planes) {
+                    Ok(()) => frame.attach(WidePlanes::new()).unwrap_err(),
+                    Err(planes) => planes,
+                };
+                drop(planes);
+                wide = frame.detach();
+                assert!(frame.detach().is_none());
             }
         }
     }

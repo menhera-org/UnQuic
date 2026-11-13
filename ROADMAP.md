@@ -57,6 +57,14 @@ workers with a receive-side reorder stage so inner TCP still sees order;
 that starts with a design amendment. The user also asked for continued work
 on userspace per-frame cost.
 
+Offload frames then landed in four steps behind `daemon.offload_frames`,
+off by default: the wire flag and negotiation, the receiver, the sender and
+the measurement. With both daemons on it, each TAP super-frame travels as
+runs of up to 12 segments instead of one frame per segment, and CPU per
+delivered bit fell 14.7% on the full-size efficiency point
+([BENCH.md](BENCH.md#sending-offload-frames-november-13-landed)). Turning
+it on by default is decision 8.
+
 ## November 12 checkpoint
 
 Stage 4 is done. An OVS system-port test now runs on Linux 6.8 and 7.0, with
@@ -259,6 +267,15 @@ Decisions only the user can make, each blocking a remaining goal:
    change the design names as a later experiment), to rely on a larger
    outer MTU where the path allows, or to judge the gate on hardware that
    segments datagrams itself.
+8. Open since November 13: should `daemon.offload_frames` be on by default?
+   With both daemons on it, the full-size efficiency point used 14.7% less
+   CPU per delivered bit in six of six rounds and lost no more frames, with
+   no receive pressure
+   ([BENCH.md](BENCH.md#sending-offload-frames-november-13-landed)). It
+   changes the wire only between peers that both advertise it, and costs
+   about 420 KiB per worker. It has run only on loopback and in the kernel
+   suites, not on real NICs or a lossy path; on a lossy path every lost
+   datagram holds two receive slots instead of one until repaired.
 
 ## November 11 checkpoint
 
@@ -586,12 +603,17 @@ rules apply to all of them.
    has landed, and so has step 2, the receiver: offload frames take runs of
    ordinary reassembly slots and reach the TAP with their virtio-net header
    or segmented in software, at no measurable cost to ordinary traffic
-   ([BENCH.md](BENCH.md#receiving-offload-frames-november-13-landed)). The
-   sender and the measurement follow. The sender has to carry frames larger
-   than one GSO aggregate (about 62 KB), which today's planner never splits,
-   and give them a separate recovery pool, since a full-size frame's
-   coverage takes 24 KiB against 3.4 KiB per ordinary slot. After them come receive without the reassembly
-   copy; fewer cross-worker wakes; one flow striped with a receive-side reorder stage (decision 7).
+   ([BENCH.md](BENCH.md#receiving-offload-frames-november-13-landed)).
+   Step 3, the sender, and step 4, the measurement, landed the same day
+   ([BENCH.md](BENCH.md#sending-offload-frames-november-13-landed)): the
+   sender cuts each super-frame into runs of up to two reassembly slots
+   (12 segments of a 1500-byte MTU), and with both daemons on it CPU per
+   delivered bit fell 14.7%. Whole 64 KB super-frames saved 23% but left a
+   receiving lane room for only eight of them, and one round collapsed
+   under receive pressure. Whether to turn it on by default is decision 8;
+   longer runs (three or four slots) may recover part of the difference.
+   Next come receive without the reassembly copy; fewer cross-worker wakes;
+   one flow striped with a receive-side reorder stage (decision 7).
    The kernel figures can only be confirmed on an R86S-class box with real
    NICs; the remote 7.0 host stands in until then. The kernel test
    `tap::read::tests::real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch`

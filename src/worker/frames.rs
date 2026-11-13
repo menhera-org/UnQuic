@@ -1,6 +1,10 @@
 //! Owner-local payload storage and compact frame handles.
 use super::{BUFFERS, Buffer};
-use crate::{loss::FrameRecovery, pack, tap::Segments};
+use crate::{
+    loss::{FrameRecovery, WidePlanes},
+    pack,
+    tap::Segments,
+};
 use std::{io, mem::size_of, ops::Range, time::Duration};
 
 pub(super) const CAPACITY: usize = 8192;
@@ -180,6 +184,8 @@ pub(super) struct Frame {
     pub lane: usize,
     pub header_len: usize,
     pub header: [u8; HEADER_BYTES],
+    /// An offload frame: a descriptor in `header`, then a whole TAP super-frame.
+    pub offload: bool,
 }
 
 impl Frame {
@@ -199,6 +205,8 @@ pub(super) struct Store {
     free_sources: Vec<usize>,
     frames: Vec<Option<Frame>>,
     recovery: Vec<FrameRecovery>,
+    // Coverage planes lent to offload frames' recovery state while they live.
+    wide: Vec<Box<WidePlanes>>,
     free_frames: Vec<usize>,
     links: Vec<Link>,
     // Min-heap of (deadline key, frame slot); keys live here so sifts stay in one array.
@@ -240,6 +248,7 @@ impl Store {
             free_sources: (0..sources).rev().collect(),
             frames: std::iter::repeat_with(|| None).take(capacity).collect(),
             recovery,
+            wide: Vec::new(),
             free_frames: (0..capacity).rev().collect(),
             links: vec![Link::EMPTY; capacity],
             expiry: Vec::with_capacity(capacity),
@@ -247,8 +256,27 @@ impl Store {
         })
     }
 
+    /// Storage one offload frame's coverage planes take, for memory accounting.
+    pub const WIDE_BYTES: usize = size_of::<WidePlanes>() + size_of::<Box<WidePlanes>>();
+
+    /// Allocates coverage planes for `count` concurrent offload frames; call
+    /// only at startup.
+    pub fn reserve_wide(&mut self, count: usize) -> io::Result<()> {
+        self.wide
+            .try_reserve_exact(count)
+            .map_err(io::Error::other)?;
+        self.wide
+            .extend(std::iter::repeat_with(WidePlanes::new).take(count));
+        Ok(())
+    }
+
     pub fn available(&self) -> usize {
         self.free_frames.len()
+    }
+
+    /// Offload frames that can still be inserted.
+    pub fn wide_available(&self) -> usize {
+        self.wide.len()
     }
 
     /// Unsent bytes of a queue's frames, counted until `cap` is reached.
@@ -328,7 +356,16 @@ impl Store {
         }
         let length = frame.header_len.checked_add(frame.range.len())?;
         let references = source.references.checked_add(1)?;
-        if frame.offset >= length || !self.recovery.get_mut(index)?.reset(length) {
+        let recovery = self.recovery.get_mut(index)?;
+        if frame.offload {
+            let planes = self.wide.pop()?;
+            if let Err(planes) = recovery.attach(planes) {
+                self.wide.push(planes);
+                return None;
+            }
+        }
+        if frame.offset >= length || !recovery.reset(length) {
+            self.wide.extend(recovery.detach());
             return None;
         }
         source.references = references;
@@ -349,6 +386,7 @@ impl Store {
             bytes: source.bytes.get(frame.range.clone())?,
             offset: frame.offset,
             end: frame.length(),
+            offload: frame.offload,
         })
     }
 
@@ -389,6 +427,12 @@ impl Store {
         self.untrack_expiry(index).ok()?;
         let frame = self.frames.get_mut(index)?.take()?;
         self.free_frames.push(index);
+        // Only offload frames hold wide planes; others leave the slot's cold tail alone.
+        if frame.offload
+            && let Some(recovery) = self.recovery.get_mut(index)
+        {
+            self.wide.extend(recovery.detach());
+        }
         let source = self.sources.get_mut(frame.source)?.as_mut()?;
         source.references = source.references.checked_sub(1)?;
         self.recycle(frame.source)
@@ -553,6 +597,7 @@ mod tests {
             deadline: Duration::from_millis(id),
             header_len: 0,
             header: [0; HEADER_BYTES],
+            offload: false,
         }
     }
 
@@ -630,7 +675,7 @@ mod tests {
                 capacity * per_frame
             );
         }
-        assert_eq!(size_of::<FrameRecovery>(), 3400);
+        assert_eq!(size_of::<FrameRecovery>(), 3408);
         assert!(size_of::<Frame>() < 256);
     }
 
