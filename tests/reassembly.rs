@@ -128,6 +128,54 @@ fn packet_replay_and_frame_repair_cannot_redeliver_after_window_reuse() {
 }
 
 #[test]
+fn window_advance_releases_only_incomplete_frames_it_passes() {
+    let mut lane = Lane::new(1, 9022).unwrap();
+    // Two incomplete frames, then a frame far enough ahead to pass the first.
+    for (packet, sequence) in [(1, 5), (2, 60_000)] {
+        assert_eq!(
+            admit(
+                &mut lane,
+                packet,
+                &[Record::Data {
+                    frame_id: (1 << 48) | sequence,
+                    total_len: 60,
+                    offset: 0,
+                    bytes: &[1; 30],
+                }],
+                Duration::ZERO
+            ),
+            Admission::Fresh
+        );
+    }
+    assert_eq!(lane.retained_frames(), 2);
+    let far = 5 + WINDOW_LEN as u64;
+    assert_eq!(
+        admit(&mut lane, 3, &[piece(far, 0, &[2; 60])], Duration::ZERO),
+        Admission::Fresh
+    );
+    // Frame 5 fell below the window; 60,000 and the new frame remain.
+    assert_eq!(lane.retained_frames(), 2);
+    assert_eq!(lane.front(Duration::ZERO).unwrap().bytes, &[2; 60]);
+    lane.finish_front();
+    assert_eq!(
+        admit(
+            &mut lane,
+            4,
+            &[Record::Data {
+                frame_id: (1 << 48) | 60_000,
+                total_len: 60,
+                offset: 30,
+                bytes: &[3; 30],
+            }],
+            Duration::ZERO
+        ),
+        Admission::Fresh
+    );
+    assert_eq!(lane.retained_frames(), 1);
+    assert!(lane.front(Duration::ZERO).is_some());
+}
+
+#[test]
 fn pressure_retains_existing_tails_without_ack_or_window_advancement() {
     let mut lane = Lane::new(1, 9022).unwrap();
     for sequence in 1..=FRAME_CAPACITY as u64 {

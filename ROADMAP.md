@@ -566,8 +566,8 @@ rules apply to all of them.
    cycles per frame event for kernel and userspace together, against about
    6,480 now, with a per-operation target that sums to about 2,060, and a
    memory-bandwidth limit that rules out the receive-side reassembly copy.
-   Coverage planes (3–6%) and a merged piece-reservation pass (about 2%)
-   landed. Next, in the section's order, each judged on the full-size
+   Coverage planes (3–6%), a merged piece-reservation pass (about 2%) and
+   receive admission without slot scans (about 2–3%) landed. Next, in the section's order, each judged on the full-size
    efficiency point (rotating rounds with an A/A copy): the compact
    per-packet record with staging during ACK application and one ACK
    summary per ACK; receive without the reassembly copy; large frames
@@ -578,7 +578,9 @@ rules apply to all of them.
    `tap::read::tests::real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch`
    failed once on Linux 6.8 with `WouldBlock` and passed on rerun: it reads
    right after raw-socket sends, so delivery into the TAP can lag; it needs
-   to wait for readability. A peer
+   to wait for readability. `foreground_readiness_dns_refresh_forwarding_and_signal_shutdown`
+   (tests/cli.rs) also timed out once on 6.8 with its 10 s wait and passed
+   on rerun; its waits span a DNS refresh and two daemon starts. A peer
    with one lane keeps ACKs and
    data on lane 0 and can still defer ACKs under loss; a separate number
    space for control (a 65th lane ID with its own receive table) would cover

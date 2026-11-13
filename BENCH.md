@@ -369,8 +369,31 @@ scan that runs whenever the frame window advances reads 512 bytes instead of
 puts receive admission's first pass at about 640 cycles per datagram before
 and 445 after, but alone the change was lower in only 3 of 6 rounds at a
 median of −0.7% here, and 5 of 8 pairs at −0.6% on the small-frame point
-([results](benches/small-frames-compact-sequences-rejected.json)), so it is
-rejected.
+([results](benches/small-frames-compact-sequences-rejected.json)), so it was
+rejected alone. It later landed inside a larger receive-admission change
+([below](#receive-admission-without-slot-scans-november-13-landed)).
+
+## Receive admission without slot scans (November 13, landed)
+
+A split of receive admission
+([diagnostic](benches/profile-receive-split-diagnostic.patch), profile
+build, offer-limited full-size point) put its first pass at about 640 cycles
+per received datagram for one or two DATA records. Two costs dominated:
+whenever the frame window advanced, which is nearly every datagram once
+sequences pass 65,536, it read the sequence of all 64 reassembly slots, each
+at the head of its own 9 KiB slot; and every datagram zero-filled a 1 KiB
+reservation array. With the sequences in one compact array the pass fell to
+about 500 (window check 23, record loop 269, window advance 231). The landed
+bundle keeps that array, adds an occupancy mask so window advance and expiry
+visit only occupied slots, and keeps the reservation array on the lane.
+
+Stated beforehand as needing five of six rounds lower than HEAD and its A/A
+copy with a median of −1% or better against the copy, on the full-size
+efficiency point ([results](benches/full-size-receive-admission.json)):
+lower in 6 of 6 rounds against both, −2.2% against HEAD and −3.1% against
+the copy (one HEAD round lost 5% of frames); HEAD against its copy 3 of 6 at
+±0.1%. A new test checks that a window advance releases exactly the
+incomplete frames it passes.
 
 ## One pass to validate and reserve DATA pieces (November 13, landed)
 
