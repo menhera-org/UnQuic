@@ -53,6 +53,99 @@ fn permutations<T: Copy>(items: &mut [T], at: usize, check: &mut impl FnMut(&[T]
 }
 
 #[test]
+fn offload_frames_take_slot_runs_and_keep_their_piece_bit() {
+    let at = Duration::ZERO;
+    let big = |sequence: u64, offset: u32, payload: &'static [u8]| Record::Data {
+        frame_id: id(1, sequence),
+        total_len: 65_535,
+        offset,
+        bytes: payload,
+        offload: true,
+    };
+    let small = |sequence: u64, offset: u32, offload: bool| Record::Data {
+        frame_id: id(1, sequence),
+        total_len: 60,
+        offset,
+        bytes: &[7; 30],
+        offload,
+    };
+    let mut lane = Lane::new(1, 1514).unwrap();
+    assert_eq!(
+        admit(&mut lane, 1, &[big(1, 0, &[1; 1000])], at),
+        Admission::Invalid
+    );
+    lane.accept_offload_frames(true);
+    // Eight maximum offload frames hold all 64 slots.
+    for sequence in 1..=8 {
+        assert_eq!(
+            admit(&mut lane, sequence, &[big(sequence, 0, &[1; 1000])], at),
+            Admission::Fresh
+        );
+    }
+    assert_eq!(lane.retained_frames(), 8);
+    assert_eq!(lane.retained_bytes(), 8 * 65_535);
+    for record in [piece(9, 0, &[9; 60]), big(9, 0, &[9; 10])] {
+        assert_eq!(admit(&mut lane, 9, &[record], at), Admission::Pressure);
+    }
+    // Completing one frees its run: an ordinary frame then leaves seven
+    // free slots, too few for another maximum offload frame.
+    let rest: &'static [u8] = Box::leak(vec![2; 8000].into_boxed_slice());
+    let mut packet = 10;
+    for offset in (1000..65_535).step_by(8000) {
+        let length = (65_535 - offset).min(8000);
+        let record = big(1, offset as u32, &rest[..length]);
+        assert_eq!(admit(&mut lane, packet, &[record], at), Admission::Fresh);
+        packet += 1;
+    }
+    let frame = lane.front(at).unwrap();
+    assert!(frame.offload);
+    assert_eq!(frame.bytes.len(), 65_535);
+    assert!(frame.bytes[..1000].iter().all(|&byte| byte == 1));
+    assert!(frame.bytes[1000..].iter().all(|&byte| byte == 2));
+    assert!(lane.finish_front());
+    assert_eq!(
+        admit(&mut lane, packet, &[piece(9, 0, &[9; 60])], at),
+        Admission::Fresh
+    );
+    assert!(!lane.front(at).unwrap().offload);
+    assert_eq!(
+        admit(&mut lane, packet + 1, &[big(10, 0, &[3; 10])], at),
+        Admission::Pressure
+    );
+    assert!(lane.finish_front());
+    // Every piece of a frame carries the same bit, across and within datagrams.
+    assert_eq!(
+        admit(&mut lane, packet + 2, &[small(11, 0, true)], at),
+        Admission::Fresh
+    );
+    for records in [
+        &[small(11, 30, false)][..],
+        &[small(12, 0, true), small(12, 30, false)],
+        &[small(12, 0, false), small(12, 30, true)],
+    ] {
+        assert_eq!(
+            admit(&mut lane, packet + 3, records, at),
+            Admission::Invalid
+        );
+    }
+    // An ordinary ceiling still applies to ordinary frames.
+    let mut wide = small(13, 0, false);
+    if let Record::Data { total_len, .. } = &mut wide {
+        *total_len = 1515;
+    }
+    assert_eq!(
+        admit(&mut lane, packet + 3, &[wide], at),
+        Admission::Invalid
+    );
+    // A reset forgets the negotiation.
+    lane.reset(1, 1514).unwrap();
+    assert_eq!(
+        admit(&mut lane, 1, &[small(1, 0, true)], at),
+        Admission::Invalid
+    );
+}
+
+#[test]
 fn originals_and_repairs_deliver_once_in_every_order() {
     permutations(&mut [0, 0, 30, 30], 0, &mut |offsets| {
         let mut lane = Lane::new(1, 9022).unwrap();

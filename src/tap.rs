@@ -428,18 +428,105 @@ impl TapQueue {
             return Err(io::ErrorKind::InvalidData.into());
         }
         if self.vnet && header[0] == 1 {
-            let start = u16::from_ne_bytes([header[6], header[7]]) as usize;
-            let field = start + u16::from_ne_bytes([header[8], header[9]]) as usize;
-            if start < 14 || field + 2 > n {
-                return Err(io::ErrorKind::InvalidData.into());
-            }
-            // Match skb_checksum_help, including the mangled representation of zero.
-            let checksum = !uso::fold(uso::sum(&buffer[start..n]));
-            buffer[field..field + 2]
-                .copy_from_slice(&if checksum == 0 { 65535u16 } else { checksum }.to_be_bytes());
+            complete_checksum(header, &mut buffer[..n])?;
             self.completed_checksums = self.completed_checksums.wrapping_add(1);
         }
         Ok(n)
+    }
+
+    /// Writes one offload frame (design section 6): a big-endian virtio-net
+    /// header as its descriptor, then one Ethernet frame. The descriptor is
+    /// checked against the frame first, and a mismatch returns InvalidData
+    /// with nothing written. GSO the TAP refuses is segmented here with
+    /// complete checksums; a failure after the first segment returns
+    /// WriteZero, since the rest cannot be retried as one frame. Returns the
+    /// Ethernet bytes delivered, counting each segment's headers.
+    pub(crate) fn write_offload(&mut self, frame: &[u8]) -> io::Result<usize> {
+        let invalid = || io::Error::from(io::ErrorKind::InvalidData);
+        let (descriptor, ethernet) = frame
+            .split_first_chunk::<{ crate::wire::DESCRIPTOR_LEN }>()
+            .ok_or_else(invalid)?;
+        let mut header = *descriptor;
+        for at in [2, 4, 6, 8] {
+            let value = u16::from_be_bytes([header[at], header[at + 1]]);
+            header[at..at + 2].copy_from_slice(&value.to_ne_bytes());
+        }
+        let kind = header[1];
+        let segments = if kind == 0 {
+            if header[0] > 1
+                || !(14..=self.frame_limit).contains(&ethernet.len())
+                || (header[0] == 1 && checksum_field(&header, ethernet.len()).is_none())
+            {
+                return Err(invalid());
+            }
+            None
+        } else {
+            Some(Segments::parse(&header, ethernet, self.frame_limit).ok_or_else(invalid)?)
+        };
+        let length = segments.map_or(Some(ethernet.len()), |segments| {
+            segments.remaining_bytes(ethernet.len())
+        });
+        let length = length.ok_or_else(invalid)?;
+        if self.vnet
+            && match kind {
+                0 => true,
+                5 => self.uso,
+                _ => self.tso,
+            }
+        {
+            let iov = [
+                libc::iovec {
+                    iov_base: header.as_mut_ptr().cast(),
+                    iov_len: header.len(),
+                },
+                libc::iovec {
+                    iov_base: ethernet.as_ptr().cast_mut().cast(),
+                    iov_len: ethernet.len(),
+                },
+            ];
+            // SAFETY: header and frame are readable for their declared lengths.
+            let n = unsafe { libc::writev(self.fd.as_raw_fd(), iov.as_ptr(), 2) };
+            match complete_write(n, header.len() + ethernet.len()) {
+                Err(error)
+                    if kind != 0
+                        && matches!(
+                            error.raw_os_error(),
+                            Some(libc::EINVAL | libc::EOPNOTSUPP)
+                        ) =>
+                {
+                    if kind == 5 {
+                        self.uso = false;
+                    } else {
+                        self.tso = false;
+                    }
+                }
+                result => return result.map(|()| length),
+            }
+        }
+        let mut output = [0u8; MAX_FRAME_LEN];
+        let Some(mut segments) = segments else {
+            // Only a queue without virtio headers gets here.
+            let copy = output.get_mut(..ethernet.len()).ok_or_else(invalid)?;
+            copy.copy_from_slice(ethernet);
+            if header[0] == 1 {
+                complete_checksum(&header, copy)?;
+            }
+            return self.write_frame(copy).map(|()| length);
+        };
+        let mut written = 0;
+        while !segments.done(ethernet.len()) {
+            let n = segments.write(ethernet, &mut output);
+            let result = match output.get(..n) {
+                Some(segment) if n != 0 => self.write_frame(segment),
+                _ => Err(invalid()),
+            };
+            match result {
+                Ok(()) => written += n,
+                Err(error) if written == 0 => return Err(error),
+                Err(_) => return Err(io::ErrorKind::WriteZero.into()),
+            }
+        }
+        Ok(written)
     }
 
     /// Writes one complete frame. Never retries a short write as another frame.
@@ -513,6 +600,24 @@ impl TapQueue {
     }
 }
 
+/// The checksum field a partial-checksum header names, if it fits the frame.
+fn checksum_field(header: &[u8; 10], length: usize) -> Option<usize> {
+    let start = u16::from_ne_bytes([header[6], header[7]]) as usize;
+    let field = start + u16::from_ne_bytes([header[8], header[9]]) as usize;
+    (start >= 14 && field + 2 <= length).then_some(field)
+}
+
+/// Completes a partial transport checksum as skb_checksum_help does,
+/// including the mangled representation of zero.
+fn complete_checksum(header: &[u8; 10], frame: &mut [u8]) -> io::Result<()> {
+    let field = checksum_field(header, frame.len()).ok_or(io::ErrorKind::InvalidData)?;
+    let start = u16::from_ne_bytes([header[6], header[7]]) as usize;
+    let checksum = !uso::fold(uso::sum(&frame[start..]));
+    frame[field..field + 2]
+        .copy_from_slice(&if checksum == 0 { 65535u16 } else { checksum }.to_be_bytes());
+    Ok(())
+}
+
 fn complete_write(written: isize, expected: usize) -> io::Result<()> {
     if written < 0 {
         Err(io::Error::last_os_error())
@@ -542,6 +647,155 @@ mod tests {
             assert!(Tap::create(c"unquic-test", mtu, queues, None).is_err());
         }
     }
+    #[test]
+    fn offload_frames_write_natively_or_segment_with_complete_checksums() {
+        use std::os::fd::FromRawFd;
+        use test_common::{tcp, udp};
+        // A seqpacket pair keeps each write's boundary for the reader.
+        let pair = || {
+            let mut fds = [0; 2];
+            let kind = libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK;
+            // SAFETY: socketpair writes two new descriptors into fds.
+            assert_eq!(
+                unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, fds.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: both descriptors are new and owned only here.
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+        };
+        let queue = |fd, vnet| TapQueue {
+            fd,
+            frame_limit: 1514,
+            vnet,
+            uso: true,
+            tso: true,
+            completed_checksums: 0,
+        };
+        let read = |fd: &OwnedFd| {
+            let mut buffer = vec![0; 70_000];
+            // SAFETY: buffer is writable for its length.
+            let n = unsafe {
+                libc::recv(
+                    fd.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            buffer.truncate(n.max(0) as usize);
+            buffer
+        };
+        let descriptor = |header: [u8; 10]| {
+            let mut descriptor = header;
+            for at in [2, 4, 6, 8] {
+                let value = u16::from_ne_bytes([header[at], header[at + 1]]);
+                descriptor[at..at + 2].copy_from_slice(&value.to_be_bytes());
+            }
+            descriptor
+        };
+        let payload: Vec<_> = (0..4000).map(|i| (i * 7) as u8).collect();
+        for v6 in [false, true] {
+            let mut input = tcp::frame(v6, 9, 1000, 0x18, &[], &payload);
+            let header = tcp::partial(&mut input, v6, 1400);
+            let frame = [&descriptor(header)[..], &input].concat();
+            let mut segments = Segments::parse(&header, &input, 1514).unwrap();
+            let mut expected = Vec::new();
+            while !segments.done(input.len()) {
+                let mut output = [0; MAX_FRAME_LEN];
+                let n = segments.write(&input, &mut output);
+                expected.push(output[..n].to_vec());
+            }
+            assert_eq!(expected.len(), 3);
+            let total: usize = expected.iter().map(Vec::len).sum();
+            // Natively: the virtio-net header, then the unchanged super-frame.
+            let (a, b) = pair();
+            let mut tap = queue(a, true);
+            assert_eq!(tap.write_offload(&frame).unwrap(), total);
+            assert_eq!(read(&b), [&header[..], &input].concat());
+            // Without TSO, and without virtio headers: one frame per segment.
+            tap.tso = false;
+            assert_eq!(tap.write_offload(&frame).unwrap(), total);
+            for segment in &expected {
+                assert_eq!(read(&b), [&[0; 10][..], segment].concat());
+            }
+            let (a, c) = pair();
+            let mut plain = queue(a, false);
+            assert_eq!(plain.write_offload(&frame).unwrap(), total);
+            for segment in &expected {
+                assert_eq!(&read(&c), segment);
+            }
+            assert!(read(&c).is_empty());
+            // A full queue refuses the first segment as retryable, but a
+            // failure after it cannot be retried as one frame.
+            while plain.write_frame(&expected[0]).is_ok() {}
+            assert_eq!(
+                plain.write_offload(&frame).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            read(&c);
+            assert_eq!(
+                plain.write_offload(&frame).unwrap_err().kind(),
+                io::ErrorKind::WriteZero
+            );
+            // A TAP refusing the GSO type loses that offload and segments instead;
+            // an epoll descriptor has no write operation, so every write gets EINVAL.
+            // SAFETY: epoll_create1 returns a new descriptor owned only here.
+            let epoll = unsafe { OwnedFd::from_raw_fd(libc::epoll_create1(libc::EPOLL_CLOEXEC)) };
+            let mut refusing = queue(epoll, true);
+            let error = refusing.write_offload(&frame).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+            assert_eq!(refusing.write_offloads(), (true, false));
+        }
+        // UDP segmentation uses its own switch.
+        let mut input = udp::frame(false, 9, &payload[..3000]);
+        let mut header = udp::partial(&mut input, false);
+        header[1] = 5;
+        header[2..4].copy_from_slice(&42u16.to_ne_bytes());
+        header[4..6].copy_from_slice(&1472u16.to_ne_bytes());
+        let frame = [&descriptor(header)[..], &input].concat();
+        let (a, b) = pair();
+        let mut tap = queue(a, true);
+        tap.uso = false;
+        tap.write_offload(&frame).unwrap();
+        assert_eq!(read(&b).len(), 10 + 1514);
+        assert_eq!(read(&b).len(), 10 + 1514);
+        assert_eq!(read(&b).len(), 10 + 42 + 56);
+        // A partial checksum without GSO passes through, or completes in place.
+        let expected = udp::frame(true, 7, &payload[..1000]);
+        let mut input = expected.clone();
+        let header = udp::partial(&mut input, true);
+        let frame = [&descriptor(header)[..], &input].concat();
+        assert_eq!(tap.write_offload(&frame).unwrap(), input.len());
+        assert_eq!(read(&b), [&header[..], &input].concat());
+        let (a, c) = pair();
+        let mut plain = queue(a, false);
+        assert_eq!(plain.write_offload(&frame).unwrap(), input.len());
+        assert_eq!(read(&c), expected);
+        // Descriptors that do not match their frame write nothing.
+        let mut bad = Vec::new();
+        bad.push(frame[..23].to_vec());
+        for (at, value) in [(0, 2), (1, 1), (1, 3), (6, 0x10), (7, 13), (8, 0xff)] {
+            let mut frame = frame.clone();
+            frame[at] = value;
+            bad.push(frame);
+        }
+        let mut long = frame.clone();
+        long.resize(10 + 1515, 0);
+        bad.push(long);
+        for frame in bad {
+            assert_eq!(
+                tap.write_offload(&frame).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                plain.write_offload(&frame).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        assert!(read(&b).is_empty());
+        assert!(read(&c).is_empty());
+    }
+
     #[test]
     fn partial_checksums_complete_in_place_with_checked_metadata() {
         let mut tap = TapQueue {

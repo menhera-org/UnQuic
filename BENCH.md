@@ -478,6 +478,30 @@ five of six rounds lower than both HEAD and its A/A copy with a median of
 against both, −1.6% against HEAD and −2.5% against the copy, two of whose
 runs lost 0.8–2.2% of frames. HEAD against its copy: 3 of 6, −0.9%.
 
+## Receiving offload frames (November 13, landed)
+
+Offload frames step 2 lays each reassembly lane's frame bytes and coverage
+out contiguously across its 64 slots, so an offload frame of up to 65,535
+bytes takes a run of up to eight slots and needs no memory of its own.
+Ordinary frames take the lowest free slot from a mask instead of popping a
+free list, and admission's first pass picks every new frame's slots. It
+changes no work on the ordinary path by design, so the bar stated beforehand
+was a non-regression one: a median no more than 1% above HEAD's A/A copy,
+and not above both HEAD and the copy in five of six rounds, on the
+full-size efficiency point.
+
+The first build failed it: above the copy in 6 of 6 rounds at +1.6%, with
+HEAD against its copy at +0.7%
+([results](benches/full-size-offload-receive-first.json)). It called the
+lane's `front()`, which also checks expiry, before every TAP write batch to
+look for an offload frame, and computed every new frame's slot span with a
+division. With both skipped when the connection did not negotiate offload
+frames, the second build sat at +0.7% against the copy and +0.5% against
+HEAD, above both in 2 of 6 rounds, with HEAD against its copy again at
++0.7% ([results](benches/full-size-offload-receive.json)). It passes, but
+a cost of about half a percent stays within this noise and cannot be ruled
+out.
+
 ## What holds one flow near 1 Gbit/s (November 13)
 
 One flow at 7.5 ms delivers 1.00–1.07 Gbit/s per direction at 5G offered

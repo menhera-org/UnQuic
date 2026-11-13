@@ -51,8 +51,11 @@ impl std::error::Error for LaneError {}
 pub struct ReadyFrame<'a> {
     /// Connection-local frame identity, including its lane.
     pub id: u64,
-    /// Whole Ethernet frame without FCS or TAP metadata.
+    /// Whole Ethernet frame without FCS or TAP metadata; for an offload
+    /// frame, its descriptor followed by the frame.
     pub bytes: &'a [u8],
+    /// Whether this is an offload frame.
+    pub offload: bool,
 }
 
 struct Window {
@@ -153,41 +156,47 @@ impl Window {
     }
 }
 
-// A frame's sequence lives in Lane::sequences, so scans and lookups read one
-// compact array instead of a header on each 9 KiB slot.
+const SLOT_WORDS: usize = MAX_FRAME_LEN.div_ceil(64);
+
+// Per-slot state. Bytes and coverage live in Lane::bytes and Lane::covered,
+// contiguous across slots, so an offload frame spans a run of whole slots and
+// needs no storage of its own. Its sequence lives in Lane::sequences.
+#[derive(Clone, Copy)]
 struct Frame {
     length: u16,
     remaining: u16,
     prefix_len: u16,
+    // Slots this frame holds, starting at its own; 1 for ordinary frames.
+    span: u8,
+    offload: bool,
     deadline: Duration,
-    covered: [u64; MAX_FRAME_LEN.div_ceil(64)],
-    bytes: [u8; MAX_FRAME_LEN],
 }
 impl Frame {
-    const fn empty() -> Self {
-        Self {
-            length: 0,
-            remaining: 0,
-            prefix_len: 0,
-            deadline: Duration::ZERO,
-            covered: [0; MAX_FRAME_LEN.div_ceil(64)],
-            bytes: [0; MAX_FRAME_LEN],
-        }
-    }
+    const EMPTY: Self = Self {
+        length: 0,
+        remaining: 0,
+        prefix_len: 0,
+        span: 1,
+        offload: false,
+        deadline: Duration::ZERO,
+    };
 
-    fn start(&mut self, length: u16, now: Duration) {
+    fn start(&mut self, length: u16, offload: bool, now: Duration, covered: &mut [u64]) {
         self.length = length;
         self.remaining = length;
         self.prefix_len = 0;
+        self.span = if offload { span(length) } else { 1 };
+        self.offload = offload;
         self.deadline = now.saturating_add(FRAME_LIFETIME);
-        let words = usize::from(length).div_ceil(64).min(self.covered.len());
-        self.covered[..words].fill(0);
+        let words = usize::from(length).div_ceil(64).min(covered.len());
+        covered[..words].fill(0);
     }
 
-    fn piece(&mut self, offset: usize, bytes: &[u8]) {
+    /// `covered` and `bytes` start at this frame's first slot.
+    fn piece(&mut self, covered: &mut [u64], storage: &mut [u8], offset: usize, bytes: &[u8]) {
         let end = offset + bytes.len();
         // Admission checks the range; this keeps every index below in bounds.
-        if end > usize::from(self.length).min(MAX_FRAME_LEN) {
+        if end > usize::from(self.length) || end > storage.len() {
             return;
         }
         // Bulk-copy an append only while no out-of-order bytes exist beyond the prefix.
@@ -195,9 +204,9 @@ impl Frame {
             && offset == usize::from(self.prefix_len)
             && self.remaining == self.length - self.prefix_len
         {
-            self.bytes[offset..end].copy_from_slice(bytes);
-            self.covered[offset / 64..end.div_ceil(64)].fill(u64::MAX);
-            self.covered[(end - 1) / 64] &= u64::MAX >> (63 - (end - 1) % 64);
+            storage[offset..end].copy_from_slice(bytes);
+            covered[offset / 64..end.div_ceil(64)].fill(u64::MAX);
+            covered[(end - 1) / 64] &= u64::MAX >> (63 - (end - 1) % 64);
             self.remaining -= bytes.len() as u16;
             self.prefix_len = end as u16;
             return;
@@ -207,17 +216,17 @@ impl Frame {
             let bit = start % 64;
             let count = (end - start).min(64 - bit);
             let mask = (u64::MAX >> (64 - count)) << bit;
-            let word = &mut self.covered[start / 64];
+            let word = &mut covered[start / 64];
             let new = mask & !*word;
             if new == mask {
-                self.bytes[start..start + count]
+                storage[start..start + count]
                     .copy_from_slice(&bytes[start - offset..start - offset + count]);
             } else {
                 // First-retained bytes win even if a conflicting duplicate arrives.
                 let mut pending = new;
                 while pending != 0 {
                     let at = start / 64 * 64 + pending.trailing_zeros() as usize;
-                    self.bytes[at] = bytes[at - offset];
+                    storage[at] = bytes[at - offset];
                     pending &= pending - 1;
                 }
             }
@@ -226,6 +235,39 @@ impl Frame {
             start += count;
         }
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Reservation {
+    sequence: u64,
+    length: u16,
+    offload: bool,
+    slot: u8,
+}
+
+/// Slots a frame of this length holds: at most 8, for MAX_OFFLOAD_FRAME_LEN.
+const fn span(length: u16) -> u8 {
+    let slots = (length as usize).div_ceil(MAX_FRAME_LEN);
+    if slots == 0 { 1 } else { slots as u8 }
+}
+
+const fn run(span: u8) -> u64 {
+    u64::MAX >> (64 - span as u32)
+}
+
+/// Reserves `span` free slots: the lowest free slot for an ordinary frame, the
+/// highest free run for an offload frame, so the two rarely fragment each other.
+fn take(reserved: &mut u64, span: u8) -> Option<usize> {
+    let run = run(span);
+    let slot = if span == 1 {
+        Some((!*reserved).trailing_zeros() as usize).filter(|&slot| slot < FRAME_CAPACITY)
+    } else {
+        (0..=FRAME_CAPACITY - usize::from(span))
+            .rev()
+            .find(|&slot| *reserved & (run << slot) == 0)
+    }?;
+    *reserved |= run << slot;
+    Some(slot)
 }
 
 /// One registered remote lane, used by exactly one worker.
@@ -240,15 +282,21 @@ pub struct Lane {
     packets: Window,
     ack: Schedule,
     terminal: Window,
-    frames: Box<[Frame]>,
-    // Sequence held by each slot; zero marks a free slot.
+    // Whether the connection negotiated offload frames.
+    offload: bool,
+    frames: [Frame; FRAME_CAPACITY],
+    covered: Box<[u64]>,
+    bytes: Box<[u8]>,
+    // Sequence held by each slot; zero marks a free slot or an offload frame's tail.
     sequences: [u64; FRAME_CAPACITY],
-    // One bit per slot holding a frame, so scans visit only occupied slots.
+    // One bit per slot starting a frame, so scans visit only occupied slots.
     occupied: u64,
-    // New frames one datagram reserves; kept so no datagram refills 1 KiB.
-    reservations: [(u64, u16); 64],
+    // One bit per slot in use, including the later slots of offload frames.
+    reserved: u64,
+    // New frames one datagram reserves, with their first slot; kept so no
+    // datagram refills 1 KiB.
+    reservations: [Reservation; 64],
     index: [u8; INDEX_LEN],
-    free: Vec<u8>,
     ready: VecDeque<u8>,
     deadline: Option<Duration>,
     retained_bytes: usize,
@@ -268,12 +316,15 @@ impl Lane {
             packets: Window::new(),
             ack: Schedule::new(),
             terminal: Window::new(),
-            frames: (0..FRAME_CAPACITY).map(|_| Frame::empty()).collect(),
+            offload: false,
+            frames: [Frame::EMPTY; FRAME_CAPACITY],
+            covered: vec![0; FRAME_CAPACITY * SLOT_WORDS].into_boxed_slice(),
+            bytes: vec![0; FRAME_CAPACITY * MAX_FRAME_LEN].into_boxed_slice(),
             sequences: [0; FRAME_CAPACITY],
             occupied: 0,
-            reservations: [(0, 0); 64],
+            reserved: 0,
+            reservations: [Reservation::default(); 64],
             index: [EMPTY; INDEX_LEN],
-            free: (0..FRAME_CAPACITY as u8).collect(),
             ready: VecDeque::with_capacity(FRAME_CAPACITY),
             deadline: None,
             retained_bytes: 0,
@@ -288,7 +339,18 @@ impl Lane {
     /// The runtime must also budget its owner tables, queues and allocator
     /// overhead; this is not a measurement of process resident memory.
     pub const fn storage_bytes() -> usize {
-        size_of::<Self>() + FRAME_CAPACITY * (size_of::<Frame>() + 2 * size_of::<u8>())
+        size_of::<Self>()
+            + FRAME_CAPACITY * (MAX_FRAME_LEN + SLOT_WORDS * size_of::<u64>() + size_of::<u8>())
+    }
+
+    /// Accepts offload frames until the next reset; call after reset when the
+    /// connection negotiated them.
+    pub fn accept_offload_frames(&mut self, accept: bool) {
+        self.offload = accept;
+    }
+
+    pub(crate) const fn accepts_offload_frames(&self) -> bool {
+        self.offload
     }
 
     /// Registered remote lane ID.
@@ -298,7 +360,7 @@ impl Lane {
 
     /// Number of retained incomplete and queued complete frames.
     pub fn retained_frames(&self) -> usize {
-        FRAME_CAPACITY - self.free.len()
+        self.occupied.count_ones() as usize
     }
 
     pub(crate) fn ready_count(&self) -> usize {
@@ -373,6 +435,7 @@ impl Lane {
         self.id = id;
         self.frame_limit = frame_limit;
         self.retired = false;
+        self.offload = false;
         self.expired_frames = 0;
         self.expired_incomplete_frames = 0;
         self.duplicate_pieces = 0;
@@ -393,9 +456,8 @@ impl Lane {
     fn clear_frames(&mut self) {
         self.sequences.fill(0);
         self.occupied = 0;
+        self.reserved = 0;
         self.index.fill(EMPTY);
-        self.free.clear();
-        self.free.extend(0..FRAME_CAPACITY as u8);
         self.ready.clear();
         self.deadline = None;
         self.retained_bytes = 0;
@@ -422,17 +484,25 @@ impl Lane {
         let mut count = 0;
         let mut highest = 0;
         let mut eliciting = false;
+        let mut pressure = false;
+        // Slots are chosen here, against the pre-admission mask, and taken in
+        // the second pass; releases in between only free more slots.
+        let mut trial = self.reserved;
         for record in datagram.records() {
             eliciting |= record.ack_eliciting();
             match record {
-                // Offload frames are not received yet; a peer must not send them.
-                Record::Data { offload: true, .. } => return Admission::Invalid,
                 Record::Data {
                     frame_id,
                     total_len,
+                    offload,
                     ..
                 } => {
-                    if total_len > u32::from(self.frame_limit) {
+                    // The codec bounds offload frames by MAX_OFFLOAD_FRAME_LEN.
+                    if if offload {
+                        !self.offload
+                    } else {
+                        total_len > u32::from(self.frame_limit)
+                    } {
                         return Admission::Invalid;
                     }
                     let sequence = frame_id & SEQUENCE_MASK;
@@ -440,25 +510,36 @@ impl Lane {
                     if self.terminal.old(sequence) {
                         continue;
                     }
-                    if let Some(slot) = self.find(sequence) {
-                        if u32::from(self.frames[slot].length) != total_len {
-                            return Admission::Invalid;
-                        }
-                    } else if let Some((_, length)) = self
+                    let (length, kind) = if let Some(slot) = self.find(sequence) {
+                        (self.frames[slot].length, self.frames[slot].offload)
+                    } else if let Some(reservation) = self
                         .reservations
                         .iter()
                         .take(count)
-                        .find(|(id, _)| *id == sequence)
+                        .find(|reservation| reservation.sequence == sequence)
                     {
-                        if u32::from(*length) != total_len {
-                            return Admission::Invalid;
-                        }
+                        (reservation.length, reservation.offload)
                     } else {
+                        let span = if offload { span(total_len as u16) } else { 1 };
+                        let slot = take(&mut trial, span);
+                        pressure |= slot.is_none();
                         // A datagram holds at most 64 records; any excess still counts as pressure.
-                        if let Some(reservation) = self.reservations.get_mut(count) {
-                            *reservation = (sequence, total_len as u16);
+                        match self.reservations.get_mut(count) {
+                            Some(reservation) => {
+                                *reservation = Reservation {
+                                    sequence,
+                                    length: total_len as u16,
+                                    offload,
+                                    slot: slot.unwrap_or_default() as u8,
+                                };
+                            }
+                            None => pressure = true,
                         }
                         count += 1;
+                        continue;
+                    };
+                    if u32::from(length) != total_len || kind != offload {
+                        return Admission::Invalid;
                     }
                 }
                 Record::FrameAbandon {
@@ -471,7 +552,6 @@ impl Lane {
                 _ => {}
             }
         }
-        let pressure = count > self.free.len();
         if !pressure {
             self.advance_frames(highest);
         }
@@ -493,17 +573,29 @@ impl Lane {
                         Some(slot) => slot,
                         None if pressure => continue,
                         None => {
-                            // The preflight reserved a slot; drop the piece as under pressure if not.
-                            let Some(slot) = self.free.pop() else {
+                            // The first pass reserved a slot for every new frame.
+                            let Some(reservation) = self
+                                .reservations
+                                .iter()
+                                .take(count)
+                                .find(|reservation| reservation.sequence == sequence)
+                            else {
                                 continue;
                             };
-                            let slot = usize::from(slot);
-                            self.frames[slot].start(total_len as u16, now);
+                            let slot = usize::from(reservation.slot);
+                            let frame = &mut self.frames[slot];
+                            frame.start(
+                                total_len as u16,
+                                reservation.offload,
+                                now,
+                                &mut self.covered[slot * SLOT_WORDS..],
+                            );
+                            self.reserved |= run(frame.span) << slot;
+                            let deadline = frame.deadline;
                             self.sequences[slot] = sequence;
                             self.occupied |= 1 << slot;
                             self.retained_bytes += total_len as usize;
                             self.insert(slot);
-                            let deadline = self.frames[slot].deadline;
                             self.deadline =
                                 Some(self.deadline.map_or(deadline, |old| old.min(deadline)));
                             slot
@@ -512,7 +604,12 @@ impl Lane {
                     let frame = &mut self.frames[slot];
                     let remaining = frame.remaining;
                     if remaining != 0 {
-                        frame.piece(offset as usize, bytes);
+                        frame.piece(
+                            &mut self.covered[slot * SLOT_WORDS..],
+                            &mut self.bytes[slot * MAX_FRAME_LEN..],
+                            offset as usize,
+                            bytes,
+                        );
                         if frame.remaining == 0 {
                             self.ready.push_back(slot as u8);
                         }
@@ -595,19 +692,25 @@ impl Lane {
         let frame = &self.frames[slot];
         Some(ReadyFrame {
             id: (u64::from(self.id) << 48) | self.sequences[slot],
-            bytes: frame.bytes.get(..usize::from(frame.length))?,
+            bytes: self.slot_bytes(slot),
+            offload: frame.offload,
         })
     }
 
+    /// Ordinary ready frames in queue order, stopping before any offload frame.
     pub(crate) fn ready_frames(&mut self, now: Duration) -> impl Iterator<Item = &[u8]> {
         self.expire(now);
-        self.ready.iter().map(|&slot| {
-            let frame = &self.frames[usize::from(slot)];
-            frame
-                .bytes
-                .get(..usize::from(frame.length))
-                .unwrap_or_default()
+        self.ready.iter().map_while(|&slot| {
+            let slot = usize::from(slot);
+            (!self.frames[slot].offload).then(|| self.slot_bytes(slot))
         })
+    }
+
+    fn slot_bytes(&self, slot: usize) -> &[u8] {
+        let start = slot * MAX_FRAME_LEN;
+        self.bytes
+            .get(start..start + usize::from(self.frames[slot].length))
+            .unwrap_or_default()
     }
 
     pub(crate) fn finish_ready(&mut self, mask: u64) {
@@ -716,7 +819,7 @@ impl Lane {
         self.retained_bytes -= usize::from(self.frames[slot].length);
         self.sequences[slot] = 0;
         self.occupied &= !(1 << slot);
-        self.free.push(slot as u8);
+        self.reserved &= !(run(self.frames[slot].span) << slot);
     }
 }
 
@@ -787,9 +890,49 @@ mod tests {
         lane.finish_ready(u64::MAX);
         assert_eq!(lane.retained_frames(), 0);
         assert_eq!(lane.retained_bytes(), 0);
-        assert_eq!(lane.free.len(), FRAME_CAPACITY);
+        assert_eq!(lane.reserved, 0);
         assert_eq!(lane.ready_frames(Duration::ZERO).count(), 0);
     }
+    #[test]
+    fn ordinary_batches_stop_before_an_offload_frame() {
+        let mut lane = Lane::new(1, 9022).unwrap();
+        lane.accept_offload_frames(true);
+        let mut bytes = [0; 256];
+        for (sequence, offload) in [(1, false), (2, true), (3, false)] {
+            let n = crate::wire::encode_datagram(
+                crate::wire::Header {
+                    cookie: crate::UnquicUuid::from_bytes([1; 16]),
+                    receive_tag: 1,
+                    lane: 1,
+                    packet_number: sequence,
+                    record_area_len: 0,
+                },
+                &[Record::Data {
+                    frame_id: (1 << 48) | sequence,
+                    total_len: 60,
+                    offset: 0,
+                    bytes: &[sequence as u8; 60],
+                    offload,
+                }],
+                &mut bytes,
+            )
+            .unwrap();
+            let datagram = Datagram::decode(&bytes[..n]).unwrap();
+            assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Fresh);
+        }
+        let firsts = |lane: &mut Lane| {
+            lane.ready_frames(Duration::ZERO)
+                .map(|frame| frame[0])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(firsts(&mut lane), [1]);
+        lane.finish_ready(1);
+        assert_eq!(firsts(&mut lane), []);
+        assert!(lane.front(Duration::ZERO).unwrap().offload);
+        assert!(lane.finish_front());
+        assert_eq!(firsts(&mut lane), [3]);
+    }
+
     #[test]
     fn random_and_mutated_datagrams_never_panic_admission() {
         use crate::{
@@ -799,6 +942,7 @@ mod tests {
         };
         let mut rng = Rng::new(0x4ea5_0001);
         let mut lane = Lane::new(1, 4000).unwrap();
+        lane.accept_offload_frames(true);
         let payload = [0x5a; MAX_FRAME_LEN];
         let mut output = [0; 8192];
         let mut bytes = Vec::new();
@@ -813,8 +957,11 @@ mod tests {
             let count = 1 + rng.below(records.len());
             for record in &mut records[..count] {
                 let frame_id = (1 << 48) | ((base + rng.below(300) as u64) & SEQUENCE_MASK);
-                let range = [128, 1600, MAX_FRAME_LEN - 13][rng.below(3)];
-                let total = 14 + rng.below(range);
+                // Offload frames follow their sequence, so most of their pieces agree.
+                let offload = (frame_id + rng.below(40) as u64).is_multiple_of(8);
+                let range = [128, 1600, MAX_FRAME_LEN - 13, 65_536 - 24]
+                    [rng.below(3 + usize::from(offload))];
+                let total = if offload { 24 } else { 14 } + rng.below(range);
                 let offset = rng.below(total);
                 let length = 1 + rng.below((total - offset).min(1500));
                 *record = if rng.below(8) == 0 {
@@ -830,7 +977,7 @@ mod tests {
                         total_len: total as u32,
                         offset: offset as u32,
                         bytes: &payload[..length],
-                        offload: false,
+                        offload,
                     }
                 };
             }
@@ -875,12 +1022,49 @@ mod tests {
                 5 => _ = lane.front(now),
                 _ => {}
             }
+            // Every frame owns exactly its run of slots, and runs never overlap.
+            let mut runs = 0;
+            let mut occupied = lane.occupied;
+            while occupied != 0 {
+                let slot = occupied.trailing_zeros() as usize;
+                occupied &= occupied - 1;
+                let frame = &lane.frames[slot];
+                assert_eq!(frame.span, span(frame.length));
+                assert_eq!(runs & (run(frame.span) << slot), 0);
+                runs |= run(frame.span) << slot;
+            }
+            assert_eq!(runs, lane.reserved);
         }
     }
 
     #[test]
     fn contiguous_copy_preserves_coverage_overlap_and_reused_slots() {
-        let mut frame = Frame::empty();
+        // One slot's storage, viewed as the fields a frame used to own.
+        struct Slot {
+            frame: Frame,
+            covered: [u64; SLOT_WORDS],
+            bytes: [u8; MAX_FRAME_LEN],
+        }
+        impl Slot {
+            fn start(&mut self, length: u16, now: Duration) {
+                self.frame.start(length, false, now, &mut self.covered);
+            }
+            fn piece(&mut self, offset: usize, bytes: &[u8]) {
+                self.frame
+                    .piece(&mut self.covered, &mut self.bytes, offset, bytes);
+            }
+        }
+        impl std::ops::Deref for Slot {
+            type Target = Frame;
+            fn deref(&self) -> &Frame {
+                &self.frame
+            }
+        }
+        let mut frame = Box::new(Slot {
+            frame: Frame::EMPTY,
+            covered: [0; SLOT_WORDS],
+            bytes: [0; MAX_FRAME_LEN],
+        });
         let first = [0x3c; MAX_FRAME_LEN];
         let rest = [0x5a; MAX_FRAME_LEN];
         for length in [14, 60, 64, 65, 128, 1514, MAX_FRAME_LEN] {
@@ -1068,7 +1252,7 @@ mod tests {
                 .take(64)
                 .collect();
             assert_eq!(colliding.len(), 64);
-            lane.free.clear();
+            lane.reserved = u64::MAX;
             for (slot, &seq) in colliding.iter().enumerate() {
                 lane.sequences[slot] = seq;
                 lane.insert(slot);

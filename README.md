@@ -658,6 +658,16 @@ false for draft 07's window. On the decision workload at 0.5 Gbit/s it
 kept every ProbeRTT episode off its window and, with host stalls counted
 out, halved the remaining loss (BENCH.md).
 
+`daemon.offload_frames`, off by default, advertises the optional handshake
+feature that lets a peer send a TAP GSO super-frame, or a frame whose
+transport checksum is still partial, as one transport frame of up to 65,535
+bytes (design section 6). The receiver checks its virtio-net descriptor,
+writes it to the TAP with that header, or segments it in software when the
+TAP refuses the offload. It stores the frame in up to eight consecutive
+ordinary reassembly slots, so receiving needs no extra memory. This daemon
+does not send offload frames yet; until it does, the switch only matters
+between a newer peer and this one.
+
 Flow hashing looks through one unfragmented IPv4, IPv6 or Ethernet
 encapsulation, including an IPv6 segment routing header before the inner
 packet. It retains the outer key and adds the inner addresses, protocol and

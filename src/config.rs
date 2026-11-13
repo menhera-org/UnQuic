@@ -60,6 +60,11 @@ pub struct Daemon {
     /// lane 0 carries only ACKs and control, so data never fills the packet
     /// history they number from. Data uses the other lanes.
     pub control_lane: bool,
+    /// Off by default: advertise optional feature `OFFLOAD_FRAMES`, so a peer
+    /// that also advertises it may send TAP GSO super-frames and frames with
+    /// partial checksums whole (design section 6). Receiving them needs no
+    /// extra memory; this daemon does not send them yet.
+    pub offload_frames: bool,
 }
 impl Default for Daemon {
     fn default() -> Self {
@@ -71,6 +76,7 @@ impl Default for Daemon {
             tx_hold_us: 0,
             probe_rtt_ack_delay: true,
             control_lane: true,
+            offload_frames: false,
         }
     }
 }

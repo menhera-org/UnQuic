@@ -581,10 +581,16 @@ rules apply to all of them.
    offload frames carrying TAP GSO super-frames with deferred checksums
    (design section 6), which divide per-frame work by up to 44 for GSO
    traffic. They land in four steps behind the optional handshake bit, and
-   nothing changes on the wire until the last one advertises it. Step 1, the
-   DATA offload flag, its length bounds and the negotiated bit, has landed;
-   receivers still refuse offload pieces. The receiver, the sender and the
-   measurement follow. After them come receive without the reassembly
+   nothing changes on the wire unless `daemon.offload_frames` advertises it.
+   Step 1, the DATA offload flag, its length bounds and the negotiated bit,
+   has landed, and so has step 2, the receiver: offload frames take runs of
+   ordinary reassembly slots and reach the TAP with their virtio-net header
+   or segmented in software, at no measurable cost to ordinary traffic
+   ([BENCH.md](BENCH.md#receiving-offload-frames-november-13-landed)). The
+   sender and the measurement follow. The sender has to carry frames larger
+   than one GSO aggregate (about 62 KB), which today's planner never splits,
+   and give them a separate recovery pool, since a full-size frame's
+   coverage takes 24 KiB against 3.4 KiB per ordinary slot. After them come receive without the reassembly
    copy; fewer cross-worker wakes; one flow striped with a receive-side reorder stage (decision 7).
    The kernel figures can only be confirmed on an R86S-class box with real
    NICs; the remote 7.0 host stands in until then. The kernel test

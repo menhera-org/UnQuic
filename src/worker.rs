@@ -991,7 +991,11 @@ impl Worker {
                             port: config.endpoints[endpoint].listen_port,
                             max_frame_len: MAX_FRAME_LEN as u16,
                             mandatory_features: 0,
-                            optional_features: 0,
+                            optional_features: if config.daemon.offload_frames {
+                                wire::OFFLOAD_FRAMES
+                            } else {
+                                0
+                            },
                         },
                         config.peers[peer].peer_port,
                         session.inner_mtu + 22,
@@ -2165,6 +2169,7 @@ impl Worker {
                 .ok_or(io::ErrorKind::InvalidData)?;
             lane.reset(header.lane, connection.max_frame_len)
                 .map_err(io::Error::other)?;
+            lane.accept_offload_frames(connection.offload_frames());
             let [.., a, b, c, d] = *header.cookie.as_bytes();
             let cookie_low = u32::from_be_bytes([a, b, c, d]);
             let owner = cookie_low.wrapping_add(u32::from(header.lane) - 1) as usize
@@ -3816,7 +3821,16 @@ impl Worker {
             let mut budget = BATCH_SIZE;
             while budget != 0 {
                 let (uso, tso) = tap.write_offloads();
-                let (mask, tcp, result) = tap.write_batch(lane.ready_frames(now).take(budget));
+                let offload = if lane.accepts_offload_frames() {
+                    lane.front(now).filter(|frame| frame.offload)
+                } else {
+                    None
+                };
+                let (mask, tcp, result) = if let Some(frame) = offload {
+                    (1, false, tap.write_offload(frame.bytes))
+                } else {
+                    tap.write_batch(lane.ready_frames(now).take(budget))
+                };
                 if mask == 0 {
                     break;
                 }
@@ -5692,6 +5706,64 @@ mod tests {
             bytes,
             offload: false,
         }
+    }
+
+    #[test]
+    fn offload_frames_reach_the_tap_in_order_between_ordinary_frames() {
+        use crate::tap::test_common::udp;
+        let (mut worker, tap) = receive_worker();
+        let expected = udp::frame(false, 5, &[9; 200]);
+        let mut inner = expected.clone();
+        let mut descriptor = udp::partial(&mut inner, false);
+        for at in [2, 4, 6, 8] {
+            let value = u16::from_ne_bytes([descriptor[at], descriptor[at + 1]]);
+            descriptor[at..at + 2].copy_from_slice(&value.to_be_bytes());
+        }
+        let frame = [&descriptor[..], &inner].concat();
+        let mut bad = frame.clone();
+        bad[0] = 2;
+        let offload = |sequence: u64, bytes| Record::Data {
+            frame_id: (7 << 48) | sequence,
+            total_len: frame.len() as u32,
+            offset: 0,
+            bytes,
+            offload: true,
+        };
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        let lane = worker.sessions[0].rx[0].as_mut().unwrap();
+        let length = receive_bytes(1, &[offload(2, &frame)], &mut bytes);
+        let datagram = Datagram::decode(&bytes[..length]).unwrap();
+        assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Invalid);
+        lane.accept_offload_frames(true);
+        for (number, record) in [
+            receive_piece(1, 0, &[1; 60]),
+            offload(2, &frame),
+            offload(3, &bad),
+            receive_piece(4, 0, &[4; 60]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let length = receive_bytes(number as u64 + 1, &[record], &mut bytes);
+            let datagram = Datagram::decode(&bytes[..length]).unwrap();
+            assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Fresh);
+        }
+        assert!(!worker.flush_rx(0, 0, Duration::ZERO));
+        let mut output = [0; 2048];
+        // This queue has no virtio headers, so the partial checksum completes here.
+        for want in [&[1; 60][..], &expected, &[4; 60]] {
+            let n = tap.recv(&mut output).unwrap();
+            assert_eq!(&output[..n], want);
+        }
+        assert_eq!(
+            tap.recv(&mut output).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(worker.counters.tap_errors, 1);
+        assert_eq!(
+            worker.sessions[0].rx[0].as_ref().unwrap().retained_frames(),
+            0
+        );
     }
 
     #[test]
