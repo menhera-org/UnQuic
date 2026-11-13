@@ -398,6 +398,26 @@ control sends 340), but wakes, polls and timers fall from about 880 to about
 mostly a light-load effect. The harness there also uses veth pairs in
 namespaces, so real NIC offloads remain unmeasured.
 
+## Inline packet pieces (November 13, rejected)
+
+The first part of the compact per-packet record kept up to two frame pieces
+inline per sent packet, which covers nearly every full-size packet, instead
+of linking journal nodes into packet and frame lists; packets with more
+pieces kept the journal. A slot generation, bumped when cleanup frees a
+frame slot, let stale inline pieces be skipped without pinning the slot
+([patch](benches/inline-packet-pieces-rejected.patch)). Stated beforehand
+with the usual bar (five of six rounds lower than HEAD and its copy, median
+−1% or better against the copy), it was lower in 3 of 6 rounds against HEAD
+at −0.2% and 4 of 6 against the copy at −0.5%
+([results](benches/full-size-inline-packet-pieces-rejected.json)); clean
+rounds sit within 1% of each other. The journal's linking is not where
+staging and reservation spend their cycles, and the change would also have
+cost about 15 MB of reserved memory at eight workers, pushing the
+default configuration past the 256 MiB `memory_limit`. The remaining
+per-packet costs are mostly per frame (frame lookups, coverage, queue and
+release bookkeeping), so carrying GSO super-frames as one frame (design
+section 6) is the next cut rather than further per-packet records.
+
 ## Receive admission without slot scans (November 13, landed)
 
 A split of receive admission

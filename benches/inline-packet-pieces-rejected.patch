@@ -1,0 +1,343 @@
+diff --git a/src/worker/recovery.rs b/src/worker/recovery.rs
+index 0630054..e8c7def 100644
+--- a/src/worker/recovery.rs
++++ b/src/worker/recovery.rs
+@@ -3,8 +3,38 @@ use super::*;
+ use crate::ack::{FramePiece, PieceJournal};
+ use crate::wire::MAX_RECORDS;
+ 
+-const MAPPINGS_PER_FRAME: usize = 32;
++// Journal nodes per frame slot. Packets of two or fewer pieces, nearly every
++// full-size packet, stay inline; the journal holds small frames' pieces.
++const MAPPINGS_PER_FRAME: usize = 16;
+ const PACKETS: usize = u16::MAX as usize;
++/// Pieces a packet keeps inline; a packet with more uses the journal.
++const INLINE: usize = 2;
++/// `InlinePacket::count` of a packet whose pieces are in the journal.
++const OVERFLOW: u8 = u8::MAX;
++
++/// One sent packet's frame pieces when it has at most INLINE of them, the
++/// common case for full-size frames: no journal nodes or frame lists.
++///
++/// Inline pieces do not pin their frame slot. Each records the slot's
++/// generation when reserved; cleanup bumps the generation when it frees the
++/// slot, so a piece that outlives its frame is recognised as stale and
++/// skipped, even if the frame ID repeats on a later connection.
++#[derive(Clone, Copy, Default)]
++struct InlinePacket {
++    pieces: [InlinePiece; INLINE],
++    count: u8,
++}
++
++/// A FramePiece without its frame ID: the generation names the slot's
++/// occupancy, and the slot holds that occupancy's ID.
++#[derive(Clone, Copy, Default)]
++struct InlinePiece {
++    generation: u32,
++    slot: u16,
++    start: u16,
++    end: u16,
++    attempt: u8,
++}
+ 
+ #[derive(Clone, Copy, Default, PartialEq, Eq)]
+ pub(super) enum Place {
+@@ -20,10 +50,14 @@ pub(super) enum Place {
+ struct Slot {
+     id: u64,
+     place: Place,
++    // Bumped each time cleanup frees the slot; see InlinePacket.
++    generation: u32,
+ }
+ 
+ pub(super) struct Recovery {
+     pub journal: PieceJournal,
++    // Indexed like the journal's packet slots; empty without frames.
++    inline: Vec<InlinePacket>,
+     slots: Vec<Slot>,
+     cleanup: VecDeque<usize>,
+     reserve: usize,
+@@ -38,12 +72,10 @@ pub(super) struct Recovery {
+ 
+ impl Recovery {
+     pub fn storage_bytes(frames: usize) -> Option<usize> {
+-        PieceJournal::storage_bytes(
+-            if frames == 0 { 0 } else { PACKETS },
+-            frames,
+-            frames.checked_mul(MAPPINGS_PER_FRAME)?,
+-        )?
+-        .checked_add(frames.checked_mul(size_of::<Slot>() + size_of::<usize>())?)
++        let packets = if frames == 0 { 0 } else { PACKETS };
++        PieceJournal::storage_bytes(packets, frames, frames.checked_mul(MAPPINGS_PER_FRAME)?)?
++            .checked_add(frames.checked_mul(size_of::<Slot>() + size_of::<usize>())?)?
++            .checked_add(packets.checked_mul(size_of::<InlinePacket>())?)
+     }
+ 
+     pub fn new(frames: usize) -> io::Result<Self> {
+@@ -54,12 +86,15 @@ impl Recovery {
+         cleanup
+             .try_reserve_exact(frames)
+             .map_err(io::Error::other)?;
++        let packets = if frames == 0 { 0 } else { PACKETS };
++        let mut inline = Vec::new();
++        inline
++            .try_reserve_exact(packets)
++            .map_err(io::Error::other)?;
++        inline.resize(packets, InlinePacket::default());
+         Ok(Self {
+-            journal: PieceJournal::new(
+-                if frames == 0 { 0 } else { PACKETS },
+-                frames,
+-                frames * MAPPINGS_PER_FRAME,
+-            )?,
++            journal: PieceJournal::new(packets, frames, frames * MAPPINGS_PER_FRAME)?,
++            inline,
+             slots,
+             cleanup,
+             reserve: frames * MAPPINGS_PER_FRAME / 2,
+@@ -117,6 +152,109 @@ impl Recovery {
+     pub fn fresh_capacity(&self) -> bool {
+         self.journal.available() > self.reserve
+     }
++
++    /// Whether a packet slot holds no pieces, inline or in the journal.
++    pub fn packet_empty(&self, packet: usize) -> bool {
++        self.inline.get(packet).is_some_and(|p| p.count == 0) && self.journal.packet_empty(packet)
++    }
++
++    /// Reserves the first `n` pieces of `self.pieces` for an empty packet slot:
++    /// inline when they fit, otherwise in the journal. False changes nothing.
++    pub fn reserve_packet(&mut self, packet: usize, n: usize) -> bool {
++        if !self.packet_empty(packet) || n > self.pieces.len() {
++            return false;
++        }
++        if n > INLINE {
++            if !self.journal.reserve_packet(packet, &self.pieces[..n]) {
++                return false;
++            }
++            if let Some(record) = self.inline.get_mut(packet) {
++                record.count = OVERFLOW;
++            }
++            return true;
++        }
++        let mut record = InlinePacket {
++            count: n as u8,
++            ..InlinePacket::default()
++        };
++        for (at, piece) in self.pieces[..n].iter().enumerate() {
++            // The caller bound every frame first; a stale identity is a bug.
++            let Some(slot) = self
++                .slots
++                .get(usize::from(piece.frame_slot))
++                .filter(|slot| slot.id == piece.frame_id && slot.id != 0)
++            else {
++                return false;
++            };
++            record.pieces[at] = InlinePiece {
++                generation: slot.generation,
++                slot: piece.frame_slot,
++                start: piece.start,
++                end: piece.end,
++                attempt: piece.attempt,
++            };
++        }
++        match self.inline.get_mut(packet) {
++            Some(slot) => {
++                *slot = record;
++                true
++            }
++            None => false,
++        }
++    }
++
++    /// Loads a packet's live pieces into `self.pieces`, skipping inline pieces
++    /// whose frame slot has been freed since. Returns how many it loaded.
++    pub fn load_packet(&mut self, packet: usize) -> io::Result<usize> {
++        let record = *self.inline.get(packet).ok_or(io::ErrorKind::InvalidData)?;
++        let mut count = 0;
++        if record.count == OVERFLOW {
++            for piece in self.journal.packet(packet) {
++                *self
++                    .pieces
++                    .get_mut(count)
++                    .ok_or(io::ErrorKind::InvalidData)? = piece;
++                count += 1;
++            }
++            return Ok(count);
++        }
++        for piece in &record.pieces[..usize::from(record.count).min(INLINE)] {
++            let Some(slot) = self
++                .slots
++                .get(usize::from(piece.slot))
++                .filter(|slot| slot.generation == piece.generation)
++            else {
++                continue;
++            };
++            self.pieces[count] = FramePiece {
++                frame_slot: piece.slot,
++                frame_id: slot.id,
++                start: piece.start,
++                end: piece.end,
++                attempt: piece.attempt,
++            };
++            count += 1;
++        }
++        Ok(count)
++    }
++
++    /// The pieces the last `load_packet` loaded.
++    pub fn loaded(&self, at: usize) -> io::Result<FramePiece> {
++        self.pieces
++            .get(at)
++            .copied()
++            .ok_or(io::ErrorKind::InvalidData.into())
++    }
++
++    /// Drops every piece a packet slot holds.
++    pub fn clear_packet(&mut self, packet: usize) {
++        if let Some(record) = self.inline.get_mut(packet) {
++            if record.count == OVERFLOW {
++                while self.journal.pop_packet(packet).is_some() {}
++            }
++            record.count = 0;
++        }
++    }
+ }
+ 
+ impl Worker {
+@@ -189,11 +327,16 @@ impl Worker {
+                 continue;
+             }
+             self.recovery.cleanup.pop_front();
+-            *self
++            let slot = self
+                 .recovery
+                 .slots
+                 .get_mut(index)
+-                .ok_or(io::ErrorKind::InvalidData)? = Slot::default();
++                .ok_or(io::ErrorKind::InvalidData)?;
++            // Inline pieces still naming this occupancy become stale.
++            *slot = Slot {
++                generation: slot.generation.wrapping_add(1),
++                ..Slot::default()
++            };
+             self.release_frame_storage(index);
+             work -= 1;
+         }
+@@ -331,21 +474,21 @@ impl Worker {
+             self.recovery.cursor += 1;
+             let Some(sample) = entry.sample else { continue };
+             let packet = usize::from(sample.get()) - 1;
+-            let mut mappings = [FramePiece::default(); 64];
+-            let mut count = 0;
++            let count = self.recovery.load_packet(packet)?;
+             let mut length = 0;
+-            for piece in self.recovery.journal.packet(packet) {
+-                if count == mappings.len() {
+-                    return Err(io::ErrorKind::InvalidData.into());
+-                }
+-                length += usize::from(piece.end - piece.start);
+-                mappings[count] = piece;
+-                count += 1;
++            for at in 0..count {
++                let piece = self.recovery.loaded(at)?;
++                length += usize::from(piece.end.saturating_sub(piece.start));
+             }
+             if length > 8952 {
+                 return Err(io::ErrorKind::InvalidData.into());
+             }
+-            for piece in &mappings[..count] {
++            // A lost packet keeps its pieces for a late ACK.
++            if !matches!(report.kind, sender::ReportKind::Loss) {
++                self.recovery.clear_packet(packet);
++            }
++            for at in 0..count {
++                let piece = &self.recovery.loaded(at)?;
+                 let index = usize::from(piece.frame_slot);
+                 if self
+                     .frames
+@@ -372,12 +515,6 @@ impl Worker {
+                     }
+                     sender::ReportKind::Retire => {}
+                 }
+-                if !matches!(report.kind, sender::ReportKind::Loss) {
+-                    self.recovery
+-                        .journal
+-                        .pop_packet(packet)
+-                        .ok_or(io::ErrorKind::InvalidData)?;
+-                }
+                 if self.recovery.place(index)? == Place::Cleanup {
+                     continue;
+                 }
+@@ -417,13 +554,17 @@ impl Worker {
+     }
+ 
+     pub(super) fn reserve_pieces(&mut self, batch: &TxBatch, count: usize) -> io::Result<bool> {
++        // Only packets with more pieces than fit inline take journal nodes.
+         let mut needed = 0;
+         for ordinal in 0..count {
+-            needed += batch
++            let pieces = batch
+                 .plan
+                 .pieces(ordinal)
+                 .ok_or(io::ErrorKind::InvalidData)?
+                 .count();
++            if pieces > INLINE {
++                needed += pieces;
++            }
+         }
+         let available = self.recovery.journal.available();
+         if needed > available
+@@ -464,12 +605,7 @@ impl Worker {
+             if let Err(error) = reserved {
+                 for prior in 0..ordinal {
+                     if let Some(sample) = self.sender.flight.handle(prior) {
+-                        while self
+-                            .recovery
+-                            .journal
+-                            .pop_packet(usize::from(sample.get()) - 1)
+-                            .is_some()
+-                        {}
++                        self.recovery.clear_packet(usize::from(sample.get()) - 1);
+                     }
+                 }
+                 return Err(error);
+@@ -487,7 +623,7 @@ impl Worker {
+             .handle(ordinal)
+             .ok_or(io::ErrorKind::InvalidData)?;
+         let slot = usize::from(sample.get()) - 1;
+-        if !self.recovery.journal.packet_empty(slot) {
++        if !self.recovery.packet_empty(slot) {
+             return Err(io::Error::other("live packet mapping reused"));
+         }
+         let packet = batch
+@@ -537,8 +673,7 @@ impl Worker {
+         if length > packet.length || packet.length > 8952 {
+             return Err(io::Error::other("DATA mapping exceeds datagram"));
+         }
+-        let recovery = &mut self.recovery;
+-        if !recovery.journal.reserve_packet(slot, &recovery.pieces[..n]) {
++        if !self.recovery.reserve_packet(slot, n) {
+             return Err(io::Error::other("invalid reserved DATA mappings"));
+         }
+         Ok(())
+@@ -552,7 +687,9 @@ impl Worker {
+             };
+             let packet = usize::from(sample.get()) - 1;
+             if ordinal < sent {
+-                for piece in self.recovery.journal.packet(packet) {
++                let count = self.recovery.load_packet(packet)?;
++                for at in 0..count {
++                    let piece = self.recovery.loaded(at)?;
+                     if self
+                         .frames
+                         .frame(usize::from(piece.frame_slot))
+@@ -572,7 +709,7 @@ impl Worker {
+                     }
+                 }
+             } else {
+-                while self.recovery.journal.pop_packet(packet).is_some() {}
++                self.recovery.clear_packet(packet);
+             }
+         }
+         Ok(())

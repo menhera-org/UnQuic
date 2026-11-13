@@ -792,7 +792,10 @@ frame to the TAP from the receive buffers that carry it. Large sends can use
 `MSG_ZEROCOPY`.
 
 **Order of work**, each change judged as CPU per delivered bit at an
-offer-limited point, in rotating rounds with an A/A copy:
+offer-limited point, in rotating rounds with an A/A copy. (November 13:
+inline packet pieces, the first part of item 1, showed no gain, because the
+remaining per-packet costs are mostly per frame; offload frames, items 3
+and 4, now come first.)
 
 1. One compact per-packet record on the transmit owner, holding the
    packet's frame pieces inline in the common case and replacing journal

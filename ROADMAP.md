@@ -573,14 +573,17 @@ rules apply to all of them.
    6,480 now, with a per-operation target that sums to about 2,060, and a
    memory-bandwidth limit that rules out the receive-side reassembly copy.
    Coverage planes (3–6%), a merged piece-reservation pass (about 2%) and
-   receive admission without slot scans (about 2–3%) landed. Next, in the section's order, each judged on the full-size
-   efficiency point (rotating rounds with an A/A copy): the compact
-   per-packet record with staging during ACK application and one ACK
-   summary per ACK; receive without the reassembly copy; large frames
-   carrying TAP GSO super-frames; deferred checksums; fewer cross-worker
-   wakes; then one flow striped with a receive-side reorder stage
-   (decision 7). The kernel figures can only be confirmed on an R86S-class
-   box with real NICs. The kernel test
+   receive admission without slot scans (about 2–3%) landed. Inline packet
+   pieces, the first part of the compact per-packet record, showed no gain
+   ([BENCH.md](BENCH.md#inline-packet-pieces-november-13-rejected)): the
+   remaining per-packet costs are mostly per frame. Next, each judged on
+   the full-size efficiency point (rotating rounds with an A/A copy):
+   offload frames carrying TAP GSO super-frames with deferred checksums
+   (design section 6), which divide per-frame work by up to 44 for GSO
+   traffic; then receive without the reassembly copy; fewer cross-worker
+   wakes; one flow striped with a receive-side reorder stage (decision 7).
+   The kernel figures can only be confirmed on an R86S-class box with real
+   NICs; the remote 7.0 host stands in until then. The kernel test
    `tap::read::tests::real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch`
    failed in 3–5% of runs: the TAP's queueing discipline dropped some of its
    raw sends, and a read finding the queue empty could leave a gap before a
