@@ -228,6 +228,21 @@ Gbit/s without it and 0.95–0.98 / 0.98–1.00 with it. Balanced lanes deliver
 the one flow across lanes either way: 1.7–2.0 million reordered frames per
 direction, against about 45,000 with hash lanes.
 
+The exploratory flow table shared by all readers
+([section](#a-flow-table-shared-by-all-readers-exploratory)), rebased onto
+the control lane ([patch](benches/shared-flow-table-control-lane-exploratory.patch)),
+was required beforehand to keep balanced lanes' loopback total within 5%.
+One pair cannot show that: 13.41 and 13.60 Gbit/s against 13.12 and 16.86
+with per-reader tables, the 16.86 above every other balanced run today, and
+12.18–12.31 with hash lanes
+([results](benches/loopback-shared-flow-table-control-lane.json)). On the
+four-flow decision points (two repeats,
+[results](benches/decision-shared-flow-table-control-lane.json)) delivery is
+level, 3.43–4.09 Gbit/s in total against 3.35–4.22 with per-reader tables,
+and the reordering bursts are gone. Per-reader tables reorder 289,000–1.4
+million frames per direction in three of eight runs as flows change readers.
+The shared table stays at or below 13,054 in every run.
+
 ## Memory reserved against memory used (November 12)
 
 The startup check reserves storage from the configuration and refuses to

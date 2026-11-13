@@ -526,8 +526,15 @@ rules apply to all of them.
    As of November 13 the ACK-path fix has landed as `daemon.control_lane`,
    off by default, and measured on the decision workload
    ([BENCH.md](BENCH.md#a-control-lane-for-acks-november-13)). Next:
-   the shared flow table with it (the lossy one-flow row loses nothing to
-   it), then decision 5 (`balance_flows` and `control_lane` together). A peer with one lane keeps ACKs and
+   build the shared flow table properly. Rebased onto the control lane, the
+   exploratory table keeps four-flow delivery level and removes the
+   reordering bursts per-reader tables show (up to 1.4 million frames per
+   direction against at most 13,054), but one loopback pair could not show
+   it within 5% of per-reader tables. A production version replaces the
+   per-reader tables under `balance_flows`, with its memory charged, tests,
+   both suites and a loopback rerun. Then decision 5 (`balance_flows` and
+   `control_lane` together). The lossy one-flow row loses nothing to the
+   control lane. A peer with one lane keeps ACKs and
    data on lane 0 and can still defer ACKs under loss; a separate number
    space for control (a 65th lane ID with its own receive table) would cover
    it if that case matters.
