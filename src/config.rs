@@ -42,9 +42,10 @@ pub struct Daemon {
     /// Raising it keeps throughput on lossy unqueued paths; the queue check
     /// still cuts whenever RTT samples show queueing.
     pub loss_threshold_permille: u16,
-    /// Off by default: pin each new flow to the next lane round-robin instead
-    /// of its hash lane, so a few heavy flows use separate transmit workers.
-    /// It lifts weaker directions and single flows but costs the favoured ones.
+    /// On by default since November 13: pin each new flow to the next lane
+    /// round-robin instead of its hash lane, so a few heavy flows use separate
+    /// transmit workers. One table, shared by every TAP reader, keeps a flow on
+    /// its lane while it sends. False restores plain hash lanes.
     pub balance_flows: bool,
     /// Off (0) by default: an idle lane holding less than two datagrams of
     /// frames waits up to this many microseconds (at most 1000) for more, so
@@ -55,9 +56,9 @@ pub struct Daemon {
     /// receiver's 1 ms ACK delay, not over min_rtt alone, so a steady offer
     /// below half the bandwidth is not cut during the probe.
     pub probe_rtt_ack_delay: bool,
-    /// Off by default: with more than one transmit lane, lane 0 carries only
-    /// ACKs and control, so data never fills the packet history they number
-    /// from. Data uses the other lanes.
+    /// On by default since November 13: with more than one transmit lane,
+    /// lane 0 carries only ACKs and control, so data never fills the packet
+    /// history they number from. Data uses the other lanes.
     pub control_lane: bool,
 }
 impl Default for Daemon {
@@ -66,10 +67,10 @@ impl Default for Daemon {
             memory_limit: 256 * 1024 * 1024,
             tolerate_random_loss: true,
             loss_threshold_permille: 20,
-            balance_flows: false,
+            balance_flows: true,
             tx_hold_us: 0,
             probe_rtt_ack_delay: true,
-            control_lane: false,
+            control_lane: true,
         }
     }
 }

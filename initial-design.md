@@ -374,9 +374,10 @@ applies only to new frames: a frame's pieces and repairs stay on its original la
 Any such change must document possible cross-lane reordering and verify overload
 behavior. eBPF is excluded because production hosts may prohibit loading programs.
 
-**Balanced flow lanes (November 10 amendment; `daemon.balance_flows`, off by
-default: it met its decision-workload bar on November 11 but cuts the
-loopback overload check by up to 4x; see BENCH.md).** Fixed-key flow hashing can place a few heavy flows on the same
+**Balanced flow lanes (November 10 amendment; `daemon.balance_flows`, on by
+default since November 13 together with the control lane below: alone it met
+its decision-workload bar on November 11 but cut the loopback overload
+check; see BENCH.md).** Fixed-key flow hashing can place a few heavy flows on the same
 transmit worker. With the switch, frames that would use strict hashing go
 through a direct-mapped table of 16,384 flows that every TAP reader shares:
 a flow's first frame takes the session's next lane round-robin, and the flow
@@ -391,8 +392,8 @@ lane.
 flow that changed readers changed lanes and reordered up to 1.4 million
 frames per direction on the decision workload; BENCH.md.)
 
-**Control lane (November 13 amendment; `daemon.control_lane`, off by
-default).** ACKs and other non-handshake control records take packet numbers
+**Control lane (November 13 amendment; `daemon.control_lane`, on by
+default with balanced lanes).** ACKs and other non-handshake control records take packet numbers
 from lane 0's sent history. That history spans at most 65,536 numbers, and
 under loss its floor waits behind lost data packets until they are retired,
 which a steady ACK stream postpones. Lane 0's data can then fill the history,

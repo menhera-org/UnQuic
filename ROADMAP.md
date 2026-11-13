@@ -35,6 +35,12 @@ That worker holds one flow near 1 Gbit/s even without loss, and its
 userspace share is only about a quarter, so the single-flow 5 Gbit/s gate
 needs a design decision (decision 7) rather than more small changes.
 
+The user decided both. Decision 5: `balance_flows` and `control_lane` are
+on by default. Decision 7: one flow should be striped across transmit
+workers with a receive-side reorder stage so inner TCP still sees order;
+that starts with a design amendment. The user also asked for continued work
+on userspace per-frame cost.
+
 ## November 12 checkpoint
 
 Stage 4 is done. An OVS system-port test now runs on Linux 6.8 and 7.0, with
@@ -200,8 +206,8 @@ Decisions only the user can make, each blocking a remaining goal:
    no longer shows a loss of its own, but it
    adds about 33 µs to the median one-way delay and 0.2 ms at p99 for light
    traffic.
-5. Should `daemon.balance_flows` and `daemon.control_lane` both be on by
-   default? As of November 13 the pair beats hash lanes everywhere it was
+5. Decided November 13: `daemon.balance_flows` and `daemon.control_lane`
+   are both on by default. The pair beats hash lanes everywhere it was
    measured ([BENCH.md](BENCH.md#a-control-lane-for-acks-november-13)):
    13.4–13.9 Gbit/s on the loopback check at 21G with the shared flow table
    (13.1–16.9 with the old per-reader tables) against 12.1–12.3, and 3–32%
@@ -224,7 +230,9 @@ Decisions only the user can make, each blocking a remaining goal:
    for a session with as many lanes (reserving 260 MB); sixteen need about
    420 MiB and use about 330 MB at overload
    ([BENCH.md](BENCH.md#memory-reserved-against-memory-used-november-12)).
-7. How should one flow reach 5 Gbit/s on a 1500-byte path? One flow runs
+7. Decided November 13: stripe one flow across transmit workers with a
+   receive-side reorder stage, starting with a design amendment. The
+   question was how one flow should reach 5 Gbit/s on a 1500-byte path. One flow runs
    on one transmit worker so its frames arrive in order, and that worker
    delivers about 1 Gbit/s on this host with or without loss: a third of
    it is the kernel sending through the emulated path, and removing all
@@ -540,10 +548,12 @@ rules apply to all of them.
    `balance_flows`: with both switches on it cuts the worst decision-workload
    reordering from 1.03 million frames per direction to 45,000 with
    delivery level or higher, and stays within 2% on the loopback check.
-   Decision 5 (`balance_flows` and `control_lane` together) now waits on the
-   user. One flow's ceiling is one transmit worker, about a quarter of it
-   userspace bookkeeping, so the single-flow gate waits on decision 7;
-   per-frame cost still matters for small frames and CPU per bit. A peer
+   Both switches are on by default (decision 5). Next, in order: cut
+   userspace per-frame cost on the transmit worker (recovery staging,
+   permit planning, queue draining and input expansion, about a quarter
+   of a one-flow worker), judged by CPU per delivered unit at an
+   offer-limited point; then the design amendment for striping one flow
+   with a receive-side reorder stage (decision 7). A peer
    with one lane keeps ACKs and
    data on lane 0 and can still defer ACKs under loss; a separate number
    space for control (a 65th lane ID with its own receive table) would cover

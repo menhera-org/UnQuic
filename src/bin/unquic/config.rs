@@ -269,15 +269,19 @@ mod tests {
             assert_eq!(loaded.config.daemon.memory_limit, 256 * 1024 * 1024);
             assert!(loaded.config.daemon.tolerate_random_loss);
             assert_eq!(loaded.config.daemon.loss_threshold_permille, 20);
-            assert!(!loaded.config.daemon.balance_flows);
+            assert!(loaded.config.daemon.balance_flows);
             assert_eq!(loaded.config.daemon.tx_hold_us, 0);
             assert!(loaded.config.daemon.probe_rtt_ack_delay);
-            assert!(!loaded.config.daemon.control_lane);
+            assert!(loaded.config.daemon.control_lane);
             loaded.config.validate().unwrap();
         }
-        let text = format!("[daemon]\ncontrol_lane = true\n{}", sample());
+        let text = format!(
+            "[daemon]\ncontrol_lane = false\nbalance_flows = false\n{}",
+            sample()
+        );
         let loaded = Loaded::parse(&text).unwrap();
-        assert!(loaded.config.daemon.control_lane);
+        assert!(!loaded.config.daemon.control_lane);
+        assert!(!loaded.config.daemon.balance_flows);
         loaded.config.validate().unwrap();
         let text = format!("[daemon]\ntx_hold_us = 1000\n{}", sample());
         let loaded = Loaded::parse(&text).unwrap();

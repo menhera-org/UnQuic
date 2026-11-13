@@ -610,7 +610,7 @@ lane counts remain independent; peers need not use identical values. eBPF is
 excluded from deployment.
 
 Fixed-key hashing can put a few heavy flows on the same transmit worker. With
-`daemon.balance_flows`, off by default, frames on the strict-hash path go
+`daemon.balance_flows`, on by default since November 13, frames on the strict-hash path go
 through a 16,384-entry table that every TAP reader shares (128 KiB): a new
 flow takes the session's next lane round-robin and keeps it while it sends,
 moving only after a second of silence, even when the kernel moves it to
@@ -620,19 +620,20 @@ runs on one lane, as with hashing; the per-reader tables it replaced let a
 flow change lanes whenever the kernel moved it between TAP queues, which
 lifted one lossy flow 50–90% at the cost of 1.7–2.0 million reordered
 frames per direction. On its own it costs the loopback overload check about
-12%; with `daemon.control_lane` (below) it gains 8–14% there instead.
-Both stay off until that trade is decided (BENCH.md).
+12%; with `daemon.control_lane` (below) it gains 8–14% there instead, so
+both are on by default. Set both to false for plain hash lanes (BENCH.md).
 
 ACKs and other control records always leave on lane 0 and take their packet
 numbers from its history, which spans 65,536 numbers. Under loss, lane 0's
 data can fill that history while lost packets wait to be retired, and then
-ACKs wait for numbers, which causes more loss. `daemon.control_lane`, off by
-default, keeps lane 0 for ACKs and control when a peer has more than one
+ACKs wait for numbers, which causes more loss. `daemon.control_lane`, on by
+default since November 13, keeps lane 0 for ACKs and control when a peer has more than one
 transmit lane; data uses the others. On the loopback overload check it
 removed every deferred ACK send. With balanced lanes it delivered 13.7–15.9
 Gbit/s at 21 Gbit/s offered, against 10.7–10.8 without it and 12.3 with hash
 lanes. On the four-lane decision workload it leaves balanced lanes level but
-costs hash lanes up to 10%, since data loses one lane of four (BENCH.md).
+costs hash lanes up to 10%, since data loses one lane of four, so turn it
+off along with `balance_flows` (BENCH.md).
 
 At light load each lane tends to send one frame at a time, and at a
 1452-byte payload limit a 1514-byte frame takes two datagrams, the second
