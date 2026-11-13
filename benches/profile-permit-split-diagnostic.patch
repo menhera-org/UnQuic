@@ -1,0 +1,452 @@
+diff --git a/src/profile.rs b/src/profile.rs
+index c12610b..1fa9a36 100644
+--- a/src/profile.rs
++++ b/src/profile.rs
+@@ -37,10 +37,38 @@ pub const NAMES: [&str; PHASES] = [
+     "read_socket",
+     "reactor_drain",
+     "poll",
++    "sub_expire",
++    "sub_cleanup",
++    "sub_prepare",
++    "sub_request",
++    "sub_claim",
++    "sub_reserve",
++    "sub_send",
++    "sub_finish",
++    "sub_submitted",
++    "sub_messages",
++    "sub_acks",
++    "sub_stage",
++    "sub_owner",
++    "sub_permit",
++    "sub_rel_store",
++    "sub_rel_buffer",
++    "sub_rel_owner",
++    "sub_rel_journal",
++    "sub_rx_decode",
++    "sub_rx_admit",
++    "sub_rx_records",
++    "sub_rx_flush",
++    "sub_rx_counters",
++    "sub_rx_release",
++    "sub_permit_send",
++    "sub_permit_flush",
+ ];
+ 
++/// Loop phases; the rest are nested inside them and excluded from the total.
++pub const LOOP_PHASES: usize = 28;
+ /// Number of accounted worker loop phases.
+-pub const PHASES: usize = 28;
++pub const PHASES: usize = 54;
+ 
+ /// Current timestamp-counter value, or nanoseconds where there is none.
+ #[inline(always)]
+@@ -80,9 +108,17 @@ pub fn syscall(kind: usize, started: u64, items: usize) {
+     }
+ }
+ 
++/// Diagnostic: loop turns and blocking waits per worker.
++pub static TURNS: [[std::sync::atomic::AtomicU64; 2]; 64] =
++    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 64];
++
+ /// Prints one worker's phase totals, largest first, as shares of their sum.
+ pub fn report(worker: usize, phases: &[u64; PHASES]) {
+-    let total: u64 = phases.iter().sum();
++    let turns = TURNS[worker.min(63)]
++        .each_ref()
++        .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
++    eprintln!("unquic: profile worker {worker} turns/blocks {turns:?}");
++    let total: u64 = phases[..LOOP_PHASES].iter().sum();
+     let mut order: Vec<usize> = (0..PHASES).collect();
+     order.sort_by_key(|&index| std::cmp::Reverse(phases[index]));
+     let admission = ADMISSION
+diff --git a/src/worker.rs b/src/worker.rs
+index 41d388b..079242d 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -842,6 +842,8 @@ pub(crate) struct Worker {
+     held: Vec<(usize, usize)>,
+     hold: Duration,
+     notifications: u64,
++    #[cfg(feature = "profile")]
++    in_permit: bool,
+     counters: Snapshot,
+     setup_due: Duration,
+     retry_due: Option<Duration>,
+@@ -1192,6 +1194,8 @@ impl Worker {
+             held: Vec::with_capacity(batch_count),
+             hold: Duration::from_micros(config.daemon.tx_hold_us.into()),
+             notifications: 0,
++            #[cfg(feature = "profile")]
++            in_permit: false,
+             counters,
+             setup_due: Duration::ZERO,
+             retry_due: None,
+@@ -1244,6 +1248,8 @@ impl Worker {
+         let mut publish_due = Duration::ZERO;
+         let mut publish_turns = 0_u8;
+         while !self.control.quitting() {
++            #[cfg(feature = "profile")]
++            crate::profile::TURNS[self.id.min(63)][0].fetch_add(1, Ordering::Relaxed);
+             let now = monotonic_now()?;
+             let mut more = phase!(self, 0, self.drain_queues(now))?;
+             if now >= self.setup_due {
+@@ -1317,6 +1323,9 @@ impl Worker {
+                 // Work queued before the flag was visible got no wake; take it now.
+                 block = self.incoming.iter_mut().flatten().all(Consumer::is_empty);
+             }
++            #[cfg(feature = "profile")]
++            crate::profile::TURNS[self.id.min(63)][1]
++                .fetch_add(u64::from(block), Ordering::Relaxed);
+             let waited = phase!(
+                 self,
+                 if block { 22 } else { 27 },
+@@ -2059,7 +2068,7 @@ impl Worker {
+                 if buffer.advance() {
+                     self.received.push_front(buffer);
+                 } else {
+-                    self.release(buffer);
++                    phase!(self, 51, self.release(buffer));
+                 }
+             }
+         }
+@@ -2084,7 +2093,11 @@ impl Worker {
+             self.counters.malformed_packets = self.counters.malformed_packets.wrapping_add(1);
+             return Ok(Some(buffer));
+         }
+-        let Ok(datagram) = Datagram::decode(&buffer.bytes[buffer.offset..end]) else {
++        let Ok(datagram) = phase!(
++            self,
++            46,
++            Datagram::decode(&buffer.bytes[buffer.offset..end])
++        ) else {
+             budget.records += wire::MAX_RECORDS;
+             self.counters.malformed_packets = self.counters.malformed_packets.wrapping_add(1);
+             return Ok(Some(buffer));
+@@ -2205,7 +2218,14 @@ impl Worker {
+             .wrapping_add((length + 48) as u64);
+         local.rx_dirty |= 1_u64 << slot;
+         let lane = local.rx[slot].as_mut().ok_or(io::ErrorKind::InvalidData)?;
++        #[cfg(feature = "profile")]
++        let admit_started = crate::profile::now();
+         let mut admission = lane.admit(&datagram, now);
++        #[cfg(feature = "profile")]
++        {
++            self.phases[47] =
++                self.phases[47].wrapping_add(crate::profile::now().wrapping_sub(admit_started));
++        }
+         if admission == Admission::Pressure {
+             let retained = lane.retained_frames();
+             self.flush_rx(session, slot, now);
+@@ -2215,6 +2235,8 @@ impl Worker {
+                 admission = lane.admit(&datagram, now);
+             }
+         }
++        #[cfg(feature = "profile")]
++        let records_started = crate::profile::now();
+         match admission {
+             Admission::Fresh => {
+                 for record in datagram.records() {
+@@ -2328,13 +2350,18 @@ impl Worker {
+                     .wrapping_add(1);
+             }
+         }
++        #[cfg(feature = "profile")]
++        {
++            self.phases[48] =
++                self.phases[48].wrapping_add(crate::profile::now().wrapping_sub(records_started));
++        }
+         if self.sessions[session].rx[slot]
+             .as_ref()
+             .is_some_and(|lane| lane.ready_count() >= 32)
+         {
+-            self.flush_rx(session, slot, now);
++            phase!(self, 49, self.flush_rx(session, slot, now));
+         }
+-        self.refresh_rx_counters(session, slot);
++        phase!(self, 50, self.refresh_rx_counters(session, slot));
+         Ok(Some(buffer))
+     }
+ 
+@@ -3111,15 +3138,18 @@ impl Worker {
+     }
+ 
+     fn release_frame_storage(&mut self, index: usize) {
+-        let owner = self
+-            .frames
+-            .frame(index)
+-            .and_then(|f| self.frames.source(f.source).map(|b| (b.session, f.source)));
++        let owner = phase!(
++            self,
++            44,
++            self.frames
++                .frame(index)
++                .and_then(|f| self.frames.source(f.source).map(|b| (b.session, f.source)))
++        );
+         if let Some((session, _)) = owner {
+             self.sessions[session].tx_retained -= 1;
+         }
+-        if let Some(buffer) = self.frames.release(index) {
+-            self.release(buffer);
++        if let Some(buffer) = phase!(self, 42, self.frames.release(index)) {
++            phase!(self, 43, self.release(buffer));
+         }
+         if let Some((session, source)) = owner
+             && self.sessions[session].slab == Some(source)
+@@ -3210,7 +3240,8 @@ impl Worker {
+     }
+ 
+     fn flush_frames(&mut self, now: Duration) -> io::Result<bool> {
+-        let more = self.expire_frames(now)? | self.cleanup_frames()?;
++        let more =
++            phase!(self, 28, self.expire_frames(now))? | phase!(self, 29, self.cleanup_frames())?;
+         self.release_holds(now);
+         let mut visited = 0;
+         for _ in 0..self.ready.len().min(BATCH_SIZE) {
+@@ -3494,15 +3525,18 @@ impl Worker {
+             }
+         }
+         if (batch.plan.is_empty() || (self.sender_enabled() && !self.sender.permitted))
+-            && batch
+-                .prepare(
++            && phase!(
++                self,
++                30,
++                batch.prepare(
+                     self.sessions[session].tx[lane]
+                         .as_mut()
+                         .ok_or(io::ErrorKind::InvalidData)?,
+                     &self.frames,
+                     limit,
+                 )
+-                .is_err()
++            )
++            .is_err()
+         {
+             trace_hold!(
+                 self.id,
+@@ -3520,7 +3554,11 @@ impl Worker {
+                     .job
+                     .is_none_or(|job| job.session != session || job.lane != lane))
+         {
+-            let keep = self.request_batch(session, lane, batch, deadline, limit)?;
++            let keep = phase!(
++                self,
++                31,
++                self.request_batch(session, lane, batch, deadline, limit)
++            )?;
+             if self.sender.job.is_none() {
+                 if !keep {
+                     self.discard_batch(session, lane, batch);
+@@ -3528,7 +3566,7 @@ impl Worker {
+                 return Ok(());
+             }
+             // Claim immediately before the syscall; a refused plan waits for its retry.
+-            match self.claim_sender(now)? {
++            match phase!(self, 32, self.claim_sender(now))? {
+                 sender::Claimed::Ready => {
+                     // A retained plan overtaken by a later send is renumbered by the
+                     // permit path before submission, never sent with stale numbers.
+@@ -3550,11 +3588,13 @@ impl Worker {
+         } else {
+             batch.plan.len()
+         };
+-        if claimed && !self.reserve_pieces(batch, count)? {
++        if claimed && !phase!(self, 33, self.reserve_pieces(batch, count))? {
+             self.finish_sender_send(0, None, true)?;
+             self.yield_batch(session, lane, batch)?;
+             return Ok(());
+         }
++        #[cfg(feature = "profile")]
++        let send_started = crate::profile::now();
+         let result = {
+             let frames = std::array::from_fn::<_, { pack::BATCH_CAPACITY }, _>(|index| {
+                 batch.frames[index]
+@@ -3599,15 +3639,27 @@ impl Worker {
+                     Ok(at)
+                 })
+         };
++        #[cfg(feature = "profile")]
++        {
++            let spent = crate::profile::now().wrapping_sub(send_started);
++            self.phases[34] = self.phases[34].wrapping_add(spent);
++            if self.in_permit {
++                self.phases[52] = self.phases[52].wrapping_add(spent);
++            }
++        }
+         if claimed {
+             let submitted = result.as_ref().ok().copied();
+-            self.finish_sender_send(
+-                submitted.map_or(0, |(count, _)| count),
+-                submitted.and_then(|(count, at)| (count != 0).then_some(at)),
+-                !expired
+-                    && result
+-                        .as_ref()
+-                        .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock),
++            phase!(
++                self,
++                35,
++                self.finish_sender_send(
++                    submitted.map_or(0, |(count, _)| count),
++                    submitted.and_then(|(count, at)| (count != 0).then_some(at)),
++                    !expired
++                        && result
++                            .as_ref()
++                            .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock),
++                )
+             )?;
+         }
+         if expired {
+@@ -3618,9 +3670,11 @@ impl Worker {
+             return Ok(());
+         }
+         match result {
+-            Ok((sent, _)) => {
+-                self.submitted_batch(session, lane, batch, sent, claimed && sent == count)?
+-            }
++            Ok((sent, _)) => phase!(
++                self,
++                36,
++                self.submitted_batch(session, lane, batch, sent, claimed && sent == count)
++            )?,
+             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                 let tx = &mut self.transmit[peer].paths[path].lanes[lane];
+                 let token = TX_TOKEN | ((peer as u64) << 7) | ((path as u64) << 6) | lane as u64;
+diff --git a/src/worker/recovery.rs b/src/worker/recovery.rs
+index 6d6bc4b..bdc025f 100644
+--- a/src/worker/recovery.rs
++++ b/src/worker/recovery.rs
+@@ -175,12 +175,20 @@ impl Worker {
+             let Some(&index) = self.recovery.cleanup.front() else {
+                 break;
+             };
++            #[cfg(feature = "profile")]
++            let started = crate::profile::now();
+             let id = self
+                 .frames
+                 .frame(index)
+                 .ok_or(io::ErrorKind::InvalidData)?
+                 .id;
+-            if self.recovery.journal.pop_frame(index, id).is_some() {
++            let popped = self.recovery.journal.pop_frame(index, id).is_some();
++            #[cfg(feature = "profile")]
++            {
++                self.phases[45] =
++                    self.phases[45].wrapping_add(crate::profile::now().wrapping_sub(started));
++            }
++            if popped {
+                 work -= 1;
+                 continue;
+             }
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index a8f1a2b..f07379d 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -1176,10 +1176,23 @@ impl Worker {
+     }
+ 
+     pub(super) fn service_sender(&mut self, now: Duration) -> io::Result<bool> {
++        macro_rules! sub {
++            ($s:ident, $phase:expr, $e:expr) => {{
++                #[cfg(feature = "profile")]
++                let started = crate::profile::now();
++                let result = $e;
++                #[cfg(feature = "profile")]
++                {
++                    $s.phases[$phase] =
++                        $s.phases[$phase].wrapping_add(crate::profile::now().wrapping_sub(started));
++                }
++                result
++            }};
++        }
+         if !self.sender_enabled() {
+             return Ok(false);
+         }
+-        let mut more = self.flush_sender_messages(now)?;
++        let mut more = sub!(self, 37, self.flush_sender_messages(now))?;
+         let ack_blocked = self.sender.checks_pending != 0 || self.sender.loss_fences != 0;
+         self.begin_sender_ack()?;
+         for group in 0..self.sender.fresh.len() {
+@@ -1189,6 +1202,8 @@ impl Worker {
+             }
+         }
+         let mut budget = BATCH_SIZE;
++        #[cfg(feature = "profile")]
++        let acks_started = crate::profile::now();
+         if self.sender.acks_pending == 0 {
+             more |= self.advance_loss_checks(now, &mut budget)?;
+         }
+@@ -1249,6 +1264,11 @@ impl Worker {
+                 self.sender.report = Some(report);
+             }
+         }
++        #[cfg(feature = "profile")]
++        {
++            self.phases[38] =
++                self.phases[38].wrapping_add(crate::profile::now().wrapping_sub(acks_started));
++        }
+         more |= budget == 0 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0);
+         // A fully protected final loss pass emits no report to wake queued ACK work.
+         more |= ack_blocked
+@@ -1256,17 +1276,24 @@ impl Worker {
+             && self.sender.loss_fences == 0
+             && !self.sender.incoming.is_empty()
+             && self.sender.report.is_some();
+-        more |= self.stage_recovery()?;
++        more |= sub!(self, 39, self.stage_recovery())?;
+         if self.sender.owner.is_some() {
+             // Apply local feedback before the shared owner considers fresh grants.
+-            more |= self.flush_sender_messages(now)?;
++            more |= sub!(self, 37, self.flush_sender_messages(now))?;
+             // Reports can have arrived after the worker turn's original timestamp.
+             let observed = self.io_clock(now)()?;
++            #[cfg(feature = "profile")]
++            let owner_started = crate::profile::now();
+             if let Some(owner) = &mut self.sender.owner {
+                 more |= owner.advance(observed, &mut self.sender.outgoing)?;
+             }
++            #[cfg(feature = "profile")]
++            {
++                self.phases[40] =
++                    self.phases[40].wrapping_add(crate::profile::now().wrapping_sub(owner_started));
++            }
+         }
+-        more |= self.flush_sender_messages(now)?;
++        more |= sub!(self, 37, self.flush_sender_messages(now))?;
+         // Probes park an unclaimed DATA plan rather than wait behind it: under
+         // pacing-limited load such a plan almost always occupies the job slot.
+         if self.parkable() {
+@@ -1362,8 +1389,8 @@ impl Worker {
+                 }
+             }
+         }
+-        if self.sender.job.is_some() && self.claim_sender(now)? == Claimed::Ready {
+-            self.use_sender_permit(now)?;
++        if self.sender.job.is_some() && sub!(self, 32, self.claim_sender(now))? == Claimed::Ready {
++            sub!(self, 41, self.use_sender_permit(now))?;
+             more = true;
+         }
+         Ok(more)
+@@ -2053,7 +2080,20 @@ impl Worker {
+                     self.rejected_sender_grant(job.session, job.lane, false);
+                     self.finish_sender_send(0, None, false)?;
+                 } else {
+-                    self.flush_batch(job.session, job.lane, &mut batch, now)?;
++                    #[cfg(feature = "profile")]
++                    let started = crate::profile::now();
++                    #[cfg(feature = "profile")]
++                    {
++                        self.in_permit = true;
++                    }
++                    let flushed = self.flush_batch(job.session, job.lane, &mut batch, now);
++                    #[cfg(feature = "profile")]
++                    {
++                        self.in_permit = false;
++                        self.phases[53] = self.phases[53]
++                            .wrapping_add(crate::profile::now().wrapping_sub(started));
++                    }
++                    flushed?;
+                     if self.sender.permitted {
+                         self.rejected_sender_grant(job.session, job.lane, false);
+                         self.finish_sender_send(0, None, false)?;

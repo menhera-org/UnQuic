@@ -548,12 +548,16 @@ rules apply to all of them.
    `balance_flows`: with both switches on it cuts the worst decision-workload
    reordering from 1.03 million frames per direction to 45,000 with
    delivery level or higher, and stays within 2% on the loopback check.
-   Both switches are on by default (decision 5). Next, in order: cut
-   userspace per-frame cost on the transmit worker (recovery staging,
-   permit planning, queue draining and input expansion, about a quarter
-   of a one-flow worker), judged by CPU per delivered unit at an
-   offer-limited point; then the design amendment for striping one flow
-   with a receive-side reorder stage (decision 7). A peer
+   Both switches are on by default (decision 5). The per-frame budget
+   ([BENCH.md](BENCH.md#the-per-frame-cost-budget-november-13)) is about
+   7,000 busy cycles per frame event per daemon, spread over ten parts, so a
+   four-core R86S-class box could carry only about 10 Gbit/s. Next, in
+   order, each with a design amendment where the wire or the frame model
+   changes, judged by cycles per frame at an offer-limited point: carry TAP
+   GSO super-frames as one unit end to end; keep sender bookkeeping per
+   batch rather than per packet; hand whole-datagram frames to the TAP
+   without the reassembly copy. Then striping one flow with a receive-side
+   reorder stage (decision 7), which the super-frame work shapes. A peer
    with one lane keeps ACKs and
    data on lane 0 and can still defer ACKs under loss; a separate number
    space for control (a 65th lane ID with its own receive table) would cover

@@ -1,0 +1,113 @@
+diff --git a/src/profile.rs b/src/profile.rs
+index c12610b..1d64792 100644
+--- a/src/profile.rs
++++ b/src/profile.rs
+@@ -66,6 +66,18 @@ pub fn now() -> u64 {
+ pub static ADMISSION: [std::sync::atomic::AtomicU64; 4] =
+     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+ 
++/// Diagnostic: wake checks per target and turn, by target awake or asleep and
++/// whether only buffer returns were queued: awake/returns, awake/other,
++/// asleep/returns, asleep/other. Asleep entries cost an eventfd write.
++pub static NOTIFY: [std::sync::atomic::AtomicU64; 4] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
++
++/// Diagnostic: pushes to other workers by event kind (Receive, Packet, Frame,
++/// Free, Feedback, Sender, Register, LaneFree, Barrier, Address, Acknowledge,
++/// ProbeFeedback, Reply, Retire), process-wide.
++pub static PUSHES: [std::sync::atomic::AtomicU64; 14] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 14];
++
+ /// Per-process syscall totals: cycles, calls and items for sendmmsg, then timerfd_settime.
+ pub static SYSCALLS: [[std::sync::atomic::AtomicU64; 3]; 2] =
+     [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 2];
+@@ -94,8 +106,14 @@ pub fn report(worker: usize, phases: &[u64; PHASES]) {
+     let timer = SYSCALLS[1]
+         .each_ref()
+         .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
++    let notify = NOTIFY
++        .each_ref()
++        .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
++    let pushes = PUSHES
++        .each_ref()
++        .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
+     let mut line = format!(
+-        "unquic: profile worker {worker} admission inputs/buffers/frames/bytes {admission:?} sendmmsg cycles/calls/datagrams {sendmmsg:?} timerfd_settime cycles/calls {:?} cycles {total}",
++        "unquic: profile worker {worker} pushes {pushes:?} notify awake-free/awake-other/asleep-free/asleep-other {notify:?} admission inputs/buffers/frames/bytes {admission:?} sendmmsg cycles/calls/datagrams {sendmmsg:?} timerfd_settime cycles/calls {:?} cycles {total}",
+         &timer[..2]
+     );
+     for index in order.into_iter().filter(|&index| phases[index] != 0) {
+diff --git a/src/worker.rs b/src/worker.rs
+index 41d388b..b108909 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -842,6 +842,8 @@ pub(crate) struct Worker {
+     held: Vec<(usize, usize)>,
+     hold: Duration,
+     notifications: u64,
++    #[cfg(feature = "profile")]
++    notify_other: u64,
+     counters: Snapshot,
+     setup_due: Duration,
+     retry_due: Option<Duration>,
+@@ -1192,6 +1194,8 @@ impl Worker {
+             held: Vec::with_capacity(batch_count),
+             hold: Duration::from_micros(config.daemon.tx_hold_us.into()),
+             notifications: 0,
++            #[cfg(feature = "profile")]
++            notify_other: 0,
+             counters,
+             setup_due: Duration::ZERO,
+             retry_due: None,
+@@ -1485,8 +1489,32 @@ impl Worker {
+         let Some(outgoing) = self.outgoing[worker].as_mut() else {
+             return Err(event);
+         };
++        #[cfg(feature = "profile")]
++        let free = matches!(event, Event::Free(_));
++        #[cfg(feature = "profile")]
++        crate::profile::PUSHES[match &event {
++            Event::Receive { .. } => 0,
++            Event::Packet(_) => 1,
++            Event::Frame(_) => 2,
++            Event::Free(_) => 3,
++            Event::Feedback(_) => 4,
++            Event::Sender(_) => 5,
++            Event::Register { .. } => 6,
++            Event::LaneFree { .. } => 7,
++            Event::Barrier { .. } => 8,
++            Event::Address(_) => 9,
++            Event::Acknowledge { .. } => 10,
++            Event::ProbeFeedback { .. } => 11,
++            Event::Reply { .. } => 12,
++            Event::Retire { .. } => 13,
++        }]
++        .fetch_add(1, Ordering::Relaxed);
+         outgoing.try_push(event).map(|()| {
+             self.notifications |= 1_u64 << worker;
++            #[cfg(feature = "profile")]
++            if !free {
++                self.notify_other |= 1_u64 << worker;
++            }
+         })
+     }
+ 
+@@ -1534,9 +1562,18 @@ impl Worker {
+ 
+     fn flush_notifications(&mut self) -> io::Result<()> {
+         let mut mask = std::mem::take(&mut self.notifications);
++        #[cfg(feature = "profile")]
++        let other = std::mem::take(&mut self.notify_other);
+         while mask != 0 {
+             let worker = mask.trailing_zeros() as usize;
+             mask &= mask - 1;
++            #[cfg(feature = "profile")]
++            {
++                std::sync::atomic::fence(Ordering::SeqCst);
++                let sleeping = self.shared.wakes[worker].sleeping.load(Ordering::Relaxed);
++                let kind = usize::from(sleeping) * 2 + usize::from(other & 1 << worker != 0);
++                crate::profile::NOTIFY[kind].fetch_add(1, Ordering::Relaxed);
++            }
+             self.shared.wakes[worker].notify_queued()?;
+         }
+         Ok(())

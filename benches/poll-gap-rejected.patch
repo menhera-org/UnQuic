@@ -1,0 +1,54 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index 41d388b..3602637 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -317,6 +317,8 @@ use std::{
+ const TAP_TOKEN: u64 = 1 << 32;
+ const TX_TOKEN: u64 = 2 << 32;
+ const RETRY: Duration = Duration::from_millis(1);
++/// A busy turn polls for readiness at most this often after an empty poll.
++const POLL_GAP: Duration = Duration::from_micros(20);
+ const RECEIVE_BYTES: usize = 65_536;
+ // Absorb a synchronized GSO burst before bounding fresh work; an oversized source needs an empty lane.
+ const FRESH_BYTES: usize = 2 * 1024 * 1024;
+@@ -1243,6 +1245,9 @@ impl Worker {
+         let mut event_start = 0;
+         let mut publish_due = Duration::ZERO;
+         let mut publish_turns = 0_u8;
++        // When the last zero-timeout poll found nothing; busy turns skip the
++        // next one within POLL_GAP, so readiness waits at most that long.
++        let mut quiet_poll: Option<Duration> = None;
+         while !self.control.quitting() {
+             let now = monotonic_now()?;
+             let mut more = phase!(self, 0, self.drain_queues(now))?;
+@@ -1317,17 +1322,25 @@ impl Worker {
+                 // Work queued before the flag was visible got no wake; take it now.
+                 block = self.incoming.iter_mut().flatten().all(Consumer::is_empty);
+             }
+-            let waited = phase!(
+-                self,
+-                if block { 22 } else { 27 },
+-                self.reactor.wait(&mut events, if block { -1 } else { 0 })
+-            );
++            let skip = !block && quiet_poll.is_some_and(|at| now.saturating_sub(at) < POLL_GAP);
++            let waited = if skip {
++                Ok(0)
++            } else {
++                phase!(
++                    self,
++                    if block { 22 } else { 27 },
++                    self.reactor.wait(&mut events, if block { -1 } else { 0 })
++                )
++            };
+             self.reactor.wake.awake();
+             let count = match waited {
+                 Ok(count) => count,
+                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                 Err(error) => return Err(error),
+             };
++            if !skip {
++                quiet_poll = (!block && count == 0).then_some(now);
++            }
+             immediate = false;
+             let now = monotonic_now()?;
+             let start = event_start.min(count);

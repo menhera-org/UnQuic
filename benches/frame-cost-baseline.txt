@@ -1,0 +1,174 @@
+Busy TSC cycles per frame event (frames sent plus frames received by that daemon), offer-limited loopback shape: QinQ 1522-byte frames, sixteen flows at 250 Mbit/s each way, eight workers, one 20 s point, profile build of 9821587 with benches/profile-permit-split-diagnostic.patch, November 13. Sub-phases are nested and excluded from busy. Columns: phase, cycles per frame event.
+
+== perm4-x/sweep/txperm-balc/loop/r1 (balc = defaults, hash = both switches off)
+left: 13572804 frame events, busy 6972 cycles per frame event
+  wait                    21036
+  service_sender           1565
+  flush_frames             1050
+  sub_send                 1043
+  flush_taps               1032
+  drain_packets             933
+  sub_permit                807
+  sub_permit_flush          804
+  sub_rx_admit              674
+  sub_permit_send           544
+  sub_stage                 534
+  read_socket               477
+  drain_tap_inputs          400
+  read_tap                  302
+  flush_notifications       273
+  sub_finish                246
+  poll                      224
+  flush_control             199
+  reactor_drain             193
+  arm                       151
+  sub_reserve               133
+  sub_submitted             105
+  drain_queues              102
+  sub_cleanup                98
+  sub_acks                   98
+  sub_rx_decode              88
+  sub_request                77
+  sub_rx_records             60
+  sub_prepare                56
+  collect_acks               56
+  sub_rel_store              39
+  sub_owner                  38
+  sub_rx_counters            25
+  sub_messages               25
+  sub_claim                  25
+  sub_rel_owner               7
+  sub_rel_journal             7
+right: 13572804 frame events, busy 6683 cycles per frame event
+  wait                    21294
+  service_sender           1459
+  flush_taps                992
+  flush_frames              933
+  drain_packets             925
+  sub_send                  915
+  sub_permit                751
+  sub_permit_flush          743
+  sub_rx_admit              662
+  sub_stage                 505
+  sub_permit_send           498
+  read_socket               463
+  drain_tap_inputs          379
+  flush_notifications       280
+  read_tap                  274
+  sub_finish                231
+  poll                      221
+  flush_control             220
+  reactor_drain             210
+  arm                       161
+  sub_reserve               116
+  sub_submitted              95
+  drain_queues               95
+  sub_cleanup                91
+  sub_rx_decode              88
+  sub_acks                   88
+  sub_rx_records             67
+  collect_acks               60
+  sub_request                56
+  sub_prepare                56
+  sub_owner                  38
+  sub_rel_store              35
+  sub_rx_counters            25
+  sub_claim                  25
+  sub_messages               17
+  sub_rel_owner               7
+  sub_rel_journal             7
+unquic: profile worker 0 turns/blocks [605395, 286450]
+unquic: profile worker 1 turns/blocks [220299, 113561]
+unquic: profile worker 2 turns/blocks [206022, 102437]
+unquic: profile worker 3 turns/blocks [204642, 96060]
+unquic: profile worker 4 turns/blocks [223917, 106278]
+unquic: profile worker 5 turns/blocks [240406, 118191]
+unquic: profile worker 6 turns/blocks [279256, 127317]
+unquic: profile worker 7 turns/blocks [360105, 148546]
+
+== permh-x/sweep/txperm-hash/loop/r1 (balc = defaults, hash = both switches off)
+left: 13290079 frame events, busy 6719 cycles per frame event
+  wait                    21064
+  service_sender           1307
+  flush_frames             1168
+  flush_taps               1061
+  drain_packets             950
+  sub_send                  921
+  sub_rx_admit              685
+  sub_permit                567
+  sub_permit_flush          563
+  sub_stage                 549
+  read_socket               456
+  drain_tap_inputs          410
+  sub_permit_send           372
+  read_tap                  310
+  sub_finish                240
+  flush_notifications       240
+  poll                      212
+  flush_control             180
+  reactor_drain             156
+  sub_reserve               132
+  arm                       111
+  sub_cleanup               104
+  sub_submitted              97
+  sub_rx_decode              97
+  drain_queues               90
+  sub_acks                   83
+  sub_rx_records             66
+  sub_request                66
+  sub_prepare                56
+  collect_acks               52
+  sub_rel_store              38
+  sub_owner                  35
+  sub_claim                  24
+  sub_messages               21
+  sub_rx_counters            14
+  sub_rel_owner              14
+  sub_rel_journal            14
+  flush_sender_messages       7
+right: 13290079 frame events, busy 6386 cycles per frame event
+  wait                    21388
+  service_sender           1422
+  flush_taps               1019
+  flush_frames              922
+  drain_packets             912
+  sub_send                  870
+  sub_permit                713
+  sub_permit_flush          710
+  sub_rx_admit              647
+  sub_stage                 518
+  sub_permit_send           463
+  read_socket               414
+  drain_tap_inputs          376
+  read_tap                  265
+  sub_finish                233
+  flush_notifications       215
+  flush_control             208
+  poll                      188
+  reactor_drain             170
+  arm                       136
+  sub_reserve               118
+  sub_submitted             101
+  sub_cleanup                97
+  sub_rx_decode              87
+  sub_acks                   80
+  drain_queues               80
+  sub_rx_records             77
+  sub_request                59
+  sub_prepare                59
+  collect_acks               45
+  sub_owner                  35
+  sub_rel_store              31
+  sub_claim                  28
+  sub_rx_counters            14
+  sub_messages               14
+  sub_rel_owner              10
+  sub_rel_journal            10
+unquic: profile worker 0 turns/blocks [601328, 316427]
+unquic: profile worker 1 turns/blocks [235522, 98495]
+unquic: profile worker 2 turns/blocks [262051, 85701]
+unquic: profile worker 3 turns/blocks [252269, 78463]
+unquic: profile worker 4 turns/blocks [39072, 21370]
+unquic: profile worker 5 turns/blocks [566, 386]
+unquic: profile worker 6 turns/blocks [212363, 104418]
+unquic: profile worker 7 turns/blocks [474044, 221518]

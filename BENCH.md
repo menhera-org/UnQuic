@@ -277,6 +277,55 @@ again runs on one transmit worker (the busiest thread at 76–90%). Lifting
 one flow needs striping with a receive-side reorder queue, or a cheaper
 per-frame path, not accidental lane changes.
 
+## The per-frame cost budget (November 13)
+
+Targets include low-power boxes such as the R86S (four cores at about
+2.9 GHz) carrying tens of Gbit/s, so the measure that matters is cycles per
+frame, not this host's throughput. An offer-limited run in the loopback
+shape (QinQ 1522-byte frames, sixteen flows at 250 Mbit/s each way, eight
+workers, default settings, profile build with the transmit and permit split,
+[counts](benches/frame-cost-baseline.txt)) costs each daemon about 7,000
+busy cycles per frame event, a frame sent or received. Hash lanes cost 4%
+less. Each loop turn handles about six frame events, so fixed per-turn work
+is not the problem. Per frame event, left daemon:
+
+| Part | Cycles |
+| --- | --- |
+| `sendmmsg` | 880 |
+| TAP writes (`flush_taps`, mostly the syscall) | 1,030 |
+| Socket reads and TAP reads (syscalls) | 780 |
+| Wakes, polls, timer arming and eventfd reads | 840 |
+| Transmit planning, claiming, finishing and submitting, beyond the syscall | about 970 |
+| Receive admission (copying pieces into reassembly slots) and the rest of receive | about 930 |
+| Recovery staging for acknowledged packets | 534 |
+| TAP input expansion (splitting GSO reads into frames) | 400 |
+| Other sender work (ACKs, owner, messages) | about 220 |
+
+At 7,000 cycles per frame event a four-core 2.9 GHz box handles about 1.6
+million frame events a second, about 10 Gbit/s in total at 1514-byte frames
+counting both directions. Tens of Gbit/s need several times less work per
+frame, and no single part holds more than a sixth of it, so trimming parts
+cannot get there. Three structural changes can:
+
+- Carry the TAP's GSO super-frames (up to 64 KiB, already read whole) as
+  one unit end to end instead of expanding them into up to 44 frames and
+  coalescing them again on the receiver, so per-frame work runs once per
+  super-frame.
+- Keep sender bookkeeping (history, sample records, journal pieces,
+  recovery) per batch of packets rather than per packet.
+- Hand whole-datagram frames to the TAP from the receive buffer without the
+  reassembly copy.
+
+Two quick candidates were measured on the way and rejected. Skipping
+zero-timeout polls within 20 µs of an empty one
+([patch](benches/poll-gap-rejected.patch),
+[results](benches/small-frames-poll-gap-rejected.json)) was lower in only
+3 of 8 pairs at a median of +0.2%, against an A/A run at 4 of 8 and −0.5%.
+Waking a sleeping reader only for buffer returns would save about 2% of one
+worker: returns alone cause 21% of the wakes on one side and almost none on
+the other ([counts](benches/one-flow-offer-limited-profile.txt),
+[diagnostic](benches/notify-kind-diagnostic.patch)).
+
 ## What holds one flow near 1 Gbit/s (November 13)
 
 One flow at 7.5 ms delivers 1.00–1.07 Gbit/s per direction at 5G offered
