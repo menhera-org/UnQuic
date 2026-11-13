@@ -386,6 +386,18 @@ of the roughly 4,400 cycles per frame event the 20 Gbit/s budget still
 needs removed ([design 13.1](initial-design.md)); the remaining cuts are
 structural.
 
+The remote Linux 7.0 test host serves as the second reference for kernel
+costs, at the user's choice, until an R86S-class box is available. The same
+shape there (Xeon Platinum 8259CL, 8 vCPUs, two workers per daemon,
+sixteen flows at 1 Gbit/s each way, offer-limited,
+[counts](benches/frame-cost-remote.txt)) costs 6,174 and 5,924 busy cycles
+per frame event, close to this host. The kernel side is again about half
+(sends 1,240, TAP writes about 1,200, socket reads 620, TAP reads 360,
+control sends 340), but wakes, polls and timers fall from about 880 to about
+190, because two busy workers rarely sleep. That line in the budget is
+mostly a light-load effect. The harness there also uses veth pairs in
+namespaces, so real NIC offloads remain unmeasured.
+
 ## Receive admission without slot scans (November 13, landed)
 
 A split of receive admission

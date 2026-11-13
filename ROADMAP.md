@@ -45,6 +45,12 @@ acknowledged plane until a frame's first loss, touching three cache lines
 per ACK instead of nine passes over nine, for 3–6% less CPU per delivered
 bit ([BENCH.md](BENCH.md#coverage-planes-that-stay-idle-without-loss-november-13-landed)).
 
+Later on November 13 the user decided two more: the remote Linux 7.0 test
+host stands in for the R86S as the kernel-cost reference until such a box
+is available, and large frames (TAP GSO super-frames as one DATA frame) and
+deferred checksums may change the wire behind an optional handshake
+feature, after the compact per-packet record.
+
 The user decided both. Decision 5: `balance_flows` and `control_lane` are
 on by default. Decision 7: one flow should be striped across transmit
 workers with a receive-side reorder stage so inner TCP still sees order;
