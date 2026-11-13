@@ -548,8 +548,35 @@ Both bars pass. The switched-on arm lost at most 0.011% of frames in any
 round, the least of the four arms, and no datagram was refused for want of
 slots. Each daemon sent about 1.23 million offload frames in place of 13.6
 million ordinary ones. The runs give up about a third of the whole-frame
-saving; three- or four-slot runs may recover part of it while a lane still
-holds 16 or 21.
+saving.
+
+Longer runs were tried next, built with only the slot count changed and
+judged against the landed two-slot runs, all switched on: a change needed
+five of six rounds lower, a median of −2% or better, no refused datagrams
+and no more lost frames ([results](benches/full-size-offload-run-length.json)).
+Three-slot runs (18 segments) were lower in 6 of 6 rounds at −2.3%, but
+refused 315 datagrams in two rounds and lost up to 0.125% of frames. Four-slot
+runs (24 segments, two per super-frame) were lower in 6 of 6 at −7.7%, with
+nothing refused or lost.
+
+That point has almost no loss, and whole super-frames had also looked fine
+in five of six rounds, so the same arms then ran on a routed path with 4.5 ms
+of round-trip delay and 1% random loss, at 125 Mbit/s per flow each way
+([results](benches/offload-lossy-path.json)). Every arm refused datagrams
+there, ordinary frames included (34,000–95,000 per daemon), which makes
+receive capacity a limit on lossy paths in its own right. Offload frames make
+it worse: a lost datagram keeps a whole run waiting for repair, not one
+frame.
+
+| Arm | Frames lost per round | CPU per delivered Gbit/s against off |
+| --- | --- | --- |
+| Off | 4.9–12.8% | |
+| Two-slot runs | 11.6–18.7% | −7.4% in 6 of 6 |
+| Four-slot runs | 52–92% | +48% in 6 of 6 |
+
+Four-slot runs collapse, so the slot count stays at two. Even two-slot runs
+lose more frames than ordinary frames under loss, which is why
+`daemon.offload_frames` stays off by default.
 
 ## What holds one flow near 1 Gbit/s (November 13)
 

@@ -273,9 +273,18 @@ Decisions only the user can make, each blocking a remaining goal:
    no receive pressure
    ([BENCH.md](BENCH.md#sending-offload-frames-november-13-landed)). It
    changes the wire only between peers that both advertise it, and costs
-   about 420 KiB per worker. It has run only on loopback and in the kernel
-   suites, not on real NICs or a lossy path; on a lossy path every lost
-   datagram holds two receive slots instead of one until repaired.
+   about 420 KiB per worker. On a routed 4.5 ms path with 1% loss, though,
+   it lost 11.6–18.7% of frames against 4.9–12.8% with it off, because a
+   lost datagram keeps a whole 12-segment run waiting for repair. The
+   recommendation is to keep it off by default and turn it on only for
+   clean paths, until receive capacity under loss improves (below).
+
+   Every arm on that lossy path refused 34,000–95,000 datagrams per daemon
+   for want of reassembly slots, ordinary frames included. A lane's 64
+   slots fill with frames waiting for repairs over a 4.5 ms round trip, so
+   receive capacity, counted in frames rather than bytes, is a limit on the
+   lossy-path gate of its own. That is worth measuring before more
+   per-frame work.
 
 ## November 11 checkpoint
 
@@ -610,8 +619,10 @@ rules apply to all of them.
    (12 segments of a 1500-byte MTU), and with both daemons on it CPU per
    delivered bit fell 14.7%. Whole 64 KB super-frames saved 23% but left a
    receiving lane room for only eight of them, and one round collapsed
-   under receive pressure. Whether to turn it on by default is decision 8;
-   longer runs (three or four slots) may recover part of the difference.
+   under receive pressure. Four-slot runs saved another 7.7% on that point
+   but collapsed on a lossy path, losing 52–92% of frames, so runs stay at
+   two slots; even those lose more frames under loss than ordinary frames.
+   Whether to turn it on by default is decision 8.
    Next come receive without the reassembly copy; fewer cross-worker wakes;
    one flow striped with a receive-side reorder stage (decision 7).
    The kernel figures can only be confirmed on an R86S-class box with real
