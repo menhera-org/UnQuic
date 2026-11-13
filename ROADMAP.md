@@ -28,7 +28,9 @@ decision 5 a question about turning on both switches. The flow table every
 TAP reader shares then replaced the per-reader tables under
 `balance_flows`: a flow keeps its lane when the kernel moves it between
 queues, and the worst decision-workload reordering falls from 1.03 million
-frames per direction to 45,000 with delivery level or higher.
+frames per direction to 45,000 with delivery level or higher. It also ends
+the lift balanced lanes gave one lossy flow, which came only from that flow
+changing lanes; one flow is back near 0.9 Gbit/s on one transmit worker.
 
 ## November 12 checkpoint
 
@@ -199,20 +201,20 @@ Decisions only the user can make, each blocking a remaining goal:
    default? As of November 13 the pair beats hash lanes everywhere it was
    measured ([BENCH.md](BENCH.md#a-control-lane-for-acks-november-13)):
    13.4–13.9 Gbit/s on the loopback check at 21G with the shared flow table
-   (13.1–16.9 with the old per-reader tables) against 12.1–12.3, 3–32%
-   more on the decision workload, and 1.55–1.82 against 0.95–1.01 Gbit/s
-   per direction for one flow at 7.5 ms with 1% loss. Balanced lanes alone
+   (13.1–16.9 with the old per-reader tables) against 12.1–12.3, and 3–32%
+   more on the decision workload. One flow at 7.5 ms with 1% loss now stays
+   on one lane and delivers about what hash lanes do (0.7–0.9 Gbit/s per
+   direction); the old per-reader tables lifted it to 1.55–1.82 only by
+   moving it between lanes. Balanced lanes alone
    used to cost the loopback check about 12%; that came from ACKs numbered
    from lane 0's packet history, which lane 0's data fills under loss, and
    the control lane removes it. With the shared flow table, a flow keeps
    its lane when the kernel moves it between TAP queues, so the
    decision workload reorders at most 45,000 frames per direction, against
    22,000 with hash lanes and up to 1 million with the old per-reader
-   tables. The costs: one lossy flow is striped across lanes and reorders
-   1.7–2.0 million frames per direction (inner TCP or QUIC would see that),
-   CPU per delivered bit is about the same, and the control lane alone costs
-   hash lanes up to 10% on four-lane peers, so it should not be on without
-   balanced lanes.
+   tables. CPU per delivered bit is about the same. The control lane alone
+   costs hash lanes up to 10% on four-lane peers, so it should not be on
+   without balanced lanes.
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB
    `memory_limit` default remains undecided. It admits up to eight workers

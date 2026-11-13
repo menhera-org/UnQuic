@@ -113,7 +113,7 @@ Gbit/s at an offer-limited load instead.
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
 | Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Loopback throughput at an 8952-byte limit is measured: the 21G total rises 70–126%; on the routed decision workload at 5G delivery rises 50–56% at 36% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)). Real-path throughput at larger MTUs remains open. DATA-quoted PTB validation now has targeted kernel coverage. |
-| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | One flow at 7.5 ms with 0.5–1% random loss: about 1.0 Gbit/s per direction locally with hash lanes and the default queue-checked loss tolerance (0.91–1.05 at 1G and 5G offered on `424f4f8`, busiest thread 76–98%, [results](benches/lossy-one-flow-424f4f8.json)), 1.5–2.0 with balanced lanes; 1.6 Gbit/s on the remote host, where a limit downstream of the sender caps it. At 5% loss draft 07 delivers under 10 Mbit/s of a 5G offer; `loss_threshold_permille = 100` raises that to about 0.45 Gbit/s ([BENCH.md](#a-configurable-loss-threshold-for-random-loss-november-12)) | Per-frame cost on one transmit worker, the 5% rows (still under a tenth of the offer; FEC or a different response), and a real-path measurement. |
+| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | One flow at 7.5 ms with 0.5–1% random loss: about 1.0 Gbit/s per direction locally with hash lanes and the default queue-checked loss tolerance (0.91–1.05 at 1G and 5G offered on `424f4f8`, busiest thread 76–98%, [results](benches/lossy-one-flow-424f4f8.json)), 1.5–2.0 with the old per-reader balanced-lane tables only because the flow kept changing lanes, which the shared flow table ends (0.7–0.9 since November 13, [BENCH.md](#a-control-lane-for-acks-november-13)); 1.6 Gbit/s on the remote host, where a limit downstream of the sender caps it. At 5% loss draft 07 delivers under 10 Mbit/s of a 5G offer; `loss_threshold_permille = 100` raises that to about 0.45 Gbit/s ([BENCH.md](#a-configurable-loss-threshold-for-random-loss-november-12)) | Per-frame cost on one transmit worker, the 5% rows (still under a tenth of the offer; FEC or a different response), and a real-path measurement. |
 | Coexist with other traffic | Against one TCP CUBIC flow at a 1 Gbit/s, 7.5 ms token-bucket bottleneck: an even share with a one-BDP queue; with a quarter-BDP queue the queue-checked tolerance keeps TCP's share | Several competitors, other buffer depths and other TCP algorithms are unmeasured. |
 
 Unlimited loss remains high. TAP ingress drops, bounded worker queue drops,
@@ -262,6 +262,20 @@ level, all with balanced lanes and the control lane. It met all three:
   15 of 16. Delivery is level or higher at every point (four flows at 5G:
   4.34 and 3.77 Gbit/s against 3.81 and 3.98; sixteen flows at 5G: 3.93 and
   3.91 against 3.89 and 3.70), at the same CPU per delivered Gbit/s.
+
+The bar left out the lossy one-flow row, and the shared table changes it.
+One flow at 7.5 ms with 1% loss, both switches on, two passes against hash
+lanes in one container
+([results](benches/lossy-one-flow-shared-flow-table.json)): at 5G it now
+delivers 0.78–0.93 / 0.68–0.92 Gbit/s with 34,000–52,000 reordered frames,
+against 0.84–0.91 / 0.92–0.96 with hash lanes. Per-reader tables had
+delivered 1.55–1.75 / 1.69–1.82, with 1.7–2.0 million reordered frames. That
+gain came from the flow changing lanes each time the kernel moved it to
+another TAP queue, the same striping the November 11 bar rejected as
+`stripe_flows` for its reordering. The shared table ends it, so one flow
+again runs on one transmit worker (the busiest thread at 76–90%). Lifting
+one flow needs striping with a receive-side reorder queue, or a cheaper
+per-frame path, not accidental lane changes.
 
 ## Memory reserved against memory used (November 12)
 

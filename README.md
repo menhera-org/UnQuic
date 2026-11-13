@@ -615,11 +615,12 @@ through a 16,384-entry table that every TAP reader shares (128 KiB): a new
 flow takes the session's next lane round-robin and keeps it while it sends,
 moving only after a second of silence, even when the kernel moves it to
 another TAP queue. A flow whose entry another active flow holds keeps its
-hash lane. It lifts one flow at 7.5 ms with 1% loss by 50–90% by striping
-it across lanes, which reorders 1.7–2.0 million of its frames per
-direction, and the decision workload by 1–36% in total. On its own it costs
-the loopback overload check about 12%; with `daemon.control_lane` (below) it
-gains 8–14% there instead.
+hash lane. It lifts the decision workload by 1–36% in total. One flow still
+runs on one lane, as with hashing; the per-reader tables it replaced let a
+flow change lanes whenever the kernel moved it between TAP queues, which
+lifted one lossy flow 50–90% at the cost of 1.7–2.0 million reordered
+frames per direction. On its own it costs the loopback overload check about
+12%; with `daemon.control_lane` (below) it gains 8–14% there instead.
 Both stay off until that trade is decided (BENCH.md).
 
 ACKs and other control records always leave on lane 0 and take their packet
