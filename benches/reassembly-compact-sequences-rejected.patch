@@ -1,0 +1,224 @@
+diff --git a/src/reassembly.rs b/src/reassembly.rs
+index bc21fb5..5d6e0cf 100644
+--- a/src/reassembly.rs
++++ b/src/reassembly.rs
+@@ -153,8 +153,9 @@ impl Window {
+     }
+ }
+ 
++// A frame's sequence lives in Lane::sequences, so scans and lookups read one
++// compact array instead of a header on each 9 KiB slot.
+ struct Frame {
+-    sequence: u64,
+     length: u16,
+     remaining: u16,
+     prefix_len: u16,
+@@ -165,7 +166,6 @@ struct Frame {
+ impl Frame {
+     const fn empty() -> Self {
+         Self {
+-            sequence: 0,
+             length: 0,
+             remaining: 0,
+             prefix_len: 0,
+@@ -175,8 +175,7 @@ impl Frame {
+         }
+     }
+ 
+-    fn start(&mut self, sequence: u64, length: u16, now: Duration) {
+-        self.sequence = sequence;
++    fn start(&mut self, length: u16, now: Duration) {
+         self.length = length;
+         self.remaining = length;
+         self.prefix_len = 0;
+@@ -242,6 +241,8 @@ pub struct Lane {
+     ack: Schedule,
+     terminal: Window,
+     frames: Box<[Frame]>,
++    // Sequence held by each slot; zero marks a free slot.
++    sequences: [u64; FRAME_CAPACITY],
+     index: [u8; INDEX_LEN],
+     free: Vec<u8>,
+     ready: VecDeque<u8>,
+@@ -264,6 +265,7 @@ impl Lane {
+             ack: Schedule::new(),
+             terminal: Window::new(),
+             frames: (0..FRAME_CAPACITY).map(|_| Frame::empty()).collect(),
++            sequences: [0; FRAME_CAPACITY],
+             index: [EMPTY; INDEX_LEN],
+             free: (0..FRAME_CAPACITY as u8).collect(),
+             ready: VecDeque::with_capacity(FRAME_CAPACITY),
+@@ -383,9 +385,7 @@ impl Lane {
+     }
+ 
+     fn clear_frames(&mut self) {
+-        for frame in &mut self.frames {
+-            frame.sequence = 0;
+-        }
++        self.sequences.fill(0);
+         self.index.fill(EMPTY);
+         self.free.clear();
+         self.free.extend(0..FRAME_CAPACITY as u8);
+@@ -488,7 +488,8 @@ impl Lane {
+                                 continue;
+                             };
+                             let slot = usize::from(slot);
+-                            self.frames[slot].start(sequence, total_len as u16, now);
++                            self.frames[slot].start(total_len as u16, now);
++                            self.sequences[slot] = sequence;
+                             self.retained_bytes += total_len as usize;
+                             self.insert(slot);
+                             let deadline = self.frames[slot].deadline;
+@@ -551,16 +552,17 @@ impl Lane {
+         }
+         self.deadline = None;
+         let mut expired = 0;
+-        for slot in 0..self.frames.len() {
+-            let frame = &self.frames[slot];
+-            if frame.sequence == 0 {
++        for slot in 0..FRAME_CAPACITY {
++            let sequence = self.sequences[slot];
++            if sequence == 0 {
+                 continue;
+             }
++            let frame = &self.frames[slot];
+             if frame.deadline <= now {
+                 self.expired_incomplete_frames = self
+                     .expired_incomplete_frames
+                     .wrapping_add(u64::from(frame.remaining != 0));
+-                self.terminal.mark(frame.sequence);
++                self.terminal.mark(sequence);
+                 self.release(slot);
+                 expired += 1;
+             } else {
+@@ -578,9 +580,10 @@ impl Lane {
+     /// other error call finish_front exactly once. It is never enqueued twice.
+     pub fn front(&mut self, now: Duration) -> Option<ReadyFrame<'_>> {
+         self.expire(now);
+-        let frame = &self.frames[usize::from(*self.ready.front()?)];
++        let slot = usize::from(*self.ready.front()?);
++        let frame = &self.frames[slot];
+         Some(ReadyFrame {
+-            id: (u64::from(self.id) << 48) | frame.sequence,
++            id: (u64::from(self.id) << 48) | self.sequences[slot],
+             bytes: frame.bytes.get(..usize::from(frame.length))?,
+         })
+     }
+@@ -615,7 +618,7 @@ impl Lane {
+         });
+         for &slot in &slots[..count] {
+             let slot = usize::from(slot);
+-            self.terminal.mark(self.frames[slot].sequence);
++            self.terminal.mark(self.sequences[slot]);
+             self.release_storage(slot);
+         }
+     }
+@@ -628,7 +631,7 @@ impl Lane {
+             return false;
+         };
+         let slot = usize::from(slot);
+-        self.terminal.mark(self.frames[slot].sequence);
++        self.terminal.mark(self.sequences[slot]);
+         self.release(slot);
+         true
+     }
+@@ -637,8 +640,8 @@ impl Lane {
+         let old = self.terminal.lower;
+         self.terminal.advance(highest);
+         if old != self.terminal.lower {
+-            for slot in 0..self.frames.len() {
+-                let sequence = self.frames[slot].sequence;
++            for slot in 0..FRAME_CAPACITY {
++                let sequence = self.sequences[slot];
+                 if sequence != 0 && sequence < self.terminal.lower {
+                     self.release(slot);
+                 }
+@@ -653,7 +656,7 @@ impl Lane {
+             if slot == EMPTY {
+                 return None;
+             }
+-            if self.frames[usize::from(slot)].sequence == sequence {
++            if self.sequences[usize::from(slot)] == sequence {
+                 return Some(usize::from(slot));
+             }
+             at = (at + 1) % INDEX_LEN;
+@@ -661,7 +664,7 @@ impl Lane {
+     }
+ 
+     fn insert(&mut self, slot: usize) {
+-        let mut at = hash(self.frames[slot].sequence);
++        let mut at = hash(self.sequences[slot]);
+         while self.index[at] != EMPTY {
+             at = (at + 1) % INDEX_LEN;
+         }
+@@ -682,14 +685,14 @@ impl Lane {
+     }
+ 
+     fn release_storage(&mut self, slot: usize) {
+-        let mut hole = hash(self.frames[slot].sequence);
++        let mut hole = hash(self.sequences[slot]);
+         while self.index[hole] != slot as u8 {
+             hole = (hole + 1) % INDEX_LEN;
+         }
+         self.index[hole] = EMPTY;
+         let mut at = (hole + 1) % INDEX_LEN;
+         while self.index[at] != EMPTY {
+-            let home = hash(self.frames[usize::from(self.index[at])].sequence);
++            let home = hash(self.sequences[usize::from(self.index[at])]);
+             if (hole.wrapping_sub(home) % INDEX_LEN) < (at.wrapping_sub(home) % INDEX_LEN) {
+                 self.index[hole] = self.index[at];
+                 self.index[at] = EMPTY;
+@@ -698,7 +701,7 @@ impl Lane {
+             at = (at + 1) % INDEX_LEN;
+         }
+         self.retained_bytes -= usize::from(self.frames[slot].length);
+-        self.frames[slot].sequence = 0;
++        self.sequences[slot] = 0;
+         self.free.push(slot as u8);
+     }
+ }
+@@ -874,7 +877,7 @@ mod tests {
+                         continue;
+                     }
+                     frame.covered.fill(u64::MAX);
+-                    frame.start(1, length as u16, Duration::ZERO);
++                    frame.start(length as u16, Duration::ZERO);
+                     frame.piece(offset, &first[..count]);
+                     assert_eq!(frame.remaining as usize, length - count);
+                     assert_eq!(
+@@ -901,7 +904,7 @@ mod tests {
+                 }
+             }
+         }
+-        frame.start(2, 128, Duration::ZERO);
++        frame.start(128, Duration::ZERO);
+         frame.piece(0, &first[..60]);
+         frame.piece(80, &first[..20]);
+         frame.piece(60, &rest[..68]);
+@@ -910,7 +913,7 @@ mod tests {
+         assert_eq!(&frame.bytes[80..100], &first[..20]);
+         assert_eq!(&frame.bytes[100..128], &rest[..28]);
+ 
+-        frame.start(3, 128, Duration::ZERO);
++        frame.start(128, Duration::ZERO);
+         for offset in (0..128).step_by(7) {
+             frame.piece(offset, &first[..(128 - offset).min(7)]);
+             assert_eq!(usize::from(frame.prefix_len), (offset + 7).min(128));
+@@ -1051,7 +1054,7 @@ mod tests {
+             assert_eq!(colliding.len(), 64);
+             lane.free.clear();
+             for (slot, &seq) in colliding.iter().enumerate() {
+-                lane.frames[slot].sequence = seq;
++                lane.sequences[slot] = seq;
+                 lane.insert(slot);
+             }
+             for step in 0..64 {
+@@ -1060,7 +1063,7 @@ mod tests {
+                 for (i, &seq) in colliding.iter().enumerate() {
+                     assert_eq!(
+                         lane.find(seq),
+-                        if lane.frames[i].sequence == 0 {
++                        if lane.sequences[i] == 0 {
+                             None
+                         } else {
+                             Some(i)

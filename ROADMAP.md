@@ -35,6 +35,16 @@ That worker holds one flow near 1 Gbit/s even without loss, and its
 userspace share is only about a quarter, so the single-flow 5 Gbit/s gate
 needs a design decision (decision 7) rather than more small changes.
 
+Per-frame cost now leads the work, because targets include low-power
+four-core boxes (R86S class) carrying tens of Gbit/s. An offer-limited
+profile costs each daemon about 7,000 busy cycles per frame event, half of
+it syscalls, the userspace half spread over about ten parts
+([BENCH.md](BENCH.md#the-per-frame-cost-budget-november-13)). The first
+structural cut landed: per-frame repair coverage keeps only its
+acknowledged plane until a frame's first loss, touching three cache lines
+per ACK instead of nine passes over nine, for 3–6% less CPU per delivered
+bit ([BENCH.md](BENCH.md#coverage-planes-that-stay-idle-without-loss-november-13-landed)).
+
 The user decided both. Decision 5: `balance_flows` and `control_lane` are
 on by default. Decision 7: one flow should be striped across transmit
 workers with a receive-side reorder stage so inner TCP still sees order;
@@ -551,13 +561,20 @@ rules apply to all of them.
    Both switches are on by default (decision 5). The per-frame budget
    ([BENCH.md](BENCH.md#the-per-frame-cost-budget-november-13)) is about
    7,000 busy cycles per frame event per daemon, spread over ten parts, so a
-   four-core R86S-class box could carry only about 10 Gbit/s. Next, in
-   order, each with a design amendment where the wire or the frame model
-   changes, judged by cycles per frame at an offer-limited point: carry TAP
-   GSO super-frames as one unit end to end; keep sender bookkeeping per
-   batch rather than per packet; hand whole-datagram frames to the TAP
-   without the reassembly copy. Then striping one flow with a receive-side
-   reorder stage (decision 7), which the super-frame work shapes. A peer
+   four-core R86S-class box could carry only about 10 Gbit/s. Coverage
+   planes landed (3–6%). Next, each judged on the full-size efficiency
+   point (`effbig`-style rotating rounds with an A/A copy): one ACK summary
+   per ACK instead of a report round trip per 64 packets; a compact
+   per-packet record holding its frame pieces inline, replacing five
+   passes over plan pieces; per-syscall delivery samples. Then, with design
+   amendments because the wire or frame model changes: carrying TAP GSO
+   super-frames as one unit end to end, leaving segment checksums to the
+   receiving kernel or NIC, and striping one flow with a receive-side
+   reorder stage (decision 7). The kernel test
+   `tap::read::tests::real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch`
+   failed once on Linux 6.8 with `WouldBlock` and passed on rerun: it reads
+   right after raw-socket sends, so delivery into the TAP can lag; it needs
+   to wait for readability. A peer
    with one lane keeps ACKs and
    data on lane 0 and can still defer ACKs under loss; a separate number
    space for control (a 65th lane ID with its own receive table) would cover

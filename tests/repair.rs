@@ -49,7 +49,7 @@ fn late_ack_cancels_a_repair_plan_and_preserves_other_copies_accounting_boundary
 
 #[test]
 fn boundaries_exhaustion_and_invalid_mappings_leave_state_consistent() {
-    assert_eq!(size_of::<FrameRecovery>(), 3392);
+    assert_eq!(size_of::<FrameRecovery>(), 3400);
     for length in [0, 13, MAX_FRAME_LEN + 1, usize::MAX] {
         assert!(FrameRecovery::new(length).is_none());
     }
@@ -204,6 +204,36 @@ fn word_masks_match_a_byte_model_through_reordered_partial_transmissions() {
             }
         }
     }
+}
+
+#[test]
+fn clean_acks_survive_the_first_loss_and_slot_reuse_leaves_no_stale_bits() {
+    let mut frame = FrameRecovery::new(MAX_FRAME_LEN).unwrap();
+    // A frame acknowledged without losses writes only its acknowledged bits.
+    assert!(frame.submitted(0..MAX_FRAME_LEN, 0));
+    assert_eq!(frame.acknowledge(100..9000, 0), Some(8900));
+    assert_eq!(frame.acknowledge(100..9000, 0), Some(0));
+    assert_eq!(frame.acknowledge(0..64, 1), None);
+    assert_eq!(frame.next_repair(usize::MAX), None);
+    // Reuse for a short clean frame, then a long one: no stale bit may survive.
+    assert!(frame.reset(1514));
+    assert!(frame.submitted(0..1514, 0));
+    assert_eq!(frame.acknowledge(0..1514, 0), Some(1514));
+    assert!(frame.reset(MAX_FRAME_LEN));
+    assert!(frame.submitted(0..4000, 0));
+    assert_eq!(frame.acknowledge(1000..2000, 0), Some(1000));
+    // The first loss keeps the earlier ACK and reopens only the lost bytes.
+    assert!(frame.lost(0..4000, 0));
+    assert_eq!(frame.next_repair(usize::MAX), Some((0..1000, 1)));
+    assert!(frame.submitted(0..1000, 1));
+    assert_eq!(frame.next_repair(usize::MAX), Some((2000..4000, 1)));
+    assert_eq!(frame.acknowledge(0..4000, 0), Some(3000));
+    assert_eq!(frame.remaining(), MAX_FRAME_LEN - 4000);
+    // A lossy frame's planes are all cleared on reuse.
+    assert!(frame.reset(MAX_FRAME_LEN));
+    assert!(frame.submitted(0..MAX_FRAME_LEN, 0));
+    assert!(frame.lost(0..MAX_FRAME_LEN, 0));
+    assert_eq!(frame.next_repair(usize::MAX), Some((0..MAX_FRAME_LEN, 1)));
 }
 
 #[test]

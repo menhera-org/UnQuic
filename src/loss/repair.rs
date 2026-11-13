@@ -5,29 +5,22 @@ use std::ops::Range;
 
 const WORDS: usize = MAX_FRAME_LEN.div_ceil(64);
 
-#[derive(Clone, Copy, Default)]
-struct Word {
-    low: u64,
-    high: u64,
-    pending: u64,
+/// Bytes of generation `attempt`: original, first repair, second repair or ACK.
+const fn generation(low: u64, high: u64, attempt: u8) -> u64 {
+    match attempt {
+        0 => !low & !high,
+        1 => low & !high,
+        2 => !low & high,
+        _ => low & high,
+    }
 }
 
-impl Word {
-    fn generation(&self, attempt: u8) -> u64 {
-        match attempt {
-            0 => !self.low & !self.high,
-            1 => self.low & !self.high,
-            2 => !self.low & self.high,
-            _ => self.low & self.high,
-        }
-    }
-
-    fn at_least(&self, attempt: u8) -> u64 {
-        match attempt {
-            0 => u64::MAX,
-            1 => self.low | self.high,
-            _ => self.high,
-        }
+/// Bytes whose generation is at least `attempt`.
+const fn at_least(low: u64, high: u64, attempt: u8) -> u64 {
+    match attempt {
+        0 => u64::MAX,
+        1 => low | high,
+        _ => high,
     }
 }
 
@@ -43,25 +36,39 @@ impl Word {
 /// Selection does not reserve bytes: serialize plans and submission results per
 /// frame, and never submit overlapping plans for the same repair generation.
 /// A frame's original deadline still applies, even when no repair is eligible.
+///
+/// The bit planes are stored apart so that a frame without losses touches only
+/// one. Until its first loss a frame is clean: every sent byte is either an
+/// outstanding original or acknowledged, so only `high` is kept, as the
+/// acknowledged bytes. The first loss rebuilds the other planes from it.
 pub struct FrameRecovery {
-    words: [Word; WORDS],
+    low: [u64; WORDS],
+    high: [u64; WORDS],
+    pending: [u64; WORDS],
     length: u16,
     sent: u16,
     unacked: u16,
+    // Words that may be nonzero in any plane; reset clears only these.
+    dirty: u16,
+    clean: bool,
 }
 
 impl FrameRecovery {
     /// Starts an unsent frame; rejects lengths outside the Ethernet frame limits.
     pub fn new(length: usize) -> Option<Self> {
-        (14..=MAX_FRAME_LEN).contains(&length).then(|| Self {
-            words: [Word::default(); WORDS],
+        (14..=MAX_FRAME_LEN).contains(&length).then_some(Self {
+            low: [0; WORDS],
+            high: [0; WORDS],
+            pending: [0; WORDS],
             length: length as u16,
             sent: 0,
             unacked: length as u16,
+            dirty: 0,
+            clean: true,
         })
     }
 
-    /// Reuses a retired frame's storage, clearing only words needed by the new length.
+    /// Reuses a retired frame's storage, clearing only words it wrote.
     ///
     /// The caller must invalidate the old frame identity in packet mappings first.
     /// Packet congestion charges remain independent of this payload-slot reuse.
@@ -69,12 +76,17 @@ impl FrameRecovery {
         if !(14..=MAX_FRAME_LEN).contains(&length) {
             return false;
         }
-        for word in self.words.iter_mut().take(length.div_ceil(64)) {
-            *word = Word::default();
+        let dirty = usize::from(self.dirty);
+        self.high[..dirty].fill(0);
+        if !self.clean {
+            self.low[..dirty].fill(0);
+            self.pending[..dirty].fill(0);
         }
         self.length = length as u16;
         self.sent = 0;
         self.unacked = length as u16;
+        self.dirty = 0;
+        self.clean = true;
         true
     }
 
@@ -100,10 +112,12 @@ impl FrameRecovery {
         if attempt == 0 {
             return range.start == self.sent();
         }
-        range.end <= self.sent()
-            && self
-                .selected(&range)
-                .all(|(word, mask)| word.generation(attempt - 1) & !word.pending & mask == mask)
+        // Nothing is repairable before the first loss.
+        !self.clean
+            && range.end <= self.sent()
+            && words(&range).all(|(i, mask)| {
+                generation(self.low[i], self.high[i], attempt - 1) & !self.pending[i] & mask == mask
+            })
     }
 
     /// Records only a successfully submitted piece; rejection changes nothing.
@@ -113,14 +127,16 @@ impl FrameRecovery {
         if !self.can_submit(range.clone(), attempt) {
             return false;
         }
-        for (word, mask) in self.selected_mut(&range) {
-            if attempt == 1 {
-                word.low |= mask;
-            } else if attempt == 2 {
-                word.low &= !mask;
-                word.high |= mask;
+        if !self.clean {
+            for (i, mask) in words(&range) {
+                if attempt == 1 {
+                    self.low[i] |= mask;
+                } else if attempt == 2 {
+                    self.low[i] &= !mask;
+                    self.high[i] |= mask;
+                }
+                self.pending[i] |= mask;
             }
-            word.pending |= mask;
         }
         if attempt == 0 {
             self.sent = range.end as u16;
@@ -135,8 +151,9 @@ impl FrameRecovery {
         if !self.feedback_valid(&range, attempt) {
             return false;
         }
-        for (word, mask) in self.selected_mut(&range) {
-            word.pending &= !(word.generation(attempt) & mask);
+        self.materialize();
+        for (i, mask) in words(&range) {
+            self.pending[i] &= !(generation(self.low[i], self.high[i], attempt) & mask);
         }
         true
     }
@@ -148,15 +165,22 @@ impl FrameRecovery {
         if !self.feedback_valid(&range, attempt) {
             return None;
         }
-        let new: u16 = self
-            .selected(&range)
-            .map(|(word, mask)| (mask & !(word.low & word.high)).count_ones() as u16)
+        let acknowledged = |low: u64, high: u64| if self.clean { high } else { low & high };
+        let new: u16 = words(&range)
+            .map(|(i, mask)| (mask & !acknowledged(self.low[i], self.high[i])).count_ones() as u16)
             .sum();
         let remaining = self.unacked.checked_sub(new)?;
-        for (word, mask) in self.selected_mut(&range) {
-            word.low |= mask;
-            word.high |= mask;
-            word.pending &= !mask;
+        if self.clean {
+            for (i, mask) in words(&range) {
+                self.high[i] |= mask;
+            }
+            self.dirty = self.dirty.max(range.end.div_ceil(64) as u16);
+        } else {
+            for (i, mask) in words(&range) {
+                self.low[i] |= mask;
+                self.high[i] |= mask;
+                self.pending[i] &= !mask;
+            }
         }
         self.unacked = remaining;
         Some(usize::from(new))
@@ -167,14 +191,16 @@ impl FrameRecovery {
     /// Returns None for zero budget, outstanding-only data or exhausted repairs.
     /// None does not imply completion; use remaining() and the original deadline.
     pub fn next_repair(&self, max_bytes: usize) -> Option<(Range<usize>, u8)> {
-        if max_bytes == 0 {
+        // A clean frame has only outstanding originals and acknowledged bytes.
+        if max_bytes == 0 || self.clean {
             return None;
         }
         let mut start = 0;
         let mut end = 0;
         let mut attempt = 0;
-        for (index, word) in self.words.iter().enumerate().take(self.sent().div_ceil(64)) {
-            let eligible = !word.high & !word.pending & mask(&(0..self.sent()), index);
+        for index in 0..self.sent().div_ceil(64) {
+            let (low, high) = (self.low[index], self.high[index]);
+            let eligible = !high & !self.pending[index] & mask(&(0..self.sent()), index);
             if attempt == 0 {
                 if eligible == 0 {
                     continue;
@@ -182,12 +208,12 @@ impl FrameRecovery {
                 let bit = eligible.trailing_zeros();
                 start = index * 64 + bit as usize;
                 end = start;
-                attempt = 1 + ((word.low >> bit) & 1) as u8;
+                attempt = 1 + ((low >> bit) & 1) as u8;
             }
             let limit = start.saturating_add(max_bytes).min(self.sent());
             let available = (index + 1) * 64;
             let target = available.min(limit);
-            let bits = eligible & word.generation(attempt - 1);
+            let bits = eligible & generation(low, high, attempt - 1);
             let count = ((bits >> (end % 64)).trailing_ones() as usize).min(target - end);
             end += count;
             if end < target || end == limit {
@@ -197,32 +223,43 @@ impl FrameRecovery {
         (attempt != 0).then_some((start..end, attempt))
     }
 
+    /// Leaves the clean state: acknowledged bytes take generation 3 and every
+    /// other sent byte becomes an outstanding original.
+    fn materialize(&mut self) {
+        if !self.clean {
+            return;
+        }
+        let sent = 0..self.sent();
+        if !sent.is_empty() {
+            for (i, mask) in words(&sent) {
+                self.low[i] = self.high[i];
+                self.pending[i] = mask & !self.high[i];
+            }
+        }
+        self.dirty = self.length.div_ceil(64);
+        self.clean = false;
+    }
+
     fn feedback_valid(&self, range: &Range<usize>, attempt: u8) -> bool {
         range.start < range.end
             && range.end <= self.sent()
             && attempt <= 2
-            && self
-                .selected(range)
-                .all(|(word, mask)| word.at_least(attempt) & mask == mask)
+            && words(range).all(|(i, mask)| {
+                // While clean, acknowledged bytes are the only ones past generation 0.
+                let reached = if self.clean {
+                    if attempt == 0 { u64::MAX } else { self.high[i] }
+                } else {
+                    at_least(self.low[i], self.high[i], attempt)
+                };
+                reached & mask == mask
+            })
     }
+}
 
-    fn selected(&self, range: &Range<usize>) -> impl Iterator<Item = (&Word, u64)> {
-        self.words
-            .iter()
-            .enumerate()
-            .take(range.end.div_ceil(64))
-            .skip(range.start / 64)
-            .map(|(index, word)| (word, mask(range, index)))
-    }
-
-    fn selected_mut(&mut self, range: &Range<usize>) -> impl Iterator<Item = (&mut Word, u64)> {
-        self.words
-            .iter_mut()
-            .enumerate()
-            .take(range.end.div_ceil(64))
-            .skip(range.start / 64)
-            .map(|(index, word)| (word, mask(range, index)))
-    }
+/// Word indexes a nonempty range covers, each with its bit mask.
+fn words(range: &Range<usize>) -> impl Iterator<Item = (usize, u64)> + use<> {
+    let range = range.clone();
+    (range.start / 64..range.end.div_ceil(64)).map(move |index| (index, mask(&range, index)))
 }
 
 fn mask(range: &Range<usize>, index: usize) -> u64 {

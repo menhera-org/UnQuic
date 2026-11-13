@@ -1,0 +1,160 @@
+diff --git a/src/profile.rs b/src/profile.rs
+index c12610b..2960fd3 100644
+--- a/src/profile.rs
++++ b/src/profile.rs
+@@ -80,8 +80,43 @@ pub fn syscall(kind: usize, started: u64, items: usize) {
+     }
+ }
+ 
++thread_local! {
++    /// Diagnostic: per-thread cycle and call counts for spots outside the
++    /// worker loop's phases, by index: see LOCAL_NAMES.
++    static LOCAL: [std::cell::Cell<u64>; 16] = const { [const { std::cell::Cell::new(0) }; 16] };
++}
++
++/// Names of the LOCAL spots, cycles then calls for each.
++pub const LOCAL_NAMES: [&str; 8] = [
++    "admit_expire",
++    "admit_scan",
++    "admit_copy",
++    "admit_tail",
++    "tap_write_syscall",
++    "tap_write_calls",
++    "expand",
++    "expand_frames",
++];
++
++/// Adds `value` to LOCAL spot `index` on this thread.
++pub fn local(index: usize, value: u64) {
++    LOCAL.with(|spots| {
++        if let Some(spot) = spots.get(index) {
++            spot.set(spot.get().wrapping_add(value));
++        }
++    });
++}
++
+ /// Prints one worker's phase totals, largest first, as shares of their sum.
+ pub fn report(worker: usize, phases: &[u64; PHASES]) {
++    LOCAL.with(|spots| {
++        let line: Vec<String> = LOCAL_NAMES
++            .iter()
++            .zip(spots.iter())
++            .map(|(name, spot)| format!("{name}={}", spot.get()))
++            .collect();
++        eprintln!("unquic: profile worker {worker} local {}", line.join(" "));
++    });
+     let total: u64 = phases.iter().sum();
+     let mut order: Vec<usize> = (0..PHASES).collect();
+     order.sort_by_key(|&index| std::cmp::Reverse(phases[index]));
+diff --git a/src/reassembly.rs b/src/reassembly.rs
+index bc21fb5..69cc8e6 100644
+--- a/src/reassembly.rs
++++ b/src/reassembly.rs
+@@ -405,7 +405,17 @@ impl Lane {
+         if self.retired || header.lane != self.id || header.receive_tag == 0 {
+             return Admission::Invalid;
+         }
++        #[cfg(feature = "profile")]
++        let mut mark = crate::profile::now();
++        #[cfg(feature = "profile")]
++        let mut lap = |index: usize| {
++            let at = crate::profile::now();
++            crate::profile::local(index, at.wrapping_sub(mark));
++            mark = at;
++        };
+         self.expire(now);
++        #[cfg(feature = "profile")]
++        lap(0);
+         if self.packets.old(header.packet_number) {
+             if datagram.records().any(Record::ack_eliciting) {
+                 self.ack.duplicate(now);
+@@ -466,6 +476,8 @@ impl Lane {
+         if !pressure {
+             self.advance_frames(highest);
+         }
++        #[cfg(feature = "profile")]
++        lap(1);
+         for record in datagram.records() {
+             match record {
+                 Record::Data {
+@@ -519,11 +531,15 @@ impl Lane {
+                 _ => {}
+             }
+         }
++        #[cfg(feature = "profile")]
++        lap(2);
+         if pressure {
+             return Admission::Pressure;
+         }
+         self.packets.mark(header.packet_number);
+         self.ack.accepted(header.packet_number, eliciting, now);
++        #[cfg(feature = "profile")]
++        lap(3);
+         Admission::Fresh
+     }
+ 
+diff --git a/src/tap.rs b/src/tap.rs
+index 78dfafa..6c4701c 100644
+--- a/src/tap.rs
++++ b/src/tap.rs
+@@ -461,6 +461,8 @@ impl TapQueue {
+                 iov_len: frame.len(),
+             },
+         ];
++        #[cfg(feature = "profile")]
++        let started = crate::profile::now();
+         // SAFETY: header and frame are readable for their declared lengths.
+         let n = unsafe {
+             if self.vnet {
+@@ -469,6 +471,11 @@ impl TapQueue {
+                 libc::write(self.fd.as_raw_fd(), frame.as_ptr().cast(), frame.len())
+             }
+         };
++        #[cfg(feature = "profile")]
++        {
++            crate::profile::local(4, crate::profile::now().wrapping_sub(started));
++            crate::profile::local(5, 1);
++        }
+         complete_write(n, frame.len() + if self.vnet { header.len() } else { 0 })
+     }
+ 
+diff --git a/src/tap/uso.rs b/src/tap/uso.rs
+index 01c9709..641f99d 100644
+--- a/src/tap/uso.rs
++++ b/src/tap/uso.rs
+@@ -313,7 +313,14 @@ pub(super) fn write<'a>(
+         iov_len: header_len,
+     };
+     // SAFETY: header and every borrowed payload remain readable until writev returns.
++    #[cfg(feature = "profile")]
++    let started = crate::profile::now();
+     let n = unsafe { libc::writev(fd, iov.as_ptr(), (count + 2) as _) };
++    #[cfg(feature = "profile")]
++    {
++        crate::profile::local(4, crate::profile::now().wrapping_sub(started));
++        crate::profile::local(5, 1);
++    }
+     let result =
+         super::complete_write(n, vnet.len() + header_len + payload).map(|()| original_bytes);
+     Some((mask, tcp, result))
+diff --git a/src/worker.rs b/src/worker.rs
+index 41d388b..61ad543 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -3001,7 +3001,15 @@ impl Worker {
+                     continue;
+                 }
+                 while frames < BATCH_SIZE && bytes < 64 * 1024 {
+-                    let Some(length) = self.materialize(source)? else {
++                    #[cfg(feature = "profile")]
++                    let started = crate::profile::now();
++                    let materialized = self.materialize(source)?;
++                    #[cfg(feature = "profile")]
++                    {
++                        crate::profile::local(6, crate::profile::now().wrapping_sub(started));
++                        crate::profile::local(7, 1);
++                    }
++                    let Some(length) = materialized else {
+                         break;
+                     };
+                     frames += 1;

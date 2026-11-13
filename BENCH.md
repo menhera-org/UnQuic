@@ -326,6 +326,52 @@ worker: returns alone cause 21% of the wakes on one side and almost none on
 the other ([counts](benches/one-flow-offer-limited-profile.txt),
 [diagnostic](benches/notify-kind-diagnostic.patch)).
 
+## Coverage planes that stay idle without loss (November 13, landed)
+
+Each retained transmit frame keeps three bits per byte for selective repair
+(original, first or second repair, acknowledged, and outstanding). They were
+interleaved as one 24-byte word per 64 frame bytes, so a 1522-byte frame's
+state spanned nine cache lines. Submission wrote all of them, each ACK
+walked them three times, the repair search after every partial ACK
+scanned them again, and slot reuse cleared them. The planes are now
+separate arrays. Until a frame's first loss only the acknowledged plane is
+kept, three cache lines for a 1522-byte frame: submission writes nothing,
+the repair search returns at once, and reuse clears only words that were
+written. The first loss rebuilds the other planes exactly, ACKed bytes as
+acknowledged and every other sent byte as an outstanding original. Duplicate
+ACKs still count zero, and the byte-model test passes unchanged, with a new
+test for ACKs before the first loss and for stale bits across slot reuse.
+
+On the full-size efficiency point (QinQ 1522-byte frames, sixteen flows at
+250 Mbit/s each way, eight workers, default settings, six rounds rotating
+the arm order, CPU per delivered Gbit/s at the second 4G point), stated
+beforehand as needing five of six rounds lower with a median of −3% or
+better against HEAD and an A/A copy that does not:
+
+| Run | Arm | Rounds lower | Median |
+| --- | --- | --- | --- |
+| [First](benches/full-size-coverage-planes.json) | Planes with compact reassembly sequences, against HEAD | 6 of 6 | −6.3% |
+| First | HEAD copy, against HEAD | 3 of 6 | −0.2% |
+| [Second](benches/full-size-coverage-planes-2.json) | Planes alone, against HEAD | 6 of 6 | −5.2% |
+| Second | Planes alone, against the HEAD copy | 6 of 6 | −2.6% |
+| Second | HEAD copy, against HEAD | 6 of 6 | −2.2% |
+
+In the second run four HEAD rounds lost 0.6–1.45% of frames, so that run's
+HEAD figures are not clean; against the clean copy the planes still come out
+lower in every round. Taken together the change saves about 3–6% of CPU per
+delivered bit.
+
+The compact reassembly sequences in the first arm
+([patch](benches/reassembly-compact-sequences-rejected.patch)) move each
+receive slot's frame sequence out of its 9 KiB slot into one array, so the
+scan that runs whenever the frame window advances reads 512 bytes instead of
+64 slot headers. A profile ([diagnostic](benches/profile-receive-split-diagnostic.patch))
+puts receive admission's first pass at about 640 cycles per datagram before
+and 445 after, but alone the change was lower in only 3 of 6 rounds at a
+median of −0.7% here, and 5 of 8 pairs at −0.6% on the small-frame point
+([results](benches/small-frames-compact-sequences-rejected.json)), so it is
+rejected.
+
 ## What holds one flow near 1 Gbit/s (November 13)
 
 One flow at 7.5 ms delivers 1.00–1.07 Gbit/s per direction at 5G offered

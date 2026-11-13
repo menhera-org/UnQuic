@@ -630,7 +630,7 @@ mod tests {
                 capacity * per_frame
             );
         }
-        assert_eq!(size_of::<FrameRecovery>(), 3392);
+        assert_eq!(size_of::<FrameRecovery>(), 3400);
         assert!(size_of::<Frame>() < 256);
     }
 
