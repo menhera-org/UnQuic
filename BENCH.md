@@ -193,8 +193,33 @@ in the exploratory run, against 11.3–12.4 elsewhere), so the fair hash-lane
 figure is the second pass. Against it, balanced lanes with the control lane
 deliver 11–29% more, at 1,004–1,021% of a core against 849%. With hash lanes
 the control lane moves capacity from L→R to R→L and changes the total by −2%
-to +15%. The decision workload and the lossy one-flow rows are not yet
-measured with it.
+to +15%.
+
+On the decision workload (routed 4.5 ms, bridged QinQ frames, four workers
+and four lanes, two repeats in alternating order,
+[results](benches/decision-control-lane.json)) the control lane also removes
+every deferred ACK send (balanced lanes defer up to 34,000 per daemon there,
+hash lanes up to 7,571), but delivery tells a different story. Totals over
+both directions, Gbit/s, one figure per repeat:
+
+| Point | Hash | Hash, control lane | Balanced | Balanced, control lane |
+| --- | --- | --- | --- | --- |
+| 4 flows, 2G | 3.01, 3.18 | 2.78, 2.99 | 3.75, 3.68 | 3.78, 3.63 |
+| 4 flows, 5G | 3.13, 3.24 | 3.13, 3.08 | 3.96, 3.87 | 4.12, 3.81 |
+| 4 flows, 1% loss, 2G | 2.81, 2.99 | 2.96, 2.89 | 3.63, 3.72 | 3.68, 3.78 |
+| 4 flows, 1% loss, 5G | 3.02, 3.05 | 2.93, 3.00 | 4.00, 4.11 | 3.87, 3.53 |
+| 16 flows, 2G | 3.41, 3.34 | 3.07, 3.13 | 3.75, 3.77 | 3.72, 3.53 |
+| 16 flows, 5G | 3.64, 3.72 | 3.48, 3.54 | 3.84, 3.76 | 3.94, 3.97 |
+| 16 flows, 1% loss, 2G | 3.34, 3.36 | 3.12, 3.14 | 3.72, 3.78 | 3.53, 3.70 |
+| 16 flows, 1% loss, 5G | 3.37, 3.52 | 3.23, 3.26 | 3.89, 3.78 | 3.74, 3.64 |
+
+With four lanes, giving lane 0 to control takes a quarter of the transmit
+lanes from data. Hash lanes lose up to 10% at seven of eight points for it.
+Balanced lanes stay level within noise (−14% to +6% per point), and run by
+run they stay above hash lanes: 1–36% without the control lane, 3–32% with
+it. Balanced lanes with the control lane are the only arm that beats hash
+lanes on both workloads: by 11–29% on the loopback check and by 3–32% here.
+The lossy one-flow row is not yet measured with it.
 
 ## Memory reserved against memory used (November 12)
 

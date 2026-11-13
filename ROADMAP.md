@@ -20,8 +20,11 @@ added loss pins the floor further
 retirement missed their bars. Keeping data off lane 0 met its bar: the
 `daemon.control_lane` switch, off by default, removes every deferred ACK
 send on the loopback check, and with balanced lanes the 21G total rises
-to 13.7–15.9 Gbit/s, 11–29% above hash lanes. Hash lanes change little with
-it. The decision workload with the switch is next, then decision 5.
+to 13.7–15.9 Gbit/s, 11–29% above hash lanes. On the four-lane decision
+workload it removes every deferral as well, leaves balanced lanes level and
+costs hash lanes up to 10%, because data loses one of four lanes. Balanced
+lanes with the control lane beat hash lanes on both workloads, which makes
+decision 5 a question about turning on both switches.
 
 ## November 12 checkpoint
 
@@ -209,9 +212,12 @@ Decisions only the user can make, each blocking a remaining goal:
    (landed November 13, off by default) keeps data off lane 0. With it,
    balanced lanes deliver 13.7–15.9 Gbit/s on the loopback check against
    12.3 with hash lanes and 10.7–10.8 without it
-   ([BENCH.md](BENCH.md#a-control-lane-for-acks-november-13)). The
-   decision workload with the control lane is measured next, and then this
-   decision becomes whether to turn on both switches.
+   ([BENCH.md](BENCH.md#a-control-lane-for-acks-november-13)). On the
+   decision workload it leaves balanced lanes level, 3–32% above hash
+   lanes, and costs hash lanes up to 10%. So the question is now whether to
+   turn on both switches together: that pair beats hash lanes on both
+   workloads, at the cost of balanced lanes' reordering (below) and with the
+   lossy one-flow row still unmeasured.
    ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB
@@ -518,12 +524,10 @@ rules apply to all of them.
    the V03 lifecycle cases are done.
 7. **Stage 5:** profile what remains and try its candidates behind switches.
    As of November 13 the ACK-path fix has landed as `daemon.control_lane`,
-   off by default
+   off by default, and measured on the decision workload
    ([BENCH.md](BENCH.md#a-control-lane-for-acks-november-13)). Next:
-   measure it on the decision workload (four and sixteen flows, 2G and 5G,
-   hash and balanced lanes) and on the lossy one-flow row, then re-measure
-   the shared flow table with it before deciding `balance_flows` and
-   `control_lane` together (decision 5). A peer with one lane keeps ACKs and
+   the lossy one-flow row and the shared flow table with it, then decision
+   5 (`balance_flows` and `control_lane` together). A peer with one lane keeps ACKs and
    data on lane 0 and can still defer ACKs under loss; a separate number
    space for control (a 65th lane ID with its own receive table) would cover
    it if that case matters.

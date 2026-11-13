@@ -625,7 +625,8 @@ default, keeps lane 0 for ACKs and control when a peer has more than one
 transmit lane; data uses the others. On the loopback overload check it
 removed every deferred ACK send. With balanced lanes it delivered 13.7–15.9
 Gbit/s at 21 Gbit/s offered, against 10.7–10.8 without it and 12.3 with hash
-lanes. With hash lanes it changed little (BENCH.md).
+lanes. On the four-lane decision workload it leaves balanced lanes level but
+costs hash lanes up to 10%, since data loses one lane of four (BENCH.md).
 
 At light load each lane tends to send one frame at a time, and at a
 1452-byte payload limit a 1514-byte frame takes two datagrams, the second
