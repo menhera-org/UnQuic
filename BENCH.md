@@ -420,6 +420,14 @@ the copy (one HEAD round lost 5% of frames); HEAD against its copy 3 of 6 at
 ±0.1%. A new test checks that a window advance releases exactly the
 incomplete frames it passes.
 
+A follow-up left each reassembly frame's byte-coverage bitmap unbuilt until
+its first out-of-order piece, since in-order pieces are fully described by
+the prefix length ([patch](benches/reassembly-lazy-coverage-rejected.patch)).
+Stated beforehand with the same bar, it was lower than HEAD in 6 of 6
+rounds at −1.0% but lower than HEAD's copy in only 4 of 6 at −1.2%
+([results](benches/full-size-reassembly-lazy-coverage-rejected.json)), so it
+is rejected.
+
 ## One pass to validate and reserve DATA pieces (November 13, landed)
 
 Reserving a send plan's piece mappings walked every packet's pieces three

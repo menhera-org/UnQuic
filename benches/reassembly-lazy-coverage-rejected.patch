@@ -1,0 +1,116 @@
+diff --git a/src/reassembly.rs b/src/reassembly.rs
+index 9aa377e..89d0dd1 100644
+--- a/src/reassembly.rs
++++ b/src/reassembly.rs
+@@ -159,6 +159,9 @@ struct Frame {
+     length: u16,
+     remaining: u16,
+     prefix_len: u16,
++    // While false, `covered` is stale and the covered bytes are exactly the
++    // first `prefix_len`; the first out-of-order piece builds the bitmap.
++    mapped: bool,
+     deadline: Duration,
+     covered: [u64; MAX_FRAME_LEN.div_ceil(64)],
+     bytes: [u8; MAX_FRAME_LEN],
+@@ -169,6 +172,7 @@ impl Frame {
+             length: 0,
+             remaining: 0,
+             prefix_len: 0,
++            mapped: false,
+             deadline: Duration::ZERO,
+             covered: [0; MAX_FRAME_LEN.div_ceil(64)],
+             bytes: [0; MAX_FRAME_LEN],
+@@ -179,9 +183,36 @@ impl Frame {
+         self.length = length;
+         self.remaining = length;
+         self.prefix_len = 0;
++        self.mapped = false;
+         self.deadline = now.saturating_add(FRAME_LIFETIME);
+-        let words = usize::from(length).div_ceil(64).min(self.covered.len());
++    }
++
++    /// Builds the coverage bitmap from the in-order prefix.
++    fn map(&mut self) {
++        let words = usize::from(self.length)
++            .div_ceil(64)
++            .min(self.covered.len());
+         self.covered[..words].fill(0);
++        let prefix = usize::from(self.prefix_len);
++        self.covered[..prefix / 64].fill(u64::MAX);
++        if prefix % 64 != 0 {
++            self.covered[prefix / 64] = u64::MAX >> (64 - prefix % 64);
++        }
++        self.mapped = true;
++    }
++
++    /// Bytes received so far, by the bitmap or, before it exists, the prefix.
++    #[cfg(test)]
++    fn covered_bytes(&self) -> usize {
++        if self.mapped {
++            let words = usize::from(self.length).div_ceil(64);
++            self.covered[..words]
++                .iter()
++                .map(|word| word.count_ones() as usize)
++                .sum()
++        } else {
++            usize::from(self.prefix_len)
++        }
+     }
+ 
+     fn piece(&mut self, offset: usize, bytes: &[u8]) {
+@@ -196,12 +227,18 @@ impl Frame {
+             && self.remaining == self.length - self.prefix_len
+         {
+             self.bytes[offset..end].copy_from_slice(bytes);
+-            self.covered[offset / 64..end.div_ceil(64)].fill(u64::MAX);
+-            self.covered[(end - 1) / 64] &= u64::MAX >> (63 - (end - 1) % 64);
++            // Before the bitmap exists the prefix alone records coverage.
++            if self.mapped {
++                self.covered[offset / 64..end.div_ceil(64)].fill(u64::MAX);
++                self.covered[(end - 1) / 64] &= u64::MAX >> (63 - (end - 1) % 64);
++            }
+             self.remaining -= bytes.len() as u16;
+             self.prefix_len = end as u16;
+             return;
+         }
++        if !self.mapped {
++            self.map();
++        }
+         let mut start = offset;
+         while start < end {
+             let bit = start % 64;
+@@ -891,13 +928,7 @@ mod tests {
+                     frame.start(length as u16, Duration::ZERO);
+                     frame.piece(offset, &first[..count]);
+                     assert_eq!(frame.remaining as usize, length - count);
+-                    assert_eq!(
+-                        frame.covered[..length.div_ceil(64)]
+-                            .iter()
+-                            .map(|word| word.count_ones() as usize)
+-                            .sum::<usize>(),
+-                        count
+-                    );
++                    assert_eq!(frame.covered_bytes(), count);
+                     frame.piece(offset, &rest[..count]);
+                     assert_eq!(frame.remaining as usize, length - count);
+                     frame.piece(0, &rest[..length]);
+@@ -915,6 +946,19 @@ mod tests {
+                 }
+             }
+         }
++        // A duplicate inside the prefix builds the bitmap; later in-order
++        // pieces must keep it current so their own duplicates count nothing.
++        frame.start(128, Duration::ZERO);
++        frame.piece(0, &first[..60]);
++        frame.piece(30, &rest[..10]);
++        assert_eq!((frame.remaining, frame.covered_bytes()), (68, 60));
++        frame.piece(60, &first[..40]);
++        assert_eq!((frame.remaining, frame.covered_bytes()), (28, 100));
++        frame.piece(70, &rest[..20]);
++        assert_eq!((frame.remaining, frame.covered_bytes()), (28, 100));
++        frame.piece(100, &first[..28]);
++        assert_eq!(frame.remaining, 0);
++        assert_eq!(&frame.bytes[..128], &first[..128]);
+         frame.start(128, Duration::ZERO);
+         frame.piece(0, &first[..60]);
+         frame.piece(80, &first[..20]);
