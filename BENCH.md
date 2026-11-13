@@ -398,6 +398,23 @@ control sends 340), but wakes, polls and timers fall from about 880 to about
 mostly a light-load effect. The harness there also uses veth pairs in
 namespaces, so real NIC offloads remain unmeasured.
 
+## How much of the cost is per frame (November 13)
+
+Profiling the same offered bit rate with 1522-byte and with 128-byte frames
+separates costs that scale with frames from those that scale with
+datagrams, since small frames pack about eleven to a datagram
+([counts](benches/frame-vs-datagram-cost.txt)). The left daemon spends
+23.1 billion busy cycles on 3.40 million frame events and 3.86 million
+datagram events with 1522-byte frames, and 144.3 billion on 60.6 million
+frame events and 6.87 million datagram events with 128-byte frames. Solving
+both gives about 1,890 cycles per frame event and 4,320 per datagram event.
+At 1522-byte frames about 28% of the cost scales with frames and 72% with
+datagrams. Offload frames can therefore remove at most about a quarter of
+the cost for GSO traffic. The larger share is per datagram, about half of it
+the kernel's send and receive path, which real NIC offloads shrink, and the
+rest the sender's and receiver's per-packet userspace work. This is a linear
+fit over two very different frame sizes, so it is an estimate.
+
 ## Inline packet pieces (November 13, rejected)
 
 The first part of the compact per-packet record kept up to two frame pieces

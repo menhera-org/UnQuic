@@ -1,0 +1,13 @@
+Per-frame against per-datagram cost, November 13: the full-size loopback shape (QinQ, sixteen 44-segment GSO flows at 62.5 Mbit/s each way, eight workers, default settings, offer-limited), profile build of bf04810 with benches/profile-permit-split-diagnostic.patch, one run each of 1522-byte and 128-byte frames. Left daemon: busy cycles = cycles per frame event x frame events; datagram events = datagrams the daemon sent plus those the right daemon sent to it (sendmmsg datagram counts).
+== 1522-byte frames
+left: 3396096 frame events, busy 6799 cycles per frame event
+right: 3396096 frame events, busy 6614 cycles per frame event
+left sendmmsg cycles/calls/datagrams [3332831538, 75149, 1929897]
+right sendmmsg cycles/calls/datagrams [3181450672, 72153, 1929657]
+== 128-byte frames
+left: 60597310 frame events, busy 2381 cycles per frame event
+right: 60597310 frame events, busy 2386 cycles per frame event
+left sendmmsg cycles/calls/datagrams [16825983554, 659818, 3357191]
+right sendmmsg cycles/calls/datagrams [16869460614, 693321, 3517394]
+
+Solving busy = a x frame events + b x datagram events over both runs: a = about 1,890 cycles per frame event, b = about 4,320 per datagram event; at 1522-byte frames about 28% of busy cycles scale with frames and 72% with datagrams.
