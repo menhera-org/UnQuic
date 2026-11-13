@@ -378,14 +378,18 @@ behavior. eBPF is excluded because production hosts may prohibit loading program
 default: it met its decision-workload bar on November 11 but cuts the
 loopback overload check by up to 4x; see BENCH.md).** Fixed-key flow hashing can place a few heavy flows on the same
 transmit worker. With the switch, frames that would use strict hashing go
-through a per-reader four-way table of 4096 flows instead: a flow's first
-frame takes the session's next lane round-robin, and the flow keeps that lane
-while it sends. Only after a second of silence, longer than any frame's sender
-and receiver lifetimes, may it take a new lane, so a move cannot reorder
-frames. A full table set falls back to the hash lane. A flow the kernel moves
-to another TAP queue meets another reader's table and can change lanes,
-reordering at most the frames in flight then, as reader-local lanes already
-allow.
+through a direct-mapped table of 16,384 flows that every TAP reader shares:
+a flow's first frame takes the session's next lane round-robin, and the flow
+keeps that lane while it sends. Only after a second of silence, longer than
+any frame's sender and receiver lifetimes, may it take a new lane, so a move
+cannot reorder frames. Each entry is one atomic word (a 32-bit key tag, the
+lane and a 24-bit millisecond stamp) updated by compare-and-swap, so a flow
+the kernel moves to another TAP queue keeps its lane. An active entry is
+never evicted: a flow whose entry another active flow holds uses its hash
+lane.
+(November 13: the table replaced per-reader four-way tables, under which a
+flow that changed readers changed lanes and reordered up to 1.4 million
+frames per direction on the decision workload; BENCH.md.)
 
 **Control lane (November 13 amendment; `daemon.control_lane`, off by
 default).** ACKs and other non-handshake control records take packet numbers

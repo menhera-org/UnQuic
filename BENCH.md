@@ -243,6 +243,26 @@ and the reordering bursts are gone. Per-reader tables reorder 289,000–1.4
 million frames per direction in three of eight runs as flows change readers.
 The shared table stays at or below 13,054 in every run.
 
+The landed version replaces the per-reader tables under `balance_flows`
+with one 16,384-entry table of atomic words (128 KiB, charged to
+`memory_limit`). Unlike the exploratory patch it never evicts an active
+entry: a colliding flow takes its hash lane, so two active flows cannot
+make each other change lanes. It was required beforehand to stay within
+5% of per-reader tables on the loopback check over three pairs, to cut the
+worst four-flow reordering tenfold, and to keep decision-workload delivery
+level, all with balanced lanes and the control lane. It met all three:
+
+- Loopback check, three pairs in alternating order
+  ([results](benches/loopback-shared-flow-table.json)): 13.35, 13.94 and
+  13.67 Gbit/s at 21G against 13.22, 15.53 and 13.46, a median of +1.6%.
+- Decision workload, every combination, two repeats
+  ([results](benches/decision-shared-flow-table.json)): the worst
+  reordering falls from 1.03 million frames per direction to 45,000, and
+  15 of 16 runs stay under 17,000, while per-reader tables exceed 30,000 in
+  15 of 16. Delivery is level or higher at every point (four flows at 5G:
+  4.34 and 3.77 Gbit/s against 3.81 and 3.98; sixteen flows at 5G: 3.93 and
+  3.91 against 3.89 and 3.70), at the same CPU per delivered Gbit/s.
+
 ## Memory reserved against memory used (November 12)
 
 The startup check reserves storage from the configuration and refuses to

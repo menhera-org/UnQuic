@@ -24,7 +24,11 @@ to 13.7–15.9 Gbit/s, 11–29% above hash lanes. On the four-lane decision
 workload it removes every deferral as well, leaves balanced lanes level and
 costs hash lanes up to 10%, because data loses one of four lanes. Balanced
 lanes with the control lane beat hash lanes on both workloads, which makes
-decision 5 a question about turning on both switches.
+decision 5 a question about turning on both switches. The flow table every
+TAP reader shares then replaced the per-reader tables under
+`balance_flows`: a flow keeps its lane when the kernel moves it between
+queues, and the worst decision-workload reordering falls from 1.03 million
+frames per direction to 45,000 with delivery level or higher.
 
 ## November 12 checkpoint
 
@@ -191,34 +195,24 @@ Decisions only the user can make, each blocking a remaining goal:
    no longer shows a loss of its own, but it
    adds about 33 µs to the median one-way delay and 0.2 ms at p99 for light
    traffic.
-5. Should `daemon.balance_flows` be on by default? On the decision workload
-   it adds about 20% for four flows even with the read margin (5G total
-   3.91–3.95 instead of 3.25–3.29 Gbit/s) and lifts sixteen flows at 2G by
-   10–15%, but it still costs the loopback overload check about 12% at 21G
-   and more CPU per bit (rechecked on `3178088`). For one lossy flow it lifts
-   5G delivery 25–90% by striping, with millions of reordered frames, and on
-   the decision workload it reorders 0.1–1.1 million frames per direction
-   against at most 22,000 with hash lanes, a cost inner TCP or QUIC would pay.
-   An exploratory flow table shared by all readers removes that reordering
-   and raises four-flow L→R at 5G to 1.98–2.00 Gbit/s (per-reader tables:
-   1.62–1.64; hash lanes: 1.15–1.19), but leaves the loopback cost (6–16%
-   in two rounds)
-   ([BENCH.md](BENCH.md#a-flow-table-shared-by-all-readers-exploratory));
-   building it properly is the next lane-placement step. A trace places that
-   loopback cost in the congestion window: with balanced lanes senders wait
-   on it 35–37% of the time while hundreds of thousands of sent frames are
-   never acknowledged. The cause was ACKs numbered from lane 0's packet
-   history, which lane 0's data fills under loss. `daemon.control_lane`
-   (landed November 13, off by default) keeps data off lane 0. With it,
-   balanced lanes deliver 13.7–15.9 Gbit/s on the loopback check against
-   12.3 with hash lanes and 10.7–10.8 without it
-   ([BENCH.md](BENCH.md#a-control-lane-for-acks-november-13)). On the
-   decision workload it leaves balanced lanes level, 3–32% above hash
-   lanes, and costs hash lanes up to 10%. So the question is now whether to
-   turn on both switches together: that pair beats hash lanes on both
-   workloads and on one lossy flow (1.55–1.82 against 0.95–1.01 Gbit/s at
-   5G), at the cost of balanced lanes' reordering (below).
-   ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
+5. Should `daemon.balance_flows` and `daemon.control_lane` both be on by
+   default? As of November 13 the pair beats hash lanes everywhere it was
+   measured ([BENCH.md](BENCH.md#a-control-lane-for-acks-november-13)):
+   13.4–13.9 Gbit/s on the loopback check at 21G with the shared flow table
+   (13.1–16.9 with the old per-reader tables) against 12.1–12.3, 3–32%
+   more on the decision workload, and 1.55–1.82 against 0.95–1.01 Gbit/s
+   per direction for one flow at 7.5 ms with 1% loss. Balanced lanes alone
+   used to cost the loopback check about 12%; that came from ACKs numbered
+   from lane 0's packet history, which lane 0's data fills under loss, and
+   the control lane removes it. With the shared flow table, a flow keeps
+   its lane when the kernel moves it between TAP queues, so the
+   decision workload reorders at most 45,000 frames per direction, against
+   22,000 with hash lanes and up to 1 million with the old per-reader
+   tables. The costs: one lossy flow is striped across lanes and reorders
+   1.7–2.0 million frames per direction (inner TCP or QUIC would see that),
+   CPU per delivered bit is about the same, and the control lane alone costs
+   hash lanes up to 10% on four-lane peers, so it should not be on without
+   balanced lanes.
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB
    `memory_limit` default remains undecided. It admits up to eight workers
@@ -525,16 +519,13 @@ rules apply to all of them.
 7. **Stage 5:** profile what remains and try its candidates behind switches.
    As of November 13 the ACK-path fix has landed as `daemon.control_lane`,
    off by default, and measured on the decision workload
-   ([BENCH.md](BENCH.md#a-control-lane-for-acks-november-13)). Next:
-   build the shared flow table properly. Rebased onto the control lane, the
-   exploratory table keeps four-flow delivery level and removes the
-   reordering bursts per-reader tables show (up to 1.4 million frames per
-   direction against at most 13,054), but one loopback pair could not show
-   it within 5% of per-reader tables. A production version replaces the
-   per-reader tables under `balance_flows`, with its memory charged, tests,
-   both suites and a loopback rerun. Then decision 5 (`balance_flows` and
-   `control_lane` together). The lossy one-flow row loses nothing to the
-   control lane. A peer with one lane keeps ACKs and
+   ([BENCH.md](BENCH.md#a-control-lane-for-acks-november-13)). The flow
+   table every TAP reader shares has replaced the per-reader tables under
+   `balance_flows`: with both switches on it cuts the worst decision-workload
+   reordering from 1.03 million frames per direction to 45,000 with
+   delivery level or higher, and stays within 2% on the loopback check.
+   Decision 5 (`balance_flows` and `control_lane` together) now waits on the
+   user. Next: the sender's per-frame cost. A peer with one lane keeps ACKs and
    data on lane 0 and can still defer ACKs under loss; a separate number
    space for control (a 65th lane ID with its own receive table) would cover
    it if that case matters.

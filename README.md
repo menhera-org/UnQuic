@@ -611,11 +611,16 @@ excluded from deployment.
 
 Fixed-key hashing can put a few heavy flows on the same transmit worker. With
 `daemon.balance_flows`, off by default, frames on the strict-hash path go
-through a per-reader table instead: a new flow takes the session's next lane
-round-robin and keeps it while it sends, moving only after a second of
-silence. It lifts one flow at 7.5 ms by 42–58% and the weaker decision-workload
-directions by up to 121%, but the direction hashing favoured loses up to 14%
-and the loopback overload check 10% in total, so it stays off (BENCH.md).
+through a 16,384-entry table that every TAP reader shares (128 KiB): a new
+flow takes the session's next lane round-robin and keeps it while it sends,
+moving only after a second of silence, even when the kernel moves it to
+another TAP queue. A flow whose entry another active flow holds keeps its
+hash lane. It lifts one flow at 7.5 ms with 1% loss by 50–90% by striping
+it across lanes, which reorders 1.7–2.0 million of its frames per
+direction, and the decision workload by 1–36% in total. On its own it costs
+the loopback overload check about 12%; with `daemon.control_lane` (below) it
+gains 8–14% there instead.
+Both stay off until that trade is decided (BENCH.md).
 
 ACKs and other control records always leave on lane 0 and take their packet
 numbers from its history, which spans 65,536 numbers. Under loss, lane 0's

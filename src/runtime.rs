@@ -76,6 +76,8 @@ pub(crate) struct Shared {
     pub address_ready: Vec<AtomicU64>,
     // Next lane for a new flow per session, under daemon.balance_flows.
     pub flow_cursors: Vec<std::sync::atomic::AtomicUsize>,
+    // The flow table all TAP readers share; empty unless daemon.balance_flows.
+    pub flows: Box<[AtomicU64]>,
 }
 
 impl Control {
@@ -364,6 +366,7 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
     let sessions = config.config().sessions.len();
     let peers = config.config().peers.len();
     let endpoints = config.config().endpoints.len();
+    let balance_flows = config.config().daemon.balance_flows;
     if peers > (u32::MAX as usize >> 7) || adopted.len() > sessions {
         return Err(io::ErrorKind::InvalidInput.into());
     }
@@ -405,6 +408,13 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
         flow_cursors: (0..sessions)
             .map(|_| std::sync::atomic::AtomicUsize::new(0))
             .collect(),
+        flows: if balance_flows {
+            (0..crate::worker::FLOW_SLOTS)
+                .map(|_| AtomicU64::new(0))
+                .collect()
+        } else {
+            Box::default()
+        },
     });
     let mut workers = (0..count)
         .map(|id| Worker::new(id, Arc::clone(&shared), control.clone()))
@@ -499,9 +509,15 @@ fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
                 .checked_mul(size_of::<LaneCounters>())?,
         )
     })?;
+    let flows = if raw.daemon.balance_flows {
+        crate::worker::FLOW_SLOTS * size_of::<AtomicU64>()
+    } else {
+        0
+    };
     let shared = sessions
         .checked_mul(65_536 + size_of::<Box<[AtomicU8]>>() + 1 + size_of::<AtomicU64>())?
-        .checked_add(workers.checked_mul(STACK_BYTES + size_of::<Counters>() + 256)?)?;
+        .checked_add(workers.checked_mul(STACK_BYTES + size_of::<Counters>() + 256)?)?
+        .checked_add(flows)?;
     // Config owns caller-supplied capacities; count those even when mostly empty.
     let mut configuration = raw
         .endpoints
