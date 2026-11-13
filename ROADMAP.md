@@ -216,8 +216,8 @@ Decisions only the user can make, each blocking a remaining goal:
    decision workload it leaves balanced lanes level, 3–32% above hash
    lanes, and costs hash lanes up to 10%. So the question is now whether to
    turn on both switches together: that pair beats hash lanes on both
-   workloads, at the cost of balanced lanes' reordering (below) and with the
-   lossy one-flow row still unmeasured.
+   workloads and on one lossy flow (1.55–1.82 against 0.95–1.01 Gbit/s at
+   5G), at the cost of balanced lanes' reordering (below).
    ([BENCH.md](BENCH.md#balanced-lanes-on-the-decision-workload-revisited)).
 6. Carried over: the real-path test needs sudo through the endpoint account,
    which conflicts with this host's no-networking-changes rule; the 256 MiB
@@ -526,8 +526,8 @@ rules apply to all of them.
    As of November 13 the ACK-path fix has landed as `daemon.control_lane`,
    off by default, and measured on the decision workload
    ([BENCH.md](BENCH.md#a-control-lane-for-acks-november-13)). Next:
-   the lossy one-flow row and the shared flow table with it, then decision
-   5 (`balance_flows` and `control_lane` together). A peer with one lane keeps ACKs and
+   the shared flow table with it (the lossy one-flow row loses nothing to
+   it), then decision 5 (`balance_flows` and `control_lane` together). A peer with one lane keeps ACKs and
    data on lane 0 and can still defer ACKs under loss; a separate number
    space for control (a 65th lane ID with its own receive table) would cover
    it if that case matters.

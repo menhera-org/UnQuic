@@ -219,7 +219,14 @@ Balanced lanes stay level within noise (−14% to +6% per point), and run by
 run they stay above hash lanes: 1–36% without the control lane, 3–32% with
 it. Balanced lanes with the control lane are the only arm that beats hash
 lanes on both workloads: by 11–29% on the loopback check and by 3–32% here.
-The lossy one-flow row is not yet measured with it.
+
+One flow at 7.5 ms with 1% random loss (four workers, two passes in reverse
+order, [results](benches/lossy-one-flow-control-lane.json)) loses nothing
+to the control lane. At 5G offered, hash lanes deliver 0.95–0.96 / 0.97–1.01
+Gbit/s without it and 0.95–0.98 / 0.98–1.00 with it. Balanced lanes deliver
+1.49–1.66 / 1.54–1.68 without it and 1.55–1.75 / 1.69–1.82 with it, striping
+the one flow across lanes either way: 1.7–2.0 million reordered frames per
+direction, against about 45,000 with hash lanes.
 
 ## Memory reserved against memory used (November 12)
 
