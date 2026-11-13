@@ -639,6 +639,14 @@ mod tests {
         let control = std::net::UdpSocket::bind("[::]:0").unwrap();
         up(&control, c"uq-read");
         tap.queues[0].set_carrier(true).unwrap();
+        // Hand raw sends straight to the TAP: a queueing discipline can drop them.
+        assert!(
+            std::process::Command::new("tc")
+                .args(["qdisc", "replace", "dev", "uq-read", "root", "noqueue"])
+                .status()
+                .unwrap()
+                .success()
+        );
         let sender = raw_socket(c"uq-read", 0x88b5);
         let mut reader = Reader::new().unwrap();
         let tasks = std::fs::read_dir("/proc/self/task").unwrap().count();
@@ -657,12 +665,33 @@ mod tests {
                 for frame in &frames {
                     raw_send(&sender, frame);
                 }
-                let batch = reader.read(&mut tap.queues[0], &mut buffers[..count]);
-                assert!(reader.enabled);
-                assert_eq!(batch.calls, 1);
-                for (i, result) in batch.results.into_iter().take(count).enumerate() {
-                    assert_eq!(result.unwrap(), size);
-                    assert_eq!(&buffers[i][..size], frames[i]);
+                // Delivery into the TAP can lag the raw sends. A read that finds
+                // the queue empty returns WouldBlock while a later read in the
+                // same batch may still get the next frame, so successful reads
+                // in index order carry the frames in order, possibly with gaps.
+                let mut done = 0;
+                let mut retries = 0;
+                while done < count {
+                    let batch = reader.read(&mut tap.queues[0], &mut buffers[done..count]);
+                    assert!(reader.enabled);
+                    assert_eq!(batch.calls, 1);
+                    let mut next = done;
+                    for (i, result) in batch.results.into_iter().take(count - done).enumerate() {
+                        match result {
+                            Ok(length) => {
+                                assert_eq!(length, size);
+                                assert_eq!(&buffers[done + i][..size], frames[next]);
+                                next += 1;
+                            }
+                            Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+                        }
+                    }
+                    done = next;
+                    if done < count {
+                        retries += 1;
+                        assert!(retries < 100, "frames never reached the TAP");
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
             }
         }
