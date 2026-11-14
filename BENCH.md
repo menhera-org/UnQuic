@@ -736,6 +736,21 @@ copy. On the lossy path ([results](benches/lossy-path-ack-prefix.json)),
 frames lost in the worse direction were 1.2–3.9% (median 2.4%) against
 HEAD's 1.0–5.3% (median 3.6%), at the same delivered rate.
 
+## The same prefix for receive coverage (November 14, rejected)
+
+Receive slots already copy in-order pieces in bulk, but still wrote each
+piece's coverage bits and cleared the frame's coverage words when a slot
+started a frame. The candidate skipped both while a frame had only an
+in-order prefix and rebuilt the words from the prefix at the first
+out-of-order piece ([patch](benches/rx-coverage-prefix-rejected.patch)).
+Six rounds were borderline (4 of 6 lower than both HEAD and its copy,
+−1.4% at the median), and twelve pooled
+([first six](benches/full-size-rx-coverage-prefix-1.json),
+[second six](benches/full-size-rx-coverage-prefix-2.json)) were lower
+than both in only 6, at −0.3% against the copy. Unlike the sender's
+read-modify-write of cold plane lines, these were stores into lines the
+slot's own copy keeps warm, so skipping them saved little.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames
