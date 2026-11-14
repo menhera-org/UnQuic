@@ -888,7 +888,10 @@ per-ACK summary. Expected together: transmit planning 600 → about 200,
 staging 330 → about 80, ACK application 200 → about 80 cycles per frame
 event.
 
-**Receive without the reassembly copy (item 2; November 14 amendment).**
+**Receive without the reassembly copy (item 2; November 14 amendment;
+tried and rejected the same day, BENCH.md).** Four builds of the scheme
+below cost 15–20% more CPU per delivered bit, because TAP writes stopped
+coalescing; the cause was not found, so receive keeps its copy.
 Today every DATA piece is copied from the receive buffer into its frame's
 reassembly slot, and the TAP write reads the slot. The receiver instead
 leaves a piece where it arrived when it can, and writes the frame to the

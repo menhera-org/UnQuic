@@ -627,9 +627,15 @@ rules apply to all of them.
    under receive pressure. Four-slot runs saved another 7.7% on that point
    but collapsed on a lossy path, losing 52–92% of frames, so runs stay at
    two slots; even those lose more frames under loss than ordinary frames.
-   Whether to turn it on by default is decision 8.
-   Next come receive without the reassembly copy; fewer cross-worker wakes;
-   one flow striped with a receive-side reorder stage (decision 7).
+   Whether to turn it on by default is decision 8, decided off.
+   Receive without the reassembly copy was tried in four builds on November
+   14 and rejected: each cost 15–20% because TAP writes stopped coalescing,
+   for a cause not yet found
+   ([BENCH.md](BENCH.md#receive-without-the-reassembly-copy-november-14-rejected)).
+   Transmit sockets now force 2 MiB send buffers where `CAP_NET_ADMIN`
+   allows, as receive sockets force 8 MiB; neither takes effect in the
+   unprivileged test containers. Next: fewer cross-worker wakes; one flow
+   striped with a receive-side reorder stage (decision 7).
    The kernel figures can only be confirmed on an R86S-class box with real
    NICs; the remote 7.0 host stands in until then. The kernel test
    `tap::read::tests::real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch`

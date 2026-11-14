@@ -1832,6 +1832,8 @@ impl Worker {
                                     continue;
                                 }
                                 socket.enable_mtu_discovery()?;
+                                self.counters.transmit_buffer_fallbacks +=
+                                    u64::from(socket.buffer_fallback);
                                 let token = TX_TOKEN
                                     | ((index as u64) << 7)
                                     | ((path_index as u64) << 6)

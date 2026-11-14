@@ -578,6 +578,51 @@ Four-slot runs collapse, so the slot count stays at two. Even two-slot runs
 lose more frames than ordinary frames under loss, which is why
 `daemon.offload_frames` stays off by default.
 
+## Receive without the reassembly copy (November 14, rejected)
+
+Design section 13.1, item 2, leaves a DATA piece in its receive buffer and
+writes the frame to the TAP by gathering its pieces
+([patch](benches/receive-without-copy-rejected.patch), the last of four
+builds). The bar stated beforehand was the usual one: five of six rounds lower
+than HEAD and its A/A copy, median −1% or better against the copy, on the
+full-size efficiency point with offload frames off. Every build lost 15–20%
+in all six rounds, and in each, TAP writes rose from about 0.68 million to
+3.5–5.2 million per run, with coalesced batches shrinking from about 20
+frames to 5:
+
+| Build | Change | Against its baseline |
+| --- | --- | --- |
+| 1 | Write and copy whenever draining a buffer pauses or ends | +20.0% |
+| 2 | Once per drain step, references naming any buffer of the step | +19.4% |
+| 3 | Also never keep a first piece too short for the headers | +15.6% |
+| 4 | Settle in the TAP flush instead of the drain step | +15.6% |
+
+Build 3 fixed one real cause. With 1522-byte frames packed tail to head, a
+frame's first piece can be any size, and the coalescing writer needs the
+headers in its first range; about 18% of frames were written alone and split
+their batches ([results](benches/full-size-receive-without-copy-rejected.json)).
+A diagnostic build that copied every kept piece where build 3 wrote it
+restored normal batches and cost only +3.5%
+([results](benches/full-size-receive-without-copy-diagnostic.json)). So written
+references, not their timing, break batching: build 4 moved the writes to
+the normal TAP flush and still cost +15.6%
+([results](benches/full-size-receive-without-copy-deferred-rejected.json)),
+although a unit test shows split frames of one flow coalescing at every split
+tried. The cause is not found; receive keeps its copy. The +3.5% of the
+diagnostic build is the bookkeeping a working version would have to beat.
+
+## Transmit socket buffers (November 14, landed)
+
+At the user's request the daemon now raises transmit socket buffers the way
+it already raised receive ones: 2 MiB per lane with `SO_SNDBUFFORCE`,
+falling back to `SO_SNDBUF` without `CAP_NET_ADMIN`. On the full-size
+efficiency point it was level with HEAD (−0.1% against HEAD's copy, 3 of 6
+rounds lower, with the copy at +0.1% against HEAD), but every socket fell
+back there: the forcing options check `CAP_NET_ADMIN` in the initial user
+namespace, which root in an unprivileged container lacks. The 416 KiB
+receive buffers behind the 20 Gbit/s gate's local limit come from the same
+check, so this measurement cannot show what either forced buffer is worth.
+
 ## What holds one flow near 1 Gbit/s (November 13)
 
 One flow at 7.5 ms delivers 1.00–1.07 Gbit/s per direction at 5G offered

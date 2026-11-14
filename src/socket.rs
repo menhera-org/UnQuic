@@ -26,6 +26,9 @@ pub const BATCH_SIZE: usize = 64;
 pub const MAX_UDP_PAYLOAD: usize = 9000 - 40 - 8;
 const MAX_VECTORS: usize = 1024;
 const RECEIVE_QUEUE_BYTES: i32 = 8 * 1024 * 1024;
+/// Send-queue request per transmit lane, ten times a usual wmem_default; at
+/// 64 lanes a peer's worst-case queued kernel memory stays near 128 MiB.
+const TRANSMIT_QUEUE_BYTES: i32 = 2 * 1024 * 1024;
 pub(crate) const GSO_MAX_BYTES: usize = 65_535 - 40 - 8;
 
 #[repr(C)]
@@ -145,24 +148,11 @@ impl ReceiveSocket {
         let socket = configured_socket(device)?;
         set_int(&socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
         set_int(&socket, libc::SOL_SOCKET, libc::SO_RXQ_OVFL, 1)?;
-        let buffer_fallback = match set_int(
+        let buffer_fallback = set_buffer(
             &socket,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUFFORCE,
+            (libc::SO_RCVBUFFORCE, libc::SO_RCVBUF),
             RECEIVE_QUEUE_BYTES,
-        ) {
-            Ok(()) => false,
-            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
-                set_int(
-                    &socket,
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVBUF,
-                    RECEIVE_QUEUE_BYTES,
-                )?;
-                true
-            }
-            Err(error) => return Err(error),
-        };
+        )?;
         bind(&socket, address)?;
         let address = local_address(&socket)?;
         Ok(Self {
@@ -329,6 +319,7 @@ impl AsFd for ReceiveSocket {
 pub struct TransmitSocket {
     socket: UdpSocket,
     gso: AtomicBool,
+    pub(crate) buffer_fallback: bool,
 }
 
 impl TransmitSocket {
@@ -353,6 +344,11 @@ impl TransmitSocket {
             libc::IPV6_PMTUDISC_DO,
         )?;
         set_int(&socket, libc::IPPROTO_IPV6, libc::IPV6_TCLASS, 0)?;
+        let buffer_fallback = set_buffer(
+            &socket,
+            (libc::SO_SNDBUFFORCE, libc::SO_SNDBUF),
+            TRANSMIT_QUEUE_BYTES,
+        )?;
         let mut local = receiver.address;
         local.set_port(0);
         bind(&socket, local)?;
@@ -367,6 +363,7 @@ impl TransmitSocket {
         Ok(Self {
             socket,
             gso: AtomicBool::new(true),
+            buffer_fallback,
         })
     }
 
@@ -793,6 +790,24 @@ fn set_int(
         )
     })?;
     Ok(())
+}
+
+/// Requests `bytes` of socket buffer with the forcing option, which passes
+/// rmem_max or wmem_max with CAP_NET_ADMIN; without it (EPERM) falls back to
+/// the plain option, which the kernel caps. Returns whether it fell back.
+fn set_buffer(
+    socket: &UdpSocket,
+    (force, plain): (libc::c_int, libc::c_int),
+    bytes: libc::c_int,
+) -> io::Result<bool> {
+    match set_int(socket, libc::SOL_SOCKET, force, bytes) {
+        Ok(()) => Ok(false),
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+            set_int(socket, libc::SOL_SOCKET, plain, bytes)?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn bind(socket: &UdpSocket, address: SocketAddrV6) -> io::Result<()> {
@@ -1430,6 +1445,14 @@ mod tests {
         assert!(queue_bytes > 0);
         if !rx.buffer_fallback {
             assert_eq!(queue_bytes, 2 * RECEIVE_QUEUE_BYTES as usize);
+        }
+        // Linux reports double the request, its overhead allowance; without
+        // CAP_NET_ADMIN wmem_max may cap it.
+        let send_bytes = option(tx.as_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF);
+        assert!(send_bytes > 0);
+        assert_eq!(rx.buffer_fallback, tx.buffer_fallback);
+        if !tx.buffer_fallback {
+            assert_eq!(send_bytes, 2 * TRANSMIT_QUEUE_BYTES);
         }
         for fd in [rx.as_fd(), tx.as_fd()] {
             assert_eq!(option(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY), 1);

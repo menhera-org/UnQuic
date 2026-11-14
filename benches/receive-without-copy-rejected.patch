@@ -1,0 +1,1352 @@
+diff --git a/src/reassembly.rs b/src/reassembly.rs
+index 349a68d..957398a 100644
+--- a/src/reassembly.rs
++++ b/src/reassembly.rs
+@@ -8,6 +8,7 @@
+ use crate::{
+     MAX_FRAME_LEN,
+     ack::Schedule,
++    tap::{Gather, HEAD_BYTES},
+     wire::{AckRange, AckRanges, Datagram, MAX_ACK_RANGES, Record},
+ };
+ use std::{collections::VecDeque, fmt, mem::size_of, time::Duration};
+@@ -157,6 +158,27 @@ impl Window {
+ }
+ 
+ const SLOT_WORDS: usize = MAX_FRAME_LEN.div_ceil(64);
++/// Pieces a frame may keep in its receive buffer: a 1514-byte frame's head and
++/// tail at a 1452-byte payload limit.
++const REFERENCES: usize = 2;
++
++/// The receive buffers a worker keeps for one drain step, by index, and which
++/// of them holds the datagram being admitted. Pieces may stay in these
++/// buffers until the caller settles every lane before any buffer leaves.
++#[derive(Clone, Copy)]
++pub(crate) struct Sources<'a> {
++    pub(crate) buffers: &'a [&'a [u8]],
++    pub(crate) current: u8,
++}
++
++impl Sources<'_> {
++    /// Where `piece`, a subslice of the current buffer, starts within it.
++    fn offset(&self, piece: &[u8]) -> Option<usize> {
++        let bytes = self.buffers.get(usize::from(self.current))?;
++        let at = (piece.as_ptr() as usize).checked_sub(bytes.as_ptr() as usize)?;
++        (at + piece.len() <= bytes.len()).then_some(at)
++    }
++}
+ 
+ // Per-slot state. Bytes and coverage live in Lane::bytes and Lane::covered,
+ // contiguous across slots, so an offload frame spans a run of whole slots and
+@@ -169,6 +191,11 @@ struct Frame {
+     // Slots this frame holds, starting at its own; 1 for ordinary frames.
+     span: u8,
+     offload: bool,
++    // While nonzero, the frame's first prefix_len bytes are these ranges
++    // (offset, length, buffer index) of the caller's receive buffers, in
++    // order, and its slot holds none of them.
++    references: u8,
++    ranges: [(u32, u16, u8); REFERENCES],
+     deadline: Duration,
+ }
+ impl Frame {
+@@ -178,6 +205,8 @@ impl Frame {
+         prefix_len: 0,
+         span: 1,
+         offload: false,
++        references: 0,
++        ranges: [(0, 0, 0); REFERENCES],
+         deadline: Duration::ZERO,
+     };
+ 
+@@ -185,6 +214,7 @@ impl Frame {
+         self.length = length;
+         self.remaining = length;
+         self.prefix_len = 0;
++        self.references = 0;
+         self.span = if offload { span(length) } else { 1 };
+         self.offload = offload;
+         self.deadline = now.saturating_add(FRAME_LIFETIME);
+@@ -192,6 +222,77 @@ impl Frame {
+         covered[..words].fill(0);
+     }
+ 
++    /// Retains the next in-order piece of an ordinary frame as the range at
++    /// `at` in receive buffer `buffer` instead of copying it. False changes
++    /// nothing.
++    fn reference(
++        &mut self,
++        covered: &mut [u64],
++        offset: usize,
++        length: usize,
++        (at, buffer): (usize, u8),
++    ) -> bool {
++        let end = offset + length;
++        let count = usize::from(self.references);
++        if self.offload
++            || length == 0
++            || end > usize::from(self.length)
++            || offset != usize::from(self.prefix_len)
++            || self.remaining != self.length - self.prefix_len
++            || count == REFERENCES
++            // A first piece must hold the headers TAP coalescing reads, or
++            // the frame would be written alone and split its batch.
++            || (count == 0 && (offset != 0 || length < usize::from(self.length).min(HEAD_BYTES)))
++            || end.div_ceil(64) > covered.len()
++        {
++            return false;
++        }
++        let Ok(at) = u32::try_from(at) else {
++            return false;
++        };
++        self.ranges[count] = (at, length as u16, buffer);
++        self.references += 1;
++        covered[offset / 64..end.div_ceil(64)].fill(u64::MAX);
++        covered[(end - 1) / 64] &= u64::MAX >> (63 - (end - 1) % 64);
++        self.remaining -= length as u16;
++        self.prefix_len = end as u16;
++        true
++    }
++
++    /// The referenced ranges, in frame order.
++    fn referenced<'a>(&self, buffers: &[&'a [u8]]) -> [&'a [u8]; REFERENCES] {
++        std::array::from_fn(|index| {
++            let (at, length, buffer) = self.ranges[index];
++            let (at, length) = (at as usize, usize::from(length));
++            if index < usize::from(self.references) {
++                buffers
++                    .get(usize::from(buffer))
++                    .and_then(|bytes| bytes.get(at..at + length))
++                    .unwrap_or_default()
++            } else {
++                &[]
++            }
++        })
++    }
++
++    fn refers_to(&self, buffer: u8) -> bool {
++        self.ranges[..usize::from(self.references)]
++            .iter()
++            .any(|range| range.2 == buffer)
++    }
++
++    /// Copies referenced bytes into the slot; the frame then holds none.
++    fn settle(&mut self, storage: &mut [u8], buffers: &[&[u8]]) {
++        let mut offset = 0;
++        for range in self.referenced(buffers) {
++            if let Some(target) = storage.get_mut(offset..offset + range.len()) {
++                target.copy_from_slice(range);
++            }
++            offset += range.len();
++        }
++        self.references = 0;
++    }
++
+     /// `covered` and `bytes` start at this frame's first slot.
+     fn piece(&mut self, covered: &mut [u64], storage: &mut [u8], offset: usize, bytes: &[u8]) {
+         let end = offset + bytes.len();
+@@ -293,6 +394,8 @@ pub struct Lane {
+     occupied: u64,
+     // One bit per slot in use, including the later slots of offload frames.
+     reserved: u64,
++    // Frames holding references into the caller's receive buffers.
++    borrowed: u64,
+     // New frames one datagram reserves, with their first slot; kept so no
+     // datagram refills 1 KiB.
+     reservations: [Reservation; 64],
+@@ -323,6 +426,7 @@ impl Lane {
+             sequences: [0; FRAME_CAPACITY],
+             occupied: 0,
+             reserved: 0,
++            borrowed: 0,
+             reservations: [Reservation::default(); 64],
+             index: [EMPTY; INDEX_LEN],
+             ready: VecDeque::with_capacity(FRAME_CAPACITY),
+@@ -457,6 +561,7 @@ impl Lane {
+         self.sequences.fill(0);
+         self.occupied = 0;
+         self.reserved = 0;
++        self.borrowed = 0;
+         self.index.fill(EMPTY);
+         self.ready.clear();
+         self.deadline = None;
+@@ -470,6 +575,18 @@ impl Lane {
+     /// fits, neither packet history, window bounds nor control records advance.
+     /// Due expirations remain independent. Other owners apply controls only on Fresh.
+     pub fn admit(&mut self, datagram: &Datagram<'_>, now: Duration) -> Admission {
++        self.admit_from(datagram, now, None)
++    }
++
++    /// Admits a datagram that lies in the current buffer of `sources`, which
++    /// in-order pieces may stay in. Settle the lane before any of those
++    /// buffers leaves the caller.
++    pub(crate) fn admit_from(
++        &mut self,
++        datagram: &Datagram<'_>,
++        now: Duration,
++        sources: Option<Sources<'_>>,
++    ) -> Admission {
+         let header = datagram.header();
+         if self.retired || header.lane != self.id || header.receive_tag == 0 {
+             return Admission::Invalid;
+@@ -604,12 +721,24 @@ impl Lane {
+                     let frame = &mut self.frames[slot];
+                     let remaining = frame.remaining;
+                     if remaining != 0 {
+-                        frame.piece(
+-                            &mut self.covered[slot * SLOT_WORDS..],
+-                            &mut self.bytes[slot * MAX_FRAME_LEN..],
+-                            offset as usize,
+-                            bytes,
+-                        );
++                        let covered = &mut self.covered[slot * SLOT_WORDS..];
++                        let storage = &mut self.bytes[slot * MAX_FRAME_LEN..];
++                        let referenced = sources.is_some_and(|sources| {
++                            sources.offset(bytes).is_some_and(|at| {
++                                let at = (at, sources.current);
++                                frame.reference(covered, offset as usize, bytes.len(), at)
++                            })
++                        });
++                        if referenced {
++                            self.borrowed |= 1 << slot;
++                        } else {
++                            if frame.references != 0 {
++                                let buffers = sources.map_or(&[][..], |s| s.buffers);
++                                frame.settle(storage, buffers);
++                                self.borrowed &= !(1 << slot);
++                            }
++                            frame.piece(covered, storage, offset as usize, bytes);
++                        }
+                         if frame.remaining == 0 {
+                             self.ready.push_back(slot as u8);
+                         }
+@@ -698,14 +827,49 @@ impl Lane {
+     }
+ 
+     /// Ordinary ready frames in queue order, stopping before any offload frame.
+-    pub(crate) fn ready_frames(&mut self, now: Duration) -> impl Iterator<Item = &[u8]> {
++    /// Frames holding references gather them from `buffers`, the table they
++    /// were admitted against.
++    pub(crate) fn ready_frames<'a>(
++        &'a mut self,
++        now: Duration,
++        buffers: &'a [&'a [u8]],
++    ) -> impl Iterator<Item = Gather<'a>> {
+         self.expire(now);
+-        self.ready.iter().map_while(|&slot| {
++        let lane = &*self;
++        lane.ready.iter().map_while(move |&slot| {
+             let slot = usize::from(slot);
+-            (!self.frames[slot].offload).then(|| self.slot_bytes(slot))
++            let frame = &lane.frames[slot];
++            (!frame.offload).then(|| {
++                if frame.references == 0 {
++                    return lane.slot_bytes(slot).into();
++                }
++                let [head, tail] = frame.referenced(buffers);
++                Gather { head, tail }
++            })
+         })
+     }
+ 
++    /// Whether any frame holds references into the caller's buffers.
++    pub(crate) const fn borrows(&self) -> bool {
++        self.borrowed != 0
++    }
++
++    /// Copies referenced bytes into frames' slots, for every frame or only
++    /// those referring to buffer `only`, so those buffers can leave. Write
++    /// ready frames first to avoid copying them.
++    pub(crate) fn settle(&mut self, buffers: &[&[u8]], only: Option<u8>) {
++        let mut borrowed = self.borrowed;
++        while borrowed != 0 {
++            let slot = borrowed.trailing_zeros() as usize;
++            borrowed &= borrowed - 1;
++            let frame = &mut self.frames[slot];
++            if only.is_none_or(|buffer| frame.refers_to(buffer)) {
++                frame.settle(&mut self.bytes[slot * MAX_FRAME_LEN..], buffers);
++                self.borrowed &= !(1 << slot);
++            }
++        }
++    }
++
+     fn slot_bytes(&self, slot: usize) -> &[u8] {
+         let start = slot * MAX_FRAME_LEN;
+         self.bytes
+@@ -819,6 +983,7 @@ impl Lane {
+         self.retained_bytes -= usize::from(self.frames[slot].length);
+         self.sequences[slot] = 0;
+         self.occupied &= !(1 << slot);
++        self.borrowed &= !(1 << slot);
+         self.reserved &= !(run(self.frames[slot].span) << slot);
+     }
+ }
+@@ -876,8 +1041,8 @@ mod tests {
+         assert_eq!(lane.retained_frames(), 32);
+         assert_eq!(lane.retained_bytes(), 32 * 60);
+         assert_eq!(
+-            lane.ready_frames(Duration::ZERO)
+-                .map(|f| f[0])
++            lane.ready_frames(Duration::ZERO, &[])
++                .map(|f| f.head[0])
+                 .collect::<Vec<_>>(),
+             (2..=64).step_by(2).collect::<Vec<_>>()
+         );
+@@ -891,8 +1056,130 @@ mod tests {
+         assert_eq!(lane.retained_frames(), 0);
+         assert_eq!(lane.retained_bytes(), 0);
+         assert_eq!(lane.reserved, 0);
+-        assert_eq!(lane.ready_frames(Duration::ZERO).count(), 0);
++        assert_eq!(lane.ready_frames(Duration::ZERO, &[]).count(), 0);
+     }
++    #[test]
++    fn in_order_pieces_stay_in_their_buffer_until_settled() {
++        use crate::wire::{Header, encode_datagram};
++        let frame = |seed: u8| -> Vec<u8> {
++            (0..1514)
++                .map(|i| (i as u8).wrapping_mul(7) ^ seed)
++                .collect()
++        };
++        let (a, b, c, d, f) = (frame(1), frame(2), frame(3), frame(4), frame(6));
++        fn piece(sequence: u64, bytes: &[u8], at: usize, end: usize, offload: bool) -> Record<'_> {
++            Record::Data {
++                frame_id: (1 << 48) | sequence,
++                total_len: bytes.len() as u32,
++                offset: at as u32,
++                bytes: &bytes[at..end],
++                offload,
++            }
++        }
++        fn gathered(lane: &mut Lane, buffers: &[&[u8]]) -> Vec<Vec<u8>> {
++            lane.ready_frames(Duration::ZERO, buffers)
++                .map(|frame| [frame.head, frame.tail].concat())
++                .collect()
++        }
++        // Datagrams back to back in one buffer, as GRO delivers a lane's run.
++        let mut packet = 0;
++        let mut fill = |buffer: &mut Vec<u8>, datagrams: &[&[Record<'_>]]| {
++            buffer.clear();
++            let mut ranges = Vec::new();
++            for records in datagrams {
++                packet += 1;
++                let mut output = [0; 2048];
++                let header = Header {
++                    cookie: crate::UnquicUuid::from_bytes([1; 16]),
++                    receive_tag: 1,
++                    lane: 1,
++                    packet_number: packet,
++                    record_area_len: 0,
++                };
++                let n = encode_datagram(header, records, &mut output).unwrap();
++                ranges.push(buffer.len()..buffer.len() + n);
++                buffer.extend_from_slice(&output[..n]);
++            }
++            ranges
++        };
++        let admit =
++            |lane: &mut Lane, buffers: &[&[u8]], current: u8, ranges: &[std::ops::Range<usize>]| {
++                let sources = Sources { buffers, current };
++                let buffer = buffers[usize::from(current)];
++                for range in ranges {
++                    let datagram = Datagram::decode(&buffer[range.clone()]).unwrap();
++                    assert_eq!(
++                        lane.admit_from(&datagram, Duration::ZERO, Some(sources)),
++                        Admission::Fresh
++                    );
++                }
++            };
++        let mut lane = Lane::new(1, 9022).unwrap();
++        lane.accept_offload_frames(true);
++        // Frame a's head ends one buffer and its tail starts the next.
++        let (mut first, mut second) = (Vec::new(), Vec::new());
++        let head = fill(&mut first, &[&[piece(1, &a, 0, 1384, false)]]);
++        let rest = fill(
++            &mut second,
++            &[
++                &[
++                    piece(1, &a, 1384, 1514, false),
++                    piece(2, &b, 0, 1100, false),
++                ],
++                &[piece(2, &b, 1100, 1300, false)],
++            ],
++        );
++        let table = [&first[..], &second[..]];
++        admit(&mut lane, &table, 0, &head);
++        admit(&mut lane, &table, 1, &rest);
++        assert!(lane.borrows());
++        // The complete frame is a range of each buffer, not a slot copy.
++        let ready = lane.ready_frames(Duration::ZERO, &table).next().unwrap();
++        assert_eq!((ready.head.len(), ready.tail.len()), (1384, 130));
++        assert!(first.as_ptr_range().contains(&ready.head.as_ptr()));
++        assert!(second.as_ptr_range().contains(&ready.tail.as_ptr()));
++        assert_eq!(gathered(&mut lane, &table), std::slice::from_ref(&a));
++        lane.finish_ready(1);
++        // Settling only the first buffer leaves b, which lies in the second.
++        lane.settle(&table, Some(0));
++        assert!(lane.borrows());
++        // Settling the rest copies b, so both buffers may be reused.
++        lane.settle(&table, None);
++        assert!(!lane.borrows());
++        let mut buffer = first;
++        // Its rest arrives as a copy; an overlap, a third in-order piece and
++        // an offload frame take the copy path too, after settling references.
++        let e: Vec<u8> = (0..60).map(|i| i as u8).collect();
++        let ranges = fill(
++            &mut buffer,
++            &[
++                &[
++                    piece(2, &b, 1300, 1514, false),
++                    piece(3, &c, 0, 1000, false),
++                ],
++                &[piece(3, &c, 500, 1200, false), piece(4, &d, 0, 500, false)],
++                &[
++                    piece(4, &d, 500, 1000, false),
++                    piece(4, &d, 1000, 1514, false),
++                ],
++                &[piece(3, &c, 1200, 1514, false), piece(5, &e, 0, 60, true)],
++                // A first piece too short for the headers is never kept.
++                &[piece(6, &f, 0, 100, false), piece(6, &f, 100, 1514, false)],
++            ],
++        );
++        admit(&mut lane, &[&buffer], 0, &ranges);
++        assert!(!lane.borrows());
++        buffer.fill(0);
++        second.fill(0);
++        let delivered = gathered(&mut lane, &[]);
++        assert_eq!(delivered, [b, d, c]);
++        lane.finish_ready(0b111);
++        assert!(lane.front(Duration::ZERO).unwrap().offload);
++        assert_eq!(lane.front(Duration::ZERO).unwrap().bytes, e);
++        assert!(lane.finish_front());
++        assert_eq!(gathered(&mut lane, &[]), [f]);
++    }
++
+     #[test]
+     fn ordinary_batches_stop_before_an_offload_frame() {
+         let mut lane = Lane::new(1, 9022).unwrap();
+@@ -921,8 +1208,8 @@ mod tests {
+             assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Fresh);
+         }
+         let firsts = |lane: &mut Lane| {
+-            lane.ready_frames(Duration::ZERO)
+-                .map(|frame| frame[0])
++            lane.ready_frames(Duration::ZERO, &[])
++                .map(|frame| frame.head[0])
+                 .collect::<Vec<_>>()
+         };
+         assert_eq!(firsts(&mut lane), [1]);
+@@ -1009,9 +1296,36 @@ mod tests {
+                     number.copy_from_slice(&packet_number.to_be_bytes());
+                 }
+             }
++            // Each datagram is its own receive buffer, settled before the next.
++            let table = [&bytes[..]];
++            let sources = Sources {
++                buffers: &table,
++                current: 0,
++            };
+             if let Ok(datagram) = Datagram::decode(&bytes) {
+-                lane.admit(&datagram, now);
++                lane.admit_from(&datagram, now, (rng.below(2) == 0).then_some(sources));
+             }
++            let mut occupied = lane.occupied;
++            while occupied != 0 {
++                let slot = occupied.trailing_zeros() as usize;
++                occupied &= occupied - 1;
++                let borrowed = lane.borrowed & 1 << slot != 0;
++                assert_eq!(lane.frames[slot].references != 0, borrowed);
++            }
++            let lengths: Vec<_> = lane
++                .ready
++                .iter()
++                .map(|&slot| &lane.frames[usize::from(slot)])
++                .take_while(|frame| !frame.offload)
++                .map(|frame| usize::from(frame.length))
++                .collect();
++            let gathered: Vec<_> = lane
++                .ready_frames(now, &table)
++                .map(|frame| frame.len())
++                .collect();
++            assert_eq!(gathered, lengths);
++            lane.settle(&table, None);
++            assert!(!lane.borrows());
+             match rng.below(8) {
+                 0 => _ = lane.finish_front(),
+                 1 => lane.finish_ready(rng.bits()),
+diff --git a/src/tap.rs b/src/tap.rs
+index ec5b7b0..f6e55e9 100644
+--- a/src/tap.rs
++++ b/src/tap.rs
+@@ -16,6 +16,7 @@ pub(crate) use read::Reader;
+ mod segment;
+ mod uso;
+ pub(crate) use segment::Segments;
++pub(crate) use uso::{Gather, HEAD_BYTES};
+ #[cfg(test)]
+ #[path = "tap/uso_tests.rs"]
+ mod uso_tests;
+@@ -534,6 +535,11 @@ impl TapQueue {
+     /// On WouldBlock the caller retains the whole frame until writable or
+     /// expired. Other errors discard the frame in the transport.
+     pub fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
++        self.write_gather(frame.into())
++    }
++
++    /// Writes one frame given as up to two ranges, as write_frame does.
++    pub(crate) fn write_gather(&mut self, frame: Gather<'_>) -> io::Result<()> {
+         if !(14..=self.frame_limit).contains(&frame.len()) {
+             return Err(io::ErrorKind::InvalidInput.into());
+         }
+@@ -544,18 +550,18 @@ impl TapQueue {
+                 iov_len: header.len(),
+             },
+             libc::iovec {
+-                iov_base: frame.as_ptr().cast_mut().cast(),
+-                iov_len: frame.len(),
++                iov_base: frame.head.as_ptr().cast_mut().cast(),
++                iov_len: frame.head.len(),
++            },
++            libc::iovec {
++                iov_base: frame.tail.as_ptr().cast_mut().cast(),
++                iov_len: frame.tail.len(),
+             },
+         ];
+-        // SAFETY: header and frame are readable for their declared lengths.
+-        let n = unsafe {
+-            if self.vnet {
+-                libc::writev(self.fd.as_raw_fd(), iov.as_ptr(), 2)
+-            } else {
+-                libc::write(self.fd.as_raw_fd(), frame.as_ptr().cast(), frame.len())
+-            }
+-        };
++        // Without virtio headers the first entry is skipped.
++        let (first, count) = if self.vnet { (0, 3) } else { (1, 2) };
++        // SAFETY: header and both ranges are readable for their declared lengths.
++        let n = unsafe { libc::writev(self.fd.as_raw_fd(), iov[first..].as_ptr(), count) };
+         complete_write(n, frame.len() + if self.vnet { header.len() } else { 0 })
+     }
+ 
+@@ -566,10 +572,11 @@ impl TapQueue {
+ 
+     /// Returns the attempted mask, whether it used TSO, and the write result.
+     /// The mask names every attempted frame, even when the write fails.
+-    pub(crate) fn write_batch<'a>(
++    pub(crate) fn write_batch<'a, F: Into<Gather<'a>>>(
+         &mut self,
+-        mut frames: impl Iterator<Item = &'a [u8]>,
++        frames: impl Iterator<Item = F>,
+     ) -> (u64, bool, io::Result<usize>) {
++        let mut frames = frames.map(Into::into);
+         let Some(first) = frames.next() else {
+             return (0, false, Ok(0));
+         };
+@@ -596,7 +603,7 @@ impl TapQueue {
+                 return (mask, tcp, result);
+             }
+         }
+-        (1, false, self.write_frame(first).map(|()| first.len()))
++        (1, false, self.write_gather(first).map(|()| first.len()))
+     }
+ }
+ 
+diff --git a/src/tap/uso.rs b/src/tap/uso.rs
+index 01c9709..e6745e5 100644
+--- a/src/tap/uso.rs
++++ b/src/tap/uso.rs
+@@ -51,7 +51,17 @@ impl Layout {
+     }
+ }
+ 
+-fn transport(frame: &[u8]) -> Option<Layout> {
++/// Bytes of a frame's head that must hold every header byte parsed here.
++pub(crate) const HEAD_BYTES: usize = 256;
++
++fn transport(input: Gather<'_>) -> Option<Layout> {
++    let frame = input.head;
++    let len = input.len();
++    // Every header byte parsed below lies in the head; a frame split earlier
++    // than that is written alone.
++    if frame.len() < len.min(HEAD_BYTES) {
++        return None;
++    }
+     let mut ip = 14;
+     let mut protocol = u16::from_be_bytes(frame.get(12..14)?.try_into().ok()?);
+     for _ in 0..2 {
+@@ -65,11 +75,11 @@ fn transport(frame: &[u8]) -> Option<Layout> {
+     let v6 = protocol == 0x86dd;
+     let mut destination = ip + 24;
+     let (at, protocol) = match protocol {
+-        0x0800 if frame.len() >= ip + 20 && frame[ip] >> 4 == 4 => {
++        0x0800 if len >= ip + 20 && frame[ip] >> 4 == 4 => {
+             let at = ip + usize::from(frame[ip] & 15) * 4;
+             if at < ip + 20
+-                || at > frame.len()
+-                || word(frame, ip + 2) as usize != frame.len() - ip
++                || at > len
++                || word(frame, ip + 2) as usize != len - ip
+                 || word(frame, ip + 6) != 0x4000
+                 || word(frame, ip + 10) == 65535
+                 || fold(sum(&frame[ip..at])) != 65535
+@@ -78,8 +88,8 @@ fn transport(frame: &[u8]) -> Option<Layout> {
+             }
+             (at, frame[ip + 9])
+         }
+-        0x86dd if frame.len() >= ip + 40 && frame[ip] >> 4 == 6 => {
+-            if word(frame, ip + 4) as usize != frame.len() - ip - 40 {
++        0x86dd if len >= ip + 40 && frame[ip] >> 4 == 6 => {
++            if word(frame, ip + 4) as usize != len - ip - 40 {
+                 return None;
+             }
+             let mut at = ip + 40;
+@@ -87,7 +97,7 @@ fn transport(frame: &[u8]) -> Option<Layout> {
+             while matches!(next, 0 | 43 | 60) {
+                 let prefix = frame.get(at..at + 8)?;
+                 let length = (usize::from(prefix[1]) + 1) * 8;
+-                if at + length > frame.len() || at + length > 128 {
++                if at + length > len || at + length > 128 {
+                     return None;
+                 }
+                 if next == 43 {
+@@ -126,15 +136,15 @@ fn transport(frame: &[u8]) -> Option<Layout> {
+     } else {
+         if protocol != 17
+             || at != ip + if v6 { 40 } else { 20 }
+-            || frame.len() < at + 9
+-            || word(frame, at + 4) as usize != frame.len() - at
++            || len < at + 9
++            || word(frame, at + 4) as usize != len - at
+             || word(frame, at + 6) == 0
+         {
+             return None;
+         }
+         at + 8
+     };
+-    if header >= frame.len() || header > 128 {
++    if header >= len || header > 128 {
+         return None;
+     }
+     let layout = Layout {
+@@ -145,7 +155,40 @@ fn transport(frame: &[u8]) -> Option<Layout> {
+         tcp,
+         v6,
+     };
+-    (fold(layout.pseudo(frame, frame.len() - at) + sum(&frame[at..])) == 65535).then_some(layout)
++    let transport = sum_split(frame.get(at..)?, input.tail);
++    (fold(layout.pseudo(frame, len - at) + transport) == 65535).then_some(layout)
++}
++
++/// The Internet checksum sum of `first` followed by `second`: after an odd
++/// number of bytes, the second range's 16-bit words are byte-swapped.
++pub(super) fn sum_split(first: &[u8], second: &[u8]) -> u32 {
++    let rest = sum(second);
++    let rest = if first.len() % 2 == 1 {
++        u32::from((rest as u16).swap_bytes())
++    } else {
++        rest
++    };
++    sum(first) + rest
++}
++
++/// One frame as up to two byte ranges in frame order; a contiguous frame has
++/// an empty tail.
++#[derive(Clone, Copy, Debug, Default)]
++pub(crate) struct Gather<'a> {
++    pub(crate) head: &'a [u8],
++    pub(crate) tail: &'a [u8],
++}
++
++impl<'a> From<&'a [u8]> for Gather<'a> {
++    fn from(head: &'a [u8]) -> Self {
++        Self { head, tail: &[] }
++    }
++}
++
++impl Gather<'_> {
++    pub(crate) const fn len(&self) -> usize {
++        self.head.len() + self.tail.len()
++    }
+ }
+ /// Callers check lengths first; the zero fallback only keeps this panic-free.
+ fn sequence(frame: &[u8], at: usize) -> u32 {
+@@ -186,13 +229,15 @@ fn matches(first: &[u8], next: &[u8], layout: Layout, count: usize, payload: usi
+ 
+ /// Returns the attempted mask, TCP flag and original byte count on success.
+ /// The mask survives failure so the caller retains every selected frame.
+-pub(super) fn write<'a>(
++pub(super) fn write<'a, F: Into<Gather<'a>>>(
+     fd: RawFd,
+-    first: &'a [u8],
+-    mut frames: impl Iterator<Item = &'a [u8]>,
++    first: impl Into<Gather<'a>>,
++    frames: impl Iterator<Item = F>,
+     frame_limit: usize,
+     enabled: (bool, bool),
+ ) -> Option<(u64, bool, io::Result<usize>)> {
++    let first = first.into();
++    let mut frames = frames.map(Into::into);
+     let second = frames.next()?;
+     let layout = transport(first)?;
+     let Layout {
+@@ -203,57 +248,61 @@ pub(super) fn write<'a>(
+         v6,
+         ..
+     } = layout;
+-    // transport() bounds every offset below by the header; `?` only keeps this panic-free.
+-    let first_flags = if tcp { *first.get(at + 13)? } else { 0 };
++    // transport() put every header offset below inside each frame's head;
++    // `?` only keeps this panic-free.
++    let first_flags = if tcp { *first.head.get(at + 13)? } else { 0 };
+     if !(if tcp { enabled.1 } else { enabled.0 }) || first_flags & 8 != 0 {
+         return None;
+     }
+-    let data = first.get(header_len..)?;
+-    let size = data.len();
+-    let hash = flow_hash(first);
++    let size = first.len() - header_len;
++    let hash = flow_hash(first.head);
+     let mut vnet = [0u8; 10];
+     let mut header = [0u8; 128];
++    // Two entries per frame: its payload's head and tail ranges.
+     let mut iov = [libc::iovec {
+         iov_base: std::ptr::null_mut(),
+         iov_len: 0,
+-    }; 66];
++    }; 2 + 2 * 64];
++    let mut entries = 2;
++    let mut push = |range: &[u8], entries: &mut usize| {
++        if !range.is_empty() {
++            iov[*entries] = libc::iovec {
++                iov_base: range.as_ptr().cast_mut().cast(),
++                iov_len: range.len(),
++            };
++            *entries += 1;
++        }
++    };
++    push(first.head.get(header_len..)?, &mut entries);
++    push(first.tail, &mut entries);
+     let mut count = 1;
+     let mut mask = 1u64;
+     let mut payload = size;
+     let mut original_bytes = first.len();
+     let mut last_flags = first_flags;
+-    iov[2] = libc::iovec {
+-        iov_base: data.as_ptr().cast_mut().cast(),
+-        iov_len: size,
+-    };
+     for (index, next) in std::iter::once(second).chain(frames).take(63).enumerate() {
+-        if flow_hash(next) != hash {
++        if flow_hash(next.head) != hash {
+             continue;
+         }
+         // A same-flow barrier must prevent moving a later frame ahead of it.
+         if next.len() > frame_limit
+             || transport(next) != Some(layout)
+-            || !matches(first, next, layout, count, payload)
++            || !matches(first.head, next.head, layout, count, payload)
+         {
+             break;
+         }
+-        let Some(data) = next.get(header_len..) else {
+-            break;
+-        };
+-        let length = data.len();
++        let length = next.len() - header_len;
+         if length > size || header_len + payload + length > 65535 {
+             break;
+         }
+-        iov[count + 2] = libc::iovec {
+-            iov_base: data.as_ptr().cast_mut().cast(),
+-            iov_len: length,
+-        };
++        push(next.head.get(header_len..)?, &mut entries);
++        push(next.tail, &mut entries);
+         count += 1;
+         mask |= 1 << (index + 1);
+         payload += length;
+         original_bytes += next.len();
+         if tcp {
+-            last_flags = *next.get(at + 13)?;
++            last_flags = *next.head.get(at + 13)?;
+         }
+         if length < size || (tcp && last_flags & 8 != 0) {
+             break;
+@@ -264,7 +313,7 @@ pub(super) fn write<'a>(
+     }
+     header
+         .get_mut(..header_len)?
+-        .copy_from_slice(first.get(..header_len)?);
++        .copy_from_slice(first.head.get(..header_len)?);
+     let transport_len = payload + header_len - at;
+     let checksum_at = at + if tcp { 16 } else { 6 };
+     if tcp {
+@@ -313,7 +362,7 @@ pub(super) fn write<'a>(
+         iov_len: header_len,
+     };
+     // SAFETY: header and every borrowed payload remain readable until writev returns.
+-    let n = unsafe { libc::writev(fd, iov.as_ptr(), (count + 2) as _) };
++    let n = unsafe { libc::writev(fd, iov.as_ptr(), entries as _) };
+     let result =
+         super::complete_write(n, vnet.len() + header_len + payload).map(|()| original_bytes);
+     Some((mask, tcp, result))
+@@ -337,6 +386,59 @@ fn checksum_matches_reference_for_odd_even_and_unaligned_inputs() {
+     }
+ }
+ 
++#[cfg(test)]
++fn parse(frame: &[u8]) -> Option<Layout> {
++    transport(frame.into())
++}
++
++#[cfg(test)]
++#[test]
++fn split_sums_and_layouts_match_contiguous_frames_at_every_split() {
++    let bytes: Vec<_> = (0..1501).map(|n| (n * 13 + n / 256) as u8).collect();
++    for split in 0..=bytes.len() {
++        let (first, second) = bytes.split_at(split);
++        assert_eq!(
++            fold(sum_split(first, second)),
++            fold(sum(&bytes)),
++            "split {split}"
++        );
++    }
++    let frame = crate::tap::test_common::udp::frame(false, 7, &[0x5a; 1472]);
++    let whole = parse(&frame).unwrap();
++    for split in [0, 41, 255, 256, 257, 1000, frame.len()] {
++        let (head, tail) = frame.split_at(split);
++        // A head too short to hold every header byte is never coalesced.
++        let expected = (split >= HEAD_BYTES).then_some(whole);
++        assert_eq!(transport(Gather { head, tail }), expected, "split {split}");
++    }
++    let mut corrupt = frame.clone();
++    corrupt[1200] ^= 1;
++    let (head, tail) = corrupt.split_at(1000);
++    assert_eq!(transport(Gather { head, tail }), None);
++    // Consecutive frames of one flow coalesce however they are split.
++    let frames: Vec<_> = (0..4)
++        .map(|id| crate::tap::test_common::udp::frame(false, 7 + id, &[id as u8; 1472]))
++        .collect();
++    for split in [300, 1001, 1384, frame.len()] {
++        let gathers: Vec<_> = frames
++            .iter()
++            .map(|frame| {
++                let (head, tail) = frame.split_at(split);
++                Gather { head, tail }
++            })
++            .collect();
++        let (mask, tcp, _) = write(
++            -1,
++            gathers[0],
++            gathers[1..].iter().copied(),
++            1514,
++            (true, true),
++        )
++        .unwrap_or_else(|| panic!("split {split} did not coalesce"));
++        assert_eq!((mask, tcp), (0b1111, false), "split {split}");
++    }
++}
++
+ #[cfg(test)]
+ #[test]
+ fn tagged_headers_preserve_tags_and_reject_truncation_and_excess_depth() {
+@@ -351,27 +453,27 @@ fn tagged_headers_preserve_tags_and_reject_truncation_and_excess_depth() {
+                 }
+             }
+             for end in 0..first.len() {
+-                assert_eq!(transport(&first[..end]), None);
++                assert_eq!(parse(&first[..end]), None);
+             }
+             if depth == 3 {
+-                assert_eq!(transport(&first), None);
++                assert_eq!(parse(&first), None);
+                 continue;
+             }
+             let ip = 14 + 4 * depth;
+             let at = ip + if v6 { 40 } else { 20 };
+-            assert_eq!(transport(&first).map(|l| (l.ip, l.at)), Some((ip, at)));
+-            assert_eq!(transport(&next).map(|l| (l.ip, l.at)), Some((ip, at)));
+-            assert!(matches(&first, &next, transport(&first).unwrap(), 1, 120));
++            assert_eq!(parse(&first).map(|l| (l.ip, l.at)), Some((ip, at)));
++            assert_eq!(parse(&next).map(|l| (l.ip, l.at)), Some((ip, at)));
++            assert!(matches(&first, &next, parse(&first).unwrap(), 1, 120));
+             for offset in 12..ip {
+                 next[offset] ^= 1;
+                 assert!(
+-                    !matches(&first, &next, transport(&first).unwrap(), 1, 120),
++                    !matches(&first, &next, parse(&first).unwrap(), 1, 120),
+                     "tag byte {offset}"
+                 );
+                 next[offset] ^= 1;
+             }
+             next[at + 6] ^= 1;
+-            assert_eq!(transport(&next), None, "bad UDP checksum");
++            assert_eq!(parse(&next), None, "bad UDP checksum");
+         }
+     }
+ }
+@@ -384,23 +486,23 @@ fn tcp_eligibility_checks_lengths_checksums_flags_and_sequence() {
+         for options in [&[][..], &[1; 40][..]] {
+             let first = tcp::frame(v6, 65535, u32::MAX - 99, 0x10, options, &[7; 100]);
+             let next = tcp::frame(v6, 0, 0, 0x18, options, &[8; 99]);
+-            let layout = transport(&first).unwrap();
+-            assert_eq!(transport(&next), Some(layout));
++            let layout = parse(&first).unwrap();
++            assert_eq!(parse(&next), Some(layout));
+             assert!(matches(&first, &next, layout, 1, 100));
+             for end in 0..first.len() {
+-                assert!(transport(&first[..end]).is_none());
++                assert!(parse(&first[..end]).is_none());
+             }
+             for flags in [0, 1, 2, 4, 0x30, 0x90] {
+-                assert!(transport(&tcp::frame(v6, 0, 0, flags, options, &[1])).is_none());
++                assert!(parse(&tcp::frame(v6, 0, 0, flags, options, &[1])).is_none());
+             }
+-            assert!(transport(&tcp::frame(v6, 0, 0, 0x10, options, &[])).is_none());
++            assert!(parse(&tcp::frame(v6, 0, 0, 0x10, options, &[])).is_none());
+             let gap = tcp::frame(v6, 0, 1, 0x10, options, &[8; 99]);
+             assert!(!matches(&first, &gap, layout, 1, 100));
+             let at = layout.at;
+             for offset in [at, at + 4, at + 8, at + 14, at + 18, first.len() - 1] {
+                 let mut bad = first.clone();
+                 bad[offset] ^= 1;
+-                assert!(transport(&bad).is_none(), "checksum mutation at {offset}");
++                assert!(parse(&bad).is_none(), "checksum mutation at {offset}");
+             }
+         }
+     }
+@@ -472,7 +574,7 @@ fn random_and_mutated_frames_never_panic_validation_or_coalescing() {
+         let limit = [1514, crate::MAX_FRAME_LEN, rng.below(10_000)][rng.below(3)];
+         let enabled = (rng.below(4) != 0, rng.below(4) != 0);
+         let frames = [&next[..], follower].into_iter().take(1 + rng.below(2));
+-        write(-1, &first, frames, limit, enabled);
++        write(-1, first.as_slice(), frames, limit, enabled);
+     }
+ }
+ 
+@@ -486,8 +588,14 @@ fn tcp_coalescing_stops_at_flow_barriers_and_counts_only_selected_frames() {
+     other[34] ^= 1;
+     tcp::repair(&mut other, false);
+     assert_ne!(flow_hash(&a), flow_hash(&other));
+-    let (mask, tcp, result) =
+-        write(-1, &a, [&other[..], &b[..]].into_iter(), 1514, (true, true)).unwrap();
++    let (mask, tcp, result) = write(
++        -1,
++        a.as_slice(),
++        [&other[..], &b[..]].into_iter(),
++        1514,
++        (true, true),
++    )
++    .unwrap();
+     assert_eq!(mask, 0b101);
+     assert!(tcp);
+     assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EBADF));
+@@ -495,11 +603,11 @@ fn tcp_coalescing_stops_at_flow_barriers_and_counts_only_selected_frames() {
+         let mut barrier = b.clone();
+         barrier[offset] ^= 1;
+         crate::tap::test_common::tcp::repair(&mut barrier, false);
+-        assert!(transport(&barrier).is_some());
++        assert!(parse(&barrier).is_some());
+         assert!(
+             write(
+                 -1,
+-                &a,
++                a.as_slice(),
+                 [&barrier[..], &b[..]].into_iter(),
+                 1514,
+                 (true, true)
+@@ -510,10 +618,17 @@ fn tcp_coalescing_stops_at_flow_barriers_and_counts_only_selected_frames() {
+     }
+     let c = crate::tap::test_common::tcp::frame(false, 102, 200, 0x10, &[1; 12], &[3; 100]);
+     assert!(
+-        write(-1, &b, [&c[..]].into_iter(), 1514, (true, true)).is_none(),
++        write(-1, b.as_slice(), [&c[..]].into_iter(), 1514, (true, true)).is_none(),
+         "PSH starts a new group"
+     );
+-    let (mask, _, _) = write(-1, &a, [&b[..], &c[..]].into_iter(), 1514, (true, true)).unwrap();
++    let (mask, _, _) = write(
++        -1,
++        a.as_slice(),
++        [&b[..], &c[..]].into_iter(),
++        1514,
++        (true, true),
++    )
++    .unwrap();
+     assert_eq!(mask, 0b11, "PSH closes the current group");
+-    assert!(write(-1, &a, [&b[..]].into_iter(), 1514, (true, false)).is_none());
++    assert!(write(-1, a.as_slice(), [&b[..]].into_iter(), 1514, (true, false)).is_none());
+ }
+diff --git a/src/worker.rs b/src/worker.rs
+index 2059696..a4f2f39 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -497,6 +497,22 @@ pub(crate) struct Buffer {
+     bytes: [u8; RECEIVE_BYTES],
+ }
+ 
++/// The receive buffers a drain step keeps, then the current one, by index:
++/// reassembly references point into these until the step settles them.
++fn buffer_table<'a>(
++    held: &'a [Box<Buffer>],
++    current: Option<&'a Buffer>,
++) -> [&'a [u8]; BATCH_SIZE + 2] {
++    let mut table = [&[][..]; BATCH_SIZE + 2];
++    for (entry, buffer) in table
++        .iter_mut()
++        .zip(held.iter().map(|buffer| &**buffer).chain(current))
++    {
++        *entry = &buffer.bytes[..buffer.length.min(RECEIVE_BYTES)];
++    }
++    table
++}
++
+ impl Buffer {
+     fn fresh_bytes(&self) -> io::Result<usize> {
+         self.segments
+@@ -606,6 +622,8 @@ struct Session {
+     tx_totals: Vec<Snapshot>,
+     ack_inflight: u64,
+     rx_dirty: u64,
++    // Receive lanes holding references into the buffer being drained.
++    rx_borrowed: u64,
+     tx_dirty: u64,
+ }
+ 
+@@ -818,6 +836,10 @@ pub(crate) struct Worker {
+     io_time: Option<fn(Duration) -> io::Result<Duration>>,
+     tap_reader: Option<crate::tap::Reader>,
+     tap_start: usize,
++    // Receive buffers the last drain step finished, and the one it paused in,
++    // kept until flush_taps settles them.
++    drained: Vec<Box<Buffer>>,
++    paused: Option<Box<Buffer>>,
+     id: usize,
+     shared: Arc<Shared>,
+     control: Control,
+@@ -1071,6 +1093,7 @@ impl Worker {
+                 tx_totals: vec![Snapshot::default(); config.peers[peer].tx_lanes],
+                 ack_inflight: 0,
+                 rx_dirty: 0,
++                rx_borrowed: 0,
+                 tx_dirty: 0,
+             });
+         }
+@@ -1125,6 +1148,8 @@ impl Worker {
+             io_time: None,
+             tap_reader,
+             tap_start: 0,
++            drained: Vec::with_capacity(BATCH_SIZE + 1),
++            paused: None,
+             id,
+             control,
+             reactor: Reactor::new(Arc::clone(&shared.wakes[id]))?,
+@@ -1832,6 +1857,8 @@ impl Worker {
+                                     continue;
+                                 }
+                                 socket.enable_mtu_discovery()?;
++                                self.counters.transmit_buffer_fallbacks +=
++                                    u64::from(socket.buffer_fallback);
+                                 let token = TX_TOKEN
+                                     | ((index as u64) << 7)
+                                     | ((path_index as u64) << 6)
+@@ -2077,19 +2104,101 @@ impl Worker {
+ 
+     fn drain_packets(&mut self, now: Duration) -> io::Result<bool> {
+         let mut budget = ReceiveBudget::default();
++        // Drained buffers stay until flush_taps settles them, so frames whose
++        // pieces they hold reach the TAP in its batches and are never copied.
++        if !self.drained.is_empty() || self.paused.is_some() {
++            self.settle_drained(now);
++        }
++        let mut held = std::mem::take(&mut self.drained);
++        let mut paused = None;
++        let mut outcome = Ok(());
+         while !budget.exhausted() {
+             let Some(buffer) = self.received.pop_front() else {
+                 break;
+             };
+-            if let Some(mut buffer) = self.packet_one(buffer, now, &mut budget)? {
+-                if buffer.advance() {
+-                    self.received.push_front(buffer);
+-                } else {
+-                    self.release(buffer);
++            match self.packet_one(buffer, now, &mut budget, &held) {
++                Err(error) => {
++                    outcome = Err(error);
++                    break;
++                }
++                Ok(None) => {}
++                Ok(Some(mut buffer)) => {
++                    let more = buffer.advance();
++                    if more && !budget.exhausted() {
++                        self.received.push_front(buffer);
++                    } else if more {
++                        paused = Some(buffer);
++                    } else {
++                        if held.len() == held.capacity() {
++                            self.settle_step(&mut held, Some(&buffer), now);
++                        }
++                        held.push(buffer);
++                    }
++                }
++            }
++        }
++        self.drained = held;
++        self.paused = paused;
++        outcome?;
++        Ok(!self.received.is_empty() || self.paused.is_some())
++    }
++
++    /// Settles the last drain step's buffers and returns a paused one to the
++    /// receive queue.
++    fn settle_drained(&mut self, now: Duration) {
++        let mut held = std::mem::take(&mut self.drained);
++        let paused = self.paused.take();
++        self.settle_step(&mut held, paused.as_deref(), now);
++        if let Some(buffer) = paused {
++            self.received.push_front(buffer);
++        }
++        self.drained = held;
++    }
++
++    /// Ends a drain step: writes ready frames to the TAP, gathering pieces
++    /// from `held` and `current`, copies every other reference into its slot,
++    /// and releases `held`.
++    fn settle_step(
++        &mut self,
++        held: &mut Vec<Box<Buffer>>,
++        current: Option<&Buffer>,
++        now: Duration,
++    ) {
++        let table = buffer_table(held, current);
++        for session in 0..self.sessions.len() {
++            let mut borrowed = std::mem::take(&mut self.sessions[session].rx_borrowed);
++            while borrowed != 0 {
++                let slot = borrowed.trailing_zeros() as usize;
++                borrowed &= borrowed - 1;
++                self.flush_rx(session, slot, now, &table);
++                if let Some(lane) = self.sessions[session].rx[slot].as_mut() {
++                    lane.settle(&table, None);
++                }
++            }
++        }
++        for buffer in held.drain(..) {
++            self.release(buffer);
++        }
++    }
++
++    /// Copies the pieces frames keep in `buffer`, the current one, before it
++    /// is handed to another worker.
++    fn settle_current(&mut self, held: &[Box<Buffer>], buffer: &Buffer) {
++        let table = buffer_table(held, Some(buffer));
++        let index = held.len() as u8;
++        for local in &mut self.sessions {
++            let mut borrowed = local.rx_borrowed;
++            while borrowed != 0 {
++                let slot = borrowed.trailing_zeros() as usize;
++                borrowed &= borrowed - 1;
++                if let Some(lane) = local.rx[slot].as_mut() {
++                    lane.settle(&table, Some(index));
++                    if !lane.borrows() {
++                        local.rx_borrowed &= !(1 << slot);
++                    }
+                 }
+             }
+         }
+-        Ok(!self.received.is_empty())
+     }
+ 
+     fn packet_one(
+@@ -2097,6 +2206,7 @@ impl Worker {
+         mut buffer: Box<Buffer>,
+         now: Duration,
+         budget: &mut ReceiveBudget,
++        held: &[Box<Buffer>],
+     ) -> io::Result<Option<Box<Buffer>>> {
+         let end = if buffer.segment_size == 0 {
+             buffer.length
+@@ -2131,6 +2241,7 @@ impl Worker {
+         buffer.tag = header.receive_tag;
+         if header.lane == 0 {
+             if self.id != 0 {
++                self.settle_current(held, &buffer);
+                 if let Err(Event::Packet(buffer)) = self.push(0, Event::Packet(buffer)) {
+                     self.queue_drop(session, true, false);
+                     return Ok(Some(buffer));
+@@ -2174,6 +2285,7 @@ impl Worker {
+         }
+         if owner == 0 {
+             if self.id != 0 {
++                self.settle_current(held, &buffer);
+                 if let Err(Event::Packet(buffer)) = self.push(0, Event::Packet(buffer)) {
+                     self.queue_drop(session, true, false);
+                     return Ok(Some(buffer));
+@@ -2199,6 +2311,7 @@ impl Worker {
+             // Publication may precede installation; an early packet is dropped without ACK.
+             self.shared.owners[session][lane_id].store(owner as u8 + 1, Ordering::Release);
+             if owner != self.id {
++                self.settle_current(held, &buffer);
+                 if let Err(Event::Register { buffer, lane }) =
+                     self.push(owner, Event::Register { buffer, lane })
+                 {
+@@ -2213,6 +2326,7 @@ impl Worker {
+             self.sessions[session].rx_index[lane_id] = slot as u8 + 1;
+             self.install_rx_counters(session, slot);
+         } else if usize::from(owner - 1) != self.id {
++            self.settle_current(held, &buffer);
+             if let Err(Event::Packet(buffer)) =
+                 self.push(usize::from(owner - 1), Event::Packet(buffer))
+             {
+@@ -2232,16 +2346,27 @@ impl Worker {
+             .wrapping_add((length + 48) as u64);
+         local.rx_dirty |= 1_u64 << slot;
+         let lane = local.rx[slot].as_mut().ok_or(io::ErrorKind::InvalidData)?;
+-        let mut admission = lane.admit(&datagram, now);
++        let table = buffer_table(held, Some(&buffer));
++        let sources = reassembly::Sources {
++            buffers: &table,
++            current: held.len() as u8,
++        };
++        let mut admission = lane.admit_from(&datagram, now, Some(sources));
+         if admission == Admission::Pressure {
+             let retained = lane.retained_frames();
+-            self.flush_rx(session, slot, now);
++            self.flush_rx(session, slot, now, &table);
+             if let Some(lane) = self.sessions[session].rx[slot].as_mut()
+                 && lane.retained_frames() < retained
+             {
+-                admission = lane.admit(&datagram, now);
++                admission = lane.admit_from(&datagram, now, Some(sources));
+             }
+         }
++        if self.sessions[session].rx[slot]
++            .as_ref()
++            .is_some_and(|lane| lane.borrows())
++        {
++            self.sessions[session].rx_borrowed |= 1 << slot;
++        }
+         match admission {
+             Admission::Fresh => {
+                 for record in datagram.records() {
+@@ -2359,7 +2484,7 @@ impl Worker {
+             .as_ref()
+             .is_some_and(|lane| lane.ready_count() >= 32)
+         {
+-            self.flush_rx(session, slot, now);
++            self.flush_rx(session, slot, now, &buffer_table(held, Some(&buffer)));
+         }
+         self.refresh_rx_counters(session, slot);
+         Ok(Some(buffer))
+@@ -3823,6 +3948,7 @@ impl Worker {
+     }
+ 
+     fn flush_taps(&mut self, now: Duration) -> io::Result<()> {
++        self.settle_drained(now);
+         for session in 0..self.sessions.len() {
+             let readable = self.tap_capacity(session) != 0;
+             let mut writable = false;
+@@ -3851,7 +3977,7 @@ impl Worker {
+                 }
+                 lane.expire(now);
+                 if lane.ready_count() != 0 {
+-                    writable |= self.flush_rx(session, slot, now);
++                    writable |= self.flush_rx(session, slot, now, &[]);
+                 }
+                 self.refresh_rx_counters(session, slot);
+             }
+@@ -3880,7 +4006,9 @@ impl Worker {
+         Ok(())
+     }
+ 
+-    fn flush_rx(&mut self, session: usize, slot: usize, now: Duration) -> bool {
++    /// Writes ready frames to the TAP. Frames holding references gather them
++    /// from `buffers`, the drain step's table; elsewhere no lane borrows.
++    fn flush_rx(&mut self, session: usize, slot: usize, now: Duration, buffers: &[&[u8]]) -> bool {
+         let local = &mut self.sessions[session];
+         if local.tap_blocked {
+             return true;
+@@ -3901,7 +4029,7 @@ impl Worker {
+                 let (mask, tcp, result) = if let Some(frame) = offload {
+                     (1, false, tap.write_offload(frame.bytes))
+                 } else {
+-                    tap.write_batch(lane.ready_frames(now).take(budget))
++                    tap.write_batch(lane.ready_frames(now, buffers).take(budget))
+                 };
+                 if mask == 0 {
+                     break;
+@@ -5780,6 +5908,68 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn gro_runs_deliver_frames_from_their_receive_buffer() {
++        let (mut worker, tap) = receive_worker();
++        let frames: Vec<Vec<u8>> = (0..8u8)
++            .map(|seed| {
++                (0..1514)
++                    .map(|i| (i as u8).wrapping_mul(11) ^ seed)
++                    .collect()
++            })
++            .collect();
++        // Pack the frames tail to head into full 1452-byte datagrams, as the
++        // sender does, and lay them back to back as one GRO receive.
++        let mut buffer = worker.free.pop().unwrap();
++        let (mut frame, mut offset, mut number) = (0, 0, 0);
++        let mut length = 0;
++        while frame < frames.len() {
++            let mut records = Vec::new();
++            let mut space = 1452 - wire::HEADER_LEN;
++            while frame < frames.len() && space > 20 {
++                let piece = (1514 - offset).min(space - 20);
++                records.push(Record::Data {
++                    frame_id: (7 << 48) | (frame as u64 + 1),
++                    total_len: 1514,
++                    offset: offset as u32,
++                    bytes: &frames[frame][offset..offset + piece],
++                    offload: false,
++                });
++                space -= 20 + piece;
++                offset += piece;
++                if offset == 1514 {
++                    (frame, offset) = (frame + 1, 0);
++                }
++            }
++            assert!(
++                space == 0 || frame == frames.len(),
++                "a datagram must be full"
++            );
++            number += 1;
++            length += receive_bytes(number, &records, &mut buffer.bytes[length..]);
++        }
++        assert!(number > 8);
++        buffer.length = length;
++        buffer.segment_size = 1452;
++        worker.received.push_back(buffer);
++        while worker.drain_packets(Duration::ZERO).unwrap() {}
++        // Frames keep their pieces in the receive buffer until the TAP flush.
++        assert!(worker.sessions[0].rx[0].as_ref().unwrap().borrows());
++        worker.flush_taps(Duration::ZERO).unwrap();
++        assert!(!worker.sessions[0].rx[0].as_ref().unwrap().borrows());
++        assert!(worker.drained.is_empty() && worker.paused.is_none());
++        let mut output = [0; 2048];
++        for expected in &frames {
++            let n = tap.recv(&mut output).unwrap();
++            assert_eq!(&output[..n], expected.as_slice());
++        }
++        assert_eq!(
++            tap.recv(&mut output).unwrap_err().kind(),
++            io::ErrorKind::WouldBlock
++        );
++        assert_eq!(worker.free.len(), BUFFERS);
++    }
++
+     #[test]
+     fn offload_frames_reach_the_tap_in_order_between_ordinary_frames() {
+         use crate::tap::test_common::udp;
+@@ -5820,7 +6010,7 @@ mod tests {
+             let datagram = Datagram::decode(&bytes[..length]).unwrap();
+             assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Fresh);
+         }
+-        assert!(!worker.flush_rx(0, 0, Duration::ZERO));
++        assert!(!worker.flush_rx(0, 0, Duration::ZERO, &[]));
+         let mut output = [0; 2048];
+         // This queue has no virtio headers, so the partial checksum completes here.
+         for want in [&[1; 60][..], &expected, &[4; 60]] {

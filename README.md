@@ -1013,6 +1013,14 @@ the actual kernel accounting limits, including Linux's doubled overhead
 allowance. It is a capacity gauge, not current occupancy. These kernel queues
 are outside `daemon.memory_limit`; each worker owns one per receive endpoint.
 
+Each transmit lane's socket likewise requests 2 MiB of send buffer with
+`SO_SNDBUFFORCE`, ten times a usual `wmem_default`, and on `EPERM` falls back
+to `SO_SNDBUF` under `net.core.wmem_max`; `transmit_buffer_fallbacks` counts
+the fallbacks. At 64 lanes a peer's worst case is about 128 MiB of queued
+kernel memory, also outside `daemon.memory_limit`. Both forcing options need
+`CAP_NET_ADMIN` in the initial user namespace: as root inside an
+unprivileged container they still fall back.
+
 Send SIGUSR1 to the foreground daemon to print independently sampled worker
 counters to stderr. Formatting runs in the daemon's supervisory thread, outside
 the workers and signal handler. The benchmark script captures these before and

@@ -155,6 +155,8 @@ metrics! {
     receive_buffer_fallbacks: sum,
     /// Sum of receive-socket kernel accounting limits, including overhead allowance.
     receive_buffer_bytes: sum,
+    /// Transmit sockets that fell back from SO_SNDBUFFORCE to SO_SNDBUF.
+    transmit_buffer_fallbacks: sum,
     /// Currently retained incomplete or queued receive frames.
     reassembly_frames: sum,
     /// Sum of full frame lengths reserved by retained receive slots.
