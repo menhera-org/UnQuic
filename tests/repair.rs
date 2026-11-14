@@ -270,6 +270,44 @@ fn clean_acks_survive_the_first_loss_and_slot_reuse_leaves_no_stale_bits() {
 }
 
 #[test]
+fn in_order_acks_keep_a_prefix_that_later_acks_and_losses_respect() {
+    let mut frame = FrameRecovery::new(MAX_FRAME_LEN).unwrap();
+    assert!(frame.submitted(0..3000, 0));
+    // In-order ACKs extend the prefix; a repeat or a repair attempt does not.
+    assert_eq!(frame.acknowledge(0..1000, 0), Some(1000));
+    assert_eq!(frame.acknowledge(1000..1500, 0), Some(500));
+    assert_eq!(frame.acknowledge(0..700, 0), Some(0));
+    assert_eq!(frame.acknowledge(1500..1600, 1), None);
+    assert_eq!(frame.acknowledge(1500..3001, 0), None);
+    assert_eq!(frame.remaining(), MAX_FRAME_LEN - 1500);
+    // An ACK past a gap keeps both acknowledged runs.
+    assert_eq!(frame.acknowledge(2000..2500, 0), Some(500));
+    assert_eq!(frame.acknowledge(1400..2100, 0), Some(500));
+    assert_eq!(frame.remaining(), MAX_FRAME_LEN - 2500);
+    // A loss after a prefix reopens only the bytes never acknowledged.
+    assert!(frame.reset(4000));
+    assert!(frame.submitted(0..4000, 0));
+    assert_eq!(frame.acknowledge(0..1000, 0), Some(1000));
+    assert!(frame.lost(0..4000, 0));
+    assert_eq!(frame.next_repair(usize::MAX), Some((1000..4000, 1)));
+    assert_eq!(frame.acknowledge(0..1000, 0), Some(0));
+    // Reuse forgets the prefix, inline or wide.
+    for wide in [false, true] {
+        if wide {
+            assert!(frame.attach(WidePlanes::new()).is_ok());
+        }
+        assert!(frame.reset(2000));
+        assert!(frame.submitted(0..2000, 0));
+        assert_eq!(frame.acknowledge(0..2000, 0), Some(2000));
+        assert_eq!(frame.remaining(), 0);
+        assert!(frame.reset(2000));
+        assert!(frame.submitted(0..2000, 0));
+        assert!(frame.lost(0..2000, 0));
+        assert_eq!(frame.next_repair(usize::MAX), Some((0..2000, 1)));
+    }
+}
+
+#[test]
 fn slot_reuse_clears_new_length_and_invalid_reset_preserves_live_state() {
     let mut frame = FrameRecovery::new(MAX_FRAME_LEN).unwrap();
     for length in [MAX_FRAME_LEN, 14, 65, 1514, MAX_FRAME_LEN] {

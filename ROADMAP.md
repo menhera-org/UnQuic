@@ -667,6 +667,10 @@ rules apply to all of them.
    their slack to 1 ns, which brought loss back down (0.5–4.9%) and kept
    the CPU saving
    ([BENCH.md](BENCH.md#timer-slack-under-epoll_pwait2-november-14-landed)).
+   Frame coverage now keeps in-order ACKs of a clean frame as a prefix
+   length instead of plane bits, which cut CPU per delivered bit 3.8%
+   at the median on the full-size point
+   ([BENCH.md](BENCH.md#an-in-order-ack-prefix-in-frame-coverage-november-14-landed)).
    Rerun after FRAME_ABANDON, offload frames still lose more on the lossy
    path (median 2.2% against 1.5%), so decision 8 stands, though the gap
    has narrowed from 11–27% against 4–13%

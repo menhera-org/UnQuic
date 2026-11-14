@@ -59,6 +59,10 @@ const fn at_least(low: u64, high: u64, attempt: u8) -> u64 {
 /// outstanding original or acknowledged, so only `high` is kept, as the
 /// acknowledged bytes. The first loss rebuilds the other planes from it.
 ///
+/// While clean, ACKs that extend the acknowledged prefix in order, the usual
+/// case without loss, only advance a counter and leave every plane untouched;
+/// any other ACK or a loss first writes that prefix into `high`.
+///
 /// The planes cover MAX_FRAME_LEN bytes, or WIDE_FRAME_LEN while WidePlanes
 /// are attached.
 pub struct FrameRecovery {
@@ -70,6 +74,9 @@ pub struct FrameRecovery {
     unacked: u16,
     // Words that may be nonzero in any plane; reset clears only these.
     dirty: u16,
+    // Acknowledged bytes below this are not in `high`; nonzero only while
+    // clean with no plane bit set.
+    prefix: u16,
     clean: bool,
 }
 
@@ -114,6 +121,7 @@ impl FrameRecovery {
             sent: 0,
             unacked: length as u16,
             dirty: 0,
+            prefix: 0,
             clean: true,
         })
     }
@@ -169,7 +177,23 @@ impl FrameRecovery {
             pending[..dirty].fill(0);
         }
         self.dirty = 0;
+        self.prefix = 0;
         self.clean = true;
+    }
+
+    /// Writes the in-order acknowledged prefix into `high` before any
+    /// operation that reads the planes.
+    fn spill(&mut self) {
+        let prefix = 0..usize::from(self.prefix);
+        if prefix.is_empty() {
+            return;
+        }
+        let [_, high, _] = planes_mut(&mut self.planes, &mut self.wide);
+        for (i, mask) in words(&prefix) {
+            high[i] |= mask;
+        }
+        self.dirty = self.dirty.max(prefix.end.div_ceil(64) as u16);
+        self.prefix = 0;
     }
 
     /// Bytes successfully submitted as fresh data, in contiguous prefix order.
@@ -232,6 +256,7 @@ impl FrameRecovery {
     ///
     /// Old/duplicate losses are harmless. Packet history releases its own charge.
     pub fn lost(&mut self, range: Range<usize>, attempt: u8) -> bool {
+        self.spill();
         if !self.feedback_valid(&range, attempt) {
             return false;
         }
@@ -247,6 +272,19 @@ impl FrameRecovery {
     ///
     /// A late original ACK also settles bytes covered by a newer repair.
     pub fn acknowledge(&mut self, range: Range<usize>, attempt: u8) -> Option<usize> {
+        if self.clean
+            && self.dirty == 0
+            && attempt == 0
+            && range.start == usize::from(self.prefix)
+            && range.start < range.end
+            && range.end <= self.sent()
+        {
+            let new = (range.end - range.start) as u16;
+            self.unacked = self.unacked.checked_sub(new)?;
+            self.prefix = range.end as u16;
+            return Some(usize::from(new));
+        }
+        self.spill();
         if !self.feedback_valid(&range, attempt) {
             return None;
         }

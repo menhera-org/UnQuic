@@ -717,6 +717,25 @@ rounds, at −1.5% against the copy at the median (−2.1% against c552ed4,
 whose copy ran +0.1% against it), so the tighter wakeups kept the saving.
 Changes to waits, timers and pacing now also get the lossy-path check.
 
+## An in-order ACK prefix in frame coverage (November 14, landed)
+
+A split profile of recovery staging at d0a4c5e put about 180 of its 400
+cycles per frame event in `FrameRecovery::acknowledge`, about 175 cycles
+per acknowledged piece. Each piece of a clean full-size frame reads and
+writes three cache lines of the `high` plane besides the frame's own
+fields, and reusing the slot clears those lines again. Without loss,
+ACKs nearly always arrive in order from byte 0. A clean frame with no
+plane bit set now keeps such ACKs as a prefix length and touches no
+plane; any other ACK, or a loss, first writes the prefix into `high`.
+
+Stated beforehand: the usual efficiency bar on the full-size point
+([results](benches/full-size-ack-prefix.json)). CPU per delivered bit
+was lower than HEAD's copy in 6 of 6 rounds at −3.8% at the median, and
+lower than both HEAD and the copy in 5 of 6; HEAD ran −0.7% against its
+copy. On the lossy path ([results](benches/lossy-path-ack-prefix.json)),
+frames lost in the worse direction were 1.2–3.9% (median 2.4%) against
+HEAD's 1.0–5.3% (median 3.6%), at the same delivered rate.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames
