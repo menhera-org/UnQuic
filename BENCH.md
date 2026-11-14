@@ -611,6 +611,42 @@ although a unit test shows split frames of one flow coalescing at every split
 tried. The cause is not found; receive keeps its copy. The +3.5% of the
 diagnostic build is the bookkeeping a working version would have to beat.
 
+## Announcing abandoned frames (November 14, landed)
+
+On the routed 4.5 ms path with 1% loss the receivers refused 18,000–88,000
+datagrams per daemon for want of reassembly slots and expired 11,000–25,000
+frames incomplete. The senders dropped frames at their deadline without
+the FRAME_ABANDON (origin 0) the design requires, so each receiver kept
+such a frame's slot until its own deadline, which starts at the first
+piece's arrival and so runs well past the sender's under backlog. Now a
+sender queues every frame it expires with sent but unacknowledged bytes and
+announces up to 64 per datagram on the frame's lane, using only an idle job
+slot so DATA never waits for it. Like a PTO probe the datagram is charged
+and paced but not held to the congestion window, which the data it concerns
+fills. A connection replacement drops queued abandons, since frame IDs are
+meaningful only within their connection.
+
+Stated beforehand: fewer frames lost in five of six rounds on the lossy
+path, and no regression on the full-size efficiency point (median no more
+than 1% above HEAD's copy). Lossy path
+([results](benches/lossy-path-frame-abandon.json)):
+
+| | Frames lost | Gbit/s delivered | Refused datagrams | Incomplete expiries |
+| --- | --- | --- | --- | --- |
+| HEAD | 7.7–11.3% | 3.59–3.74 | 17,910–87,693 | 10,946–24,821 |
+| Abandons | 2.2–6.1% | 3.76–3.88 | 5,784–28,471 | 3,958–12,156 |
+
+Loss fell in 6 of 6 rounds, and CPU per delivered bit fell 2.9% at the
+median; each daemon announced 130,000–260,000 frames a run. On the
+full-size efficiency point ([results](benches/full-size-frame-abandon.json))
+it was lower than HEAD's copy in 4 of 6 rounds at −1.1%, with HEAD against
+its copy at +0.4%, and lost the fewest frames of the three arms.
+
+The first builds sent nothing: the datagram's own length was passed as the
+send's payload limit, which must be at least the 1,232-byte baseline, so
+every send failed and abandon jobs churned through the job slot, which
+stalled PMTU discovery and data in the kernel suites.
+
 ## Transmit socket buffers (November 14, landed)
 
 At the user's request the daemon now raises transmit socket buffers the way

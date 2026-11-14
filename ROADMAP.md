@@ -647,10 +647,14 @@ rules apply to all of them.
    the FRAME_ABANDON (origin 0) that design section 6 requires, so the
    receiver keeps those frames until its own deadline, which starts at the
    first piece's arrival and so runs well past the sender's under backlog.
-   Next: send origin-0 FRAME_ABANDON, batched, for frames the sender drops
-   while bytes of them may sit incomplete at the receiver, then rerun that
-   path. After that, fewer cross-worker wakes; one flow striped with a
-   receive-side reorder stage (decision 7).
+   Senders now announce such frames with origin-0 FRAME_ABANDON, batched
+   on the frame's lane. On that path frames lost fell from 7.7–11.3% to
+   2.2–6.1% in six of six rounds, refused datagrams about fourfold, and
+   the full-size efficiency point did not regress
+   ([BENCH.md](BENCH.md#announcing-abandoned-frames-november-14-landed)).
+   Receivers still refuse 6,000–28,000 datagrams per daemon there, so
+   capacity under loss stays open. Next, fewer cross-worker wakes; one
+   flow striped with a receive-side reorder stage (decision 7).
    The kernel figures can only be confirmed on an R86S-class box with real
    NICs; the remote 7.0 host stands in until then. The kernel test
    `tap::read::tests::real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch`

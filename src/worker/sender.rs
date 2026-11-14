@@ -221,8 +221,35 @@ impl Lane {
 #[derive(Clone, Copy)]
 pub(super) enum JobKind {
     Data,
-    Probe { length: usize, pmtu: bool },
+    Probe {
+        length: usize,
+        pmtu: bool,
+    },
+    /// One datagram of FRAME_ABANDON records for the first `count` queued
+    /// abandons, all of this job's lane.
+    Abandon {
+        count: usize,
+    },
 }
+
+/// A frame to announce as abandoned. Its ID is meaningful only within its
+/// connection generation, so an abandon outliving that generation is dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Abandon {
+    pub(super) session: usize,
+    pub(super) lane: usize,
+    pub(super) generation: u64,
+    pub(super) frame_id: u64,
+}
+
+/// Abandons a worker queues; more are dropped, since abandonment is advisory.
+pub(super) const ABANDONS: usize = 256;
+/// FRAME_ABANDON records in one baseline datagram: 48 + 64 × 16 bytes.
+const ABANDONS_PER_DATAGRAM: usize = wire::MAX_RECORDS;
+/// One FRAME_ABANDON record: a 4-byte record header and a 12-byte body.
+const ABANDON_RECORD_LEN: usize = 16;
+const _: () =
+    assert!(wire::HEADER_LEN + ABANDONS_PER_DATAGRAM * ABANDON_RECORD_LEN <= BASE_UDP_PAYLOAD);
 
 #[derive(Clone, Copy)]
 pub(super) struct Job {
@@ -281,6 +308,10 @@ pub(super) struct State {
     // When a refused claim may succeed: the pacing time or a window retry.
     pub(super) retry: Option<Duration>,
     pub(super) job: Option<Job>,
+    // Frames this worker stopped sending while bytes of them may sit
+    // incomplete at the receiver, announced with FRAME_ABANDON so the
+    // receiver frees their slots before its deadline.
+    pub(super) abandons: Vec<Abandon>,
     pub(super) report: Option<Box<Report>>,
     #[allow(clippy::vec_box)]
     pub(super) ack_free: Vec<Box<Ack>>,
@@ -392,6 +423,7 @@ impl State {
             budgets: Arc::from(Vec::new()),
             retry: None,
             job: None,
+            abandons: Vec::with_capacity(ABANDONS),
             report: Some(boxed(Report::new(id))?),
             ack_free,
             incoming,
@@ -1362,6 +1394,12 @@ impl Worker {
                 }
             }
         }
+        // Abandonment is advisory: it uses only an idle job slot, so it never
+        // holds DATA back, and it waits behind both kinds of probe.
+        if self.sender.job.is_none() && !self.sender.abandons.is_empty() {
+            self.request_abandon(now)?;
+            more |= !self.sender.abandons.is_empty();
+        }
         if self.sender.job.is_some() && self.claim_sender(now)? == Claimed::Ready {
             self.use_sender_permit(now)?;
             more = true;
@@ -1644,6 +1682,114 @@ impl Worker {
         Ok(())
     }
 
+    /// Prepares one datagram of queued FRAME_ABANDON records for the first
+    /// queued abandon's lane in an idle job slot. Like a probe it is charged
+    /// and paced. Abandons whose connection generation ended are dropped.
+    pub(super) fn request_abandon(&mut self, now: Duration) -> io::Result<()> {
+        if self.sender.job.is_some() {
+            return Ok(());
+        }
+        // Frame IDs mean nothing outside their connection generation.
+        let sessions = &self.sessions;
+        self.sender.abandons.retain(|abandon| {
+            sessions.get(abandon.session).is_some_and(|local| {
+                local.connection.is_some()
+                    && local.tx.get(abandon.lane).is_some_and(Option::is_some)
+                    && local
+                        .installed
+                        .is_some_and(|c| c.generation == abandon.generation)
+            })
+        });
+        let Some(&Abandon {
+            session,
+            lane,
+            generation,
+            ..
+        }) = self.sender.abandons.first()
+        else {
+            return Ok(());
+        };
+        let same = |abandon: &Abandon| (abandon.session, abandon.lane) == (session, lane);
+        // Without allocating, move this lane's abandons to the front.
+        self.sender
+            .abandons
+            .sort_unstable_by_key(|abandon| !same(abandon));
+        let count = self
+            .sender
+            .abandons
+            .iter()
+            .take(ABANDONS_PER_DATAGRAM)
+            .take_while(|abandon| same(abandon))
+            .count();
+        let Ok(index) = self.sender_index(session, lane) else {
+            self.sender.abandons.retain(|abandon| !same(abandon));
+            return Ok(());
+        };
+        let next = self.sessions[session].tx[lane]
+            .as_ref()
+            .map_or(0, pack::Lane::next_packet);
+        if self.sender.records.available() == 0
+            || !self.sender.lanes[index].history.can_reserve(next)
+        {
+            self.sender.reclaim = Some(self.sender.lanes.len());
+            return Ok(());
+        }
+        let local = &mut self.sessions[session];
+        let tx = local.tx[lane].as_mut().ok_or(io::ErrorKind::InvalidData)?;
+        let length = wire::HEADER_LEN + count * ABANDON_RECORD_LEN;
+        let first = tx.allocate_packets(1).map_err(io::Error::other)?;
+        match self.sender.lanes[index]
+            .history
+            .reserve(first, (length + 48) as u16, true, true)
+        {
+            Ok(()) => {}
+            Err(crate::ack::HistoryError::Full) => {
+                self.sender.reclaim = Some(self.sender.lanes.len());
+                return Ok(());
+            }
+            Err(error) => return Err(io::Error::other(error)),
+        }
+        self.sender
+            .flight
+            .prepare(
+                &[pacing::Planned {
+                    id: PacketId {
+                        session,
+                        generation,
+                        lane: lane as u16 + 1,
+                        number: first,
+                    },
+                    bytes: (length + 48) as u16,
+                }],
+                &mut self.sender.records,
+            )
+            .map_err(io::Error::other)?;
+        let peer = self
+            .shared
+            .config
+            .peer_for_session(session)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        let mtu = (self.transmit[peer].paths[local.path].lanes[lane]
+            .mtu
+            .payload_limit()
+            + 48)
+            .max(1280);
+        self.sender.job = Some(Job {
+            session,
+            generation,
+            lane,
+            path: local.path,
+            group: self.sender.lanes[index].group,
+            first,
+            count: 1,
+            deadline: now.saturating_add(Duration::from_millis(100)),
+            kind: JobKind::Abandon { count },
+            mtu: mtu as u16,
+            probe: None,
+        });
+        Ok(())
+    }
+
     /// Claims inflight and pacing credit for the prepared job immediately before
     /// its syscall. A refusal keeps the plan and sets the retry time.
     pub(super) fn claim_sender(&mut self, now: Duration) -> io::Result<Claimed> {
@@ -1707,7 +1853,10 @@ impl Worker {
             self.recycle_job(now)?;
             return Ok(Claimed::Abandoned);
         }
-        let window = job.probe.is_none().then_some(state.window);
+        // PTO probes and abandons bypass the window, as small control that must
+        // not wait behind the data it concerns; both stay paced and charged.
+        let window = (job.probe.is_none() && !matches!(job.kind, JobKind::Abandon { .. }))
+            .then_some(state.window);
         let room = window.map_or(state.quantum, |window| {
             state.quantum.min(window.saturating_sub(budget.in_flight()))
         });
@@ -1780,17 +1929,24 @@ impl Worker {
 
     /// Whether a probe may take the job slot: it is free or holds unclaimed DATA.
     pub(super) fn parkable(&self) -> bool {
-        self.sender
-            .job
-            .is_none_or(|job| !self.sender.permitted && matches!(job.kind, JobKind::Data))
+        self.sender.job.is_none_or(|job| {
+            !self.sender.permitted && matches!(job.kind, JobKind::Data | JobKind::Abandon { .. })
+        })
     }
 
-    /// Steps an unclaimed DATA job aside. Its plan and history reservations stay
-    /// in the batch, so the next flush requests the same numbers again.
+    /// Steps an unclaimed DATA or abandon job aside. A DATA plan keeps its
+    /// history reservations in the batch, so the next flush requests the same
+    /// numbers again; an abandon's number is cancelled and its records stay
+    /// queued for a later datagram.
     pub(super) fn park_job(&mut self) {
-        if self.sender.job.take().is_some() {
+        if let Some(job) = self.sender.job.take() {
             self.sender.flight.release(&mut self.sender.records);
             self.sender.retry = None;
+            if matches!(job.kind, JobKind::Abandon { .. })
+                && let Ok(index) = self.sender_index(job.session, job.lane)
+            {
+                self.sender.lanes[index].history.cancel(job.first);
+            }
         }
     }
 
@@ -1959,7 +2115,7 @@ impl Worker {
                 old_count = old_count.max(batch.plan.len());
                 batch.plan.renumber(tx)
             }
-            JobKind::Probe { .. } => tx.allocate_packets(1),
+            JobKind::Probe { .. } | JobKind::Abandon { .. } => tx.allocate_packets(1),
         };
         let Ok(first) = first else { return Ok(false) };
         let history = &mut self.sender.lanes[index].history;
@@ -1970,7 +2126,7 @@ impl Worker {
         // Refreshed DATA keeps the same headroom as a fresh request; a probe may use it.
         let headroom = match job.kind {
             JobKind::Data => 2 * PROBE_HEADROOM,
-            JobKind::Probe { .. } => 0,
+            JobKind::Probe { .. } | JobKind::Abandon { .. } => 0,
         };
         let mut reserved = 0;
         for packet in flight.packets() {
@@ -2160,6 +2316,92 @@ impl Worker {
                     }
                 }
             }
+            JobKind::Abandon { count } => self.send_abandons(job, count, now)?,
+        }
+        Ok(())
+    }
+
+    /// Sends the prepared FRAME_ABANDON datagram; sent abandons leave the
+    /// queue, and a failed send leaves them for the next attempt.
+    fn send_abandons(&mut self, job: Job, count: usize, now: Duration) -> io::Result<()> {
+        let mut clock = self.io_clock(now);
+        let connection = self.sessions[job.session]
+            .connection
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let header = Header {
+            cookie: self.shared.config.config().sessions[job.session].cookie,
+            receive_tag: connection.remote_tag().get(),
+            lane: job.lane as u16 + 1,
+            packet_number: job.first,
+            record_area_len: 0,
+        };
+        let mut records = [Record::Probe; ABANDONS_PER_DATAGRAM];
+        let queued = self
+            .sender
+            .abandons
+            .get(..count)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        for (record, abandon) in records.iter_mut().zip(queued) {
+            *record = Record::FrameAbandon {
+                lane: job.lane as u16 + 1,
+                origin: 0,
+                reason: 1,
+                frame_id: abandon.frame_id,
+            };
+        }
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        let length = wire::encode_datagram(header, &records[..count], &mut bytes)
+            .map_err(io::Error::other)?;
+        let peer = self
+            .shared
+            .config
+            .peer_for_session(job.session)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        let socket = self.transmit[peer].paths[job.path].lanes[job.lane]
+            .socket
+            .as_ref();
+        let mut expired = false;
+        let result = if let Some(socket) = socket {
+            let parts = [&bytes[..length]];
+            // The limit bounds the datagram; the baseline always admits it.
+            socket.send_batch_checked(&[SendDatagram { parts: &parts }], BASE_UDP_PAYLOAD, || {
+                let at = clock()?;
+                if at >= job.deadline {
+                    expired = true;
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                Ok(at)
+            })
+        } else {
+            Err(io::ErrorKind::NotConnected.into())
+        };
+        if expired {
+            self.rejected_sender_grant(job.session, job.lane, true);
+        }
+        let sent = result.as_ref().ok().copied();
+        self.finish_sender_send(
+            sent.map_or(0, |(n, _)| n),
+            sent.and_then(|(n, at)| (n != 0).then_some(at)),
+            result
+                .as_ref()
+                .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock),
+        )?;
+        if let Some((1, _)) = sent {
+            self.sender.abandons.drain(..count);
+            let local = &mut self.sessions[job.session];
+            for totals in [
+                &mut self.counters,
+                &mut local.totals,
+                &mut local.tx_totals[job.lane],
+            ] {
+                totals.tx_outer_bytes = totals.tx_outer_bytes.wrapping_add((length + 48) as u64);
+                totals.tx_frame_abandons = totals.tx_frame_abandons.wrapping_add(count as u64);
+            }
+            local.tx_dirty |= 1_u64 << job.lane;
+        } else if let Err(error) = result
+            && !transient(&error)
+        {
+            self.counters.socket_errors = self.counters.socket_errors.wrapping_add(1);
         }
         Ok(())
     }

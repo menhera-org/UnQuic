@@ -3169,6 +3169,25 @@ impl Worker {
         } else {
             TxExpiry::Sent
         };
+        // Bytes may sit incomplete at the receiver until its own, later,
+        // deadline: announce the abandonment so it frees their slots now.
+        let unacknowledged = self
+            .frames
+            .recovery(index)
+            .is_some_and(|state| state.remaining() != 0);
+        if self.sender_enabled()
+            && submitted != 0
+            && unacknowledged
+            && self.sender.abandons.len() < sender::ABANDONS
+            && let Some(installed) = self.sessions[source.session].installed
+        {
+            self.sender.abandons.push(sender::Abandon {
+                session: source.session,
+                lane: frame.lane,
+                generation: installed.generation,
+                frame_id: frame.id,
+            });
+        }
         trace_event!(
             self.id,
             EXPIRE,

@@ -2234,7 +2234,7 @@ fn an_empty_history_still_drains_its_ack_loss_fence_before_replacement() {
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
 fn transmit_expiry_classifies_successful_prefixes_once() {
-    let (mut workers, _rx) = workers();
+    let (mut workers, rx) = workers();
     let worker = &mut workers[1];
     for _ in 0..3 {
         queue_frame(worker, 60);
@@ -2245,9 +2245,58 @@ fn transmit_expiry_classifies_successful_prefixes_once() {
         .pending
         .iter(&worker.frames)
         .collect();
+    let ids: Vec<_> = slots
+        .iter()
+        .map(|&slot| worker.frames.frame(slot).unwrap().id)
+        .collect();
     submit_original(worker, slots[1], 0..30);
     submit_original(worker, slots[2], 0..60);
     assert!(!worker.expire_frames(Duration::from_millis(100)).unwrap());
+    // The partly and the wholly sent, unacknowledged frames are abandoned to
+    // the receiver in one datagram on their own lane; the unsent one is not.
+    let mut queued: Vec<_> = worker
+        .sender
+        .abandons
+        .iter()
+        .map(|abandon| (abandon.session, abandon.lane, abandon.frame_id))
+        .collect();
+    queued.sort_unstable();
+    assert_eq!(queued, [(0, 1, ids[1]), (0, 1, ids[2])]);
+    // Worker zero publishes the send budget the charged datagram needs; the
+    // I/O clock follows the test's time, so pacing sees it advance.
+    for step in 0..16 {
+        let now = Duration::from_millis(100 + step);
+        for worker in &mut workers {
+            worker.io_time = Some(Ok);
+            worker.drain_queues(now).unwrap();
+            worker.service_sender(now).unwrap();
+        }
+    }
+    let worker = &mut workers[1];
+    assert!(worker.sender.abandons.is_empty());
+    assert_eq!(worker.counters.tx_frame_abandons, 2);
+    let mut bytes = [0; BASE_UDP_PAYLOAD];
+    let mut abandoned = Vec::new();
+    while let Ok((n, _)) = rx.recv(&mut bytes) {
+        let datagram = Datagram::decode(&bytes[..n]).unwrap();
+        let mut found: Vec<_> = datagram
+            .records()
+            .filter_map(|record| match record {
+                Record::FrameAbandon {
+                    lane: 2,
+                    origin: 0,
+                    frame_id,
+                    ..
+                } => Some(frame_id),
+                _ => None,
+            })
+            .collect();
+        if !found.is_empty() {
+            found.sort_unstable();
+            abandoned.push((datagram.header().lane, found));
+        }
+    }
+    assert_eq!(abandoned, [(2, vec![ids[1], ids[2]])]);
     assert!(!worker.cleanup_frames().unwrap());
     for totals in [
         &worker.counters,

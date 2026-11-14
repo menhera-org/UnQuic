@@ -230,6 +230,13 @@ backpressure until delivery, discard or the original 100 ms deadline. Overlappin
 pieces keep the first retained bytes; changed frame lengths reject the datagram.
 Tests cover full queues, overlap, retirement and allocation-free operation.
 
+A sender that expires a frame with sent but unacknowledged bytes announces it
+with FRAME_ABANDON (origin 0), up to 64 per datagram on the frame's lane, so
+the receiver frees the frame's slot at once instead of at its own later
+deadline. These datagrams use only an idle send slot and are paced like
+probes; `tx_frame_abandons` counts the frames announced. On a lossy path
+this cut lost frames by about half (BENCH.md).
+
 `pack::Lane` segments frames into baseline datagrams and keeps monotonic packet
 and frame identities. Every Ethernet frame length from 14 through 9022 bytes
 round-trips through the real encoder and reassembler in tests; a maximum frame
