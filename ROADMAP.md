@@ -634,8 +634,23 @@ rules apply to all of them.
    ([BENCH.md](BENCH.md#receive-without-the-reassembly-copy-november-14-rejected)).
    Transmit sockets now force 2 MiB send buffers where `CAP_NET_ADMIN`
    allows, as receive sockets force 8 MiB; neither takes effect in the
-   unprivileged test containers. Next: fewer cross-worker wakes; one flow
-   striped with a receive-side reorder stage (decision 7).
+   unprivileged test containers. The user asked for all three of: the cause
+   of the coalescing failure (parked after a diagnostic build itself failed
+   to run), receive capacity under loss, and fewer cross-worker wakes.
+
+   Receive capacity under loss: on the routed 4.5 ms path with 1% loss
+   ([results](benches/offload-lossy-path.json), arm `run0`) a receiving
+   daemon refused 47,000–95,000 datagrams for want of slots and expired
+   17,000–29,000 frames incomplete, each holding its slot for the full
+   100 ms. Its sender meanwhile expired 2,200–4,500 partly sent frames and
+   about 440,000–800,000 sent but not fully acknowledged, yet never sends
+   the FRAME_ABANDON (origin 0) that design section 6 requires, so the
+   receiver keeps those frames until its own deadline, which starts at the
+   first piece's arrival and so runs well past the sender's under backlog.
+   Next: send origin-0 FRAME_ABANDON, batched, for frames the sender drops
+   while bytes of them may sit incomplete at the receiver, then rerun that
+   path. After that, fewer cross-worker wakes; one flow striped with a
+   receive-side reorder stage (decision 7).
    The kernel figures can only be confirmed on an R86S-class box with real
    NICs; the remote 7.0 host stands in until then. The kernel test
    `tap::read::tests::real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch`
