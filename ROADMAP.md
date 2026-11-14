@@ -667,6 +667,10 @@ rules apply to all of them.
    their slack to 1 ns, which brought loss back down (0.5–4.9%) and kept
    the CPU saving
    ([BENCH.md](BENCH.md#timer-slack-under-epoll_pwait2-november-14-landed)).
+   Rerun after FRAME_ABANDON, offload frames still lose more on the lossy
+   path (median 2.2% against 1.5%), so decision 8 stands, though the gap
+   has narrowed from 11–27% against 4–13%
+   ([BENCH.md](BENCH.md#offload-frames-on-the-lossy-path-after-frame_abandon-november-14)).
    Next, the userspace parts still over their section 13.1 targets
    (receive admission, staging and the frame flush); one flow striped with
    a receive-side reorder stage (decision 7).

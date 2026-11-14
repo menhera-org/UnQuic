@@ -717,6 +717,28 @@ rounds, at −1.5% against the copy at the median (−2.1% against c552ed4,
 whose copy ran +0.1% against it), so the tighter wakeups kept the saving.
 Changes to waits, timers and pacing now also get the lossy-path check.
 
+## Offload frames on the lossy path after FRAME_ABANDON (November 14)
+
+Decision 8 kept offload frames off because two-slot runs lost more frames
+on the lossy path than ordinary frames. FRAME_ABANDON since frees
+receive slots earlier, so the comparison was rerun at 6ca0b66. Stated
+beforehand: offload frames become a candidate for default-on if they lose
+no more frames than ordinary ones in at least 4 of 6 rounds and deliver
+no less at the median ([results](benches/offload-lossy-path-after-abandon.json)):
+
+| | Frames lost, worse direction | Median | Gbit/s delivered | Refused datagrams per daemon | Incomplete expiries per daemon |
+| --- | --- | --- | --- | --- | --- |
+| Off | 1.1–3.5% | 1.5% | 3.83–3.91 | 3,154–14,692 | 2,603–5,550 |
+| On | 1.5–3.9% | 2.2% | 3.83–3.90 | 0–4,017 | 111–441 |
+
+Offload frames lost no more than ordinary ones at only 3 of 12 points, so
+they stay off. The gap has narrowed, though: before FRAME_ABANDON the
+same comparison ([results](benches/offload-lossy-path.json)) lost
+11.0–26.8% with two-slot runs against 3.8–12.8% without, and with offload
+on the receivers now refuse and expire about a tenth as much. A first run of
+this comparison landed on d0a4c5e before its timer-slack fix and is not
+used.
+
 ## What holds one flow near 1 Gbit/s (November 13)
 
 One flow at 7.5 ms delivers 1.00–1.07 Gbit/s per direction at 5G offered
