@@ -888,6 +888,45 @@ per-ACK summary. Expected together: transmit planning 600 → about 200,
 staging 330 → about 80, ACK application 200 → about 80 cycles per frame
 event.
 
+**Receive without the reassembly copy (item 2; November 14 amendment).**
+Today every DATA piece is copied from the receive buffer into its frame's
+reassembly slot, and the TAP write reads the slot. The receiver instead
+leaves a piece where it arrived when it can, and writes the frame to the
+TAP by gathering its pieces from the receive buffers.
+
+- A receive buffer usually holds one lane's GRO run of up to about 44
+  datagrams, and packing puts a frame's tail and the next frame's head in
+  consecutive datagrams. Nearly every frame therefore starts and completes
+  within one buffer; at most the frame straddling the buffer's end does
+  not.
+- Admission is unchanged in what it accepts, reserves and acknowledges.
+  A new frame still reserves its slots, the coverage bitmap still records
+  every byte, and a packet is still ACK-eligible only when all its DATA
+  bytes are retained. A piece whose bytes are all new may be retained as a
+  reference into the buffer being drained (offset within it, length and
+  offset within the frame) instead of a copy; a frame holds a few such
+  references, and a piece that overlaps covered bytes, or that would
+  exceed them, is copied as today. A frame's bytes are then its slot's
+  bytes and its references, in frame order.
+- Before a receive buffer leaves the worker, whether released or handed to
+  another worker, every lane that took references into it settles them:
+  complete frames are written to the TAP, as many as the TAP accepts, and
+  every other frame still referring to the buffer, incomplete or not yet
+  written, gets those bytes copied into its slot. Settling copies at most
+  what today's admission copies, so retention, memory and pressure
+  behaviour are the same; references never outlive their buffer.
+- The TAP write path takes each frame as a short list of byte ranges
+  rather than one slice: plain writes gather them with `writev`, USO and
+  TSO coalescing read the headers from the frame's first range and append
+  each range's payload, and the pre-coalescing checksum covers every
+  range. Offload frames gather the same way.
+
+Expected gain: one fewer copy of every received byte, a fifth of the
+copying either box does at 20 Gbit/s (2.5 of 12.5 GB/s), and the copy's share of receive
+admission's 890 cycles per frame event. Measure it on the full-size
+efficiency point, with and without offload frames, and on the lossy path,
+where frames wait longer and more of them are settled by copying.
+
 # 14 Validation and acceptance
 
 Freeze a repeatable acceptance profile before declaring the performance requirements met. It must name the endpoint hardware and core budget, inner MTU, frame mix, flow count, traffic direction, attachment topology, loss profile, and contemporaneous direct-underlay capacity.

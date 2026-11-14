@@ -62,8 +62,10 @@ off by default: the wire flag and negotiation, the receiver, the sender and
 the measurement. With both daemons on it, each TAP super-frame travels as
 runs of up to 12 segments instead of one frame per segment, and CPU per
 delivered bit fell 14.7% on the full-size efficiency point
-([BENCH.md](BENCH.md#sending-offload-frames-november-13-landed)). Turning
-it on by default is decision 8.
+([BENCH.md](BENCH.md#sending-offload-frames-november-13-landed)). On a
+lossy path it loses more frames than ordinary traffic, so the user decided
+to keep it off by default (decision 8) and to continue with receive without
+the reassembly copy.
 
 ## November 12 checkpoint
 
@@ -267,7 +269,10 @@ Decisions only the user can make, each blocking a remaining goal:
    change the design names as a later experiment), to rely on a larger
    outer MTU where the path allows, or to judge the gate on hardware that
    segments datagrams itself.
-8. Open since November 13: should `daemon.offload_frames` be on by default?
+8. Decided November 14: `daemon.offload_frames` stays off by default, for
+   clean paths only, until receive capacity under loss improves. Next is
+   receive without the reassembly copy. The question was whether it should
+   be on by default.
    With both daemons on it, the full-size efficiency point used 14.7% less
    CPU per delivered bit in six of six rounds and lost no more frames, with
    no receive pressure
