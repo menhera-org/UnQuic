@@ -835,6 +835,13 @@ before packing. Older kernels that reject USO retain TCP and checksum offloads,
 with UDP segmentation performed by the kernel. Standalone `Tap::create`
 keeps read offloads disabled until runtime setup.
 
+At startup the runtime also raises the TAP's transmit queue, the frames the
+kernel holds for the daemon's reads, to at least 1000 through rtnetlink, as
+`ip link set ... txqueuelen` does; the older `SIOCSIFTXQLEN` ioctl is refused
+once queues are attached. Current kernels already give new tun devices 1000,
+so this matters for a device someone set shorter, and a longer queue stays.
+Without `CAP_NET_ADMIN` the queue is left as it is.
+
 UDP/TCP expansion accepts IPv4 options, VLAN tags, and IPv6 hop-by-hop, routing
 and destination headers. It validates protocol, lengths and checksum offsets,
 adjusts the supplied pseudo-header checksum seed, and advances IPv4 IDs.

@@ -447,6 +447,7 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
             }
         };
         tap.enable_input_offloads()?;
+        tap.raise_queue()?;
         for (worker, queue) in workers.iter_mut().zip(tap.into_queues()) {
             worker.attach_tap(index, queue)?;
         }

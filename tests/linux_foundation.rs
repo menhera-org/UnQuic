@@ -72,6 +72,21 @@ fn kernel_socket_and_tap_invariants() {
     // SAFETY: output ifreq is valid.
     check(unsafe { libc::ioctl(control.as_raw_fd(), libc::SIOCGIFMTU as _, &mut req) });
     assert_eq!(unsafe { req.ifr_ifru.ifru_mtu }, 9000);
+    // The TAP's queue rises to TAP_QUEUE_LEN, and a longer one stays.
+    let queue_len = |req: &mut libc::ifreq| {
+        // SAFETY: SIOCGIFTXQLEN writes the length into valid ifreq storage.
+        check(unsafe { libc::ioctl(control.as_raw_fd(), libc::SIOCGIFTXQLEN as _, &mut *req) });
+        unsafe { req.ifr_ifru.ifru_metric }
+    };
+    // Current kernels already start tun devices at 1000; lower it first. With
+    // queues attached only rtnetlink can resize, as `ip link` does.
+    ip(&["link", "set", "uq-test", "txqueuelen", "500"]);
+    assert_eq!(queue_len(&mut req), 500);
+    assert_eq!(tap.raise_queue().unwrap(), 1000);
+    assert_eq!(queue_len(&mut req), unquic::tap::TAP_QUEUE_LEN);
+    ip(&["link", "set", "uq-test", "txqueuelen", "3000"]);
+    assert_eq!(tap.raise_queue().unwrap(), 3000);
+    assert_eq!(queue_len(&mut req), 3000);
     for queue in tap.queues() {
         let fd = queue.as_fd().as_raw_fd();
         let mut req = request(c"uq-test");

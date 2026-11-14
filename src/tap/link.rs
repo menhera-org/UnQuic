@@ -1,4 +1,5 @@
-//! One rtnetlink query: what kind of device, if any, holds a TAP name.
+//! Two rtnetlink requests: what kind of device, if any, holds a TAP name, and
+//! setting a device's transmit queue length.
 use crate::sys::cvt;
 use std::{
     ffi::CStr,
@@ -8,9 +9,12 @@ use std::{
 
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
+const RTM_SETLINK: u16 = 19;
 const NLMSG_ERROR: u16 = 2;
 const NLM_F_REQUEST: u16 = 1;
+const NLM_F_ACK: u16 = 4;
 const IFLA_IFNAME: u16 = 3;
+const IFLA_TXQLEN: u16 = 13;
 const IFLA_LINKINFO: u16 = 18;
 const IFLA_INFO_KIND: u16 = 1;
 const IFLA_INFO_DATA: u16 = 2;
@@ -69,9 +73,12 @@ fn attributes(mut bytes: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
     })
 }
 
+fn malformed() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "malformed rtnetlink reply")
+}
+
 /// Parses one RTM_GETLINK reply.
 fn parse(reply: &[u8]) -> io::Result<Link> {
-    let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed rtnetlink reply");
     let length = u32_at(reply, 0).ok_or_else(malformed)? as usize;
     let message = reply.get(..length).ok_or_else(malformed)?;
     match u16_at(message, 4).ok_or_else(malformed)? {
@@ -114,6 +121,52 @@ fn parse(reply: &[u8]) -> io::Result<Link> {
 
 /// Asks the kernel about the device named `name` in this network namespace.
 pub(crate) fn query(name: &CStr) -> io::Result<Link> {
+    let reply = transact(&link_request(RTM_GETLINK, NLM_F_REQUEST, name, &[]))?;
+    parse(&reply)
+}
+
+/// Sets the transmit queue length of the device named `name` through
+/// rtnetlink, which, unlike SIOCSIFTXQLEN, resizes a TAP with queues attached.
+pub(crate) fn set_queue_length(name: &CStr, length: u32) -> io::Result<()> {
+    let attribute = [
+        &8_u16.to_ne_bytes()[..],
+        &IFLA_TXQLEN.to_ne_bytes(),
+        &length.to_ne_bytes(),
+    ]
+    .concat();
+    let request = link_request(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, name, &attribute);
+    let reply = transact(&request)?;
+    // An acknowledgement is an NLMSG_ERROR carrying a zero or negative errno.
+    if u16_at(&reply, 4) != Some(NLMSG_ERROR) {
+        return Err(malformed());
+    }
+    match u32_at(&reply, HEADER).map(|code| code as i32) {
+        Some(0) => Ok(()),
+        Some(code) if code < 0 => Err(io::Error::from_raw_os_error(-code)),
+        _ => Err(malformed()),
+    }
+}
+
+/// An ifinfomsg request naming the device, followed by `extra` attributes.
+fn link_request(kind: u16, flags: u16, name: &CStr, extra: &[u8]) -> Vec<u8> {
+    let name = name.to_bytes_with_nul();
+    let attribute = 4 + name.len();
+    let total = HEADER + IFINFO + attribute.next_multiple_of(4) + extra.len();
+    let mut request = vec![0_u8; total];
+    request[0..4].copy_from_slice(&(total as u32).to_ne_bytes());
+    request[4..6].copy_from_slice(&kind.to_ne_bytes());
+    request[6..8].copy_from_slice(&flags.to_ne_bytes());
+    request[HEADER] = libc::AF_UNSPEC as u8;
+    let at = HEADER + IFINFO;
+    request[at..at + 2].copy_from_slice(&(attribute as u16).to_ne_bytes());
+    request[at + 2..at + 4].copy_from_slice(&IFLA_IFNAME.to_ne_bytes());
+    request[at + 4..at + 4 + name.len()].copy_from_slice(name);
+    request[total - extra.len()..].copy_from_slice(extra);
+    request
+}
+
+/// Sends one request to the kernel and returns its first reply.
+fn transact(request: &[u8]) -> io::Result<Vec<u8>> {
     // SAFETY: plain socket creation; the result is owned below.
     let fd = cvt(unsafe {
         libc::socket(
@@ -124,18 +177,6 @@ pub(crate) fn query(name: &CStr) -> io::Result<Link> {
     })?;
     // SAFETY: socket just returned this descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let name = name.to_bytes_with_nul();
-    let attribute = 4 + name.len();
-    let total = HEADER + IFINFO + attribute.next_multiple_of(4);
-    let mut request = vec![0_u8; total];
-    request[0..4].copy_from_slice(&(total as u32).to_ne_bytes());
-    request[4..6].copy_from_slice(&RTM_GETLINK.to_ne_bytes());
-    request[6..8].copy_from_slice(&NLM_F_REQUEST.to_ne_bytes());
-    request[HEADER] = libc::AF_UNSPEC as u8;
-    let at = HEADER + IFINFO;
-    request[at..at + 2].copy_from_slice(&(attribute as u16).to_ne_bytes());
-    request[at + 2..at + 4].copy_from_slice(&IFLA_IFNAME.to_ne_bytes());
-    request[at + 4..at + 4 + name.len()].copy_from_slice(name);
     // SAFETY: the zeroed sockaddr_nl addresses the kernel; request is readable.
     let sent = unsafe {
         let mut kernel: libc::sockaddr_nl = std::mem::zeroed();
@@ -157,7 +198,8 @@ pub(crate) fn query(name: &CStr) -> io::Result<Link> {
         // SAFETY: reply is writable for its length.
         let n = unsafe { libc::recv(fd.as_raw_fd(), reply.as_mut_ptr().cast(), reply.len(), 0) };
         if n >= 0 {
-            return parse(reply.get(..n as usize).unwrap_or_default());
+            reply.truncate(n as usize);
+            return Ok(reply);
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {

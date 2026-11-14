@@ -31,6 +31,11 @@ use std::{
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
 };
 
+/// Transmit queue length raise_queue ensures: frames the kernel holds for the
+/// daemon's reads. Current kernels give new tun devices this length already;
+/// a device left shorter is raised.
+pub const TAP_QUEUE_LEN: libc::c_int = 1000;
+
 /// Owns every queue of a created or reattached TAP.
 ///
 /// The device is persistent: closing every queue keeps it, with its MAC,
@@ -274,6 +279,27 @@ impl Tap {
                 cvt(unsafe { libc::ioctl(fd, libc::TUNSETOFFLOAD, tcp) })?;
                 Ok(())
             }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Raises the device's transmit queue, the frames waiting for this daemon
+    /// to read, to at least TAP_QUEUE_LEN, so a briefly slow worker drops
+    /// fewer; an operator's longer queue stays. Without CAP_NET_ADMIN it
+    /// changes nothing. Returns the queue length now in force.
+    pub fn raise_queue(&self) -> io::Result<usize> {
+        let control = udp_socket()?;
+        let mut request = request_for(self.name());
+        // SAFETY: SIOCGIFTXQLEN reads the name and writes the length into ifreq.
+        cvt(unsafe { libc::ioctl(control.as_raw_fd(), libc::SIOCGIFTXQLEN as _, &mut request) })?;
+        // SAFETY: the kernel filled the integer member (ifr_qlen) just read.
+        let length = unsafe { request.ifr_ifru.ifru_metric };
+        if length >= TAP_QUEUE_LEN {
+            return Ok(length as usize);
+        }
+        match link::set_queue_length(self.name(), TAP_QUEUE_LEN as u32) {
+            Ok(()) => Ok(TAP_QUEUE_LEN as usize),
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => Ok(length as usize),
             Err(error) => Err(error),
         }
     }
