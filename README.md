@@ -220,8 +220,10 @@ producer writes the eventfd only when that flag is set, so a busy destination
 costs no syscall; fences on both sides ensure one of them sees the other
 (BENCH.md). A worker about to block passes its next deadline to
 `epoll_pwait2` as the timeout, so it never sets a timer; on kernels older
-than 5.11 it falls back to arming its timerfd. A turn with pending work, or
-whose next deadline has already passed, polls instead.
+than 5.11 it falls back to arming its timerfd. Workers set their timer
+slack to 1 ns, since the default 50 µs let paced sends leave late. A turn
+with pending work, or whose next deadline has already passed, polls
+instead.
 
 `reassembly::Lane` now reserves a complete datagram before applying its records,
 with 64 fixed frame slots and separate 65536-entry packet and frame windows.

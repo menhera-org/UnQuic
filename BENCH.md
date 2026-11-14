@@ -678,6 +678,45 @@ against the copy and −2.7% against HEAD at the median; HEAD itself ran
 The kernel suite's fault test used to fail workers by denying
 `timerfd_settime`; it now denies `epoll_pwait2` as well.
 
+This change also raised frames lost on the lossy path, which the
+full-size point, with neither delay nor loss, could not show; the next
+section has the cause and the fix.
+
+## Timer slack under epoll_pwait2 (November 14, landed)
+
+A recheck of offload frames on the routed 4.5 ms path with 1% loss found
+the ordinary arm losing 10–20% of frames, against 1–6% when FRAME_ABANDON
+landed. A rotating comparison of c552ed4 with d0a4c5e on that path
+([results](benches/lossy-path-epoll-pwait2.json)) put the regression on
+the epoll_pwait2 commit:
+
+| | Frames lost, worse direction | Gbit/s delivered |
+| --- | --- | --- |
+| c552ed4 (timerfd) | 3.0–7.6% | 3.40–3.86 |
+| d0a4c5e (epoll_pwait2) | 8.4–24.6% | 2.85–3.65 |
+
+`epoll_pwait2` lets the kernel end the sleep up to the thread's timer
+slack past its timeout: at least 50 µs by default, or 0.1% of the
+timeout if that is longer. A timerfd fires with no slack, so before
+d0a4c5e paced sends left on time. Each worker thread now sets its slack
+to 1 ns with `prctl(PR_SET_TIMERSLACK)`, the least the kernel accepts.
+
+Stated beforehand: frames lost on the lossy path back at c552ed4's level
+(median worse-direction loss no more than a point above it), and the
+full-size efficiency bar still met against c552ed4. Lossy path
+([results](benches/lossy-path-timer-slack.json)):
+
+| | Frames lost, worse direction | Median | Gbit/s delivered |
+| --- | --- | --- | --- |
+| c552ed4 | 2.7–5.9% | 4.5% | 3.77–3.87 |
+| Timer slack 1 ns | 0.5–4.9% | 2.4% | 3.75–3.93 |
+
+On the full-size point ([results](benches/full-size-timer-slack.json)),
+CPU per delivered bit was lower than c552ed4 and its copy in 5 of 6
+rounds, at −1.5% against the copy at the median (−2.1% against c552ed4,
+whose copy ran +0.1% against it), so the tighter wakeups kept the saving.
+Changes to waits, timers and pacing now also get the lossy-path check.
+
 ## What holds one flow near 1 Gbit/s (November 13)
 
 One flow at 7.5 ms delivers 1.00–1.07 Gbit/s per direction at 5G offered

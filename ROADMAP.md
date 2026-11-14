@@ -662,6 +662,11 @@ rules apply to all of them.
    setting the timerfd, which cut CPU per delivered bit 1.3% at the
    median against HEAD's copy over 12 rounds
    ([BENCH.md](BENCH.md#deadlines-through-epoll_pwait2-november-14-landed)).
+   It also slept up to 50 µs of timer slack past each deadline, which
+   raised frames lost on the lossy path from 3–8% to 8–25%; workers now set
+   their slack to 1 ns, which brought loss back down (0.5–4.9%) and kept
+   the CPU saving
+   ([BENCH.md](BENCH.md#timer-slack-under-epoll_pwait2-november-14-landed)).
    Next, the userspace parts still over their section 13.1 targets
    (receive admission, staging and the frame flush); one flow striped with
    a receive-side reorder stage (decision 7).

@@ -329,6 +329,15 @@ pub(crate) fn monotonic_now() -> io::Result<Duration> {
     Ok(Duration::new(value.tv_sec as u64, value.tv_nsec as u32))
 }
 
+/// epoll_pwait2 may sleep past its timeout by the thread's timer slack, 50 µs
+/// by default, which delayed paced sends enough to lose frames; a timerfd has
+/// no slack. One nanosecond is the least the kernel accepts (0 restores the default).
+fn tighten_timer_slack() {
+    // SAFETY: PR_SET_TIMERSLACK takes an integer and changes only this thread;
+    // failure leaves the default slack, which is still correct, only later.
+    unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, 1 as libc::c_ulong) };
+}
+
 pub(crate) fn pin_to_allowed(index: usize) -> io::Result<()> {
     // SAFETY: a zeroed cpu_set_t is a valid empty set.
     let mut allowed: libc::cpu_set_t = unsafe { zeroed() };
@@ -1327,6 +1336,7 @@ impl Worker {
         if pin_to_allowed(self.id).is_err() {
             self.counters.affinity_failures = self.counters.affinity_failures.wrapping_add(1);
         }
+        tighten_timer_slack();
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 128];
         let mut immediate = true;
         let mut event_start = 0;
@@ -9152,6 +9162,23 @@ mod tests {
             slept != 0,
             "the consumer never blocked, so the race went untested"
         );
+    }
+
+    #[test]
+    fn workers_wait_with_the_least_timer_slack() {
+        let slack = || {
+            // SAFETY: PR_GET_TIMERSLACK only reads this thread's slack.
+            unsafe { libc::prctl(libc::PR_GET_TIMERSLACK) }
+        };
+        let (before, after) = std::thread::spawn(move || {
+            let before = slack();
+            tighten_timer_slack();
+            (before, slack())
+        })
+        .join()
+        .unwrap();
+        assert!(before > 1, "default slack {before}");
+        assert_eq!(after, 1);
     }
 
     #[test]
