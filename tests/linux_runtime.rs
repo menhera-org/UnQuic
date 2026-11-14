@@ -2207,8 +2207,12 @@ fn worker_and_thread_start_failures_stop_the_runtime_but_keep_its_tap() {
         // SAFETY: the name is NUL-terminated; the call only queries this namespace.
         unsafe { libc::if_nametoindex(c"uq-fault".as_ptr()) }
     };
-    // Workers first arm their timer after every TAP exists, so this fails them mid-run.
-    deny(&[libc::SYS_timerfd_settime], libc::EIO);
+    // Workers first wait for a deadline after every TAP exists, so this fails them
+    // mid-run: epoll_pwait2 carries the deadline, or timerfd_settime where it is missing.
+    deny(
+        &[libc::SYS_epoll_pwait2, libc::SYS_timerfd_settime],
+        libc::EIO,
+    );
     let control = Control::new();
     let error = runtime::run(single(), control.clone()).unwrap_err();
     assert_eq!(error.raw_os_error(), Some(libc::EIO));

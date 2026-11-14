@@ -99,6 +99,9 @@ pub(crate) struct Reactor {
     timer: OwnedFd,
     wake: Arc<Wake>,
     deadline: Option<Duration>,
+    // Whether epoll_pwait2 (Linux 5.11) carries deadlines, so the timer is
+    // never set; cleared on ENOSYS.
+    pwait2: bool,
 }
 
 impl Reactor {
@@ -121,6 +124,7 @@ impl Reactor {
             timer,
             wake,
             deadline: None,
+            pwait2: true,
         };
         reactor.add(reactor.wake.fd.as_fd(), WAKE_TOKEN, libc::EPOLLIN as u32)?;
         reactor.add(reactor.timer.as_fd(), TIMER_TOKEN, libc::EPOLLIN as u32)?;
@@ -172,6 +176,65 @@ impl Reactor {
             )
         })?;
         Ok(count as usize)
+    }
+
+    /// Polls without blocking, or blocks until an event or `deadline`. With
+    /// epoll_pwait2 the deadline is its timeout, which saves setting and
+    /// draining the timer, a syscall each, on every sleep; older kernels
+    /// arm the timer instead.
+    pub(crate) fn wait_until(
+        &mut self,
+        events: &mut [libc::epoll_event],
+        block: bool,
+        deadline: Option<Duration>,
+    ) -> io::Result<usize> {
+        if !block {
+            return self.wait(events, 0);
+        }
+        if self.pwait2 {
+            if events.is_empty() || events.len() > i32::MAX as usize {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            let timeout = match deadline {
+                Some(due) => {
+                    let left = due.saturating_sub(monotonic_now()?);
+                    Some(libc::timespec {
+                        tv_sec: left
+                            .as_secs()
+                            .try_into()
+                            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
+                        tv_nsec: left.subsec_nanos().into(),
+                    })
+                }
+                None => None,
+            };
+            let timeout = timeout
+                .as_ref()
+                .map_or(std::ptr::null(), std::ptr::from_ref);
+            // SAFETY: events is writable for its bounded length, timeout is null
+            // or a valid timespec, and a null signal mask needs no size.
+            let count = unsafe {
+                libc::syscall(
+                    libc::SYS_epoll_pwait2,
+                    self.poll.as_raw_fd(),
+                    events.as_mut_ptr(),
+                    events.len() as libc::c_int,
+                    timeout,
+                    std::ptr::null::<libc::sigset_t>(),
+                    0_usize,
+                )
+            };
+            if count >= 0 {
+                return Ok(count as usize);
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENOSYS) {
+                return Err(error);
+            }
+            self.pwait2 = false;
+        }
+        self.arm(deadline)?;
+        self.wait(events, -1)
     }
 
     pub(crate) fn drain(&mut self, token: u64) -> io::Result<()> {
@@ -1330,9 +1393,6 @@ impl Worker {
                 self.retry_due = None;
             }
             let mut block = should_block(more || immediate, deadline, now);
-            if block {
-                self.reactor.arm(deadline)?;
-            }
             #[cfg(feature = "profile")]
             {
                 self.phases[21] =
@@ -1346,7 +1406,7 @@ impl Worker {
             let waited = phase!(
                 self,
                 if block { 22 } else { 27 },
-                self.reactor.wait(&mut events, if block { -1 } else { 0 })
+                self.reactor.wait_until(&mut events, block, deadline)
             );
             self.reactor.wake.awake();
             let count = match waited {
@@ -9092,6 +9152,44 @@ mod tests {
             slept != 0,
             "the consumer never blocked, so the race went untested"
         );
+    }
+
+    #[test]
+    fn deadline_waits_return_at_the_deadline_with_or_without_epoll_pwait2() {
+        let wake = Arc::new(Wake::new().unwrap());
+        let mut reactor = Reactor::new(Arc::clone(&wake)).unwrap();
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+        for pwait2 in [true, false] {
+            reactor.pwait2 = pwait2;
+            let started = monotonic_now().unwrap();
+            let due = started + Duration::from_millis(5);
+            let count = reactor.wait_until(&mut events, true, Some(due)).unwrap();
+            assert!(monotonic_now().unwrap() >= due, "returned early");
+            // Without epoll_pwait2 the armed timer reports the deadline.
+            if pwait2 {
+                assert_eq!(count, 0);
+                assert_eq!(reactor.deadline, None, "the timer stays unset");
+            } else {
+                assert_eq!(count, 1);
+                assert_eq!({ events[0].u64 }, TIMER_TOKEN);
+                reactor.drain(TIMER_TOKEN).unwrap();
+            }
+            // A past deadline and a non-blocking poll both return at once.
+            assert_eq!(
+                reactor
+                    .wait_until(&mut events, true, Some(started))
+                    .unwrap(),
+                if pwait2 { 0 } else { 1 }
+            );
+            if !pwait2 {
+                reactor.drain(TIMER_TOKEN).unwrap();
+            }
+            assert_eq!(reactor.wait_until(&mut events, false, None).unwrap(), 0);
+            wake.notify().unwrap();
+            assert_eq!(reactor.wait_until(&mut events, true, None).unwrap(), 1);
+            assert_eq!({ events[0].u64 }, WAKE_TOKEN);
+            reactor.drain(WAKE_TOKEN).unwrap();
+        }
     }
 
     #[test]

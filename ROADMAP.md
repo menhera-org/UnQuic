@@ -524,7 +524,10 @@ rules apply to all of them.
    throughput, which an A/A run shows is noise; retested on CPU per
    delivered Gbit/s at the offer-limited 4G point, it used less in seven of
    eight alternating pairs (median −2.0%) and landed on November 12
-   ([BENCH.md](BENCH.md#arming-the-timer-only-before-blocking-november-11)). Sixteen workers per daemon raise the loopback total 36–38%
+   ([BENCH.md](BENCH.md#arming-the-timer-only-before-blocking-november-11)).
+   Since November 14 the deadline goes to `epoll_pwait2` instead, so no
+   timer is set at all where Linux 5.11 or later runs
+   ([BENCH.md](BENCH.md#deadlines-through-epoll_pwait2-november-14-landed)). Sixteen workers per daemon raise the loopback total 36–38%
    with no thread saturated; there the limit is receive-socket overflow,
    which the container's 416 KiB receive buffer (no `CAP_NET_ADMIN` in the
    initial namespace) makes worse than a root deployment's 8 MiB
@@ -653,8 +656,15 @@ rules apply to all of them.
    the full-size efficiency point did not regress
    ([BENCH.md](BENCH.md#announcing-abandoned-frames-november-14-landed)).
    Receivers still refuse 6,000–28,000 datagrams per daemon there, so
-   capacity under loss stays open. Next, fewer cross-worker wakes; one
-   flow striped with a receive-side reorder stage (decision 7).
+   capacity under loss stays open. Workers already write a destination's
+   eventfd only while it sleeps, so most wakes left are at light load. A
+   blocking wait now passes its deadline to `epoll_pwait2` instead of
+   setting the timerfd, which cut CPU per delivered bit 1.3% at the
+   median against HEAD's copy over 12 rounds
+   ([BENCH.md](BENCH.md#deadlines-through-epoll_pwait2-november-14-landed)).
+   Next, the userspace parts still over their section 13.1 targets
+   (receive admission, staging and the frame flush); one flow striped with
+   a receive-side reorder stage (decision 7).
    The kernel figures can only be confirmed on an R86S-class box with real
    NICs; the remote 7.0 host stands in until then. The kernel test
    `tap::read::tests::real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch`
@@ -664,7 +674,10 @@ rules apply to all of them.
    and accepts in-order reads with gaps, and passed 150 of 150 runs.
    `foreground_readiness_dns_refresh_forwarding_and_signal_shutdown`
    (tests/cli.rs) also timed out once on 6.8 with its 10 s wait and passed
-   on rerun; its waits span a DNS refresh and two daemon starts. A peer
+   on rerun; its waits span a DNS refresh and two daemon starts.
+   `segmented_sends_follow_available_tap_offloads` (examples/udp_load.rs)
+   failed once on 7.0 when a stray 100-byte frame came before the
+   super-frame it reads; that read now skips non-IPv4 frames. A peer
    with one lane keeps ACKs and
    data on lane 0 and can still defer ACKs under loss; a separate number
    space for control (a 65th lane ID with its own receive table) would cover
@@ -1591,7 +1604,8 @@ full expired batches sharing the cleanup budget.
   return an error that stopped the runtime. The queue now reserves room for
   every ACK buffer, and a randomized test drives 20,000 mutated datagrams
   through two linked workers' receive paths. A fault-injection runtime test
-  uses seccomp to fail a syscall every worker needs (`timerfd_settime`) after
+  uses seccomp to fail a syscall every worker needs (`epoll_pwait2`, and
+  `timerfd_settime` for kernels without it) after
   the TAP exists, and then thread creation itself: each time the runtime
   stops with that error and the published TAP keeps its ifindex (Linux 6.8
   and 7.0). On November 12 the last 93 indexing sites Clippy's

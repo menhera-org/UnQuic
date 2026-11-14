@@ -1158,7 +1158,14 @@ mod tests {
         );
         assert_eq!(socket.send(&bytes).unwrap(), bytes.len());
         let mut frame = [0u8; 65536];
-        let n = unsafe { libc::read(fd, frame.as_mut_ptr().cast(), frame.len()) };
+        // Skip stray frames, such as IPv6 neighbour discovery on the new link.
+        let n = loop {
+            // SAFETY: frame provides writable storage for the complete read.
+            let n = unsafe { libc::read(fd, frame.as_mut_ptr().cast(), frame.len()) };
+            if n < 24 || frame[22..24] == [8, 0] {
+                break n;
+            }
+        };
         assert_eq!(n, 10 + 42 + bytes.len() as isize);
         assert_eq!(frame[1], 5);
         assert_eq!(&frame[52..n as usize], &bytes);

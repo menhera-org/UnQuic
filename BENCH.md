@@ -659,6 +659,25 @@ namespace, which root in an unprivileged container lacks. The 416 KiB
 receive buffers behind the 20 Gbit/s gate's local limit come from the same
 check, so this measurement cannot show what either forced buffer is worth.
 
+## Deadlines through epoll_pwait2 (November 14, landed)
+
+Before each blocking wait a worker set its timerfd to the next deadline,
+and the profile put `timerfd_settime` at about 3,480 cycles a call. Since
+Linux 5.11 `epoll_pwait2` takes the deadline as a nanosecond timeout, so
+the worker now passes it there and never sets the timer. On `ENOSYS` it
+clears a flag and goes back to the timer for good.
+
+Stated beforehand: the usual efficiency bar on the full-size point. Six
+rounds were borderline, so twelve were pooled
+([first six](benches/full-size-epoll-pwait2-1.json),
+[second six](benches/full-size-epoll-pwait2-2.json)). CPU per delivered
+bit was lower than both HEAD and its copy in 10 of 12 rounds, at −1.3%
+against the copy and −2.7% against HEAD at the median; HEAD itself ran
++0.9% against its copy.
+
+The kernel suite's fault test used to fail workers by denying
+`timerfd_settime`; it now denies `epoll_pwait2` as well.
+
 ## What holds one flow near 1 Gbit/s (November 13)
 
 One flow at 7.5 ms delivers 1.00–1.07 Gbit/s per direction at 5G offered

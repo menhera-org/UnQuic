@@ -218,9 +218,10 @@ handoff batch and keep draining queues while retrying retained control work.
 A worker about to block sets a sleeping flag and rechecks its queues, and a
 producer writes the eventfd only when that flag is set, so a busy destination
 costs no syscall; fences on both sides ensure one of them sees the other
-(BENCH.md). A worker arms its timerfd only when it is about to block; a turn
-with pending work, or whose next deadline has already passed, polls instead,
-which halves `timerfd_settime` calls on the loopback check.
+(BENCH.md). A worker about to block passes its next deadline to
+`epoll_pwait2` as the timeout, so it never sets a timer; on kernels older
+than 5.11 it falls back to arming its timerfd. A turn with pending work, or
+whose next deadline has already passed, polls instead.
 
 `reassembly::Lane` now reserves a complete datagram before applying its records,
 with 64 fixed frame slots and separate 65536-entry packet and frame windows.
