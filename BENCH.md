@@ -777,6 +777,17 @@ checksum. Lossy path ([results](benches/lossy-path-partial-checksums.json)):
 frames lost in the worse direction were 0.6–2.8% (median 1.1%) against
 HEAD's 0.5–3.7% (median 1.3%), at the same delivered rate.
 
+## Freeing unmapped frames without a cleanup pass (November 15, rejected)
+
+Every released frame waits in the cleanup queue until a later pass checks
+its journal mappings and frees it, about 100 cycles per frame event at
+fef95b5. The candidate freed a frame at release when no packet mapping
+named it any more ([patch](benches/free-unmapped-frames-rejected.patch)).
+On the full-size point ([results](benches/full-size-free-unmapped-frames.json))
+it was lower than HEAD's copy in 3 of 6 rounds at +0.2%; HEAD itself ran
+−1.4% against its copy, so the queue's second visit costs less than this
+point can resolve.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames

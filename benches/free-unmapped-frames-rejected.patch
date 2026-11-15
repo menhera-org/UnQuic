@@ -1,0 +1,101 @@
+diff --git a/src/worker/recovery.rs b/src/worker/recovery.rs
+index 0630054..d18eb0f 100644
+--- a/src/worker/recovery.rs
++++ b/src/worker/recovery.rs
+@@ -143,8 +143,20 @@ impl Worker {
+                 .length()
+                 .checked_sub(sent)
+                 .ok_or(io::ErrorKind::InvalidData)?;
++            let id = frame.id;
+             self.release_unsent(session, lane, unsent)?;
+             self.recovery.set(index, Place::Cleanup)?;
++            // With no packet mapping left, free it now while its lines are warm;
++            // a later piece naming it, even in the packet being staged, keeps it mapped.
++            if self.recovery.journal.frame_empty(index, id) {
++                *self
++                    .recovery
++                    .slots
++                    .get_mut(index)
++                    .ok_or(io::ErrorKind::InvalidData)? = Slot::default();
++                self.release_frame_storage(index);
++                return Ok(());
++            }
+             if self.recovery.cleanup.len() == self.recovery.cleanup.capacity() {
+                 return Err(io::ErrorKind::InvalidData.into());
+             }
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index ca8412d..3533227 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -1628,6 +1628,71 @@ fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
+     );
+ }
+ 
++#[test]
++#[ignore = "kernel descriptor test; run in a disposable container"]
++fn acknowledged_frames_without_other_mappings_free_without_a_cleanup_pass() {
++    let (mut workers, _rx) = workers();
++    let worker = &mut workers[1];
++    for _ in 0..4 {
++        queue_frame(worker, 60);
++    }
++    let slots: Vec<_> = worker.sessions[0].batches[1]
++        .as_ref()
++        .unwrap()
++        .pending
++        .iter(&worker.frames)
++        .collect();
++    let mut pieces = [crate::ack::FramePiece::default(); 4];
++    for (piece, &index) in pieces.iter_mut().zip(&slots) {
++        let frame = worker.frames.frame(index).unwrap();
++        *piece = crate::ack::FramePiece {
++            frame_slot: index as u16,
++            frame_id: frame.id,
++            start: 0,
++            end: 60,
++            attempt: 0,
++        };
++        submit_original(worker, index, 0..60);
++    }
++    // Packet 0 carries all four frames; packet 1 another copy of the last.
++    assert!(worker.recovery.journal.reserve_packet(0, &pieces));
++    assert!(worker.recovery.journal.reserve_packet(1, &pieces[3..]));
++    for handle in 1..=2 {
++        assert_eq!(worker.sender.records.take().unwrap().get(), handle);
++    }
++    let mut report = worker.sender.report.take().unwrap();
++    report.kind = ReportKind::Ack {
++        received: Duration::from_millis(2),
++        delay_us: 0,
++        first: true,
++        end: None,
++    };
++    report.count = 1;
++    report.entries[0] = Entry {
++        number: 1,
++        sample: NonZeroU16::new(1),
++        settled: true,
++        ..Entry::default()
++    };
++    worker.recovery.staged = Some(report);
++    assert!(!worker.stage_recovery().unwrap());
++    // The three frames only packet 0 mapped are gone without a cleanup pass;
++    // the fourth is acknowledged too but waits for packet 1's mapping.
++    assert!(
++        slots[..3]
++            .iter()
++            .all(|&slot| worker.frames.frame(slot).is_none())
++    );
++    assert_eq!(worker.frames.recovery(slots[3]).unwrap().remaining(), 0);
++    assert_eq!(worker.sessions[0].tx_retained, 1);
++    assert_eq!(worker.counters.recovery_cleanup_peak, 1);
++    assert!(worker.recovery.has_cleanup());
++    assert!(worker.recovery.journal.pop_packet(1).is_some());
++    while worker.cleanup_frames().unwrap() {}
++    assert!(worker.frames.frame(slots[3]).is_none());
++    assert_eq!(worker.sessions[0].tx_retained, 0);
++}
++
+ #[test]
+ #[ignore = "kernel descriptor test; run in a disposable container"]
+ fn lost_original_repairs_only_missing_bytes_and_late_ack_cancels_prepared_repair() {
