@@ -3122,6 +3122,130 @@ impl Worker {
         Ok(Some(length))
     }
 
+    /// Expands consecutive segments of one TAP super-frame into ordinary
+    /// frames as materialize does, but looks up the source and lane, pushes
+    /// the ready lane and counts once per run. Ordinary frames free no
+    /// unsent bytes, so that accounting is skipped. Returns None, having
+    /// changed nothing, where materialize must decide instead: another kind
+    /// of input, a lane that may send offload frames, or a first frame that
+    /// cannot start.
+    fn materialize_segments(
+        &mut self,
+        source: usize,
+        frame_budget: usize,
+        byte_budget: usize,
+    ) -> io::Result<Option<(usize, usize)>> {
+        let input = self
+            .frames
+            .source(source)
+            .ok_or_else(|| io::Error::other("missing transmit input"))?;
+        let (session, lane, deadline, input_length) =
+            (input.session, input.lane, input.deadline, input.length);
+        let Some(mut cursor) = input
+            .segments
+            .filter(|s| s.header_len() <= frames::HEADER_BYTES)
+        else {
+            return Ok(None);
+        };
+        let Some(tx) = self.sessions[session].tx[lane].as_ref() else {
+            return Ok(None);
+        };
+        if tx.offload_frames() {
+            return Ok(None);
+        }
+        let partial = tx.partial_checksums();
+        let enabled = self.sender_enabled();
+        let (mut count, mut bytes) = (0, 0);
+        while count < frame_budget
+            && bytes < byte_budget
+            && !cursor.done(input_length)
+            && self.can_materialize(source)
+        {
+            let length = cursor.next_len(input_length);
+            let Some(Ok(id)) = self.sessions[session].tx[lane]
+                .as_mut()
+                .map(|tx| tx.start_frame(length))
+            else {
+                if count == 0 {
+                    return Ok(None);
+                }
+                break;
+            };
+            let mut frame = frames::Frame {
+                id,
+                deadline,
+                source,
+                range: 0..0,
+                offset: 0,
+                lane,
+                header_len: cursor.header_len(),
+                header: [0; frames::HEADER_BYTES],
+                offload: false,
+                partial,
+            };
+            let input = self
+                .frames
+                .source(source)
+                .ok_or_else(|| io::Error::other("missing transmit input"))?;
+            let input_bytes = input
+                .bytes
+                .get(..input_length)
+                .ok_or(io::ErrorKind::InvalidData)?;
+            frame.range = if partial {
+                cursor.write_seed_header(input_bytes, &mut frame.header)
+            } else {
+                cursor.write_header(input_bytes, &mut frame.header)
+            }
+            .ok_or_else(|| io::Error::other("invalid transmit header"))?;
+            if let Some(input) = self.frames.source_mut(source) {
+                input.segments = Some(cursor);
+            }
+            let index = self
+                .frames
+                .insert_frame(frame)
+                .ok_or_else(|| io::Error::other("transmit frame capacity exhausted"))?;
+            self.sessions[session].tx_retained += 1;
+            if enabled {
+                let unexpanded = &mut self.sessions[session].unexpanded_bytes[lane];
+                *unexpanded = unexpanded
+                    .checked_sub(length)
+                    .ok_or(io::ErrorKind::InvalidData)?;
+                self.recovery.bind(
+                    index,
+                    self.frames.frame(index).ok_or(io::ErrorKind::InvalidData)?,
+                )?;
+            }
+            self.sessions[session].batches[lane]
+                .as_mut()
+                .ok_or_else(|| io::Error::other("missing transmit batch"))?
+                .pending
+                .push_back(&mut self.frames, index)?;
+            count += 1;
+            bytes += length;
+        }
+        if count != 0 {
+            let local = &mut self.sessions[session];
+            if local.tx_ready & (1_u64 << lane) == 0 {
+                local.tx_ready |= 1_u64 << lane;
+                self.ready.push_back((session, lane));
+            }
+            let frames = count as u64;
+            for totals in [&mut self.counters, &mut self.sessions[session].totals] {
+                totals.tap_gso_frames = totals.tap_gso_frames.wrapping_add(frames);
+                let checksums = if partial {
+                    &mut totals.tx_partial_frames
+                } else {
+                    &mut totals.tap_checksums
+                };
+                *checksums = checksums.wrapping_add(frames);
+            }
+            if cursor.done(input_length) {
+                self.close_source(source);
+            }
+        }
+        Ok(Some((count, bytes)))
+    }
+
     fn drain_tap_inputs(&mut self, now: Duration) -> io::Result<bool> {
         let mut frames = 0;
         let mut bytes = 0;
@@ -3166,6 +3290,16 @@ impl Worker {
                     continue;
                 }
                 while frames < BATCH_SIZE && bytes < 64 * 1024 {
+                    if let Some((count, length)) =
+                        self.materialize_segments(source, BATCH_SIZE - frames, 64 * 1024 - bytes)?
+                    {
+                        frames += count;
+                        bytes += length;
+                        if count == 0 || !self.frames.producing(source) {
+                            break;
+                        }
+                        continue;
+                    }
                     let Some(length) = self.materialize(source)? else {
                         break;
                     };

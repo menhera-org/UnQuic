@@ -725,9 +725,13 @@ rules apply to all of them.
    the ACK pass landed: −2.8% on the small-frame point, level on the
    full-size point
    ([BENCH.md](BENCH.md#freeing-retained-frames-in-the-ack-pass-november-15-landed)).
-   Next on that path: a fresh frame sent whole skipping its separate
-   retained transition; then one flow striped with a receive-side reorder
-   stage (decision 7).
+   Expanding a super-frame's segments in runs, paying lookups, accounting
+   and counters once per run, landed next: −1.9% on the small-frame point,
+   −1.0% on the full-size point
+   ([BENCH.md](BENCH.md#expanding-super-frames-in-runs-november-15-landed)).
+   The send-side retained transition the design names next costs about 20
+   cycles per frame, below what either point resolves. Then one flow
+   striped with a receive-side reorder stage (decision 7).
    The kernel figures can only be confirmed on an R86S-class box with real
    NICs; the remote 7.0 host stands in until then. The kernel test
    `tap::read::tests::real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch`
@@ -744,7 +748,10 @@ rules apply to all of them.
    `workers_forward_both_directions_and_reconnect_after_restart`
    (tests/linux_runtime.rs) failed once on 7.0 on November 15: after the
    restart one frame on lane 2 was repaired twice and expired while the
-   receiver had registered no lane 2; it passed three reruns. A peer
+   receiver had registered no lane 2; it passed three reruns.
+   `a_flooded_session_neither_allocates_nor_corrupts_its_neighbour` timed
+   out once on 6.8 the same day waiting 5 s for the quiet session's first
+   frame after carrier, and passed three reruns. A peer
    with one lane keeps ACKs and
    data on lane 0 and can still defer ACKs under loss; a separate number
    space for control (a 65th lane ID with its own receive table) would cover

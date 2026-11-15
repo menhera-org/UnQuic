@@ -777,6 +777,29 @@ checksum. Lossy path ([results](benches/lossy-path-partial-checksums.json)):
 frames lost in the worse direction were 0.6–2.8% (median 1.1%) against
 HEAD's 0.5–3.7% (median 1.3%), at the same delivered rate.
 
+## Expanding super-frames in runs (November 15, landed)
+
+At the small-frame point, expanding a TAP super-frame into frames cost
+about 320 cycles per frame event, about 500 per 64-byte segment, and each
+segment repeated the source and lane lookups, the offload check, the
+unsent-byte accounting (zero for ordinary frames), the ready-lane check and
+the counter updates. Expansion now runs through consecutive segments of
+one super-frame in one call, keeping per frame only the capacity check,
+the frame start, the header write, the insert, the recovery binding and
+the queueing; offload lanes, oversized headers and other inputs keep the
+per-frame path.
+
+Stated beforehand: the usual bar on the small-frame point, no more than
+0.5% above HEAD's copy on the full-size point, and no rise in frames lost
+on the lossy path. Small-frame point
+([results](benches/small-frames-segment-runs.json)): lower than both
+HEAD and its copy in 5 of 6 rounds, −1.9% against the copy at the
+median; HEAD itself was −1.0% against its copy, so the margin over noise
+is thin. Full-size point ([results](benches/full-size-segment-runs.json)):
+−1.0% against the copy, −0.7% against HEAD. Lossy path
+([results](benches/lossy-path-segment-runs.json)): worse-direction loss
+at a median of 1.4% against HEAD's 1.2%, within its spread.
+
 ## Freeing retained frames in the ACK pass (November 15, landed)
 
 The frame fast path of design section 13.1 (November 15 amendment): a
