@@ -1113,6 +1113,24 @@ points, which carry no striped flow unless one is detected, no change.
 A larger outer MTU or a NIC that segments in hardware remains the cheaper
 answer where a path allows it.
 
+**First measurement (November 15).** Every piece landed behind
+`daemon.stripe_flows` and the bar was missed: about 8% more delivery at
+0.5% loss, ten times the reordering, and runs where one direction
+collapsed (BENCH.md). Two parts of this section do not fit the stage 3
+path. First, a repair takes at least one round trip, 7.5 ms there, so a
+hold limit capped at 5 ms skips every lost frame and delivers it out of
+sequence; the cap was chosen for latency, but it makes order through
+loss impossible on any path whose RTT exceeds it. Second, a 256-frame
+window covers about 2.5 ms at 1.2 Gbit/s and well under 1 ms at the
+5 Gbit/s goal. Before striping is measured again, the hold limit and
+window have to be sized from the path: a hold above one smoothed RTT
+plus the repair delay, and a window of rate × hold, which on the stage
+3 path at 5 Gbit/s is several thousand frames and several MB per stripe.
+Whether that memory and latency is worth one flow's order is the open
+question. The writer's placement matters as well: on a worker that also
+reads the TAP it saturates first, and the TAP's queue choice varies, so
+a fixed stripe-to-worker map cannot avoid it.
+
 # 14 Validation and acceptance
 
 Freeze a repeatable acceptance profile before declaring the performance requirements met. It must name the endpoint hardware and core budget, inner MTU, frame mix, flow count, traffic direction, attachment topology, loss profile, and contemporaneous direct-underlay capacity.

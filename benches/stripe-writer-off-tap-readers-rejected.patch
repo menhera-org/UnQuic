@@ -1,0 +1,224 @@
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 530949a..c50463e 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -81,8 +81,12 @@ pub(crate) struct Shared {
+     // Per session, the stripes TAP readers claim for flows one worker cannot
+     // carry; empty unless daemon.stripe_flows and daemon.balance_flows.
+     pub stripes: Vec<Box<[crate::worker::Stripe]>>,
+-    // Per session and transmit lane, its owner's backlog mark; empty with stripes.
++    // Per session and transmit lane, its owner's refusal mark; empty with stripes.
+     pub backlog: Vec<Box<[AtomicU64]>>,
++    // Per session and stripe number, its writer; empty unless daemon.stripe_flows.
++    pub writers: Vec<Box<[AtomicU64]>>,
++    // Per worker, when it last read a TAP; empty unless daemon.stripe_flows.
++    pub readers: Box<[AtomicU64]>,
+ }
+ 
+ impl Control {
+@@ -413,6 +417,19 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
+     } else {
+         (Vec::new(), Vec::new())
+     };
++    let receiving = config.config().daemon.stripe_flows;
++    let writers = (0..sessions)
++        .filter(|_| receiving)
++        .map(|_| {
++            (0..crate::worker::STRIPE_SLOTS)
++                .map(|_| AtomicU64::new(0))
++                .collect()
++        })
++        .collect();
++    let readers = (0..count)
++        .filter(|_| receiving)
++        .map(|_| AtomicU64::new(0))
++        .collect();
+     let shared = Arc::new(Shared {
+         config,
+         wakes,
+@@ -444,6 +461,8 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
+         },
+         stripes,
+         backlog,
++        writers,
++        readers,
+     });
+     let mut workers = (0..count)
+         .map(|id| Worker::new(id, Arc::clone(&shared), control.clone()))
+@@ -554,6 +573,16 @@ fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
+     } else {
+         flows
+     };
++    // Stripe writer choices per session and TAP read stamps per worker.
++    let flows = if raw.daemon.stripe_flows {
++        sessions
++            .checked_mul(crate::worker::STRIPE_SLOTS)?
++            .checked_add(workers)?
++            .checked_mul(size_of::<AtomicU64>())?
++            .checked_add(flows)?
++    } else {
++        flows
++    };
+     let shared = sessions
+         .checked_mul(65_536 + size_of::<Box<[AtomicU8]>>() + 1 + size_of::<AtomicU64>())?
+         .checked_add(workers.checked_mul(STACK_BYTES + size_of::<Counters>() + 256)?)?
+diff --git a/src/worker.rs b/src/worker.rs
+index b0dc583..ca3f926 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -544,6 +544,77 @@ fn claim_stripe(stripes: &[Stripe], ms: u64) -> Option<usize> {
+     })
+ }
+ 
++/// A worker that read a TAP this recently counts as busy reading.
++const READER_MS: u64 = 100;
++
++/// Records for stripe writers that this worker is reading a TAP.
++fn mark_reader(stamp: &AtomicU64, ms: u64) {
++    let now = STRIPE_IN_USE | (ms & FLOW_MS_MASK);
++    if stamp.load(Ordering::Relaxed) != now {
++        stamp.store(now, Ordering::Relaxed);
++    }
++}
++
++/// The worker that writes a stripe's frames to the TAP. Receive owners
++/// share the choice through `slot`, which holds the writer plus one and a
++/// millisecond stamp. The first to forward a frame of a silent stripe
++/// chooses, among workers that have not read a TAP within READER_MS when
++/// there are any, so that one worker does not both read a TAP and write a
++/// striped flow. A stripe silent for FLOW_IDLE_MS, past the writer's own
++/// restart, may be given another writer.
++fn stripe_writer(
++    slot: Option<&AtomicU64>,
++    readers: &[AtomicU64],
++    number: u16,
++    workers: usize,
++    ms: u64,
++) -> usize {
++    let fallback = usize::from(number) % workers;
++    let Some(slot) = slot else {
++        return fallback;
++    };
++    let now = ms & FLOW_MS_MASK;
++    let quiet = |worker: usize| {
++        readers.get(worker).is_none_or(|stamp| {
++            let stamp = stamp.load(Ordering::Relaxed);
++            stamp == 0 || now.wrapping_sub(stamp) & FLOW_MS_MASK >= READER_MS
++        })
++    };
++    let mut old = slot.load(Ordering::Acquire);
++    loop {
++        let (writer, stamp) = ((old >> 24) as usize, old & FLOW_MS_MASK);
++        if old != 0
++            && (1..=workers).contains(&writer)
++            && now.wrapping_sub(stamp) & FLOW_MS_MASK < FLOW_IDLE_MS
++        {
++            if stamp != now {
++                // A lost race only leaves the stamp a millisecond older.
++                let _ = slot.compare_exchange(
++                    old,
++                    (writer as u64) << 24 | now,
++                    Ordering::AcqRel,
++                    Ordering::Acquire,
++                );
++            }
++            return writer - 1;
++        }
++        let count = (0..workers).filter(|&w| quiet(w)).count();
++        let choice = (0..workers)
++            .filter(|&w| quiet(w))
++            .nth(usize::from(number) % count.max(1))
++            .unwrap_or(fallback);
++        match slot.compare_exchange(
++            old,
++            ((choice + 1) as u64) << 24 | now,
++            Ordering::AcqRel,
++            Ordering::Acquire,
++        ) {
++            Ok(_) => return choice,
++            Err(current) => old = current,
++        }
++    }
++}
++
+ /// Takes a striped read's lane, the next of `first..lanes` in turn, and the
+ /// first of its `frames` sequences.
+ fn stripe_read(
+@@ -2791,6 +2862,9 @@ impl Worker {
+                 local.tx_bytes += length;
+                 buffer.tx_reserved = true;
+                 buffer.tag = connection.local_tag().get();
++                if let Some(stamp) = self.shared.readers.get(self.id) {
++                    mark_reader(stamp, now.as_millis() as u64);
++                }
+                 let frames = buffer.segments.map_or(1, |s| s.remaining(length));
+                 (buffer.lane, buffer.stripe) = self.route(
+                     session,
+@@ -4544,7 +4618,16 @@ impl Worker {
+                 }
+                 continue;
+             };
+-            let writer = usize::from(number) % workers;
++            let writer = stripe_writer(
++                self.shared
++                    .writers
++                    .get(session)
++                    .and_then(|slots| slots.get(usize::from(number))),
++                &self.shared.readers,
++                number,
++                workers,
++                now.as_millis() as u64,
++            );
+             let Some(out) = stripes.out.get_mut(writer) else {
+                 break;
+             };
+@@ -7273,6 +7356,38 @@ mod tests {
+         assert_eq!(lane, 2);
+     }
+ 
++    #[test]
++    fn stripe_writers_avoid_tap_readers_and_stay_until_their_stripe_goes_silent() {
++        let readers: Vec<_> = (0..4).map(|_| AtomicU64::new(0)).collect();
++        let slot = AtomicU64::new(0);
++        // Without a shared slot the stripe number picks the writer.
++        assert_eq!(stripe_writer(None, &readers, 6, 4, 0), 2);
++        // Worker 0 reads a TAP, so stripe 0 goes to the first quiet worker.
++        mark_reader(&readers[0], 100);
++        assert_eq!(stripe_writer(Some(&slot), &readers, 0, 4, 150), 1);
++        // The choice holds while frames arrive, even once worker 1 reads too.
++        mark_reader(&readers[1], 200);
++        assert_eq!(stripe_writer(Some(&slot), &readers, 0, 4, 250), 1);
++        assert_eq!(
++            stripe_writer(Some(&slot), &readers, 0, 4, 250 + FLOW_IDLE_MS - 1),
++            1
++        );
++        // After a silent second the stripe is placed afresh; no worker has
++        // read within READER_MS, so stripe 5 takes worker 5 mod 4.
++        let late = 250 + 2 * FLOW_IDLE_MS;
++        assert_eq!(stripe_writer(Some(&slot), &readers, 5, 4, late), 1);
++        // With worker 1 reading, it takes the third of workers 0, 2 and 3.
++        let slot = AtomicU64::new(0);
++        mark_reader(&readers[1], late);
++        assert_eq!(stripe_writer(Some(&slot), &readers, 5, 4, late), 3);
++        // When every worker reads, the stripe number decides.
++        for reader in &readers {
++            mark_reader(reader, late);
++        }
++        let slot = AtomicU64::new(0);
++        assert_eq!(stripe_writer(Some(&slot), &readers, 7, 4, late), 3);
++    }
++
+     #[test]
+     fn backlogged_flows_stripe_across_data_lanes_only_where_negotiated() {
+         let ms = Duration::from_millis;
+@@ -9251,6 +9366,10 @@ mod tests {
+             backlog: (0..2)
+                 .map(|_| (0..tx_lanes).map(|_| AtomicU64::new(0)).collect())
+                 .collect(),
++            writers: (0..2)
++                .map(|_| (0..STRIPE_SLOTS).map(|_| AtomicU64::new(0)).collect())
++                .collect(),
++            readers: (0..2).map(|_| AtomicU64::new(0)).collect(),
+         });
+         let workers: [Worker; 2] = std::array::from_fn(|id| {
+             let mut worker = Worker::new(id, Arc::clone(&shared), Control::new()).unwrap();

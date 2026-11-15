@@ -367,8 +367,16 @@ Decisions only the user can make, each blocking a remaining goal:
    on the single-flow target, the bar is not met: striping lifts the flow
    by about 8% at 0.5% loss and reorders ten times more frames. Worker 0
    on each side reads the whole TAP and is also stripe 0's writer, so it
-   saturates while the other workers idle. Next: keep the writer off the
-   TAP reader and measure again; then the hold limit from SRTT.
+   saturates while the other workers idle. Moving the writer elsewhere,
+   fixed or chosen at run time away from TAP readers, did not help
+   either: one direction collapsed or the writer moved within a run
+   (BENCH.md). The design's own limits also rule the bar out on this
+   path: repairs take at least one 7.5 ms round trip, longer than the
+   5 ms hold cap, and the 256-frame window covers about 2.5 ms at
+   1.2 Gbit/s, so every loss is delivered out of order. Next, before
+   more measurement: size the hold and window from the path (more than
+   one round trip, over 1,000 frames per stripe here), and trace why
+   striped runs stall in one direction.
 8. Decided November 14: `daemon.offload_frames` stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should

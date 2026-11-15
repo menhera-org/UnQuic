@@ -697,8 +697,11 @@ CPU per delivered Gbit/s 2.5% at the median, in all six rounds, and lost
 no more frames on the lossy path (BENCH.md). Set it to false to keep
 complete checksums on the wire.
 
-`daemon.stripe_flows`, off by default and still unmeasured, turns on
-single-flow striping (decision 7, design section 13.1). It advertises the
+`daemon.stripe_flows`, off by default, turns on single-flow striping
+(decision 7, design section 13.1). It is experimental: on the lossy
+single-flow target it lifted delivery by about 8% at 0.5% loss, reordered
+ten times more frames, and in some runs collapsed one direction
+(BENCH.md). It advertises the
 optional `STRIPED_FLOWS` feature; it acts only where both peers advertise
 it, `balance_flows` is on, and the session has at least two data lanes.
 When a flow's transmit worker has kept refusing frames for its lane for

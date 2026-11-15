@@ -926,8 +926,33 @@ every striped frame back to the TAP. On the receiving side it dropped
 about 83,000 striped frames per direction and wrote another 190,000–
 260,000 out of sequence. Its receive socket overflowed 1,500–3,900 times.
 The other workers stay at 34–46%. One run at 1% loss collapsed R→L to
-0.23 Gbit/s. Next: keep the stripe writer off the worker that reads the
-TAP, then measure again.
+0.23 Gbit/s.
+
+Two follow-ups tried to keep the writer off the worker that reads the
+TAP. Neither helped.
+
+- Moving every stripe's writer three workers on, so that stripe 0
+  landed on worker 3, the one worker that received no data lane in the
+  first runs ([results](benches/lossy-one-flow-stripe-writer-fixed-exploratory.json)).
+  The kernel picks the queue that QinQ input lands on per run, and in
+  this container it was worker 3's: in three of four striped runs one
+  direction reached 1.36–1.55 Gbit/s while the other fell to 0.10–0.61.
+- Letting receive owners choose the writer at run time, among workers
+  that had not read a TAP in the last 100 ms, and keep that choice
+  while the stripe stays active
+  ([patch](benches/stripe-writer-off-tap-readers-rejected.patch),
+  [results](benches/lossy-one-flow-stripe-writer-off-readers-rejected.json)).
+  Striped runs delivered 0.44–1.45 Gbit/s against 0.75–1.20 without
+  striping, with every worker reporting writer drops and out-of-order
+  writes, so the writer moved within a run.
+
+The order cannot hold on this path in any case. A repair takes at least
+one 7.5 ms round trip, but the hold limit is capped at 5 ms, and at
+1.2 Gbit/s the 256-frame window fills in about 2.5 ms. Every lost frame
+therefore forces a skip and arrives out of sequence, which matches the
+hundreds of thousands of out-of-order writes. Keeping order through
+repairs here would need a hold of more than one round trip and a window
+of over 1,000 frames per stripe, about 1.5 MB at 1500-byte frames.
 
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
