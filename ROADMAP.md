@@ -34,6 +34,17 @@ reassembly copy. Differences near 1% are now about as large as the
 point's A/A noise. The kernel figures need an R86S-class box with real
 NICs to confirm.
 
+Later on November 15 the user chose sender bookkeeping. Measurement
+ruled out both planned restructures (per-packet records cost about 20
+cycles; per-frame state is already cached because frame slots are reused
+LIFO), so the work moved to the small-frame point, where per-frame
+bookkeeping is a larger share, and to skipping whole stages: retained,
+fully acknowledged frames are now freed in the ACK pass (−2.8% there),
+and TAP super-frames expand in runs of segments (−1.9%). The small-frame
+point now costs each daemon about 2,150 and 2,000 busy cycles per frame
+event. Without GSO the full-size point costs about 19,400, almost all of
+it per-frame syscalls (one TAP read, send and write per frame).
+
 ## November 13 checkpoint
 
 Balanced lanes' loopback loss came from ACKs waiting for packet numbers.
