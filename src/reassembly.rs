@@ -810,8 +810,9 @@ impl Lane {
         let mut slots = [0u8; FRAME_CAPACITY];
         let mut count = 0;
         let mut index = 0;
+        // The mask covers the first 64 ready frames; a lane may queue more.
         self.ready.retain(|&slot| {
-            let remove = mask & (1 << index) != 0;
+            let remove = index < 64 && mask & (1 << index) != 0;
             index += 1;
             if remove {
                 slots[count] = slot;
@@ -933,7 +934,8 @@ mod tests {
     fn batch_completion_releases_only_selected_slots_and_preserves_other_frames() {
         let mut lane = Lane::new(1, 9022).unwrap();
         let mut bytes = [0; 256];
-        for sequence in 1..=64u64 {
+        let full = FRAME_CAPACITY as u64;
+        for sequence in 1..=full {
             let payload = [sequence as u8; 60];
             let n = crate::wire::encode_datagram(
                 crate::wire::Header {
@@ -963,21 +965,26 @@ mod tests {
                 Admission::Fresh
             );
         }
+        // The mask covers the first 64 ready frames; the rest stay queued.
         lane.finish_ready(0x5555_5555_5555_5555);
-        assert_eq!(lane.retained_frames(), 32);
-        assert_eq!(lane.retained_bytes(), 32 * 60);
+        assert_eq!(lane.retained_frames(), 96);
+        assert_eq!(lane.retained_bytes(), 96 * 60);
         assert_eq!(
             lane.ready_frames(Duration::ZERO)
-                .map(|f| f[0])
+                .map(|f| u64::from(f[0]))
                 .collect::<Vec<_>>(),
-            (2..=64).step_by(2).collect::<Vec<_>>()
+            (2..=64).step_by(2).chain(65..=full).collect::<Vec<_>>()
         );
-        for sequence in 1..=64 {
-            assert_eq!(lane.terminal.old(sequence), sequence % 2 == 1);
-            assert_eq!(lane.find(sequence).is_none(), sequence % 2 == 1);
+        for sequence in 1..=full {
+            let finished = sequence <= 64 && sequence % 2 == 1;
+            assert_eq!(lane.terminal.old(sequence), finished);
+            assert_eq!(lane.find(sequence).is_none(), finished);
         }
         lane.finish_ready(1);
         assert!(lane.terminal.old(2));
+        lane.finish_ready(u64::MAX);
+        assert_eq!(lane.retained_frames(), 31);
+        assert!(!lane.terminal.old(98));
         lane.finish_ready(u64::MAX);
         assert_eq!(lane.retained_frames(), 0);
         assert_eq!(lane.retained_bytes(), 0);

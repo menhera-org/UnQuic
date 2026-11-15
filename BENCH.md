@@ -1000,6 +1000,14 @@ the lossy gate is a requirement, and the change is small to revert if a
 cheaper layout turns up. Where the 1% goes is not known yet; the
 larger slot table and the `u128` masks are the suspects.
 
+The first landed version (aed037d) had a bug these runs could not show.
+A TAP batch's completion mask covers the first 64 ready frames, but
+`finish_ready` walked the whole ready queue, which can now hold up to 128,
+and shifted a `u64` by the position. In a release build a frame past
+position 63 could be released unwritten whenever the bit at its position
+modulo 64 was set. The fix stops at 64, and the batch test now fills all
+128 slots.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames
