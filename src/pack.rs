@@ -67,6 +67,8 @@ pub struct Lane {
     offload: bool,
     // Whether the connection negotiated partial checksums.
     partial: bool,
+    // Whether the connection negotiated striped flows.
+    striped: bool,
     next_frame: u64,
 }
 impl Lane {
@@ -91,6 +93,7 @@ impl Lane {
             frame_limit: connection.max_frame_len,
             offload: connection.offload_frames(),
             partial: connection.partial_checksums(),
+            striped: connection.striped_flows(),
             next_frame: 1,
         })
     }
@@ -265,6 +268,7 @@ impl<'a> Frame<'a> {
             bytes,
             offload: false,
             partial: false,
+            striped: false,
         };
         let length =
             encode_data_prefix(self.lane.header, record, prefix).map_err(PackError::Wire)?;
@@ -302,6 +306,7 @@ impl<'a> Frame<'a> {
             bytes: self.bytes.get(self.offset..end).ok_or(PackError::Frame)?,
             offload: false,
             partial: false,
+            striped: false,
         };
         let packet = self.lane.record(record, output)?;
         self.offset = end;
@@ -335,6 +340,9 @@ pub struct FrameInput<'a> {
     /// An ordinary TCP or UDP frame whose checksum holds only the
     /// pseudo-header sum; needs a lane with partial_checksums.
     pub partial: bool,
+    /// A striped frame, whose bytes start with a stripe tag; needs a lane
+    /// with striped_flows.
+    pub striped: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -595,16 +603,22 @@ impl Batch {
         if frames.len() > BATCH_CAPACITY
             || frames.iter().any(|frame| {
                 let length = frame.header.len().saturating_add(frame.bytes.len());
+                let tag = if frame.striped {
+                    crate::wire::STRIPE_TAG_LEN
+                } else {
+                    0
+                };
                 let lengths = if frame.offload {
                     if !lane.offload {
                         return true;
                     }
-                    14 + DESCRIPTOR_LEN..=MAX_OFFLOAD_FRAME_LEN
+                    14 + tag + DESCRIPTOR_LEN..=MAX_OFFLOAD_FRAME_LEN
                 } else {
-                    14..=usize::from(lane.frame_limit)
+                    14 + tag..=usize::from(lane.frame_limit) + tag
                 };
                 !lengths.contains(&length)
                     || (frame.partial && (frame.offload || !lane.partial))
+                    || (frame.striped && !lane.striped)
                     || frame.offset >= frame.end
                     || frame.end > length
                     || frame.id >> 48 != u64::from(lane.header.lane)
@@ -706,7 +720,7 @@ impl Batch {
                     frame_len as u32,
                     offset as u32,
                     end - offset,
-                    crate::wire::data_flags(input.offload, input.partial),
+                    crate::wire::data_flags(input.offload, input.partial, input.striped),
                     &mut prefix,
                 )
                 .map_err(PackError::Wire)?;
@@ -1033,6 +1047,7 @@ mod tests {
             end: 1514,
             offload: false,
             partial: false,
+            striped: false,
         }];
         lane.header.packet_number = u64::MAX;
         let mut batch = Batch::new();
@@ -1078,6 +1093,7 @@ mod tests {
             end: 18_044,
             offload: true,
             partial: false,
+            striped: false,
         };
         let mut batch = Batch::new();
         assert_eq!(
@@ -1120,6 +1136,7 @@ mod tests {
             end: 1514,
             offload: false,
             partial: true,
+            striped: false,
         };
         let mut batch = Batch::new();
         assert_eq!(
@@ -1143,6 +1160,50 @@ mod tests {
         assert!(pieces >= 2);
         for index in 0..pieces {
             assert_eq!(batch.prefixes[index][1], 2, "partial flag on every piece");
+        }
+    }
+
+    #[test]
+    fn striped_frames_need_negotiation_count_their_tag_and_flag_every_piece() {
+        let mut plain = lane();
+        let mut lane = lane();
+        lane.striped = true;
+        let limit = lane.frame_limit();
+        let tagged = limit + crate::wire::STRIPE_TAG_LEN;
+        let id = lane.start_frame(limit).unwrap();
+        plain.start_frame(limit).unwrap();
+        let bytes = vec![7; tagged - 62];
+        let input = FrameInput {
+            id,
+            header: &[9; 62],
+            bytes: &bytes,
+            offset: 0,
+            end: tagged,
+            offload: false,
+            partial: false,
+            striped: true,
+        };
+        let mut batch = Batch::new();
+        assert_eq!(
+            batch.prepare(&mut plain, &[input], 1232),
+            Err(PackError::Frame)
+        );
+        // Untagged, the same length exceeds the ceiling.
+        let untagged = FrameInput {
+            striped: false,
+            ..input
+        };
+        assert_eq!(
+            batch.prepare(&mut lane, &[untagged], 1232),
+            Err(PackError::Frame)
+        );
+        batch.prepare(&mut lane, &[input], 1232).unwrap();
+        let pieces: usize = (0..batch.len())
+            .map(|packet| batch.pieces(packet).unwrap().count())
+            .sum();
+        assert!(pieces >= 2);
+        for index in 0..pieces {
+            assert_eq!(batch.prefixes[index][1], 4, "striped flag on every piece");
         }
     }
 
@@ -1204,6 +1265,7 @@ mod renumber_tests {
             end: 1514,
             offload: false,
             partial: false,
+            striped: false,
         }];
         batch.prepare(&mut lane, &frames, BASE_UDP_PAYLOAD).unwrap();
         assert_eq!(batch.len(), 2);
@@ -1248,6 +1310,7 @@ mod retained_prefix_tests {
                 end: payload.len(),
                 offload: false,
                 partial: false,
+                striped: false,
             })
             .collect();
         let mut batch = Batch::new();
@@ -1326,6 +1389,7 @@ mod refill_tests {
                         end: length,
                         offload: false,
                         partial: false,
+                        striped: false,
                     });
                     lengths.push(length);
                     accepted.push(0);
@@ -1408,6 +1472,7 @@ mod refill_tests {
                 end: data.len(),
                 offload: false,
                 partial: false,
+                striped: false,
             })
             .collect();
         let mut batch = Batch::new();

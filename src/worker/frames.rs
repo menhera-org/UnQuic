@@ -390,6 +390,7 @@ impl Store {
             end: frame.length(),
             offload: frame.offload,
             partial: frame.partial,
+            striped: false,
         })
     }
 

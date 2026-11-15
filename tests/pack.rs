@@ -439,6 +439,7 @@ fn pack_all(sender: &mut pack::Lane, frames: &[&[u8]], limit: usize) -> Vec<Vec<
             end: bytes.len(),
             offload: false,
             partial: false,
+            striped: false,
         })
         .collect();
     let mut output = Vec::new();
@@ -577,6 +578,7 @@ fn batch_input_validation_and_empty_queue_preserve_packet_numbers() {
         end: 60,
         offload: false,
         partial: false,
+        striped: false,
     };
     let mut batch = pack::Batch::new();
     for bad in [
@@ -708,6 +710,7 @@ fn packed_datagrams_send_original_slices_through_the_socket_batch() {
             end: bytes.len(),
             offload: false,
             partial: false,
+            striped: false,
         })
         .collect();
     let mut batch = pack::Batch::new();
@@ -772,6 +775,7 @@ fn dropping_alternate_gso_batches_leaves_no_orphan_frames() {
                         end: bytes.len(),
                         offload: false,
                         partial: false,
+                        striped: false,
                     })
                     .collect();
                 while !inputs.is_empty() {
@@ -849,6 +853,7 @@ fn scattered_headers_match_contiguous_frames_across_boundaries_and_retries() {
                             end: size,
                             offload: false,
                             partial: false,
+                            striped: false,
                         }
                     })
                     .collect();
@@ -939,6 +944,7 @@ fn selected_ranges_preserve_total_length_across_spans_and_partial_sends() {
                     end: range.end,
                     offload: false,
                     partial: false,
+                    striped: false,
                 })
                 .collect();
             let mut assembled = [Vec::new(), Vec::new(), Vec::new()];
@@ -1003,6 +1009,7 @@ fn losing_each_original_piece_and_its_first_repair_still_delivers_once() {
                 end: bytes.len(),
                 offload: false,
                 partial: false,
+                striped: false,
             };
             let mut batch = pack::Batch::new();
             batch.prepare(&mut sender, &[input], limit).unwrap();
@@ -1177,6 +1184,7 @@ fn packed_tail_head_loss_recovers_through_actual_receiver_acks_without_duplicate
                 end: length,
                 offload: false,
                 partial: false,
+                striped: false,
             })
             .collect();
         let mut history = History::new().unwrap();

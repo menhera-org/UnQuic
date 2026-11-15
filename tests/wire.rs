@@ -98,6 +98,7 @@ fn record(kind: usize) -> Record<'static> {
             bytes: &[0xde, 0xad, 0xbe, 0xef],
             offload: false,
             partial: false,
+            striped: false,
         },
         2 => Record::Ack {
             lane: 0x5678,
@@ -260,15 +261,15 @@ fn rejects_bad_header_length_magic_version_and_reserved_flags() {
 fn rejects_bad_record_types_lengths_flags_and_reserved_bodies() {
     for kind in 0..VECTORS.len() {
         let good = vector(kind);
-        // DATA defines flags 1 (offload) and 2 (partial checksum), never both;
-        // every other value and record reserves them.
-        for flags in [1, 2, 3, 4, 0x80] {
-            if kind == 1 && matches!(flags, 1 | 2) {
+        // DATA defines flags 1 (offload), 2 (partial checksum) and 4 (striped),
+        // never 1 and 2 together; every other value and record reserves them.
+        for flags in [1, 2, 3, 4, 7, 8, 0x80] {
+            if kind == 1 && matches!(flags, 1 | 2 | 4) {
                 continue;
             }
             let mut bad = good.clone();
             bad[49] = flags;
-            let expected = if kind == 1 && flags == 3 {
+            let expected = if kind == 1 && matches!(flags, 3 | 7) {
                 WireError::Data
             } else {
                 WireError::Reserved
@@ -388,6 +389,7 @@ fn rejects_data_identity_and_range_errors_without_overflow() {
             bytes: &payload,
             offload: false,
             partial: false,
+            striped: false,
         };
         let mut output = vec![0; HEADER_LEN + record.encoded_len()];
         encode_datagram(header(false), &[record], &mut output).unwrap();
@@ -405,6 +407,7 @@ fn offload_flag_round_trips_and_moves_the_frame_length_bounds() {
         bytes: &payload[..length],
         offload,
         partial: false,
+        striped: false,
     };
     for (total_len, length) in [(24, 24), (9023, 100), (65_535, 100)] {
         let mut output = vec![0; HEADER_LEN + data(total_len, length, true).encoded_len()];
@@ -446,6 +449,7 @@ fn partial_flag_round_trips_and_never_joins_the_offload_flag() {
         bytes: &payload,
         offload,
         partial,
+        striped: false,
     };
     let mut output = vec![0; HEADER_LEN + data(false, true).encoded_len()];
     encode_datagram(header(false), &[data(false, true)], &mut output).unwrap();
@@ -459,7 +463,7 @@ fn partial_flag_round_trips_and_never_joins_the_offload_flag() {
     };
     assert!(partial && !offload);
     // Both flags, or an undefined one, are refused on decode and encode.
-    for flags in [3, 4, 0x80] {
+    for flags in [3, 7, 8, 0x80] {
         output[49] = flags;
         assert!(Datagram::decode(&output).is_err(), "flags {flags}");
     }
@@ -470,6 +474,53 @@ fn partial_flag_round_trips_and_never_joins_the_offload_flag() {
     let mut prefix = [0; unquic::wire::DATA_PREFIX_LEN];
     unquic::wire::encode_data_prefix(header(false), data(false, true), &mut prefix).unwrap();
     assert_eq!(prefix[HEADER_LEN + 1], 2);
+}
+
+#[test]
+fn striped_flag_round_trips_with_either_other_flag_and_counts_its_tag() {
+    use unquic::wire::{MAX_OFFLOAD_FRAME_LEN, STRIPE_TAG_LEN};
+    let payload = [0x5a; 100];
+    let data = |total_len: u32, offload: bool, partial: bool| Record::Data {
+        frame_id: FRAME,
+        total_len,
+        offset: 0,
+        bytes: &payload,
+        offload,
+        partial,
+        striped: true,
+    };
+    for (record, flags) in [
+        (data(1514 + STRIPE_TAG_LEN as u32, false, false), 4),
+        (data(9022 + STRIPE_TAG_LEN as u32, false, true), 6),
+        (data(MAX_OFFLOAD_FRAME_LEN as u32, true, false), 5),
+    ] {
+        let mut output = vec![0; HEADER_LEN + record.encoded_len()];
+        encode_datagram(header(false), &[record], &mut output).unwrap();
+        assert_eq!(output[49], flags);
+        roundtrip(&output);
+        let Some(Record::Data {
+            offload,
+            partial,
+            striped,
+            ..
+        }) = Datagram::decode(&output).unwrap().records().next()
+        else {
+            panic!("expected DATA")
+        };
+        assert_eq!(
+            (offload, partial, striped),
+            (flags & 1 != 0, flags & 2 != 0, true)
+        );
+    }
+    // The tag counts toward the frame's length: an ordinary striped frame may
+    // reach the ceiling plus the tag, and must hold the tag and a header.
+    let mut output = [0; 1024];
+    for total_len in [9023 + STRIPE_TAG_LEN as u32, 13 + STRIPE_TAG_LEN as u32] {
+        assert_eq!(
+            encode_datagram(header(false), &[data(total_len, false, false)], &mut output),
+            Err(WireError::Data)
+        );
+    }
 }
 
 #[test]
@@ -630,6 +681,7 @@ fn encoder_errors_never_modify_output() {
             bytes: &[],
             offload: false,
             partial: false,
+            striped: false,
         }],
         vec![Record::Padding { length: u16::MAX }],
         vec![Record::Padding { length: 40000 }; 2],

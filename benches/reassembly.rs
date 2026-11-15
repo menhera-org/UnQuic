@@ -30,6 +30,7 @@ fn main() {
                     bytes: &frame[offset..end],
                     offload: false,
                     partial: false,
+                    striped: false,
                 }],
                 &mut bytes,
             )

@@ -1082,7 +1082,9 @@ of its frames.
 
 Landing order: the receiver's reorder window as a unit with tests for
 every gap rule (landed first, `reorder::Window`); the wire flag, tag and
-negotiation with codec tests; the writer handoff; the sender's flow
+negotiation with codec tests (landed second; receive lanes refuse striped
+pieces until the writer exists); the writer handoff, including two-slot
+runs for a striped frame longer than one reassembly slot; the sender's flow
 selection and lane rotation. Measure on
 the stage 3 single-flow target (7.5 ms RTT, 0.5% and 1% loss, four
 workers, 5 Gbit/s offered), stating the bar first: delivery above the

@@ -513,14 +513,18 @@ impl Lane {
                     total_len,
                     offload,
                     partial,
+                    striped,
                     ..
                 } => {
                     // The codec bounds offload frames by MAX_OFFLOAD_FRAME_LEN.
+                    // Striped frames wait for their reorder writer (design
+                    // section 13.1, item 6), so no lane accepts them yet.
                     if if offload {
                         !self.offload
                     } else {
                         total_len > u32::from(self.frame_limit)
                     } || (partial && !self.partial)
+                        || striped
                     {
                         return Admission::Invalid;
                     }
@@ -905,6 +909,7 @@ mod tests {
                     bytes: &payload,
                     offload: false,
                     partial: false,
+                    striped: false,
                 }],
                 &mut bytes,
             )
@@ -959,6 +964,7 @@ mod tests {
                     bytes: &[sequence as u8; 60],
                     offload,
                     partial: false,
+                    striped: false,
                 }],
                 &mut bytes,
             )
@@ -977,6 +983,39 @@ mod tests {
         assert!(lane.front(Duration::ZERO).unwrap().offload);
         assert!(lane.finish_front());
         assert_eq!(firsts(&mut lane), [3]);
+    }
+
+    #[test]
+    fn striped_frames_are_refused_until_a_reorder_writer_receives_them() {
+        let mut lane = Lane::new(1, 9022).unwrap();
+        lane.accept_offload_frames(true);
+        lane.accept_partial_checksums(true);
+        let mut bytes = [0; 256];
+        for (offload, partial) in [(false, false), (false, true), (true, false)] {
+            let n = crate::wire::encode_datagram(
+                crate::wire::Header {
+                    cookie: crate::UnquicUuid::from_bytes([1; 16]),
+                    receive_tag: 1,
+                    lane: 1,
+                    packet_number: 1,
+                    record_area_len: 0,
+                },
+                &[Record::Data {
+                    frame_id: (1 << 48) | 1,
+                    total_len: 80,
+                    offset: 0,
+                    bytes: &[1; 80],
+                    offload,
+                    partial,
+                    striped: true,
+                }],
+                &mut bytes,
+            )
+            .unwrap();
+            let datagram = Datagram::decode(&bytes[..n]).unwrap();
+            assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Invalid);
+        }
+        assert_eq!(lane.retained_bytes(), 0);
     }
 
     #[test]
@@ -1001,6 +1040,7 @@ mod tests {
                         bytes: &[sequence as u8; 30],
                         offload,
                         partial,
+                        striped: false,
                     }],
                     &mut bytes,
                 )
@@ -1104,6 +1144,7 @@ mod tests {
                         bytes: &payload[..length],
                         offload,
                         partial: false,
+                        striped: false,
                     }
                 };
             }

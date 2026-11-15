@@ -22,6 +22,12 @@ pub const OFFLOAD_FRAMES: u32 = 1;
 /// Optional handshake feature bit 1: DATA may carry ordinary frames whose
 /// TCP or UDP checksum the receiver completes.
 pub const PARTIAL_CHECKSUMS: u32 = 2;
+/// Optional handshake feature bit 2: DATA may carry striped frames, whose
+/// bytes start with a STRIPE_TAG_LEN-byte stripe tag (design section 13.1).
+pub const STRIPED_FLOWS: u32 = 4;
+/// Bytes of the tag that starts every striped frame: a 16-bit stripe number
+/// and a 48-bit sequence from 1, big-endian.
+pub const STRIPE_TAG_LEN: usize = 8;
 /// Bytes of the descriptor that starts every offload frame.
 pub const DESCRIPTOR_LEN: usize = 10;
 /// Largest offload frame, descriptor included.
@@ -227,6 +233,10 @@ pub enum Record<'a> {
         /// to complete. Never set with `offload`; valid only on connections
         /// that negotiated PARTIAL_CHECKSUMS.
         partial: bool,
+        /// Record flag bit 2: a piece of a striped frame, whose bytes start
+        /// with a STRIPE_TAG_LEN-byte stripe tag, before any offload
+        /// descriptor. Valid only on connections that negotiated STRIPED_FLOWS.
+        striped: bool,
     },
     /// Transport acceptance of packets on the explicitly named sender lane.
     Ack {
@@ -353,8 +363,11 @@ impl Record<'_> {
         };
         let flags = match self {
             Self::Data {
-                offload, partial, ..
-            } => u8::from(offload) | u8::from(partial) << 1,
+                offload,
+                partial,
+                striped,
+                ..
+            } => data_flags(offload, partial, striped),
             _ => 0,
         };
         // The length check above bounds every write; errors only keep this panic-free.
@@ -458,7 +471,14 @@ impl Record<'_> {
                 bytes,
                 offload,
                 partial,
-            } => validate_data(frame_id, total_len, offset, bytes.len(), offload, partial)?,
+                striped,
+            } => validate_data(
+                frame_id,
+                total_len,
+                offset,
+                bytes.len(),
+                data_flags(offload, partial, striped),
+            )?,
             Self::Ack {
                 lane,
                 delay_us,
@@ -658,6 +678,7 @@ pub fn encode_data_prefix(
         bytes,
         offload,
         partial,
+        striped,
     } = data
     else {
         return Err(WireError::Data);
@@ -668,14 +689,15 @@ pub fn encode_data_prefix(
         total_len,
         offset,
         bytes.len(),
-        data_flags(offload, partial),
+        data_flags(offload, partial, striped),
         output,
     )
 }
 
-/// A DATA record's flags byte: bit 0 offload, bit 1 partial checksum.
-pub(crate) const fn data_flags(offload: bool, partial: bool) -> u8 {
-    offload as u8 | (partial as u8) << 1
+/// A DATA record's flags byte: bit 0 offload, bit 1 partial checksum, bit 2
+/// striped.
+pub(crate) const fn data_flags(offload: bool, partial: bool, striped: bool) -> u8 {
+    offload as u8 | (partial as u8) << 1 | (striped as u8) << 2
 }
 
 fn validate_data(
@@ -683,20 +705,21 @@ fn validate_data(
     total_len: u32,
     offset: u32,
     length: usize,
-    offload: bool,
-    partial: bool,
+    flags: u8,
 ) -> Result<(), WireError> {
     if length > u16::MAX as usize - 20 {
         return Err(WireError::Length);
     }
+    let (offload, partial, striped) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
     // An offload frame's descriptor already says whether its checksum is partial.
-    if offload && partial {
+    if flags > 7 || (offload && partial) {
         return Err(WireError::Data);
     }
+    let tag = if striped { STRIPE_TAG_LEN as u32 } else { 0 };
     let lengths = if offload {
-        (14 + DESCRIPTOR_LEN) as u32..=MAX_OFFLOAD_FRAME_LEN as u32
+        14 + tag + DESCRIPTOR_LEN as u32..=MAX_OFFLOAD_FRAME_LEN as u32
     } else {
-        14..=MAX_FRAME_LEN as u32
+        14 + tag..=MAX_FRAME_LEN as u32 + tag
     };
     if frame_id >> 48 == 0
         || frame_id & 0x0000_ffff_ffff_ffff == 0
@@ -721,18 +744,15 @@ pub(crate) fn encode_data_prefix_length(
     flags: u8,
     output: &mut [u8; DATA_PREFIX_LEN],
 ) -> Result<usize, WireError> {
-    let (offload, partial) = (flags & 1 != 0, flags & 2 != 0);
-    if flags > 3 {
-        return Err(WireError::Data);
-    }
-    validate_data(frame_id, total_len, offset, piece_len, offload, partial)?;
+    validate_data(frame_id, total_len, offset, piece_len, flags)?;
     Record::Data {
         frame_id,
         total_len,
         offset,
         bytes: &[],
-        offload,
-        partial,
+        offload: flags & 1 != 0,
+        partial: flags & 2 != 0,
+        striped: flags & 4 != 0,
     }
     .validate_context(header, 1)?;
     let length = 20 + piece_len;
@@ -797,8 +817,9 @@ fn decode_record(input: &[u8]) -> Result<(Record<'_>, usize), WireError> {
     }
     let [kind, flags] = read(input, 0);
     // Only DATA defines flags: bit 0 marks an offload frame's piece, bit 1 a
-    // partial checksum; validation rejects both together.
-    if flags != 0 && (kind != 1 || flags > 3) {
+    // partial checksum and bit 2 a striped frame; validation rejects bits 0
+    // and 1 together.
+    if flags != 0 && (kind != 1 || flags > 7) {
         return Err(WireError::Reserved);
     }
     let length = usize::from(read16(input, 2));
@@ -820,6 +841,7 @@ fn decode_record(input: &[u8]) -> Result<(Record<'_>, usize), WireError> {
             bytes: tail(body, 16),
             offload: flags & 1 != 0,
             partial: flags & 2 != 0,
+            striped: flags & 4 != 0,
         },
         2 if body.len() >= 8 => {
             let [count, reserved] = read(body, 2);
@@ -997,18 +1019,30 @@ fn scattered_data_prefix_rejects_invalid_lengths_before_writing() {
         );
         assert_eq!(output, [0xa5; DATA_PREFIX_LEN]);
     }
-    // A partial offload piece and unknown flags are rejected before any write.
-    for flags in [3, 4] {
+    // A partial offload piece, unknown flags, and a striped frame too short
+    // for its tag and an Ethernet header are rejected before any write.
+    for (flags, total) in [(3, 60), (7, 60), (8, 60), (4, 21)] {
         let mut output = [0xa5; DATA_PREFIX_LEN];
         assert_eq!(
-            encode_data_prefix_length(header, (1 << 48) | 1, 60, 0, 1, flags, &mut output),
+            encode_data_prefix_length(header, (1 << 48) | 1, total, 0, 1, flags, &mut output),
             Err(WireError::Data)
         );
         assert_eq!(output, [0xa5; DATA_PREFIX_LEN]);
     }
+    // Partial, striped, striped offload and striped partial frames encode.
+    for flags in [2, 4, 5, 6] {
+        let mut output = [0; DATA_PREFIX_LEN];
+        encode_data_prefix_length(header, (1 << 48) | 1, 60, 0, 1, flags, &mut output).unwrap();
+        assert_eq!(output[HEADER_LEN + 1], flags);
+    }
+    // The tag lets an ordinary striped frame exceed the frame ceiling by its length.
     let mut output = [0; DATA_PREFIX_LEN];
-    encode_data_prefix_length(header, (1 << 48) | 1, 60, 0, 1, 2, &mut output).unwrap();
-    assert_eq!(output[HEADER_LEN + 1], 2);
+    let tagged = (MAX_FRAME_LEN + STRIPE_TAG_LEN) as u32;
+    encode_data_prefix_length(header, (1 << 48) | 1, tagged, 0, 1, 4, &mut output).unwrap();
+    assert_eq!(
+        encode_data_prefix_length(header, (1 << 48) | 1, tagged, 0, 1, 0, &mut output),
+        Err(WireError::Data)
+    );
 }
 
 #[cfg(test)]
@@ -1040,6 +1074,7 @@ fn random_and_mutated_datagrams_never_panic_decoding() {
         bytes: &[7; 50],
         offload: false,
         partial: false,
+        striped: false,
     };
     let ack = Record::Ack {
         lane: 2,

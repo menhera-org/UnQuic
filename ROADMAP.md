@@ -325,7 +325,13 @@ Decisions only the user can make, each blocking a remaining goal:
    runtime so far: fixed storage, skips by abandonment, hold limit and
    full window, late frames delivered once out of sequence, and a
    randomized test that every frame leaves at most once and in order
-   except late ones.
+   except late ones. The wire step followed: optional feature bit 2,
+   `STRIPED_FLOWS`, DATA flag bit 2 with the 8-byte tag counted in the
+   frame's length (an ordinary striped frame may reach the ceiling plus
+   the tag), the packer's checks, and receive lanes that refuse striped
+   pieces until the reorder writer lands. Nothing advertises the bit yet.
+   Next: the writer handoff, which also needs a two-slot run for a
+   striped frame longer than one reassembly slot.
 8. Decided November 14: `daemon.offload_frames` stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should

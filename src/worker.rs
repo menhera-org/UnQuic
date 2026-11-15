@@ -771,6 +771,7 @@ impl TxBatch {
             end: 0,
             offload: false,
             partial: false,
+            striped: false,
         }; pack::BATCH_CAPACITY];
         for (index, (input, frame)) in inputs.iter_mut().zip(&self.frames[..self.len]).enumerate() {
             *input = frame
@@ -3885,6 +3886,7 @@ impl Worker {
                         end: 0,
                         offload: false,
                         partial: false,
+                        striped: false,
                     })
             });
             let mut slices = [&[][..]; pack::BATCH_SLICES];
@@ -6022,6 +6024,7 @@ mod tests {
             bytes,
             offload: false,
             partial: false,
+            striped: false,
         }
     }
 
@@ -6046,6 +6049,7 @@ mod tests {
             bytes,
             offload: true,
             partial: false,
+            striped: false,
         };
         let mut bytes = [0; BASE_UDP_PAYLOAD];
         let lane = worker.sessions[0].rx[0].as_mut().unwrap();
@@ -6186,6 +6190,7 @@ mod tests {
                     bytes: &[sequence as u8; 60],
                     offload: false,
                     partial: false,
+                    striped: false,
                 }],
                 &mut buffer.bytes,
             )
@@ -6262,6 +6267,7 @@ mod tests {
                     bytes: &[5; 30],
                     offload: false,
                     partial: false,
+                    striped: false,
                 }],
                 &mut buffer.bytes,
             )
@@ -7111,6 +7117,7 @@ mod tests {
                         bytes: &[3; 1164],
                         offload: false,
                         partial: false,
+                        striped: false,
                     }],
                     &mut buffer.bytes[buffer.length..],
                 );
@@ -8648,6 +8655,7 @@ mod tests {
                             bytes: &payload[..1 + rng.below((total - offset).min(1400))],
                             offload: false,
                             partial: false,
+                            striped: false,
                         }
                     }
                     2 => match AckRanges::new(&storage[slot][..counts[slot]]) {
@@ -8990,6 +8998,7 @@ mod tests {
                     bytes: &[5; 30],
                     offload: false,
                     partial: false,
+                    striped: false,
                 }],
                 &mut buffer.bytes,
             )
@@ -9158,6 +9167,7 @@ mod tests {
                     bytes: if short { &[5; 14] } else { &[5; 30] },
                     offload: false,
                     partial: false,
+                    striped: false,
                 }],
                 &mut buffer.bytes[start..],
             )
