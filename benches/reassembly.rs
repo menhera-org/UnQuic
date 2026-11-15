@@ -29,6 +29,7 @@ fn main() {
                     offset: offset as u32,
                     bytes: &frame[offset..end],
                     offload: false,
+                    partial: false,
                 }],
                 &mut bytes,
             )

@@ -1,0 +1,28 @@
+diff --git a/src/tap/segment.rs b/src/tap/segment.rs
+index 022fd0f..077a8a4 100644
+--- a/src/tap/segment.rs
++++ b/src/tap/segment.rs
+@@ -185,7 +185,8 @@ impl Segments {
+         output: &mut [u8],
+     ) -> Option<std::ops::Range<usize>> {
+         let count = self.size.min(input.len().checked_sub(self.next)?);
+-        self.write_run(input, output, count, 1, true)
++        // DIAGNOSTIC: leave the checksum seed; never land.
++        self.write_run(input, output, count, 1, false)
+     }
+ 
+     /// Writes the header for the next `count` payload bytes, `segments` whole
+diff --git a/src/tap/uso.rs b/src/tap/uso.rs
+index 01c9709..b62001f 100644
+--- a/src/tap/uso.rs
++++ b/src/tap/uso.rs
+@@ -145,7 +145,8 @@ fn transport(frame: &[u8]) -> Option<Layout> {
+         tcp,
+         v6,
+     };
+-    (fold(layout.pseudo(frame, frame.len() - at) + sum(&frame[at..])) == 65535).then_some(layout)
++    // DIAGNOSTIC: skip verification; never land.
++    Some(layout)
+ }
+ /// Callers check lengths first; the zero fallback only keeps this panic-free.
+ fn sequence(frame: &[u8], at: usize) -> u32 {

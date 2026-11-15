@@ -274,16 +274,18 @@ mod tests {
             assert!(loaded.config.daemon.probe_rtt_ack_delay);
             assert!(loaded.config.daemon.control_lane);
             assert!(!loaded.config.daemon.offload_frames);
+            assert!(loaded.config.daemon.partial_checksums);
             loaded.config.validate().unwrap();
         }
         let text = format!(
-            "[daemon]\ncontrol_lane = false\nbalance_flows = false\noffload_frames = true\n{}",
+            "[daemon]\ncontrol_lane = false\nbalance_flows = false\noffload_frames = true\npartial_checksums = false\n{}",
             sample()
         );
         let loaded = Loaded::parse(&text).unwrap();
         assert!(!loaded.config.daemon.control_lane);
         assert!(!loaded.config.daemon.balance_flows);
         assert!(loaded.config.daemon.offload_frames);
+        assert!(!loaded.config.daemon.partial_checksums);
         loaded.config.validate().unwrap();
         let text = format!("[daemon]\ntx_hold_us = 1000\n{}", sample());
         let loaded = Loaded::parse(&text).unwrap();

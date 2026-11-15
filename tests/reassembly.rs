@@ -32,6 +32,7 @@ fn piece(sequence: u64, offset: u32, payload: &[u8]) -> Record<'_> {
         offset,
         bytes: payload,
         offload: false,
+        partial: false,
     }
 }
 fn admit(lane: &mut Lane, packet: u64, records: &[Record<'_>], now: Duration) -> Admission {
@@ -61,6 +62,7 @@ fn offload_frames_take_slot_runs_and_keep_their_piece_bit() {
         offset,
         bytes: payload,
         offload: true,
+        partial: false,
     };
     let small = |sequence: u64, offset: u32, offload: bool| Record::Data {
         frame_id: id(1, sequence),
@@ -68,6 +70,7 @@ fn offload_frames_take_slot_runs_and_keep_their_piece_bit() {
         offset,
         bytes: &[7; 30],
         offload,
+        partial: false,
     };
     let mut lane = Lane::new(1, 1514).unwrap();
     assert_eq!(
@@ -236,6 +239,7 @@ fn window_advance_releases_only_incomplete_frames_it_passes() {
                     offset: 0,
                     bytes: &[1; 30],
                     offload: false,
+                    partial: false,
                 }],
                 Duration::ZERO
             ),
@@ -262,6 +266,7 @@ fn window_advance_releases_only_incomplete_frames_it_passes() {
                 offset: 30,
                 bytes: &[3; 30],
                 offload: false,
+                partial: false,
             }],
             Duration::ZERO
         ),
@@ -334,6 +339,7 @@ fn retirement_and_lane_identity_prevent_redelivery_until_explicit_reset() {
             offset: 0,
             bytes: &[2; 60],
             offload: false,
+            partial: false,
         }],
     );
     assert_eq!(
@@ -425,6 +431,7 @@ fn length_conflicts_and_negotiated_ceiling_reject_before_any_effect() {
         offset: 0,
         bytes: &[2; 30],
         offload: false,
+        partial: false,
     };
     let huge = Record::Data {
         frame_id: id(1, 2),
@@ -432,6 +439,7 @@ fn length_conflicts_and_negotiated_ceiling_reject_before_any_effect() {
         offset: 0,
         bytes: &[2; 30],
         offload: false,
+        partial: false,
     };
     // Offload frames are not received yet, even when negotiated.
     let offload = Record::Data {
@@ -440,6 +448,7 @@ fn length_conflicts_and_negotiated_ceiling_reject_before_any_effect() {
         offset: 0,
         bytes: &[2; 60],
         offload: true,
+        partial: false,
     };
     for records in [[first, wrong], [first, huge], [first, offload]] {
         assert_eq!(
@@ -477,6 +486,7 @@ fn arbitrary_overlap_keeps_first_bytes_and_all_frame_sizes_reassemble() {
                 offset: start as u32,
                 bytes: &expected[start..end],
                 offload: false,
+                partial: false,
             };
             assert_eq!(
                 admit(&mut lane, packet, &[record], Duration::ZERO),
@@ -647,6 +657,7 @@ fn feedback_excludes_rejected_packets_and_survives_frame_delivery() {
         offset: 0,
         bytes: &[1],
         offload: false,
+        partial: false,
     };
     assert_eq!(
         admit(&mut lane, 65, &[too_large], Duration::ZERO),
@@ -840,6 +851,7 @@ fn pressure_validates_all_lengths_and_defers_controls_until_full_admission() {
         offset: 0,
         bytes: &[0],
         offload: false,
+        partial: false,
     };
     assert_eq!(
         admit(

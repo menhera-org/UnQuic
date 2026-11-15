@@ -770,6 +770,7 @@ impl TxBatch {
             offset: 0,
             end: 0,
             offload: false,
+            partial: false,
         }; pack::BATCH_CAPACITY];
         for (index, (input, frame)) in inputs.iter_mut().zip(&self.frames[..self.len]).enumerate() {
             *input = frame
@@ -1083,6 +1084,10 @@ impl Worker {
                             mandatory_features: 0,
                             optional_features: if config.daemon.offload_frames {
                                 wire::OFFLOAD_FRAMES
+                            } else {
+                                0
+                            } | if config.daemon.partial_checksums {
+                                wire::PARTIAL_CHECKSUMS
                             } else {
                                 0
                             },
@@ -2264,6 +2269,7 @@ impl Worker {
             lane.reset(header.lane, connection.max_frame_len)
                 .map_err(io::Error::other)?;
             lane.accept_offload_frames(connection.offload_frames());
+            lane.accept_partial_checksums(connection.partial_checksums());
             let [.., a, b, c, d] = *header.cookie.as_bytes();
             let cookie_low = u32::from_be_bytes([a, b, c, d]);
             let owner = cookie_low.wrapping_add(u32::from(header.lane) - 1) as usize
@@ -3009,6 +3015,7 @@ impl Worker {
             self.discard_input(source)?;
             return Ok(Some(0));
         };
+        let partial = sender.partial_checksums();
 
         let mut frame = frames::Frame {
             id,
@@ -3020,6 +3027,7 @@ impl Worker {
             header_len: 0,
             header: [0; frames::HEADER_BYTES],
             offload: run.is_some(),
+            partial: false,
         };
         if let Some(range) = run.clone() {
             frame.header = header;
@@ -3033,10 +3041,15 @@ impl Worker {
                 .frames
                 .source(source)
                 .ok_or_else(|| io::Error::other("missing transmit input"))?;
+            let bytes = &input.bytes[..input.length];
             frame.header_len = cursor.header_len();
-            frame.range = cursor
-                .write_header(&input.bytes[..input.length], &mut frame.header)
-                .ok_or_else(|| io::Error::other("invalid transmit header"))?;
+            frame.partial = partial;
+            frame.range = if partial {
+                cursor.write_seed_header(bytes, &mut frame.header)
+            } else {
+                cursor.write_header(bytes, &mut frame.header)
+            }
+            .ok_or_else(|| io::Error::other("invalid transmit header"))?;
         } else {
             let slab = self.slab(session, tag, length)?;
             frame.range = self
@@ -3049,6 +3062,7 @@ impl Worker {
         if let Some(input) = self.frames.source_mut(source) {
             input.segments = segments;
         }
+        let seeded = frame.partial;
         let frame = self
             .frames
             .insert_frame(frame)
@@ -3091,6 +3105,9 @@ impl Worker {
             for totals in [&mut self.counters, &mut self.sessions[session].totals] {
                 if run.is_some() {
                     totals.tx_offload_frames = totals.tx_offload_frames.wrapping_add(1);
+                } else if seeded {
+                    totals.tap_gso_frames = totals.tap_gso_frames.wrapping_add(1);
+                    totals.tx_partial_frames = totals.tx_partial_frames.wrapping_add(1);
                 } else {
                     totals.tap_gso_frames = totals.tap_gso_frames.wrapping_add(1);
                     totals.tap_checksums = totals.tap_checksums.wrapping_add(1);
@@ -3733,6 +3750,7 @@ impl Worker {
                         offset: 0,
                         end: 0,
                         offload: false,
+                        partial: false,
                     })
             });
             let mut slices = [&[][..]; pack::BATCH_SLICES];
@@ -3992,7 +4010,8 @@ impl Worker {
                 let (mask, tcp, result) = if let Some(frame) = offload {
                     (1, false, tap.write_offload(frame.bytes))
                 } else {
-                    tap.write_batch(lane.ready_frames(now).take(budget))
+                    let partial = lane.ready_partial(now);
+                    tap.write_batch_partial(lane.ready_frames(now).take(budget), partial)
                 };
                 if mask == 0 {
                     break;
@@ -5868,6 +5887,7 @@ mod tests {
             offset,
             bytes,
             offload: false,
+            partial: false,
         }
     }
 
@@ -5891,6 +5911,7 @@ mod tests {
             offset: 0,
             bytes,
             offload: true,
+            partial: false,
         };
         let mut bytes = [0; BASE_UDP_PAYLOAD];
         let lane = worker.sessions[0].rx[0].as_mut().unwrap();
@@ -6030,6 +6051,7 @@ mod tests {
                     offset: 0,
                     bytes: &[sequence as u8; 60],
                     offload: false,
+                    partial: false,
                 }],
                 &mut buffer.bytes,
             )
@@ -6105,6 +6127,7 @@ mod tests {
                     offset: 0,
                     bytes: &[5; 30],
                     offload: false,
+                    partial: false,
                 }],
                 &mut buffer.bytes,
             )
@@ -6953,6 +6976,7 @@ mod tests {
                         offset: 0,
                         bytes: &[3; 1164],
                         offload: false,
+                        partial: false,
                     }],
                     &mut buffer.bytes[buffer.length..],
                 );
@@ -8489,6 +8513,7 @@ mod tests {
                             offset: offset as u32,
                             bytes: &payload[..1 + rng.below((total - offset).min(1400))],
                             offload: false,
+                            partial: false,
                         }
                     }
                     2 => match AckRanges::new(&storage[slot][..counts[slot]]) {
@@ -8830,6 +8855,7 @@ mod tests {
                     offset: 0,
                     bytes: &[5; 30],
                     offload: false,
+                    partial: false,
                 }],
                 &mut buffer.bytes,
             )
@@ -8997,6 +9023,7 @@ mod tests {
                     offset: 0,
                     bytes: if short { &[5; 14] } else { &[5; 30] },
                     offload: false,
+                    partial: false,
                 }],
                 &mut buffer.bytes[start..],
             )

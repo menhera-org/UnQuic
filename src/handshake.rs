@@ -89,6 +89,12 @@ impl Connection {
         self.local.optional_features & self.peer.optional_features & crate::wire::OFFLOAD_FRAMES
             != 0
     }
+
+    /// Whether both endpoints advertised partial checksums.
+    pub const fn partial_checksums(self) -> bool {
+        self.local.optional_features & self.peer.optional_features & crate::wire::PARTIAL_CHECKSUMS
+            != 0
+    }
 }
 
 /// Session lifecycle, independent of TAP existence and daemon readiness.
@@ -196,7 +202,8 @@ impl Session {
         required_frame_len: u16,
     ) -> Result<Self, HandshakeError> {
         local.validate().map_err(|_| HandshakeError::Parameters)?;
-        if local.optional_features & !crate::wire::OFFLOAD_FRAMES != 0
+        if local.optional_features & !(crate::wire::OFFLOAD_FRAMES | crate::wire::PARTIAL_CHECKSUMS)
+            != 0
             || peer_port == 0
             || !(1514..=local.max_frame_len).contains(&required_frame_len)
         {

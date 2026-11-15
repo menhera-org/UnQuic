@@ -252,6 +252,30 @@ by ignoring the unknown bit.
 - Integrity of a partial-checksum frame in transit rests on the outer UDP
   checksum, as for any tunnel carrying offloaded traffic.
 
+**Partial checksums (November 15 amendment, decision 9; on by default as
+`daemon.partial_checksums`).** Optional feature bit 1, `PARTIAL_CHECKSUMS`,
+lets a peer send an ordinary frame whose TCP or UDP checksum field holds
+only the pseudo-header sum, so neither endpoint sums the payload. Like
+bit 0, it applies only when both endpoints advertise it.
+
+- A DATA record whose flags byte has bit 1 set carries a piece of such a
+  frame. Every piece of one frame carries the same bit, and bits 0 and 1
+  never appear together: an offload frame's descriptor already says
+  whether its checksum is partial. Flags 3 is invalid DATA; higher values
+  stay reserved.
+- A sender sets it only on frames it cut from a TAP GSO super-frame, whose
+  payload never left the kernels holding it. A frame read with a complete
+  checksum, which may have been corrupted before it reached the TAP, keeps
+  the receiver's verification before coalescing, so a coalesced write
+  cannot launder it.
+- No descriptor travels. The receiver finds the checksum by parsing the
+  Ethernet header (up to two VLAN tags), IPv4 or IPv6 (with hop-by-hop,
+  routing and destination-option headers) and the TCP or UDP header. It
+  coalesces such a frame without checking its checksum and writes it,
+  coalesced or alone, with a NEEDS_CSUM virtio-net header for its kernel
+  to complete; a TAP without virtio headers completes it in software
+  first. A frame that is neither TCP nor UDP is written unchanged.
+
 With a 1500-byte outer IP ceiling and no extension headers, the UDP payload ceiling is `1500 - 40 - 8 = 1452`. One DATA record holds `1452 - 48 - 20 = 1384` frame bytes. A 1514-byte Ethernet frame splits into 1384 and 130 bytes before packing. At the 1280-byte IPv6 baseline, the equivalent frame-piece ceiling is 1164 bytes.
 
 # 7 Packing and segmentation

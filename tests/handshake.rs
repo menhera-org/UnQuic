@@ -491,11 +491,36 @@ fn negotiation_enforces_required_size_and_ignores_unknown_optional_bits() {
     .commit
     .unwrap();
     assert!(connection.offload_frames());
+    assert!(!connection.partial_checksums());
+    // Partial checksums negotiate on their own bit.
+    let mut partial = Session::new(
+        Params {
+            optional_features: unquic::wire::PARTIAL_CHECKSUMS,
+            ..B
+        },
+        A.port,
+        2422,
+    )
+    .unwrap();
+    receive(&mut partial, ha_for(1, peer), 0, 2);
+    let connection = receive(
+        &mut partial,
+        Record::Confirm {
+            initiator: 1,
+            responder: 2,
+        },
+        0,
+        3,
+    )
+    .commit
+    .unwrap();
+    assert!(connection.partial_checksums());
+    assert!(!connection.offload_frames());
     // Unknown local bits are still refused.
     assert!(
         Session::new(
             Params {
-                optional_features: 2,
+                optional_features: 4,
                 ..A
             },
             B.port,
@@ -892,6 +917,7 @@ fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
         offset: 0,
         bytes: &[3; 60],
         offload: false,
+        partial: false,
     };
     let len = encode_datagram(header, &[record], &mut packet).unwrap();
     let datagram = Datagram::decode(&packet[..len]).unwrap();
@@ -919,6 +945,7 @@ fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
             frame_id: (1 << 48) | sequence,
             bytes: &[3; 30],
             offload: false,
+            partial: false,
             total_len: 60,
             offset: 0,
         };
@@ -943,6 +970,7 @@ fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
             offset: 30,
             bytes: &[3; 30],
             offload: false,
+            partial: false,
         },
         Record::Data {
             frame_id: (1 << 48) | 65,
@@ -950,6 +978,7 @@ fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
             offset: 0,
             bytes: &[3; 30],
             offload: false,
+            partial: false,
         },
     ];
     let len = encode_datagram(
@@ -1009,6 +1038,7 @@ fn segmentation_and_flow_selection_allocate_nothing() {
             offset: 0,
             end: frames[index].len(),
             offload: false,
+            partial: false,
         });
     let mut batch = pack::Batch::new();
     for (start, end) in [(0, 60), (40, 44)] {

@@ -65,6 +65,8 @@ pub struct Lane {
     frame_limit: u16,
     // Whether the connection negotiated offload frames.
     offload: bool,
+    // Whether the connection negotiated partial checksums.
+    partial: bool,
     next_frame: u64,
 }
 impl Lane {
@@ -88,6 +90,7 @@ impl Lane {
             },
             frame_limit: connection.max_frame_len,
             offload: connection.offload_frames(),
+            partial: connection.partial_checksums(),
             next_frame: 1,
         })
     }
@@ -95,6 +98,11 @@ impl Lane {
     /// Whether this lane may send offload frames.
     pub const fn offload_frames(&self) -> bool {
         self.offload
+    }
+
+    /// Whether this lane may send frames with partial checksums.
+    pub const fn partial_checksums(&self) -> bool {
+        self.partial
     }
 
     /// The negotiated ceiling for ordinary frames.
@@ -256,6 +264,7 @@ impl<'a> Frame<'a> {
             offset: self.offset as u32,
             bytes,
             offload: false,
+            partial: false,
         };
         let length =
             encode_data_prefix(self.lane.header, record, prefix).map_err(PackError::Wire)?;
@@ -292,6 +301,7 @@ impl<'a> Frame<'a> {
             offset: self.offset as u32,
             bytes: self.bytes.get(self.offset..end).ok_or(PackError::Frame)?,
             offload: false,
+            partial: false,
         };
         let packet = self.lane.record(record, output)?;
         self.offset = end;
@@ -322,6 +332,9 @@ pub struct FrameInput<'a> {
     pub end: usize,
     /// An offload frame, started by Lane::start_offload_frame.
     pub offload: bool,
+    /// An ordinary TCP or UDP frame whose checksum holds only the
+    /// pseudo-header sum; needs a lane with partial_checksums.
+    pub partial: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -591,6 +604,7 @@ impl Batch {
                     14..=usize::from(lane.frame_limit)
                 };
                 !lengths.contains(&length)
+                    || (frame.partial && (frame.offload || !lane.partial))
                     || frame.offset >= frame.end
                     || frame.end > length
                     || frame.id >> 48 != u64::from(lane.header.lane)
@@ -692,7 +706,7 @@ impl Batch {
                     frame_len as u32,
                     offset as u32,
                     end - offset,
-                    input.offload,
+                    crate::wire::data_flags(input.offload, input.partial),
                     &mut prefix,
                 )
                 .map_err(PackError::Wire)?;
@@ -1018,6 +1032,7 @@ mod tests {
             offset: 0,
             end: 1514,
             offload: false,
+            partial: false,
         }];
         lane.header.packet_number = u64::MAX;
         let mut batch = Batch::new();
@@ -1062,6 +1077,7 @@ mod tests {
             offset: 0,
             end: 18_044,
             offload: true,
+            partial: false,
         };
         let mut batch = Batch::new();
         assert_eq!(
@@ -1085,6 +1101,49 @@ mod tests {
             batch.prepare(&mut lane, &[ordinary], 1452),
             Err(PackError::Frame)
         );
+    }
+
+    #[test]
+    fn partial_checksums_need_negotiation_and_flag_every_piece() {
+        let mut plain = lane();
+        let mut lane = lane();
+        lane.partial = true;
+        assert!(lane.partial_checksums() && !plain.partial_checksums());
+        let id = lane.start_frame(1514).unwrap();
+        plain.start_frame(1514).unwrap();
+        let bytes = vec![7; 1460];
+        let input = FrameInput {
+            id,
+            header: &[9; 54],
+            bytes: &bytes,
+            offset: 0,
+            end: 1514,
+            offload: false,
+            partial: true,
+        };
+        let mut batch = Batch::new();
+        assert_eq!(
+            batch.prepare(&mut plain, &[input], 1232),
+            Err(PackError::Frame)
+        );
+        // Never with offload, even where both are negotiated.
+        lane.offload = true;
+        let both = FrameInput {
+            offload: true,
+            ..input
+        };
+        assert_eq!(
+            batch.prepare(&mut lane, &[both], 1232),
+            Err(PackError::Frame)
+        );
+        batch.prepare(&mut lane, &[input], 1232).unwrap();
+        let pieces: usize = (0..batch.len())
+            .map(|packet| batch.pieces(packet).unwrap().count())
+            .sum();
+        assert!(pieces >= 2);
+        for index in 0..pieces {
+            assert_eq!(batch.prefixes[index][1], 2, "partial flag on every piece");
+        }
     }
 
     #[test]
@@ -1144,6 +1203,7 @@ mod renumber_tests {
             offset: 0,
             end: 1514,
             offload: false,
+            partial: false,
         }];
         batch.prepare(&mut lane, &frames, BASE_UDP_PAYLOAD).unwrap();
         assert_eq!(batch.len(), 2);
@@ -1187,6 +1247,7 @@ mod retained_prefix_tests {
                 offset: 0,
                 end: payload.len(),
                 offload: false,
+                partial: false,
             })
             .collect();
         let mut batch = Batch::new();
@@ -1264,6 +1325,7 @@ mod refill_tests {
                         offset: 0,
                         end: length,
                         offload: false,
+                        partial: false,
                     });
                     lengths.push(length);
                     accepted.push(0);
@@ -1345,6 +1407,7 @@ mod refill_tests {
                 offset: 0,
                 end: data.len(),
                 offload: false,
+                partial: false,
             })
             .collect();
         let mut batch = Batch::new();

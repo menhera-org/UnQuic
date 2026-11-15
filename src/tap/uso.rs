@@ -51,7 +51,9 @@ impl Layout {
     }
 }
 
-fn transport(frame: &[u8]) -> Option<Layout> {
+/// The coalescing layout of a TCP or UDP frame, checking its checksum unless
+/// `partial`: then the field holds only the pseudo-header sum.
+fn transport(frame: &[u8], partial: bool) -> Option<Layout> {
     let mut ip = 14;
     let mut protocol = u16::from_be_bytes(frame.get(12..14)?.try_into().ok()?);
     for _ in 0..2 {
@@ -145,7 +147,52 @@ fn transport(frame: &[u8]) -> Option<Layout> {
         tcp,
         v6,
     };
-    (fold(layout.pseudo(frame, frame.len() - at) + sum(&frame[at..])) == 65535).then_some(layout)
+    (partial || fold(layout.pseudo(frame, frame.len() - at) + sum(&frame[at..])) == 65535)
+        .then_some(layout)
+}
+
+/// A NEEDS_CSUM virtio-net header for one frame whose TCP or UDP checksum
+/// holds its pseudo-header sum, or None when it is neither TCP nor UDP.
+/// Unlike transport() this accepts any such frame, coalescible or not.
+pub(super) fn partial_header(frame: &[u8]) -> Option<[u8; 10]> {
+    let mut ip = 14;
+    let mut protocol = word(frame, 12);
+    for _ in 0..2 {
+        if !matches!(protocol, 0x8100 | 0x88a8) {
+            break;
+        }
+        protocol = word(frame, ip + 2);
+        ip += 4;
+    }
+    let (at, protocol) = match protocol {
+        0x0800 if frame.len() >= ip + 20 && frame[ip] >> 4 == 4 => {
+            (ip + usize::from(frame[ip] & 15) * 4, frame[ip + 9])
+        }
+        0x86dd if frame.len() >= ip + 40 && frame[ip] >> 4 == 6 => {
+            let mut at = ip + 40;
+            let mut next = frame[ip + 6];
+            while matches!(next, 0 | 43 | 60) {
+                let prefix = frame.get(at..at + 8)?;
+                next = prefix[0];
+                at += (usize::from(prefix[1]) + 1) * 8;
+            }
+            (at, next)
+        }
+        _ => return None,
+    };
+    let offset: u16 = match protocol {
+        6 => 16,
+        17 => 6,
+        _ => return None,
+    };
+    if at < ip + 20 || at + usize::from(offset) + 2 > frame.len() {
+        return None;
+    }
+    let mut vnet = [0u8; 10];
+    vnet[0] = 1; // VIRTIO_NET_HDR_F_NEEDS_CSUM
+    vnet[6..8].copy_from_slice(&(at as u16).to_ne_bytes());
+    vnet[8..10].copy_from_slice(&offset.to_ne_bytes());
+    Some(vnet)
 }
 /// Callers check lengths first; the zero fallback only keeps this panic-free.
 fn sequence(frame: &[u8], at: usize) -> u32 {
@@ -186,15 +233,17 @@ fn matches(first: &[u8], next: &[u8], layout: Layout, count: usize, payload: usi
 
 /// Returns the attempted mask, TCP flag and original byte count on success.
 /// The mask survives failure so the caller retains every selected frame.
+/// Bit i of `partial` marks the i-th frame's checksum as partial.
 pub(super) fn write<'a>(
     fd: RawFd,
     first: &'a [u8],
     mut frames: impl Iterator<Item = &'a [u8]>,
     frame_limit: usize,
     enabled: (bool, bool),
+    partial: u64,
 ) -> Option<(u64, bool, io::Result<usize>)> {
     let second = frames.next()?;
-    let layout = transport(first)?;
+    let layout = transport(first, partial & 1 != 0)?;
     let Layout {
         ip,
         at,
@@ -232,7 +281,7 @@ pub(super) fn write<'a>(
         }
         // A same-flow barrier must prevent moving a later frame ahead of it.
         if next.len() > frame_limit
-            || transport(next) != Some(layout)
+            || transport(next, partial >> (index + 1) & 1 != 0) != Some(layout)
             || !matches(first, next, layout, count, payload)
         {
             break;
@@ -319,6 +368,12 @@ pub(super) fn write<'a>(
     Some((mask, tcp, result))
 }
 
+/// transport() for a frame whose checksum must verify.
+#[cfg(test)]
+fn checked(frame: &[u8]) -> Option<Layout> {
+    transport(frame, false)
+}
+
 #[cfg(test)]
 #[test]
 fn checksum_matches_reference_for_odd_even_and_unaligned_inputs() {
@@ -351,27 +406,27 @@ fn tagged_headers_preserve_tags_and_reject_truncation_and_excess_depth() {
                 }
             }
             for end in 0..first.len() {
-                assert_eq!(transport(&first[..end]), None);
+                assert_eq!(checked(&first[..end]), None);
             }
             if depth == 3 {
-                assert_eq!(transport(&first), None);
+                assert_eq!(checked(&first), None);
                 continue;
             }
             let ip = 14 + 4 * depth;
             let at = ip + if v6 { 40 } else { 20 };
-            assert_eq!(transport(&first).map(|l| (l.ip, l.at)), Some((ip, at)));
-            assert_eq!(transport(&next).map(|l| (l.ip, l.at)), Some((ip, at)));
-            assert!(matches(&first, &next, transport(&first).unwrap(), 1, 120));
+            assert_eq!(checked(&first).map(|l| (l.ip, l.at)), Some((ip, at)));
+            assert_eq!(checked(&next).map(|l| (l.ip, l.at)), Some((ip, at)));
+            assert!(matches(&first, &next, checked(&first).unwrap(), 1, 120));
             for offset in 12..ip {
                 next[offset] ^= 1;
                 assert!(
-                    !matches(&first, &next, transport(&first).unwrap(), 1, 120),
+                    !matches(&first, &next, checked(&first).unwrap(), 1, 120),
                     "tag byte {offset}"
                 );
                 next[offset] ^= 1;
             }
             next[at + 6] ^= 1;
-            assert_eq!(transport(&next), None, "bad UDP checksum");
+            assert_eq!(checked(&next), None, "bad UDP checksum");
         }
     }
 }
@@ -384,23 +439,23 @@ fn tcp_eligibility_checks_lengths_checksums_flags_and_sequence() {
         for options in [&[][..], &[1; 40][..]] {
             let first = tcp::frame(v6, 65535, u32::MAX - 99, 0x10, options, &[7; 100]);
             let next = tcp::frame(v6, 0, 0, 0x18, options, &[8; 99]);
-            let layout = transport(&first).unwrap();
-            assert_eq!(transport(&next), Some(layout));
+            let layout = checked(&first).unwrap();
+            assert_eq!(checked(&next), Some(layout));
             assert!(matches(&first, &next, layout, 1, 100));
             for end in 0..first.len() {
-                assert!(transport(&first[..end]).is_none());
+                assert!(checked(&first[..end]).is_none());
             }
             for flags in [0, 1, 2, 4, 0x30, 0x90] {
-                assert!(transport(&tcp::frame(v6, 0, 0, flags, options, &[1])).is_none());
+                assert!(checked(&tcp::frame(v6, 0, 0, flags, options, &[1])).is_none());
             }
-            assert!(transport(&tcp::frame(v6, 0, 0, 0x10, options, &[])).is_none());
+            assert!(checked(&tcp::frame(v6, 0, 0, 0x10, options, &[])).is_none());
             let gap = tcp::frame(v6, 0, 1, 0x10, options, &[8; 99]);
             assert!(!matches(&first, &gap, layout, 1, 100));
             let at = layout.at;
             for offset in [at, at + 4, at + 8, at + 14, at + 18, first.len() - 1] {
                 let mut bad = first.clone();
                 bad[offset] ^= 1;
-                assert!(transport(&bad).is_none(), "checksum mutation at {offset}");
+                assert!(checked(&bad).is_none(), "checksum mutation at {offset}");
             }
         }
     }
@@ -472,7 +527,53 @@ fn random_and_mutated_frames_never_panic_validation_or_coalescing() {
         let limit = [1514, crate::MAX_FRAME_LEN, rng.below(10_000)][rng.below(3)];
         let enabled = (rng.below(4) != 0, rng.below(4) != 0);
         let frames = [&next[..], follower].into_iter().take(1 + rng.below(2));
-        write(-1, &first, frames, limit, enabled);
+        write(-1, &first, frames, limit, enabled, rng.below(4) as u64);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn partial_frames_skip_verification_and_locate_their_checksum() {
+    use crate::tap::test_common::{tcp, udp};
+    for v6 in [false, true] {
+        let at = if v6 { 54 } else { 34 };
+        let mut a = udp::frame(v6, 65535, &[1; 120]);
+        let mut b = udp::frame(v6, 0, &[2; 120]);
+        let header = udp::partial(&mut a, v6);
+        udp::partial(&mut b, v6);
+        assert_eq!(partial_header(&a), Some(header));
+        // Seeds fail verification unless their frames are marked partial.
+        assert_eq!(checked(&a), None);
+        let pair = || [&b[..]].into_iter();
+        assert!(write(-1, &a, pair(), 1514, (true, true), 0).is_none());
+        assert!(write(-1, &a, pair(), 1514, (true, true), 0b01).is_none());
+        let (mask, tcp, result) = write(-1, &a, pair(), 1514, (true, true), 0b11).unwrap();
+        assert_eq!((mask, tcp), (0b11, false));
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EBADF));
+        // VLAN tags and IPv6 extension headers move the checksum start.
+        let mut tagged = a.clone();
+        tagged.splice(12..12, [0x81, 0, 0, 7]);
+        let start = |header: [u8; 10]| u16::from_ne_bytes([header[6], header[7]]) as usize;
+        assert_eq!(partial_header(&tagged).map(start), Some(at + 4));
+        if v6 {
+            let mut extended = a.clone();
+            extended[20] = 60;
+            extended.splice(54..54, [17, 0, 1, 4, 0, 0, 0, 0]);
+            assert_eq!(partial_header(&extended).map(start), Some(62));
+        }
+        // Any TCP frame qualifies, even one coalescing would refuse.
+        let mut syn = tcp::frame(v6, 1, 0, 0x02, &[], &[]);
+        let expected = tcp::partial(&mut syn, v6, 1460);
+        let located = partial_header(&syn).unwrap();
+        assert_eq!(located[0], 1);
+        assert_eq!(located[6..10], expected[6..10]);
+        // Neither TCP nor UDP, or too short for the checksum field: none.
+        let mut other = a.clone();
+        other[if v6 { 20 } else { 23 }] = 1;
+        assert_eq!(partial_header(&other), None);
+        for end in 0..at + 8 {
+            assert_eq!(partial_header(&a[..end]), None);
+        }
     }
 }
 
@@ -486,8 +587,15 @@ fn tcp_coalescing_stops_at_flow_barriers_and_counts_only_selected_frames() {
     other[34] ^= 1;
     tcp::repair(&mut other, false);
     assert_ne!(flow_hash(&a), flow_hash(&other));
-    let (mask, tcp, result) =
-        write(-1, &a, [&other[..], &b[..]].into_iter(), 1514, (true, true)).unwrap();
+    let (mask, tcp, result) = write(
+        -1,
+        &a,
+        [&other[..], &b[..]].into_iter(),
+        1514,
+        (true, true),
+        0,
+    )
+    .unwrap();
     assert_eq!(mask, 0b101);
     assert!(tcp);
     assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EBADF));
@@ -495,14 +603,15 @@ fn tcp_coalescing_stops_at_flow_barriers_and_counts_only_selected_frames() {
         let mut barrier = b.clone();
         barrier[offset] ^= 1;
         crate::tap::test_common::tcp::repair(&mut barrier, false);
-        assert!(transport(&barrier).is_some());
+        assert!(checked(&barrier).is_some());
         assert!(
             write(
                 -1,
                 &a,
                 [&barrier[..], &b[..]].into_iter(),
                 1514,
-                (true, true)
+                (true, true),
+                0
             )
             .is_none(),
             "changed TCP field {offset} must not be crossed"
@@ -510,10 +619,10 @@ fn tcp_coalescing_stops_at_flow_barriers_and_counts_only_selected_frames() {
     }
     let c = crate::tap::test_common::tcp::frame(false, 102, 200, 0x10, &[1; 12], &[3; 100]);
     assert!(
-        write(-1, &b, [&c[..]].into_iter(), 1514, (true, true)).is_none(),
+        write(-1, &b, [&c[..]].into_iter(), 1514, (true, true), 0).is_none(),
         "PSH starts a new group"
     );
-    let (mask, _, _) = write(-1, &a, [&b[..], &c[..]].into_iter(), 1514, (true, true)).unwrap();
+    let (mask, _, _) = write(-1, &a, [&b[..], &c[..]].into_iter(), 1514, (true, true), 0).unwrap();
     assert_eq!(mask, 0b11, "PSH closes the current group");
-    assert!(write(-1, &a, [&b[..]].into_iter(), 1514, (true, false)).is_none());
+    assert!(write(-1, &a, [&b[..]].into_iter(), 1514, (true, false), 0).is_none());
 }

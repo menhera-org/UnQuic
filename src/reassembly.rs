@@ -56,6 +56,8 @@ pub struct ReadyFrame<'a> {
     pub bytes: &'a [u8],
     /// Whether this is an offload frame.
     pub offload: bool,
+    /// Whether its transport checksum is left partial (PARTIAL_CHECKSUMS).
+    pub partial: bool,
 }
 
 struct Window {
@@ -169,6 +171,8 @@ struct Frame {
     // Slots this frame holds, starting at its own; 1 for ordinary frames.
     span: u8,
     offload: bool,
+    // The transport checksum is left partial; set by admission after start.
+    partial: bool,
     deadline: Duration,
 }
 impl Frame {
@@ -178,6 +182,7 @@ impl Frame {
         prefix_len: 0,
         span: 1,
         offload: false,
+        partial: false,
         deadline: Duration::ZERO,
     };
 
@@ -187,6 +192,7 @@ impl Frame {
         self.prefix_len = 0;
         self.span = if offload { span(length) } else { 1 };
         self.offload = offload;
+        self.partial = false;
         self.deadline = now.saturating_add(FRAME_LIFETIME);
         let words = usize::from(length).div_ceil(64).min(covered.len());
         covered[..words].fill(0);
@@ -242,6 +248,7 @@ struct Reservation {
     sequence: u64,
     length: u16,
     offload: bool,
+    partial: bool,
     slot: u8,
 }
 
@@ -284,6 +291,8 @@ pub struct Lane {
     terminal: Window,
     // Whether the connection negotiated offload frames.
     offload: bool,
+    // Whether the connection negotiated partial checksums.
+    partial: bool,
     frames: [Frame; FRAME_CAPACITY],
     covered: Box<[u64]>,
     bytes: Box<[u8]>,
@@ -317,6 +326,7 @@ impl Lane {
             ack: Schedule::new(),
             terminal: Window::new(),
             offload: false,
+            partial: false,
             frames: [Frame::EMPTY; FRAME_CAPACITY],
             covered: vec![0; FRAME_CAPACITY * SLOT_WORDS].into_boxed_slice(),
             bytes: vec![0; FRAME_CAPACITY * MAX_FRAME_LEN].into_boxed_slice(),
@@ -351,6 +361,12 @@ impl Lane {
 
     pub(crate) const fn accepts_offload_frames(&self) -> bool {
         self.offload
+    }
+
+    /// Accepts frames with partial checksums until the next reset; call after
+    /// reset when the connection negotiated them.
+    pub fn accept_partial_checksums(&mut self, accept: bool) {
+        self.partial = accept;
     }
 
     /// Registered remote lane ID.
@@ -436,6 +452,7 @@ impl Lane {
         self.frame_limit = frame_limit;
         self.retired = false;
         self.offload = false;
+        self.partial = false;
         self.expired_frames = 0;
         self.expired_incomplete_frames = 0;
         self.duplicate_pieces = 0;
@@ -495,6 +512,7 @@ impl Lane {
                     frame_id,
                     total_len,
                     offload,
+                    partial,
                     ..
                 } => {
                     // The codec bounds offload frames by MAX_OFFLOAD_FRAME_LEN.
@@ -502,7 +520,8 @@ impl Lane {
                         !self.offload
                     } else {
                         total_len > u32::from(self.frame_limit)
-                    } {
+                    } || (partial && !self.partial)
+                    {
                         return Admission::Invalid;
                     }
                     let sequence = frame_id & SEQUENCE_MASK;
@@ -511,14 +530,18 @@ impl Lane {
                         continue;
                     }
                     let (length, kind) = if let Some(slot) = self.find(sequence) {
-                        (self.frames[slot].length, self.frames[slot].offload)
+                        let frame = &self.frames[slot];
+                        (frame.length, (frame.offload, frame.partial))
                     } else if let Some(reservation) = self
                         .reservations
                         .iter()
                         .take(count)
                         .find(|reservation| reservation.sequence == sequence)
                     {
-                        (reservation.length, reservation.offload)
+                        (
+                            reservation.length,
+                            (reservation.offload, reservation.partial),
+                        )
                     } else {
                         let span = if offload { span(total_len as u16) } else { 1 };
                         let slot = take(&mut trial, span);
@@ -530,6 +553,7 @@ impl Lane {
                                     sequence,
                                     length: total_len as u16,
                                     offload,
+                                    partial,
                                     slot: slot.unwrap_or_default() as u8,
                                 };
                             }
@@ -538,7 +562,8 @@ impl Lane {
                         count += 1;
                         continue;
                     };
-                    if u32::from(length) != total_len || kind != offload {
+                    // Every piece of a frame carries the same flags.
+                    if u32::from(length) != total_len || kind != (offload, partial) {
                         return Admission::Invalid;
                     }
                 }
@@ -590,6 +615,7 @@ impl Lane {
                                 now,
                                 &mut self.covered[slot * SLOT_WORDS..],
                             );
+                            frame.partial = reservation.partial;
                             self.reserved |= run(frame.span) << slot;
                             let deadline = frame.deadline;
                             self.sequences[slot] = sequence;
@@ -694,6 +720,7 @@ impl Lane {
             id: (u64::from(self.id) << 48) | self.sequences[slot],
             bytes: self.slot_bytes(slot),
             offload: frame.offload,
+            partial: frame.partial,
         })
     }
 
@@ -704,6 +731,23 @@ impl Lane {
             let slot = usize::from(slot);
             (!self.frames[slot].offload).then(|| self.slot_bytes(slot))
         })
+    }
+
+    /// One bit per frame ready_frames(now) yields, at most 64, set for frames
+    /// with partial checksums.
+    pub(crate) fn ready_partial(&mut self, now: Duration) -> u64 {
+        self.expire(now);
+        self.ready
+            .iter()
+            .take(64)
+            .map_while(|&slot| {
+                let frame = &self.frames[usize::from(slot)];
+                (!frame.offload).then_some(frame.partial)
+            })
+            .enumerate()
+            .fold(0, |mask, (index, partial)| {
+                mask | u64::from(partial) << index
+            })
     }
 
     fn slot_bytes(&self, slot: usize) -> &[u8] {
@@ -860,6 +904,7 @@ mod tests {
                     offset: 0,
                     bytes: &payload,
                     offload: false,
+                    partial: false,
                 }],
                 &mut bytes,
             )
@@ -913,6 +958,7 @@ mod tests {
                     offset: 0,
                     bytes: &[sequence as u8; 60],
                     offload,
+                    partial: false,
                 }],
                 &mut bytes,
             )
@@ -931,6 +977,85 @@ mod tests {
         assert!(lane.front(Duration::ZERO).unwrap().offload);
         assert!(lane.finish_front());
         assert_eq!(firsts(&mut lane), [3]);
+    }
+
+    #[test]
+    fn partial_checksums_need_acceptance_one_flag_per_frame_and_mark_ready_frames() {
+        let mut lane = Lane::new(1, 9022).unwrap();
+        let mut bytes = [0; 256];
+        let mut admit =
+            |lane: &mut Lane, number: u64, sequence: u64, offset: u32, flags: (bool, bool)| {
+                let (offload, partial) = flags;
+                let n = crate::wire::encode_datagram(
+                    crate::wire::Header {
+                        cookie: crate::UnquicUuid::from_bytes([1; 16]),
+                        receive_tag: 1,
+                        lane: 1,
+                        packet_number: number,
+                        record_area_len: 0,
+                    },
+                    &[Record::Data {
+                        frame_id: (1 << 48) | sequence,
+                        total_len: 60,
+                        offset,
+                        bytes: &[sequence as u8; 30],
+                        offload,
+                        partial,
+                    }],
+                    &mut bytes,
+                )
+                .unwrap();
+                lane.admit(&Datagram::decode(&bytes[..n]).unwrap(), Duration::ZERO)
+            };
+        assert_eq!(admit(&mut lane, 1, 1, 0, (false, true)), Admission::Invalid);
+        lane.accept_partial_checksums(true);
+        lane.accept_offload_frames(true);
+        // Frames 1 and 3 are partial, 2 is not, 4 is an offload frame.
+        for (number, sequence, flags) in [
+            (1, 1, (false, true)),
+            (2, 2, (false, false)),
+            (3, 3, (false, true)),
+            (4, 4, (true, false)),
+            (5, 5, (false, true)),
+        ] {
+            assert_eq!(
+                admit(&mut lane, number, sequence, 0, flags),
+                Admission::Fresh
+            );
+        }
+        // A later piece must repeat its frame's flags.
+        assert_eq!(
+            admit(&mut lane, 6, 1, 30, (false, false)),
+            Admission::Invalid
+        );
+        assert_eq!(
+            admit(&mut lane, 6, 2, 30, (false, true)),
+            Admission::Invalid
+        );
+        for (number, sequence, flags) in [
+            (6, 1, (false, true)),
+            (7, 2, (false, false)),
+            (8, 3, (false, true)),
+            (9, 4, (true, false)),
+            (10, 5, (false, true)),
+        ] {
+            assert_eq!(
+                admit(&mut lane, number, sequence, 30, flags),
+                Admission::Fresh
+            );
+        }
+        // The mask stops where ready_frames stops, before the offload frame.
+        assert_eq!(lane.ready_frames(Duration::ZERO).count(), 3);
+        assert_eq!(lane.ready_partial(Duration::ZERO), 0b101);
+        lane.finish_ready(0b111);
+        assert!(lane.front(Duration::ZERO).unwrap().offload);
+        assert!(!lane.front(Duration::ZERO).unwrap().partial);
+        assert!(lane.finish_front());
+        assert!(lane.front(Duration::ZERO).unwrap().partial);
+        assert_eq!(lane.ready_partial(Duration::ZERO), 1);
+        // A reset forgets acceptance.
+        lane.reset(1, 9022).unwrap();
+        assert_eq!(admit(&mut lane, 1, 1, 0, (false, true)), Admission::Invalid);
     }
 
     #[test]
@@ -978,6 +1103,7 @@ mod tests {
                         offset: offset as u32,
                         bytes: &payload[..length],
                         offload,
+                        partial: false,
                     }
                 };
             }

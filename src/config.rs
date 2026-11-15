@@ -67,6 +67,12 @@ pub struct Daemon {
     /// extra memory; sending reserves 64 sets of coverage planes per worker,
     /// about 420 KiB.
     pub offload_frames: bool,
+    /// On by default since November 15: advertise optional feature
+    /// `PARTIAL_CHECKSUMS`. When both peers advertise it, frames the sender
+    /// cuts from a TAP GSO super-frame leave its TCP or UDP checksum partial,
+    /// and the receiving TAP's kernel completes it, so neither daemon sums
+    /// the payload.
+    pub partial_checksums: bool,
 }
 impl Default for Daemon {
     fn default() -> Self {
@@ -79,6 +85,7 @@ impl Default for Daemon {
             probe_rtt_ack_delay: true,
             control_lane: true,
             offload_frames: false,
+            partial_checksums: true,
         }
     }
 }

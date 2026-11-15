@@ -682,8 +682,20 @@ lost no more frames. On a routed 4.5 ms path with 1% loss it lost more
 frames than ordinary frames do (11.6–18.7% against 4.9–12.8%), because a
 lost datagram keeps a whole run waiting for repair (BENCH.md), so it suits
 clean paths only. Receiving uses the ordinary reassembly slots; sending
-reserves about 420 KiB of coverage planes per worker. Whether to turn it on
-by default is an open decision (ROADMAP.md).
+reserves about 420 KiB of coverage planes per worker. It stays off by
+default (decision 8 in ROADMAP.md).
+
+`daemon.partial_checksums`, on by default, advertises the optional handshake
+feature that leaves transport checksums partial (design section 6). When
+both peers advertise it, each frame the sender cuts from a TAP GSO
+super-frame carries only its TCP or UDP pseudo-header sum and a DATA flag
+saying so, and the receiver writes it to its TAP with a NEEDS_CSUM header,
+so neither daemon sums the payload. Frames read with complete checksums are
+still verified before the receiver coalesces them. `tx_partial_frames`
+counts the frames sent this way. On the full-size efficiency point it cut
+CPU per delivered Gbit/s 2.5% at the median, in all six rounds, and lost
+no more frames on the lossy path (BENCH.md). Set it to false to keep
+complete checksums on the wire.
 
 Flow hashing looks through one unfragmented IPv4, IPv6 or Ethernet
 encapsulation, including an IPv6 segment routing header before the inner

@@ -560,10 +560,33 @@ impl TapQueue {
     /// On WouldBlock the caller retains the whole frame until writable or
     /// expired. Other errors discard the frame in the transport.
     pub fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+        self.write_with_header(&[0; 10], frame)
+    }
+
+    /// Writes one frame whose TCP or UDP checksum holds its pseudo-header sum
+    /// (PARTIAL_CHECKSUMS): with a NEEDS_CSUM header for the kernel to
+    /// complete, or completed here on a queue without virtio headers. Any
+    /// other frame is written unchanged.
+    fn write_partial_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+        let Some(header) = uso::partial_header(frame) else {
+            return self.write_frame(frame);
+        };
+        if self.vnet {
+            return self.write_with_header(&header, frame);
+        }
+        let mut output = [0u8; MAX_FRAME_LEN];
+        let copy = output
+            .get_mut(..frame.len())
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        copy.copy_from_slice(frame);
+        complete_checksum(&header, copy)?;
+        self.write_frame(copy)
+    }
+
+    fn write_with_header(&mut self, header: &[u8; 10], frame: &[u8]) -> io::Result<()> {
         if !(14..=self.frame_limit).contains(&frame.len()) {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        let header = [0u8; 10];
         let iov = [
             libc::iovec {
                 iov_base: header.as_ptr().cast_mut().cast(),
@@ -592,9 +615,21 @@ impl TapQueue {
 
     /// Returns the attempted mask, whether it used TSO, and the write result.
     /// The mask names every attempted frame, even when the write fails.
+    #[cfg(test)]
     pub(crate) fn write_batch<'a>(
         &mut self,
+        frames: impl Iterator<Item = &'a [u8]>,
+    ) -> (u64, bool, io::Result<usize>) {
+        self.write_batch_partial(frames, 0)
+    }
+
+    /// write_batch, where bit i of `partial` marks the i-th frame's checksum
+    /// as partial (PARTIAL_CHECKSUMS): such frames are never verified, and
+    /// reach the kernel with NEEDS_CSUM whether coalesced or not.
+    pub(crate) fn write_batch_partial<'a>(
+        &mut self,
         mut frames: impl Iterator<Item = &'a [u8]>,
+        partial: u64,
     ) -> (u64, bool, io::Result<usize>) {
         let Some(first) = frames.next() else {
             return (0, false, Ok(0));
@@ -607,6 +642,7 @@ impl TapQueue {
                 frames,
                 self.frame_limit,
                 (self.uso, self.tso),
+                partial,
             )
         {
             if result
@@ -622,7 +658,12 @@ impl TapQueue {
                 return (mask, tcp, result);
             }
         }
-        (1, false, self.write_frame(first).map(|()| first.len()))
+        let written = if partial & 1 != 0 {
+            self.write_partial_frame(first)
+        } else {
+            self.write_frame(first)
+        };
+        (1, false, written.map(|()| first.len()))
     }
 }
 
@@ -673,6 +714,68 @@ mod tests {
             assert!(Tap::create(c"unquic-test", mtu, queues, None).is_err());
         }
     }
+    #[test]
+    fn single_partial_frames_carry_needs_csum_or_are_completed_without_vnet() {
+        use std::os::fd::FromRawFd;
+        use test_common::udp;
+        let pair = || {
+            let mut fds = [0; 2];
+            let kind = libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK;
+            // SAFETY: socketpair writes two new descriptors into fds.
+            assert_eq!(
+                unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, fds.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: both descriptors are new and owned only here.
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+        };
+        let read = |fd: &OwnedFd| {
+            let mut buffer = vec![0; 4096];
+            // SAFETY: buffer is writable for its length.
+            let n = unsafe {
+                libc::recv(
+                    fd.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            buffer.truncate(n.max(0) as usize);
+            buffer
+        };
+        for v6 in [false, true] {
+            let complete = udp::frame(v6, 7, &[3; 200]);
+            let mut seeded = complete.clone();
+            let header = udp::partial(&mut seeded, v6);
+            for vnet in [true, false] {
+                let (a, b) = pair();
+                let mut tap = TapQueue {
+                    fd: a,
+                    frame_limit: 1514,
+                    vnet,
+                    uso: true,
+                    tso: true,
+                    completed_checksums: 0,
+                };
+                let (mask, _, result) = tap.write_batch_partial([&seeded[..]].into_iter(), 1);
+                assert_eq!((mask, result.unwrap()), (1, seeded.len()));
+                // The kernel completes it from NEEDS_CSUM; without virtio
+                // headers the queue completes it first.
+                if vnet {
+                    assert_eq!(read(&b), [&header[..], &seeded].concat());
+                } else {
+                    assert_eq!(read(&b), complete);
+                }
+                // Unmarked, the same bytes go out unchanged.
+                tap.write_batch_partial([&seeded[..]].into_iter(), 0)
+                    .2
+                    .unwrap();
+                let plain = read(&b);
+                assert_eq!(&plain[plain.len() - seeded.len()..], &seeded[..]);
+            }
+        }
+    }
+
     #[test]
     fn offload_frames_write_natively_or_segment_with_complete_checksums() {
         use std::os::fd::FromRawFd;

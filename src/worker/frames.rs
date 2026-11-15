@@ -186,6 +186,8 @@ pub(super) struct Frame {
     pub header: [u8; HEADER_BYTES],
     /// An offload frame: a descriptor in `header`, then a whole TAP super-frame.
     pub offload: bool,
+    /// A segment whose transport checksum in `header` is only the seed.
+    pub partial: bool,
 }
 
 impl Frame {
@@ -387,6 +389,7 @@ impl Store {
             offset: frame.offset,
             end: frame.length(),
             offload: frame.offload,
+            partial: frame.partial,
         })
     }
 
@@ -598,6 +601,7 @@ mod tests {
             header_len: 0,
             header: [0; HEADER_BYTES],
             offload: false,
+            partial: false,
         }
     }
 

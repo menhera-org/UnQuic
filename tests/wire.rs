@@ -97,6 +97,7 @@ fn record(kind: usize) -> Record<'static> {
             offset: 10,
             bytes: &[0xde, 0xad, 0xbe, 0xef],
             offload: false,
+            partial: false,
         },
         2 => Record::Ack {
             lane: 0x5678,
@@ -259,14 +260,20 @@ fn rejects_bad_header_length_magic_version_and_reserved_flags() {
 fn rejects_bad_record_types_lengths_flags_and_reserved_bodies() {
     for kind in 0..VECTORS.len() {
         let good = vector(kind);
-        // DATA defines flag 1 (offload); every other value and record reserves it.
-        for flags in [1, 2, 3, 0x80] {
-            if kind == 1 && flags == 1 {
+        // DATA defines flags 1 (offload) and 2 (partial checksum), never both;
+        // every other value and record reserves them.
+        for flags in [1, 2, 3, 4, 0x80] {
+            if kind == 1 && matches!(flags, 1 | 2) {
                 continue;
             }
             let mut bad = good.clone();
             bad[49] = flags;
-            assert_eq!(Datagram::decode(&bad).unwrap_err(), WireError::Reserved);
+            let expected = if kind == 1 && flags == 3 {
+                WireError::Data
+            } else {
+                WireError::Reserved
+            };
+            assert_eq!(Datagram::decode(&bad).unwrap_err(), expected);
         }
         for length in [0u16, 1, 2, 3, u16::MAX] {
             let mut bad = good.clone();
@@ -380,6 +387,7 @@ fn rejects_data_identity_and_range_errors_without_overflow() {
             offset: 0,
             bytes: &payload,
             offload: false,
+            partial: false,
         };
         let mut output = vec![0; HEADER_LEN + record.encoded_len()];
         encode_datagram(header(false), &[record], &mut output).unwrap();
@@ -396,6 +404,7 @@ fn offload_flag_round_trips_and_moves_the_frame_length_bounds() {
         offset: 0,
         bytes: &payload[..length],
         offload,
+        partial: false,
     };
     for (total_len, length) in [(24, 24), (9023, 100), (65_535, 100)] {
         let mut output = vec![0; HEADER_LEN + data(total_len, length, true).encoded_len()];
@@ -425,6 +434,42 @@ fn offload_flag_round_trips_and_moves_the_frame_length_bounds() {
     );
     unquic::wire::encode_data_prefix(header(false), data(65_535, 100, true), &mut prefix).unwrap();
     assert_eq!(prefix[HEADER_LEN + 1], 1);
+}
+
+#[test]
+fn partial_flag_round_trips_and_never_joins_the_offload_flag() {
+    let payload = [0x5a; 100];
+    let data = |offload: bool, partial: bool| Record::Data {
+        frame_id: FRAME,
+        total_len: 1514,
+        offset: 0,
+        bytes: &payload,
+        offload,
+        partial,
+    };
+    let mut output = vec![0; HEADER_LEN + data(false, true).encoded_len()];
+    encode_datagram(header(false), &[data(false, true)], &mut output).unwrap();
+    assert_eq!(output[49], 2);
+    roundtrip(&output);
+    let Some(Record::Data {
+        offload, partial, ..
+    }) = Datagram::decode(&output).unwrap().records().next()
+    else {
+        panic!("expected DATA")
+    };
+    assert!(partial && !offload);
+    // Both flags, or an undefined one, are refused on decode and encode.
+    for flags in [3, 4, 0x80] {
+        output[49] = flags;
+        assert!(Datagram::decode(&output).is_err(), "flags {flags}");
+    }
+    assert_eq!(
+        encode_datagram(header(false), &[data(true, true)], &mut output),
+        Err(WireError::Data)
+    );
+    let mut prefix = [0; unquic::wire::DATA_PREFIX_LEN];
+    unquic::wire::encode_data_prefix(header(false), data(false, true), &mut prefix).unwrap();
+    assert_eq!(prefix[HEADER_LEN + 1], 2);
 }
 
 #[test]
@@ -584,6 +629,7 @@ fn encoder_errors_never_modify_output() {
             offset: 0,
             bytes: &[],
             offload: false,
+            partial: false,
         }],
         vec![Record::Padding { length: u16::MAX }],
         vec![Record::Padding { length: 40000 }; 2],

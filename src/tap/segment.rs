@@ -188,6 +188,17 @@ impl Segments {
         self.write_run(input, output, count, 1, true)
     }
 
+    /// As write_header, but leaves the transport checksum as its pseudo-header
+    /// seed for the receiver to complete (PARTIAL_CHECKSUMS).
+    pub(crate) fn write_seed_header(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Option<std::ops::Range<usize>> {
+        let count = self.size.min(input.len().checked_sub(self.next)?);
+        self.write_run(input, output, count, 1, false)
+    }
+
     /// Writes the header for the next `count` payload bytes, `segments` whole
     /// segments except at the end, with a complete transport checksum or its seed.
     fn write_run(
@@ -412,6 +423,33 @@ pub(super) mod tests {
             if let Some(mut segments) = Segments::parse(&header, &input, limit) {
                 drain(&mut segments, &input, &mut rng);
             }
+        }
+    }
+
+    #[test]
+    fn seed_headers_differ_from_full_headers_only_by_the_completed_checksum() {
+        use crate::tap::test_common::tcp;
+        for v6 in [false, true] {
+            let at = if v6 { 54 } else { 34 };
+            let payload: Vec<_> = (0..4000).map(|i| (i * 7) as u8).collect();
+            let mut input = tcp::frame(v6, 9, 1000, 0x18, &[], &payload);
+            let header = tcp::partial(&mut input, v6, 1400);
+            let mut full = Segments::parse(&header, &input, 1514).unwrap();
+            let mut seed = full;
+            let mut count = 0;
+            loop {
+                let (mut a, mut b) = ([0; 128], [0; 128]);
+                let range = full.write_header(&input, &mut a);
+                assert_eq!(seed.write_seed_header(&input, &mut b), range);
+                let Some(range) = range else { break };
+                let length = full.header_len();
+                // Completing the seed over the header and payload gives the full header.
+                let checksum = !fold(sum(&b[at..length]) + sum(&input[range]));
+                b[at + 16..at + 18].copy_from_slice(&checksum.to_be_bytes());
+                assert_eq!(a[..length], b[..length]);
+                count += 1;
+            }
+            assert_eq!(count, 3);
         }
     }
 

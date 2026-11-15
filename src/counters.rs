@@ -206,6 +206,9 @@ metrics! {
     tap_gso_frames: sum,
     /// TAP super-frames sent whole as offload frames.
     tx_offload_frames: sum,
+    /// Frames from TAP super-frames sent with their transport checksum left
+    /// partial (PARTIAL_CHECKSUMS); not in tap_checksums.
+    tx_partial_frames: sum,
     /// Expired frames announced to the receiver with FRAME_ABANDON.
     tx_frame_abandons: sum,
     /// Workers without a read ring at startup, plus rings disabled after rejection.

@@ -67,6 +67,14 @@ lossy path it loses more frames than ordinary traffic, so the user decided
 to keep it off by default (decision 8) and to continue with receive without
 the reassembly copy.
 
+On November 15 the user decided that ordinary frames may carry partial
+checksums behind their own optional handshake feature, on by default
+(decision 9). Frames the sender cuts from TAP GSO super-frames leave their
+TCP or UDP checksum as the pseudo-header sum, and the receiving TAP's
+kernel completes it, so neither daemon sums the payload. CPU per delivered
+bit fell 2.5% on the full-size point with no rise in loss on the lossy path
+([BENCH.md](BENCH.md#partial-checksums-for-ordinary-frames-november-15-landed)).
+
 ## November 12 checkpoint
 
 Stage 4 is done. An OVS system-port test now runs on Linux 6.8 and 7.0, with
@@ -675,9 +683,15 @@ rules apply to all of them.
    path (median 2.2% against 1.5%), so decision 8 stands, though the gap
    has narrowed from 11–27% against 4–13%
    ([BENCH.md](BENCH.md#offload-frames-on-the-lossy-path-after-frame_abandon-november-14)).
-   Next, the userspace parts still over their section 13.1 targets
-   (receive admission, staging and the frame flush); one flow striped with
-   a receive-side reorder stage (decision 7).
+   The same prefix for receive coverage was rejected (−0.3% over 12
+   rounds). Partial checksums (decision 9, design section 6) removed both
+   per-frame checksum passes for 2.5%
+   ([BENCH.md](BENCH.md#partial-checksums-for-ordinary-frames-november-15-landed)).
+   Frames read from the TAP singly with a partial checksum are still
+   completed at read time and could take the same path. Next, the
+   userspace parts still over their section 13.1 targets (receive
+   admission, staging and the frame flush); one flow striped with a
+   receive-side reorder stage (decision 7).
    The kernel figures can only be confirmed on an R86S-class box with real
    NICs; the remote 7.0 host stands in until then. The kernel test
    `tap::read::tests::real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch`

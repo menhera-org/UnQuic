@@ -19,6 +19,9 @@ pub const MAX_RECORDS: usize = 64;
 pub const MAX_ACK_RANGES: usize = 32;
 /// Optional handshake feature bit 0: DATA may carry offload frames.
 pub const OFFLOAD_FRAMES: u32 = 1;
+/// Optional handshake feature bit 1: DATA may carry ordinary frames whose
+/// TCP or UDP checksum the receiver completes.
+pub const PARTIAL_CHECKSUMS: u32 = 2;
 /// Bytes of the descriptor that starts every offload frame.
 pub const DESCRIPTOR_LEN: usize = 10;
 /// Largest offload frame, descriptor included.
@@ -219,6 +222,11 @@ pub enum Record<'a> {
         /// DESCRIPTOR_LEN-byte descriptor and may reach MAX_OFFLOAD_FRAME_LEN.
         /// Valid only on connections that negotiated OFFLOAD_FRAMES.
         offload: bool,
+        /// Record flag bit 1: a piece of an ordinary TCP or UDP frame whose
+        /// checksum field holds only the pseudo-header sum, for the receiver
+        /// to complete. Never set with `offload`; valid only on connections
+        /// that negotiated PARTIAL_CHECKSUMS.
+        partial: bool,
     },
     /// Transport acceptance of packets on the explicitly named sender lane.
     Ack {
@@ -343,7 +351,12 @@ impl Record<'_> {
             Self::Ready { .. } => 9,
             Self::LaneRetire { .. } => 10,
         };
-        let flags = u8::from(matches!(self, Self::Data { offload: true, .. }));
+        let flags = match self {
+            Self::Data {
+                offload, partial, ..
+            } => u8::from(offload) | u8::from(partial) << 1,
+            _ => 0,
+        };
         // The length check above bounds every write; errors only keep this panic-free.
         put(output, 0, &[kind, flags, (length >> 8) as u8, length as u8])?;
         let body = output.get_mut(4..length).ok_or(WireError::BufferTooSmall)?;
@@ -444,7 +457,8 @@ impl Record<'_> {
                 offset,
                 bytes,
                 offload,
-            } => validate_data(frame_id, total_len, offset, bytes.len(), offload)?,
+                partial,
+            } => validate_data(frame_id, total_len, offset, bytes.len(), offload, partial)?,
             Self::Ack {
                 lane,
                 delay_us,
@@ -643,6 +657,7 @@ pub fn encode_data_prefix(
         offset,
         bytes,
         offload,
+        partial,
     } = data
     else {
         return Err(WireError::Data);
@@ -653,9 +668,14 @@ pub fn encode_data_prefix(
         total_len,
         offset,
         bytes.len(),
-        offload,
+        data_flags(offload, partial),
         output,
     )
+}
+
+/// A DATA record's flags byte: bit 0 offload, bit 1 partial checksum.
+pub(crate) const fn data_flags(offload: bool, partial: bool) -> u8 {
+    offload as u8 | (partial as u8) << 1
 }
 
 fn validate_data(
@@ -664,9 +684,14 @@ fn validate_data(
     offset: u32,
     length: usize,
     offload: bool,
+    partial: bool,
 ) -> Result<(), WireError> {
     if length > u16::MAX as usize - 20 {
         return Err(WireError::Length);
+    }
+    // An offload frame's descriptor already says whether its checksum is partial.
+    if offload && partial {
+        return Err(WireError::Data);
     }
     let lengths = if offload {
         (14 + DESCRIPTOR_LEN) as u32..=MAX_OFFLOAD_FRAME_LEN as u32
@@ -685,23 +710,29 @@ fn validate_data(
     Ok(())
 }
 
-/// Prefix for a DATA piece whose payload may span separate borrowed slices.
+/// Prefix for a DATA piece whose payload may span separate borrowed slices;
+/// `flags` is the record's flags byte, from data_flags.
 pub(crate) fn encode_data_prefix_length(
     mut header: Header,
     frame_id: u64,
     total_len: u32,
     offset: u32,
     piece_len: usize,
-    offload: bool,
+    flags: u8,
     output: &mut [u8; DATA_PREFIX_LEN],
 ) -> Result<usize, WireError> {
-    validate_data(frame_id, total_len, offset, piece_len, offload)?;
+    let (offload, partial) = (flags & 1 != 0, flags & 2 != 0);
+    if flags > 3 {
+        return Err(WireError::Data);
+    }
+    validate_data(frame_id, total_len, offset, piece_len, offload, partial)?;
     Record::Data {
         frame_id,
         total_len,
         offset,
         bytes: &[],
         offload,
+        partial,
     }
     .validate_context(header, 1)?;
     let length = 20 + piece_len;
@@ -710,7 +741,7 @@ pub(crate) fn encode_data_prefix_length(
     put(
         output,
         HEADER_LEN,
-        &[1, u8::from(offload), (length >> 8) as u8, length as u8],
+        &[1, flags, (length >> 8) as u8, length as u8],
     )?;
     encode_data_fields(
         frame_id,
@@ -765,8 +796,9 @@ fn decode_record(input: &[u8]) -> Result<(Record<'_>, usize), WireError> {
         return Err(WireError::Length);
     }
     let [kind, flags] = read(input, 0);
-    // Only DATA defines a flag: bit 0 marks an offload frame's piece.
-    if flags != 0 && (kind != 1 || flags != 1) {
+    // Only DATA defines flags: bit 0 marks an offload frame's piece, bit 1 a
+    // partial checksum; validation rejects both together.
+    if flags != 0 && (kind != 1 || flags > 3) {
         return Err(WireError::Reserved);
     }
     let length = usize::from(read16(input, 2));
@@ -786,7 +818,8 @@ fn decode_record(input: &[u8]) -> Result<(Record<'_>, usize), WireError> {
             total_len: read32(body, 8),
             offset: read32(body, 12),
             bytes: tail(body, 16),
-            offload: flags == 1,
+            offload: flags & 1 != 0,
+            partial: flags & 2 != 0,
         },
         2 if body.len() >= 8 => {
             let [count, reserved] = read(body, 2);
@@ -959,11 +992,23 @@ fn scattered_data_prefix_rejects_invalid_lengths_before_writing() {
     ] {
         let mut output = [0xa5; DATA_PREFIX_LEN];
         assert_eq!(
-            encode_data_prefix_length(header, id, total, offset, length, false, &mut output),
+            encode_data_prefix_length(header, id, total, offset, length, 0, &mut output),
             Err(expected)
         );
         assert_eq!(output, [0xa5; DATA_PREFIX_LEN]);
     }
+    // A partial offload piece and unknown flags are rejected before any write.
+    for flags in [3, 4] {
+        let mut output = [0xa5; DATA_PREFIX_LEN];
+        assert_eq!(
+            encode_data_prefix_length(header, (1 << 48) | 1, 60, 0, 1, flags, &mut output),
+            Err(WireError::Data)
+        );
+        assert_eq!(output, [0xa5; DATA_PREFIX_LEN]);
+    }
+    let mut output = [0; DATA_PREFIX_LEN];
+    encode_data_prefix_length(header, (1 << 48) | 1, 60, 0, 1, 2, &mut output).unwrap();
+    assert_eq!(output[HEADER_LEN + 1], 2);
 }
 
 #[cfg(test)]
@@ -994,6 +1039,7 @@ fn random_and_mutated_datagrams_never_panic_decoding() {
         offset: 10,
         bytes: &[7; 50],
         offload: false,
+        partial: false,
     };
     let ack = Record::Ack {
         lane: 2,

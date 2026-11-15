@@ -751,6 +751,32 @@ than both in only 6, at −0.3% against the copy. Unlike the sender's
 read-modify-write of cold plane lines, these were stores into lines the
 slot's own copy keeps warm, so skipping them saved little.
 
+## Partial checksums for ordinary frames (November 15, landed)
+
+A split profile at ac2a7d2 put two checksum passes on every frame: the
+sender completing each GSO segment's transport checksum, about 205
+cycles per frame event and mostly a cache miss on the payload, and the
+receiver verifying every frame before coalescing, about 110. A
+diagnostic build that skipped both
+([patch](benches/checksum-skip-diagnostic.patch), never to land, since a
+frame written alone would carry a bad checksum) was lower than HEAD's
+copy in 6 of 6 rounds at −3.1% at the median
+([results](benches/full-size-checksum-diagnostic.json)). Doing it
+properly needs a wire change, which the user approved as decision 9: a
+new optional handshake feature, on by default, and a DATA flag marking a
+frame whose checksum holds only the pseudo-header sum (design section 6).
+The receiver writes such frames with NEEDS_CSUM, coalesced or alone.
+
+Stated beforehand: the usual efficiency bar on the full-size point, and
+no rise in frames lost on the lossy path. Full-size point
+([results](benches/full-size-partial-checksums.json)): lower than both
+HEAD and its copy in 6 of 6 rounds, −2.5% against the copy at the
+median, with HEAD at +0.5% against its copy. Each daemon sent about
+850,000–1,700,000 partial frames per worker log and completed no
+checksum. Lossy path ([results](benches/lossy-path-partial-checksums.json)):
+frames lost in the worse direction were 0.6–2.8% (median 1.1%) against
+HEAD's 0.5–3.7% (median 1.3%), at the same delivered rate.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames
