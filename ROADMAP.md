@@ -7,6 +7,33 @@ read that section before writing code. Keep the "Current status" paragraph in
 section 15 of the design and the "Implementation status" section of
 [README.md](README.md) true after every step.
 
+## November 15 checkpoint
+
+Per-frame cost on the full-size efficiency point fell about 12% in two
+days: a split profile puts each daemon at about 5,800 and 5,500 busy
+cycles per frame event, against about 6,600 and 6,000 at d0a4c5e and
+7,000 on November 13. What landed, each against its stated bar:
+announcing abandoned frames with FRAME_ABANDON, which cut frames lost on
+the lossy path several-fold; deadlines through `epoll_pwait2` with the
+worker timer slack at 1 ns (−1.5%); in-order ACKs kept as a prefix in
+frame coverage (−3.8%); and partial checksums on ordinary frames (−2.5%,
+decision 9, a new optional handshake feature on by default). Transmit
+socket buffers are forced to 2 MiB and the TAP queue to at least 1000
+where `CAP_NET_ADMIN` allows. Rejected: receive without the reassembly
+copy, the same ACK prefix for receive coverage, and freeing unmapped
+frames without a cleanup pass. Offload frames stay off (decision 8): on
+the lossy path they still lose a little more than ordinary frames.
+
+Of the remaining 5,800 cycles, about 3,250 are syscalls in this
+container: outer `sendmmsg` with software segmentation (about 1,500
+cycles per datagram at 17 segments per GSO message), TAP writes and
+reads, `recvmmsg`, and the per-turn polls and eventfd wakes of an
+offer-limited point, which run about 5.6 frame events per turn. The
+userspace rest has no part above about 300 cycles, the largest being the
+reassembly copy. Differences near 1% are now about as large as the
+point's A/A noise. The kernel figures need an R86S-class box with real
+NICs to confirm.
+
 ## November 13 checkpoint
 
 Balanced lanes' loopback loss came from ACKs waiting for packet numbers.
