@@ -899,6 +899,36 @@ each lost frame still arrives behind its successors; reordering on the
 scale of the loss rate is expected on both arms. The full-size and lossy
 efficiency points carry no striped flow with the feature off, the default.
 
+The bar is not met, and `stripe_flows` stays off.
+
+The first build (116a2ab) never striped. It marked a lane once its owner
+held 1 MiB unsent, but the flow's transmit worker filled its
+retained-frame quota first: in each run it refused about a million frames
+at admission with no backlog drop, and no stripe was claimed. Detection
+now uses those refusals: a flow is striped once its lane's owner has kept
+refusing frames for 10 ms. That build also crashed the daemon with
+"invalid data" as soon as a flow striped. Unsent bytes were charged
+without the 8-byte tag, but a sent or abandoned frame removes its whole
+length; the tag is now charged when the frame is cut.
+
+With both fixes ([results](benches/lossy-one-flow-striping.json)), the
+flow stripes within its first second, but the lift is small:
+
+| Loss | balc, L→R / R→L | strc, L→R / R→L | Reordered frames per direction |
+| --- | --- | --- | --- |
+| 0.5% | 1.12 / 1.18, 1.15 / 1.09 Gbit/s | 1.25 / 1.19, 1.24 / 1.27 | 20,000–21,000 → 190,000–260,000 |
+| 1% | 1.06 / 1.13, 1.09 / 1.13 | 1.62 / 0.23, 1.26 / 1.13 | 42,000–56,000 → 72,000–422,000 |
+
+The three data lanes' workers now share the transmit work, but worker 0
+on each side runs at 87–92%. It reads every frame from the TAP (QinQ input
+lands on one queue), and as the writer of stripe 0 (`0 mod 4`) it writes
+every striped frame back to the TAP. On the receiving side it dropped
+about 83,000 striped frames per direction and wrote another 190,000–
+260,000 out of sequence. Its receive socket overflowed 1,500–3,900 times.
+The other workers stay at 34–46%. One run at 1% loss collapsed R→L to
+0.23 Gbit/s. Next: keep the stripe writer off the worker that reads the
+TAP, then measure again.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames

@@ -2959,6 +2959,36 @@ fn fresh_materialization_gates_large_sources_without_losing_order_or_credit() {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
+fn striped_frames_charge_their_tags_to_unsent_bytes() {
+    let (mut workers, _rx) = workers();
+    let worker = &mut workers[0];
+    let index = worker.sender_index(0, 0).unwrap();
+    let mut connection = worker.sessions[0].connection.unwrap();
+    connection.local.optional_features |= crate::wire::STRIPED_FLOWS;
+    connection.peer.optional_features |= crate::wire::STRIPED_FLOWS;
+    worker.sessions[0].tx[0] = Some(
+        crate::pack::Lane::new(crate::UnquicUuid::from_bytes([1; 16]), connection, 1).unwrap(),
+    );
+    let mut input = gso_input(worker, 3, 100);
+    input.stripe = Some((0, 1));
+    worker.input_frame(input, Duration::ZERO).unwrap();
+    worker.drain_tap_inputs(Duration::ZERO).unwrap();
+    assert_eq!(worker.sender.lanes[index].unsent_bytes, 3 * (142 + 8));
+    // Abandoning the unsent frames removes them whole and balances.
+    let mut batch = worker.sessions[0].batches[0].take().unwrap();
+    let mut count = 0;
+    while let Some(frame) = batch.pending.pop_front(&mut worker.frames).unwrap() {
+        assert!(worker.frames.frame(frame).unwrap().striped);
+        worker.release_frame(frame).unwrap();
+        count += 1;
+    }
+    worker.sessions[0].batches[0] = Some(batch);
+    assert_eq!(count, 3);
+    assert_eq!(worker.sender.lanes[index].unsent_bytes, 0);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
 fn fresh_materialization_tracks_discovered_mtu_and_resumes_on_expiry() {
     for ceiling in [BASE_UDP_PAYLOAD, 1452, 8952] {
         let (mut workers, _rx) = workers();
@@ -3266,8 +3296,7 @@ fn fresh_admission_preserves_sixteen_flow_qinq_gso_burst_before_bounding_excess(
         worker.input_frame(buffer, Duration::ZERO).unwrap();
     }
     assert_eq!(worker.sender.lanes[index].unsent_bytes, 1_071_488);
-    // Past half the admission budget, the lane is marked for stripe detection.
-    assert_eq!(worker.shared.backlog[0][0].load(Ordering::Relaxed), 1);
+    assert_eq!(worker.shared.backlog[0][0].load(Ordering::Relaxed), 0);
     assert_eq!(worker.sessions[0].tap_inputs.len(), 16);
     assert_eq!(worker.counters.tx_backlog_drops, 0);
     assert_eq!(worker.counters.tap_gso_frames, 0);
@@ -3283,11 +3312,8 @@ fn fresh_admission_preserves_sixteen_flow_qinq_gso_burst_before_bounding_excess(
     );
     assert_eq!(worker.counters.tx_backlog_drops, 1);
     assert_eq!(worker.counters.queue_drops, 1);
-    let unsent = worker.sender.lanes[index].unsent_bytes;
-    worker
-        .remove_unsent(index, unsent - (STRIPE_BACKLOG - 1))
-        .unwrap();
-    assert_eq!(worker.shared.backlog[0][0].load(Ordering::Relaxed), 0);
+    // The refusal is recorded for stripe detection.
+    assert_ne!(worker.shared.backlog[0][0].load(Ordering::Relaxed), 0);
 }
 
 #[test]

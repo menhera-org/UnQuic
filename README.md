@@ -701,8 +701,9 @@ complete checksums on the wire.
 single-flow striping (decision 7, design section 13.1). It advertises the
 optional `STRIPED_FLOWS` feature; it acts only where both peers advertise
 it, `balance_flows` is on, and the session has at least two data lanes.
-When a flow's lane has held more than 1 MiB of unsent data for 10 ms, the
-flow takes one of the session's 16 stripes: each later TAP read of it goes
+When a flow's transmit worker has kept refusing frames for its lane for
+10 ms (it has no room for more), the flow takes one of the session's 16
+stripes: each later TAP read of it goes
 to the next data lane in turn, and every frame carries an 8-byte tag with
 its stripe and sequence. Such frames are never sent as offload frames. On
 the receiving side, the workers that reassemble striped frames pass them to

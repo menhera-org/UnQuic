@@ -470,20 +470,20 @@ const FLOW_MS_MASK: u64 = 0xff_ffff;
 pub(crate) const STRIPE_SLOTS: usize = 16;
 /// A flow-table lane value with this bit names a stripe slot instead.
 const STRIPED: usize = 0x80;
-/// Unsent bytes on one transmit lane that mark it backlogged: half of what
-/// admission lets one lane queue.
-// shortcut: fixed byte and time thresholds stand in for the design's one
-// pacing round; derive them from the lane's pacing rate if measurement
-// shows striping starting too late or on paths that are merely congested.
-const STRIPE_BACKLOG: usize = FRESH_BYTES / 2;
-/// How long a lane stays backlogged before the next read of a flow on it
-/// stripes the flow.
+/// How long a lane's owner must keep refusing admission before the next read
+/// of a flow on it stripes the flow.
+// shortcut: fixed times stand in for the design's one pacing round; derive
+// them from the lane's pacing rate if measurement shows striping starting
+// too late or on paths that are merely congested.
 const STRIPE_PRESS_MS: u64 = 10;
+/// A refusal this long after the previous one starts a new episode.
+const STRIPE_EPISODE_MS: u64 = 100;
 /// A stripe slot silent this long may be claimed again: twice a flow entry's
 /// idle time, so no live entry still names it, and past the writer's
 /// one-second restart.
 const STRIPE_IDLE_MS: u64 = 2 * FLOW_IDLE_MS;
 const STRIPE_IN_USE: u64 = 1 << 32;
+const STRIPE_REFUSING: u64 = 1 << 48;
 const SEQUENCE_MASK: u64 = (1 << 48) - 1;
 
 /// One stripe slot TAP readers share: a use stamp, and the next read number
@@ -494,28 +494,32 @@ pub(crate) struct Stripe {
     next: AtomicU64,
 }
 
-/// A transmit owner marks its lane when unsent bytes cross STRIPE_BACKLOG.
-fn mark_backlog(mark: &AtomicU64, before: usize, after: usize) {
-    if before < STRIPE_BACKLOG && after >= STRIPE_BACKLOG {
-        let _ = mark.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
-    } else if before >= STRIPE_BACKLOG && after < STRIPE_BACKLOG {
-        mark.store(0, Ordering::Relaxed);
-    }
+/// A transmit owner records refusing admission on its lane: the episode's
+/// first refusal in bits 24..48 and its latest in bits 0..24. Only the
+/// owner writes, at most once per millisecond.
+fn mark_refusal(mark: &AtomicU64, ms: u64) {
+    let now = ms & FLOW_MS_MASK;
+    let old = mark.load(Ordering::Relaxed);
+    let last = old & FLOW_MS_MASK;
+    let new = if old == 0 || now.wrapping_sub(last) & FLOW_MS_MASK >= STRIPE_EPISODE_MS {
+        STRIPE_REFUSING | now << 24 | now
+    } else if last != now {
+        old & !FLOW_MS_MASK | now
+    } else {
+        return;
+    };
+    mark.store(new, Ordering::Relaxed);
 }
 
-/// Whether a lane has been marked for STRIPE_PRESS_MS; the first reader to
-/// see a fresh mark stamps it.
+/// Whether a lane's owner is still refusing admission and has been for
+/// STRIPE_PRESS_MS.
 fn backlogged(mark: &AtomicU64, ms: u64) -> bool {
     let now = ms & FLOW_MS_MASK;
-    match mark.load(Ordering::Relaxed) {
-        0 => false,
-        1 => {
-            let _ =
-                mark.compare_exchange(1, STRIPE_IN_USE | now, Ordering::Relaxed, Ordering::Relaxed);
-            false
-        }
-        since => now.wrapping_sub(since) & FLOW_MS_MASK >= STRIPE_PRESS_MS,
-    }
+    let old = mark.load(Ordering::Relaxed);
+    let (first, last) = ((old >> 24) & FLOW_MS_MASK, old & FLOW_MS_MASK);
+    old != 0
+        && now.wrapping_sub(last) & FLOW_MS_MASK < STRIPE_EPISODE_MS
+        && last.wrapping_sub(first) & FLOW_MS_MASK >= STRIPE_PRESS_MS
 }
 
 /// Claims an idle stripe slot and restarts its reads and sequence at 1.
@@ -2903,6 +2907,13 @@ impl Worker {
         Ok(())
     }
 
+    /// Records for TAP readers that this lane's owner refused a frame.
+    fn mark_refusal(&self, session: usize, lane: usize, now: Duration) {
+        if let Some(mark) = self.shared.backlog.get(session).and_then(|m| m.get(lane)) {
+            mark_refusal(mark, now.as_millis() as u64);
+        }
+    }
+
     /// Counts one queue drop and, when known, its handoff or transmit-admission subset.
     fn queue_drop(&mut self, session: usize, handoff: bool, admission: bool) {
         for totals in [&mut self.counters, &mut self.sessions[session].totals] {
@@ -2974,6 +2985,7 @@ impl Worker {
             }]
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.queue_drop(session, false, true);
+            self.mark_refusal(session, lane, now);
             if self.sender_enabled()
                 && let Ok(index) = self.sender_index(session, lane)
             {
@@ -2998,6 +3010,7 @@ impl Worker {
                 }
                 local.tx_dirty |= 1_u64 << buffer.lane;
                 self.release(buffer);
+                self.mark_refusal(session, lane, now);
                 return Ok(());
             }
             Some(index)
@@ -3333,6 +3346,11 @@ impl Worker {
                 .checked_sub(length)
                 .ok_or(io::ErrorKind::InvalidData)?;
             self.release_unsent(session, lane, saved)?;
+            // Sends and abandons remove the whole frame, tag included.
+            if tag_len != 0 {
+                let index = self.sender_index(session, lane)?;
+                self.add_unsent(index, tag_len)?;
+            }
             self.recovery.bind(
                 frame,
                 self.frames.frame(frame).ok_or(io::ErrorKind::InvalidData)?,
@@ -3481,6 +3499,11 @@ impl Worker {
                 *unexpanded = unexpanded
                     .checked_sub(length)
                     .ok_or(io::ErrorKind::InvalidData)?;
+                // Sends and abandons remove the whole frame, tag included.
+                if tag_len != 0 {
+                    let index = self.sender_index(session, lane)?;
+                    self.add_unsent(index, tag_len)?;
+                }
                 self.recovery.bind(
                     index,
                     self.frames.frame(index).ok_or(io::ErrorKind::InvalidData)?,
@@ -7194,20 +7217,23 @@ mod tests {
     fn backlogged_flows_claim_a_stripe_and_take_lanes_and_sequences_in_turn() {
         use std::sync::atomic::AtomicUsize;
         let mark = AtomicU64::new(0);
-        mark_backlog(&mark, 0, STRIPE_BACKLOG - 1);
-        assert!(!backlogged(&mark, 100));
-        // The first reader to see the mark stamps it.
-        mark_backlog(&mark, STRIPE_BACKLOG - 1, STRIPE_BACKLOG);
-        assert!(!backlogged(&mark, 100));
-        assert!(!backlogged(&mark, 100 + STRIPE_PRESS_MS - 1));
-        mark_backlog(&mark, STRIPE_BACKLOG, 2 * STRIPE_BACKLOG);
-        assert!(backlogged(&mark, 100 + STRIPE_PRESS_MS));
-        mark_backlog(&mark, STRIPE_BACKLOG, STRIPE_BACKLOG - 1);
-        assert!(!backlogged(&mark, 200));
-        // A stamp at millisecond zero still counts as stamped.
-        mark_backlog(&mark, 0, STRIPE_BACKLOG);
         assert!(!backlogged(&mark, 0));
+        // A refusal episode starting at millisecond zero still counts.
+        mark_refusal(&mark, 0);
+        assert!(!backlogged(&mark, 5));
+        mark_refusal(&mark, STRIPE_PRESS_MS - 1);
+        assert!(!backlogged(&mark, STRIPE_PRESS_MS));
+        // Refusals that last STRIPE_PRESS_MS stripe until they stop.
+        mark_refusal(&mark, STRIPE_PRESS_MS);
+        mark_refusal(&mark, STRIPE_PRESS_MS);
         assert!(backlogged(&mark, STRIPE_PRESS_MS));
+        assert!(backlogged(&mark, STRIPE_PRESS_MS + STRIPE_EPISODE_MS - 1));
+        assert!(!backlogged(&mark, STRIPE_PRESS_MS + STRIPE_EPISODE_MS));
+        // A refusal after a quiet spell starts a new episode.
+        mark_refusal(&mark, 500);
+        assert!(!backlogged(&mark, 501));
+        mark_refusal(&mark, 500 + STRIPE_EPISODE_MS - 1);
+        assert!(backlogged(&mark, 500 + STRIPE_EPISODE_MS));
 
         let stripes: Vec<Stripe> = (0..2).map(|_| Stripe::default()).collect();
         assert_eq!(claim_stripe(&stripes, 5), Some(0));
@@ -7251,12 +7277,15 @@ mod tests {
     fn backlogged_flows_stripe_across_data_lanes_only_where_negotiated() {
         let ms = Duration::from_millis;
         for negotiated in [false, true] {
-            let (shared, [worker, _]) = test_workers_with(3, true);
+            let (_, [worker, _]) = test_workers_with(3, true);
             let frame = crate::tap::test_common::tcp::frame(false, 1, 1, 0x10, &[], &[7; 100]);
             // Lane 0 carries control, so the flow takes data lane 1.
             assert_eq!(worker.route(0, negotiated, &frame, 1, ms(0)), (1, None));
-            mark_backlog(&shared.backlog[0][1], 0, STRIPE_BACKLOG);
-            assert_eq!(worker.route(0, negotiated, &frame, 1, ms(1)), (1, None));
+            // Lane 1's owner refused frames from 0 to 9 ms, then from 10.
+            worker.mark_refusal(0, 1, ms(0));
+            worker.mark_refusal(0, 1, ms(9));
+            assert_eq!(worker.route(0, negotiated, &frame, 1, ms(9)), (1, None));
+            worker.mark_refusal(0, 1, ms(10));
             let routes: Vec<_> = [3, 1, 2]
                 .into_iter()
                 .zip(11..)

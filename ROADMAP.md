@@ -351,16 +351,24 @@ Decisions only the user can make, each blocking a remaining goal:
    TAP input carrying a stripe number and next sequence turns each frame
    cut from it into a striped frame whose header starts with the tag, on
    lanes that negotiated the feature, and never into an offload frame.
-   Flow selection and lane rotation followed in the same commit. A
-   transmit owner marks its lane in a shared word when unsent bytes cross
-   1 MiB, half of what admission lets a lane queue, and clears the mark
-   below it. The first TAP reader to see a fresh mark stamps it; once a
-   lane has been marked for 10 ms, the next read of an established flow on
-   it claims one of the session's 16 stripe slots and records the stripe in
-   the flow's table entry. Each read of a striped flow then takes one
-   atomic add on the slot, which yields both its data lane, in turn, and
-   its frames' first sequence. A slot silent for 2 s may be claimed again.
-   Next: the single-flow measurement, then the hold limit from SRTT.
+   Flow selection and lane rotation followed in the same commit. Once a
+   lane's owner has kept refusing frames for it at admission for 10 ms,
+   the next read of an established flow on the lane claims one of the
+   session's 16 stripe slots and records the stripe in the flow's table
+   entry. Each read of a striped flow then takes one atomic add on the
+   slot, which yields both its data lane, in turn, and its frames' first
+   sequence. A slot silent for 2 s may be claimed again. The first version
+   marked a lane holding more than 1 MiB unsent instead, and never fired
+   on the single-flow target: the owner ran out of retained-frame quota
+   and refused a million frames without ever queuing that much
+   ([BENCH.md](BENCH.md#striping-one-flow-across-transmit-workers-november-15)).
+   It also crashed the daemon once a flow striped, because unsent bytes
+   left out the tag; the tag is now charged when a frame is cut. Measured
+   on the single-flow target, the bar is not met: striping lifts the flow
+   by about 8% at 0.5% loss and reorders ten times more frames. Worker 0
+   on each side reads the whole TAP and is also stripe 0's writer, so it
+   saturates while the other workers idle. Next: keep the writer off the
+   TAP reader and measure again; then the hold limit from SRTT.
 8. Decided November 14: `daemon.offload_frames` stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should

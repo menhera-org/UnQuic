@@ -1097,12 +1097,14 @@ header with the tag on negotiated lanes (landed, unused until flow
 selection; it does not yet stripe offload frames, so a striped input is cut
 into ordinary frames); the sender's flow selection
 and lane rotation (landed with tag insertion). Flow selection simplifies
-"one pacing round" to fixed values: a lane is backlogged while its owner
-holds more than 1 MiB unsent, half the per-lane admission limit, and a
-flow on it is striped once the lane has been backlogged for 10 ms. The
-backlog is the lane's, not the flow's, so a small flow sharing a
-backlogged lane may take a stripe too; the 16 slots per session bound
-that. Measure on
+"one pacing round" to fixed values and replaces the unsent-byte test with
+admission refusals: a flow is striped once its lane's owner has kept
+refusing frames for the lane for 10 ms, with no gap of 100 ms or more
+between refusals. On the single-flow target the owner fills its
+retained-frame quota and refuses frames long before 1 MiB is unsent,
+so a byte threshold never fires. The signal is the lane's, not the
+flow's, so a small flow sharing a refusing lane may take a stripe too;
+the 16 slots per session bound that. Measure on
 the stage 3 single-flow target (7.5 ms RTT, 0.5% and 1% loss, four
 workers, 5 Gbit/s offered), stating the bar first: delivery above the
 November 11 striped range in both directions, frames reordered at the

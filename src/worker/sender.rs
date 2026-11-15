@@ -192,14 +192,6 @@ pub(super) struct Lane {
     pub(super) retire_due: bool,
 }
 
-/// The shared backlog mark TAP readers check before striping a flow on this lane.
-fn backlog_mark<'a>(shared: &'a crate::runtime::Shared, lane: &Lane) -> Option<&'a AtomicU64> {
-    shared
-        .backlog
-        .get(lane.session)?
-        .get(usize::from(lane.lane).checked_sub(1)?)
-}
-
 impl Lane {
     fn new(session: usize, lane: u16, group: usize) -> io::Result<Self> {
         Ok(Self {
@@ -811,14 +803,10 @@ impl Worker {
             .lanes
             .get_mut(index)
             .ok_or(io::ErrorKind::InvalidData)?;
-        let before = lane.unsent_bytes;
         lane.unsent_bytes = lane
             .unsent_bytes
             .checked_add(bytes)
             .ok_or(io::ErrorKind::InvalidData)?;
-        if let Some(mark) = backlog_mark(&self.shared, lane) {
-            super::mark_backlog(mark, before, lane.unsent_bytes);
-        }
         let group = lane.group;
         let unsent = self
             .sender
@@ -881,14 +869,10 @@ impl Worker {
             .lanes
             .get_mut(index)
             .ok_or(io::ErrorKind::InvalidData)?;
-        let before = lane.unsent_bytes;
         lane.unsent_bytes = lane
             .unsent_bytes
             .checked_sub(bytes)
             .ok_or(io::ErrorKind::InvalidData)?;
-        if let Some(mark) = backlog_mark(&self.shared, lane) {
-            super::mark_backlog(mark, before, lane.unsent_bytes);
-        }
         let group = lane.group;
         let unsent = self
             .sender
