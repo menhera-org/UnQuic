@@ -211,6 +211,14 @@ metrics! {
     tx_partial_frames: sum,
     /// Expired frames announced to the receiver with FRAME_ABANDON.
     tx_frame_abandons: sum,
+    /// Completed striped frames handed toward their stripe's writer.
+    rx_striped_frames: sum,
+    /// Striped frames a writer wrote out of sequence: late after a skipped
+    /// gap, or finding no free stripe slot.
+    stripe_unordered: sum,
+    /// Striped frames a writer dropped as duplicates or malformed, or could
+    /// not write to the TAP.
+    stripe_drops: sum,
     /// Workers without a read ring at startup, plus rings disabled after rejection.
     tap_read_fallbacks: sum,
     /// TAP frame write syscalls, including unsuccessful attempts and fallback retries.

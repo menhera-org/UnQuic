@@ -275,10 +275,11 @@ mod tests {
             assert!(loaded.config.daemon.control_lane);
             assert!(!loaded.config.daemon.offload_frames);
             assert!(loaded.config.daemon.partial_checksums);
+            assert!(!loaded.config.daemon.stripe_flows);
             loaded.config.validate().unwrap();
         }
         let text = format!(
-            "[daemon]\ncontrol_lane = false\nbalance_flows = false\noffload_frames = true\npartial_checksums = false\n{}",
+            "[daemon]\ncontrol_lane = false\nbalance_flows = false\noffload_frames = true\npartial_checksums = false\nstripe_flows = true\n{}",
             sample()
         );
         let loaded = Loaded::parse(&text).unwrap();
@@ -286,6 +287,7 @@ mod tests {
         assert!(!loaded.config.daemon.balance_flows);
         assert!(loaded.config.daemon.offload_frames);
         assert!(!loaded.config.daemon.partial_checksums);
+        assert!(loaded.config.daemon.stripe_flows);
         loaded.config.validate().unwrap();
         let text = format!("[daemon]\ntx_hold_us = 1000\n{}", sample());
         let loaded = Loaded::parse(&text).unwrap();

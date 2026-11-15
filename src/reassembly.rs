@@ -391,6 +391,10 @@ impl Lane {
         self.striped = accept;
     }
 
+    pub(crate) const fn accepts_striped_flows(&self) -> bool {
+        self.striped
+    }
+
     /// Registered remote lane ID.
     pub const fn id(&self) -> u16 {
         self.id

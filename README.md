@@ -697,6 +697,14 @@ CPU per delivered Gbit/s 2.5% at the median, in all six rounds, and lost
 no more frames on the lossy path (BENCH.md). Set it to false to keep
 complete checksums on the wire.
 
+`daemon.stripe_flows`, off by default, is the receiving half of single-flow
+striping (decision 7, design section 13.1): it advertises the optional
+`STRIPED_FLOWS` feature, and frames a peer stripes across lanes are passed
+from the workers that reassemble them to one writer per stripe, which writes
+them to the TAP in stripe order, holding frames behind a gap for at most
+5 ms. `rx_striped_frames`, `stripe_unordered` and `stripe_drops` count them.
+No sender stripes a flow yet, so turning it on changes nothing today.
+
 Flow hashing looks through one unfragmented IPv4, IPv6 or Ethernet
 encapsulation, including an IPv6 segment routing header before the inner
 packet. It retains the outer key and adds the inner addresses, protocol and

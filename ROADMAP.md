@@ -341,10 +341,14 @@ Decisions only the user can make, each blocking a remaining goal:
    window, and up to 64 buffers, each held until every frame in it has been
    written or dropped. A stripe silent for a second starts afresh, and a
    frame finding no stripe slot or arriving late is written out of
-   sequence and counted. Next: wiring it into the workers (the handoff
-   event, TAP writes from held buffers, the hold-limit deadline in the
-   worker's wait, counters), then the sender's flow selection and lane
-   rotation.
+   sequence and counted. The receive side is now wired in behind
+   `daemon.stripe_flows`, off by default: lane owners pack leading
+   striped frames into a transfer buffer per writer worker, hand full or
+   end-of-turn buffers over as one event (or write them locally), the
+   writer writes frames to its TAP queue in stripe order, and its hold
+   deadline joins the worker's wait. The hold limit is a fixed 5 ms for
+   now, not yet min(2 × SRTT, 5 ms). Next: the sender's flow selection,
+   lane rotation and tag insertion, then the single-flow measurement.
 8. Decided November 14: `daemon.offload_frames` stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should

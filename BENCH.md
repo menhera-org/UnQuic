@@ -790,6 +790,12 @@ admission is the largest userspace share, the candidate no more than
 [second six](benches/small-frames-striped-acceptance-2.json)) put it at
 +0.05%, within the bar.
 
+The receive side of striping then joined the workers behind
+`daemon.stripe_flows`, off by default, which leaves each TAP flush one
+check per lane. Same bar, against the previous step
+([results](benches/small-frames-striped-receive.json)): +0.2% against
+its copy at the median, with that step itself at −1.3% against its copy.
+
 ## Expanding super-frames in runs (November 15, landed)
 
 At the small-frame point, expanding a TAP super-frame into frames cost

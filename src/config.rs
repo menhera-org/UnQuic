@@ -73,6 +73,11 @@ pub struct Daemon {
     /// and the receiving TAP's kernel completes it, so neither daemon sums
     /// the payload.
     pub partial_checksums: bool,
+    /// Off by default, not yet complete: advertise optional feature
+    /// `STRIPED_FLOWS` and receive striped frames, restoring each stripe's
+    /// order on one worker before its TAP (design section 13.1, item 6).
+    /// Sending striped flows is not implemented yet.
+    pub stripe_flows: bool,
 }
 impl Default for Daemon {
     fn default() -> Self {
@@ -86,6 +91,7 @@ impl Default for Daemon {
             control_lane: true,
             offload_frames: false,
             partial_checksums: true,
+            stripe_flows: false,
         }
     }
 }
