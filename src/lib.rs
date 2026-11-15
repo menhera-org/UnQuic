@@ -59,6 +59,7 @@ pub mod runtime;
 mod sha256;
 pub mod socket;
 pub mod spsc;
+pub mod stripe;
 mod sys;
 pub mod tap;
 #[cfg(feature = "trace")]

@@ -334,9 +334,17 @@ Decisions only the user can make, each blocking a remaining goal:
    not call yet: an accepted striped frame keeps its flag across pieces,
    takes a run of two slots when the tag pushes it past one, and leaves
    through `Lane::front` rather than the ordinary TAP batch, with
-   `wire::stripe_tag` to read its stripe and sequence. Next: transfer
-   storage and the writer, which take a completed striped frame from its
-   lane owner to the stripe's reorder window and TAP queue.
+   `wire::stripe_tag` to read its stripe and sequence. The writer's logic
+   then landed as `stripe::Writer`, also unused so far: lane owners pack
+   completed striped frames into a pooled 64 KiB buffer as length-prefixed
+   entries, and the writer keeps up to 16 stripes, each with its reorder
+   window, and up to 64 buffers, each held until every frame in it has been
+   written or dropped. A stripe silent for a second starts afresh, and a
+   frame finding no stripe slot or arriving late is written out of
+   sequence and counted. Next: wiring it into the workers (the handoff
+   event, TAP writes from held buffers, the hold-limit deadline in the
+   worker's wait, counters), then the sender's flow selection and lane
+   rotation.
 8. Decided November 14: `daemon.offload_frames` stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should

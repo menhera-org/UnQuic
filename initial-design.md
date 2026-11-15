@@ -1067,7 +1067,13 @@ of its frames.
   and hands it to the writer through the existing worker queues; the copy
   is the price of a single writer, paid only by striped flows. The writer
   keeps a reorder window of 256 frames per stripe and writes frames to its
-  TAP queue in sequence, after removing the tag.
+  TAP queue in sequence, after removing the tag. Transfer buffers are the
+  workers' pooled 64 KiB buffers, each packed with length-prefixed frames,
+  so a 256-frame window needs only a few of them; the writer tracks up to
+  16 stripes and 64 buffers, holds each buffer until all its frames are
+  written or dropped, and writes a frame that finds no stripe slot out of
+  sequence rather than drop it. A stripe silent for a second starts
+  afresh, so a reused stripe number cannot meet its old window.
 - **Gaps.** A frame missing from the sequence holds the frames behind it
   until it arrives, until it is abandoned or expires on the lane that
   carries it, or until the oldest held frame has waited the hold limit,
