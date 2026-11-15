@@ -54,6 +54,7 @@ pub mod pmtu;
 #[cfg(feature = "profile")]
 pub mod profile;
 pub mod reassembly;
+pub mod reorder;
 pub mod runtime;
 mod sha256;
 pub mod socket;

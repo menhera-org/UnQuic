@@ -1080,9 +1080,10 @@ of its frames.
   skipped by arrival, timeout and full window, and frames delivered out of
   sequence (zero unless a gap was skipped).
 
-Landing order: the wire flag, tag and negotiation with codec tests; the
-receiver's reorder window as a unit with tests for every gap rule; the
-writer handoff; the sender's flow selection and lane rotation. Measure on
+Landing order: the receiver's reorder window as a unit with tests for
+every gap rule (landed first, `reorder::Window`); the wire flag, tag and
+negotiation with codec tests; the writer handoff; the sender's flow
+selection and lane rotation. Measure on
 the stage 3 single-flow target (7.5 ms RTT, 0.5% and 1% loss, four
 workers, 5 Gbit/s offered), stating the bar first: delivery above the
 November 11 striped range in both directions, frames reordered at the

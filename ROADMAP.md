@@ -321,6 +321,11 @@ Decisions only the user can make, each blocking a remaining goal:
    flow's reads over the data lanes once one worker cannot carry it, and
    one receive worker per stripe writes its frames in order through a
    256-frame reorder window with a hold limit of min(2 × SRTT, 5 ms).
+   The reorder window landed first, as `reorder::Window`, unused by the
+   runtime so far: fixed storage, skips by abandonment, hold limit and
+   full window, late frames delivered once out of sequence, and a
+   randomized test that every frame leaves at most once and in order
+   except late ones.
 8. Decided November 14: `daemon.offload_frames` stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should
