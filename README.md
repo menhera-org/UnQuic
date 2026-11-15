@@ -539,9 +539,10 @@ If a frame reaches its original 20–100 ms sender deadline, it is removed;
 remaining frames keep their
 IDs and submitted offsets and are repacked with fresh packet numbers. Connection
 retirement discards every queued batch before the worker acknowledges quiescence.
-Receive reassembly copies pieces into 64 fixed frame slots per lane and retains
-complete frames through TAP backpressure until delivery or the original 100 ms
-expiry. Receive work yields after 64 logical datagrams, 64 records or 64 KiB of
+Receive reassembly copies pieces into 128 fixed slots of 4,544 bytes per lane
+(the storage of 64 jumbo frames): a frame of a 1500-byte MTU takes one slot, a
+jumbo frame two and an offload frame up to fifteen. It retains complete frames
+through TAP backpressure until delivery or the original 100 ms expiry. Receive work yields after 64 logical datagrams, 64 records or 64 KiB of
 UDP payload, counting GRO-expanded segments and handoffs. The record bound
 matches the 64-frame TAP-read batch so small-frame receive bursts cannot take
 twice the work allowance of the reverse direction. A final datagram is

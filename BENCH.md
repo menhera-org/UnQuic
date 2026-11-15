@@ -954,6 +954,52 @@ hundreds of thousands of out-of-order writes. Keeping order through
 repairs here would need a hold of more than one round trip and a window
 of over 1,000 frames per stripe, about 1.5 MB at 1500-byte frames.
 
+## Twice the receive slots in the same storage (November 15, landed)
+
+On the routed 4.5 ms path with 1% loss (the lossy efficiency point,
+sixteen QinQ flows at 2 Gbit/s each way), every daemon refused thousands
+of datagrams for want of reassembly slots: each lane held at most 64
+incomplete or queued frames, and frames waiting a round trip for repair
+filled them. Each slot held a whole 9022-byte frame. Hypothesis: with
+more slots per lane, these refusals and the frame loss they cause go
+away. Bar, stated first: refusals near zero and the worse direction's
+lost share lower in at least two of three rounds, with CPU per
+delivered bit on the full-size point within A/A noise.
+
+An exploratory build with 128 whole-frame slots, which doubles receive
+storage, removed every refusal and roughly halved the worse point's loss
+in each round
+([results](benches/lossy-receive-slots-doubled-exploratory.json)). The landed version
+halves the slot instead: 128 slots of 4,544 bytes per lane, in the
+storage the 64 slots used. A frame of a 1500-byte MTU takes one slot, a
+jumbo frame two, and an offload frame up to fifteen; slot and reservation
+masks are `u128`, and the slot index has 256 entries.
+
+Lossy point, three rounds against HEAD in one container
+([results](benches/lossy-receive-slots.json)):
+
+| Round | HEAD refused, L / R | HEAD lost, worse direction, per point | 128 slots refused | 128 slots lost |
+| --- | --- | --- | --- | --- |
+| 1 | 9,440 / 3,525 | 1.00%, 1.70% | 0 / 0 | 0.48%, 1.06% |
+| 2 | 13,169 / 170 | 9.48%, 1.31% | 0 / 0 | 1.00%, 2.53% |
+| 3 | 4,672 / 8,056 | 1.39%, 1.00% | 0 / 0 | 0.53%, 1.03% |
+
+Each round has a warm-up point and a measured point. Delivery stays at
+3.75–3.93 Gbit/s on both arms. Frames expired incomplete fall from
+1,009–4,982 to 841–2,282 per daemon.
+
+The full-size point misses the efficiency part of the bar by about 1%.
+Six rounds of HEAD, HEAD's copy and the candidate were borderline, so six
+more were pooled with them
+([first](benches/full-size-receive-slots-1.json),
+[second](benches/full-size-receive-slots-2.json)). Over the twelve rounds
+the candidate used 1.1% more CPU per delivered Gbit/s than HEAD at the
+median and was lower in only 4 rounds; HEAD's copy came out +0.3%. Delivery
+and loss on that clean point did not change. The change lands anyway:
+the lossy gate is a requirement, and the change is small to revert if a
+cheaper layout turns up. Where the 1% goes is not known yet; the
+larger slot table and the `u128` masks are the suspects.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames

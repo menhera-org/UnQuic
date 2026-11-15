@@ -45,6 +45,16 @@ point now costs each daemon about 2,150 and 2,000 busy cycles per frame
 event. Without GSO the full-size point costs about 19,400, almost all of
 it per-frame syscalls (one TAP read, send and write per frame).
 
+In the evening, single-flow striping (decision 7) was completed behind
+`daemon.stripe_flows`, off by default: sender tag insertion, flow
+selection from admission refusals, and lane rotation. It misses its bar
+on the lossy single-flow target. The design's 5 ms hold cap and 256-frame
+window cannot keep order through repairs on a 7.5 ms path, and the stripe
+writer saturates on the worker that also reads the TAP. Receive slots
+were halved in size and doubled in number in the same storage, which
+ended reassembly refusals on the lossy point and cut its loss, for about
+1% CPU per bit on the clean full-size point.
+
 ## November 13 checkpoint
 
 Balanced lanes' loopback loss came from ACKs waiting for packet numbers.
@@ -398,6 +408,17 @@ Decisions only the user can make, each blocking a remaining goal:
    receive capacity, counted in frames rather than bytes, is a limit on the
    lossy-path gate of its own. That is worth measuring before more
    per-frame work.
+
+   Measured and addressed November 15: each lane now has 128 slots of
+   4,544 bytes in the same storage, so frames of a 1500-byte MTU get twice
+   the slots and jumbo frames as many as before. On the lossy point the
+   refusals fell from thousands per daemon to none, and the worse
+   direction lost less in every round
+   ([BENCH.md](BENCH.md#twice-the-receive-slots-in-the-same-storage-november-15-landed)).
+   It costs about 1% CPU per delivered bit on the clean full-size point
+   (median of twelve rounds), cause not yet found. Offload frames, which
+   take four slots each now, should be measured on the lossy path again
+   before the default is revisited.
 
 ## November 11 checkpoint
 

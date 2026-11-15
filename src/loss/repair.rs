@@ -4,8 +4,8 @@ use crate::MAX_FRAME_LEN;
 use std::ops::Range;
 
 /// Largest frame WidePlanes cover, and so the largest offload frame a sender
-/// builds: two reassembly slots, so a receiving lane holds 32 of them while
-/// repairs are pending instead of 8 maximum-size ones.
+/// builds: two jumbo frames, four reassembly slots, so a receiving lane holds
+/// 32 of them while repairs are pending instead of 8 maximum-size ones.
 pub const WIDE_FRAME_LEN: usize = 2 * MAX_FRAME_LEN;
 
 const WORDS: usize = MAX_FRAME_LEN.div_ceil(64);

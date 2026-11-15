@@ -81,22 +81,33 @@ fn offload_frames_take_slot_runs_and_keep_their_piece_bit() {
         Admission::Invalid
     );
     lane.accept_offload_frames(true);
-    // Eight maximum offload frames hold all 64 slots.
+    // Eight maximum offload frames hold 120 of the 128 slots, 15 each, and
+    // eight ordinary frames the rest.
     for sequence in 1..=8 {
         assert_eq!(
             admit(&mut lane, sequence, &[big(sequence, 0, &[1; 1000])], at),
             Admission::Fresh
         );
     }
-    assert_eq!(lane.retained_frames(), 8);
-    assert_eq!(lane.retained_bytes(), 8 * 65_535);
-    for record in [piece(9, 0, &[9; 60]), big(9, 0, &[9; 10])] {
-        assert_eq!(admit(&mut lane, 9, &[record], at), Admission::Pressure);
+    assert_eq!(
+        admit(&mut lane, 9, &[big(9, 0, &[9; 10])], at),
+        Admission::Pressure
+    );
+    for sequence in 9..=16 {
+        assert_eq!(
+            admit(&mut lane, sequence, &[piece(sequence, 0, &[9; 30])], at),
+            Admission::Fresh
+        );
     }
-    // Completing one frees its run: an ordinary frame then leaves seven
+    assert_eq!(lane.retained_frames(), 16);
+    assert_eq!(lane.retained_bytes(), 8 * 65_535 + 8 * 60);
+    for record in [piece(17, 0, &[9; 60]), big(17, 0, &[9; 10])] {
+        assert_eq!(admit(&mut lane, 17, &[record], at), Admission::Pressure);
+    }
+    // Completing one frees its run: an ordinary frame then leaves fourteen
     // free slots, too few for another maximum offload frame.
     let rest: &'static [u8] = Box::leak(vec![2; 8000].into_boxed_slice());
-    let mut packet = 10;
+    let mut packet = 20;
     for offset in (1000..65_535).step_by(8000) {
         let length = (65_535 - offset).min(8000);
         let record = big(1, offset as u32, &rest[..length]);
@@ -110,24 +121,24 @@ fn offload_frames_take_slot_runs_and_keep_their_piece_bit() {
     assert!(frame.bytes[1000..].iter().all(|&byte| byte == 2));
     assert!(lane.finish_front());
     assert_eq!(
-        admit(&mut lane, packet, &[piece(9, 0, &[9; 60])], at),
+        admit(&mut lane, packet, &[piece(17, 0, &[9; 60])], at),
         Admission::Fresh
     );
     assert!(!lane.front(at).unwrap().offload);
     assert_eq!(
-        admit(&mut lane, packet + 1, &[big(10, 0, &[3; 10])], at),
+        admit(&mut lane, packet + 1, &[big(18, 0, &[3; 10])], at),
         Admission::Pressure
     );
     assert!(lane.finish_front());
     // Every piece of a frame carries the same bit, across and within datagrams.
     assert_eq!(
-        admit(&mut lane, packet + 2, &[small(11, 0, true)], at),
+        admit(&mut lane, packet + 2, &[small(21, 0, true)], at),
         Admission::Fresh
     );
     for records in [
-        &[small(11, 30, false)][..],
-        &[small(12, 0, true), small(12, 30, false)],
-        &[small(12, 0, false), small(12, 30, true)],
+        &[small(21, 30, false)][..],
+        &[small(22, 0, true), small(22, 30, false)],
+        &[small(22, 0, false), small(22, 30, true)],
     ] {
         assert_eq!(
             admit(&mut lane, packet + 3, records, at),
@@ -135,7 +146,7 @@ fn offload_frames_take_slot_runs_and_keep_their_piece_bit() {
         );
     }
     // An ordinary ceiling still applies to ordinary frames.
-    let mut wide = small(13, 0, false);
+    let mut wide = small(23, 0, false);
     if let Record::Data { total_len, .. } = &mut wide {
         *total_len = 1515;
     }
@@ -554,12 +565,13 @@ fn full_ready_queue_rejects_new_frames_but_accepts_duplicates_without_reenqueuei
             Admission::Fresh
         );
     }
+    let next = FRAME_CAPACITY as u64 + 1;
     assert_eq!(
-        admit(&mut lane, 100, &[piece(65, 0, &[7; 60])], Duration::ZERO),
+        admit(&mut lane, 200, &[piece(next, 0, &[7; 60])], Duration::ZERO),
         Admission::Pressure
     );
     assert_eq!(
-        admit(&mut lane, 101, &[piece(1, 0, &[8; 60])], Duration::ZERO),
+        admit(&mut lane, 201, &[piece(1, 0, &[8; 60])], Duration::ZERO),
         Admission::Fresh
     );
     for sequence in 1..=FRAME_CAPACITY as u64 {
@@ -570,7 +582,7 @@ fn full_ready_queue_rejects_new_frames_but_accepts_duplicates_without_reenqueuei
     }
     assert!(lane.front(Duration::ZERO).is_none());
     assert_eq!(
-        admit(&mut lane, 100, &[piece(65, 0, &[7; 60])], Duration::ZERO),
+        admit(&mut lane, 200, &[piece(next, 0, &[7; 60])], Duration::ZERO),
         Admission::Fresh
     );
 }
@@ -629,7 +641,8 @@ fn feedback_excludes_rejected_packets_and_survives_frame_delivery() {
     use unquic::wire::{AckRange, MAX_ACK_RANGES};
     let mut lane = Lane::new(1, 1514).unwrap();
     let mut ranges = [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES];
-    for sequence in 1..=64 {
+    let full = FRAME_CAPACITY as u64;
+    for sequence in 1..=full {
         assert_eq!(
             admit(
                 &mut lane,
@@ -650,13 +663,16 @@ fn feedback_excludes_rejected_packets_and_survives_frame_delivery() {
     };
     assert_eq!(
         accepted.iter().collect::<Vec<_>>(),
-        [AckRange { start: 1, end: 64 }]
+        [AckRange {
+            start: 1,
+            end: full
+        }]
     );
     assert_eq!(
         admit(
             &mut lane,
             1000,
-            &[Record::Probe, piece(65, 0, &[1])],
+            &[Record::Probe, piece(full + 1, 0, &[1])],
             Duration::ZERO
         ),
         Admission::Pressure
@@ -671,7 +687,7 @@ fn feedback_excludes_rejected_packets_and_survives_frame_delivery() {
         striped: false,
     };
     assert_eq!(
-        admit(&mut lane, 65, &[too_large], Duration::ZERO),
+        admit(&mut lane, full + 1, &[too_large], Duration::ZERO),
         Admission::Invalid
     );
     assert_eq!(lane.ack_deadline(), None);
@@ -681,7 +697,12 @@ fn feedback_excludes_rejected_packets_and_survives_frame_delivery() {
     );
 
     assert_eq!(
-        admit(&mut lane, 65, &[piece(1, 1, &[1; 59])], Duration::ZERO),
+        admit(
+            &mut lane,
+            full + 1,
+            &[piece(1, 1, &[1; 59])],
+            Duration::ZERO
+        ),
         Admission::Fresh
     );
     assert_eq!(lane.front(Duration::ZERO).unwrap().id, id(1, 1));
@@ -694,13 +715,16 @@ fn feedback_excludes_rejected_packets_and_survives_frame_delivery() {
     };
     assert_eq!(
         accepted.iter().collect::<Vec<_>>(),
-        [AckRange { start: 1, end: 65 }]
+        [AckRange {
+            start: 1,
+            end: full + 1
+        }]
     );
 
     assert_eq!(
         admit(
             &mut lane,
-            65,
+            full + 1,
             &[piece(1, 1, &[1; 59])],
             Duration::from_millis(1)
         ),
@@ -847,7 +871,8 @@ fn only_ack_eliciting_records_schedule_feedback() {
 #[test]
 fn pressure_validates_all_lengths_and_defers_controls_until_full_admission() {
     let mut lane = Lane::new(1, 1514).unwrap();
-    for sequence in 1..=64 {
+    let full = FRAME_CAPACITY as u64;
+    for sequence in 1..=full {
         admit(
             &mut lane,
             sequence,
@@ -868,8 +893,8 @@ fn pressure_validates_all_lengths_and_defers_controls_until_full_admission() {
     assert_eq!(
         admit(
             &mut lane,
-            65,
-            &[tail, piece(65, 0, &[9; 30]), wrong],
+            full + 1,
+            &[tail, piece(full + 1, 0, &[9; 30]), wrong],
             Duration::ZERO
         ),
         Admission::Invalid
@@ -881,21 +906,21 @@ fn pressure_validates_all_lengths_and_defers_controls_until_full_admission() {
         reason: 1,
         frame_id: id(1, 2),
     };
-    let records = [tail, piece(65, 0, &[9; 30]), abandon];
+    let records = [tail, piece(full + 1, 0, &[9; 30]), abandon];
     assert_eq!(
-        admit(&mut lane, 65, &records, Duration::ZERO),
+        admit(&mut lane, full + 1, &records, Duration::ZERO),
         Admission::Pressure
     );
-    assert_eq!(lane.retained_frames(), 64); // The abandon did not run.
+    assert_eq!(lane.retained_frames(), FRAME_CAPACITY); // The abandon did not run.
     assert_eq!(lane.front(Duration::ZERO).unwrap().bytes, &[7; 60]);
     lane.finish_front();
     assert_eq!(
-        admit(&mut lane, 65, &records, Duration::ZERO),
+        admit(&mut lane, full + 1, &records, Duration::ZERO),
         Admission::Fresh
     );
-    assert_eq!(lane.retained_frames(), 63);
+    assert_eq!(lane.retained_frames(), FRAME_CAPACITY - 1);
     assert_eq!(
-        admit(&mut lane, 65, &records, Duration::ZERO),
+        admit(&mut lane, full + 1, &records, Duration::ZERO),
         Admission::Duplicate
     );
     assert!(lane.front(Duration::ZERO).is_none());

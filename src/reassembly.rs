@@ -15,7 +15,7 @@ use std::{collections::VecDeque, fmt, mem::size_of, time::Duration};
 /// Number of packet numbers and frame sequences retained in each lane window.
 pub const WINDOW_LEN: usize = 65_536;
 /// Maximum incomplete plus queued complete frames in this initial lane table.
-pub const FRAME_CAPACITY: usize = 64;
+pub const FRAME_CAPACITY: usize = 128;
 /// Lifetime from the first retained piece, unchanged by subsequent pieces.
 pub const FRAME_LIFETIME: Duration = Duration::from_millis(100);
 const WORDS: usize = WINDOW_LEN / 64;
@@ -160,10 +160,14 @@ impl Window {
     }
 }
 
-const SLOT_WORDS: usize = MAX_FRAME_LEN.div_ceil(64);
+/// Bytes per reassembly slot: half the largest ordinary frame, rounded to
+/// whole coverage words. A 1500-byte frame takes one slot and a jumbo frame
+/// two, so frames of a 1500-byte MTU get twice the slots in the same storage.
+pub(crate) const SLOT_LEN: usize = (MAX_FRAME_LEN / 2).next_multiple_of(64);
+const SLOT_WORDS: usize = SLOT_LEN / 64;
 
 // Per-slot state. Bytes and coverage live in Lane::bytes and Lane::covered,
-// contiguous across slots, so an offload frame spans a run of whole slots and
+// contiguous across slots, so a long frame spans a run of whole slots and
 // needs no storage of its own. Its sequence lives in Lane::sequences.
 #[derive(Clone, Copy)]
 struct Frame {
@@ -195,7 +199,7 @@ impl Frame {
         self.length = length;
         self.remaining = length;
         self.prefix_len = 0;
-        // Only offload frames and striped frames past one slot span more.
+        // Only frames longer than one slot span more.
         self.span = span(length);
         self.offload = offload;
         self.partial = false;
@@ -260,23 +264,23 @@ struct Reservation {
     slot: u8,
 }
 
-/// Slots a frame of this length holds: at most 8, for MAX_OFFLOAD_FRAME_LEN.
+/// Slots a frame of this length holds: at most 15, for MAX_OFFLOAD_FRAME_LEN.
 const fn span(length: u16) -> u8 {
     // Nearly every frame fits one slot; skip the division for them.
-    if length as usize <= MAX_FRAME_LEN {
+    if length as usize <= SLOT_LEN {
         return 1;
     }
-    let slots = (length as usize).div_ceil(MAX_FRAME_LEN);
+    let slots = (length as usize).div_ceil(SLOT_LEN);
     if slots == 0 { 1 } else { slots as u8 }
 }
 
-const fn run(span: u8) -> u64 {
-    u64::MAX >> (64 - span as u32)
+const fn run(span: u8) -> u128 {
+    u128::MAX >> (128 - span as u32)
 }
 
-/// Reserves `span` free slots: the lowest free slot for an ordinary frame, the
-/// highest free run for an offload frame, so the two rarely fragment each other.
-fn take(reserved: &mut u64, span: u8) -> Option<usize> {
+/// Reserves `span` free slots: the lowest free slot for a one-slot frame, the
+/// highest free run for a longer one, so the two rarely fragment each other.
+fn take(reserved: &mut u128, span: u8) -> Option<usize> {
     let run = run(span);
     let slot = if span == 1 {
         Some((!*reserved).trailing_zeros() as usize).filter(|&slot| slot < FRAME_CAPACITY)
@@ -313,9 +317,9 @@ pub struct Lane {
     // Sequence held by each slot; zero marks a free slot or an offload frame's tail.
     sequences: [u64; FRAME_CAPACITY],
     // One bit per slot starting a frame, so scans visit only occupied slots.
-    occupied: u64,
-    // One bit per slot in use, including the later slots of offload frames.
-    reserved: u64,
+    occupied: u128,
+    // One bit per slot in use, including the later slots of long frames.
+    reserved: u128,
     // New frames one datagram reserves, with their first slot; kept so no
     // datagram refills 1 KiB.
     reservations: [Reservation; 64],
@@ -344,7 +348,7 @@ impl Lane {
             striped: false,
             frames: [Frame::EMPTY; FRAME_CAPACITY],
             covered: vec![0; FRAME_CAPACITY * SLOT_WORDS].into_boxed_slice(),
-            bytes: vec![0; FRAME_CAPACITY * MAX_FRAME_LEN].into_boxed_slice(),
+            bytes: vec![0; FRAME_CAPACITY * SLOT_LEN].into_boxed_slice(),
             sequences: [0; FRAME_CAPACITY],
             occupied: 0,
             reserved: 0,
@@ -365,7 +369,7 @@ impl Lane {
     /// overhead; this is not a measurement of process resident memory.
     pub const fn storage_bytes() -> usize {
         size_of::<Self>()
-            + FRAME_CAPACITY * (MAX_FRAME_LEN + SLOT_WORDS * size_of::<u64>() + size_of::<u8>())
+            + FRAME_CAPACITY * (SLOT_LEN + SLOT_WORDS * size_of::<u64>() + size_of::<u8>())
     }
 
     /// Accepts offload frames until the next reset; call after reset when the
@@ -670,7 +674,7 @@ impl Lane {
                     if remaining != 0 {
                         frame.piece(
                             &mut self.covered[slot * SLOT_WORDS..],
-                            &mut self.bytes[slot * MAX_FRAME_LEN..],
+                            &mut self.bytes[slot * SLOT_LEN..],
                             offset as usize,
                             bytes,
                         );
@@ -792,7 +796,7 @@ impl Lane {
     }
 
     fn slot_bytes(&self, slot: usize) -> &[u8] {
-        let start = slot * MAX_FRAME_LEN;
+        let start = slot * SLOT_LEN;
         self.bytes
             .get(start..start + usize::from(self.frames[slot].length))
             .unwrap_or_default()
@@ -910,7 +914,7 @@ impl Lane {
 
 const fn hash(sequence: u64) -> usize {
     // Multiplication folds high sequence bits into the small, half-full table.
-    (sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - 7)) as usize
+    (sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - INDEX_LEN.trailing_zeros())) as usize
 }
 
 fn validate(id: u16, frame_limit: u16) -> Result<(), LaneError> {
@@ -1313,11 +1317,28 @@ mod tests {
     }
 
     #[test]
+    fn frames_of_a_1500_byte_mtu_take_one_slot_and_jumbo_frames_two() {
+        assert_eq!(FRAME_CAPACITY * SLOT_LEN, 128 * 4544);
+        assert_eq!(span(1514), 1);
+        assert_eq!(span(SLOT_LEN as u16), 1);
+        assert_eq!(span(SLOT_LEN as u16 + 1), 2);
+        assert_eq!(span(MAX_FRAME_LEN as u16), 2);
+        // A lane holds 128 one-slot frames, or 64 jumbo frames, at once.
+        let mut reserved = 0;
+        assert!((0..FRAME_CAPACITY).all(|_| take(&mut reserved, 1).is_some()));
+        assert_eq!(take(&mut reserved, 1), None);
+        let mut reserved = 0;
+        assert!((0..FRAME_CAPACITY / 2).all(|_| take(&mut reserved, 2).is_some()));
+        assert_eq!(take(&mut reserved, 2), None);
+    }
+
+    #[test]
     fn contiguous_copy_preserves_coverage_overlap_and_reused_slots() {
-        // One slot's storage, viewed as the fields a frame used to own.
+        // Two slots' storage, enough for the largest ordinary frame, viewed
+        // as the fields a frame used to own.
         struct Slot {
             frame: Frame,
-            covered: [u64; SLOT_WORDS],
+            covered: [u64; 2 * SLOT_WORDS],
             bytes: [u8; MAX_FRAME_LEN],
         }
         impl Slot {
@@ -1337,7 +1358,7 @@ mod tests {
         }
         let mut frame = Box::new(Slot {
             frame: Frame::EMPTY,
-            covered: [0; SLOT_WORDS],
+            covered: [0; 2 * SLOT_WORDS],
             bytes: [0; MAX_FRAME_LEN],
         });
         let first = [0x3c; MAX_FRAME_LEN];
@@ -1521,19 +1542,19 @@ mod tests {
     #[test]
     fn index_deletion_preserves_colliding_and_wrapping_probe_chains() {
         let mut lane = Lane::new(1, 9022).unwrap();
-        for home in [0, 120, 127] {
-            let colliding: Vec<_> = (1..100_000)
+        for home in [0, 120, INDEX_LEN - 1] {
+            let colliding: Vec<_> = (1..200_000)
                 .filter(|&seq| hash(seq) == home)
-                .take(64)
+                .take(FRAME_CAPACITY)
                 .collect();
-            assert_eq!(colliding.len(), 64);
-            lane.reserved = u64::MAX;
+            assert_eq!(colliding.len(), FRAME_CAPACITY);
+            lane.reserved = u128::MAX;
             for (slot, &seq) in colliding.iter().enumerate() {
                 lane.sequences[slot] = seq;
                 lane.insert(slot);
             }
-            for step in 0..64 {
-                let slot = (step * 17) % 64;
+            for step in 0..FRAME_CAPACITY {
+                let slot = (step * 17) % FRAME_CAPACITY;
                 lane.release(slot);
                 for (i, &seq) in colliding.iter().enumerate() {
                     assert_eq!(

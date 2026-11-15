@@ -229,7 +229,8 @@ by ignoring the unknown bit.
   is discarded like a failed TAP write. The total frame length includes
   the descriptor and is at most 65,535 bytes.
 - A sender cuts a super-frame into runs of whole segments of at most two
-  reassembly slots (18,044 bytes), each with its own rewritten headers
+  jumbo frames (18,044 bytes, four reassembly slots since slots were
+  halved on November 15), each with its own rewritten headers
   (lengths, TCP sequence and flags, IPv4 identification) and the run's
   pseudo-header checksum seed, so a receiving lane holds 32 offload frames.
   Whole super-frames, up to eight slots, left a lane only eight; under a
@@ -243,8 +244,9 @@ by ignoring the unknown bit.
   pre-coalescing checksum check; nothing has been computed to check.
 - Repair, abandonment, lifetime and per-byte coverage are unchanged. A lost
   datagram repairs only its pieces. A receiver stores an offload frame in
-  a run of consecutive ordinary reassembly slots, at most eight for the
-  largest, so receiving needs no memory beyond today's; ordinary frames
+  a run of consecutive ordinary reassembly slots, at most fifteen of the
+  4,544-byte slots for the largest, so receiving needs no memory beyond
+  today's; ordinary frames
   take the lowest free slots and offload frames the highest free run.
   Senders keep offload frames' coverage in a bounded pool of wide planes,
   64 per worker, charged to `memory_limit`; when it runs out, segments go

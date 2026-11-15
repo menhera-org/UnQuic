@@ -414,7 +414,8 @@ impl ReceiveBudget {
 }
 // Receive quotas follow from fixed lane/slot counts, without shared reservations.
 const _: () = assert!(LANES * reassembly::FRAME_CAPACITY <= 8192);
-const _: () = assert!(LANES * reassembly::FRAME_CAPACITY * MAX_FRAME_LEN <= 64 * 1024 * 1024);
+const _: () =
+    assert!(LANES * reassembly::FRAME_CAPACITY * reassembly::SLOT_LEN <= 64 * 1024 * 1024);
 
 const fn frame_quota(workers: usize) -> usize {
     frames::CAPACITY / workers
@@ -7952,11 +7953,12 @@ mod tests {
     #[ignore = "kernel descriptor test; run in a disposable container"]
     fn blocked_tap_keeps_tails_but_never_acks_an_unretained_head() {
         use wire::{AckRange, MAX_ACK_RANGES};
+        let full = reassembly::FRAME_CAPACITY as u64;
         for blocked in [false, true] {
             let (mut worker, rx) = receive_worker();
             let now = Duration::ZERO;
             let mut bytes = [0; 256];
-            for number in 1..=64 {
+            for number in 1..=full {
                 let length =
                     receive_bytes(number, &[receive_piece(number, 0, &[7; 30])], &mut bytes);
                 assert_eq!(
@@ -7974,11 +7976,11 @@ mod tests {
             }
             let records = [
                 receive_piece(1, 30, &[7; 30]),
-                receive_piece(65, 0, &[9; 30]),
+                receive_piece(full + 1, 0, &[9; 30]),
             ];
             for _ in 0..2 {
                 let mut buffer = worker.free.pop().unwrap();
-                buffer.length = receive_bytes(65, &records, &mut buffer.bytes);
+                buffer.length = receive_bytes(full + 1, &records, &mut buffer.bytes);
                 worker.received.push_back(buffer);
                 worker.drain_packets(now).unwrap();
             }
@@ -7987,7 +7989,7 @@ mod tests {
                 if blocked { 2 } else { 0 }
             );
             let lane = worker.sessions[0].rx[0].as_mut().unwrap();
-            assert_eq!(lane.retained_frames(), 64);
+            assert_eq!(lane.retained_frames(), reassembly::FRAME_CAPACITY);
             if blocked {
                 assert_eq!(lane.front(now).unwrap().bytes, &[7; 60]);
             }
@@ -8002,7 +8004,7 @@ mod tests {
                 accepted.iter().collect::<Vec<_>>(),
                 [AckRange {
                     start: 1,
-                    end: if blocked { 64 } else { 65 }
+                    end: if blocked { full } else { full + 1 }
                 }]
             );
             if blocked {
@@ -8025,12 +8027,15 @@ mod tests {
             assert_eq!(&bytes[..60], &[7; 60]);
             // Retry identical bytes and packet number: only the new head is retained.
             let mut buffer = worker.free.pop().unwrap();
-            buffer.length = receive_bytes(65, &records, &mut buffer.bytes);
+            buffer.length = receive_bytes(full + 1, &records, &mut buffer.bytes);
             worker.received.push_back(buffer);
             worker.drain_packets(now).unwrap();
             let mut buffer = worker.free.pop().unwrap();
-            buffer.length =
-                receive_bytes(66, &[receive_piece(65, 30, &[9; 30])], &mut buffer.bytes);
+            buffer.length = receive_bytes(
+                full + 2,
+                &[receive_piece(full + 1, 30, &[9; 30])],
+                &mut buffer.bytes,
+            );
             worker.received.push_back(buffer);
             worker.drain_packets(now).unwrap();
             worker.flush_taps(now).unwrap();
@@ -8051,7 +8056,10 @@ mod tests {
             };
             assert_eq!(
                 accepted.iter().collect::<Vec<_>>(),
-                [AckRange { start: 1, end: 66 }]
+                [AckRange {
+                    start: 1,
+                    end: full + 2
+                }]
             );
         }
     }

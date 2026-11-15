@@ -924,7 +924,7 @@ fn commit_barriers_allocate_nothing() {
 fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
     use unquic::{
         UnquicUuid,
-        reassembly::{Admission, Lane},
+        reassembly::{Admission, FRAME_CAPACITY, Lane},
         wire::{Datagram, Header, encode_datagram},
     };
     let mut lane = Lane::new(1, 9022).unwrap();
@@ -966,7 +966,9 @@ fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
         lane.retire();
         lane.reset(1, 9022).unwrap();
     }
-    for sequence in 1..=64 {
+    // Fill every slot with a half-received frame; the next new frame finds none.
+    let capacity = FRAME_CAPACITY as u64;
+    for sequence in 1..=capacity {
         let record = Record::Data {
             frame_id: (1 << 48) | sequence,
             bytes: &[3; 30],
@@ -1001,7 +1003,7 @@ fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
             striped: false,
         },
         Record::Data {
-            frame_id: (1 << 48) | 65,
+            frame_id: (1 << 48) | (capacity + 1),
             total_len: 60,
             offset: 0,
             bytes: &[3; 30],
@@ -1012,7 +1014,7 @@ fn reassembly_admission_expiry_delivery_and_reset_allocate_nothing() {
     ];
     let len = encode_datagram(
         Header {
-            packet_number: 65,
+            packet_number: capacity + 1,
             ..header
         },
         &records,
