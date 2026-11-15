@@ -777,6 +777,19 @@ checksum. Lossy path ([results](benches/lossy-path-partial-checksums.json)):
 frames lost in the worse direction were 0.6–2.8% (median 1.1%) against
 HEAD's 0.5–3.7% (median 1.3%), at the same delivered rate.
 
+## Striped-frame acceptance in receive admission (November 15, no regression)
+
+The second and third steps of single-flow striping (design section 13.1,
+item 6) add a DATA flag and a third per-frame flag that receive admission
+checks, and every new frame's slot span. Nothing is striped yet, so the
+only question is cost. Stated beforehand: on the small-frame point, where
+admission is the largest userspace share, the candidate no more than
+0.5% above the previous HEAD's copy at the median. Six rounds came out at
++0.8% with HEAD at +0.4%; twelve pooled
+([first six](benches/small-frames-striped-acceptance-1.json),
+[second six](benches/small-frames-striped-acceptance-2.json)) put it at
++0.05%, within the bar.
+
 ## Expanding super-frames in runs (November 15, landed)
 
 At the small-frame point, expanding a TAP super-frame into frames cost

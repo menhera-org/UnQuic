@@ -8,7 +8,7 @@
 use crate::{
     MAX_FRAME_LEN,
     ack::Schedule,
-    wire::{AckRange, AckRanges, Datagram, MAX_ACK_RANGES, Record},
+    wire::{AckRange, AckRanges, Datagram, MAX_ACK_RANGES, Record, STRIPE_TAG_LEN},
 };
 use std::{collections::VecDeque, fmt, mem::size_of, time::Duration};
 
@@ -58,6 +58,8 @@ pub struct ReadyFrame<'a> {
     pub offload: bool,
     /// Whether its transport checksum is left partial (PARTIAL_CHECKSUMS).
     pub partial: bool,
+    /// Whether its bytes start with a stripe tag (STRIPED_FLOWS).
+    pub striped: bool,
 }
 
 struct Window {
@@ -173,6 +175,8 @@ struct Frame {
     offload: bool,
     // The transport checksum is left partial; set by admission after start.
     partial: bool,
+    // The bytes start with a stripe tag; set by admission after start.
+    striped: bool,
     deadline: Duration,
 }
 impl Frame {
@@ -183,6 +187,7 @@ impl Frame {
         span: 1,
         offload: false,
         partial: false,
+        striped: false,
         deadline: Duration::ZERO,
     };
 
@@ -190,9 +195,11 @@ impl Frame {
         self.length = length;
         self.remaining = length;
         self.prefix_len = 0;
-        self.span = if offload { span(length) } else { 1 };
+        // Only offload frames and striped frames past one slot span more.
+        self.span = span(length);
         self.offload = offload;
         self.partial = false;
+        self.striped = false;
         self.deadline = now.saturating_add(FRAME_LIFETIME);
         let words = usize::from(length).div_ceil(64).min(covered.len());
         covered[..words].fill(0);
@@ -249,11 +256,16 @@ struct Reservation {
     length: u16,
     offload: bool,
     partial: bool,
+    striped: bool,
     slot: u8,
 }
 
 /// Slots a frame of this length holds: at most 8, for MAX_OFFLOAD_FRAME_LEN.
 const fn span(length: u16) -> u8 {
+    // Nearly every frame fits one slot; skip the division for them.
+    if length as usize <= MAX_FRAME_LEN {
+        return 1;
+    }
     let slots = (length as usize).div_ceil(MAX_FRAME_LEN);
     if slots == 0 { 1 } else { slots as u8 }
 }
@@ -293,6 +305,8 @@ pub struct Lane {
     offload: bool,
     // Whether the connection negotiated partial checksums.
     partial: bool,
+    // Whether this lane's owner hands striped frames to their reorder writer.
+    striped: bool,
     frames: [Frame; FRAME_CAPACITY],
     covered: Box<[u64]>,
     bytes: Box<[u8]>,
@@ -327,6 +341,7 @@ impl Lane {
             terminal: Window::new(),
             offload: false,
             partial: false,
+            striped: false,
             frames: [Frame::EMPTY; FRAME_CAPACITY],
             covered: vec![0; FRAME_CAPACITY * SLOT_WORDS].into_boxed_slice(),
             bytes: vec![0; FRAME_CAPACITY * MAX_FRAME_LEN].into_boxed_slice(),
@@ -367,6 +382,13 @@ impl Lane {
     /// reset when the connection negotiated them.
     pub fn accept_partial_checksums(&mut self, accept: bool) {
         self.partial = accept;
+    }
+
+    /// Accepts striped frames until the next reset; call after reset only
+    /// when the connection negotiated them and the caller takes striped
+    /// frames from [`Lane::front`] to their reorder writer.
+    pub fn accept_striped_flows(&mut self, accept: bool) {
+        self.striped = accept;
     }
 
     /// Registered remote lane ID.
@@ -453,6 +475,7 @@ impl Lane {
         self.retired = false;
         self.offload = false;
         self.partial = false;
+        self.striped = false;
         self.expired_frames = 0;
         self.expired_incomplete_frames = 0;
         self.duplicate_pieces = 0;
@@ -516,15 +539,15 @@ impl Lane {
                     striped,
                     ..
                 } => {
-                    // The codec bounds offload frames by MAX_OFFLOAD_FRAME_LEN.
-                    // Striped frames wait for their reorder writer (design
-                    // section 13.1, item 6), so no lane accepts them yet.
+                    // The codec bounds offload frames by MAX_OFFLOAD_FRAME_LEN;
+                    // a stripe tag adds to the ordinary ceiling.
+                    let tag = if striped { STRIPE_TAG_LEN as u32 } else { 0 };
                     if if offload {
                         !self.offload
                     } else {
-                        total_len > u32::from(self.frame_limit)
+                        total_len > u32::from(self.frame_limit) + tag
                     } || (partial && !self.partial)
-                        || striped
+                        || (striped && !self.striped)
                     {
                         return Admission::Invalid;
                     }
@@ -535,7 +558,7 @@ impl Lane {
                     }
                     let (length, kind) = if let Some(slot) = self.find(sequence) {
                         let frame = &self.frames[slot];
-                        (frame.length, (frame.offload, frame.partial))
+                        (frame.length, (frame.offload, frame.partial, frame.striped))
                     } else if let Some(reservation) = self
                         .reservations
                         .iter()
@@ -544,10 +567,15 @@ impl Lane {
                     {
                         (
                             reservation.length,
-                            (reservation.offload, reservation.partial),
+                            (
+                                reservation.offload,
+                                reservation.partial,
+                                reservation.striped,
+                            ),
                         )
                     } else {
-                        let span = if offload { span(total_len as u16) } else { 1 };
+                        // Ordinary frames hold one slot; a striped one past it holds two.
+                        let span = span(total_len as u16);
                         let slot = take(&mut trial, span);
                         pressure |= slot.is_none();
                         // A datagram holds at most 64 records; any excess still counts as pressure.
@@ -558,6 +586,7 @@ impl Lane {
                                     length: total_len as u16,
                                     offload,
                                     partial,
+                                    striped,
                                     slot: slot.unwrap_or_default() as u8,
                                 };
                             }
@@ -567,7 +596,7 @@ impl Lane {
                         continue;
                     };
                     // Every piece of a frame carries the same flags.
-                    if u32::from(length) != total_len || kind != (offload, partial) {
+                    if u32::from(length) != total_len || kind != (offload, partial, striped) {
                         return Admission::Invalid;
                     }
                 }
@@ -620,6 +649,7 @@ impl Lane {
                                 &mut self.covered[slot * SLOT_WORDS..],
                             );
                             frame.partial = reservation.partial;
+                            frame.striped = reservation.striped;
                             self.reserved |= run(frame.span) << slot;
                             let deadline = frame.deadline;
                             self.sequences[slot] = sequence;
@@ -725,15 +755,18 @@ impl Lane {
             bytes: self.slot_bytes(slot),
             offload: frame.offload,
             partial: frame.partial,
+            striped: frame.striped,
         })
     }
 
-    /// Ordinary ready frames in queue order, stopping before any offload frame.
+    /// Ordinary ready frames in queue order, stopping before any offload or
+    /// striped frame, which go out through [`Lane::front`].
     pub(crate) fn ready_frames(&mut self, now: Duration) -> impl Iterator<Item = &[u8]> {
         self.expire(now);
         self.ready.iter().map_while(|&slot| {
             let slot = usize::from(slot);
-            (!self.frames[slot].offload).then(|| self.slot_bytes(slot))
+            let frame = &self.frames[slot];
+            (!frame.offload && !frame.striped).then(|| self.slot_bytes(slot))
         })
     }
 
@@ -746,7 +779,7 @@ impl Lane {
             .take(64)
             .map_while(|&slot| {
                 let frame = &self.frames[usize::from(slot)];
-                (!frame.offload).then_some(frame.partial)
+                (!frame.offload && !frame.striped).then_some(frame.partial)
             })
             .enumerate()
             .fold(0, |mask, (index, partial)| {
@@ -986,36 +1019,107 @@ mod tests {
     }
 
     #[test]
-    fn striped_frames_are_refused_until_a_reorder_writer_receives_them() {
+    fn striped_frames_need_acceptance_leave_through_front_and_may_span_two_slots() {
         let mut lane = Lane::new(1, 9022).unwrap();
         lane.accept_offload_frames(true);
         lane.accept_partial_checksums(true);
-        let mut bytes = [0; 256];
-        for (offload, partial) in [(false, false), (false, true), (true, false)] {
+        let mut bytes = vec![0; 9200];
+        let mut admit = |lane: &mut Lane, number: u64, piece: Record<'_>| {
             let n = crate::wire::encode_datagram(
                 crate::wire::Header {
                     cookie: crate::UnquicUuid::from_bytes([1; 16]),
                     receive_tag: 1,
                     lane: 1,
-                    packet_number: 1,
+                    packet_number: number,
                     record_area_len: 0,
                 },
-                &[Record::Data {
-                    frame_id: (1 << 48) | 1,
-                    total_len: 80,
-                    offset: 0,
-                    bytes: &[1; 80],
-                    offload,
-                    partial,
-                    striped: true,
-                }],
+                &[piece],
                 &mut bytes,
             )
-            .unwrap();
-            let datagram = Datagram::decode(&bytes[..n]).unwrap();
-            assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Invalid);
-        }
+            .unwrap_or_else(|error| panic!("packet {number}: {error:?}"));
+            lane.admit(&Datagram::decode(&bytes[..n]).unwrap(), Duration::ZERO)
+        };
+        let tag = |sequence: u64| ((7_u64 << 48) | sequence).to_be_bytes();
+        let short = [&tag(1)[..], &[1; 72]].concat();
+        let piece = |sequence: u64, frame: &'static [u8], offset: u32, striped| Record::Data {
+            frame_id: (1 << 48) | sequence,
+            total_len: frame.len() as u32,
+            offset,
+            bytes: frame,
+            offload: false,
+            partial: false,
+            striped,
+        };
+        let short: &'static [u8] = short.leak();
+        assert_eq!(
+            admit(&mut lane, 1, piece(1, short, 0, true)),
+            Admission::Invalid
+        );
         assert_eq!(lane.retained_bytes(), 0);
+        lane.accept_striped_flows(true);
+        // An ordinary frame, then a striped one: the batch stops before it.
+        let plain: &'static [u8] = vec![2; 60].leak();
+        assert_eq!(
+            admit(&mut lane, 1, piece(1, plain, 0, false)),
+            Admission::Fresh
+        );
+        assert_eq!(
+            admit(&mut lane, 2, piece(2, short, 0, true)),
+            Admission::Fresh
+        );
+        assert_eq!(lane.ready_frames(Duration::ZERO).count(), 1);
+        lane.finish_ready(1);
+        let front = lane.front(Duration::ZERO).unwrap();
+        assert!(front.striped && !front.offload);
+        assert_eq!(crate::wire::stripe_tag(front.bytes), Some((7, 1)));
+        assert_eq!(&front.bytes[STRIPE_TAG_LEN..], &[1; 72]);
+        assert!(lane.finish_front());
+        // A striped frame past one slot holds a run of two, and its later
+        // pieces must repeat the flag.
+        let long = [&tag(2)[..], &vec![3; MAX_FRAME_LEN]].concat();
+        let long: &'static [u8] = long.leak();
+        let long_piece = |offset: usize, end: usize, striped| Record::Data {
+            frame_id: (1 << 48) | 3,
+            total_len: long.len() as u32,
+            offset: offset as u32,
+            bytes: &long[offset..end],
+            offload: false,
+            partial: false,
+            striped,
+        };
+        assert_eq!(
+            admit(&mut lane, 3, long_piece(0, 4000, true)),
+            Admission::Fresh
+        );
+        assert_eq!(
+            admit(&mut lane, 4, long_piece(4000, long.len(), true)),
+            Admission::Fresh
+        );
+        let front = lane.front(Duration::ZERO).unwrap();
+        assert!(front.striped);
+        assert_eq!(front.bytes, long);
+        assert_eq!(lane.reserved.count_ones(), 2);
+        assert!(lane.finish_front());
+        assert_eq!(lane.reserved, 0);
+        // A later piece of a striped frame must repeat the flag.
+        let split = |offset: usize, striped| Record::Data {
+            frame_id: (1 << 48) | 4,
+            total_len: short.len() as u32,
+            offset: offset as u32,
+            bytes: &short[offset..offset + 40],
+            offload: false,
+            partial: false,
+            striped,
+        };
+        assert_eq!(admit(&mut lane, 5, split(0, true)), Admission::Fresh);
+        assert_eq!(admit(&mut lane, 6, split(40, false)), Admission::Invalid);
+        assert_eq!(admit(&mut lane, 6, split(40, true)), Admission::Fresh);
+        // A reset forgets acceptance.
+        lane.reset(1, 9022).unwrap();
+        assert_eq!(
+            admit(&mut lane, 1, piece(1, short, 0, true)),
+            Admission::Invalid
+        );
     }
 
     #[test]

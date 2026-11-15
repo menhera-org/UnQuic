@@ -694,6 +694,14 @@ pub fn encode_data_prefix(
     )
 }
 
+/// The stripe number and sequence a striped frame's bytes start with, or
+/// None when they are too short or the sequence is zero.
+pub fn stripe_tag(frame: &[u8]) -> Option<(u16, u64)> {
+    let tag = u64::from_be_bytes(*frame.first_chunk::<STRIPE_TAG_LEN>()?);
+    let sequence = tag & 0x0000_ffff_ffff_ffff;
+    (sequence != 0).then_some(((tag >> 48) as u16, sequence))
+}
+
 /// A DATA record's flags byte: bit 0 offload, bit 1 partial checksum, bit 2
 /// striped.
 pub(crate) const fn data_flags(offload: bool, partial: bool, striped: bool) -> u8 {

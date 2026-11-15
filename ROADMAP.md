@@ -330,8 +330,13 @@ Decisions only the user can make, each blocking a remaining goal:
    frame's length (an ordinary striped frame may reach the ceiling plus
    the tag), the packer's checks, and receive lanes that refuse striped
    pieces until the reorder writer lands. Nothing advertises the bit yet.
-   Next: the writer handoff, which also needs a two-slot run for a
-   striped frame longer than one reassembly slot.
+   Receive lanes then gained `accept_striped_flows`, which the runtime does
+   not call yet: an accepted striped frame keeps its flag across pieces,
+   takes a run of two slots when the tag pushes it past one, and leaves
+   through `Lane::front` rather than the ordinary TAP batch, with
+   `wire::stripe_tag` to read its stripe and sequence. Next: transfer
+   storage and the writer, which take a completed striped frame from its
+   lane owner to the stripe's reorder window and TAP queue.
 8. Decided November 14: `daemon.offload_frames` stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should

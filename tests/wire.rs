@@ -512,6 +512,11 @@ fn striped_flag_round_trips_with_either_other_flag_and_counts_its_tag() {
             (flags & 1 != 0, flags & 2 != 0, true)
         );
     }
+    // The tag reads back; a short frame or sequence zero has none.
+    let tagged = ((9_u64 << 48) | 42).to_be_bytes();
+    assert_eq!(unquic::wire::stripe_tag(&tagged), Some((9, 42)));
+    assert_eq!(unquic::wire::stripe_tag(&tagged[..7]), None);
+    assert_eq!(unquic::wire::stripe_tag(&(9_u64 << 48).to_be_bytes()), None);
     // The tag counts toward the frame's length: an ordinary striped frame may
     // reach the ceiling plus the tag, and must hold the tag and a header.
     let mut output = [0; 1024];
