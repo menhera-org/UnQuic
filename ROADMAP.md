@@ -715,10 +715,19 @@ rules apply to all of them.
    per-frame checksum passes for 2.5%
    ([BENCH.md](BENCH.md#partial-checksums-for-ordinary-frames-november-15-landed)).
    Frames read from the TAP singly with a partial checksum are still
-   completed at read time and could take the same path. Next, the
-   userspace parts still over their section 13.1 targets (receive
-   admission, staging and the frame flush); one flow striped with a
-   receive-side reorder stage (decision 7).
+   completed at read time and could take the same path. The user then
+   chose sender bookkeeping. Per-packet send records measured at about
+   20 cycles, so the per-packet record plan was dropped; moving coverage
+   planes out of line, the first step of one hot line per frame, measured
+   nothing either, since frame slots are reused LIFO and stay cached
+   ([BENCH.md](BENCH.md#per-frame-state-out-of-line-november-15-rejected)).
+   A fast path that frees retained, fully acknowledged, unmapped frames in
+   the ACK pass landed: −2.8% on the small-frame point, level on the
+   full-size point
+   ([BENCH.md](BENCH.md#freeing-retained-frames-in-the-ack-pass-november-15-landed)).
+   Next on that path: a fresh frame sent whole skipping its separate
+   retained transition; then one flow striped with a receive-side reorder
+   stage (decision 7).
    The kernel figures can only be confirmed on an R86S-class box with real
    NICs; the remote 7.0 host stands in until then. The kernel test
    `tap::read::tests::real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch`
@@ -731,7 +740,11 @@ rules apply to all of them.
    on rerun; its waits span a DNS refresh and two daemon starts.
    `segmented_sends_follow_available_tap_offloads` (examples/udp_load.rs)
    failed once on 7.0 when a stray 100-byte frame came before the
-   super-frame it reads; that read now skips non-IPv4 frames. A peer
+   super-frame it reads; that read now skips non-IPv4 frames.
+   `workers_forward_both_directions_and_reconnect_after_restart`
+   (tests/linux_runtime.rs) failed once on 7.0 on November 15: after the
+   restart one frame on lane 2 was repaired twice and expired while the
+   receiver had registered no lane 2; it passed three reruns. A peer
    with one lane keeps ACKs and
    data on lane 0 and can still defer ACKs under loss; a separate number
    space for control (a 65th lane ID with its own receive table) would cover

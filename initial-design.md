@@ -953,6 +953,28 @@ lives. The sender's per-frame cost is the length of the code path through
 about ten stages, not cache misses, and this plan is on hold; fewer
 stages per frame, not fewer lines, would have to come next.
 
+**A frame fast path (November 15 amendment).** The user chose to shorten
+the common frame's lifecycle: sent whole in one batch, acknowledged by
+one ACK, never lost. After its last piece is acknowledged such a frame
+still passes through detach (it sits in no queue), unsent-byte
+accounting (it has none), two place transitions, a second frame-and-source
+lookup for its owner, and the cleanup queue, which a later pass empties
+by looking the frame up again. The fast path frees it in the ACK pass
+itself when three things hold: it is retained (in no queue or batch),
+its coverage is complete, and no other packet maps it. Every other frame
+takes today's path, so loss, repair, expiry, abandonment and connection
+replacement are unchanged. The freeing work that remains is real (the
+expiry heap entry, the frame slot, the source's reference), so the
+expected gain is the bookkeeping around it: small at the full-size point,
+where an earlier change that only skipped the cleanup queue measured
+nothing, and larger at the small-frame point, where cleanup alone takes
+about 6% of the busy cycles. It is judged there first, with the
+full-size point and the lossy path as no-regression checks. If it lands,
+the same rule applies on the send side: a fresh frame sent whole skips
+its separate retained transition. It landed the same day: −2.8% CPU per
+delivered bit on the small-frame point, level on the full-size point
+(BENCH.md).
+
 **Receive without the reassembly copy (item 2; November 14 amendment;
 tried and rejected the same day, BENCH.md).** Four builds of the scheme
 below cost 15–20% more CPU per delivered bit, because TAP writes stopped

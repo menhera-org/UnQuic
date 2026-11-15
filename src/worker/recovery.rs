@@ -378,14 +378,27 @@ impl Worker {
                         .pop_packet(packet)
                         .ok_or(io::ErrorKind::InvalidData)?;
                 }
-                if self.recovery.place(index)? == Place::Cleanup {
+                let place = self.recovery.place(index)?;
+                if place == Place::Cleanup {
                     continue;
                 }
-                if self
+                let done = self
                     .frames
                     .recovery(index)
-                    .is_some_and(|s| s.remaining() == 0)
+                    .is_some_and(|s| s.remaining() == 0);
+                if done
+                    && place == Place::Retained
+                    && self.recovery.journal.frame_empty(index, piece.frame_id)
                 {
+                    // Fast path: retained frames sit in no queue and have no unsent
+                    // bytes, and nothing else maps this one, so free it now.
+                    *self
+                        .recovery
+                        .slots
+                        .get_mut(index)
+                        .ok_or(io::ErrorKind::InvalidData)? = Slot::default();
+                    self.release_frame_storage(index);
+                } else if done {
                     self.detach_frame(index)?;
                     self.release_frame(index)?;
                 } else {

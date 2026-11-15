@@ -1630,6 +1630,83 @@ fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
+fn acknowledged_retained_frames_free_in_the_ack_pass() {
+    use crate::worker::recovery::Place;
+    let (mut workers, _rx) = workers();
+    let worker = &mut workers[1];
+    for _ in 0..4 {
+        queue_frame(worker, 60);
+    }
+    let slots: Vec<_> = worker.sessions[0].batches[1]
+        .as_ref()
+        .unwrap()
+        .pending
+        .iter(&worker.frames)
+        .collect();
+    let mut pieces = [crate::ack::FramePiece::default(); 4];
+    for (ordinal, (piece, &index)) in pieces.iter_mut().zip(&slots).enumerate() {
+        let frame = worker.frames.frame(index).unwrap();
+        *piece = crate::ack::FramePiece {
+            frame_slot: index as u16,
+            frame_id: frame.id,
+            start: 0,
+            end: 60,
+            attempt: 0,
+        };
+        submit_original(worker, index, 0..60);
+        // The first three leave their queue as a fully sent batch's frames do.
+        if ordinal < 3 {
+            let mut batch = worker.sessions[0].batches[1].take().unwrap();
+            worker.frames.unqueue(&mut batch.pending, index).unwrap();
+            worker.sessions[0].batches[1] = Some(batch);
+            worker.recovery.set(index, Place::Retained).unwrap();
+        }
+    }
+    // Packet 0 carries all four frames; packet 1 another copy of the third.
+    assert!(worker.recovery.journal.reserve_packet(0, &pieces));
+    assert!(worker.recovery.journal.reserve_packet(1, &pieces[2..3]));
+    for handle in 1..=2 {
+        assert_eq!(worker.sender.records.take().unwrap().get(), handle);
+    }
+    let mut report = worker.sender.report.take().unwrap();
+    report.kind = ReportKind::Ack {
+        received: Duration::from_millis(2),
+        delay_us: 0,
+        first: true,
+        end: None,
+    };
+    report.count = 1;
+    report.entries[0] = Entry {
+        number: 1,
+        sample: NonZeroU16::new(1),
+        settled: true,
+        ..Entry::default()
+    };
+    worker.recovery.staged = Some(report);
+    // The four frames, plus any slab buffer holding them.
+    let retained = worker.sessions[0].tx_retained;
+    assert!(!worker.stage_recovery().unwrap());
+    // Retained and mapped by nothing else: freed in the ACK pass.
+    assert!(worker.frames.frame(slots[0]).is_none());
+    assert!(worker.frames.frame(slots[1]).is_none());
+    // Still mapped by packet 1, or still queued: today's path, via cleanup.
+    for &slot in &slots[2..] {
+        assert!(worker.recovery.place(slot).unwrap() == Place::Cleanup);
+    }
+    assert_eq!(worker.counters.recovery_cleanup_peak, 2);
+    assert_eq!(worker.sessions[0].tx_retained, retained - 2);
+    assert!(worker.recovery.journal.pop_packet(1).is_some());
+    while worker.cleanup_frames().unwrap() {}
+    assert!(
+        slots
+            .iter()
+            .all(|&slot| worker.frames.frame(slot).is_none())
+    );
+    assert!(worker.sessions[0].tx_retained <= retained - 4);
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
 fn lost_original_repairs_only_missing_bytes_and_late_ack_cancels_prepared_repair() {
     let (mut workers, rx) = workers();
     for worker in &mut workers {

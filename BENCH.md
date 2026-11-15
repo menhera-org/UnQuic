@@ -777,6 +777,33 @@ checksum. Lossy path ([results](benches/lossy-path-partial-checksums.json)):
 frames lost in the worse direction were 0.6–2.8% (median 1.1%) against
 HEAD's 0.5–3.7% (median 1.3%), at the same delivered rate.
 
+## Freeing retained frames in the ACK pass (November 15, landed)
+
+The frame fast path of design section 13.1 (November 15 amendment): a
+frame that is retained (in no queue or batch), fully acknowledged and
+mapped by no other packet is freed in the ACK pass, skipping detach, the
+unsent-byte accounting (it has none), the cleanup place and queue, and
+the cleanup pass's second lookups. Every other frame keeps today's path.
+
+Stated beforehand, judged on the small-frame point, where cleanup alone
+takes about 6% of the busy cycles: the usual efficiency bar, with the
+full-size point no more than 0.5% above HEAD's copy at the median and no
+rise in frames lost on the lossy path. Small-frame point, untagged
+64-byte frames at 20 Mbit/s per flow
+([results](benches/small-frames-frame-fast-path.json)): lower than both
+HEAD and its copy in 6 of 6 rounds, −2.8% against the copy at the median,
+with HEAD at −0.9%. Full-size point
+([results](benches/full-size-frame-fast-path.json)): 0.0% against the
+copy, HEAD +0.3%. Lossy path
+([results](benches/lossy-path-frame-fast-path.json)): frames lost in the
+worse direction at a median of 1.4% against HEAD's 1.3%, within this
+path's run-to-run spread; the change cannot alter delivery, since it only
+frees frames that the cleanup pass would free a turn later.
+
+An earlier change that skipped only the cleanup queue measured nothing on
+the full-size point (below); skipping the stages around it as well is
+what shows on small frames.
+
 ## Per-frame state out of line (November 15, rejected)
 
 The per-packet record of design section 13.1 rested on per-packet costs.
