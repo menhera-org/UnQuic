@@ -1017,6 +1017,80 @@ admission's 890 cycles per frame event. Measure it on the full-size
 efficiency point, with and without offload frames, and on the lossy path,
 where frames wait longer and more of them are settled by copying.
 
+**Single-flow striping (item 6; decision 7; November 15 amendment; not
+yet implemented).** One flow keeps one lane, so one transmit worker sends
+it, and on the 1500-byte path that worker stops one flow near 1 Gbit/s
+whatever the loss rate: a third of it is the kernel sending through the
+emulated path and a quarter userspace bookkeeping (BENCH.md, November 13).
+The 5 Gbit/s single-flow gate needs the flow's frames sent by several
+workers. Striping without reordering was measured on November 11: sixteen-
+frame runs over every lane lifted one flow 24–36% and doubled the frames
+it reordered. This amendment adds the order back.
+
+Where the order has to be restored follows from the lane formulas. A lane's
+transmit owner is `(lane − 1) mod n` and its receive owner
+`(cookie_low32 + lane − 1) mod n`, so lanes that share a receive owner also
+share a transmit owner: a flow spread over several transmit workers always
+completes on several receive workers. Those workers cannot each write their
+own frames in turn, even with a shared next-sequence counter, because a
+host bridge to a NIC that picks transmit queues per CPU (XPS) may reorder
+frames written from different CPUs. One worker per striped flow writes all
+of its frames.
+
+- **Negotiation.** Optional feature bit 2, `STRIPED_FLOWS`, under
+  `daemon.stripe_flows`, off by default until it meets its bar. A peer
+  without it receives no striped frames.
+- **Wire.** DATA flag bit 2 marks a piece of a striped frame. Like an
+  offload frame's descriptor, its first 8 bytes are a stripe tag: a 16-bit
+  stripe number, unique among the session's live stripes, and a 48-bit
+  sequence counting that stripe's frames from 1. The tag is part of the
+  frame's bytes, so repair, coverage and lifetime treat it as payload and
+  a lost piece cannot lose the order. Bits 0 and 2 may combine, so an
+  offload frame can be striped whole; bits 1 and 2 may combine as well,
+  since the tag precedes the Ethernet header the receiver parses.
+- **Choosing flows.** Only a flow that one worker cannot carry is
+  striped. Its entry in the shared flow table gains a stripe state: when
+  the flow's lane holds more unsent bytes than one pacing round of its
+  path for longer than a pacing round, the next TAP read of the flow
+  allocates a stripe number and starts striping; after the table's
+  one-second silence the stripe ends with the entry. Other flows are
+  untouched and keep their order by lane, as today.
+- **Sending.** The TAP reader assigns each read of a striped flow (one
+  super-frame, or one frame) to the next of the session's data lanes in
+  turn, and takes the frames' stripe sequences from the stripe's counter
+  in the flow table, one atomic add per read. Each transmit owner sends its
+  share on its own lane exactly as today, with the tag prepended to every
+  frame's rewritten header.
+- **Receiving.** Each striped frame completes on its lane's receive owner
+  as now. The stripe's writer is the worker `stripe mod n`. Any other
+  receive owner copies a completed striped frame into a transfer buffer
+  and hands it to the writer through the existing worker queues; the copy
+  is the price of a single writer, paid only by striped flows. The writer
+  keeps a reorder window of 256 frames per stripe and writes frames to its
+  TAP queue in sequence, after removing the tag.
+- **Gaps.** A frame missing from the sequence holds the frames behind it
+  until it arrives, until it is abandoned or expires on the lane that
+  carries it, or until the oldest held frame has waited the hold limit,
+  min(2 × smoothed RTT, 5 ms); then the window skips the gap. An abandoned
+  or expired striped frame that never arrived cannot name its sequence, so
+  the hold limit covers it. A full window skips the oldest gap at once.
+  Held frames keep their own deadlines, and the reorder buffers are charged
+  to `memory_limit`.
+- **Counters.** Striped frames sent and received, frames held, gaps
+  skipped by arrival, timeout and full window, and frames delivered out of
+  sequence (zero unless a gap was skipped).
+
+Landing order: the wire flag, tag and negotiation with codec tests; the
+receiver's reorder window as a unit with tests for every gap rule; the
+writer handoff; the sender's flow selection and lane rotation. Measure on
+the stage 3 single-flow target (7.5 ms RTT, 0.5% and 1% loss, four
+workers, 5 Gbit/s offered), stating the bar first: delivery above the
+November 11 striped range in both directions, frames reordered at the
+generator near zero instead of millions, and on the full-size and lossy
+points, which carry no striped flow unless one is detected, no change.
+A larger outer MTU or a NIC that segments in hardware remains the cheaper
+answer where a path allows it.
+
 # 14 Validation and acceptance
 
 Freeze a repeatable acceptance profile before declaring the performance requirements met. It must name the endpoint hardware and core budget, inner MTU, frame mix, flow count, traffic direction, attachment topology, loss profile, and contemporaneous direct-underlay capacity.

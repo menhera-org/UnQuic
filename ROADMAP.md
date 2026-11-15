@@ -315,6 +315,12 @@ Decisions only the user can make, each blocking a remaining goal:
    change the design names as a later experiment), to rely on a larger
    outer MTU where the path allows, or to judge the gate on hardware that
    segments datagrams itself.
+   The design amendment followed on November 15 (design section 13.1,
+   item 6): striped frames carry an 8-byte stripe tag in their repaired
+   bytes under a new optional feature bit, the TAP reader rotates a
+   flow's reads over the data lanes once one worker cannot carry it, and
+   one receive worker per stripe writes its frames in order through a
+   256-frame reorder window with a hold limit of min(2 × SRTT, 5 ms).
 8. Decided November 14: `daemon.offload_frames` stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should
