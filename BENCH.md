@@ -1008,6 +1008,17 @@ position 63 could be released unwritten whenever the bit at its position
 modulo 64 was set. The fix stops at 64, and the batch test now fills all
 128 slots.
 
+Offload frames on the same lossy point, with the fix (3a2ce34), three
+rounds of both daemons off against both on
+([results](benches/lossy-offload-receive-slots.json)). Bar, stated
+first: with offload frames on, the worse direction loses no more than
+with them off in at least two of three rounds, with refusals near zero.
+Not met: the worst points per round were 1.49%, 1.37% and 1.55% on against
+1.06%, 1.10% and 1.69% off, and offload frames, four slots each, brought
+back 0–2,721 refusals per daemon while ordinary frames had none. The gap
+is much smaller than on November 14 (11.6–18.7% against 4.9–12.8%), and
+delivery stays level at 3.77–3.92 Gbit/s on both arms. Decision 8 stands.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames

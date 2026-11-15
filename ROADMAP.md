@@ -417,8 +417,10 @@ Decisions only the user can make, each blocking a remaining goal:
    ([BENCH.md](BENCH.md#twice-the-receive-slots-in-the-same-storage-november-15-landed)).
    It costs about 1% CPU per delivered bit on the clean full-size point
    (median of twelve rounds), cause not yet found. Offload frames, which
-   take four slots each now, should be measured on the lossy path again
-   before the default is revisited.
+   take four slots each now, were measured again on the lossy path: they
+   still lose a little more than ordinary frames (worst points 1.37–1.55%
+   against 1.06–1.69%) and bring back some refusals, so they stay off by
+   default, though the gap fell from about six points to a fraction of one.
 
 ## November 11 checkpoint
 
