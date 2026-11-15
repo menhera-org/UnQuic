@@ -2,8 +2,9 @@
 //! their order there (design section 13.1, item 6).
 //!
 //! A lane owner packs completed striped frames, each still starting with its
-//! stripe tag, into a transfer buffer as `[length: u16 big-endian][frame]`
-//! entries and hands the buffer to the stripe's writer. The [`Writer`] keeps
+//! stripe tag, into a transfer buffer as `[length: u16 big-endian][flags:
+//! u8][frame]` entries (flag bit 1: partial checksum, as on the wire) and
+//! hands the buffer to the stripe's writer. The [`Writer`] keeps
 //! a [`reorder::Window`] per active stripe, holds each buffer until every
 //! frame in it has been delivered or dropped, and reports both through
 //! callbacks, so nothing allocates.
@@ -20,38 +21,45 @@ pub const HOLDERS: usize = 64;
 /// meet its predecessor's window.
 pub const IDLE: Duration = Duration::from_secs(1);
 
-/// Appends one frame to a transfer buffer at `*used`; false, changing
-/// nothing, when it does not fit or carries no stripe tag.
-pub fn pack(buffer: &mut [u8], used: &mut usize, frame: &[u8]) -> bool {
+/// Entry header bytes: length, then flags.
+const ENTRY_LEN: usize = 3;
+
+/// Appends one frame, with whether its checksum is partial, to a transfer
+/// buffer at `*used`; false, changing nothing, when it does not fit or
+/// carries no stripe tag.
+pub fn pack(buffer: &mut [u8], used: &mut usize, frame: &[u8], partial: bool) -> bool {
     let Ok(length) = u16::try_from(frame.len()) else {
         return false;
     };
-    let end = *used + 2 + frame.len();
+    let end = *used + ENTRY_LEN + frame.len();
     if frame.len() < STRIPE_TAG_LEN || end > buffer.len() {
         return false;
     }
     buffer[*used..*used + 2].copy_from_slice(&length.to_be_bytes());
-    buffer[*used + 2..end].copy_from_slice(frame);
+    buffer[*used + 2] = u8::from(partial) << 1;
+    buffer[*used + ENTRY_LEN..end].copy_from_slice(frame);
     *used = end;
     true
 }
 
-/// The frames packed in the first `used` bytes, as ranges of the buffer.
+/// The frames packed in a buffer, as ranges of it with their partial flag.
 /// Stops at the first malformed entry.
-pub fn entries(buffer: &[u8]) -> impl Iterator<Item = Range<usize>> + '_ {
+pub fn entries(buffer: &[u8]) -> impl Iterator<Item = (Range<usize>, bool)> + '_ {
     let mut at = 0;
     std::iter::from_fn(move || {
-        let length = usize::from(u16::from_be_bytes(*buffer.get(at..)?.first_chunk()?));
-        let range = at + 2..at + 2 + length;
+        let header = buffer.get(at..)?.first_chunk::<ENTRY_LEN>()?;
+        let length = usize::from(u16::from_be_bytes([header[0], header[1]]));
+        let range = at + ENTRY_LEN..at + ENTRY_LEN + length;
         buffer.get(range.clone())?;
         at = range.end;
-        Some(range)
+        Some((range, header[2] & 2 != 0))
     })
 }
 
 #[derive(Clone, Copy)]
 struct Item {
     holder: u8,
+    partial: bool,
     start: u32,
     end: u32,
 }
@@ -152,7 +160,7 @@ impl<H: Copy> Writer<H> {
         handle: H,
         bytes: &[u8],
         now: Duration,
-        deliver: &mut impl FnMut(H, Range<usize>),
+        deliver: &mut impl FnMut(H, Range<usize>, bool),
         release: &mut impl FnMut(H),
     ) -> bool {
         let Some(holder) = self.holders.iter().position(Option::is_none) else {
@@ -160,7 +168,7 @@ impl<H: Copy> Writer<H> {
         };
         // Held while this call runs, so deliveries cannot release it early.
         self.holders[holder] = Some((handle, 1));
-        for range in entries(bytes) {
+        for (range, partial) in entries(bytes) {
             let frame = &bytes[range.clone()];
             let Some((number, sequence)) = stripe_tag(frame) else {
                 self.totals.dropped += 1;
@@ -168,12 +176,13 @@ impl<H: Copy> Writer<H> {
             };
             let item = Item {
                 holder: holder as u8,
+                partial,
                 start: range.start as u32,
                 end: range.end as u32,
             };
             let Some(index) = self.stripe(number, now) else {
                 self.totals.unordered += 1;
-                deliver(handle, range);
+                deliver(handle, range, partial);
                 continue;
             };
             while let Some(stripe) = self.stripes[index].as_mut() {
@@ -185,7 +194,7 @@ impl<H: Copy> Writer<H> {
                     }
                     Placement::Late => {
                         self.totals.unordered += 1;
-                        deliver(handle, range.clone());
+                        deliver(handle, range.clone(), partial);
                     }
                     Placement::Duplicate => self.totals.dropped += 1,
                     Placement::Blocked => {
@@ -216,7 +225,7 @@ impl<H: Copy> Writer<H> {
     fn drain(
         &mut self,
         index: usize,
-        deliver: &mut impl FnMut(H, Range<usize>),
+        deliver: &mut impl FnMut(H, Range<usize>, bool),
         release: &mut impl FnMut(H),
     ) {
         while let Some(item) = self.stripes[index]
@@ -225,7 +234,7 @@ impl<H: Copy> Writer<H> {
         {
             if let Some((handle, _)) = self.holders[usize::from(item.holder)] {
                 self.totals.delivered += 1;
-                deliver(handle, item.start as usize..item.end as usize);
+                deliver(handle, item.start as usize..item.end as usize, item.partial);
             }
             self.unhold(item.holder, release);
         }
@@ -237,7 +246,7 @@ impl<H: Copy> Writer<H> {
         &mut self,
         now: Duration,
         limit: Duration,
-        deliver: &mut impl FnMut(H, Range<usize>),
+        deliver: &mut impl FnMut(H, Range<usize>, bool),
         release: &mut impl FnMut(H),
     ) -> Option<Duration> {
         let mut due: Option<Duration> = None;
@@ -275,7 +284,7 @@ mod tests {
         let mut buffer = vec![0; 4096];
         let mut used = 0;
         for frame in frames {
-            assert!(pack(&mut buffer, &mut used, frame));
+            assert!(pack(&mut buffer, &mut used, frame, false));
         }
         buffer.truncate(used);
         buffer
@@ -286,15 +295,20 @@ mod tests {
         let frames = [frame(1, 1, 1), frame(1, 2, 2)];
         let buffer = batch(&frames);
         let read: Vec<_> = entries(&buffer)
-            .map(|range| buffer[range].to_vec())
+            .map(|(range, _)| buffer[range].to_vec())
             .collect();
         assert_eq!(read, frames);
         let mut small = [0; 60];
         let mut used = 0;
-        assert!(pack(&mut small, &mut used, &frame(1, 1, 1)));
-        assert!(!pack(&mut small, &mut used, &frame(1, 2, 2)));
-        assert!(!pack(&mut small, &mut used, &[0; 7]), "no room for a tag");
-        assert_eq!(used, 50);
+        assert!(pack(&mut small, &mut used, &frame(1, 1, 1), true));
+        assert!(!pack(&mut small, &mut used, &frame(1, 2, 2), false));
+        assert!(
+            !pack(&mut small, &mut used, &[0; 7], false),
+            "no room for a tag"
+        );
+        assert_eq!(used, 51);
+        // The partial flag travels with its frame.
+        assert_eq!(entries(&small[..used]).next(), Some((3..51, true)));
         // A truncated entry ends the walk.
         assert_eq!(entries(&buffer[..buffer.len() - 1]).count(), 1);
     }
@@ -308,7 +322,7 @@ mod tests {
             batch(&[frame(3, 2, 2), frame(3, 4, 4)]),
             batch(&[frame(3, 1, 1), frame(3, 3, 3)]),
         ];
-        let mut deliver = |handle: u8, range: Range<usize>| {
+        let mut deliver = |handle: u8, range: Range<usize>, _| {
             written.push(buffers[usize::from(handle)][range][STRIPE_TAG_LEN]);
         };
         let mut release = |handle: u8| released.push(handle);
@@ -334,7 +348,7 @@ mod tests {
             batch(&[frame(9, 1, 1), frame(9, 3, 3)]),
             batch(&[frame(9, 1, 7)]),
         ];
-        let mut deliver = |handle: u8, range: Range<usize>| {
+        let mut deliver = |handle: u8, range: Range<usize>, _| {
             written.push(buffers[usize::from(handle)][range][STRIPE_TAG_LEN]);
         };
         let mut release = |_| released += 1;
@@ -399,7 +413,7 @@ mod tests {
         let mut released = vec![0_u8; buffers.len()];
         let mut now = Duration::ZERO;
         {
-            let mut deliver = |handle: usize, range: Range<usize>| {
+            let mut deliver = |handle: usize, range: Range<usize>, _| {
                 let (number, sequence) = stripe_tag(&buffers[handle][range]).unwrap();
                 assert!(seen.insert((number, sequence)), "{number}/{sequence} twice");
                 if sequence < last[usize::from(number)] {
@@ -434,7 +448,7 @@ mod tests {
         let buffers: Vec<_> = (0..=STRIPES)
             .map(|number| batch(&[frame(number as u16, 2, 0)]))
             .collect();
-        let mut deliver = |_: usize, _: Range<usize>| written += 1;
+        let mut deliver = |_: usize, _: Range<usize>, _| written += 1;
         let mut release = |_: usize| released += 1;
         for (handle, buffer) in buffers.iter().enumerate().take(STRIPES) {
             assert!(writer.accept(handle, buffer, Duration::ZERO, &mut deliver, &mut release));
@@ -457,10 +471,22 @@ mod tests {
             .map(|handle| batch(&[frame(1, handle as u64 + 2, 0)]))
             .collect();
         for (handle, buffer) in held.iter().enumerate().take(HOLDERS) {
-            assert!(holder.accept(handle, buffer, Duration::ZERO, &mut |_, _| {}, &mut |_| {}));
+            assert!(holder.accept(
+                handle,
+                buffer,
+                Duration::ZERO,
+                &mut |_, _, _| {},
+                &mut |_| {}
+            ));
         }
         assert!(!holder.can_accept());
         let last = &held[HOLDERS];
-        assert!(!holder.accept(HOLDERS, last, Duration::ZERO, &mut |_, _| {}, &mut |_| {}));
+        assert!(!holder.accept(
+            HOLDERS,
+            last,
+            Duration::ZERO,
+            &mut |_, _, _| {},
+            &mut |_| {}
+        ));
     }
 }
