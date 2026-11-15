@@ -78,6 +78,11 @@ pub(crate) struct Shared {
     pub flow_cursors: Vec<std::sync::atomic::AtomicUsize>,
     // The flow table all TAP readers share; empty unless daemon.balance_flows.
     pub flows: Box<[AtomicU64]>,
+    // Per session, the stripes TAP readers claim for flows one worker cannot
+    // carry; empty unless daemon.stripe_flows and daemon.balance_flows.
+    pub stripes: Vec<Box<[crate::worker::Stripe]>>,
+    // Per session and transmit lane, its owner's backlog mark; empty with stripes.
+    pub backlog: Vec<Box<[AtomicU64]>>,
 }
 
 impl Control {
@@ -367,6 +372,7 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
     let peers = config.config().peers.len();
     let endpoints = config.config().endpoints.len();
     let balance_flows = config.config().daemon.balance_flows;
+    let striping = balance_flows && config.config().daemon.stripe_flows;
     if peers > (u32::MAX as usize >> 7) || adopted.len() > sessions {
         return Err(io::ErrorKind::InvalidInput.into());
     }
@@ -386,6 +392,27 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
                 .collect())
         })
         .collect::<io::Result<_>>()?;
+    let (stripes, backlog) = if striping {
+        (
+            (0..sessions)
+                .map(|_| {
+                    (0..crate::worker::STRIPE_SLOTS)
+                        .map(|_| crate::worker::Stripe::default())
+                        .collect()
+                })
+                .collect(),
+            (0..sessions)
+                .map(|session| {
+                    let lanes = config
+                        .peer_for_session(session)
+                        .map_or(0, |peer| config.config().peers[peer].tx_lanes);
+                    (0..lanes).map(|_| AtomicU64::new(0)).collect()
+                })
+                .collect(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let shared = Arc::new(Shared {
         config,
         wakes,
@@ -415,6 +442,8 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
         } else {
             Box::default()
         },
+        stripes,
+        backlog,
     });
     let mut workers = (0..count)
         .map(|id| Worker::new(id, Arc::clone(&shared), control.clone()))
@@ -514,6 +543,16 @@ fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
         crate::worker::FLOW_SLOTS * size_of::<AtomicU64>()
     } else {
         0
+    };
+    let flows = if raw.daemon.balance_flows && raw.daemon.stripe_flows {
+        // Stripe slots per session, and the backlog marks counted with the lanes.
+        let marks = transmit / size_of::<LaneCounters>() * size_of::<AtomicU64>();
+        sessions
+            .checked_mul(crate::worker::STRIPE_SLOTS * size_of::<crate::worker::Stripe>())?
+            .checked_add(marks)?
+            .checked_add(flows)?
+    } else {
+        flows
     };
     let shared = sessions
         .checked_mul(65_536 + size_of::<Box<[AtomicU8]>>() + 1 + size_of::<AtomicU64>())?

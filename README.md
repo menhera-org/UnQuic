@@ -697,13 +697,19 @@ CPU per delivered Gbit/s 2.5% at the median, in all six rounds, and lost
 no more frames on the lossy path (BENCH.md). Set it to false to keep
 complete checksums on the wire.
 
-`daemon.stripe_flows`, off by default, is the receiving half of single-flow
-striping (decision 7, design section 13.1): it advertises the optional
-`STRIPED_FLOWS` feature, and frames a peer stripes across lanes are passed
-from the workers that reassemble them to one writer per stripe, which writes
-them to the TAP in stripe order, holding frames behind a gap for at most
-5 ms. `rx_striped_frames`, `stripe_unordered` and `stripe_drops` count them.
-No sender stripes a flow yet, so turning it on changes nothing today.
+`daemon.stripe_flows`, off by default and still unmeasured, turns on
+single-flow striping (decision 7, design section 13.1). It advertises the
+optional `STRIPED_FLOWS` feature; it acts only where both peers advertise
+it, `balance_flows` is on, and the session has at least two data lanes.
+When a flow's lane has held more than 1 MiB of unsent data for 10 ms, the
+flow takes one of the session's 16 stripes: each later TAP read of it goes
+to the next data lane in turn, and every frame carries an 8-byte tag with
+its stripe and sequence. Such frames are never sent as offload frames. On
+the receiving side, the workers that reassemble striped frames pass them to
+one writer per stripe, which writes them to the TAP in stripe order,
+holding frames behind a gap for at most 5 ms. `rx_striped_frames`,
+`stripe_unordered` and `stripe_drops` count received ones. A stripe ends
+when its flow's table entry goes idle for a second.
 
 Flow hashing looks through one unfragmented IPv4, IPv6 or Ethernet
 encapsulation, including an IPv6 segment routing header before the inner

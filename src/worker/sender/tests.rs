@@ -3266,6 +3266,8 @@ fn fresh_admission_preserves_sixteen_flow_qinq_gso_burst_before_bounding_excess(
         worker.input_frame(buffer, Duration::ZERO).unwrap();
     }
     assert_eq!(worker.sender.lanes[index].unsent_bytes, 1_071_488);
+    // Past half the admission budget, the lane is marked for stripe detection.
+    assert_eq!(worker.shared.backlog[0][0].load(Ordering::Relaxed), 1);
     assert_eq!(worker.sessions[0].tap_inputs.len(), 16);
     assert_eq!(worker.counters.tx_backlog_drops, 0);
     assert_eq!(worker.counters.tap_gso_frames, 0);
@@ -3281,6 +3283,11 @@ fn fresh_admission_preserves_sixteen_flow_qinq_gso_burst_before_bounding_excess(
     );
     assert_eq!(worker.counters.tx_backlog_drops, 1);
     assert_eq!(worker.counters.queue_drops, 1);
+    let unsent = worker.sender.lanes[index].unsent_bytes;
+    worker
+        .remove_unsent(index, unsent - (STRIPE_BACKLOG - 1))
+        .unwrap();
+    assert_eq!(worker.shared.backlog[0][0].load(Ordering::Relaxed), 0);
 }
 
 #[test]

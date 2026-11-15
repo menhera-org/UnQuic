@@ -188,6 +188,8 @@ pub(super) struct Frame {
     pub offload: bool,
     /// A segment whose transport checksum in `header` is only the seed.
     pub partial: bool,
+    /// A striped frame: `header` starts with its stripe tag.
+    pub striped: bool,
 }
 
 impl Frame {
@@ -390,7 +392,7 @@ impl Store {
             end: frame.length(),
             offload: frame.offload,
             partial: frame.partial,
-            striped: false,
+            striped: frame.striped,
         })
     }
 
@@ -587,6 +589,7 @@ mod tests {
             lane: 0,
             length,
             deadline: Duration::from_millis(100),
+            stripe: None,
             bytes: [7; 65536],
         })
     }
@@ -603,6 +606,7 @@ mod tests {
             header: [0; HEADER_BYTES],
             offload: false,
             partial: false,
+            striped: false,
         }
     }
 

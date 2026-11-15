@@ -878,6 +878,27 @@ it was lower than HEAD's copy in 3 of 6 rounds at +0.2%; HEAD itself ran
 −1.4% against its copy, so the queue's second visit costs less than this
 point can resolve.
 
+## Striping one flow across transmit workers (November 15)
+
+Decision 7's sender half is in: a flow whose lane stays backlogged for
+10 ms takes a stripe, its TAP reads rotate over the data lanes, and the
+peer's writer restores the order. The workload is the stage 3 single-flow
+target: one QinQ flow at 7.5 ms RTT with 0.5% and 1% random loss, four
+workers per daemon, 5 Gbit/s offered, balanced lanes with the control lane
+on both arms, `stripe_flows` off (balc) or on (strc), two passes in
+reverse order.
+
+Hypothesis: one transmit worker caps the flow near 0.8–0.9 Gbit/s, so
+spreading it over three data lanes and their workers should lift it well
+past the 1.55–1.82 Gbit/s that accidental lane changes reached on
+November 11. Bar, stated before the run: at both loss rates, strc delivers
+more than 1.82 Gbit/s in both directions in every run, and reorders no
+more frames at the generator than twice the balc arm. Repairs take at
+least one 7.5 ms round trip, longer than the fixed 5 ms hold limit, so
+each lost frame still arrives behind its successors; reordering on the
+scale of the loss rate is expected on both arms. The full-size and lossy
+efficiency points carry no striped flow with the feature off, the default.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames

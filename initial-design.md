@@ -1090,8 +1090,19 @@ Landing order: the receiver's reorder window as a unit with tests for
 every gap rule (landed first, `reorder::Window`); the wire flag, tag and
 negotiation with codec tests (landed second; receive lanes refuse striped
 pieces until the writer exists); the writer handoff, including two-slot
-runs for a striped frame longer than one reassembly slot; the sender's flow
-selection and lane rotation. Measure on
+runs for a striped frame longer than one reassembly slot (landed behind
+`daemon.stripe_flows`); tag insertion in the sender, where a TAP input
+with a stripe number and next sequence prefixes each frame's rewritten
+header with the tag on negotiated lanes (landed, unused until flow
+selection; it does not yet stripe offload frames, so a striped input is cut
+into ordinary frames); the sender's flow selection
+and lane rotation (landed with tag insertion). Flow selection simplifies
+"one pacing round" to fixed values: a lane is backlogged while its owner
+holds more than 1 MiB unsent, half the per-lane admission limit, and a
+flow on it is striped once the lane has been backlogged for 10 ms. The
+backlog is the lane's, not the flow's, so a small flow sharing a
+backlogged lane may take a stripe too; the 16 slots per session bound
+that. Measure on
 the stage 3 single-flow target (7.5 ms RTT, 0.5% and 1% loss, four
 workers, 5 Gbit/s offered), stating the bar first: delivery above the
 November 11 striped range in both directions, frames reordered at the

@@ -152,6 +152,21 @@ impl Lane {
         self.next_frame_id()
     }
 
+    /// Allocates one frame identity for a striped frame, whose length counts
+    /// its stripe tag; the connection must have negotiated striped flows.
+    pub fn start_striped_frame(&mut self, length: usize) -> Result<u64, PackError> {
+        let tag = crate::wire::STRIPE_TAG_LEN;
+        if !self.striped || !(14 + tag..=usize::from(self.frame_limit) + tag).contains(&length) {
+            return Err(PackError::Frame);
+        }
+        self.next_frame_id()
+    }
+
+    /// Whether this lane may send striped frames.
+    pub const fn striped_flows(&self) -> bool {
+        self.striped
+    }
+
     /// Allocates one frame identity for an offload frame; the connection must
     /// have negotiated them.
     pub fn start_offload_frame(&mut self, length: usize) -> Result<u64, PackError> {
@@ -1170,7 +1185,12 @@ mod tests {
         lane.striped = true;
         let limit = lane.frame_limit();
         let tagged = limit + crate::wire::STRIPE_TAG_LEN;
-        let id = lane.start_frame(limit).unwrap();
+        // Only a negotiated lane starts striped frames, and their length counts the tag.
+        assert_eq!(plain.start_striped_frame(tagged), Err(PackError::Frame));
+        assert_eq!(lane.start_striped_frame(tagged + 1), Err(PackError::Frame));
+        assert_eq!(lane.start_striped_frame(21), Err(PackError::Frame));
+        assert!(lane.striped_flows() && !plain.striped_flows());
+        let id = lane.start_striped_frame(tagged).unwrap();
         plain.start_frame(limit).unwrap();
         let bytes = vec![7; tagged - 62];
         let input = FrameInput {

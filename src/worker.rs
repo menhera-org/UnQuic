@@ -466,21 +466,126 @@ pub(crate) const FLOW_SLOTS: usize = 16_384;
 const FLOW_IDLE_MS: u64 = 1000;
 const FLOW_MS_MASK: u64 = 0xff_ffff;
 
+/// Stripes per session, one per writer slot of `stripe::Writer`.
+pub(crate) const STRIPE_SLOTS: usize = 16;
+/// A flow-table lane value with this bit names a stripe slot instead.
+const STRIPED: usize = 0x80;
+/// Unsent bytes on one transmit lane that mark it backlogged: half of what
+/// admission lets one lane queue.
+// shortcut: fixed byte and time thresholds stand in for the design's one
+// pacing round; derive them from the lane's pacing rate if measurement
+// shows striping starting too late or on paths that are merely congested.
+const STRIPE_BACKLOG: usize = FRESH_BYTES / 2;
+/// How long a lane stays backlogged before the next read of a flow on it
+/// stripes the flow.
+const STRIPE_PRESS_MS: u64 = 10;
+/// A stripe slot silent this long may be claimed again: twice a flow entry's
+/// idle time, so no live entry still names it, and past the writer's
+/// one-second restart.
+const STRIPE_IDLE_MS: u64 = 2 * FLOW_IDLE_MS;
+const STRIPE_IN_USE: u64 = 1 << 32;
+const SEQUENCE_MASK: u64 = (1 << 48) - 1;
+
+/// One stripe slot TAP readers share: a use stamp, and the next read number
+/// (high 16 bits) and sequence (low 48 bits).
+#[derive(Default)]
+pub(crate) struct Stripe {
+    stamp: AtomicU64,
+    next: AtomicU64,
+}
+
+/// A transmit owner marks its lane when unsent bytes cross STRIPE_BACKLOG.
+fn mark_backlog(mark: &AtomicU64, before: usize, after: usize) {
+    if before < STRIPE_BACKLOG && after >= STRIPE_BACKLOG {
+        let _ = mark.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
+    } else if before >= STRIPE_BACKLOG && after < STRIPE_BACKLOG {
+        mark.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Whether a lane has been marked for STRIPE_PRESS_MS; the first reader to
+/// see a fresh mark stamps it.
+fn backlogged(mark: &AtomicU64, ms: u64) -> bool {
+    let now = ms & FLOW_MS_MASK;
+    match mark.load(Ordering::Relaxed) {
+        0 => false,
+        1 => {
+            let _ =
+                mark.compare_exchange(1, STRIPE_IN_USE | now, Ordering::Relaxed, Ordering::Relaxed);
+            false
+        }
+        since => now.wrapping_sub(since) & FLOW_MS_MASK >= STRIPE_PRESS_MS,
+    }
+}
+
+/// Claims an idle stripe slot and restarts its reads and sequence at 1.
+fn claim_stripe(stripes: &[Stripe], ms: u64) -> Option<usize> {
+    let now = ms & FLOW_MS_MASK;
+    stripes.iter().position(|stripe| {
+        let old = stripe.stamp.load(Ordering::Acquire);
+        (old == 0 || now.wrapping_sub(old) & FLOW_MS_MASK >= STRIPE_IDLE_MS)
+            && stripe
+                .stamp
+                .compare_exchange(
+                    old,
+                    STRIPE_IN_USE | now,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            && {
+                stripe.next.store(1, Ordering::Release);
+                true
+            }
+    })
+}
+
+/// Takes a striped read's lane, the next of `first..lanes` in turn, and the
+/// first of its `frames` sequences.
+fn stripe_read(
+    stripe: &Stripe,
+    frames: usize,
+    first: usize,
+    lanes: usize,
+    ms: u64,
+) -> (usize, u64) {
+    let now = ms & FLOW_MS_MASK;
+    let stamp = stripe.stamp.load(Ordering::Relaxed);
+    if stamp & FLOW_MS_MASK != now {
+        let _ = stripe.stamp.compare_exchange(
+            stamp,
+            STRIPE_IN_USE | now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+    let old = stripe
+        .next
+        .fetch_add((1 << 48) | frames as u64, Ordering::AcqRel);
+    (
+        first + (old >> 48) as usize % (lanes - first),
+        old & SEQUENCE_MASK,
+    )
+}
+
 /// Pins a flow to the lane it first received, assigning new flows round-robin
-/// across lanes `first..lanes` so a few heavy flows do not share one transmit
-/// worker. Every reader shares the table, so a flow the kernel moves to
-/// another TAP queue keeps its lane. Each entry holds a 32-bit key tag, the
+/// across the data lanes `first..lanes` so a few heavy flows do not share one
+/// transmit worker. Every reader shares the table, so a flow the kernel moves
+/// to another TAP queue keeps its lane. Each entry holds a 32-bit key tag, the
 /// lane and a 24-bit millisecond stamp. A flow whose entry another active flow
-/// holds falls back to its hash lane, as does every flow without a table.
+/// holds falls back to its hash lane among all `lanes`, as does every flow
+/// without a table. `stripe` may move an active flow from its lane to a
+/// stripe slot, which the entry then keeps and this returns with the STRIPED bit.
 fn balanced_lane(
     slots: &[AtomicU64],
     cursor: &std::sync::atomic::AtomicUsize,
     key: u64,
     hash: u64,
-    first: usize,
-    lanes: usize,
+    data: std::ops::Range<usize>,
     ms: u64,
+    mut stripe: impl FnMut(usize) -> Option<usize>,
 ) -> usize {
+    let (first, lanes) = (data.start, data.end);
     let Some(slot) = slots.get(key as usize % slots.len().max(1)) else {
         return hash as usize % lanes;
     };
@@ -490,7 +595,29 @@ fn balanced_lane(
     loop {
         let (old_tag, old_lane, old_ms) = (old >> 32, (old >> 24) & 0xff, old & FLOW_MS_MASK);
         let active = old != 0 && now.wrapping_sub(old_ms) & FLOW_MS_MASK < FLOW_IDLE_MS;
-        if active && old_tag == tag && (first..lanes).contains(&(old_lane as usize)) {
+        let striped = old_lane as usize & STRIPED != 0;
+        if active
+            && old_tag == tag
+            && !striped
+            && (first..lanes).contains(&(old_lane as usize))
+            && let Some(number) = stripe(old_lane as usize)
+        {
+            let lane = (STRIPED | number) as u64;
+            // A lost race leaves the claimed stripe to go idle.
+            if slot
+                .compare_exchange(
+                    old,
+                    tag << 32 | lane << 24 | now,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return lane as usize;
+            }
+            return old_lane as usize;
+        }
+        if active && old_tag == tag && (striped || (first..lanes).contains(&(old_lane as usize))) {
             if old_ms != now {
                 // A lost race only leaves the stamp a millisecond older.
                 let _ = slot.compare_exchange(
@@ -568,6 +695,8 @@ pub(crate) struct Buffer {
     lane: usize,
     length: usize,
     deadline: Duration,
+    // A striped TAP input's stripe number and the sequence of its next frame.
+    stripe: Option<(u16, u64)>,
     bytes: [u8; RECEIVE_BYTES],
 }
 
@@ -1206,6 +1335,7 @@ impl Worker {
                     lane: 0,
                     length: 0,
                     deadline: Duration::ZERO,
+                    stripe: None,
                     bytes: [0; RECEIVE_BYTES],
                 })
             })
@@ -2657,29 +2787,14 @@ impl Worker {
                 local.tx_bytes += length;
                 buffer.tx_reserved = true;
                 buffer.tag = connection.local_tag().get();
-                let frame = &buffer.bytes[..length];
-                let (workers, lanes) = (self.shared.workers(), self.sessions[session].tx.len());
-                let queues = self.shared.config.config().sessions[session].queue_count;
-                let cursor = self.shared.flow_cursors.get(session);
-                let first = first_data_lane(self.shared.config.config().daemon.control_lane, lanes);
-                let lane = if let Some(cursor) = cursor
-                    && !self.shared.flows.is_empty()
-                    && strict_lane(frame, self.id, workers, queues, lanes)
-                {
-                    let hash = pack::flow_hash(frame);
-                    balanced_lane(
-                        &self.shared.flows,
-                        cursor,
-                        hash ^ (session as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
-                        hash,
-                        first,
-                        lanes,
-                        now.as_millis() as u64,
-                    )
-                } else {
-                    tap_lane(frame, self.id, workers, queues, lanes)
-                };
-                buffer.lane = data_lane(lane, first, lanes, || pack::flow_hash(frame));
+                let frames = buffer.segments.map_or(1, |s| s.remaining(length));
+                (buffer.lane, buffer.stripe) = self.route(
+                    session,
+                    connection.striped_flows(),
+                    &buffer.bytes[..length],
+                    frames,
+                    now,
+                );
                 buffer.deadline = now + reassembly::FRAME_LIFETIME;
                 if buffer.segments.is_some() {
                     self.counters.tap_gso_reads = self.counters.tap_gso_reads.wrapping_add(1);
@@ -2707,6 +2822,73 @@ impl Worker {
             }
         }
         Ok(false)
+    }
+
+    /// Chooses a TAP read's transmit lane and, for a striped flow, its stripe
+    /// number and first sequence; `frames` is how many frames the read holds.
+    fn route(
+        &self,
+        session: usize,
+        striped: bool,
+        frame: &[u8],
+        frames: usize,
+        now: Duration,
+    ) -> (usize, Option<(u16, u64)>) {
+        let (workers, lanes) = (self.shared.workers(), self.sessions[session].tx.len());
+        let queues = self.shared.config.config().sessions[session].queue_count;
+        let first = first_data_lane(self.shared.config.config().daemon.control_lane, lanes);
+        let ms = now.as_millis() as u64;
+        // Striping needs the peer's writer and a second data lane.
+        let stripes = self
+            .shared
+            .stripes
+            .get(session)
+            .filter(|_| striped && lanes - first > 1);
+        let backlog = self.shared.backlog.get(session);
+        let lane = if let Some(cursor) = self.shared.flow_cursors.get(session)
+            && !self.shared.flows.is_empty()
+            && strict_lane(frame, self.id, workers, queues, lanes)
+        {
+            let hash = pack::flow_hash(frame);
+            balanced_lane(
+                &self.shared.flows,
+                cursor,
+                hash ^ (session as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                hash,
+                first..lanes,
+                ms,
+                |lane| {
+                    backlog
+                        .and_then(|marks| marks.get(lane))
+                        .filter(|mark| backlogged(mark, ms))
+                        .and(stripes)
+                        .and_then(|stripes| claim_stripe(stripes, ms))
+                },
+            )
+        } else {
+            tap_lane(frame, self.id, workers, queues, lanes)
+        };
+        if lane & STRIPED == 0 {
+            return (
+                data_lane(lane, first, lanes, || pack::flow_hash(frame)),
+                None,
+            );
+        }
+        let number = lane & !STRIPED;
+        match stripes.and_then(|s| s.get(number)) {
+            Some(stripe) => {
+                let (lane, sequence) = stripe_read(stripe, frames, first, lanes, ms);
+                (lane, Some((number as u16, sequence)))
+            }
+            // The connection that striped this flow was replaced.
+            None => {
+                let hash = pack::flow_hash(frame);
+                (
+                    data_lane(hash as usize % lanes, first, lanes, || hash),
+                    None,
+                )
+            }
+        }
     }
 
     fn dispatch_frame(&mut self, buffer: Box<Buffer>, now: Duration) -> io::Result<()> {
@@ -3015,17 +3197,25 @@ impl Worker {
             .frames
             .source(source)
             .ok_or_else(|| io::Error::other("missing transmit input"))?;
-        let (session, lane, tag, deadline, mut segments, input_length) = (
+        let (session, lane, tag, deadline, mut segments, input_length, stripe) = (
             input.session,
             input.lane,
             input.tag,
             input.deadline,
             input.segments,
             input.length,
+            input.stripe,
         );
         let Some(sender) = self.sessions[session].tx[lane].as_mut() else {
             self.discard_input(source)?;
             return Ok(Some(0));
+        };
+        // A striped input's frames carry its stripe tag where the lane negotiated it.
+        let tagging = stripe.filter(|_| sender.striped_flows());
+        let tag_len = if tagging.is_some() {
+            wire::STRIPE_TAG_LEN
+        } else {
+            0
         };
         // A run of whole segments travels as one offload frame when the
         // connection negotiated them and coverage planes are free for it.
@@ -3033,7 +3223,8 @@ impl Worker {
         let mut header = [0; frames::HEADER_BYTES];
         let run = match segments.as_mut() {
             Some(cursor)
-                if sender.offload_frames()
+                if tagging.is_none()
+                    && sender.offload_frames()
                     && cursor.next_len(input_length) <= sender.frame_limit()
                     && self.frames.wide_available() != 0 =>
             {
@@ -3052,6 +3243,8 @@ impl Worker {
         };
         let started = if run.is_some() {
             sender.start_offload_frame(length)
+        } else if tagging.is_some() {
+            sender.start_striped_frame(length + tag_len)
         } else {
             sender.start_frame(length)
         };
@@ -3072,26 +3265,32 @@ impl Worker {
             header: [0; frames::HEADER_BYTES],
             offload: run.is_some(),
             partial: false,
+            striped: tagging.is_some(),
         };
+        if let Some((number, sequence)) = tagging {
+            frame.header[..tag_len]
+                .copy_from_slice(&((u64::from(number) << 48) | sequence).to_be_bytes());
+        }
         if let Some(range) = run.clone() {
             frame.header = header;
             frame.header_len = header_len;
             frame.range = range;
         } else if let Some(cursor) = segments
             .as_mut()
-            .filter(|s| s.header_len() <= frames::HEADER_BYTES)
+            .filter(|s| s.header_len() + tag_len <= frames::HEADER_BYTES)
         {
             let input = self
                 .frames
                 .source(source)
                 .ok_or_else(|| io::Error::other("missing transmit input"))?;
             let bytes = &input.bytes[..input.length];
-            frame.header_len = cursor.header_len();
+            frame.header_len = tag_len + cursor.header_len();
             frame.partial = partial;
+            let output = &mut frame.header[tag_len..];
             frame.range = if partial {
-                cursor.write_seed_header(bytes, &mut frame.header)
+                cursor.write_seed_header(bytes, output)
             } else {
-                cursor.write_header(bytes, &mut frame.header)
+                cursor.write_header(bytes, output)
             }
             .ok_or_else(|| io::Error::other("invalid transmit header"))?;
         } else {
@@ -3101,10 +3300,14 @@ impl Worker {
                 .append(slab, source, segments.as_mut())
                 .ok_or_else(|| io::Error::other("invalid transmit slab range"))?;
             frame.source = slab;
+            frame.header_len = tag_len;
             self.sessions[session].tx_bytes += frame.range.len();
         }
         if let Some(input) = self.frames.source_mut(source) {
             input.segments = segments;
+            if let Some((number, sequence)) = tagging {
+                input.stripe = Some((number, sequence + 1));
+            }
         }
         let seeded = frame.partial;
         let frame = self
@@ -3183,18 +3386,29 @@ impl Worker {
             .frames
             .source(source)
             .ok_or_else(|| io::Error::other("missing transmit input"))?;
-        let (session, lane, deadline, input_length) =
-            (input.session, input.lane, input.deadline, input.length);
-        let Some(mut cursor) = input
-            .segments
-            .filter(|s| s.header_len() <= frames::HEADER_BYTES)
-        else {
-            return Ok(None);
-        };
+        let (session, lane, deadline, input_length, stripe) = (
+            input.session,
+            input.lane,
+            input.deadline,
+            input.length,
+            input.stripe,
+        );
         let Some(tx) = self.sessions[session].tx[lane].as_ref() else {
             return Ok(None);
         };
-        if tx.offload_frames() {
+        let mut tagging = stripe.filter(|_| tx.striped_flows());
+        let tag_len = if tagging.is_some() {
+            wire::STRIPE_TAG_LEN
+        } else {
+            0
+        };
+        let Some(mut cursor) = input
+            .segments
+            .filter(|s| s.header_len() + tag_len <= frames::HEADER_BYTES)
+        else {
+            return Ok(None);
+        };
+        if tx.offload_frames() && tagging.is_none() {
             return Ok(None);
         }
         let partial = tx.partial_checksums();
@@ -3206,10 +3420,13 @@ impl Worker {
             && self.can_materialize(source)
         {
             let length = cursor.next_len(input_length);
-            let Some(Ok(id)) = self.sessions[session].tx[lane]
-                .as_mut()
-                .map(|tx| tx.start_frame(length))
-            else {
+            let Some(Ok(id)) = self.sessions[session].tx[lane].as_mut().map(|tx| {
+                if tagging.is_some() {
+                    tx.start_striped_frame(length + tag_len)
+                } else {
+                    tx.start_frame(length)
+                }
+            }) else {
                 if count == 0 {
                     return Ok(None);
                 }
@@ -3222,11 +3439,17 @@ impl Worker {
                 range: 0..0,
                 offset: 0,
                 lane,
-                header_len: cursor.header_len(),
+                header_len: tag_len + cursor.header_len(),
                 header: [0; frames::HEADER_BYTES],
                 offload: false,
                 partial,
+                striped: tagging.is_some(),
             };
+            if let Some((number, sequence)) = tagging {
+                frame.header[..tag_len]
+                    .copy_from_slice(&((u64::from(number) << 48) | sequence).to_be_bytes());
+                tagging = Some((number, sequence + 1));
+            }
             let input = self
                 .frames
                 .source(source)
@@ -3235,14 +3458,18 @@ impl Worker {
                 .bytes
                 .get(..input_length)
                 .ok_or(io::ErrorKind::InvalidData)?;
+            let output = &mut frame.header[tag_len..];
             frame.range = if partial {
-                cursor.write_seed_header(input_bytes, &mut frame.header)
+                cursor.write_seed_header(input_bytes, output)
             } else {
-                cursor.write_header(input_bytes, &mut frame.header)
+                cursor.write_header(input_bytes, output)
             }
             .ok_or_else(|| io::Error::other("invalid transmit header"))?;
             if let Some(input) = self.frames.source_mut(source) {
                 input.segments = Some(cursor);
+                if tagging.is_some() {
+                    input.stripe = tagging;
+                }
             }
             let index = self
                 .frames
@@ -5706,6 +5933,57 @@ mod tests {
 
     #[test]
     #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn striped_inputs_tag_their_frames_only_where_the_lane_negotiated_stripes() {
+        for (negotiated, gso) in [(false, true), (true, true), (false, false), (true, false)] {
+            let (mut worker, _) = receive_worker();
+            let lane = worker.sender_index(0, 0).unwrap();
+            assert!(worker.sender.lanes[lane].rtt.sample(
+                Duration::ZERO,
+                Duration::from_millis(1),
+                0
+            ));
+            let mut connection = worker.sessions[0].connection.unwrap();
+            if negotiated {
+                connection.local.optional_features = wire::STRIPED_FLOWS;
+                connection.peer.optional_features = wire::STRIPED_FLOWS;
+            }
+            worker.sessions[0].tx[0] = Some(
+                pack::Lane::new(crate::UnquicUuid::from_bytes([1; 16]), connection, 1).unwrap(),
+            );
+            let mut buffer = deadline_input(&mut worker, gso);
+            buffer.stripe = Some((2, 10));
+            worker.input_frame(buffer, Duration::ZERO).unwrap();
+            // A plain input expands on admission; a GSO input waits for the drain.
+            let source = worker.sessions[0].tap_inputs.front().copied();
+            assert_eq!(source.is_some(), gso);
+            worker.drain_tap_inputs(Duration::ZERO).unwrap();
+            let frames = pending(&worker);
+            assert_eq!(frames.len(), if gso { BATCH_SIZE } else { 1 });
+            let tag_len = if negotiated { wire::STRIPE_TAG_LEN } else { 0 };
+            for (index, frame) in frames.into_iter().enumerate() {
+                let frame = worker.frames.frame(frame).unwrap();
+                let tag = ((2_u64 << 48) | (10 + index as u64)).to_be_bytes();
+                assert_eq!(frame.striped, negotiated);
+                assert_eq!(frame.header[..8] == tag, negotiated);
+                // A GSO child carries its rewritten Ethernet, IPv4 and UDP headers after the tag.
+                assert_eq!(frame.header_len, tag_len + if gso { 42 } else { 0 });
+            }
+            if let Some(source) = source {
+                let next = if negotiated {
+                    10 + BATCH_SIZE as u64
+                } else {
+                    10
+                };
+                assert_eq!(
+                    worker.frames.source(source).unwrap().stripe,
+                    Some((2, next))
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
     fn borrowed_views_stop_at_the_session_quota_and_expire_without_stranding_sources() {
         use crate::tap::test_common::udp;
         use std::os::unix::net::UnixDatagram;
@@ -6866,41 +7144,133 @@ mod tests {
         let cursor = AtomicUsize::new(0);
         // Four new flows spread across four lanes whatever their hashes.
         let lanes: Vec<_> = (1..=4)
-            .map(|key| balanced_lane(&slots, &cursor, key, 0, 0, 4, 10))
+            .map(|key| balanced_lane(&slots, &cursor, key, 0, 0..4, 10, |_| None))
             .collect();
         assert_eq!(lanes, [0, 1, 2, 3]);
         // An active flow keeps its lane.
-        assert_eq!(balanced_lane(&slots, &cursor, 2, 0, 0, 4, 900), 1);
+        assert_eq!(balanced_lane(&slots, &cursor, 2, 0, 0..4, 900, |_| None), 1);
         // After a full idle period a flow may move: none of its frames remain.
         assert_eq!(
-            balanced_lane(&slots, &cursor, 2, 0, 0, 4, 900 + FLOW_IDLE_MS),
+            balanced_lane(&slots, &cursor, 2, 0, 0..4, 900 + FLOW_IDLE_MS, |_| None),
             0
         );
         // A flow whose entry another active flow holds takes its hash lane and
         // leaves that flow's lane alone.
         let slots = table();
         let cursor = AtomicUsize::new(3);
-        assert_eq!(balanced_lane(&slots, &cursor, 7, 0, 0, 4, 0), 3);
+        assert_eq!(balanced_lane(&slots, &cursor, 7, 0, 0..4, 0, |_| None), 3);
         let other = 7 + (2 << 32);
-        assert_eq!(balanced_lane(&slots, &cursor, other, 6, 0, 4, 5), 2);
-        assert_eq!(balanced_lane(&slots, &cursor, 7, 0, 0, 4, 10), 3);
+        assert_eq!(
+            balanced_lane(&slots, &cursor, other, 6, 0..4, 5, |_| None),
+            2
+        );
+        assert_eq!(balanced_lane(&slots, &cursor, 7, 0, 0..4, 10, |_| None), 3);
         // Once the holder goes idle the other flow takes the entry.
         assert_eq!(
-            balanced_lane(&slots, &cursor, other, 6, 0, 4, 10 + FLOW_IDLE_MS),
+            balanced_lane(&slots, &cursor, other, 6, 0..4, 10 + FLOW_IDLE_MS, |_| None),
             0
         );
         // A lane that no longer exists is reassigned.
         let slots = table();
         let cursor = AtomicUsize::new(3);
-        assert_eq!(balanced_lane(&slots, &cursor, 9, 0, 0, 4, 0), 3);
-        assert!(balanced_lane(&slots, &cursor, 9, 0, 0, 2, 1) < 2);
+        assert_eq!(balanced_lane(&slots, &cursor, 9, 0, 0..4, 0, |_| None), 3);
+        assert!(balanced_lane(&slots, &cursor, 9, 0, 0..2, 1, |_| None) < 2);
         // The 24-bit stamp wraps without making an active flow look idle.
         let slots = table();
         let cursor = AtomicUsize::new(1);
         let wrap = FLOW_MS_MASK + 1;
-        assert_eq!(balanced_lane(&slots, &cursor, 4, 0, 0, 4, wrap - 10), 1);
-        assert_eq!(balanced_lane(&slots, &cursor, 4, 0, 0, 4, wrap + 5), 1);
-        assert_eq!(balanced_lane(&[], &cursor, 1, 5, 0, 4, 0), 1);
+        assert_eq!(
+            balanced_lane(&slots, &cursor, 4, 0, 0..4, wrap - 10, |_| None),
+            1
+        );
+        assert_eq!(
+            balanced_lane(&slots, &cursor, 4, 0, 0..4, wrap + 5, |_| None),
+            1
+        );
+        assert_eq!(balanced_lane(&[], &cursor, 1, 5, 0..4, 0, |_| None), 1);
+    }
+
+    #[test]
+    fn backlogged_flows_claim_a_stripe_and_take_lanes_and_sequences_in_turn() {
+        use std::sync::atomic::AtomicUsize;
+        let mark = AtomicU64::new(0);
+        mark_backlog(&mark, 0, STRIPE_BACKLOG - 1);
+        assert!(!backlogged(&mark, 100));
+        // The first reader to see the mark stamps it.
+        mark_backlog(&mark, STRIPE_BACKLOG - 1, STRIPE_BACKLOG);
+        assert!(!backlogged(&mark, 100));
+        assert!(!backlogged(&mark, 100 + STRIPE_PRESS_MS - 1));
+        mark_backlog(&mark, STRIPE_BACKLOG, 2 * STRIPE_BACKLOG);
+        assert!(backlogged(&mark, 100 + STRIPE_PRESS_MS));
+        mark_backlog(&mark, STRIPE_BACKLOG, STRIPE_BACKLOG - 1);
+        assert!(!backlogged(&mark, 200));
+        // A stamp at millisecond zero still counts as stamped.
+        mark_backlog(&mark, 0, STRIPE_BACKLOG);
+        assert!(!backlogged(&mark, 0));
+        assert!(backlogged(&mark, STRIPE_PRESS_MS));
+
+        let stripes: Vec<Stripe> = (0..2).map(|_| Stripe::default()).collect();
+        assert_eq!(claim_stripe(&stripes, 5), Some(0));
+        assert_eq!(claim_stripe(&stripes, 5), Some(1));
+        assert_eq!(claim_stripe(&stripes, 6), None);
+        // Reads take data lanes 1..4 in turn and consecutive sequences from 1.
+        assert_eq!(stripe_read(&stripes[0], 3, 1, 4, 7), (1, 1));
+        assert_eq!(stripe_read(&stripes[0], 1, 1, 4, 8), (2, 4));
+        assert_eq!(stripe_read(&stripes[0], 2, 1, 4, 9), (3, 5));
+        assert_eq!(stripe_read(&stripes[0], 1, 1, 4, 9), (1, 7));
+        // Only a silent stripe is claimed again, and it starts afresh.
+        assert_eq!(claim_stripe(&stripes, 5 + STRIPE_IDLE_MS), Some(1));
+        assert_eq!(claim_stripe(&stripes, 8 + STRIPE_IDLE_MS), None);
+        assert_eq!(claim_stripe(&stripes, 9 + STRIPE_IDLE_MS), Some(0));
+        assert_eq!(
+            stripe_read(&stripes[0], 1, 1, 4, 9 + STRIPE_IDLE_MS),
+            (1, 1)
+        );
+
+        let slots: Vec<_> = (0..FLOW_SLOTS).map(|_| AtomicU64::new(0)).collect();
+        let cursor = AtomicUsize::new(0);
+        // A new flow takes a lane without asking to stripe.
+        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 10, |_| unreachable!());
+        assert_eq!(lane, 1);
+        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 11, |lane| {
+            assert_eq!(lane, 1);
+            Some(3)
+        });
+        assert_eq!(lane, STRIPED | 3);
+        // The entry keeps its stripe without asking again, until it goes idle.
+        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 12, |_| unreachable!());
+        assert_eq!(lane, STRIPED | 3);
+        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 12 + FLOW_IDLE_MS, |_| None);
+        assert_eq!(lane, 2);
+        // Declining keeps the lane.
+        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 13 + FLOW_IDLE_MS, |_| None);
+        assert_eq!(lane, 2);
+    }
+
+    #[test]
+    fn backlogged_flows_stripe_across_data_lanes_only_where_negotiated() {
+        let ms = Duration::from_millis;
+        for negotiated in [false, true] {
+            let (shared, [worker, _]) = test_workers_with(3, true);
+            let frame = crate::tap::test_common::tcp::frame(false, 1, 1, 0x10, &[], &[7; 100]);
+            // Lane 0 carries control, so the flow takes data lane 1.
+            assert_eq!(worker.route(0, negotiated, &frame, 1, ms(0)), (1, None));
+            mark_backlog(&shared.backlog[0][1], 0, STRIPE_BACKLOG);
+            assert_eq!(worker.route(0, negotiated, &frame, 1, ms(1)), (1, None));
+            let routes: Vec<_> = [3, 1, 2]
+                .into_iter()
+                .zip(11..)
+                .map(|(frames, at)| worker.route(0, negotiated, &frame, frames, ms(at)))
+                .collect();
+            if negotiated {
+                assert_eq!(
+                    routes,
+                    [(1, Some((0, 1))), (2, Some((0, 4))), (1, Some((0, 5)))]
+                );
+            } else {
+                assert_eq!(routes, [(1, None); 3]);
+            }
+        }
     }
 
     #[test]
@@ -6913,7 +7283,7 @@ mod tests {
         let slots: Vec<_> = (0..FLOW_SLOTS).map(|_| AtomicU64::new(0)).collect();
         let cursor = AtomicUsize::new(0);
         let lanes: Vec<_> = (1..=4)
-            .map(|key| balanced_lane(&slots, &cursor, key, 0, 1, 4, 10))
+            .map(|key| balanced_lane(&slots, &cursor, key, 0, 1..4, 10, |_| None))
             .collect();
         assert_eq!(lanes, [1, 2, 3, 1]);
         // A lane-0 choice moves to a data lane by hash; others and single lanes stay.
@@ -8769,6 +9139,11 @@ mod tests {
     }
 
     pub(super) fn test_workers_with_lanes(tx_lanes: usize) -> (Arc<Shared>, [Worker; 2]) {
+        test_workers_with(tx_lanes, false)
+    }
+
+    /// Two workers; `flows` gives them the shared flow table.
+    fn test_workers_with(tx_lanes: usize, flows: bool) -> (Arc<Shared>, [Worker; 2]) {
         use crate::config::{Config, Daemon, Endpoint, Peer, Session as ConfigSession};
         use std::{
             net::Ipv6Addr,
@@ -8833,8 +9208,20 @@ mod tests {
             requests: std::sync::Mutex::new(crate::spsc::channel().0),
             address_pending: vec![std::sync::atomic::AtomicBool::new(false)],
             address_ready: (0..2).map(|_| AtomicU64::new(0)).collect(),
-            flow_cursors: Vec::new(),
-            flows: Box::default(),
+            flow_cursors: (0..2)
+                .filter(|_| flows)
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
+            flows: (0..FLOW_SLOTS)
+                .filter(|_| flows)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            stripes: (0..2)
+                .map(|_| (0..STRIPE_SLOTS).map(|_| Stripe::default()).collect())
+                .collect(),
+            backlog: (0..2)
+                .map(|_| (0..tx_lanes).map(|_| AtomicU64::new(0)).collect())
+                .collect(),
         });
         let workers: [Worker; 2] = std::array::from_fn(|id| {
             let mut worker = Worker::new(id, Arc::clone(&shared), Control::new()).unwrap();

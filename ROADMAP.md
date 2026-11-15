@@ -347,8 +347,20 @@ Decisions only the user can make, each blocking a remaining goal:
    end-of-turn buffers over as one event (or write them locally), the
    writer writes frames to its TAP queue in stripe order, and its hold
    deadline joins the worker's wait. The hold limit is a fixed 5 ms for
-   now, not yet min(2 × SRTT, 5 ms). Next: the sender's flow selection,
-   lane rotation and tag insertion, then the single-flow measurement.
+   now, not yet min(2 × SRTT, 5 ms). The sender inserts tags as well: a
+   TAP input carrying a stripe number and next sequence turns each frame
+   cut from it into a striped frame whose header starts with the tag, on
+   lanes that negotiated the feature, and never into an offload frame.
+   Flow selection and lane rotation followed in the same commit. A
+   transmit owner marks its lane in a shared word when unsent bytes cross
+   1 MiB, half of what admission lets a lane queue, and clears the mark
+   below it. The first TAP reader to see a fresh mark stamps it; once a
+   lane has been marked for 10 ms, the next read of an established flow on
+   it claims one of the session's 16 stripe slots and records the stripe in
+   the flow's table entry. Each read of a striped flow then takes one
+   atomic add on the slot, which yields both its data lane, in turn, and
+   its frames' first sequence. A slot silent for 2 s may be claimed again.
+   Next: the single-flow measurement, then the hold limit from SRTT.
 8. Decided November 14: `daemon.offload_frames` stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should
