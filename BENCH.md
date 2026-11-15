@@ -777,6 +777,27 @@ checksum. Lossy path ([results](benches/lossy-path-partial-checksums.json)):
 frames lost in the worse direction were 0.6–2.8% (median 1.1%) against
 HEAD's 0.5–3.7% (median 1.3%), at the same delivered rate.
 
+## Per-frame state out of line (November 15, rejected)
+
+The per-packet record of design section 13.1 rested on per-packet costs.
+A split profile at fef95b5 put building and storing a packet's send record
+at about 20 cycles and its history update at about 30, so one delivery
+sample per `sendmmsg` call would save about 15 cycles per frame event.
+The user chose instead to pursue one hot cache line per frame (design
+section 13.1, November 15 amendment), whose first step moves each frame's
+3.4 KB of coverage planes out of `FrameRecovery`, so the scalars every
+ACK reads pack 40 bytes apart instead of one per page
+([patch](benches/dense-coverage-scalars-rejected.patch)).
+
+Stated beforehand: the usual efficiency bar. Full-size point
+([results](benches/full-size-dense-coverage-scalars.json)): lower than
+HEAD's copy in 3 of 6 rounds at 0.0%, with HEAD at −0.9% against its
+copy. Small-frame point, untagged 64-byte frames at 20 Mbit/s per flow
+([results](benches/small-frames-dense-coverage-scalars.json)): 4 of 6
+rounds lower than the copy at −0.8%, with HEAD at −0.6%. Free frame
+slots are reused last in, first out, so the frames in flight stay cached
+however their state is laid out; the plan is on hold.
+
 ## Freeing unmapped frames without a cleanup pass (November 15, rejected)
 
 Every released frame waits in the cleanup queue until a later pass checks

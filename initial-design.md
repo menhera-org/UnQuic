@@ -912,6 +912,47 @@ per-ACK summary. Expected together: transmit planning 600 → about 200,
 staging 330 → about 80, ACK application 200 → about 80 cycles per frame
 event.
 
+**One hot line per frame (November 15 amendment, replacing the plan
+above).** Measurement did not support the per-packet record. Inline
+pieces showed no gain on November 13, and on November 15 a split profile
+put building and storing a packet's send record at about 20 cycles and
+its history update at about 30, so delivery samples per call would save
+about 15 cycles per frame event. The sender's bookkeeping, about 900
+cycles per frame event at the full-size point, is per frame instead: a
+frame passes through about ten stages (insert, bind, queueing, selection,
+reservation, send finish, ACK staging, detach, release and cleanup), and
+its state lives in six places, so most stages touch several cache lines
+that the previous stage left cold:
+
+| State | Where | Size per frame |
+| --- | --- | --- |
+| Identity, deadline, source range, offset, lane, flags, rewritten header | `frames::Frame` | 208 bytes, four lines |
+| Coverage scalars (length, sent, unacknowledged, prefix) | `FrameRecovery`, after 3.4 KB of inline planes | one line on its own page |
+| Bound identity and place (fresh, batch, retained, repair, cleanup) | recovery slot | 16 bytes |
+| Head of its piece list | journal frame entry | 16 bytes |
+| Queue links | link array | 4 bytes |
+| Expiry heap position | position array | 2 bytes |
+
+The replacement keeps one 64-byte line per frame with every field a stage
+reads or writes, and moves the rest out of line: the rewritten header
+bytes, read only when packing and the kernel copies them, and the coverage
+planes, used only after a loss. Landing order, each measured on its own:
+coverage planes out of line, which packs the coverage scalars densely
+instead of one per page; the header bytes out of line, with the frame's
+remaining fields narrowed so that they and the coverage scalars fit one
+line; then the recovery slot, the journal head, the links and the expiry
+position folded into it. The invariants listed above for the per-packet
+record still apply.
+
+The first step was measured the same day and showed no effect: with the
+planes out of line, CPU per delivered bit was level with HEAD's copy on
+the full-size point and within A/A noise on the small-frame point
+(BENCH.md). Free frame slots are reused last in, first out, so the few
+hundred frames in flight per worker keep their state cached wherever it
+lives. The sender's per-frame cost is the length of the code path through
+about ten stages, not cache misses, and this plan is on hold; fewer
+stages per frame, not fewer lines, would have to come next.
+
 **Receive without the reassembly copy (item 2; November 14 amendment;
 tried and rejected the same day, BENCH.md).** Four builds of the scheme
 below cost 15–20% more CPU per delivered bit, because TAP writes stopped

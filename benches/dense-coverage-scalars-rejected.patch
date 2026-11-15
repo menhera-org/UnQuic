@@ -1,0 +1,121 @@
+diff --git a/src/loss/repair.rs b/src/loss/repair.rs
+index 5966de0..ef8b6aa 100644
+--- a/src/loss/repair.rs
++++ b/src/loss/repair.rs
+@@ -66,8 +66,9 @@ const fn at_least(low: u64, high: u64, attempt: u8) -> u64 {
+ /// The planes cover MAX_FRAME_LEN bytes, or WIDE_FRAME_LEN while WidePlanes
+ /// are attached.
+ pub struct FrameRecovery {
+-    // Low, high and pending planes.
+-    planes: [[u64; WORDS]; 3],
++    // Low, high and pending planes, WORDS each, allocated once and kept apart
++    // so that an array of these packs the scalars every ACK reads densely.
++    planes: Box<[u64]>,
+     wide: Option<Box<WidePlanes>>,
+     length: u16,
+     sent: u16,
+@@ -82,21 +83,22 @@ pub struct FrameRecovery {
+ 
+ /// The active low, high and pending planes; fields are passed separately so
+ /// callers keep the rest of the frame state.
+-fn planes<'a>(inline: &'a [[u64; WORDS]; 3], wide: &'a Option<Box<WidePlanes>>) -> [&'a [u64]; 3] {
++fn planes<'a>(inline: &'a [u64], wide: &'a Option<Box<WidePlanes>>) -> [&'a [u64]; 3] {
+     match wide {
+         Some(wide) => {
+             let [low, high, pending] = &wide.0;
+             [low, high, pending]
+         }
+         None => {
+-            let [low, high, pending] = inline;
++            let (low, rest) = inline.split_at(WORDS);
++            let (high, pending) = rest.split_at(WORDS);
+             [low, high, pending]
+         }
+     }
+ }
+ 
+ fn planes_mut<'a>(
+-    inline: &'a mut [[u64; WORDS]; 3],
++    inline: &'a mut [u64],
+     wide: &'a mut Option<Box<WidePlanes>>,
+ ) -> [&'a mut [u64]; 3] {
+     match wide {
+@@ -105,17 +107,28 @@ fn planes_mut<'a>(
+             [low, high, pending]
+         }
+         None => {
+-            let [low, high, pending] = inline;
++            let (low, rest) = inline.split_at_mut(WORDS);
++            let (high, pending) = rest.split_at_mut(WORDS);
+             [low, high, pending]
+         }
+     }
+ }
+ 
+ impl FrameRecovery {
+-    /// Starts an unsent frame; rejects lengths outside the Ethernet frame limits.
++    /// Heap bytes each one allocates for its inline-sized planes.
++    pub const PLANE_BYTES: usize = 3 * WORDS * size_of::<u64>();
++
++    /// Starts an unsent frame; rejects lengths outside the Ethernet frame
++    /// limits or a failed allocation. Allocates; call only at startup.
+     pub fn new(length: usize) -> Option<Self> {
+-        (14..=MAX_FRAME_LEN).contains(&length).then_some(Self {
+-            planes: [[0; WORDS]; 3],
++        if !(14..=MAX_FRAME_LEN).contains(&length) {
++            return None;
++        }
++        let mut planes = Vec::new();
++        planes.try_reserve_exact(3 * WORDS).ok()?;
++        planes.resize(3 * WORDS, 0);
++        Some(Self {
++            planes: planes.into_boxed_slice(),
+             wide: None,
+             length: length as u16,
+             sent: 0,
+diff --git a/src/worker/frames.rs b/src/worker/frames.rs
+index 9be5286..172b665 100644
+--- a/src/worker/frames.rs
++++ b/src/worker/frames.rs
+@@ -227,6 +227,7 @@ impl Store {
+             + capacity
+                 * (size_of::<Option<Frame>>()
+                     + size_of::<FrameRecovery>()
++                    + FrameRecovery::PLANE_BYTES
+                     + size_of::<usize>()
+                     + size_of::<Link>()
+                     + size_of::<(u64, u16)>()
+@@ -669,6 +670,7 @@ mod tests {
+     fn recovery_storage_is_charged_for_exact_frame_capacity() {
+         let per_frame = size_of::<Option<Frame>>()
+             + size_of::<FrameRecovery>()
++            + FrameRecovery::PLANE_BYTES
+             + size_of::<usize>()
+             + size_of::<Link>()
+             + size_of::<(u64, u16)>()
+@@ -679,7 +681,9 @@ mod tests {
+                 capacity * per_frame
+             );
+         }
+-        assert_eq!(size_of::<FrameRecovery>(), 3408);
++        // The planes live apart, so the scalars every ACK reads pack densely.
++        assert_eq!(FrameRecovery::PLANE_BYTES, 3384);
++        assert!(size_of::<FrameRecovery>() <= 40);
+         assert!(size_of::<Frame>() < 256);
+     }
+ 
+diff --git a/tests/repair.rs b/tests/repair.rs
+index 078b88b..44487d8 100644
+--- a/tests/repair.rs
++++ b/tests/repair.rs
+@@ -52,7 +52,9 @@ fn late_ack_cancels_a_repair_plan_and_preserves_other_copies_accounting_boundary
+ 
+ #[test]
+ fn boundaries_exhaustion_and_invalid_mappings_leave_state_consistent() {
+-    assert_eq!(size_of::<FrameRecovery>(), 3408);
++    // The inline-sized planes live in one heap allocation apart from the scalars.
++    assert_eq!(size_of::<FrameRecovery>(), 40);
++    assert_eq!(FrameRecovery::PLANE_BYTES, 3384);
+     for length in [0, 13, MAX_FRAME_LEN + 1, usize::MAX] {
+         assert!(FrameRecovery::new(length).is_none());
+     }
