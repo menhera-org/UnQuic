@@ -523,8 +523,8 @@ Decisions only the user can make, each blocking a remaining goal:
    is a startup fault that ordinary frames would have hit too, not an
    offload-frame fault. The bench script moved the TAP to its namespace
    between the daemon's first queue attach and the rest, and the later
-   attaches, made by name, created a second device. Open: the script
-   should wait for "TAPs ready"; `Tap::create` should verify that the
+   attaches, made by name, created a second device. The script now
+   waits for "TAPs ready". Open: `Tap::create` should verify that the
    device holds every queue and fail otherwise, since a rename or move
    by udev could do the same; and a refused TAP write should keep its
    error code. With that round explained, offload frames have met both

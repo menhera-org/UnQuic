@@ -1602,13 +1602,14 @@ is after the first attach. When the move lands before the other
 attaches, they find no such name in the daemon's namespace and the
 kernel creates a second device there for them. The daemon ends with one
 queue on the moved device and seven on a device that is never brought
-up, and a write to a down TAP fails. The script should wait for the
+up, and a write to a down TAP fails. The script now waits for the
 daemon's "TAPs ready" line before it moves the link. The daemon has the
 same exposure to anything that renames or moves a fresh TAP between two
 attaches, udev included, so after attaching it should check that the
 device holds every queue and fail startup otherwise; it should also
 keep the error code of a refused write, which it only counts today.
-Neither is done yet. With the failed round explained and not theirs,
+Neither daemon change is done yet. With the failed round explained and
+not theirs,
 offload frames have met both bars set for the default.
 
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)

@@ -246,7 +246,11 @@ nsenter --net="$right_netns" taskset -c "${DAEMON_RIGHT_CPUS:-$workers-$((worker
 right=$!
 for side in left right; do
     attempts=0
-    until outer "$side" ip link show "uq-$side" >/dev/null 2>&1; do
+    # Wait for the daemon's line, not only the link: the name exists after the
+    # first queue attach, and moving the TAP then leaves the daemon's other
+    # queues on a second device created in the old namespace.
+    until grep -q 'TAPs ready' "$out/$side.log" 2>/dev/null &&
+        outer "$side" ip link show "uq-$side" >/dev/null 2>&1; do
         kill -0 "$left" && kill -0 "$right" || exit 1
         attempts=$((attempts + 1))
         [ "$attempts" -lt 500 ] || { echo "TAP readiness timeout" >&2; exit 1; }
