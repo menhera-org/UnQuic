@@ -135,6 +135,16 @@ blocking wait measured nothing and was rejected
 the empty second turn itself, asked for by phases that count a message
 handed to another worker as progress, is the target that remains.
 
+With four workers the day's changes save 10% of CPU below saturation
+and 6% near it, and leave delivery under overload where it was (13.5–
+13.6 Gbit/s in total). What caps that is balance, not cycles: with
+QinQ traffic one worker reads the whole TAP and still carries a full
+transmit and receive lane, and it saturates while the other three are
+33–55% idle. Placement that weighs each worker's whole load, and can
+move a running flow, is the open design question for the four-core
+target
+([BENCH.md](BENCH.md#four-workers-up-to-and-past-saturation-november-16)).
+
 Next targets in the daemon's own code, by cycles per frame event in
 that profile: output coalescing around the TAP write (about 320, the
 `flush_taps` phase less its syscall), the reassembly copy and slot scan

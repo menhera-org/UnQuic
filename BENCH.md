@@ -1790,6 +1790,43 @@ find something now waits for the next turn, which adds a turn. The
 second, empty turn is the cost worth removing, and it comes from phases
 that report progress after handing work to another worker.
 
+## Four workers up to and past saturation (November 16)
+
+The day's changes were measured on the full-size point, where eight
+workers are a quarter busy. Four workers per daemon, the count of the
+boxes this is meant for, were run at three loads on the build of the
+morning and on `7526db0`, sixteen QinQ flows each way, three rounds
+([results](benches/four-workers-load-steps-7526db0.json)):
+
+| Offered each way | `6fcf89d`, CPU per daemon | `7526db0` | Delivered each way |
+| --- | --- | --- | --- |
+| 4.8 Gbit/s | 190–201% | 174–179% | 4.74–4.75 Gbit/s on both |
+| 6.4 Gbit/s | 266–271% | 250–257% | 6.23–6.32 against 6.25–6.30 |
+
+That is 10% less CPU below saturation and 6% less near it. At 8 Gbit/s
+offered each way neither build keeps up, and three rounds suggested the
+newer one delivered less in one direction. Eight points each, with the
+build between them
+([results](benches/four-workers-overload-7526db0.json)), show no
+difference: 13.54, 13.64 and 13.50 Gbit/s in total on average, while a
+single direction swings between 5.5 and 7.6 Gbit/s on every build as
+flows land on lanes.
+
+A profile of that overload
+([worker lines](benches/four-workers-overload-profile.txt)) shows what
+caps it. QinQ frames give tun's flow steering nothing to hash, so one
+worker reads every frame from the TAP. That worker waits 12% of the
+time; reading the TAP takes 18.5% of its core, and it carries a third
+of the transmit lanes (15% in sends alone) and a receive lane (13% in
+TAP writes, 11% in admission) as well. The other three wait 33–55%. So
+past saturation the daemon is short of balance, not of cycles: about a
+core and a half of four is idle while one worker drops frames at its
+TAP queue. New flows are placed on the data lanes in turn, the reading
+worker's own lane included, and stay for as long as they are active.
+Leaving the reader's lane out would only move the limit to the worker
+that both transmits and receives. Raising it properly means weighing
+each worker's whole load and moving flows that are already running.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames
