@@ -823,6 +823,39 @@ records) is then paid once per GSO super-frame of up to 44 segments rather
 than per frame. Small or non-GSO traffic keeps the per-frame costs, so its
 rate in frames a second, not bytes, sets that limit.
 
+**Where it goes on November 16.** The same point profiled at `6fcf89d`,
+with the profile's phases mapped onto the rows above and kernel and
+userspace added together. The ranges span the two daemons of one round
+(BENCH.md):
+
+| Operation | `f1788ab` | `6fcf89d` | Target |
+| --- | --- | --- | --- |
+| Outer UDP send | 1,000 | 970–1,030 | 350 |
+| Outer UDP receive | 460 | 410–440 | 250 |
+| TAP read and input expansion | 670 | 450–530 | 150 |
+| TAP write and output coalescing | 990 | 900–945 | 200 |
+| Wakes, polls, timers, eventfd reads | 880 | 705–715 | 250 |
+| ACK and control sends | 200 | 100–110 | 100 |
+| Transmit planning, claim, finish, submit | 600 | 370–410 | 200 |
+| Recovery staging of acknowledged packets | 330 | 225–240 | 80 |
+| ACK application and controller reports | 200 | 70–80 | 80 |
+| Receive admission and dispatch | 890 | 715–765 | 300 |
+| Queues and the rest | 260 | 290 | 100 |
+| **Total** | **6,480** | **5,230–5,540** | **2,060** |
+
+Two of the daemon's own rows, both of them ACK work, have reached their
+targets. The four
+syscall rows hold 2,700–2,950 of the total against a target of 950, and
+this test bed inflates them: a TAP write carries the frame through a
+bridge and a veth pair, and the outer path segments in software. They
+fall with NIC offloads on the box and with offload frames, which bring
+the total to 4,360–4,670 here. Near saturation with four workers the
+total is 5,160–5,360, so load does not thin these costs out by itself.
+Wakes are the largest row the daemon controls. Two attempts to remove
+them one message at a time missed their bars, one costing 4.8% and the
+other gaining about 1% (BENCH.md); what remains follows from keeping the
+controller owner on a worker apart from the lanes' workers.
+
 **Memory bandwidth.** Each payload byte is copied five times by the CPU
 across the two boxes: the sender's TAP read and UDP send, then the
 receiver's UDP receive, reassembly copy and TAP write. Per box that is 12.5
