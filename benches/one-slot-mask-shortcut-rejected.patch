@@ -1,0 +1,74 @@
+diff --git a/src/reassembly.rs b/src/reassembly.rs
+index 851421a..399c85d 100644
+--- a/src/reassembly.rs
++++ b/src/reassembly.rs
+@@ -278,18 +278,28 @@ const fn run(span: u8) -> u128 {
+     u128::MAX >> (128 - span as u32)
+ }
+ 
++/// The mask of `span` slots from `slot`. Nearly every frame holds one slot,
++/// whose bit takes a 64-bit shift instead of two 128-bit ones.
++const fn slots(slot: usize, span: u8) -> u128 {
++    if span != 1 {
++        return run(span) << slot;
++    }
++    let bit = (1_u64 << (slot % 64)) as u128;
++    if slot < 64 { bit } else { bit << 64 }
++}
++
+ /// Reserves `span` free slots: the lowest free slot for a one-slot frame, the
+ /// highest free run for a longer one, so the two rarely fragment each other.
+ fn take(reserved: &mut u128, span: u8) -> Option<usize> {
+-    let run = run(span);
+     let slot = if span == 1 {
+         Some((!*reserved).trailing_zeros() as usize).filter(|&slot| slot < FRAME_CAPACITY)
+     } else {
++        let run = run(span);
+         (0..=FRAME_CAPACITY - usize::from(span))
+             .rev()
+             .find(|&slot| *reserved & (run << slot) == 0)
+     }?;
+-    *reserved |= run << slot;
++    *reserved |= slots(slot, span);
+     Some(slot)
+ }
+ 
+@@ -658,10 +668,10 @@ impl Lane {
+                             );
+                             frame.partial = reservation.partial;
+                             frame.striped = reservation.striped;
+-                            self.reserved |= run(frame.span) << slot;
++                            self.reserved |= slots(slot, frame.span);
+                             let deadline = frame.deadline;
+                             self.sequences[slot] = sequence;
+-                            self.occupied |= 1 << slot;
++                            self.occupied |= slots(slot, 1);
+                             self.retained_bytes += total_len as usize;
+                             self.insert(slot);
+                             self.deadline =
+@@ -908,8 +918,8 @@ impl Lane {
+         }
+         self.retained_bytes -= usize::from(self.frames[slot].length);
+         self.sequences[slot] = 0;
+-        self.occupied &= !(1 << slot);
+-        self.reserved &= !(run(self.frames[slot].span) << slot);
++        self.occupied &= !slots(slot, 1);
++        self.reserved &= !slots(slot, self.frames[slot].span);
+     }
+ }
+ 
+@@ -1330,6 +1340,14 @@ mod tests {
+         assert_eq!(span(SLOT_LEN as u16), 1);
+         assert_eq!(span(SLOT_LEN as u16 + 1), 2);
+         assert_eq!(span(MAX_FRAME_LEN as u16), 2);
++        // The one-slot shortcut agrees with the general mask everywhere.
++        for slot in 0..FRAME_CAPACITY {
++            assert_eq!(slots(slot, 1), 1 << slot);
++            assert_eq!(
++                slots(slot.min(FRAME_CAPACITY - 15), 15),
++                run(15) << slot.min(113)
++            );
++        }
+         // A lane holds 128 one-slot frames, or 64 jumbo frames, at once.
+         let mut reserved = 0;
+         assert!((0..FRAME_CAPACITY).all(|_| take(&mut reserved, 1).is_some()));

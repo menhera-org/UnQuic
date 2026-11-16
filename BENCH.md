@@ -954,6 +954,66 @@ hundreds of thousands of out-of-order writes. Keeping order through
 repairs here would need a hold of more than one round trip and a window
 of over 1,000 frames per stripe, about 1.5 MB at 1500-byte frames.
 
+### Skipping gaps every lane has passed (November 16)
+
+Waiting for repairs is the wrong goal: an unstriped flow does not get
+its repaired frames in order either. Each lane delivers its share of a
+stripe in rising sequence, apart from repairs, so a missing sequence is
+known to be late as soon as every lane carrying the stripe has delivered
+something past it. Transfer entries now name the lane a frame completed
+on, the writer keeps each lane's highest sequence per stripe, and it
+skips the gaps below the lowest of them at once; a lane silent for the
+hold limit stops counting. The 5 ms hold and the full window remain as
+fallbacks. In the writer's randomized test, three lanes with lost,
+repeated and late-repaired frames leave 32 frames out of sequence for 31
+repairs.
+
+Hypothesis: reordering on the single-flow target falls to about the
+unstriped level, since only repaired frames leave late, and the writer
+stops dropping frames because it no longer holds buffers for 5 ms.
+Delivery may still be limited where the writer shares a worker with the
+TAP reader. Bar, unchanged and stated before the run: at both loss
+rates strc delivers more than 1.82 Gbit/s in both directions in every
+run and reorders no more than twice the balc arm.
+
+The gap rule alone changed little
+([results](benches/lossy-one-flow-striping-passed-gaps-only.json)): 0.68–
+1.41 Gbit/s striped, 37,000–398,000 frames reordered, and the writer
+still dropped 163,000–190,000 frames per direction. The counters pointed
+at two more faults in the writer, fixed in turn:
+
+- It wrote each frame with its own TAP write and dropped the frame when
+  that write failed, as it does whenever the TAP queue is briefly full.
+  Released frames now wait in an outbox of up to 1,024 and go out in
+  batches of up to 64, as ordinary frames do, and a blocked TAP leaves
+  them queued until it is writable. That gave 1.34–1.84 Gbit/s in both
+  directions with no collapse
+  ([results](benches/lossy-one-flow-striping-outbox.json)), about five
+  frames per write.
+- The reorder window remembers deliveries for one window below its
+  position, and treated any older frame as a repeat. A repaired frame
+  arrives a round trip late, about 800 sequences at this rate against a
+  256-frame window, so the writer dropped nearly every repair: 100,000–
+  130,000 per direction. Lanes hand each frame over once, so an older
+  frame is now written as late. The window also grew to 1,024 frames,
+  since lanes drift further apart than 256.
+
+With all three ([results](benches/lossy-one-flow-striping-late-repairs.json)):
+
+| Loss | balc, L→R / R→L | strc, L→R / R→L | Reordered frames per direction |
+| --- | --- | --- | --- |
+| 0.5% | 1.14 / 1.17, 1.12 / 0.83 Gbit/s | 2.19 / 2.19, 1.71 / 1.39 | 14,000–32,000 → 32,000–105,000 |
+| 1% | 0.79 / 1.07, 1.11 / 1.03 | 2.19 / 2.05, 2.01 / 2.06 | 28,000–48,000 → 76,000–84,000 |
+
+Three of the four striped runs meet the bar: about twice the unstriped
+delivery in both directions, with the share of frames reordered
+unchanged at about 2.3% at 1% loss, so only repaired frames arrive late.
+The fourth run delivered 1.71 / 1.39 Gbit/s. There the flow took stripe
+1, whose writer, worker 1, was also the receiving daemon's TAP reader:
+it ran at 92% and dropped 106,000 frames. In the other runs the writer
+is the busiest thread at 92–97%, so it now limits the flow. `stripe_flows`
+stays off until the writer is kept off the TAP reader.
+
 ## Twice the receive slots in the same storage (November 15, landed)
 
 On the routed 4.5 ms path with 1% loss (the lossy efficiency point,
@@ -999,6 +1059,19 @@ and loss on that clean point did not change. The change lands anyway:
 the lossy gate is a requirement, and the change is small to revert if a
 cheaper layout turns up. Where the 1% goes is not known yet; the
 larger slot table and the `u128` masks are the suspects.
+
+November 16: the cost does not reproduce. Building one-slot masks with a
+64-bit shift instead of 128-bit ones
+([patch](benches/one-slot-mask-shortcut-rejected.patch),
+[results](benches/full-size-one-slot-mask-shortcut.json)) was lower than
+HEAD in 3 of 6 rounds at a median of +0.7%, and is rejected; a build
+running beside the benchmark disturbed two of those rounds. The pre-slot
+build (8b16ec4) ran in the same set and was not cheaper than HEAD either,
+also +0.7%. A clean set of six
+([results](benches/full-size-receive-slots-3.json)) put HEAD at +0.2%
+against the pre-slot build, while a byte-identical copy of HEAD read
++1.4% in the same rounds. The slot change costs somewhere between
+nothing and 1% here, which this point cannot resolve.
 
 The first landed version (aed037d) had a bug these runs could not show.
 A TAP batch's completion mask covers the first 64 ready frames, but

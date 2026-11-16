@@ -10,8 +10,9 @@
 
 use std::time::Duration;
 
-/// Frames a window can hold ahead of its next sequence.
-pub const WINDOW: usize = 256;
+/// Frames a window can hold ahead of its next sequence: the skew between a
+/// stripe's lanes it can absorb, about 10 ms of one flow at 1 Gbit/s.
+pub const WINDOW: usize = 1024;
 const WORDS: usize = WINDOW / 64;
 
 /// What [`Window::insert`] did with a frame.
@@ -42,6 +43,8 @@ pub struct Counters {
     pub full_skips: u64,
     /// Sequences known to be abandoned.
     pub abandoned: u64,
+    /// Skips the caller started because every source had passed the gap.
+    pub passed_skips: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -96,6 +99,7 @@ impl<T: Copy> Window<T> {
                 timeout_skips: 0,
                 full_skips: 0,
                 abandoned: 0,
+                passed_skips: 0,
             },
         }
     }
@@ -137,12 +141,17 @@ impl<T: Copy> Window<T> {
     /// Offers a frame with its stripe sequence, received at `now`.
     pub fn insert(&mut self, sequence: u64, item: T, now: Duration) -> Placement {
         if sequence < self.next {
-            if sequence == 0 || self.next - sequence > WINDOW as u64 || self.was_delivered(sequence)
-            {
+            // The delivered marks cover the WINDOW sequences below the next.
+            // An older frame cannot be checked against them; its lane hands
+            // over each frame once, so it is a late repair, not a repeat.
+            let marked = self.next - sequence <= WINDOW as u64;
+            if sequence == 0 || (marked && self.was_delivered(sequence)) {
                 self.counters.duplicates += 1;
                 return Placement::Duplicate;
             }
-            self.set_delivered(sequence, true);
+            if marked {
+                self.set_delivered(sequence, true);
+            }
             self.counters.late += 1;
             return Placement::Late;
         }
@@ -183,6 +192,19 @@ impl<T: Copy> Window<T> {
             *slot = Slot::Gone { sequence };
             self.counters.abandoned += 1;
         }
+    }
+
+    /// Skips every gap below `sequence`, which the caller knows no frame can
+    /// still fill in order; true when drain may now release more. Sequences
+    /// beyond the window's reach are left to the full-window rule.
+    pub fn skip_to(&mut self, sequence: u64) -> bool {
+        let sequence = sequence.min(self.next + WINDOW as u64);
+        if sequence <= self.floor || sequence <= self.next {
+            return false;
+        }
+        self.floor = sequence;
+        self.counters.passed_skips += 1;
+        true
     }
 
     /// Releases the next frame in order, skipping gaps below the floor and
@@ -272,6 +294,31 @@ mod tests {
     }
 
     #[test]
+    fn gaps_every_source_has_passed_are_skipped_at_once() {
+        let mut window = Window::new();
+        for sequence in [2, 3, 5, 6] {
+            assert_eq!(window.insert(sequence, sequence, ms(0)), Placement::Held);
+        }
+        // Nothing below 1 or at the next sequence can be skipped.
+        assert!(!window.skip_to(1));
+        assert_eq!(drained(&mut window), []);
+        // Every source is past 4: sequences 1 and 4 are skipped, 5 and 6 are not held back.
+        assert!(window.skip_to(5));
+        assert_eq!(drained(&mut window), [2, 3, 5, 6]);
+        assert!(!window.skip_to(5));
+        assert_eq!(window.counters().passed_skips, 1);
+        assert_eq!(window.counters().skipped, 2);
+        // The skipped frames still arrive once, out of sequence.
+        assert_eq!(window.insert(4, 4, ms(1)), Placement::Late);
+        assert_eq!(window.insert(4, 4, ms(1)), Placement::Duplicate);
+        // A mark beyond the window stops at its reach.
+        assert_eq!(window.insert(8, 8, ms(1)), Placement::Held);
+        assert!(window.skip_to(u64::MAX));
+        assert_eq!(drained(&mut window), [8]);
+        assert_eq!(window.next(), 7 + WINDOW as u64);
+    }
+
+    #[test]
     fn in_order_and_held_frames_leave_in_sequence() {
         let mut window = Window::new();
         assert_eq!(window.insert(1, 1, ms(0)), Placement::Held);
@@ -318,6 +365,24 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_older_than_the_delivered_marks_is_late_not_a_repeat() {
+        let mut window = Window::new();
+        // Sequence 1 is skipped, then a window and more of frames goes by.
+        let last = WINDOW as u64 + 2;
+        for sequence in 2..=last {
+            assert_eq!(window.insert(sequence, sequence, ms(0)), Placement::Held);
+            window.skip_to(2);
+            assert_eq!(drained(&mut window), [sequence]);
+        }
+        // A repair that late is still delivered, once at least; within the
+        // marks a repeat is recognized.
+        assert_eq!(window.insert(1, 1, ms(9)), Placement::Late);
+        assert_eq!(window.insert(last, last, ms(9)), Placement::Duplicate);
+        let counters = window.counters();
+        assert_eq!((counters.late, counters.duplicates), (1, 1));
+    }
+
+    #[test]
     fn abandoned_sequences_and_a_full_window_skip_their_gaps() {
         let mut window = Window::new();
         window.abandon(1);
@@ -356,9 +421,11 @@ mod tests {
         for round in 0..50 {
             let mut window = Window::new();
             let count = 2000;
-            // Sequences arrive shuffled within a bounded distance, some lost or duplicated.
+            // Sequences arrive shuffled within a bounded distance, some lost or
+            // repeated. A repeat follows closely: lanes hand each frame over
+            // once, so none can come from beyond the delivered marks.
             let mut arrivals: Vec<u64> = (1..=count).collect();
-            let spread = [4, 64, 300][round % 3];
+            let spread = [4, 64, 1500][round % 3];
             for index in 0..arrivals.len() {
                 let other = (index + random(spread) as usize).min(arrivals.len() - 1);
                 arrivals.swap(index, other);
@@ -372,8 +439,10 @@ mod tests {
                 if random(50) == 0 {
                     continue; // lost
                 }
-                if random(50) == 0 {
-                    queue.push_back(sequence); // duplicated later
+                // A frame later than the marks reach is not remembered, so only
+                // rounds that stay within them repeat frames.
+                if spread < WINDOW as u64 && random(50) == 0 {
+                    queue.insert(queue.len().min(2), sequence); // repeated soon
                 }
                 match window.insert(sequence, sequence, now) {
                     Placement::Blocked => {

@@ -829,6 +829,31 @@ struct Stripes {
     held: [Option<Box<Buffer>>; stripe::HOLDERS],
     writer: stripe::Writer<u8>,
     due: Option<Duration>,
+    // Frames the writer released, in order, waiting for a TAP batch: the
+    // held buffer, the frame's range in it and whether its checksum is partial.
+    outbox: VecDeque<(u8, u32, u32, bool)>,
+    // Outbox frames still pointing into each held buffer.
+    queued: [u16; stripe::HOLDERS],
+    // One bit per held buffer the writer let go of while the outbox needs it.
+    released: u64,
+}
+
+/// Frames a writer may queue for the TAP; beyond it the newest are dropped.
+const STRIPE_OUTBOX: usize = 1024;
+const _: () = assert!(stripe::HOLDERS <= 64);
+
+impl Stripes {
+    fn new(workers: usize) -> Self {
+        Self {
+            out: (0..workers).map(|_| None).collect(),
+            held: std::array::from_fn(|_| None),
+            writer: stripe::Writer::new(),
+            due: None,
+            outbox: VecDeque::with_capacity(STRIPE_OUTBOX),
+            queued: [0; stripe::HOLDERS],
+            released: 0,
+        }
+    }
 }
 
 /// How long a writer holds frames behind a gap.
@@ -1172,6 +1197,8 @@ impl Worker {
             if config.daemon.stripe_flows {
                 per_worker = per_worker
                     .checked_add(size_of::<Stripes>())?
+                    .checked_add(stripe::Writer::<u8>::storage_bytes())?
+                    .checked_add(STRIPE_OUTBOX * size_of::<(u8, u32, u32, bool)>())?
                     .checked_add(workers.checked_mul(size_of::<Option<(Box<Buffer>, usize)>>())?)?;
             }
         }
@@ -1314,14 +1341,10 @@ impl Worker {
                 ack_inflight: 0,
                 rx_dirty: 0,
                 tx_dirty: 0,
-                stripes: config.daemon.stripe_flows.then(|| {
-                    Box::new(Stripes {
-                        out: (0..count).map(|_| None).collect(),
-                        held: std::array::from_fn(|_| None),
-                        writer: stripe::Writer::new(),
-                        due: None,
-                    })
-                }),
+                stripes: config
+                    .daemon
+                    .stripe_flows
+                    .then(|| Box::new(Stripes::new(count))),
             });
         }
         let free = (0..BUFFERS)
@@ -4402,7 +4425,7 @@ impl Worker {
             }
             if self.sessions[session].stripes.is_some() {
                 self.flush_stripes(session, now);
-                self.run_writer(session, None, now);
+                writable |= self.run_writer(session, None, now);
             }
             let local = &mut self.sessions[session];
             local.totals.reassembly_frames =
@@ -4558,7 +4581,8 @@ impl Worker {
             let Some((buffer, used)) = out.as_mut() else {
                 break;
             };
-            if stripe::pack(&mut buffer.bytes, used, frame.bytes, frame.partial) {
+            let source = (frame.id >> 48) as u16;
+            if stripe::pack(&mut buffer.bytes, used, frame.bytes, frame.partial, source) {
                 lane.finish_front();
                 for totals in [&mut self.counters, &mut local.totals] {
                     totals.rx_striped_frames = totals.rx_striped_frames.wrapping_add(1);
@@ -4651,74 +4675,123 @@ impl Worker {
     }
 
     /// Accepts a held transfer buffer into the session's writer, or with
-    /// `None` only expires its gaps, writing what that releases to the TAP
-    /// and returning emptied buffers to their pools.
-    fn run_writer(&mut self, session: usize, accept: Option<(u8, usize)>, now: Duration) {
+    /// `None` only expires its gaps. Frames the writer releases queue in the
+    /// outbox and go to the TAP in batches, as ordinary frames do; emptied
+    /// buffers return to their pools once the outbox no longer needs them.
+    /// True when frames still wait for a blocked TAP to become writable.
+    fn run_writer(&mut self, session: usize, accept: Option<(u8, usize)>, now: Duration) -> bool {
         let mut emptied: [Option<Box<Buffer>>; stripe::HOLDERS] = std::array::from_fn(|_| None);
-        let (mut delivered, mut dropped) = (0_u64, 0_u64);
-        let before = {
-            let Session { tap, stripes, .. } = &mut self.sessions[session];
+        let (mut delivered, mut dropped, mut calls) = (0_u64, 0_u64, 0_u64);
+        let (before, waiting) = {
+            let Session {
+                tap,
+                stripes,
+                tap_blocked,
+                ..
+            } = &mut self.sessions[session];
             let Some(stripes) = stripes.as_mut() else {
-                return;
+                return false;
             };
             let Stripes {
-                held, writer, due, ..
+                held,
+                writer,
+                due,
+                outbox,
+                queued,
+                released,
+                ..
             } = &mut **stripes;
             let before = writer.totals();
-            let mut released = [0_u8; stripe::HOLDERS];
-            let mut count = 0;
             {
                 let held: &[Option<Box<Buffer>>; stripe::HOLDERS] = held;
                 let mut deliver = |holder: u8, range: Range<usize>, partial: bool| {
-                    let frame = held[usize::from(holder)]
-                        .as_ref()
-                        .and_then(|buffer| buffer.bytes.get(range))
-                        .and_then(|frame| frame.get(wire::STRIPE_TAG_LEN..));
-                    let written = match (frame, tap.as_mut()) {
-                        (Some(frame), Some(tap)) => tap
-                            .write_batch_partial(std::iter::once(frame), u64::from(partial))
-                            .2
-                            .ok(),
-                        _ => None,
-                    };
-                    match written {
-                        Some(length) => delivered += length as u64,
-                        None => dropped += 1,
+                    if outbox.len() < STRIPE_OUTBOX {
+                        outbox.push_back((holder, range.start as u32, range.end as u32, partial));
+                        queued[usize::from(holder)] += 1;
+                    } else {
+                        dropped += 1;
                     }
                 };
-                let mut release = |holder: u8| {
-                    if let Some(slot) = released.get_mut(count) {
-                        *slot = holder;
-                        count += 1;
-                    }
-                };
+                let mut release = |holder: u8| *released |= 1_u64 << holder;
                 if let Some((holder, length)) = accept {
                     let bytes = held[usize::from(holder)]
                         .as_ref()
                         .and_then(|buffer| buffer.bytes.get(..length))
                         .unwrap_or_default();
                     // Held slots mirror the writer's, so this only fails if they diverge.
-                    if !writer.accept(holder, bytes, now, &mut deliver, &mut release) {
+                    if !writer.accept(holder, bytes, now, STRIPE_HOLD, &mut deliver, &mut release) {
                         release(holder);
                     }
                 }
                 *due = writer.expire(now, STRIPE_HOLD, &mut deliver, &mut release);
             }
-            for (slot, &holder) in emptied.iter_mut().zip(&released[..count]) {
-                *slot = held[usize::from(holder)].take();
+            while !*tap_blocked && !outbox.is_empty() {
+                let Some(tap) = tap.as_mut() else {
+                    // No TAP to write to: the frames are lost.
+                    dropped += outbox.len() as u64;
+                    for (holder, ..) in outbox.drain(..) {
+                        queued[usize::from(holder)] -= 1;
+                    }
+                    break;
+                };
+                let batch = outbox.len().min(BATCH_SIZE);
+                let partial = outbox
+                    .iter()
+                    .take(batch)
+                    .enumerate()
+                    .fold(0, |mask, (index, entry)| mask | u64::from(entry.3) << index);
+                let frames = outbox.iter().take(batch).map(|&(holder, start, end, _)| {
+                    held[usize::from(holder)]
+                        .as_ref()
+                        .and_then(|buffer| buffer.bytes.get(start as usize..end as usize))
+                        .and_then(|frame| frame.get(wire::STRIPE_TAG_LEN..))
+                        .unwrap_or_default()
+                });
+                let (mask, _, result) = tap.write_batch_partial(frames, partial);
+                if mask == 0 {
+                    break;
+                }
+                calls += 1;
+                match result {
+                    Ok(length) => delivered += length as u64,
+                    Err(error) if transient(&error) => {
+                        *tap_blocked = true;
+                        break;
+                    }
+                    Err(_) => dropped += u64::from(mask.count_ones()),
+                }
+                // The mask names the batch's frames that this write covered.
+                let mut index = 0;
+                outbox.retain(|&(holder, ..)| {
+                    let written = index < 64 && mask & (1 << index) != 0;
+                    index += 1;
+                    if written {
+                        queued[usize::from(holder)] -= 1;
+                    }
+                    !written
+                });
             }
-            before
+            let mut count = 0;
+            for holder in 0..stripe::HOLDERS {
+                if *released & (1_u64 << holder) != 0 && queued[holder] == 0 {
+                    *released &= !(1_u64 << holder);
+                    emptied[count] = held[holder].take();
+                    count += 1;
+                }
+            }
+            (before, !outbox.is_empty())
         };
         for buffer in emptied.into_iter().flatten() {
             self.release(buffer);
         }
         let Some(stripes) = self.sessions[session].stripes.as_ref() else {
-            return;
+            return waiting;
         };
         let after = stripes.writer.totals();
         let local = &mut self.sessions[session];
         for totals in [&mut self.counters, &mut local.totals] {
             totals.delivered_frame_bytes = totals.delivered_frame_bytes.wrapping_add(delivered);
+            totals.tap_write_calls = totals.tap_write_calls.wrapping_add(calls);
             totals.stripe_unordered = totals
                 .stripe_unordered
                 .wrapping_add(after.unordered - before.unordered);
@@ -4726,6 +4799,7 @@ impl Worker {
                 .stripe_drops
                 .wrapping_add(after.dropped - before.dropped + dropped);
         }
+        waiting
     }
 
     // Nominally one 9000-byte probe per 3 ms globally, without a shared counter or lock.
@@ -6598,12 +6672,7 @@ mod tests {
     #[test]
     fn striped_frames_reach_the_tap_in_stripe_order_through_their_writer() {
         let (mut worker, tap) = receive_worker();
-        worker.sessions[0].stripes = Some(Box::new(Stripes {
-            out: (0..2).map(|_| None).collect(),
-            held: std::array::from_fn(|_| None),
-            writer: stripe::Writer::new(),
-            due: None,
-        }));
+        worker.sessions[0].stripes = Some(Box::new(Stripes::new(2)));
         worker.sessions[0].rx[0]
             .as_mut()
             .unwrap()
@@ -6645,7 +6714,21 @@ mod tests {
         let length = receive_bytes(2, &[receive_piece(2, 0, &[9; 60])], &mut bytes);
         admit(&mut worker, &bytes[..length]);
         admit(&mut worker, &striped(3, &frame(2, 1, 1)));
-        admit(&mut worker, &striped(4, &frame(2, 3, 3)));
+        worker.flush_taps(Duration::ZERO).unwrap();
+        // Sequence 3 completed on lane 9, which another worker owns: it
+        // arrives as a transfer.
+        let mut transfer = worker.free.pop().unwrap();
+        let mut used = 0;
+        assert!(stripe::pack(
+            &mut transfer.bytes,
+            &mut used,
+            &frame(2, 3, 3),
+            false,
+            9
+        ));
+        transfer.session = 0;
+        transfer.length = used;
+        worker.accept_stripes(transfer, Duration::ZERO);
         worker.flush_taps(Duration::ZERO).unwrap();
         let mut output = [0; 2048];
         let mut read = || tap.recv(&mut output).ok().map(|n| output[..n].to_vec());
@@ -6654,8 +6737,9 @@ mod tests {
             assert_eq!(read(), Some(vec![fill; 60]), "stripe sequence {fill}");
         }
         assert_eq!(read(), None);
-        assert_eq!(worker.counters.rx_striped_frames, 3);
-        // Sequence 5 waits behind the missing 4 until the hold limit.
+        assert_eq!(worker.counters.rx_striped_frames, 2);
+        // Lane 9 has only reached 3, so sequence 5 waits behind the missing
+        // 4 until the hold limit.
         admit(&mut worker, &striped(5, &frame(2, 5, 5)));
         worker.flush_taps(Duration::from_millis(1)).unwrap();
         assert_eq!(read(), None);
@@ -6688,7 +6772,53 @@ mod tests {
         );
         assert!(worker.sessions[0].stripes.as_ref().unwrap().out[1].is_none());
         assert_eq!(worker.counters.stripe_unordered, 0);
-        assert_eq!(worker.counters.rx_striped_frames, 5);
+        assert_eq!(worker.counters.rx_striped_frames, 4);
+    }
+
+    #[test]
+    fn a_blocked_tap_keeps_striped_frames_queued_until_it_is_writable() {
+        let (mut worker, tap) = receive_worker();
+        worker.sessions[0].stripes = Some(Box::new(Stripes::new(2)));
+        // Fill the simulated TAP's send queue.
+        let queue = worker.sessions[0].tap.as_mut().unwrap();
+        while queue.write_frame(&[0; 60]).is_ok() {}
+        let mut transfer = worker.free.pop().unwrap();
+        let mut used = 0;
+        for sequence in 1..=3_u64 {
+            let mut frame = ((2_u64 << 48) | sequence).to_be_bytes().to_vec();
+            frame.extend_from_slice(&[sequence as u8; 60]);
+            assert!(stripe::pack(
+                &mut transfer.bytes,
+                &mut used,
+                &frame,
+                false,
+                7
+            ));
+        }
+        transfer.session = 0;
+        transfer.length = used;
+        worker.accept_stripes(transfer, Duration::ZERO);
+        // Nothing is dropped: the frames wait in the outbox with their buffer.
+        let outbox = |worker: &Worker| worker.sessions[0].stripes.as_ref().unwrap().outbox.len();
+        assert!(worker.sessions[0].tap_blocked);
+        assert_eq!(outbox(&worker), 3);
+        assert_eq!(worker.free.len(), BUFFERS - 1);
+        worker.flush_taps(Duration::ZERO).unwrap();
+        assert!(worker.sessions[0].tap_writable);
+        assert_eq!(outbox(&worker), 3);
+        // Once the queue drains and EPOLLOUT clears the block, they go out in order.
+        let mut bytes = [0; 2048];
+        while tap.recv(&mut bytes).is_ok() {}
+        worker.sessions[0].tap_blocked = false;
+        worker.flush_taps(Duration::ZERO).unwrap();
+        for fill in 1..=3 {
+            assert_eq!(tap.recv(&mut bytes).unwrap(), 60);
+            assert_eq!(&bytes[..60], &[fill; 60]);
+        }
+        assert_eq!(outbox(&worker), 0);
+        assert_eq!(worker.free.len(), BUFFERS);
+        assert_eq!(worker.counters.stripe_drops, 0);
+        assert_eq!(worker.counters.delivered_frame_bytes, 180);
     }
 
     #[test]
@@ -6699,19 +6829,14 @@ mod tests {
         let mut used = 0;
         let mut frame = ((2_u64 << 48) | 1).to_be_bytes().to_vec();
         frame.extend_from_slice(&[1; 60]);
-        assert!(stripe::pack(&mut buffer.bytes, &mut used, &frame, false));
+        assert!(stripe::pack(&mut buffer.bytes, &mut used, &frame, false, 7));
         buffer.session = 0;
         buffer.length = used;
         worker.accept_stripes(buffer, Duration::ZERO);
         assert_eq!(worker.counters.stripe_drops, 1);
         assert_eq!(worker.free.len(), BUFFERS);
         // A striped frame whose tag has sequence zero cannot be ordered.
-        worker.sessions[0].stripes = Some(Box::new(Stripes {
-            out: (0..2).map(|_| None).collect(),
-            held: std::array::from_fn(|_| None),
-            writer: stripe::Writer::new(),
-            due: None,
-        }));
+        worker.sessions[0].stripes = Some(Box::new(Stripes::new(2)));
         let lane = worker.sessions[0].rx[0].as_mut().unwrap();
         lane.accept_striped_flows(true);
         let untagged = [&(2_u64 << 48).to_be_bytes()[..], &[3; 60]].concat();

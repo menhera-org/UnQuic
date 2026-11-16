@@ -1077,9 +1077,13 @@ of its frames.
   sequence rather than drop it. A stripe silent for a second starts
   afresh, so a reused stripe number cannot meet its old window.
 - **Gaps.** A frame missing from the sequence holds the frames behind it
-  until it arrives, until it is abandoned or expires on the lane that
-  carries it, or until the oldest held frame has waited the hold limit,
-  min(2 × smoothed RTT, 5 ms); then the window skips the gap. An abandoned
+  until it arrives, until every lane carrying the stripe has delivered a
+  later sequence (November 16: each lane delivers in rising sequence
+  apart from repairs, so the frame is then known to be late), until it is
+  abandoned or expires on the lane that carries it, or until the oldest
+  held frame has waited the hold limit, min(2 × smoothed RTT, 5 ms); then
+  the window skips the gap. A lane silent for the hold limit no longer
+  counts among the stripe's lanes. An abandoned
   or expired striped frame that never arrived cannot name its sequence, so
   the hold limit covers it. A full window skips the oldest gap at once.
   Held frames keep their own deadlines, and the reorder buffers are charged
@@ -1129,7 +1133,11 @@ window have to be sized from the path: a hold above one smoothed RTT
 plus the repair delay, and a window of rate × hold, which on the stage
 3 path at 5 Gbit/s is several thousand frames and several MB per stripe.
 Whether that memory and latency is worth one flow's order is the open
-question. The writer's placement matters as well: on a worker that also
+question. (November 16: it need not be answered. The writer now skips a
+gap once every lane has passed it, so it never waits for a repair, and a
+repaired frame arrives late exactly as it does on an unstriped flow. The
+hold limit and window only have to cover the skew between lanes.) The
+writer's placement matters as well: on a worker that also
 reads the TAP it saturates first, and the TAP's queue choice varies, so
 a fixed stripe-to-worker map cannot avoid it.
 

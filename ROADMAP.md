@@ -52,8 +52,15 @@ on the lossy single-flow target. The design's 5 ms hold cap and 256-frame
 window cannot keep order through repairs on a 7.5 ms path, and the stripe
 writer saturates on the worker that also reads the TAP. Receive slots
 were halved in size and doubled in number in the same storage, which
-ended reassembly refusals on the lossy point and cut its loss, for about
-1% CPU per bit on the clean full-size point.
+ended reassembly refusals on the lossy point and cut its loss, at a cost
+on the clean full-size point that later sets could not tell from noise.
+
+November 16: striping came good on the single-flow target. The writer
+skips a gap as soon as every lane has passed it, batches its TAP writes
+through an outbox, and writes late repairs instead of dropping them.
+One flow at 7.5 ms with 0.5–1% loss now gets 2.0–2.2 Gbit/s in both
+directions against 0.8–1.2 unstriped, unless its writer lands on the
+worker that reads the TAP.
 
 ## November 13 checkpoint
 
@@ -383,10 +390,22 @@ Decisions only the user can make, each blocking a remaining goal:
    (BENCH.md). The design's own limits also rule the bar out on this
    path: repairs take at least one 7.5 ms round trip, longer than the
    5 ms hold cap, and the 256-frame window covers about 2.5 ms at
-   1.2 Gbit/s, so every loss is delivered out of order. Next, before
-   more measurement: size the hold and window from the path (more than
-   one round trip, over 1,000 frames per stripe here), and trace why
-   striped runs stall in one direction.
+   1.2 Gbit/s, so every loss is delivered out of order.
+
+   November 16: the writer no longer waits for repairs at all. It skips
+   a gap once every lane carrying the stripe has delivered a later
+   sequence, as an unstriped flow in effect does. Three writer faults
+   that the first measurement had hidden were fixed with it: one TAP
+   write per frame with a drop on any failed write (now a batching
+   outbox that waits for a blocked TAP), repaired frames older than the
+   reorder window dropped as repeats (now written as late), and a window
+   too small for the skew between lanes (now 1,024 frames). Striped
+   runs then deliver 2.0–2.2 Gbit/s in both directions against 0.8–1.2
+   unstriped, with the same share of frames reordered, in three of four
+   runs. In the fourth the stripe's writer was also the receiving
+   daemon's TAP reader and saturated. Next: choose the writer away from
+   TAP readers, then measure the full-size and lossy points with the
+   feature on before considering the default.
 8. Decided November 14: `daemon.offload_frames` stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should
@@ -415,8 +434,10 @@ Decisions only the user can make, each blocking a remaining goal:
    refusals fell from thousands per daemon to none, and the worse
    direction lost less in every round
    ([BENCH.md](BENCH.md#twice-the-receive-slots-in-the-same-storage-november-15-landed)).
-   It costs about 1% CPU per delivered bit on the clean full-size point
-   (median of twelve rounds), cause not yet found. Offload frames, which
+   The first twelve rounds on the clean full-size point read about 1%
+   more CPU per delivered bit; later sets did not reproduce it (+0.2%,
+   with an identical copy at +1.4%), so the cost is within that point's
+   noise. Offload frames, which
    take four slots each now, were measured again on the lossy path: they
    still lose a little more than ordinary frames (worst points 1.37–1.55%
    against 1.06–1.69%) and bring back some refusals, so they stay off by

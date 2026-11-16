@@ -700,9 +700,10 @@ complete checksums on the wire.
 
 `daemon.stripe_flows`, off by default, turns on single-flow striping
 (decision 7, design section 13.1). It is experimental: on the lossy
-single-flow target it lifted delivery by about 8% at 0.5% loss, reordered
-ten times more frames, and in some runs collapsed one direction
-(BENCH.md). It advertises the
+single-flow target it about doubles one flow's delivery, to 2.0–2.2
+Gbit/s in both directions, with the same share of frames reordered as
+without it, but a run in which the stripe's writer shares a worker with
+the TAP reader falls short (BENCH.md). It advertises the
 optional `STRIPED_FLOWS` feature; it acts only where both peers advertise
 it, `balance_flows` is on, and the session has at least two data lanes.
 When a flow's transmit worker has kept refusing frames for its lane for
@@ -711,8 +712,10 @@ stripes: each later TAP read of it goes
 to the next data lane in turn, and every frame carries an 8-byte tag with
 its stripe and sequence. Such frames are never sent as offload frames. On
 the receiving side, the workers that reassemble striped frames pass them to
-one writer per stripe, which writes them to the TAP in stripe order,
-holding frames behind a gap for at most 5 ms. `rx_striped_frames`,
+one writer per stripe, which writes them to the TAP in stripe order. It
+holds frames behind a gap only until every lane carrying the stripe has
+delivered a later frame, and for 5 ms at most; a repaired frame then
+arrives late, as on any flow. `rx_striped_frames`,
 `stripe_unordered` and `stripe_drops` count received ones. A stripe ends
 when its flow's table entry goes idle for a second.
 
