@@ -1124,8 +1124,13 @@ of its frames.
   later sequence (November 16: each lane delivers in rising sequence
   apart from repairs, so the frame is then known to be late), until it is
   abandoned or expires on the lane that carries it, or until the oldest
-  held frame has waited the hold limit, min(2 × smoothed RTT, 5 ms); then
-  the window skips the gap. A lane counts among the stripe's lanes until
+  held frame has waited the hold limit, 5 ms; then
+  the window skips the gap. (The limit was to be min(2 × smoothed RTT,
+  5 ms). November 16: it stays fixed. Since the writer stopped waiting for
+  repairs the limit covers lanes that lag each other, and that lag does
+  not shrink with the path: on a 0.5 ms path a 1 ms limit delivered a
+  quarter to a third less and reordered ten times as many frames, and
+  10 ms did no better than 5, BENCH.md.) A lane counts among the stripe's lanes until
   it has been silent for a second, as long as a stripe may idle, so a
   flow that pauses between bursts keeps its lanes; the hold limit covers
   a lane that has stopped. An abandoned

@@ -397,8 +397,12 @@ Decisions only the user can make, each blocking a remaining goal:
    striped frames into a transfer buffer per writer worker, hand full or
    end-of-turn buffers over as one event (or write them locally), the
    writer writes frames to its TAP queue in stripe order, and its hold
-   deadline joins the worker's wait. The hold limit is a fixed 5 ms for
-   now, not yet min(2 × SRTT, 5 ms). The sender inserts tags as well: a
+   deadline joins the worker's wait. The hold limit is a fixed 5 ms and
+   stays so: the planned min(2 × SRTT, 5 ms) was measured on a short
+   path on November 16 and dropped, because the limit covers lag between
+   lanes, which does not follow the path's RTT
+   ([BENCH.md](BENCH.md#the-stripe-writers-hold-on-a-short-path-november-16-exploratory)).
+   The sender inserts tags as well: a
    TAP input carrying a stripe number and next sequence turns each frame
    cut from it into a striped frame whose header starts with the tag, on
    lanes that negotiated the feature, and never into an offload frame.

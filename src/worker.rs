@@ -874,8 +874,10 @@ impl Stripes {
     }
 }
 
-/// How long a writer holds frames behind a gap.
-// shortcut: the design's min(2 × SRTT, 5 ms) needs the receive side's RTT; fixed until then.
+/// How long a writer holds frames behind a gap. It covers lanes that lag
+/// each other, not repairs, so it does not follow the path's RTT: on a
+/// 0.5 ms path 1 ms reordered ten times as many frames and 10 ms did no
+/// better (BENCH.md, November 16).
 const STRIPE_HOLD: Duration = Duration::from_millis(5);
 
 impl Session {

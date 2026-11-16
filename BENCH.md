@@ -1527,6 +1527,33 @@ feedback loop's seven wakes per ACK datagram come from its shape, a
 controller owner apart from the lanes' workers, and a real saving has to
 change that or the number of ACKs.
 
+## The stripe writer's hold on a short path (November 16, exploratory)
+
+The stripe writer skips a gap after 5 ms if nothing else resolves it.
+The design asked for min(2 × smoothed RTT, 5 ms), which on the 7.5 ms
+target is 5 ms as well, so the formula only matters on short paths. Two
+exploratory builds with other fixed limits ran the striped single flow
+(four workers, 5 Gbit/s offered, 0.5% and 1% loss, two alternating
+repeats) on a 0.5 ms path, where the formula gives 1 ms.
+
+| Hold | Gbit/s, 0.5% loss | Reordered, thousands | Gbit/s, 1% loss | Reordered, thousands | Median latency, ms |
+| --- | --- | --- | --- | --- | --- |
+| 5 ms (HEAD) | 2.30–2.48 | 41–53 | 2.01–2.12 | 69–72 | 0.7–3.5 |
+| 1 ms | 1.42–1.72 | 463–711 | 1.47–1.64 | 615–699 | 3.9–6.3 |
+| 5 ms (HEAD, second run) | 2.29–2.33 | 44–46 | 1.80–2.28 | 75–80 | 0.9–3.5 |
+| 10 ms | 2.22–2.38 | 40–45 | 1.64–2.18 | 51–74 | 0.7–4.8 |
+
+([1 ms](benches/short-path-stripe-hold-1ms-exploratory.json),
+[10 ms](benches/short-path-stripe-hold-10ms-exploratory.json).) The
+hypothesis was that the limit rarely binds since the writer stopped
+waiting for repairs, so that 1 ms would change little. It binds often:
+1 ms delivers a quarter to a third less, reorders ten times as many
+frames and adds 2–4 ms to the median. What the limit covers is lanes lagging each other,
+each with its own pacing and backlog, and that lag is several
+milliseconds whatever the path's RTT. Doubling the limit to 10 ms
+changes nothing beyond the spread between runs, so 5 ms sits on the
+plateau. The limit stays a fixed 5 ms and the design drops the formula.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames
