@@ -513,6 +513,15 @@ Decisions only the user can make, each blocking a remaining goal:
    either arm and 14.7% of CPU per bit at stake on clean paths, the
    default is worth the user's second look.
 
+   Later on November 16, on the build with fewer ACKs, offload frames
+   met that bar (no more loss than ordinary frames in two rounds of
+   three) and saved 15.6% on the clean point in five rounds of six. In
+   the sixth, six of one daemon's eight TAP queues refused every
+   offload-frame write (a million `tap_errors`) and 13–14 of 16 flows in
+   that direction delivered nothing. The cause is unknown and comes
+   before any change of default
+   ([BENCH.md](BENCH.md#offload-frames-after-the-ack-change-and-a-round-of-refused-tap-writes-november-16)).
+
 ## November 11 checkpoint
 
 The loopback overload check was window-limited, not CPU-limited. BBR sized

@@ -1554,6 +1554,37 @@ milliseconds whatever the path's RTT. Doubling the limit to 10 ms
 changes nothing beyond the spread between runs, so 5 ms sits on the
 plateau. The limit stays a fixed 5 ms and the design drops the formula.
 
+## Offload frames after the ACK change, and a round of refused TAP writes (November 16)
+
+Decision 8 was measured again on `6fcf89d`, one binary with
+`daemon.offload_frames` off and on. Stated beforehand: on still saves
+about 15% of CPU per delivered bit on the full-size point, and on the
+lossy point loses no more than off in two rounds of three, the bar of
+November 15.
+
+Lossy point ([results](benches/lossy-offload-frames-6fcf89d.json)):
+0.105%, 0.015% and 0.035% of frames lost at each round's worst point
+with offload frames on, against 0.036%, 0.134% and 0.053% off. On loses
+no more in two rounds of three, so that bar is met for the first time.
+
+Full-size point
+([results](benches/full-size-offload-frames-6fcf89d.json)): 43.5–43.8
+CPU% per Gbit/s on against 51.3–52.3 off in five rounds, −15.6% at the
+median. The sixth round failed outright. One direction delivered 0.49
+and 0.74 of 4 Gbit/s at its two points, 14 and then 13 of its 16 flows
+missing entirely, while the other direction and both daemons' loss
+counters looked normal. The receiving daemon counted 1,041,644
+`tap_errors` in 1.23 million TAP writes: six of its eight workers had
+154,000–193,000 writes refused each, and the other two none. No other
+round of this set or of the lossy set counted one.
+
+The cause is not known. The refusals lasted the whole run on those six
+queues and nothing in the daemon's log marks them, which suggests the
+queues' offload state at startup, not the frames. Until it is found
+and fixed, offload frames cannot become the default whatever the
+averages say: a refused write loses the whole frame, and here it took
+most of a direction.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames
