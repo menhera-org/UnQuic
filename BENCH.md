@@ -1490,9 +1490,42 @@ worker asleep on a finished exchange: senders merged 422,000 arriving
 ACKs into ones still waiting, against 17,000, and about a million
 frames expired. The report return has to wake. The two other returns
 are 16% of wakes between them and would need the sleeper to say when it
-is waiting for a box; the Sent notice, 18–19%, is the better target,
-since the controller owner needs it at once only when it arms a lane's
-first probe timeout or restarts from idle.
+is waiting for a box.
+
+The Sent notice, 18–19% of wakes, looked the better target. The
+controller owner needs it at once only when it arms a lane's first probe
+timeout, restarts from idle or learns a new datagram size; otherwise it
+moves a timeout base later. In a candidate
+([patch](benches/quiet-sent-notices.patch)) the owner publishes a bit
+for each lane whose transmissions it has outstanding. A transmit worker
+queues its notice, then reads the bit, and skips the wake while it is
+set; the owner clears the bit before the queue check that precedes its
+sleep, so one of the two always sees the other. A refused push wakes the
+owner whatever the bit says.
+
+Stated beforehand: 1% or more off CPU per delivered bit on the full-size
+point by the usual bar, and no more frames lost on the lossy point.
+[First set](benches/full-size-quiet-sent-notices.json): lower than both
+HEAD and its copy in 4 of 6 rounds, −1.0% against HEAD and −0.6% against
+the copy at the median. With a
+[second](benches/full-size-quiet-sent-notices-second.json): lower than
+both in 6 of 12, −1.3% and −1.0%. The round clause is missed. The lossy
+point ([results](benches/lossy-path-quiet-sent-notices.json)) lost
+0.149%, 0.059% and 0.013% at each round's worst point, against 0.018%,
+0.059% and 0.016% for HEAD and 0.008%, 0.103% and 0.028% for its copy,
+which shows no gain and does not rule out a cost. Rejected. An earlier
+exploratory build that mirrored the owner's count on the transmit worker
+([results](benches/full-size-quiet-sent-exploratory.json)) had measured
+−1.4% and −2.0% in 6 of 6 rounds, in a set where two rounds lost 8–15%
+of their frames on every arm.
+
+The saving is about half of what the wake count promised. The owner
+that is spared a wake for the notice is woken by the same lane's ACK
+report soon after, so much of the cost moves instead of going. Cutting
+wakes one message at a time is not worth more rules in the sender; the
+feedback loop's seven wakes per ACK datagram come from its shape, a
+controller owner apart from the lanes' workers, and a real saving has to
+change that or the number of ACKs.
 
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 

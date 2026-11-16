@@ -1,0 +1,418 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index 2c22772..4176f08 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -1801,9 +1801,31 @@ impl Worker {
+         let Some(outgoing) = self.outgoing[worker].as_mut() else {
+             return Err(event);
+         };
+-        outgoing.try_push(event).map(|()| {
+-            self.notifications |= 1_u64 << worker;
+-        })
++        // A Sent notice for a lane the owner already times only moves that
++        // lane's PTO base later, which the owner can learn on its next turn.
++        let routine = match &event {
++            Event::Sender(sender::Message::Sent(sent)) => sent.routine(),
++            _ => None,
++        };
++        match outgoing.try_push(event) {
++            Ok(()) => {
++                // Read the bit after the push: the owner clears it before the
++                // queue check that precedes its sleep, so one of us sees the other.
++                let quiet = routine.is_some_and(|(session, lane)| {
++                    std::sync::atomic::fence(Ordering::SeqCst);
++                    self.sender.owner_times(session, lane)
++                });
++                if !quiet {
++                    self.notifications |= 1_u64 << worker;
++                }
++                Ok(())
++            }
++            Err(event) => {
++                // Quiet notices may have filled the queue of a sleeping owner.
++                self.notifications |= 1_u64 << worker;
++                Err(event)
++            }
++        }
+     }
+ 
+     fn release(&mut self, mut buffer: Box<Buffer>) {
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 3f1d02e..e1876db 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -92,11 +92,22 @@ pub(crate) struct Sent {
+     count: u32,
+     at: Duration,
+     mtu: u16,
++    // The lane's first notice with this datagram size.
++    resized: bool,
+     cwnd_limited: bool,
+     // Charged from zero inflight: an idle restart.
+     restart: bool,
+ }
+ 
++impl Sent {
++    /// The lane whose armed bit decides whether this notice must wake the
++    /// owner: none when the owner has to act on it at once, as an idle
++    /// restart or a new datagram size requires.
++    pub(super) fn routine(&self) -> Option<(usize, u16)> {
++        (!self.restart && !self.resized).then_some((self.id.session, self.id.lane))
++    }
++}
++
+ #[derive(Clone, Copy)]
+ pub(super) enum ReportKind {
+     Ack {
+@@ -185,6 +196,8 @@ pub(super) struct Lane {
+     pub(super) ack: Option<AckTiming>,
+     pub(super) ack_first: bool,
+     pub(super) report_pending: bool,
++    // Datagram size of the last Sent notice; zero before the first.
++    sent_mtu: u16,
+     // Complete an older scan, if any, then one pass using the admitted ACK.
+     pub(super) loss_passes: u8,
+     pub(super) probes: [Option<(u64, u16)>; 2],
+@@ -211,6 +224,7 @@ impl Lane {
+             ack: None,
+             ack_first: true,
+             report_pending: false,
++            sent_mtu: 0,
+             loss_passes: 0,
+             probes: [None; 2],
+             retire_due: false,
+@@ -305,6 +319,8 @@ pub(super) struct State {
+     pub(super) flight: Flight,
+     pub(super) records: Records,
+     pub(super) budgets: Arc<[Budget]>,
++    // The owner's armed words: lanes it already times (see `timers::armed`).
++    pub(super) armed: Arc<[std::sync::atomic::AtomicU64]>,
+     // When a refused claim may succeed: the pacing time or a window retry.
+     pub(super) retry: Option<Duration>,
+     pub(super) job: Option<Job>,
+@@ -421,6 +437,7 @@ impl State {
+             flight: Flight::default(),
+             records: Records::new(RECORDS)?,
+             budgets: Arc::from(Vec::new()),
++            armed: Arc::from(Vec::new()),
+             retry: None,
+             job: None,
+             abandons: Vec::with_capacity(ABANDONS),
+@@ -455,6 +472,12 @@ impl State {
+             .min()
+     }
+ 
++    /// Whether the owner holds outstanding transmissions, and so a PTO base,
++    /// for this lane.
++    pub(super) fn owner_times(&self, session: usize, lane: u16) -> bool {
++        timers::armed(&self.armed, session, lane)
++    }
++
+     pub(super) fn queue(&mut self, worker: usize, message: Message) -> io::Result<()> {
+         if self.outgoing.len() == self.outgoing.capacity() {
+             return Err(io::Error::other("sender message storage exhausted"));
+@@ -766,8 +789,10 @@ impl Worker {
+             first.shared.config.config().daemon.loss_threshold_permille,
+             first.shared.config.config().daemon.probe_rtt_ack_delay,
+         )?;
++        let armed = owner.armed();
+         for worker in workers.iter_mut() {
+             worker.sender.budgets = Arc::clone(&budgets);
++            worker.sender.armed = Arc::clone(&armed);
+         }
+         workers
+             .first_mut()
+@@ -2050,7 +2075,10 @@ impl Worker {
+         budget.release(claim.bytes.saturating_sub(sent_bytes));
+         if let Some(at) = at {
+             let in_flight = budget.in_flight();
++            let resized =
++                std::mem::replace(&mut self.sender.lanes[index].sent_mtu, job.mtu) != job.mtu;
+             let sent = Sent {
++                resized,
+                 group: claim.group,
+                 id: PacketId {
+                     session: job.session,
+diff --git a/src/worker/sender/owner.rs b/src/worker/sender/owner.rs
+index 2e949f5..83cba33 100644
+--- a/src/worker/sender/owner.rs
++++ b/src/worker/sender/owner.rs
+@@ -188,6 +188,11 @@ impl Owner {
+             .checked_add(2 * size_of::<usize>())
+     }
+ 
++    /// Which lanes this owner already times; see `timers::armed`.
++    pub(super) fn armed(&self) -> Arc<[std::sync::atomic::AtomicU64]> {
++        self.timers.armed()
++    }
++
+     /// Records a worker's successful transmissions for PTO and controller inputs.
+     pub(super) fn sent(&mut self, sent: Sent) -> io::Result<()> {
+         let state = self
+diff --git a/src/worker/sender/owner/tests.rs b/src/worker/sender/owner/tests.rs
+index 4c6c6f5..ba281df 100644
+--- a/src/worker/sender/owner/tests.rs
++++ b/src/worker/sender/owner/tests.rs
+@@ -36,11 +36,53 @@ fn sent(id: PacketId, count: u32, at: Duration) -> Sent {
+         count,
+         at,
+         mtu: 1280,
++        resized: false,
+         cwnd_limited: false,
+         restart: false,
+     }
+ }
+ 
++#[test]
++fn a_sent_notice_is_routine_only_while_the_owner_times_its_lane() {
++    let mut owner = owner(1, 1, &[(0, 1, 0), (0, 2, 0)]);
++    let armed = owner.armed();
++    let timed = |notice: &Sent| {
++        notice
++            .routine()
++            .is_some_and(|(session, lane)| timers::armed(&armed, session, lane))
++    };
++    let notice = sent(lane(1), 2, Duration::ZERO);
++    // Before the owner installs the lane it counts nothing, so every notice wakes it.
++    owner.sent(notice).unwrap();
++    assert!(!timed(&notice));
++    owner.timers.install(0, 1).unwrap();
++    assert!(!timed(&notice));
++    owner.sent(notice).unwrap();
++    assert!(timed(&notice));
++    // Another lane of the session has its own base.
++    assert!(!timed(&sent(lane(2), 1, Duration::ZERO)));
++    // An idle restart and a new datagram size need the owner at once.
++    assert_eq!(
++        Sent {
++            restart: true,
++            ..notice
++        }
++        .routine(),
++        None
++    );
++    assert_eq!(
++        Sent {
++            resized: true,
++            ..notice
++        }
++        .routine(),
++        None
++    );
++    // Once the lane's transmissions settle, its next send arms it again.
++    owner.timers.settled(0, 1, 1, 2).unwrap();
++    assert!(!timed(&notice));
++}
++
+ /// Charges and records count 1280-byte sends as one worker syscall would;
+ /// the window is not under test here.
+ fn send(owner: &Owner, count: u64, at: Duration) -> Vec<SendRecord> {
+diff --git a/src/worker/sender/tests.rs b/src/worker/sender/tests.rs
+index 15e215d..930f37c 100644
+--- a/src/worker/sender/tests.rs
++++ b/src/worker/sender/tests.rs
+@@ -55,6 +55,57 @@ fn workers_with_lanes(lanes: usize) -> ([Worker; 2], ReceiveSocket) {
+     (workers, rx)
+ }
+ 
++#[test]
++fn a_routine_sent_notice_skips_the_wake_only_for_a_lane_the_owner_times() {
++    let (mut workers, _rx) = workers();
++    let notice = Sent {
++        group: 0,
++        id: PacketId {
++            session: 0,
++            generation: 1,
++            lane: 2,
++            number: 0,
++        },
++        count: 1,
++        at: Duration::from_millis(1),
++        mtu: 1280,
++        resized: false,
++        cwnd_limited: false,
++        restart: false,
++    };
++    let [owner, worker] = &mut workers;
++    let push = |worker: &mut Worker, message: Message| {
++        worker.notifications = 0;
++        assert!(worker.push(0, Event::Sender(message)).is_ok());
++        worker.notifications
++    };
++    // The owner has counted nothing for the lane yet, so its PTO needs this notice.
++    assert_eq!(push(worker, Message::Sent(notice)), 1);
++    owner.sender.owner.as_mut().unwrap().sent(notice).unwrap();
++    assert_eq!(push(worker, Message::Sent(notice)), 0);
++    // An idle restart, a new datagram size and every other message still wake.
++    let restart = Sent {
++        restart: true,
++        ..notice
++    };
++    let resized = Sent {
++        resized: true,
++        ..notice
++    };
++    assert_eq!(push(worker, Message::Sent(restart)), 1);
++    assert_eq!(push(worker, Message::Sent(resized)), 1);
++    assert_eq!(push(worker, Message::ProbeReplied { group: 0 }), 1);
++    // Quiet notices can fill a sleeping owner's queue; the refused push wakes it.
++    while worker.push(0, Event::Sender(Message::Sent(notice))).is_ok() {}
++    worker.notifications = 0;
++    assert!(
++        worker
++            .push(0, Event::Sender(Message::Sent(notice)))
++            .is_err()
++    );
++    assert_eq!(worker.notifications, 1);
++}
++
+ fn queue_frame(worker: &mut Worker, length: usize) {
+     let mut frame = worker.free.pop().unwrap();
+     frame.session = 0;
+diff --git a/src/worker/sender/timers.rs b/src/worker/sender/timers.rs
+index 78f0c56..97c090c 100644
+--- a/src/worker/sender/timers.rs
++++ b/src/worker/sender/timers.rs
+@@ -1,6 +1,14 @@
+ //! Exact per-group PTO bases; packet histories remain on their transmit workers.
+ use crate::pacing::PacketId;
+-use std::{io, mem::size_of, time::Duration};
++use std::{
++    io,
++    mem::size_of,
++    sync::{
++        Arc,
++        atomic::{AtomicU64, Ordering},
++    },
++    time::Duration,
++};
+ 
+ const ABSENT: usize = usize::MAX;
+ 
+@@ -30,6 +38,25 @@ pub(super) struct Timers {
+     lanes: Box<[Lane]>,
+     heaps: Box<[Vec<usize>]>,
+     installed: Box<[usize]>,
++    // One word per session, a bit per lane (wire lane minus one) that has
++    // outstanding transmissions here and so already holds a PTO base. A
++    // transmit worker reads it to skip the wake for a further send.
++    armed: Arc<[AtomicU64]>,
++}
++
++/// A lane's bit in its session's armed word; lanes past the word have none.
++fn armed_bit(lane: u16) -> u64 {
++    u32::from(lane)
++        .checked_sub(1)
++        .and_then(|shift| 1_u64.checked_shl(shift))
++        .unwrap_or(0)
++}
++
++/// Whether the owner already times this lane, as a transmit worker sees it.
++pub(in crate::worker) fn armed(words: &[AtomicU64], session: usize, lane: u16) -> bool {
++    words
++        .get(session)
++        .is_some_and(|word| word.load(Ordering::Relaxed) & armed_bit(lane) != 0)
+ }
+ 
+ impl Timers {
+@@ -83,7 +110,13 @@ impl Timers {
+             .try_reserve_exact(groups)
+             .map_err(io::Error::other)?;
+         installed.resize(groups, ABSENT);
++        let mut armed = Vec::new();
++        armed
++            .try_reserve_exact(sessions_count)
++            .map_err(io::Error::other)?;
++        armed.resize_with(sessions_count, || AtomicU64::new(0));
+         Ok(Self {
++            armed: Arc::from(armed),
+             installed: installed.into_boxed_slice(),
+             sessions: sessions.into_boxed_slice(),
+             lanes: lanes.into_boxed_slice(),
+@@ -97,7 +130,7 @@ impl Timers {
+     ) -> Option<usize> {
+         let sessions = layout(groups, descriptors)?;
+         size_of::<Self>()
+-            .checked_add(sessions.checked_mul(size_of::<Session>())?)?
++            .checked_add(sessions.checked_mul(size_of::<Session>() + size_of::<AtomicU64>())?)?
+             .checked_add(
+                 descriptors
+                     .len()
+@@ -245,6 +278,9 @@ impl Timers {
+         self.lanes[index].outstanding = outstanding;
+         self.lanes[index].latest = at;
+         if position == ABSENT {
++            if let Some(word) = self.armed.get(session) {
++                word.fetch_or(armed_bit(lane), Ordering::Relaxed);
++            }
+             let position = self.heaps[group].len();
+             self.heaps[group].push(index);
+             self.lanes[index].position = position;
+@@ -283,6 +319,11 @@ impl Timers {
+             .max())
+     }
+ 
++    /// The published armed words, for transmit workers to read.
++    pub(super) fn armed(&self) -> Arc<[AtomicU64]> {
++        Arc::clone(&self.armed)
++    }
++
+     /// Outstanding eliciting transmissions on one installed lane.
+     pub(super) fn outstanding(&self, session: usize, lane: u16, generation: u64) -> Option<u32> {
+         Some(self.lanes[self.index(session, lane, generation)?].outstanding)
+@@ -313,6 +354,12 @@ impl Timers {
+         if remaining != 0 {
+             return Ok(());
+         }
++        // Cleared before this owner next checks its queues to sleep, so a
++        // sender either reads the cleared bit and wakes it, or has already
++        // queued the notice that check finds.
++        if let Some(word) = self.armed.get(session) {
++            word.fetch_and(!armed_bit(lane), Ordering::Relaxed);
++        }
+         self.heaps[group].swap_remove(position);
+         self.lanes[index].position = ABSENT;
+         if let Some(&moved) = self.heaps[group].get(position) {
+@@ -425,6 +472,34 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn armed_bits_follow_each_lanes_outstanding_transmissions() {
++        let mut timers = Timers::new(2, &[(0, 1, 0), (0, 2, 0), (1, 1, 1)]).unwrap();
++        let words = timers.armed();
++        let seen = || [(0, 1), (0, 2), (1, 1)].map(|(session, lane)| armed(&words, session, lane));
++        timers.install(0, 1).unwrap();
++        timers.install(1, 8).unwrap();
++        assert_eq!(seen(), [false; 3]);
++        timers
++            .submitted(0, 2, 1, 2, Duration::from_millis(10))
++            .unwrap();
++        assert_eq!(seen(), [false, true, false]);
++        timers
++            .submitted(1, 1, 8, 1, Duration::from_millis(10))
++            .unwrap();
++        // A partial settlement keeps the lane's base, and so its bit.
++        timers.settled(0, 2, 1, 1).unwrap();
++        assert_eq!(seen(), [false, true, true]);
++        timers.settled(0, 2, 1, 1).unwrap();
++        assert_eq!(seen(), [false, false, true]);
++        // Lane zero, lanes past the word and unknown sessions read as unarmed.
++        assert!(!armed(&words, 0, 0));
++        assert!(!armed(&words, 0, 65));
++        assert!(!armed(&words, 2, 1));
++        assert_eq!(armed_bit(64), 1 << 63);
++        assert_eq!(armed_bit(65), 0);
++    }
++
+     #[test]
+     fn replacement_and_rejections_preserve_live_counts() {
+         let mut timers = Timers::new(2, &[(0, 1, 0), (0, 2, 0), (1, 1, 1)]).unwrap();
+@@ -631,6 +706,7 @@ mod tests {
+             + timers.lanes.len() * size_of::<Lane>()
+             + timers.heaps.len() * size_of::<Vec<usize>>()
+             + timers.installed.len() * size_of::<usize>()
++            + timers.armed.len() * size_of::<AtomicU64>()
+             + timers
+                 .heaps
+                 .iter()

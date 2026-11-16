@@ -87,9 +87,13 @@ on, cross-worker wakes become the largest item the daemon controls. A
 daemon wakes a sleeping worker once per fifteen frame events; seven
 wakes in ten serve the sender's feedback loop. Letting box returns wake
 nobody was tried and rejected (+4.8%, with loss), because a lane worker
-waits for its one report box. The Sent notice to the controller owner,
-18–19% of wakes, comes next: it is needed at once only when it arms a
-lane's first probe timeout or restarts from idle
+waits for its one report box. Sparing the controller owner a wake for
+each Sent notice (18–19% of wakes) while it already times the lane was
+built and measured: about 1% over twelve rounds, lower than both HEAD
+and its copy in only six, so it was rejected too. Wakes avoided one
+message at a time mostly move to the next message. What is left of this
+item is structural: the feedback loop costs seven wakes per ACK datagram
+because the controller owner is a worker apart from the lanes' workers
 ([BENCH.md](BENCH.md#where-the-wakes-come-from-november-16)).
 
 ## November 13 checkpoint
