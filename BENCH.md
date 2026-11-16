@@ -1349,7 +1349,7 @@ build with it, two repeats each in alternating order
 level: 0.98–0.99 Gbit/s delivered at the light points on both, 3.50–3.89
 before against 3.61–3.92 after at the 2 Gbit/s points, and 4.18–4.60
 against 4.12–4.47 at the overload, inside the spread between repeats.
-The light lossy rows lose less after (0.02% at most against 0.15–0.45%
+The light lossy rows lose less after (0.02% at most against 0.04–0.45%
 at the warm-up point).
 
 What is left on the lossy point looked like second repairs: a frame
