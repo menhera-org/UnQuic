@@ -1427,6 +1427,73 @@ spent about 200. That is the target the budget set for the line. Each
 daemon's busy total is 5,230 and 5,540 cycles per frame event against
 5,400–5,650.
 
+## Where the wakes come from (November 16)
+
+Three profiled rounds of `6fcf89d` asked what the next round of
+per-frame work should aim at
+([phase lists](benches/full-size-profile-saturated-and-offload.txt)).
+
+The cost of a frame event hardly depends on load. Four workers per
+daemon offered 6.4 Gbit/s each way, with the busiest thread at 95–98% of
+a core and 4–10% of frames undelivered, spend 5,160 and 5,360 busy
+cycles per frame event; eight workers at 4 Gbit/s each way spend 5,230
+and 5,540. Notifying other workers falls from 290 cycles per frame
+event to 115–120 near saturation and reading the wake counter from 165
+to 65, while transmit staging and TAP reads rise by about half of that.
+The four per-frame syscalls (UDP send and receive, TAP read and write)
+take 2,250–2,400 of the total at either load. No stage repeats work as
+the backlog grows: a finer split of `flush_frames` put 705–830 of its
+765–950 cycles in building and sending batches at both loads.
+
+With offload frames on, the light point costs 4,360 and 4,670 cycles
+per frame event. Receive admission falls from 470–510 to 280–310 and
+transmit work by about 400, while the TAP write phase stays at 900–970,
+because in this test bed the write carries the frame through the bridge
+and the veth pair in the writer's own syscall. Waking other workers,
+draining the wake counter, polling and arming the wait then take about
+700 cycles per frame event, the largest item the daemon itself
+controls.
+
+So wakes were counted by cause: each push that was the first of its
+turn to a worker whose sleeping flag was set
+([patch](benches/profile-wake-causes-diagnostic.patch),
+[worker lines](benches/full-size-wake-causes.txt)). A daemon makes 1.81–
+1.86 million of them in a run of 27.2 million frame events, one for
+every fifteen. At about 4,400 cycles for the notifying write and 2,500
+for the woken worker's drain, that is some 460 cycles per frame event
+before the woken turn does anything.
+
+| Push that found its target asleep | Thousands, left / right | Share |
+| --- | --- | --- |
+| Report box returned to its lane worker | 345 / 365 | 19–20% |
+| Sent notice to the controller owner | 335 / 353 | 18–19% |
+| ACK report to the controller owner | 310 / 306 | 16–17% |
+| Frame from its reader to the lane's worker | 212 / 218 | 12% |
+| Arriving ACK to the lane's worker | 184 / 186 | 10% |
+| ACK box returned to the receiving worker | 149 / 149 | 8% |
+| Feedback box returned to its receive owner | 140 / 152 | 8% |
+| Feedback to worker 0 for sending | 112 / 110 | 6% |
+| Buffer returned | 20 / 23 | 1% |
+
+Seven wakes in ten serve the sender's feedback loop, about seven for
+each ACK datagram that arrives, and a third of all wakes return a box
+to its pool.
+
+An exploratory build let the three box returns wake nobody
+([patch](benches/quiet-box-returns-exploratory.patch),
+[results](benches/full-size-quiet-box-returns-exploratory.json)). The
+hypothesis was a saving of 2% or more; it cost 4.8% against HEAD at the
+median, lower in none of six rounds, and lost 0.07–1.1% of frames. A
+lane worker has one report box and cannot report its next ACK until the
+controller owner hands that box back, so a silent return leaves the
+worker asleep on a finished exchange: senders merged 422,000 arriving
+ACKs into ones still waiting, against 17,000, and about a million
+frames expired. The report return has to wake. The two other returns
+are 16% of wakes between them and would need the sleeper to say when it
+is waiting for a box; the Sent notice, 18–19%, is the better target,
+since the controller owner needs it at once only when it arms a lane's
+first probe timeout or restarts from idle.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames

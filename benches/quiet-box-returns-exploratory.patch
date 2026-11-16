@@ -1,0 +1,38 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index 2c22772..05b99e1 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -1801,8 +1801,16 @@ impl Worker {
+         let Some(outgoing) = self.outgoing[worker].as_mut() else {
+             return Err(event);
+         };
++        // EXPLORATORY: a box going back to its pool wakes nobody.
++        let quiet = match &event {
++            Event::Sender(sender::Message::AckReturn(_) | sender::Message::ReportReturn(_)) => true,
++            Event::Feedback(feedback) => feedback.is_return(),
++            _ => false,
++        };
+         outgoing.try_push(event).map(|()| {
+-            self.notifications |= 1_u64 << worker;
++            if !quiet {
++                self.notifications |= 1_u64 << worker;
++            }
+         })
+     }
+ 
+diff --git a/src/worker/feedback.rs b/src/worker/feedback.rs
+index cb13b37..f03d214 100644
+--- a/src/worker/feedback.rs
++++ b/src/worker/feedback.rs
+@@ -41,6 +41,11 @@ impl Feedback {
+     fn record_len(&self) -> usize {
+         12 + 16 * self.count
+     }
++
++    /// Whether this box is on its way back to its origin's pool.
++    pub(super) fn is_return(&self) -> bool {
++        self.count == 0
++    }
+ }
+ 
+ /// ACK records one control datagram carries at most: one lane's each.

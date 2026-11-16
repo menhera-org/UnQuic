@@ -1,0 +1,133 @@
+diff --git a/src/profile.rs b/src/profile.rs
+index 5beb9c9..c148a9d 100644
+--- a/src/profile.rs
++++ b/src/profile.rs
+@@ -115,11 +115,11 @@ pub static TURNS: [[std::sync::atomic::AtomicU64; 2]; 64] =
+ thread_local! {
+     /// Diagnostic: per-thread cycle and call counts for spots outside the
+     /// worker loop's phases, by index: see LOCAL_NAMES.
+-    static LOCAL: [std::cell::Cell<u64>; 16] = const { [const { std::cell::Cell::new(0) }; 16] };
++    static LOCAL: [std::cell::Cell<u64>; 32] = const { [const { std::cell::Cell::new(0) }; 32] };
+ }
+ 
+ /// Names of the LOCAL spots, cycles then calls for each.
+-pub const LOCAL_NAMES: [&str; 8] = [
++pub const LOCAL_NAMES: [&str; 28] = [
+     "admit_expire",
+     "admit_scan",
+     "admit_copy",
+@@ -128,6 +128,26 @@ pub const LOCAL_NAMES: [&str; 8] = [
+     "tap_write_calls",
+     "expand",
+     "expand_frames",
++    "ff_hold",
++    "ff_compact",
++    "ff_fill",
++    "ff_batch",
++    "ff_lanes",
++    "ff_batches",
++    "wake_packet",
++    "wake_frame",
++    "wake_free",
++    "wake_stripe",
++    "wake_feedback_return",
++    "wake_feedback",
++    "wake_ack",
++    "wake_other",
++    "pushes",
++    "wake_ack_return",
++    "wake_sent",
++    "wake_report",
++    "wake_report_return",
++    "wake_sender_other",
+ ];
+ 
+ /// Adds `value` to LOCAL spot `index` on this thread.
+diff --git a/src/worker.rs b/src/worker.rs
+index c6ce50e..1adbc81 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -1810,7 +1810,28 @@ impl Worker {
+         let Some(outgoing) = self.outgoing[worker].as_mut() else {
+             return Err(event);
+         };
++        let kind = match &event {
++            Event::Packet(_) => 14,
++            Event::Frame(_) => 15,
++            Event::Free(_) => 16,
++            Event::Stripe(_) => 17,
++            Event::Feedback(feedback) if feedback.count == 0 => 18,
++            Event::Feedback(_) => 19,
++            Event::Sender(sender::Message::Ack(_)) => 20,
++            Event::Sender(sender::Message::AckReturn(_)) => 23,
++            Event::Sender(sender::Message::Sent(_)) => 24,
++            Event::Sender(sender::Message::Report(_)) => 25,
++            Event::Sender(sender::Message::ReportReturn(_)) => 26,
++            Event::Sender(_) => 27,
++            _ => 21,
++        };
++        let first = self.notifications & (1_u64 << worker) == 0
++            && self.shared.wakes[worker].sleeping.load(Ordering::Relaxed);
+         outgoing.try_push(event).map(|()| {
++            crate::profile::local(22, 1);
++            if first {
++                crate::profile::local(kind, 1);
++            }
+             self.notifications |= 1_u64 << worker;
+         })
+     }
+@@ -3907,7 +3928,11 @@ impl Worker {
+             let mut batch = self.sessions[session].batches[lane]
+                 .take()
+                 .ok_or_else(|| io::Error::other("missing transmit batch"))?;
+-            if self.hold_lane(session, lane, &mut batch, now) {
++            let spot = crate::profile::now();
++            let held = self.hold_lane(session, lane, &mut batch, now);
++            crate::profile::local(8, crate::profile::now().wrapping_sub(spot));
++            crate::profile::local(12, 1);
++            if held {
+                 let local = &mut self.sessions[session];
+                 local.batches[lane] = Some(batch);
+                 local.tx_ready &= !(1_u64 << lane);
+@@ -3919,8 +3944,11 @@ impl Worker {
+             }
+             let refill = self.sender_enabled() && self.sender.job.is_none();
+             if refill && !batch.plan.is_empty() {
++                let spot = crate::profile::now();
+                 batch.compact().map_err(io::Error::other)?;
++                crate::profile::local(9, crate::profile::now().wrapping_sub(spot));
+             }
++            let fill_spot = crate::profile::now();
+             if batch.len == 0 {
+                 batch.repair = !batch.repairs.is_empty()
+                     && (batch.pending.is_empty()
+@@ -4005,10 +4033,15 @@ impl Worker {
+                 }
+                 visited += 1;
+             }
++            crate::profile::local(10, crate::profile::now().wrapping_sub(fill_spot));
+             let result = if batch.len == 0 {
+                 Ok(())
+             } else {
+-                self.flush_batch(session, lane, &mut batch, now)
++                let spot = crate::profile::now();
++                let result = self.flush_batch(session, lane, &mut batch, now);
++                crate::profile::local(11, crate::profile::now().wrapping_sub(spot));
++                crate::profile::local(13, 1);
++                result
+             };
+             if batch.len != 0 || !batch.pending.is_empty() || !batch.repairs.is_empty() {
+                 self.ready.push_back((session, lane));
+diff --git a/src/worker/feedback.rs b/src/worker/feedback.rs
+index cb13b37..b9d16d6 100644
+--- a/src/worker/feedback.rs
++++ b/src/worker/feedback.rs
+@@ -11,7 +11,7 @@ pub(crate) struct Feedback {
+     tag: u128,
+     lane: u16,
+     slot: usize,
+-    count: usize,
++    pub(super) count: usize,
+     delay_us: u32,
+     created: Duration,
+     sent: Option<Duration>,
