@@ -1580,7 +1580,9 @@ round of this set or of the lossy set counted one.
 
 The cause is not known. The refusals lasted the whole run on those six
 queues and nothing in the daemon's log marks them, which suggests the
-queues' offload state at startup, not the frames. Until it is found
+queues' offload state at startup, not the frames. The daemon counts a
+refused write without keeping its error code, so the first step is to
+record that code. Until the cause is found
 and fixed, offload frames cannot become the default whatever the
 averages say: a refused write loses the whole frame, and here it took
 most of a direction.
