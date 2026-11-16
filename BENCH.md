@@ -1844,6 +1844,39 @@ morning's builds included, usually with under 1% lost and twice with
 far more; it is not explained. The bar is met and the three land
 together.
 
+## Three trims of receive admission (November 16, landed)
+
+A profile of `0decf64` put each daemon at 4,450 and 4,530 busy cycles
+per frame event, and receive admission with its decoding at about 610 of
+them, the largest block the daemon controls. Three fixed costs per
+datagram went as one candidate.
+
+A lane keeps a window of 65,536 frame sequences. Once a lane has
+carried that many frames, which takes under two seconds at this point's
+rates, every new frame moves the window's lower edge, and admission then
+looked at every held frame to see whether the edge had passed it. Held
+frames are a few sequences old, so none ever had. The lane now keeps a
+sequence at or below every held frame and rescans only when the edge
+passes it, once per window of frames.
+
+A datagram's records were walked a fourth time to dispatch PROBE,
+PROBE_REPLY, ACK and LANE_RETIRE, which a data datagram does not carry.
+Decoding now notes whether any is present, and the walk is skipped
+otherwise.
+
+The lane's counters were refreshed after every datagram and again in the
+TAP flush of the same turn. The first is gone.
+
+Stated beforehand: 2% or more by the usual bar. The trims change no
+timing; the lossy point was run all the same.
+[Results](benches/full-size-receive-trims.json): lower than both HEAD
+and its copy in 6 of 6 rounds, −1.3% against HEAD and −1.5% against the
+copy at the median, with the copy at +0.4% against HEAD. Less than
+guessed, and the bar is met. Lossy point
+([results](benches/lossy-path-receive-trims.json)): 0.005%, 0.049% and
+0.011% lost at each round's worst point against 0.017%, 0.030% and
+0.064% for HEAD and 0.005–0.011% for its copy.
+
 ## ACKs due on a shared tick (November 16, exploratory, rejected)
 
 A lane holds an ACK for 1 ms after its first unacknowledged packet, so

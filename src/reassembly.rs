@@ -318,6 +318,10 @@ pub struct Lane {
     sequences: [u64; FRAME_CAPACITY],
     // One bit per slot starting a frame, so scans visit only occupied slots.
     occupied: u128,
+    // At or below the sequence of every held frame; u64::MAX right after a
+    // scan found none. It only rises when advance_frames rescans, so that
+    // scan runs once per window of frames instead of once per datagram.
+    oldest: u64,
     // One bit per slot in use, including the later slots of long frames.
     reserved: u128,
     // New frames one datagram reserves, with their first slot; kept so no
@@ -351,6 +355,7 @@ impl Lane {
             bytes: vec![0; FRAME_CAPACITY * SLOT_LEN].into_boxed_slice(),
             sequences: [0; FRAME_CAPACITY],
             occupied: 0,
+            oldest: u64::MAX,
             reserved: 0,
             reservations: [Reservation::default(); 64],
             index: [EMPTY; INDEX_LEN],
@@ -504,6 +509,7 @@ impl Lane {
     fn clear_frames(&mut self) {
         self.sequences.fill(0);
         self.occupied = 0;
+        self.oldest = u64::MAX;
         self.reserved = 0;
         self.index.fill(EMPTY);
         self.ready.clear();
@@ -662,6 +668,7 @@ impl Lane {
                             let deadline = frame.deadline;
                             self.sequences[slot] = sequence;
                             self.occupied |= 1 << slot;
+                            self.oldest = self.oldest.min(sequence);
                             self.retained_bytes += total_len as usize;
                             self.insert(slot);
                             self.deadline =
@@ -841,18 +848,25 @@ impl Lane {
     }
 
     fn advance_frames(&mut self, highest: u64) {
-        let old = self.terminal.lower;
         self.terminal.advance(highest);
-        if old != self.terminal.lower {
-            let mut occupied = self.occupied;
-            while occupied != 0 {
-                let slot = occupied.trailing_zeros() as usize;
-                occupied &= occupied - 1;
-                if self.sequences[slot] < self.terminal.lower {
-                    self.release(slot);
-                }
+        // Once a lane has carried a window of frames, every new frame moves
+        // the window. Held frames are a few sequences old, far ahead of its
+        // lower edge, so they need a look only when the edge passes `oldest`.
+        if self.terminal.lower <= self.oldest {
+            return;
+        }
+        let mut oldest = u64::MAX;
+        let mut occupied = self.occupied;
+        while occupied != 0 {
+            let slot = occupied.trailing_zeros() as usize;
+            occupied &= occupied - 1;
+            if self.sequences[slot] < self.terminal.lower {
+                self.release(slot);
+            } else {
+                oldest = oldest.min(self.sequences[slot]);
             }
         }
+        self.oldest = oldest;
     }
 
     fn find(&self, sequence: u64) -> Option<usize> {
@@ -991,6 +1005,66 @@ mod tests {
         assert_eq!(lane.reserved, 0);
         assert_eq!(lane.ready_frames(Duration::ZERO).count(), 0);
     }
+    #[test]
+    fn held_frames_are_rescanned_only_when_the_window_edge_passes_the_oldest() {
+        let mut lane = Lane::new(1, 9022).unwrap();
+        let mut bytes = [0; 256];
+        // Half of a frame, so the lane keeps holding it.
+        let mut half = |lane: &mut Lane, packet: u64, sequence: u64| {
+            let n = crate::wire::encode_datagram(
+                crate::wire::Header {
+                    cookie: crate::UnquicUuid::from_bytes([1; 16]),
+                    receive_tag: 1,
+                    lane: 1,
+                    packet_number: packet,
+                    record_area_len: 0,
+                },
+                &[crate::wire::Record::Data {
+                    frame_id: (1 << 48) | sequence,
+                    total_len: 60,
+                    offset: 0,
+                    bytes: &[7; 30],
+                    offload: false,
+                    partial: false,
+                    striped: false,
+                }],
+                &mut bytes,
+            )
+            .unwrap();
+            lane.admit(
+                &crate::wire::Datagram::decode(&bytes[..n]).unwrap(),
+                Duration::ZERO,
+            )
+        };
+        let window = WINDOW_LEN as u64;
+        assert_eq!(lane.oldest, u64::MAX);
+        assert_eq!(half(&mut lane, 1, 5), Admission::Fresh);
+        assert_eq!(half(&mut lane, 2, 9), Admission::Fresh);
+        assert_eq!(lane.oldest, 5);
+        // The window's edge reaches the oldest frame without passing it:
+        // nothing is released and nothing rescanned.
+        assert_eq!(half(&mut lane, 3, window + 4), Admission::Fresh);
+        assert_eq!(lane.terminal.lower, 5);
+        assert_eq!((lane.retained_frames(), lane.oldest), (3, 5));
+        // One further and frame 5 is behind the window: it goes, and the
+        // scan leaves the oldest of the rest.
+        assert_eq!(half(&mut lane, 4, window + 5), Admission::Fresh);
+        assert_eq!(lane.terminal.lower, 6);
+        assert!(lane.find(5).is_none());
+        assert_eq!((lane.retained_frames(), lane.oldest), (3, 9));
+        // A frame finishing does not raise the mark; the next pass of the
+        // edge finds the truth.
+        let slot = lane.find(9).unwrap();
+        lane.release(slot);
+        assert_eq!(lane.oldest, 9);
+        assert_eq!(half(&mut lane, 5, window + 9), Admission::Fresh);
+        assert_eq!(lane.oldest, window + 4);
+        assert_eq!(lane.retained_frames(), 3);
+        // Abandoning everything held leaves the mark for the next scan to clear.
+        lane.retire();
+        assert_eq!(lane.oldest, u64::MAX);
+    }
+
     #[test]
     fn ordinary_batches_stop_before_an_offload_frame() {
         let mut lane = Lane::new(1, 9022).unwrap();

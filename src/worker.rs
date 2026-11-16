@@ -2605,6 +2605,9 @@ impl Worker {
             }
         }
         match admission {
+            // Admission dealt with DATA and FRAME_ABANDON; most datagrams
+            // carry nothing else.
+            Admission::Fresh if !datagram.controls() => {}
             Admission::Fresh => {
                 for record in datagram.records() {
                     match record {
@@ -2723,7 +2726,7 @@ impl Worker {
         {
             self.flush_rx(session, slot, now);
         }
-        self.refresh_rx_counters(session, slot);
+        // The lane's counters are refreshed once a turn, in the TAP flush.
         Ok(Some(buffer))
     }
 

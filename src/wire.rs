@@ -580,6 +580,8 @@ pub struct Datagram<'a> {
     header: Header,
     area: &'a [u8],
     pub(crate) record_count: usize,
+    // Whether any record is a PROBE, PROBE_REPLY, ACK or LANE_RETIRE.
+    controls: bool,
 }
 
 impl<'a> Datagram<'a> {
@@ -589,12 +591,20 @@ impl<'a> Datagram<'a> {
         let area = input.get(HEADER_LEN..).ok_or(WireError::Length)?;
         let mut remaining = area;
         let mut count = 0;
+        let mut controls = false;
         while !remaining.is_empty() {
             count += 1;
             if count > MAX_RECORDS {
                 return Err(WireError::RecordCount);
             }
             let (record, length) = decode_record(remaining)?;
+            controls |= matches!(
+                record,
+                Record::Probe
+                    | Record::ProbeReply { .. }
+                    | Record::Ack { .. }
+                    | Record::LaneRetire { .. }
+            );
             // A handshake must consume the entire area on its first record.
             let context_count = if length == area.len() { 1 } else { 2 };
             record.validate_context(header, context_count)?;
@@ -607,7 +617,15 @@ impl<'a> Datagram<'a> {
             header,
             area,
             record_count: count,
+            controls,
         })
+    }
+
+    /// Whether a record asks for more than receive admission does with DATA
+    /// and FRAME_ABANDON: a PROBE, PROBE_REPLY, ACK or LANE_RETIRE. A
+    /// datagram without one needs no second walk of its records.
+    pub const fn controls(self) -> bool {
+        self.controls
     }
 
     /// Returns the validated header.

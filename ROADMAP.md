@@ -140,6 +140,14 @@ header-byte check that spares coalesced TAP writes a hash and a parse
 per frame): 2.0–2.4% in 6 of 6 rounds as one candidate, where none of
 them alone could clear the bar on this host
 ([BENCH.md](BENCH.md#three-changes-of-about-one-percent-november-16-landed-together)).
+Receive admission was then the largest block left in the daemon's own
+code, and three fixed costs per datagram came off it: a rescan of every
+held frame each time the 65,536-frame window moved, which after two
+seconds is every datagram; a fourth walk of the records to dispatch
+control records that data datagrams do not carry; and a counter refresh
+repeated in the same turn. Together 1.3–1.5% in 6 of 6 rounds
+([BENCH.md](BENCH.md#three-trims-of-receive-admission-november-16-landed)).
+
 One open oddity turned up beside them: about one run in eighty, on the
 morning's builds as on the evening's, stalls one direction for 200 ms
 or more with nothing wrong in the other, and twice it lost over a tenth

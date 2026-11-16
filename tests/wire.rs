@@ -357,6 +357,23 @@ fn record_count_bounds_and_mixed_established_packets() {
         Datagram::decode(&buffer[..n]).unwrap().records().count(),
         records.len()
     );
+    // Only PROBE, PROBE_REPLY, ACK and LANE_RETIRE ask for a second walk of
+    // an established datagram's records, wherever they sit among the others.
+    for kind in [0, 1, 2, 5, 6, 7, 10] {
+        let controls = matches!(kind, 2 | 5 | 6 | 10);
+        for records in [
+            &[record(kind)][..],
+            &[record(1), record(kind), record(0)],
+            &[record(7), record(1), record(kind)],
+        ] {
+            let n = encode_datagram(header(false), records, &mut buffer).unwrap();
+            assert_eq!(
+                Datagram::decode(&buffer[..n]).unwrap().controls(),
+                controls,
+                "kind {kind}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -340,8 +340,9 @@ pass, since a pass could act on nothing; its report then comes back without
 waking a sleeping worker. A returned report, ACK or feedback box wakes its
 owner only when the owner sleeps with work held behind one; a lane whose
 feedback box is away keeps a timer on its next ACK instead. A notice of sent
-packets wakes the controller owner only when it arms a lane's first probe
-timeout, restarts from idle or changes the datagram size.
+packets wakes the controller owner only when no lane of its session is being
+timed, when it restarts from idle or when it changes the datagram size. A
+worker that hands work to another does not take a further turn for it.
 
 ACK, handshake and PROBE_REPLY sends share a 4 MiB/s outer-byte ceiling per
 path group, with a burst of sixteen datagrams. Worker zero owns each fixed
