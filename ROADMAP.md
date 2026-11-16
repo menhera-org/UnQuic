@@ -518,10 +518,13 @@ Decisions only the user can make, each blocking a remaining goal:
    three) and saved 15.6% on the clean point in five rounds of six. In
    the sixth, six of one daemon's eight TAP queues refused every
    offload-frame write (a million `tap_errors`) and 13–14 of 16 flows in
-   that direction delivered nothing. The logs fit a TAP that came up
-   with one attached queue, which would be a startup fault and not
-   specific to offload frames, but that is unconfirmed. Finding the
-   cause comes before any change of default
+   that direction delivered nothing. That TAP had come up with one
+   attached queue instead of eight (its qdisc dump shows one), so this
+   is a startup fault that ordinary frames would have hit too, not an
+   offload-frame fault. Why the other queues were not attached is
+   unknown; the daemon should check the queue count after creating its
+   TAP and keep the error code of a refused write. Finding the cause
+   comes before any change of default
    ([BENCH.md](BENCH.md#offload-frames-after-the-ack-change-and-a-round-of-refused-tap-writes-november-16)).
 
 ## November 11 checkpoint

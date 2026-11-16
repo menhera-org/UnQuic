@@ -1586,13 +1586,16 @@ worker 0's was the only queue whose writes succeeded; the device
 counted exactly those 192,878 writes as received and no errors or
 drops. That is what a TAP with one attached queue looks like: the
 kernel steers every flow to queue 0 and refuses writes on a detached
-queue's descriptor before they reach the device. If so, the fault is in
-how the queues come up, the other six were detached from the start, and
-ordinary frames would have been lost the same way; offload frames only
-happened to be on. This is a hypothesis, not a finding. The daemon
-counts a refused write without keeping its error code, so the first
-step is to record that code and the device's queue count at startup.
-Until the cause is found
+queue's descriptor before they reach the device. The run's saved qdisc
+dumps confirm it: that TAP shows one child qdisc under `mq`, before the
+point and after it, where the peer's TAP and every healthy run show
+eight. So the device came up with a single queue, the other workers
+held descriptors that were not attached to it, and ordinary frames
+would have been lost the same way; offload frames only happened to be
+on. Why seven queues failed to attach, or were detached, is not known.
+The daemon counts a refused write without keeping its error code and
+does not check the device's queue count after creating it, so those are
+the first two things to add. Until the cause is found
 and fixed, offload frames cannot become the default whatever the
 averages say: a refused write loses the whole frame, and here it took
 most of a direction.
