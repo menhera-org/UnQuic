@@ -41,6 +41,12 @@ impl Feedback {
     fn record_len(&self) -> usize {
         12 + 16 * self.count
     }
+
+    /// Whether this box is on its way back to its origin's pool, its ACK sent
+    /// or dropped.
+    pub(super) fn is_return(&self) -> bool {
+        self.count == 0
+    }
 }
 
 /// ACK records one control datagram carries at most: one lane's each.
@@ -57,6 +63,17 @@ pub(super) enum Pending {
         due: Duration,
     },
     Ack(Box<Feedback>),
+}
+
+/// See [`Worker::ack_wait`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AckWait {
+    /// No ACK is pending.
+    Idle,
+    /// Wake at this time.
+    Timer(Duration),
+    /// The ACK is due and waits for a feedback box to come back.
+    Return,
 }
 
 impl Worker {
@@ -115,6 +132,48 @@ impl Worker {
             return Err(io::Error::other("feedback delivered to the wrong owner"));
         }
         Ok(())
+    }
+
+    /// What the pending ACK of the lane in `slot` asks of this worker's sleep.
+    ///
+    /// With a feedback box at hand the ACK goes out at its deadline. A lane
+    /// whose box is with worker 0, or that finds the pool empty, keeps that
+    /// timer while the deadline lies ahead, by when a box is normally back
+    /// in a queue. Once the ACK is due only a returned box can help: a timer
+    /// would spin, so the return has to wake the worker.
+    pub(super) fn ack_wait(&self, session: &super::Session, slot: usize, now: Duration) -> AckWait {
+        let bit = 1_u64 << slot;
+        let Some(due) = session
+            .rx
+            .get(slot)
+            .and_then(Option::as_ref)
+            .filter(|_| session.returning & bit == 0)
+            .and_then(|lane| lane.ack_deadline())
+        else {
+            return AckWait::Idle;
+        };
+        let due = due.max(self.feedback_retry);
+        if (!self.feedback_free.is_empty() && session.ack_inflight & bit == 0) || due > now {
+            AckWait::Timer(due)
+        } else {
+            AckWait::Return
+        }
+    }
+
+    /// Whether an ACK is due on a lane that cannot send it for want of a
+    /// feedback box, so that a box's return must wake this worker.
+    pub(super) fn feedback_wanted(&self, now: Duration) -> bool {
+        self.sessions.iter().any(|session| {
+            let mut occupied = session.rx_occupied;
+            while occupied != 0 {
+                let slot = occupied.trailing_zeros() as usize;
+                occupied &= occupied - 1;
+                if self.ack_wait(session, slot, now) == AckWait::Return {
+                    return true;
+                }
+            }
+            false
+        })
     }
 
     pub(super) fn collect_acks(&mut self, now: Duration) -> io::Result<()> {
@@ -685,6 +744,75 @@ mod tests {
         assert!(worker.pending_control.is_empty());
         assert_eq!(worker.feedback_free.len(), BUFFERS);
         assert_eq!(worker.control_replies, 0);
+    }
+
+    #[test]
+    fn a_returning_feedback_box_is_pushed_without_the_ordinary_notification() {
+        let (_shared, mut workers) = test_workers();
+        let (tx, rx) = crate::spsc::channel();
+        workers[1].outgoing[0] = Some(tx);
+        workers[0].incoming[1] = Some(rx);
+        let worker = &mut workers[1];
+        // An ACK on its way to worker 0 is work for it.
+        let mut feedback = worker.feedback_free.pop().unwrap();
+        feedback.count = 1;
+        assert!(worker.push(0, Event::Feedback(feedback)).is_ok());
+        assert_eq!((worker.notifications, worker.return_notifications), (1, 0));
+        // An emptied box going home is not.
+        worker.notifications = 0;
+        let feedback = worker.feedback_free.pop().unwrap();
+        assert!(feedback.is_return());
+        assert!(worker.push(0, Event::Feedback(feedback)).is_ok());
+        assert_eq!((worker.notifications, worker.return_notifications), (0, 1));
+    }
+
+    #[test]
+    fn a_pending_ack_keeps_its_timer_until_due_and_then_wants_its_box_back() {
+        let (mut worker, _tap) = receive_worker();
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        let wait = |worker: &Worker, now| worker.ack_wait(&worker.sessions[0], 0, now);
+        // Nothing received: nothing pending.
+        assert_eq!(wait(&worker, Duration::ZERO), AckWait::Idle);
+        assert!(!worker.feedback_wanted(Duration::MAX));
+        let length = receive_bytes(1, &[receive_piece(1, 0, &[1; 60])], &mut bytes);
+        let datagram = Datagram::decode(&bytes[..length]).unwrap();
+        let lane = worker.sessions[0].rx[0].as_mut().unwrap();
+        assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Fresh);
+        let due = crate::ack::DELAY;
+        let late = due + Duration::from_micros(1);
+        // A box at hand: the ACK's deadline is a timer, before and after it.
+        for now in [Duration::ZERO, due, late] {
+            assert_eq!(wait(&worker, now), AckWait::Timer(due));
+            assert!(!worker.feedback_wanted(now));
+        }
+        // The lane's box is with worker 0, or the pool is empty: the timer
+        // holds until the ACK is due, and from then the return must wake.
+        let pool = std::mem::take(&mut worker.feedback_free);
+        for inflight in [0, 1] {
+            worker.sessions[0].ack_inflight = inflight;
+            assert_eq!(wait(&worker, Duration::ZERO), AckWait::Timer(due));
+            assert!(!worker.feedback_wanted(Duration::ZERO));
+            for now in [due, late] {
+                assert_eq!(wait(&worker, now), AckWait::Return);
+                assert!(worker.feedback_wanted(now));
+            }
+        }
+        worker.feedback_free = pool;
+        worker.sessions[0].ack_inflight = 1;
+        assert_eq!(wait(&worker, late), AckWait::Return);
+        // A retry time after a full handoff queue postpones both.
+        worker.feedback_retry = late;
+        assert_eq!(wait(&worker, due), AckWait::Timer(late));
+        assert_eq!(wait(&worker, late), AckWait::Return);
+        // A lane on its way back to its owner sends no more ACKs from here.
+        worker.sessions[0].returning = 1;
+        assert_eq!(wait(&worker, late), AckWait::Idle);
+        assert!(!worker.feedback_wanted(late));
+        // An empty slot has no lane to ask.
+        assert_eq!(
+            worker.ack_wait(&worker.sessions[0], LANES - 1, late),
+            AckWait::Idle
+        );
     }
 
     #[test]

@@ -1516,7 +1516,10 @@ both in 6 of 12, −1.3% and −1.0%. The round clause is missed. The lossy
 point ([results](benches/lossy-path-quiet-sent-notices.json)) lost
 0.149%, 0.059% and 0.013% at each round's worst point, against 0.018%,
 0.059% and 0.016% for HEAD and 0.008%, 0.103% and 0.028% for its copy,
-which shows no gain and does not rule out a cost. Rejected. An earlier
+which shows no gain and does not rule out a cost. Rejected then; it
+landed later the same day together with quiet feedback returns, where
+the two measured far more than either alone (see "Feedback returns and
+Sent notices that wake nobody"). An earlier
 exploratory build that mirrored the owner's count on the transmit worker
 ([results](benches/full-size-quiet-sent-exploratory.json)) had measured
 −1.4% and −2.0% in 6 of 6 rounds, in a set where two rounds lost 8–15%
@@ -1524,11 +1527,11 @@ of their frames on every arm.
 
 The saving is about half of what the wake count promised. The owner
 that is spared a wake for the notice is woken by the same lane's ACK
-report soon after, so much of the cost moves instead of going. Cutting
-wakes one message at a time is not worth more rules in the sender; the
-feedback loop's seven wakes per ACK datagram come from its shape, a
-controller owner apart from the lanes' workers, and a real saving has to
-change that or the number of ACKs.
+report soon after, so much of the cost moves instead of going. The
+conclusion drawn here at first, that cutting wakes one message at a
+time is not worth more rules in the sender, was wrong in one respect:
+the cost only goes once every needless wake of a worker is gone, so the
+changes have to be judged together.
 
 ## The stripe writer's hold on a short path (November 16, exploratory)
 
@@ -1683,6 +1686,49 @@ against 0.066% and 0.149% for HEAD and 0.009%, 0.031% and 0.005% for
 its copy. HEAD's first lossy round is missing: both receivers died
 before the run, a fault of the benchmark script that has not been
 traced. The bar is met.
+
+## Feedback returns and Sent notices that wake nobody (November 16, landed together)
+
+Two wake causes were left that a worker can often do without. A
+feedback box coming home from worker 0 (8% of wakes before the change
+above) woke its receive owner although the lane's next ACK is not due
+for up to a millisecond. And a Sent notice (18–19%) woke the controller
+owner although it only moves a lane's timeout base; that candidate was
+rejected in the morning at about 1%.
+
+For feedback boxes the receive owner now keeps a timer on a lane's ACK
+deadline while the lane's box is away, where it used to set none and
+rely on the return, and asks for a wake on return only once the ACK is
+due. The box itself comes back without the ordinary notification.
+Stated beforehand: about 1% by the usual bar, and no more loss on the
+lossy point. [First set](benches/full-size-quiet-feedback-returns.json):
+lower than both HEAD and its copy in 4 of 6 rounds, −1.3% against each
+at the median. With a
+[second](benches/full-size-quiet-feedback-returns-second.json): 7 of
+12, −1.1% against HEAD and −0.9% against the copy. Lossy point, six
+rounds ([first](benches/lossy-path-quiet-feedback-returns.json),
+[second](benches/lossy-path-quiet-feedback-returns-second.json)):
+0.010–0.206% lost at each round's worst point against 0.005–0.297% for
+HEAD and 0.005–0.878% for its copy. Alone it misses the round clause,
+exactly as the Sent notices did: each is worth about 1%, which twelve
+rounds on this host cannot confirm.
+
+The two are independent, so they were measured as one candidate, with
+the morning's Sent patch applied on top. Stated beforehand: 1.5% or
+more by the usual bar, and no more loss on the lossy point.
+[Results](benches/full-size-quiet-sent-and-feedback-returns.json):
+lower than both HEAD and its copy in 6 of 6 rounds, −4.1% against HEAD
+and −3.7% against the copy at the median, with the copy at −0.5%
+against HEAD. That is more than the two parts add up to. A worker
+spared one of its wakes was still woken by the other a moment later, so
+each part alone mostly moved its cost; with both gone the worker stays
+asleep. Median latency and its 99th percentile on that point are
+unchanged (307–327 µs and 1.0–2.3 ms against 307–327 µs and 1.1–1.9
+ms). Lossy point
+([results](benches/lossy-path-quiet-sent-and-feedback-returns.json)):
+0.021%, 0.011% and 0.077% lost at each round's worst point, against
+0.171%, 0.101% and 0.006% for HEAD and 0.030%, 0.006% and 0.180% for
+its copy. The bar is met and both land.
 
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 

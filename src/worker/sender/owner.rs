@@ -188,6 +188,11 @@ impl Owner {
             .checked_add(2 * size_of::<usize>())
     }
 
+    /// Which lanes this owner already times; see `timers::armed`.
+    pub(super) fn armed(&self) -> Arc<[std::sync::atomic::AtomicU64]> {
+        self.timers.armed()
+    }
+
     /// Records a worker's successful transmissions for PTO and controller inputs.
     pub(super) fn sent(&mut self, sent: Sent) -> io::Result<()> {
         let state = self

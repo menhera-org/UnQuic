@@ -857,8 +857,14 @@ the total to 4,360–4,670 here. Near saturation with four workers the
 total is 5,160–5,360, so load does not thin these costs out by itself.
 Wakes are the largest row the daemon controls. Two attempts to remove
 them one message at a time missed their bars, one costing 4.8% and the
-other gaining about 1% (BENCH.md); what remains follows from keeping the
-controller owner on a worker apart from the lanes' workers.
+other gaining about 1% (BENCH.md). Later the same day they went
+together: a third of all wakes returned a box to its pool and a fifth
+told the controller owner of a send it already timed, and a worker now
+gets neither unless it sleeps waiting for exactly that. With the pass an
+ACK cannot need skipped as well, and per-turn visits to empty receive
+slots gone, CPU per delivered bit on this point fell by about 9% over
+the afternoon. The table above predates that and awaits a new profile.
+The wakes left are work for their target.
 
 **Memory bandwidth.** Each payload byte is copied five times by the CPU
 across the two boxes: the sender's TAP read and UDP send, then the

@@ -90,11 +90,10 @@ nobody was tried and rejected (+4.8%, with loss), because a lane worker
 waits for its one report box. Sparing the controller owner a wake for
 each Sent notice (18–19% of wakes) while it already times the lane was
 built and measured: about 1% over twelve rounds, lower than both HEAD
-and its copy in only six, so it was rejected too. Wakes avoided one
-message at a time mostly move to the next message. What is left of this
-item is structural: the feedback loop costs seven wakes per ACK datagram
-because the controller owner is a worker apart from the lanes' workers
-([BENCH.md](BENCH.md#where-the-wakes-come-from-november-16)).
+and its copy in only six, so it was rejected at first. Wakes avoided
+one message at a time mostly move to the next message
+([BENCH.md](BENCH.md#where-the-wakes-come-from-november-16)); the
+afternoon's work, below, removed them together.
 
 A split of the TAP write phase then found 118 cycles per frame event in
 per-turn visits to all 64 receive slots. Walking only the occupied ones
@@ -111,8 +110,15 @@ made, a sleeping worker says whether it waits for a box, and a returned
 report or ACK box wakes it only then: 3.0–3.1% off CPU per delivered
 bit, with the lossy point unchanged
 ([BENCH.md](BENCH.md#box-returns-that-wake-only-a-waiting-owner-november-16-landed)).
-Feedback boxes, 8% of wakes, still wake on return; doing the same for
-them needs the lane's ACK deadline armed while its box is out.
+Feedback boxes followed, with the lane's ACK deadline armed while its
+box is away, and with them the Sent notices rejected in the morning.
+Each alone measured about 1% and missed the bar's round clause; as one
+candidate they were lower than both HEAD and its copy in 6 of 6 rounds,
+by 3.7–4.1%, because a worker spared one needless wake was still woken
+by the other
+([BENCH.md](BENCH.md#feedback-returns-and-sent-notices-that-wake-nobody-november-16-landed-together)).
+The wakes left are work for their target: frames to send, ACKs to
+apply, reports for the controller and ACKs for worker 0 to send.
 
 Next targets in the daemon's own code, by cycles per frame event in
 that profile: output coalescing around the TAP write (about 320, the

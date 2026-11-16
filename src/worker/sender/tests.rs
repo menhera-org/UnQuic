@@ -97,6 +97,57 @@ fn returned_boxes_are_pushed_without_the_ordinary_notification() {
     assert_eq!(worker.notifications, 1);
 }
 
+#[test]
+fn a_routine_sent_notice_skips_the_wake_only_for_a_lane_the_owner_times() {
+    let (mut workers, _rx) = workers();
+    let notice = Sent {
+        group: 0,
+        id: PacketId {
+            session: 0,
+            generation: 1,
+            lane: 2,
+            number: 0,
+        },
+        count: 1,
+        at: Duration::from_millis(1),
+        mtu: 1280,
+        resized: false,
+        cwnd_limited: false,
+        restart: false,
+    };
+    let [owner, worker] = &mut workers;
+    let push = |worker: &mut Worker, message: Message| {
+        worker.notifications = 0;
+        assert!(worker.push(0, Event::Sender(message)).is_ok());
+        worker.notifications
+    };
+    // The owner has counted nothing for the lane yet, so its PTO needs this notice.
+    assert_eq!(push(worker, Message::Sent(notice)), 1);
+    owner.sender.owner.as_mut().unwrap().sent(notice).unwrap();
+    assert_eq!(push(worker, Message::Sent(notice)), 0);
+    // An idle restart, a new datagram size and every other message still wake.
+    let restart = Sent {
+        restart: true,
+        ..notice
+    };
+    let resized = Sent {
+        resized: true,
+        ..notice
+    };
+    assert_eq!(push(worker, Message::Sent(restart)), 1);
+    assert_eq!(push(worker, Message::Sent(resized)), 1);
+    assert_eq!(push(worker, Message::ProbeReplied { group: 0 }), 1);
+    // Quiet notices can fill a sleeping owner's queue; the refused push wakes it.
+    while worker.push(0, Event::Sender(Message::Sent(notice))).is_ok() {}
+    worker.notifications = 0;
+    assert!(
+        worker
+            .push(0, Event::Sender(Message::Sent(notice)))
+            .is_err()
+    );
+    assert_eq!(worker.notifications, 1);
+}
+
 fn queue_frame(worker: &mut Worker, length: usize) {
     let mut frame = worker.free.pop().unwrap();
     frame.session = 0;
@@ -2349,10 +2400,10 @@ fn an_ack_owes_a_loss_pass_only_for_packets_left_below_it() {
         assert_eq!(worker.sender.lanes[index].loss_passes, u8::from(hole));
         assert_eq!(worker.sender.loss_fences, usize::from(hole));
         assert_eq!(worker.sender.lanes[index].waits_for_report(), hole);
-        assert_eq!(worker.wants_returns(), hole);
+        assert_eq!(worker.wants_returns(now), hole);
         // An empty ACK pool wants its boxes back whatever the report's state.
         let pool = std::mem::take(&mut worker.sender.ack_free);
-        assert!(worker.wants_returns());
+        assert!(worker.wants_returns(now));
         worker.sender.ack_free = pool;
         worker
             .sender_message(Message::ReportReturn(report), now)

@@ -1652,7 +1652,7 @@ impl Worker {
                     self.phases[21].wrapping_add(crate::profile::now().wrapping_sub(arming));
             }
             if block {
-                self.reactor.wake.sleep(self.wants_returns());
+                self.reactor.wake.sleep(self.wants_returns(now));
                 // Work queued before the flag was visible got no wake; take it now.
                 block = self.incoming.iter_mut().flatten().all(Consumer::is_empty);
             }
@@ -1826,17 +1826,32 @@ impl Worker {
         };
         // A box going back to its pool wakes its owner only if the owner
         // sleeps waiting for one.
-        let returned = matches!(
-            &event,
-            Event::Sender(sender::Message::ReportReturn(_) | sender::Message::AckReturn(_))
-        );
+        let returned = match &event {
+            Event::Sender(sender::Message::ReportReturn(_) | sender::Message::AckReturn(_)) => true,
+            Event::Feedback(feedback) => feedback.is_return(),
+            _ => false,
+        };
+        // A Sent notice for a lane the owner already times only moves that
+        // lane's PTO base later, which the owner can learn on its next turn.
+        let routine = match &event {
+            Event::Sender(sender::Message::Sent(sent)) => sent.routine(),
+            _ => None,
+        };
         match outgoing.try_push(event) {
             Ok(()) if returned => {
                 self.return_notifications |= 1_u64 << worker;
                 Ok(())
             }
             Ok(()) => {
-                self.notifications |= 1_u64 << worker;
+                // Read the bit after the push: the owner clears it before the
+                // queue check that precedes its sleep, so one of us sees the other.
+                let quiet = routine.is_some_and(|(session, lane)| {
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    self.sender.owner_times(session, lane)
+                });
+                if !quiet {
+                    self.notifications |= 1_u64 << worker;
+                }
                 Ok(())
             }
             Err(event) => {
@@ -5854,12 +5869,8 @@ impl Worker {
                 let Some(lane) = session.rx[slot].as_ref() else {
                     continue;
                 };
-                if !self.feedback_free.is_empty()
-                    && session.ack_inflight & (1 << slot) == 0
-                    && session.returning & (1 << slot) == 0
-                    && let Some(deadline) = lane.ack_deadline()
-                {
-                    due = due.min(deadline.max(self.feedback_retry));
+                if let feedback::AckWait::Timer(deadline) = self.ack_wait(session, slot, now) {
+                    due = due.min(deadline);
                 }
                 if let Some(deadline) = lane.deadline() {
                     due = due.min(deadline);

@@ -92,9 +92,20 @@ pub(crate) struct Sent {
     count: u32,
     at: Duration,
     mtu: u16,
+    // The lane's first notice with this datagram size.
+    resized: bool,
     cwnd_limited: bool,
     // Charged from zero inflight: an idle restart.
     restart: bool,
+}
+
+impl Sent {
+    /// The lane whose armed bit decides whether this notice must wake the
+    /// owner: none when the owner has to act on it at once, as an idle
+    /// restart or a new datagram size requires.
+    pub(super) fn routine(&self) -> Option<(usize, u16)> {
+        (!self.restart && !self.resized).then_some((self.id.session, self.id.lane))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -187,6 +198,8 @@ pub(super) struct Lane {
     // The report in flight carries the end of this lane's ACK.
     pub(super) ack_ending: bool,
     pub(super) report_pending: bool,
+    // Datagram size of the last Sent notice; zero before the first.
+    sent_mtu: u16,
     // Complete an older scan, if any, then one pass using the admitted ACK.
     pub(super) loss_passes: u8,
     pub(super) probes: [Option<(u64, u16)>; 2],
@@ -214,6 +227,7 @@ impl Lane {
             ack_first: true,
             ack_ending: false,
             report_pending: false,
+            sent_mtu: 0,
             loss_passes: 0,
             probes: [None; 2],
             retire_due: false,
@@ -308,6 +322,8 @@ pub(super) struct State {
     pub(super) flight: Flight,
     pub(super) records: Records,
     pub(super) budgets: Arc<[Budget]>,
+    // The owner's armed words: lanes it already times (see `timers::armed`).
+    pub(super) armed: Arc<[std::sync::atomic::AtomicU64]>,
     // When a refused claim may succeed: the pacing time or a window retry.
     pub(super) retry: Option<Duration>,
     pub(super) job: Option<Job>,
@@ -424,6 +440,7 @@ impl State {
             flight: Flight::default(),
             records: Records::new(RECORDS)?,
             budgets: Arc::from(Vec::new()),
+            armed: Arc::from(Vec::new()),
             retry: None,
             job: None,
             abandons: Vec::with_capacity(ABANDONS),
@@ -456,6 +473,12 @@ impl State {
             .filter(|lane| self.acks_pending == 0 || lane.ack.is_some())
             .filter_map(Lane::deadline)
             .min()
+    }
+
+    /// Whether the owner holds outstanding transmissions, and so a PTO base,
+    /// for this lane.
+    pub(super) fn owner_times(&self, session: usize, lane: u16) -> bool {
+        timers::armed(&self.armed, session, lane)
     }
 
     pub(super) fn queue(&mut self, worker: usize, message: Message) -> io::Result<()> {
@@ -769,8 +792,10 @@ impl Worker {
             first.shared.config.config().daemon.loss_threshold_permille,
             first.shared.config.config().daemon.probe_rtt_ack_delay,
         )?;
+        let armed = owner.armed();
         for worker in workers.iter_mut() {
             worker.sender.budgets = Arc::clone(&budgets);
+            worker.sender.armed = Arc::clone(&armed);
         }
         workers
             .first_mut()
@@ -783,12 +808,13 @@ impl Worker {
     /// Whether a box coming back to this worker must wake it from sleep. A
     /// returned box otherwise waits in its queue for the worker's next turn.
     ///
-    /// It must when no ACK box is left for arriving feedback, and when work
-    /// is held behind the report box while the owner has it: deadlines are
-    /// not armed then (see `feedback_deadline`), so only the return restarts
-    /// that work.
-    pub(super) fn wants_returns(&self) -> bool {
+    /// It must when no ACK box is left for arriving feedback, when an ACK is
+    /// due on a lane whose feedback box is away, and when work is held
+    /// behind the report box while the owner has it: deadlines are not armed
+    /// then (see `feedback_deadline`), so only the return restarts that work.
+    pub(super) fn wants_returns(&self, now: Duration) -> bool {
         self.sender.ack_free.is_empty()
+            || self.feedback_wanted(now)
             || (self.sender.report.is_none()
                 && (!self.sender.incoming.is_empty()
                     || self.sender.checks_pending != 0
@@ -2073,7 +2099,10 @@ impl Worker {
         budget.release(claim.bytes.saturating_sub(sent_bytes));
         if let Some(at) = at {
             let in_flight = budget.in_flight();
+            let resized =
+                std::mem::replace(&mut self.sender.lanes[index].sent_mtu, job.mtu) != job.mtu;
             let sent = Sent {
+                resized,
                 group: claim.group,
                 id: PacketId {
                     session: job.session,

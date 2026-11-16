@@ -1,6 +1,14 @@
 //! Exact per-group PTO bases; packet histories remain on their transmit workers.
 use crate::pacing::PacketId;
-use std::{io, mem::size_of, time::Duration};
+use std::{
+    io,
+    mem::size_of,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 const ABSENT: usize = usize::MAX;
 
@@ -30,6 +38,25 @@ pub(super) struct Timers {
     lanes: Box<[Lane]>,
     heaps: Box<[Vec<usize>]>,
     installed: Box<[usize]>,
+    // One word per session, a bit per lane (wire lane minus one) that has
+    // outstanding transmissions here and so already holds a PTO base. A
+    // transmit worker reads it to skip the wake for a further send.
+    armed: Arc<[AtomicU64]>,
+}
+
+/// A lane's bit in its session's armed word; lanes past the word have none.
+fn armed_bit(lane: u16) -> u64 {
+    u32::from(lane)
+        .checked_sub(1)
+        .and_then(|shift| 1_u64.checked_shl(shift))
+        .unwrap_or(0)
+}
+
+/// Whether the owner already times this lane, as a transmit worker sees it.
+pub(in crate::worker) fn armed(words: &[AtomicU64], session: usize, lane: u16) -> bool {
+    words
+        .get(session)
+        .is_some_and(|word| word.load(Ordering::Relaxed) & armed_bit(lane) != 0)
 }
 
 impl Timers {
@@ -83,7 +110,13 @@ impl Timers {
             .try_reserve_exact(groups)
             .map_err(io::Error::other)?;
         installed.resize(groups, ABSENT);
+        let mut armed = Vec::new();
+        armed
+            .try_reserve_exact(sessions_count)
+            .map_err(io::Error::other)?;
+        armed.resize_with(sessions_count, || AtomicU64::new(0));
         Ok(Self {
+            armed: Arc::from(armed),
             installed: installed.into_boxed_slice(),
             sessions: sessions.into_boxed_slice(),
             lanes: lanes.into_boxed_slice(),
@@ -97,7 +130,7 @@ impl Timers {
     ) -> Option<usize> {
         let sessions = layout(groups, descriptors)?;
         size_of::<Self>()
-            .checked_add(sessions.checked_mul(size_of::<Session>())?)?
+            .checked_add(sessions.checked_mul(size_of::<Session>() + size_of::<AtomicU64>())?)?
             .checked_add(
                 descriptors
                     .len()
@@ -245,6 +278,9 @@ impl Timers {
         self.lanes[index].outstanding = outstanding;
         self.lanes[index].latest = at;
         if position == ABSENT {
+            if let Some(word) = self.armed.get(session) {
+                word.fetch_or(armed_bit(lane), Ordering::Relaxed);
+            }
             let position = self.heaps[group].len();
             self.heaps[group].push(index);
             self.lanes[index].position = position;
@@ -283,6 +319,11 @@ impl Timers {
             .max())
     }
 
+    /// The published armed words, for transmit workers to read.
+    pub(super) fn armed(&self) -> Arc<[AtomicU64]> {
+        Arc::clone(&self.armed)
+    }
+
     /// Outstanding eliciting transmissions on one installed lane.
     pub(super) fn outstanding(&self, session: usize, lane: u16, generation: u64) -> Option<u32> {
         Some(self.lanes[self.index(session, lane, generation)?].outstanding)
@@ -312,6 +353,12 @@ impl Timers {
         self.lanes[index].outstanding = remaining;
         if remaining != 0 {
             return Ok(());
+        }
+        // Cleared before this owner next checks its queues to sleep, so a
+        // sender either reads the cleared bit and wakes it, or has already
+        // queued the notice that check finds.
+        if let Some(word) = self.armed.get(session) {
+            word.fetch_and(!armed_bit(lane), Ordering::Relaxed);
         }
         self.heaps[group].swap_remove(position);
         self.lanes[index].position = ABSENT;
@@ -423,6 +470,34 @@ mod tests {
             generation,
             number: 123,
         }
+    }
+
+    #[test]
+    fn armed_bits_follow_each_lanes_outstanding_transmissions() {
+        let mut timers = Timers::new(2, &[(0, 1, 0), (0, 2, 0), (1, 1, 1)]).unwrap();
+        let words = timers.armed();
+        let seen = || [(0, 1), (0, 2), (1, 1)].map(|(session, lane)| armed(&words, session, lane));
+        timers.install(0, 1).unwrap();
+        timers.install(1, 8).unwrap();
+        assert_eq!(seen(), [false; 3]);
+        timers
+            .submitted(0, 2, 1, 2, Duration::from_millis(10))
+            .unwrap();
+        assert_eq!(seen(), [false, true, false]);
+        timers
+            .submitted(1, 1, 8, 1, Duration::from_millis(10))
+            .unwrap();
+        // A partial settlement keeps the lane's base, and so its bit.
+        timers.settled(0, 2, 1, 1).unwrap();
+        assert_eq!(seen(), [false, true, true]);
+        timers.settled(0, 2, 1, 1).unwrap();
+        assert_eq!(seen(), [false, false, true]);
+        // Lane zero, lanes past the word and unknown sessions read as unarmed.
+        assert!(!armed(&words, 0, 0));
+        assert!(!armed(&words, 0, 65));
+        assert!(!armed(&words, 2, 1));
+        assert_eq!(armed_bit(64), 1 << 63);
+        assert_eq!(armed_bit(65), 0);
     }
 
     #[test]
@@ -631,6 +706,7 @@ mod tests {
             + timers.lanes.len() * size_of::<Lane>()
             + timers.heaps.len() * size_of::<Vec<usize>>()
             + timers.installed.len() * size_of::<usize>()
+            + timers.armed.len() * size_of::<AtomicU64>()
             + timers
                 .heaps
                 .iter()
