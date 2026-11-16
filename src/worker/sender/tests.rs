@@ -98,7 +98,7 @@ fn returned_boxes_are_pushed_without_the_ordinary_notification() {
 }
 
 #[test]
-fn a_routine_sent_notice_skips_the_wake_only_for_a_lane_the_owner_times() {
+fn a_routine_sent_notice_skips_the_wake_only_for_a_session_the_owner_times() {
     let (mut workers, _rx) = workers();
     let notice = Sent {
         group: 0,
@@ -998,6 +998,25 @@ fn sender_queue_pressure_preserves_destination_order_across_partial_sweeps() {
     }
     assert_eq!(received, (1..=70).collect::<Vec<_>>());
     assert!(worker.sender.outgoing.is_empty());
+    // A message handed to another worker is that worker's work: it asks for
+    // no further turn here.
+    worker
+        .sender
+        .queue(
+            1,
+            Message::CheckLoss {
+                group: 0,
+                token: 71,
+                before: Duration::ZERO,
+                force: false,
+            },
+        )
+        .unwrap();
+    assert!(!worker.flush_sender_messages(Duration::ZERO).unwrap());
+    assert!(matches!(
+        incoming.try_pop(),
+        Some(Event::Sender(Message::CheckLoss { token: 71, .. }))
+    ));
 }
 
 #[test]

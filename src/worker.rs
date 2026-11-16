@@ -1831,8 +1831,9 @@ impl Worker {
             Event::Feedback(feedback) => feedback.is_return(),
             _ => false,
         };
-        // A Sent notice for a lane the owner already times only moves that
-        // lane's PTO base later, which the owner can learn on its next turn.
+        // A Sent notice for a session the owner already times only moves a
+        // PTO base later or adds one behind an earlier deadline, which the
+        // owner can learn on its next turn.
         let routine = match &event {
             Event::Sender(sender::Message::Sent(sent)) => sent.routine(),
             _ => None,
@@ -1843,11 +1844,11 @@ impl Worker {
                 Ok(())
             }
             Ok(()) => {
-                // Read the bit after the push: the owner clears it before the
-                // queue check that precedes its sleep, so one of us sees the other.
-                let quiet = routine.is_some_and(|(session, lane)| {
+                // Read the word after the push: the owner clears its bits before
+                // the queue check that precedes its sleep, so one of us sees the other.
+                let quiet = routine.is_some_and(|session| {
                     std::sync::atomic::fence(Ordering::SeqCst);
-                    self.sender.owner_times(session, lane)
+                    self.sender.owner_times(session)
                 });
                 if !quiet {
                     self.notifications |= 1_u64 << worker;

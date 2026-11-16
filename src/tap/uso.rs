@@ -231,6 +231,35 @@ fn matches(first: &[u8], next: &[u8], layout: Layout, count: usize, payload: usi
         }
 }
 
+/// Whether `next` is the UDP frame that follows `count` frames of `first`'s
+/// run, decided on the header bytes alone: the same length, and every header
+/// byte equal except the IPv4 identification, which must be `count` on, and
+/// the IPv4 header checksum, which must still verify.
+///
+/// Both frames carry partial checksums and `first` passed transport(), so
+/// equal bytes give `next` the same flow hash, the same layout and the same
+/// answers to every check transport() and matches() make on those bytes. This
+/// accepts nothing the slower path would refuse; what it refuses goes there.
+fn follows(first: &[u8], next: &[u8], layout: Layout, count: usize) -> bool {
+    let Layout {
+        ip, at, header, v6, ..
+    } = layout;
+    let same = |range: std::ops::Range<usize>| matches!((first.get(range.clone()), next.get(range)), (Some(a), Some(b)) if a == b);
+    next.len() == first.len()
+        && if v6 {
+            same(0..header)
+        } else {
+            same(0..ip + 4)
+                && same(ip + 6..ip + 10)
+                && same(ip + 12..header)
+                && word(next, ip + 4) == word(first, ip + 4).wrapping_add(count as u16)
+                && word(next, ip + 10) != 65535
+                && next
+                    .get(ip..at)
+                    .is_some_and(|ip_header| fold(sum(ip_header)) == 65535)
+        }
+}
+
 /// Returns the attempted mask, TCP flag and original byte count on success.
 /// The mask survives failure so the caller retains every selected frame.
 /// Bit i of `partial` marks the i-th frame's checksum as partial.
@@ -276,15 +305,24 @@ pub(super) fn write<'a>(
         iov_len: size,
     };
     for (index, next) in std::iter::once(second).chain(frames).take(63).enumerate() {
-        if flow_hash(next) != hash {
-            continue;
-        }
-        // A same-flow barrier must prevent moving a later frame ahead of it.
-        if next.len() > frame_limit
-            || transport(next, partial >> (index + 1) & 1 != 0) != Some(layout)
-            || !matches(first, next, layout, count, payload)
-        {
-            break;
+        // The common case, a full-size UDP segment of the same run with its
+        // checksum left partial, needs no hash and no parse of its own.
+        let run = !tcp
+            && partial & 1 != 0
+            && partial >> (index + 1) & 1 != 0
+            && first.len() <= frame_limit
+            && follows(first, next, layout, count);
+        if !run {
+            if flow_hash(next) != hash {
+                continue;
+            }
+            // A same-flow barrier must prevent moving a later frame ahead of it.
+            if next.len() > frame_limit
+                || transport(next, partial >> (index + 1) & 1 != 0) != Some(layout)
+                || !matches(first, next, layout, count, payload)
+            {
+                break;
+            }
         }
         let Some(data) = next.get(header_len..) else {
             break;
@@ -625,4 +663,64 @@ fn tcp_coalescing_stops_at_flow_barriers_and_counts_only_selected_frames() {
     let (mask, _, _) = write(-1, &a, [&b[..], &c[..]].into_iter(), 1514, (true, true), 0).unwrap();
     assert_eq!(mask, 0b11, "PSH closes the current group");
     assert!(write(-1, &a, [&b[..]].into_iter(), 1514, (true, false), 0).is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn follows_accepts_only_what_the_parsing_path_accepts() {
+    use crate::tap::test_common::udp;
+    for v6 in [false, true] {
+        let payload = [7u8; 200];
+        let mut a = udp::frame(v6, 100, &payload);
+        let mut b = udp::frame(v6, 101, &payload);
+        udp::partial(&mut a, v6);
+        udp::partial(&mut b, v6);
+        let layout = transport(&a, true).unwrap();
+        let parsed = |next: &[u8], count: usize| {
+            flow_hash(next) == flow_hash(&a)
+                && transport(next, true) == Some(layout)
+                && matches(&a, next, layout, count, payload.len())
+        };
+        // The next segment of the run passes both ways.
+        assert!(parsed(&b, 1));
+        assert!(follows(&a, &b, layout, 1));
+        // No header bit may change unseen: whatever follows() still takes,
+        // the parsing path takes too.
+        for at in 0..layout.header {
+            for bit in 0..8 {
+                let mut changed = b.clone();
+                changed[at] ^= 1 << bit;
+                for count in [1, 2] {
+                    assert!(
+                        !follows(&a, &changed, layout, count) || parsed(&changed, count),
+                        "byte {at} bit {bit}"
+                    );
+                }
+            }
+        }
+        // A shorter last segment and a segment out of place go the long way.
+        let mut short = udp::frame(v6, 101, &payload[..100]);
+        udp::partial(&mut short, v6);
+        assert!(!follows(&a, &short, layout, 1));
+        assert_eq!(follows(&a, &b, layout, 2), v6);
+        // Through write(): the run coalesces across another flow's frame,
+        // which the hash still skips.
+        let mut other = udp::frame(v6, 100, &payload);
+        let port = layout.at + 1;
+        other[port] ^= 1;
+        udp::repair(&mut other, v6);
+        udp::partial(&mut other, v6);
+        assert_ne!(flow_hash(&a), flow_hash(&other));
+        let (mask, tcp, _) = write(
+            -1,
+            &a,
+            [&other[..], &b[..]].into_iter(),
+            1514,
+            (true, true),
+            0b111,
+        )
+        .unwrap();
+        assert_eq!(mask, 0b101);
+        assert!(!tcp);
+    }
 }

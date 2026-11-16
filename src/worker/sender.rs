@@ -100,11 +100,11 @@ pub(crate) struct Sent {
 }
 
 impl Sent {
-    /// The lane whose armed bit decides whether this notice must wake the
-    /// owner: none when the owner has to act on it at once, as an idle
+    /// The session whose armed word decides whether this notice must wake
+    /// the owner: none when the owner has to act on it at once, as an idle
     /// restart or a new datagram size requires.
-    pub(super) fn routine(&self) -> Option<(usize, u16)> {
-        (!self.restart && !self.resized).then_some((self.id.session, self.id.lane))
+    pub(super) fn routine(&self) -> Option<usize> {
+        (!self.restart && !self.resized).then_some(self.id.session)
     }
 }
 
@@ -476,9 +476,9 @@ impl State {
     }
 
     /// Whether the owner holds outstanding transmissions, and so a PTO base,
-    /// for this lane.
-    pub(super) fn owner_times(&self, session: usize, lane: u16) -> bool {
-        timers::armed(&self.armed, session, lane)
+    /// for some lane of this session.
+    pub(super) fn owner_times(&self, session: usize) -> bool {
+        timers::armed(&self.armed, session)
     }
 
     pub(super) fn queue(&mut self, worker: usize, message: Message) -> io::Result<()> {
@@ -1136,7 +1136,9 @@ impl Worker {
                 progress = true;
             } else {
                 match self.push(worker, Event::Sender(message)) {
-                    Ok(()) => progress = true,
+                    // A message handed over is its target's work, and the push
+                    // sees to the wake: it leaves nothing to do here.
+                    Ok(()) => {}
                     Err(Event::Sender(message)) => {
                         // Keep destination FIFO across partial sweeps and mid-sweep queue relief.
                         self.sender.outgoing.insert(index, (worker, message));
@@ -1323,14 +1325,18 @@ impl Worker {
                     .and_then(|left| left.checked_sub(1).filter(|&n| n != 0));
             }
             if produced {
+                // Staging below says whether it needs another turn.
                 self.recovery.staged = Some(report);
-                more = true;
             } else {
                 budget = budget.saturating_sub(1);
                 self.sender.report = Some(report);
             }
         }
-        more |= budget == 0 && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0);
+        // Pending work can only go on with the report box at hand; with the
+        // box on its way to the owner, its return restarts it.
+        more |= budget == 0
+            && self.sender.report.is_some()
+            && (self.sender.acks_pending != 0 || self.sender.checks_pending != 0);
         // A fully protected final loss pass emits no report to wake queued ACK work.
         more |= ack_blocked
             && self.sender.checks_pending == 0

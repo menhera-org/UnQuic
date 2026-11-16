@@ -1790,6 +1790,60 @@ find something now waits for the next turn, which adds a turn. The
 second, empty turn is the cost worth removing, and it comes from phases
 that report progress after handing work to another worker.
 
+## Three changes of about one percent (November 16, landed together)
+
+After the larger changes, three smaller ones each showed about 1%,
+which six rounds on this host cannot confirm: HEAD and its own copy
+differ by up to 3% in a single round. They were built on top of each
+other and judged together.
+
+A Sent notice skips the wake when any lane of its session is timed, not
+only its own. The profile had 130,000 notices a run still waking the
+controller owner because their lane had nothing outstanding; but while
+any lane of the session is outstanding the owner holds a timeout that
+fires before one for the new send would, or a loss check whose
+completion wakes it. Alone
+([first set](benches/full-size-sent-per-session.json),
+[second](benches/full-size-sent-per-session-second.json),
+[lossy](benches/lossy-path-sent-per-session.json)): lower than both
+HEAD and its copy in 9 of 12 rounds, −1.0% against each at the median,
+and the lowest loss of the three arms in every lossy round. One round
+short of the bar.
+
+No further turn after handing work over. Half of a worker's turns ended
+in a non-blocking poll because the sender service reported progress
+whenever it pushed a message to another worker, produced a report that
+the same call then staged, or had an ACK waiting whose report box was
+already on its way to the owner. None of these leaves the worker
+anything to do. With the first change
+([results](benches/full-size-sent-per-session-and-turns.json)): lower
+than both in 4 of 6 rounds, −1.4% against HEAD and −1.1% against the
+copy; in the set below, 4 of 6 again at −1.8% and −1.75%.
+
+A run check on header bytes for coalescing TAP writes. Each frame that
+joined a run paid for a SipHash of its flow key, a full parse with an
+IPv4 header sum, and a field-by-field comparison with the run's first
+frame. For a UDP frame with a partial checksum and the first frame's
+length, the same answer follows from the header bytes being equal apart
+from the IPv4 identification and header checksum; what that check
+refuses goes the old way, and a test flips every header bit to show it
+accepts nothing the old way would not.
+
+All three, stated beforehand as 1.5% or more by the usual bar and no
+more loss on the lossy point
+([results](benches/full-size-sent-turns-and-run-headers.json)): lower
+than both HEAD and its copy in 6 of 6 rounds, −2.4% against HEAD and
+−2.0% against the copy at the median. Lossy point
+([results](benches/lossy-path-sent-turns-and-run-headers.json)):
+0.010%, 0.009% and 0.005% lost at each round's worst point against
+0.008%, 0.021% and 0.007% for HEAD. HEAD's copy lost 18% in one
+direction of its first round, with a 600 ms latency maximum there and
+none in the other direction. A stall of 200 ms or more in one direction
+alone turns up in about one run in eighty across today's 500 runs, the
+morning's builds included, usually with under 1% lost and twice with
+far more; it is not explained. The bar is met and the three land
+together.
+
 ## ACKs due on a shared tick (November 16, exploratory, rejected)
 
 A lane holds an ACK for 1 ms after its first unacknowledged packet, so

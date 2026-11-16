@@ -133,7 +133,17 @@ non-blocking poll and that four in five of those polls find nothing,
 blocking wait measured nothing and was rejected
 ([BENCH.md](BENCH.md#skipping-the-poll-after-a-blocking-wait-november-16-rejected));
 the empty second turn itself, asked for by phases that count a message
-handed to another worker as progress, is the target that remains.
+handed to another worker as progress, was the target that remained.
+It went together with two other changes of about 1% each (a Sent
+notice that waits whenever any lane of its session is timed, and a
+header-byte check that spares coalesced TAP writes a hash and a parse
+per frame): 2.0–2.4% in 6 of 6 rounds as one candidate, where none of
+them alone could clear the bar on this host
+([BENCH.md](BENCH.md#three-changes-of-about-one-percent-november-16-landed-together)).
+One open oddity turned up beside them: about one run in eighty, on the
+morning's builds as on the evening's, stalls one direction for 200 ms
+or more with nothing wrong in the other, and twice it lost over a tenth
+of that direction's frames.
 
 With four workers the day's changes save 10% of CPU below saturation
 and 6% near it, and leave delivery under overload where it was (13.5–

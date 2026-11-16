@@ -43,13 +43,13 @@ fn sent(id: PacketId, count: u32, at: Duration) -> Sent {
 }
 
 #[test]
-fn a_sent_notice_is_routine_only_while_the_owner_times_its_lane() {
+fn a_sent_notice_is_routine_only_while_the_owner_times_its_session() {
     let mut owner = owner(1, 1, &[(0, 1, 0), (0, 2, 0)]);
     let armed = owner.armed();
     let timed = |notice: &Sent| {
         notice
             .routine()
-            .is_some_and(|(session, lane)| timers::armed(&armed, session, lane))
+            .is_some_and(|session| timers::armed(&armed, session))
     };
     let notice = sent(lane(1), 2, Duration::ZERO);
     // Before the owner installs the lane it counts nothing, so every notice wakes it.
@@ -59,8 +59,8 @@ fn a_sent_notice_is_routine_only_while_the_owner_times_its_lane() {
     assert!(!timed(&notice));
     owner.sent(notice).unwrap();
     assert!(timed(&notice));
-    // Another lane of the session has its own base.
-    assert!(!timed(&sent(lane(2), 1, Duration::ZERO)));
+    // Another lane of the session waits behind that lane's deadline.
+    assert!(timed(&sent(lane(2), 1, Duration::ZERO)));
     // An idle restart and a new datagram size need the owner at once.
     assert_eq!(
         Sent {
@@ -78,9 +78,10 @@ fn a_sent_notice_is_routine_only_while_the_owner_times_its_lane() {
         .routine(),
         None
     );
-    // Once the lane's transmissions settle, its next send arms it again.
+    // Once the session's transmissions settle, its next send arms it again.
     owner.timers.settled(0, 1, 1, 2).unwrap();
     assert!(!timed(&notice));
+    assert!(!timed(&sent(lane(2), 1, Duration::ZERO)));
 }
 
 /// Charges and records count 1280-byte sends as one worker syscall would;

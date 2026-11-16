@@ -40,7 +40,8 @@ pub(super) struct Timers {
     installed: Box<[usize]>,
     // One word per session, a bit per lane (wire lane minus one) that has
     // outstanding transmissions here and so already holds a PTO base. A
-    // transmit worker reads it to skip the wake for a further send.
+    // transmit worker reads the word to skip the wake for a further send.
+    // Lanes past the word have no bit and never arm it.
     armed: Arc<[AtomicU64]>,
 }
 
@@ -52,11 +53,17 @@ fn armed_bit(lane: u16) -> u64 {
         .unwrap_or(0)
 }
 
-/// Whether the owner already times this lane, as a transmit worker sees it.
-pub(in crate::worker) fn armed(words: &[AtomicU64], session: usize, lane: u16) -> bool {
+/// Whether the owner already times some lane of this session, as a transmit
+/// worker sees it.
+///
+/// Any such lane gives the session's group a PTO deadline, or a loss check
+/// whose completion wakes the owner, no later than a send made now would
+/// need one. So a further send on any lane of the session, armed itself or
+/// not, can wait for the owner's next turn.
+pub(in crate::worker) fn armed(words: &[AtomicU64], session: usize) -> bool {
     words
         .get(session)
-        .is_some_and(|word| word.load(Ordering::Relaxed) & armed_bit(lane) != 0)
+        .is_some_and(|word| word.load(Ordering::Relaxed) != 0)
 }
 
 impl Timers {
@@ -473,29 +480,38 @@ mod tests {
     }
 
     #[test]
-    fn armed_bits_follow_each_lanes_outstanding_transmissions() {
+    fn armed_words_follow_each_sessions_outstanding_transmissions() {
         let mut timers = Timers::new(2, &[(0, 1, 0), (0, 2, 0), (1, 1, 1)]).unwrap();
         let words = timers.armed();
-        let seen = || [(0, 1), (0, 2), (1, 1)].map(|(session, lane)| armed(&words, session, lane));
+        let seen = || [0, 1].map(|session| armed(&words, session));
+        let bits = |session: usize| words[session].load(Ordering::Relaxed);
         timers.install(0, 1).unwrap();
         timers.install(1, 8).unwrap();
-        assert_eq!(seen(), [false; 3]);
+        assert_eq!(seen(), [false; 2]);
         timers
             .submitted(0, 2, 1, 2, Duration::from_millis(10))
             .unwrap();
-        assert_eq!(seen(), [false, true, false]);
+        assert_eq!(seen(), [true, false]);
+        assert_eq!(bits(0), 0b10);
         timers
             .submitted(1, 1, 8, 1, Duration::from_millis(10))
             .unwrap();
+        timers
+            .submitted(0, 1, 1, 1, Duration::from_millis(11))
+            .unwrap();
+        assert_eq!(bits(0), 0b11);
         // A partial settlement keeps the lane's base, and so its bit.
         timers.settled(0, 2, 1, 1).unwrap();
-        assert_eq!(seen(), [false, true, true]);
+        assert_eq!(bits(0), 0b11);
+        // One lane settling leaves the session armed through the other.
         timers.settled(0, 2, 1, 1).unwrap();
-        assert_eq!(seen(), [false, false, true]);
-        // Lane zero, lanes past the word and unknown sessions read as unarmed.
-        assert!(!armed(&words, 0, 0));
-        assert!(!armed(&words, 0, 65));
-        assert!(!armed(&words, 2, 1));
+        assert_eq!(bits(0), 0b01);
+        assert_eq!(seen(), [true, true]);
+        timers.settled(0, 1, 1, 1).unwrap();
+        assert_eq!(seen(), [false, true]);
+        // An unknown session reads as unarmed; lanes past the word have no bit.
+        assert!(!armed(&words, 2));
+        assert_eq!(armed_bit(0), 0);
         assert_eq!(armed_bit(64), 1 << 63);
         assert_eq!(armed_bit(65), 0);
     }
