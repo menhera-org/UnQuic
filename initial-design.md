@@ -1059,7 +1059,9 @@ of its frames.
   untouched and keep their order by lane, as today.
 - **Sending.** The TAP reader assigns each read of a striped flow (one
   super-frame, or one frame) to the next of the session's data lanes in
-  turn, and takes the frames' stripe sequences from the stripe's counter
+  turn, leaving out the lanes it transmits itself while two others
+  remain (November 16: it already handles every frame of the flow once),
+  and takes the frames' stripe sequences from the stripe's counter
   in the flow table, one atomic add per read. Each transmit owner sends its
   share on its own lane exactly as today, with the tag prepended to every
   frame's rewritten header.
@@ -1139,7 +1141,11 @@ repaired frame arrives late exactly as it does on an unstriped flow. The
 hold limit and window only have to cover the skew between lanes.) The
 writer's placement matters as well: on a worker that also
 reads the TAP it saturates first, and the TAP's queue choice varies, so
-a fixed stripe-to-worker map cannot avoid it.
+a fixed stripe-to-worker map cannot avoid it. (November 16: no map can.
+A multi-queue TAP delivers a flow's frames to the queue that last wrote
+that flow, so the reverse direction's reads follow the stripe's writer
+wherever it is placed. The reading worker is kept out of the flow's
+transmit rotation instead.)
 
 # 14 Validation and acceptance
 

@@ -1011,8 +1011,51 @@ unchanged at about 2.3% at 1% loss, so only repaired frames arrive late.
 The fourth run delivered 1.71 / 1.39 Gbit/s. There the flow took stripe
 1, whose writer, worker 1, was also the receiving daemon's TAP reader:
 it ran at 92% and dropped 106,000 frames. In the other runs the writer
-is the busiest thread at 92–97%, so it now limits the flow. `stripe_flows`
-stays off until the writer is kept off the TAP reader.
+is the busiest thread at 92–97%, so it now limits the flow.
+
+### Where the writer and the reader meet (November 16)
+
+Choosing the writer away from workers that recently read a TAP was
+tried again on the repaired writer, with the November 15 patch
+([results](benches/lossy-one-flow-stripe-writer-off-readers-2-rejected.json)).
+It is rejected again: 1.38–1.62 Gbit/s and 440,000–546,000 frames
+reordered. Two things were wrong with the idea.
+
+- The choice did not hold. Workers stamp shared words with the time
+  their own turn began; a stamp from a worker whose turn began a
+  millisecond later looked 4.6 hours old after the 24-bit wrap, so a
+  stripe seemed silent and got a new writer, again and again. The same
+  comparison sat in the stripe claim and the shared flow table, where a
+  second reader with an older clock could move a flow or take a live
+  stripe slot. A stamp up to a second ahead now counts as fresh.
+- Placement cannot separate the two jobs on this harness. A multi-queue
+  TAP sends a flow's frames to the queue that last wrote that flow, and
+  both directions of the test flow share one hash, so the worker that
+  writes a striped flow to the TAP is also handed the reverse direction
+  to read. In every run inspected the reader and the writer were the
+  same worker; moving the writer moved the reader with it.
+
+What can be chosen is whether that worker also transmits. A striped flow
+is read by one worker, which already handles every frame once. Hypothesis:
+when it also owns a data lane, its share of the transmit work is what
+overloads it, as in the slow run above. The rotation now leaves out the
+lanes the reading worker transmits itself while at least two others
+remain. Bar, stated first: more delivery than the base in both directions
+in at least three of four pairs, 10% or more at the median, with no more
+reordering. The comparison ran without the control lane, so that the
+worker reading and writing the flow always owns a data lane
+([results](benches/lossy-one-flow-striping-skip-own-lanes.json)):
+
+| Loss | Base, L→R / R→L | Skipping own lanes | Reordered frames per direction |
+| --- | --- | --- | --- |
+| 0.5% | 1.49 / 1.36, 1.43 / 1.44 Gbit/s | 2.14 / 2.12, 1.96 / 1.99 | 27,000–33,000 → 47,000–71,000 |
+| 1% | 1.36 / 1.37, 1.36 / 1.31 | 1.95 / 2.13, 2.05 / 2.15 | 52,000–57,000 → 74,000–83,000 |
+
+Met in four of four pairs: 38–64% more delivery, and the share of frames
+reordered stays at about 2.3–2.4% at 1% loss. With it, a striped flow
+reaches about 2 Gbit/s in each direction whichever worker the stripe's
+writer falls on. The worker that reads and writes the flow is then the
+busiest at about 92%; the three that transmit run at 62–76%.
 
 ## Twice the receive slots in the same storage (November 15, landed)
 

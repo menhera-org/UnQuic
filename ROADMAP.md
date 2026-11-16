@@ -403,9 +403,16 @@ Decisions only the user can make, each blocking a remaining goal:
    runs then deliver 2.0–2.2 Gbit/s in both directions against 0.8–1.2
    unstriped, with the same share of frames reordered, in three of four
    runs. In the fourth the stripe's writer was also the receiving
-   daemon's TAP reader and saturated. Next: choose the writer away from
-   TAP readers, then measure the full-size and lossy points with the
-   feature on before considering the default.
+   daemon's TAP reader and saturated. The writer cannot be moved away
+   from the reader: a multi-queue TAP hands a flow's frames to the queue
+   that last wrote that flow, so the reverse direction's reads follow
+   the writer. What helps is that the worker reading a striped flow no
+   longer transmits it: the lane rotation leaves out that worker's own
+   lanes while two others remain, which lifted the overloaded case by
+   38–64% to about 2 Gbit/s each way. Shared millisecond stamps also
+   tolerate a stamp slightly ahead of the reading worker's clock now.
+   Next: measure the full-size and lossy points with the feature on,
+   and a single TCP flow, before considering the default.
 8. Decided November 14: `daemon.offload_frames` stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should

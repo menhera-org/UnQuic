@@ -467,6 +467,15 @@ pub(crate) const FLOW_SLOTS: usize = 16_384;
 const FLOW_IDLE_MS: u64 = 1000;
 const FLOW_MS_MASK: u64 = 0xff_ffff;
 
+/// Milliseconds from a shared 24-bit stamp to `now`. Workers stamp with
+/// the time their own turn began, so a stamp may lie a little ahead of the
+/// worker reading it; up to a second ahead counts as just now instead of
+/// wrapping to hours ago.
+const fn stamp_age(now: u64, stamp: u64) -> u64 {
+    let age = now.wrapping_sub(stamp) & FLOW_MS_MASK;
+    if age > FLOW_MS_MASK - 1000 { 0 } else { age }
+}
+
 /// Stripes per session, one per writer slot of `stripe::Writer`.
 pub(crate) const STRIPE_SLOTS: usize = 16;
 /// A flow-table lane value with this bit names a stripe slot instead.
@@ -519,7 +528,7 @@ fn backlogged(mark: &AtomicU64, ms: u64) -> bool {
     let old = mark.load(Ordering::Relaxed);
     let (first, last) = ((old >> 24) & FLOW_MS_MASK, old & FLOW_MS_MASK);
     old != 0
-        && now.wrapping_sub(last) & FLOW_MS_MASK < STRIPE_EPISODE_MS
+        && stamp_age(now, last) < STRIPE_EPISODE_MS
         && last.wrapping_sub(first) & FLOW_MS_MASK >= STRIPE_PRESS_MS
 }
 
@@ -528,7 +537,7 @@ fn claim_stripe(stripes: &[Stripe], ms: u64) -> Option<usize> {
     let now = ms & FLOW_MS_MASK;
     stripes.iter().position(|stripe| {
         let old = stripe.stamp.load(Ordering::Acquire);
-        (old == 0 || now.wrapping_sub(old) & FLOW_MS_MASK >= STRIPE_IDLE_MS)
+        (old == 0 || stamp_age(now, old) >= STRIPE_IDLE_MS)
             && stripe
                 .stamp
                 .compare_exchange(
@@ -545,14 +554,16 @@ fn claim_stripe(stripes: &[Stripe], ms: u64) -> Option<usize> {
     })
 }
 
-/// Takes a striped read's lane, the next of `first..lanes` in turn, and the
-/// first of its `frames` sequences.
+/// Takes a striped read's lane, the next of the data lanes in turn, and the
+/// first of its `frames` sequences. Lanes `own` names, those the reading
+/// worker transmits itself, are left out while two others remain: that
+/// worker already handles every frame of the flow once.
 fn stripe_read(
     stripe: &Stripe,
     frames: usize,
-    first: usize,
-    lanes: usize,
+    data: std::ops::Range<usize>,
     ms: u64,
+    own: impl Fn(usize) -> bool,
 ) -> (usize, u64) {
     let now = ms & FLOW_MS_MASK;
     let stamp = stripe.stamp.load(Ordering::Relaxed);
@@ -567,10 +578,17 @@ fn stripe_read(
     let old = stripe
         .next
         .fetch_add((1 << 48) | frames as u64, Ordering::AcqRel);
-    (
-        first + (old >> 48) as usize % (lanes - first),
-        old & SEQUENCE_MASK,
-    )
+    let turn = (old >> 48) as usize;
+    let others = data.clone().filter(|&lane| !own(lane)).count();
+    let lane = if others >= 2 {
+        data.clone()
+            .filter(|&lane| !own(lane))
+            .nth(turn % others)
+            .unwrap_or(data.start)
+    } else {
+        data.start + turn % data.len().max(1)
+    };
+    (lane, old & SEQUENCE_MASK)
 }
 
 /// Pins a flow to the lane it first received, assigning new flows round-robin
@@ -599,7 +617,7 @@ fn balanced_lane(
     let mut old = slot.load(Ordering::Acquire);
     loop {
         let (old_tag, old_lane, old_ms) = (old >> 32, (old >> 24) & 0xff, old & FLOW_MS_MASK);
-        let active = old != 0 && now.wrapping_sub(old_ms) & FLOW_MS_MASK < FLOW_IDLE_MS;
+        let active = old != 0 && stamp_age(now, old_ms) < FLOW_IDLE_MS;
         let striped = old_lane as usize & STRIPED != 0;
         if active
             && old_tag == tag
@@ -2905,7 +2923,9 @@ impl Worker {
         let number = lane & !STRIPED;
         match stripes.and_then(|s| s.get(number)) {
             Some(stripe) => {
-                let (lane, sequence) = stripe_read(stripe, frames, first, lanes, ms);
+                let (lane, sequence) = stripe_read(stripe, frames, first..lanes, ms, |lane| {
+                    lane % workers == self.id
+                });
                 (lane, Some((number as u16, sequence)))
             }
             // The connection that striped this flow was replaced.
@@ -7361,23 +7381,41 @@ mod tests {
         mark_refusal(&mark, 500 + STRIPE_EPISODE_MS - 1);
         assert!(backlogged(&mark, 500 + STRIPE_EPISODE_MS));
 
+        // A stamp slightly ahead of the reader's clock is fresh, not hours old.
+        assert_eq!((stamp_age(12, 10), stamp_age(10, 12)), (2, 0));
+        assert_eq!(stamp_age(5, FLOW_MS_MASK - 3), 9);
+        assert!(stamp_age(0, 1500) > FLOW_IDLE_MS);
+
         let stripes: Vec<Stripe> = (0..2).map(|_| Stripe::default()).collect();
         assert_eq!(claim_stripe(&stripes, 5), Some(0));
         assert_eq!(claim_stripe(&stripes, 5), Some(1));
         assert_eq!(claim_stripe(&stripes, 6), None);
+        // A reader whose turn began earlier cannot take a slot just claimed.
+        assert_eq!(claim_stripe(&stripes, 3), None);
         // Reads take data lanes 1..4 in turn and consecutive sequences from 1.
-        assert_eq!(stripe_read(&stripes[0], 3, 1, 4, 7), (1, 1));
-        assert_eq!(stripe_read(&stripes[0], 1, 1, 4, 8), (2, 4));
-        assert_eq!(stripe_read(&stripes[0], 2, 1, 4, 9), (3, 5));
-        assert_eq!(stripe_read(&stripes[0], 1, 1, 4, 9), (1, 7));
+        assert_eq!(stripe_read(&stripes[0], 3, 1..4, 7, |_| false), (1, 1));
+        assert_eq!(stripe_read(&stripes[0], 1, 1..4, 8, |_| false), (2, 4));
+        assert_eq!(stripe_read(&stripes[0], 2, 1..4, 9, |_| false), (3, 5));
+        assert_eq!(stripe_read(&stripes[0], 1, 1..4, 9, |_| false), (1, 7));
         // Only a silent stripe is claimed again, and it starts afresh.
         assert_eq!(claim_stripe(&stripes, 5 + STRIPE_IDLE_MS), Some(1));
         assert_eq!(claim_stripe(&stripes, 8 + STRIPE_IDLE_MS), None);
         assert_eq!(claim_stripe(&stripes, 9 + STRIPE_IDLE_MS), Some(0));
         assert_eq!(
-            stripe_read(&stripes[0], 1, 1, 4, 9 + STRIPE_IDLE_MS),
+            stripe_read(&stripes[0], 1, 1..4, 9 + STRIPE_IDLE_MS, |_| false),
             (1, 1)
         );
+        // A reader that transmits lane 2 itself leaves it out of the turn
+        // while two other data lanes remain, and not otherwise.
+        let late = 9 + STRIPE_IDLE_MS;
+        let lanes: Vec<_> = (0..3)
+            .map(|_| stripe_read(&stripes[0], 1, 1..4, late, |lane| lane == 2).0)
+            .collect();
+        assert_eq!(lanes, [3, 1, 3]);
+        let lanes: Vec<_> = (0..2)
+            .map(|_| stripe_read(&stripes[0], 1, 1..3, late, |lane| lane == 2).0)
+            .collect();
+        assert_eq!(lanes, [1, 2]);
 
         let slots: Vec<_> = (0..FLOW_SLOTS).map(|_| AtomicU64::new(0)).collect();
         let cursor = AtomicUsize::new(0);
@@ -7396,6 +7434,9 @@ mod tests {
         assert_eq!(lane, 2);
         // Declining keeps the lane.
         let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 13 + FLOW_IDLE_MS, |_| None);
+        assert_eq!(lane, 2);
+        // So does a reader whose turn began before the entry's last stamp.
+        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 11 + FLOW_IDLE_MS, |_| None);
         assert_eq!(lane, 2);
     }
 
