@@ -103,8 +103,11 @@ in receive admission (260–285 and 123–133), recovery staging (225–240)
 and TAP input expansion (190–210). The first is not wasted attempts:
 with offload frames off a write carries twenty frames (13.6 million
 frames in 665,000–682,000 writes), so the 320 cycles are what building
-those runs costs, about 640 for each frame written, and `uso::write`
-is the place to split next. Each is small against the syscalls,
+those runs costs, about 640 for each frame written. `uso::write`
+passes payloads by reference and no longer verifies checksums, so the
+phase needs a finer split (run building, ready-frame collection,
+counters, buffer release) before a change is chosen. Each is small
+against the syscalls,
 so each needs the small-frame point as well as the full-size one to
 show.
 
