@@ -1057,6 +1057,62 @@ reaches about 2 Gbit/s in each direction whichever worker the stripe's
 writer falls on. The worker that reads and writes the flow is then the
 busiest at about 92%; the three that transmit run at 62–76%.
 
+The original comparison again with this build (0d128df) and the default
+control lane ([results](benches/lossy-one-flow-striping-final.json)):
+
+| Loss | balc, L→R / R→L | strc, L→R / R→L | Reordered frames per direction |
+| --- | --- | --- | --- |
+| 0.5% | 1.16 / 1.08, 1.06 / 1.19 Gbit/s | 2.03 / 2.23, 2.01 / 2.22 | 21,000–23,000 → 44,000–59,000 |
+| 1% | 0.79 / 1.09, 1.06 / 1.09 | 1.93 / 2.16, 2.02 / 2.12 | 27,000–49,000 → 76,000–90,000 |
+
+Every striped run delivers more than 1.82 Gbit/s in both directions, so
+the delivery half of the bar is met in four of four. The reordered count
+is 1.9–2.8 times the unstriped arm's, a little over the stated limit of
+twice at 0.5% loss, because delivery itself nearly doubled; as a share
+of delivered frames it is unchanged, about 1.5% at 0.5% loss and 2.3% at
+1%. Those are the repaired frames, which arrive late on any flow.
+
+### One TCP flow (November 16)
+
+`udp_load` does not react to reordering or loss; TCP does. One iperf3
+TCP flow each way, unlimited, at 7.5 ms RTT with four workers, with no
+outer loss and with 0.5%, balc against strc as above. Hypothesis: a
+single TCP flow is also held by one transmit worker, so striping lifts
+it, though by less than the UDP flow where TCP's own window or the
+generator limits it first. Expectation, stated before the run: strc
+delivers at least 20% more in both directions without outer loss in
+both passes, and no less at 0.5% loss.
+
+Not met ([results](benches/tcp-one-flow-striping.json)); striping does
+nothing for this TCP flow:
+
+| Outer loss | balc, L→R / R→L | strc, L→R / R→L | TCP retransmits per direction |
+| --- | --- | --- | --- |
+| none | 1.02 / 0.95, 0.75 / 0.67 Gbit/s | 0.68 / 0.74, 0.80 / 0.68 | 517–894 → 1,067–7,939 |
+| 0.5% | 0.38 / 0.38, 0.48 / 0.58 | 0.51 / 0.60, 0.54 / 0.56 | 358–1,346 → 330–1,218 |
+
+The hypothesis was wrong about what holds the flow. Unstriped, its one
+transmit worker runs at 73%, not at its limit. The flow is held by loss
+inside the tunnel: in the run inspected, 848 and 2,025 frames per
+direction were sent and expired unacknowledged, though the path has no
+configured loss, and the
+receiving daemon's receive socket reports overflows (its buffer is
+capped at 416 KiB in this container). TCP sends in bursts, a burst
+overflows that socket, the repairs fall into the same overflow, the
+frames expire, and TCP backs off before a lane's owner refuses frames
+for long. So striping rarely engages: never at 0.5% loss, and for part
+of the lossless runs (one direction of the run inspected). Where it did
+engage it made things worse: 8,800 frames expired, 1,566 of them before
+they were admitted,
+and the writer wrote 2% of frames out of sequence with nothing lost on
+the path, which means the lanes drifted more than the 5 ms hold apart.
+
+Striping therefore helps a flow that keeps offering load whatever the
+tunnel does, such as the UDP generator or an aggregate inside another
+tunnel, and not a lone TCP flow here. What limits one TCP flow is the
+next thing to find: the receive-socket overflows first, then the lane
+skew under bursts.
+
 ## Twice the receive slots in the same storage (November 15, landed)
 
 On the routed 4.5 ms path with 1% loss (the lossy efficiency point,

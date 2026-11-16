@@ -411,8 +411,16 @@ Decisions only the user can make, each blocking a remaining goal:
    lanes while two others remain, which lifted the overloaded case by
    38–64% to about 2 Gbit/s each way. Shared millisecond stamps also
    tolerate a stamp slightly ahead of the reading worker's clock now.
-   Next: measure the full-size and lossy points with the feature on,
-   and a single TCP flow, before considering the default.
+   With that build every striped run of the UDP flow delivers 1.93–2.23
+   Gbit/s in both directions. One TCP flow gains nothing, though: it is
+   not held by a worker but by loss inside the tunnel. TCP's bursts
+   overflow the receiving daemon's 416 KiB receive socket, sent frames
+   expire unacknowledged, and TCP backs off near 0.7–1.0 Gbit/s with its
+   transmit worker at 73%. `stripe_flows` stays off by default; it suits
+   flows that keep offering load, such as an aggregate inside another
+   tunnel. Next: what limits one TCP flow (the receive-socket overflows
+   first, then lane skew under bursts), since that, not striping, stands
+   between a single TCP stream and the 5 Gbit/s gate.
 8. Decided November 14: `daemon.offload_frames` stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should

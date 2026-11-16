@@ -1,0 +1,10 @@
+{"schema":1,"date":"2026-11-16","build":"0d128df, --features bin","conditions":{"generator":"iperf3 TCP, one flow each way, unlimited, 20 s","workers":4,"one_way_delay_us":3750,"outer_payload_limit":1452,"arms":{"balc":"balance_flows and control_lane","strc":"balc plus stripe_flows"},"order":"per loss rate: balc, strc, then strc, balc"},"runs":[
+{"arm":"balc","outer_loss_permille":0,"repeat":"r1","lr_received_gbps":1.02,"rl_received_gbps":0.95,"lr_retransmits":595,"rl_retransmits":894,"striped_frames_received":0},
+{"arm":"balc","outer_loss_permille":0,"repeat":"r2","lr_received_gbps":0.75,"rl_received_gbps":0.67,"lr_retransmits":517,"rl_retransmits":608,"striped_frames_received":0},
+{"arm":"strc","outer_loss_permille":0,"repeat":"r1","lr_received_gbps":0.68,"rl_received_gbps":0.74,"lr_retransmits":1067,"rl_retransmits":2033,"striped_frames_received":218895},
+{"arm":"strc","outer_loss_permille":0,"repeat":"r2","lr_received_gbps":0.80,"rl_received_gbps":0.68,"lr_retransmits":7939,"rl_retransmits":4822,"striped_frames_received":1371477},
+{"arm":"balc","outer_loss_permille":5,"repeat":"r1","lr_received_gbps":0.38,"rl_received_gbps":0.38,"lr_retransmits":1346,"rl_retransmits":1310,"striped_frames_received":0},
+{"arm":"balc","outer_loss_permille":5,"repeat":"r2","lr_received_gbps":0.48,"rl_received_gbps":0.58,"lr_retransmits":798,"rl_retransmits":358,"striped_frames_received":0},
+{"arm":"strc","outer_loss_permille":5,"repeat":"r1","lr_received_gbps":0.51,"rl_received_gbps":0.60,"lr_retransmits":681,"rl_retransmits":330,"striped_frames_received":0},
+{"arm":"strc","outer_loss_permille":5,"repeat":"r2","lr_received_gbps":0.54,"rl_received_gbps":0.56,"lr_retransmits":873,"rl_retransmits":1218,"striped_frames_received":0}
+]}
