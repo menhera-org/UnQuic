@@ -874,8 +874,9 @@ The kernel columns can only be confirmed on the box itself, with real NICs.
 1 ms, where it took sixteen, and ACKs due together for one session's
 lanes share a datagram. On the full-size point the control lane carries
 less than half the bytes it did and CPU per delivered bit falls 1.6–1.8%
-(BENCH.md). The split profile has not been repeated since, so the line's
-share of the table above is not yet known.
+(BENCH.md). A split profile of that build puts control sends at 100–110
+cycles per frame event against about 200 before, which is this line's
+target.
 
 **The compact per-packet record (item 1).** Today one sent DATA datagram
 touches five structures on its transmit owner: the flight plan, a 64-byte

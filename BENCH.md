@@ -1421,6 +1421,12 @@ rounds −1.4% against HEAD and −1.2% against the copy, but lower than
 both in only 8, which misses the bar's round clause. Sharing datagrams
 is what carried it over.
 
+A split profile of the landed build (one round on the same point) puts
+control sends at 100–110 cycles per frame event, where the build before
+spent about 200. That is the target the budget set for the line. Each
+daemon's busy total is 5,230 and 5,540 cycles per frame event against
+5,400–5,650.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames
