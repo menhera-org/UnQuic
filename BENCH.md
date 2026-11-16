@@ -2066,7 +2066,10 @@ three fixes from review (a moved lane's counters carried over once,
 steering kept per endpoint, the rotation applied to a socket group bound
 late), none of which touches the steady state. The repeat on the
 committed code gained 3.2%, which alone is short of the bar; the sixteen
-points together gain 5.1%. At this offer the rotated daemon is already
+points together gain 5.1%. Four more points on the committed code read
+15.09 (15.01–15.21) against 14.44 (13.85–14.83), which puts its twelve
+at 3.6%
+([results](benches/four-workers-rotate-lanes-repeat-3.json)). At this offer the rotated daemon is already
 limited by its two workers that transmit and receive, the busier of
 which refused 14,000–30,000 frames a round. At 10 Gbit/s offered each way
 it gains
