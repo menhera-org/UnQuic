@@ -794,12 +794,15 @@ delivery passes that point. Without this, ACKs of sparse traffic before a load
 could end Startup before the load arrived. The daemon-wide
 `tolerate_random_loss` switch, on by default, deviates from draft 07: outside
 bandwidth probing, a loss round cuts the short-term bounds only when it lost
-more than 2% or its RTT samples rose more than max(min_rtt / 8, 250 µs) above
-min_rtt, the sign of a queue. Random loss on an unqueued path no longer
-ratchets the rate down, while congestion loss at a shared bottleneck still
-does: against one TCP CUBIC flow at a quarter-BDP queue the switch leaves the
-TCP share unchanged, and on the lossy single-flow target it raises every
-direction by 4–26% (BENCH.md). While it is on, `daemon.loss_threshold_permille`
+more than 2% or even its smallest RTT sample, less the receiver's reported
+ACK hold, rose more than max(min_rtt / 8, 250 µs) above min_rtt, the sign of
+a standing queue. Random loss on an unqueued path no longer ratchets the rate
+down, while congestion loss at a shared bottleneck still does: against one
+TCP CUBIC flow at a quarter-BDP queue the TCP share is not reduced, and on a
+4.5 ms path with 1% random loss sixteen flows at 2 Gbit/s each way lose
+0.02–0.04% of their frames instead of about 1% (BENCH.md). Until November 16
+the check used the round's largest sample, which the hosts' own jitter
+tripped in most rounds. While it is on, `daemon.loss_threshold_permille`
 (20–200, default 20, draft 07's 2%) sets the loss rate above which a round
 counts as too lossy, in every loss-rate test: the probe-time inflight bound,
 the short-term cut, Startup's loss exit and ProbeBW_UP. The queue check still

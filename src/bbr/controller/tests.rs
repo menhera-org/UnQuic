@@ -353,17 +353,22 @@ fn tolerated_random_loss_cuts_shortterm_only_above_the_loss_threshold_or_with_a_
     // 600 of 30,000 bytes is exactly 2%, which is not too high. With a 10 ms
     // min_rtt, RTT samples above 11.25 ms show a queue, which still cuts. A
     // 10% threshold moves the boundary to 3,000 bytes only while tolerating.
+    // The receiver's reported hold of the ACK comes off the sample first: an
+    // ACK held 1 ms on purpose shows no queue, and one reported hold serves
+    // one ACK only.
     let rtt = Duration::from_micros;
-    for (tolerate, threshold, lost, sampled, cut) in [
-        (false, 20, 600, rtt(10_000), true),
-        (true, 20, 600, rtt(10_000), false),
-        (true, 20, 601, rtt(10_000), true),
-        (true, 20, 600, rtt(11_250), false),
-        (true, 20, 600, rtt(11_251), true),
-        (true, 100, 3000, rtt(10_000), false),
-        (true, 100, 3001, rtt(10_000), true),
-        (true, 100, 1500, rtt(11_251), true),
-        (false, 100, 601, rtt(10_000), true),
+    for (tolerate, threshold, lost, sampled, held, cut) in [
+        (false, 20, 600, rtt(10_000), 0, true),
+        (true, 20, 600, rtt(10_000), 0, false),
+        (true, 20, 601, rtt(10_000), 0, true),
+        (true, 20, 600, rtt(11_250), 0, false),
+        (true, 20, 600, rtt(11_251), 0, true),
+        (true, 20, 600, rtt(12_250), 1000, false),
+        (true, 20, 600, rtt(12_251), 1000, true),
+        (true, 100, 3000, rtt(10_000), 0, false),
+        (true, 100, 3001, rtt(10_000), 0, true),
+        (true, 100, 1500, rtt(11_251), 0, true),
+        (false, 100, 601, rtt(10_000), 0, true),
     ] {
         let mut c = cruise();
         c.tolerate_random_loss(tolerate);
@@ -375,7 +380,9 @@ fn tolerated_random_loss_cuts_shortterm_only_above_the_loss_threshold_or_with_a_
         let mut s = sample(&c, 100_000, 1500);
         s.lost = u64::from(lost);
         s.tx_in_flight = 30000;
+        c.ack_delay(rtt(held));
         c.on_ack(s, Some(sampled), 15000, false, ms(60)).unwrap();
+        assert_eq!(c.ack_delay, Duration::ZERO);
         let bounds = (c.bw_shortterm, c.inflight_shortterm);
         if cut {
             assert_eq!(bounds, (1_050_000, 31500));
@@ -383,6 +390,33 @@ fn tolerated_random_loss_cuts_shortterm_only_above_the_loss_threshold_or_with_a_
             assert_eq!(bounds, (INFINITY, INFINITY));
             assert_eq!(c.pacing_rate, 1_485_000);
         }
+    }
+}
+
+#[test]
+fn the_queue_check_judges_a_loss_round_by_its_smallest_rtt_sample() {
+    // The round's last ACK samples 13 ms against a 10 ms min_rtt. Alone that
+    // shows a queue. An earlier sample within the 11.25 ms margin shows the
+    // path was not queued throughout, so tolerated loss does not cut.
+    for (earlier, cut) in [(None, true), (Some(11_250), false), (Some(11_251), true)] {
+        let mut c = cruise();
+        c.tolerate_random_loss(true);
+        c.bw_latest = 0;
+        c.inflight_latest = 0;
+        c.enter_recovery(c.now, 30000, false).unwrap();
+        loss(&mut c, 600, 600, 30000, false);
+        c.loss_round_rtt = earlier.map(Duration::from_micros);
+        let mut s = sample(&c, 100_000, 1500);
+        s.lost = 600;
+        s.tx_in_flight = 30000;
+        c.on_ack(s, Some(ms(13)), 15000, false, ms(60)).unwrap();
+        assert_eq!(
+            c.bw_shortterm != INFINITY,
+            cut,
+            "earlier sample {earlier:?}"
+        );
+        // The next round starts without a sample.
+        assert_eq!(c.loss_round_rtt, None);
     }
 }
 

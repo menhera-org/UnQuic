@@ -643,6 +643,10 @@ impl Owner {
                 let rtt = progress
                     .rtt_sent_at
                     .and_then(|sent| received.checked_sub(sent));
+                // The receiver holds an ACK for at most ack::DELAY.
+                state
+                    .controller
+                    .ack_delay(Duration::from_micros(u64::from(delay_us)).min(crate::ack::DELAY));
                 if state
                     .controller
                     .on_ack(sample, rtt, in_flight, state.cwnd_limited, now)

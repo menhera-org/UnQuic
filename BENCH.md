@@ -1216,6 +1216,110 @@ back 0–2,721 refusals per daemon while ordinary frames had none. The gap
 is much smaller than on November 14 (11.6–18.7% against 4.9–12.8%), and
 delivery stays level at 3.77–3.92 Gbit/s on both arms. Decision 8 stands.
 
+## Where the lossy point loses its frames (November 16)
+
+On the routed 4.5 ms path with 1% loss, about 1% of frames are still
+lost at 2 Gbit/s each way, though a repair should fit a frame's 20 ms
+lifetime with room to spare. Counters, a trace and three temporary
+histograms (packet age at loss declaration, and a frame's remaining
+lifetime at its first send and at each repair) show where they go.
+
+- Loss detection and repair are prompt. Packets are declared lost at
+  5–6 ms, and most repairs leave with 12–14 ms of lifetime left.
+- The frames wait before their first send. In 40 s one daemon first
+  sent 15% of its 6.75 million frames with 15 ms or less left, 7% with
+  12 ms or less, and never sent 0.5–0.7% within 20 ms. Those unsent
+  frames are most of the loss; frames sent late that then lose a piece
+  add 0.1–0.2%.
+- The pacing rate averages 3.7 Gbit/s but is within 15% of the offered
+  load for 35% of the run and below it for 4.6%. BBR's short-term
+  bandwidth bound, its response to loss, is in force 31% of the time,
+  and it holds the rate at what the last round delivered, which for an
+  offer of 2 Gbit/s is 2 Gbit/s.
+- Among frames never sent, ProbeRTT covered 47% of their last 20 ms,
+  though it is 2% of the run: every 10 s the window is halved for
+  200 ms, 44 round trips here.
+
+Two causes follow. The random-loss tolerance (`tolerate_random_loss`,
+on by default) is meant to keep loss under 2% from cutting the
+short-term bounds unless an RTT sample in the round shows a queue, more
+than an eighth of min_rtt (0.57 ms here) above it. But the sample it
+used runs from send to the ACK's receipt and includes the receiver's
+hold of the ACK, up to 1 ms on purpose, so nearly every lossy round
+looked queued and was cut. And ProbeRTT's 200 ms is long against a
+20 ms frame lifetime.
+
+An exploratory build with a 20 ms ProbeRTT lost 0.59%, 0.79% and 0.86%
+at each round's worst point against 1.30%, 1.12% and 1.12%
+([results](benches/lossy-probe-rtt-20ms-exploratory.json)). It is not a
+candidate as it stands: the draft's 200 ms is what lets flows sharing a
+bottleneck see its queue drain together.
+
+The first candidate took the receiver's reported hold off each RTT
+sample before the queue check; nothing else changed. Hypothesis: the
+short-term bound then stays out of the way under random loss, the
+sender stops queuing, and unsent expiries fall sharply. Bar, stated
+before the run: on the lossy point, each round's worst point loses less
+than HEAD's in three of three rounds and frames never sent fall by half
+or more; on the full-size point, which has no loss, CPU per delivered
+bit stays within A/A noise.
+
+It missed the bar ([results](benches/lossy-queue-check-ack-hold.json)):
+0.48%, 0.57% and 0.96% lost against 0.83%, 1.01% and 0.88%, lower in two
+rounds of three, and frames never sent did not halve. Counting what cut
+each lossy round showed why. With the hold taken off, 3,888 of one
+daemon's 4,432 lossy rounds outside probing were still cut by the queue
+check, 9 by the loss rate, and 535 were left alone. The largest sample
+of a round sat 0.5–1.25 ms above min_rtt in most rounds. A round has
+hundreds of samples, and their maximum only shows the hosts' own jitter.
+
+The second candidate judges a round by its smallest sample, with the
+hold still taken off: a standing queue delays every packet of the round.
+This is the November 11 idea
+([below](#the-queue-check-from-each-rounds-smallest-rtt-november-11)),
+rejected then because the single-flow target it was judged on was held
+by lane placement and showed nothing. Same bar as above
+([results](benches/lossy-queue-check-smallest-rtt.json)):
+
+| Round | HEAD: worst point lost | Never sent | Abandoned | Smallest sample: lost | Never sent | Abandoned |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1.18% | 91,581 | 153,047 | 0.04% | 2,650 | 10,185 |
+| 2 | 0.64% | 46,605 | 114,521 | 0.015% | 256 | 4,384 |
+| 3 | 0.67% | 54,138 | 123,688 | 0.016% | 436 | 5,685 |
+
+Counts are per run over both daemons, of 13.6 million frames. Loss on
+the lossy point falls by a factor of 30–40 in every round, to about what
+1% random loss leaves when one repair fits the lifetime, and delivery
+rises from 3.91–3.93 to 3.94–3.95 Gbit/s.
+
+A sender that ignores more loss might take a shared bottleneck from
+other traffic, so the November 11 coexistence check ran again with its
+bar: a 1 Gbit/s token-bucket bottleneck at 7.5 ms, one QinQ flow each
+way offered 1 Gbit/s through the tunnel, one outer TCP CUBIC flow left
+to right, three interleaved repeats; the TCP flow's median with the
+candidate must not fall below HEAD's range by more than its width
+([quarter BDP](benches/coexist-queue-check-smallest-rtt-160.json),
+[one BDP](benches/coexist-queue-check-smallest-rtt-640.json)), Mbit/s
+over 20 s:
+
+| Queue | Build | Tunnel L→R | Tunnel R→L | Competing TCP L→R |
+| --- | --- | --- | --- | --- |
+| 160 (¼ BDP) | HEAD | 701 (554–702) | 778 (721–791) | 136 (135–218) |
+| 160 (¼ BDP) | Smallest sample | 629 (561–712) | 707 (620–800) | 196 (138–209) |
+| 640 (1 BDP) | HEAD | 532 (350–545) | 781 (762–829) | 350 (334–533) |
+| 640 (1 BDP) | Smallest sample | 530 (516–536) | 751 (402–782) | 350 (344–373) |
+
+The TCP flow's median is higher with the candidate at the shallow queue
+and the same at the deep one, so the bar holds: where a queue stands,
+every sample of the round shows it and the bounds are still cut.
+
+On the full-size point, which has no loss, the candidate was lower than
+HEAD in 3 of 6 rounds at a median of +0.1%, with HEAD's copy at +0.4%
+([results](benches/full-size-queue-check-smallest-rtt.json)). Every part
+of the bar is met and the check lands. ProbeRTT's share of the remaining
+loss is left for a later look; after this change it is a share of a
+much smaller number.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames

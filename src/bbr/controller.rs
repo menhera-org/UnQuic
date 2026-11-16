@@ -127,8 +127,11 @@ pub struct Controller {
     // Deviation switch: only loss rounds above the 2% threshold, or with queueing
     // delay, cut short-term bounds.
     tolerate_random_loss: bool,
-    // Largest RTT sample since the current loss round began.
-    loss_round_rtt: Duration,
+    // Smallest RTT sample since the current loss round began, each less the
+    // receiver's reported hold of its ACK.
+    loss_round_rtt: Option<Duration>,
+    // The receiver's hold of the ACK the next on_ack applies.
+    ack_delay: Duration,
     // Loss-rate threshold in permille while random loss is tolerated.
     loss_threshold: u16,
     // ProbeRTT's BDP spans min_rtt plus the maximum ACK delay.
@@ -221,7 +224,8 @@ impl Controller {
             bw_latest: 0,
             inflight_latest: 0,
             tolerate_random_loss: false,
-            loss_round_rtt: Duration::ZERO,
+            loss_round_rtt: None,
+            ack_delay: Duration::ZERO,
             loss_threshold: LOSS_THRESHOLD,
             probe_rtt_ack_delay: false,
             extra_filter: [0; 10],
@@ -261,7 +265,7 @@ impl Controller {
     /// Deviation from draft 07, off by default. Outside bandwidth probing, a
     /// loss round then cuts the short-term bounds only when the ACK that ends
     /// it shows more than the loss threshold that already stops probing (2%
-    /// unless set by [`Controller::set_loss_threshold`]), or when an
+    /// unless set by [`Controller::set_loss_threshold`]), or when every
     /// RTT sample in that round shows a queue, so steady random loss on an
     /// unqueued path no longer ratchets the rate down round by round while
     /// congestion loss still does.
@@ -293,13 +297,27 @@ impl Controller {
         }
     }
 
-    /// Whether the current loss round's RTT samples show queueing delay: more
-    /// than an eighth of min_rtt, and at least 250 µs, above min_rtt.
+    /// Reports how long the receiver held the ACK that the next
+    /// [`Controller::on_ack`] applies. The queue check of
+    /// [`Controller::tolerate_random_loss`] takes it off that ACK's RTT
+    /// sample: a receiver may hold an ACK for a millisecond on purpose, more
+    /// than the check's margin on a short path, and that is not a queue.
+    pub fn ack_delay(&mut self, delay: Duration) {
+        self.ack_delay = delay;
+    }
+
+    /// Whether the current loss round's RTT samples show a standing queue:
+    /// even the smallest of them, after the receiver's reported ACK hold is
+    /// taken off, is more than an eighth of min_rtt, and at least 250 µs,
+    /// above min_rtt. A queue delays every packet of the round; the largest
+    /// sample among hundreds only shows the hosts' own jitter.
     fn queued_in_round(&self) -> bool {
-        self.min_rtt.is_some_and(|min| {
-            let margin = (min / 8).max(Duration::from_micros(250));
-            self.loss_round_rtt > min.saturating_add(margin)
-        })
+        self.loss_round_rtt
+            .zip(self.min_rtt)
+            .is_some_and(|(rtt, min)| {
+                let margin = (min / 8).max(Duration::from_micros(250));
+                rtt > min.saturating_add(margin)
+            })
     }
 
     /// Current phase, for diagnostics and deterministic tests.
@@ -404,8 +422,10 @@ impl Controller {
         let rate = sample.rate.unwrap_or(0);
 
         self.loss_round_start = sample.prior_delivered >= self.loss_round_delivered;
+        let held = std::mem::take(&mut self.ack_delay);
         if let Some(rtt) = rtt {
-            self.loss_round_rtt = self.loss_round_rtt.max(rtt);
+            let rtt = rtt.saturating_sub(held);
+            self.loss_round_rtt = Some(self.loss_round_rtt.map_or(rtt, |least| least.min(rtt)));
         }
         self.bw_latest = self.bw_latest.max(rate);
         self.inflight_latest = self.inflight_latest.max(sample.delivered);
@@ -600,7 +620,7 @@ impl Controller {
                         .max(scale(self.inflight_shortterm, 70, 100));
             }
             self.loss_in_round = false;
-            self.loss_round_rtt = Duration::ZERO;
+            self.loss_round_rtt = None;
         }
     }
 

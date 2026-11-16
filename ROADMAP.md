@@ -1981,8 +1981,16 @@ November 10 evidence for that list, all in BENCH.md:
   max(min_rtt / 8, 250 µs): TCP keeps its share, the lossy target rises 4–26%,
   and the switch is on by default
   ([BENCH.md](BENCH.md#tolerating-random-loss-only-without-queueing-delay-november-11)).
-  Checking each round's smallest RTT instead did not help. The 5% loss rows
-  still need FEC or a loss-agnostic response.
+  Checking each round's smallest RTT instead did not help the single-flow
+  target then, which lane placement held. On November 16 it did land: on
+  the lossy multi-flow point the largest sample tripped the check in 88%
+  of lossy rounds from host jitter alone, which pinned the pacing rate to
+  the offered load, queued frames in the sender and expired about 1% of
+  them. Judged by the round's smallest sample, less the receiver's ACK
+  hold, that point loses 0.02–0.04%, the competing TCP share is not
+  reduced, and the full-size point is unchanged
+  ([BENCH.md](BENCH.md#where-the-lossy-point-loses-its-frames-november-16)).
+  The 5% loss rows still need FEC or a loss-agnostic response.
 
 ## Stage 6: protocol freeze
 
