@@ -2072,7 +2072,11 @@ which refused 14,000–30,000 frames a round. At 10 Gbit/s offered each way
 it gains
 16.1% with every point above every point of `0a15d20`, and no direction
 delivers less than 7.75 Gbit/s where `0a15d20` falls to 5.63. The cores
-it uses were idle: 334% of a core per daemon against 276%.
+it uses were idle: 334% of a core per daemon against 276%. At 12 Gbit/s
+offered each way it delivers no more than at 10, 16.20 (15.91–16.59)
+against 14.84 (14.59–15.22) in four points, so about 16.3 Gbit/s in
+total is this bed's ceiling with the rotation
+([results](benches/four-workers-rotate-lanes-12g.json)).
 
 In every run the reading worker received 0.36–0.65 GB in the two points
 of a round, the two seconds before the rotation, against about 14 GB on
