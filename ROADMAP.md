@@ -158,10 +158,27 @@ and 6% near it, and leave delivery under overload where it was (13.5–
 13.6 Gbit/s in total). What caps that is balance, not cycles: with
 QinQ traffic one worker reads the whole TAP and still carries a full
 transmit and receive lane, and it saturates while the other three are
-33–55% idle. Placement that weighs each worker's whole load, and can
-move a running flow, is the open design question for the four-core
-target
+33–55% idle
 ([BENCH.md](BENCH.md#four-workers-up-to-and-past-saturation-november-16)).
+
+Three probes in the evening showed where the balance goes wrong. The
+receive owner of a lane follows from the session cookie, and with this
+one the worker that reads the TAP also receives a data lane, while
+another worker only transmits. Emptying the transmit lane whose frames
+the peer's reader receives delivered 8–10% more at 8 Gbit/s offered each
+way; emptying the reader's own lane delivered 14% less. A sender cannot
+tell those two lanes apart: a `daemon.balance_load` switch that moved
+flows by each worker's busy share, and then by lanes refusing frames,
+gained 2% in both forms and was rejected. A receiver can: rotating its
+receive owners so that the reader gets only the peer's control lane
+delivered 7.7% more at 8 Gbit/s offered and 12.6% more at 10, moving no
+flow. As a constant that is no candidate, because the reading worker is
+known only once traffic flows. The next step for the four-core target is
+to move a receive lane between workers at run time: when one worker reads
+nearly all of a session's TAP frames and receives a data lane, exchange
+that lane's owner with the control lane's, hand over its reassembly and
+ACK state, and change the steering constant to match
+([BENCH.md](BENCH.md#which-worker-receives-which-lane-with-four-workers-november-16)).
 
 Next targets in the daemon's own code, by cycles per frame event in
 that profile: output coalescing around the TAP write (about 320, the

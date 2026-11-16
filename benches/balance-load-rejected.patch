@@ -1,0 +1,633 @@
+diff --git a/src/bin/unquic/config.rs b/src/bin/unquic/config.rs
+index aa63dca..e5d16ed 100644
+--- a/src/bin/unquic/config.rs
++++ b/src/bin/unquic/config.rs
+@@ -276,10 +276,11 @@ mod tests {
+             assert!(!loaded.config.daemon.offload_frames);
+             assert!(loaded.config.daemon.partial_checksums);
+             assert!(!loaded.config.daemon.stripe_flows);
++            assert!(!loaded.config.daemon.balance_load);
+             loaded.config.validate().unwrap();
+         }
+         let text = format!(
+-            "[daemon]\ncontrol_lane = false\nbalance_flows = false\noffload_frames = true\npartial_checksums = false\nstripe_flows = true\n{}",
++            "[daemon]\ncontrol_lane = false\nbalance_flows = false\noffload_frames = true\npartial_checksums = false\nstripe_flows = true\nbalance_load = true\n{}",
+             sample()
+         );
+         let loaded = Loaded::parse(&text).unwrap();
+@@ -288,6 +289,7 @@ mod tests {
+         assert!(loaded.config.daemon.offload_frames);
+         assert!(!loaded.config.daemon.partial_checksums);
+         assert!(loaded.config.daemon.stripe_flows);
++        assert!(loaded.config.daemon.balance_load);
+         loaded.config.validate().unwrap();
+         let text = format!("[daemon]\ntx_hold_us = 1000\n{}", sample());
+         let loaded = Loaded::parse(&text).unwrap();
+diff --git a/src/config.rs b/src/config.rs
+index 6a05a9a..d85bc30 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -78,6 +78,12 @@ pub struct Daemon {
+     /// order on one worker before its TAP (design section 13.1, item 6).
+     /// Sending striped flows is not implemented yet.
+     pub stripe_flows: bool,
++    /// Off by default; needs `balance_flows`. Each worker publishes how busy
++    /// it is, and a TAP reader moves an active flow, once, from a data lane
++    /// whose worker is at least 75% busy to the data lane of the least busy
++    /// worker when that one is 25 points less busy, at most one flow per
++    /// session every 200 ms. The move can reorder that flow's frames once.
++    pub balance_load: bool,
+ }
+ impl Default for Daemon {
+     fn default() -> Self {
+@@ -92,6 +98,7 @@ impl Default for Daemon {
+             offload_frames: false,
+             partial_checksums: true,
+             stripe_flows: false,
++            balance_load: false,
+         }
+     }
+ }
+diff --git a/src/counters.rs b/src/counters.rs
+index 79e50fb..79aa868 100644
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -241,6 +241,10 @@ metrics! {
+     /// lanes differ; zero with tap_errors nonzero means the frame failed
+     /// this daemon's own checks before any syscall.
+     tap_error_code: max,
++    /// Active flows a TAP reader moved to a less busy worker's lane under
++    /// daemon.balance_load. A lost race with another reader counts a move
++    /// that did not happen.
++    flow_shifts: sum,
+ }
+ 
+ fn sum(a: u64, b: u64) -> u64 {
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 530949a..5790415 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -81,8 +81,15 @@ pub(crate) struct Shared {
+     // Per session, the stripes TAP readers claim for flows one worker cannot
+     // carry; empty unless daemon.stripe_flows and daemon.balance_flows.
+     pub stripes: Vec<Box<[crate::worker::Stripe]>>,
+-    // Per session and transmit lane, its owner's backlog mark; empty with stripes.
++    // Per session and transmit lane, its owner's backlog mark; empty unless
++    // stripes or loads exist.
+     pub backlog: Vec<Box<[AtomicU64]>>,
++    // Per worker, the percentage of its last window it was busy; empty
++    // unless daemon.balance_load and daemon.balance_flows.
++    pub loads: Box<[AtomicU8]>,
++    // Per session, the millisecond a reader last moved a flow by load; empty
++    // with loads.
++    pub shifts: Box<[AtomicU64]>,
+ }
+ 
+ impl Control {
+@@ -373,6 +380,7 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
+     let endpoints = config.config().endpoints.len();
+     let balance_flows = config.config().daemon.balance_flows;
+     let striping = balance_flows && config.config().daemon.stripe_flows;
++    let loading = balance_flows && config.config().daemon.balance_load;
+     if peers > (u32::MAX as usize >> 7) || adopted.len() > sessions {
+         return Err(io::ErrorKind::InvalidInput.into());
+     }
+@@ -392,26 +400,28 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
+                 .collect())
+         })
+         .collect::<io::Result<_>>()?;
+-    let (stripes, backlog) = if striping {
+-        (
+-            (0..sessions)
+-                .map(|_| {
+-                    (0..crate::worker::STRIPE_SLOTS)
+-                        .map(|_| crate::worker::Stripe::default())
+-                        .collect()
+-                })
+-                .collect(),
+-            (0..sessions)
+-                .map(|session| {
+-                    let lanes = config
+-                        .peer_for_session(session)
+-                        .map_or(0, |peer| config.config().peers[peer].tx_lanes);
+-                    (0..lanes).map(|_| AtomicU64::new(0)).collect()
+-                })
+-                .collect(),
+-        )
++    let stripes = if striping {
++        (0..sessions)
++            .map(|_| {
++                (0..crate::worker::STRIPE_SLOTS)
++                    .map(|_| crate::worker::Stripe::default())
++                    .collect()
++            })
++            .collect()
++    } else {
++        Vec::new()
++    };
++    let backlog = if striping || loading {
++        (0..sessions)
++            .map(|session| {
++                let lanes = config
++                    .peer_for_session(session)
++                    .map_or(0, |peer| config.config().peers[peer].tx_lanes);
++                (0..lanes).map(|_| AtomicU64::new(0)).collect()
++            })
++            .collect()
+     } else {
+-        (Vec::new(), Vec::new())
++        Vec::new()
+     };
+     let shared = Arc::new(Shared {
+         config,
+@@ -444,6 +454,12 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
+         },
+         stripes,
+         backlog,
++        loads: (0..if loading { count } else { 0 })
++            .map(|_| AtomicU8::new(0))
++            .collect(),
++        shifts: (0..if loading { sessions } else { 0 })
++            .map(|_| AtomicU64::new(0))
++            .collect(),
+     });
+     let mut workers = (0..count)
+         .map(|id| Worker::new(id, Arc::clone(&shared), control.clone()))
+@@ -544,9 +560,10 @@ fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
+     } else {
+         0
+     };
++    // The backlog marks, counted with the lanes.
++    let marks = transmit / size_of::<LaneCounters>() * size_of::<AtomicU64>();
+     let flows = if raw.daemon.balance_flows && raw.daemon.stripe_flows {
+-        // Stripe slots per session, and the backlog marks counted with the lanes.
+-        let marks = transmit / size_of::<LaneCounters>() * size_of::<AtomicU64>();
++        // Stripe slots per session.
+         sessions
+             .checked_mul(crate::worker::STRIPE_SLOTS * size_of::<crate::worker::Stripe>())?
+             .checked_add(marks)?
+@@ -554,6 +571,17 @@ fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
+     } else {
+         flows
+     };
++    let flows = if raw.daemon.balance_flows && raw.daemon.balance_load {
++        // One busy share per worker and one move stamp per session, and the
++        // marks unless striping counted them.
++        let marks = if raw.daemon.stripe_flows { 0 } else { marks };
++        flows
++            .checked_add(workers)?
++            .checked_add(sessions.checked_mul(size_of::<AtomicU64>())?)?
++            .checked_add(marks)?
++    } else {
++        flows
++    };
+     let shared = sessions
+         .checked_mul(65_536 + size_of::<Box<[AtomicU8]>>() + 1 + size_of::<AtomicU64>())?
+         .checked_add(workers.checked_mul(STACK_BYTES + size_of::<Counters>() + 256)?)?
+diff --git a/src/worker.rs b/src/worker.rs
+index 0a8b98c..7589a42 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -404,7 +404,7 @@ use std::{
+     collections::VecDeque,
+     net::SocketAddrV6,
+     ops::Range,
+-    sync::atomic::{AtomicU64, Ordering},
++    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+ };
+ 
+ const TAP_TOKEN: u64 = 1 << 32;
+@@ -498,6 +498,20 @@ const fn stamp_age(now: u64, stamp: u64) -> u64 {
+ pub(crate) const STRIPE_SLOTS: usize = 16;
+ /// A flow-table lane value with this bit names a stripe slot instead.
+ const STRIPED: usize = 0x80;
++/// A flow-table lane value with this bit was moved by load once already and
++/// stays on its lane until the flow goes idle. Lanes number below 64.
++// shortcut: one move per active flow bounds reordering but cannot follow a
++// load that changes twice; allow another move after a long hold if
++// long-lived flows are seen stranded on a busy worker.
++const SHIFTED: usize = 0x40;
++/// The window over which a worker measures how busy it was.
++const LOAD_WINDOW: Duration = Duration::from_millis(100);
++/// A flow moves by load only to a lane whose worker was at most this many
++/// percent busy, so the move does not overload that worker in turn.
++const LOAD_ROOM: u8 = 70;
++/// Flows of one session move by load no more often than this, so each
++/// move's effect is in the published loads before the next.
++const SHIFT_MS: u64 = 200;
+ /// How long a lane's owner must keep refusing admission before the next read
+ /// of a flow on it stripes the flow.
+ // shortcut: fixed times stand in for the design's one pacing round; derive
+@@ -615,8 +629,10 @@ fn stripe_read(
+ /// to another TAP queue keeps its lane. Each entry holds a 32-bit key tag, the
+ /// lane and a 24-bit millisecond stamp. A flow whose entry another active flow
+ /// holds falls back to its hash lane among all `lanes`, as does every flow
+-/// without a table. `stripe` may move an active flow from its lane to a
+-/// stripe slot, which the entry then keeps and this returns with the STRIPED bit.
++/// without a table. `replace` sees an active flow's entry, its lane with the
++/// SHIFTED bit if it has moved by load, and may give the entry a new value:
++/// a stripe slot with the STRIPED bit, which this returns as it is, or
++/// another lane with the SHIFTED bit, which this returns without the bit.
+ fn balanced_lane(
+     slots: &[AtomicU64],
+     cursor: &std::sync::atomic::AtomicUsize,
+@@ -624,8 +640,15 @@ fn balanced_lane(
+     hash: u64,
+     data: std::ops::Range<usize>,
+     ms: u64,
+-    mut stripe: impl FnMut(usize) -> Option<usize>,
++    mut replace: impl FnMut(usize) -> Option<usize>,
+ ) -> usize {
++    let routed = |entry: usize| {
++        if entry & STRIPED != 0 {
++            entry
++        } else {
++            entry & !SHIFTED
++        }
++    };
+     let (first, lanes) = (data.start, data.end);
+     let Some(slot) = slots.get(key as usize % slots.len().max(1)) else {
+         return hash as usize % lanes;
+@@ -634,41 +657,42 @@ fn balanced_lane(
+     let now = ms & FLOW_MS_MASK;
+     let mut old = slot.load(Ordering::Acquire);
+     loop {
+-        let (old_tag, old_lane, old_ms) = (old >> 32, (old >> 24) & 0xff, old & FLOW_MS_MASK);
++        let (old_tag, entry, old_ms) = (old >> 32, (old >> 24) & 0xff, old & FLOW_MS_MASK);
+         let active = old != 0 && stamp_age(now, old_ms) < FLOW_IDLE_MS;
+-        let striped = old_lane as usize & STRIPED != 0;
++        let striped = entry as usize & STRIPED != 0;
++        let old_lane = routed(entry as usize);
+         if active
+             && old_tag == tag
+             && !striped
+-            && (first..lanes).contains(&(old_lane as usize))
+-            && let Some(number) = stripe(old_lane as usize)
++            && (first..lanes).contains(&old_lane)
++            && let Some(moved) = replace(entry as usize)
+         {
+-            let lane = (STRIPED | number) as u64;
+-            // A lost race leaves the claimed stripe to go idle.
++            // A lost race leaves the flow where it was, and a claimed stripe
++            // to go idle.
+             if slot
+                 .compare_exchange(
+                     old,
+-                    tag << 32 | lane << 24 | now,
++                    tag << 32 | (moved as u64) << 24 | now,
+                     Ordering::AcqRel,
+                     Ordering::Acquire,
+                 )
+                 .is_ok()
+             {
+-                return lane as usize;
++                return routed(moved);
+             }
+-            return old_lane as usize;
++            return old_lane;
+         }
+-        if active && old_tag == tag && (striped || (first..lanes).contains(&(old_lane as usize))) {
++        if active && old_tag == tag && (striped || (first..lanes).contains(&old_lane)) {
+             if old_ms != now {
+                 // A lost race only leaves the stamp a millisecond older.
+                 let _ = slot.compare_exchange(
+                     old,
+-                    tag << 32 | old_lane << 24 | now,
++                    tag << 32 | entry << 24 | now,
+                     Ordering::AcqRel,
+                     Ordering::Acquire,
+                 );
+             }
+-            return old_lane as usize;
++            return old_lane;
+         }
+         if active && old_tag != tag {
+             return hash as usize % lanes;
+@@ -686,6 +710,47 @@ fn balanced_lane(
+     }
+ }
+ 
++/// Whether a lane's owner refused admission within the last episode time.
++fn refusing(mark: &AtomicU64, ms: u64) -> bool {
++    let old = mark.load(Ordering::Relaxed);
++    old != 0 && stamp_age(ms & FLOW_MS_MASK, old & FLOW_MS_MASK) < STRIPE_EPISODE_MS
++}
++
++/// Under `daemon.balance_load`: the data lane a flow should move to from
++/// backlogged `lane`: the one with the least busy worker among those that
++/// are not refusing frames and whose worker has room, unless the session
++/// moved a flow in the last SHIFT_MS. `loads` holds each worker's busy
++/// percentage, `marks` each lane's backlog mark and `stamp` the millisecond
++/// of the session's last move.
++fn shift_lane(
++    loads: &[AtomicU8],
++    marks: &[AtomicU64],
++    stamp: &AtomicU64,
++    lane: usize,
++    data: std::ops::Range<usize>,
++    ms: u64,
++) -> Option<usize> {
++    let load = |lane: usize| {
++        loads
++            .get(lane % loads.len().max(1))
++            .map(|load| load.load(Ordering::Relaxed))
++    };
++    let target = data
++        .filter(|&to| to != lane && marks.get(to).is_some_and(|mark| !refusing(mark, ms)))
++        .filter_map(|to| Some((load(to).filter(|&busy| busy <= LOAD_ROOM)?, to)))
++        .min()?
++        .1;
++    let last = stamp.load(Ordering::Relaxed);
++    if last != 0 && ms.wrapping_sub(last) < SHIFT_MS {
++        return None;
++    }
++    // Another reader that moved a flow this instant keeps the turn.
++    stamp
++        .compare_exchange(last, ms.max(1), Ordering::Relaxed, Ordering::Relaxed)
++        .ok()?;
++    Some(target)
++}
++
+ /// First lane that carries data: 1 under `daemon.control_lane` when another
+ /// lane exists, so lane 0 keeps ACKs and control off data's packet history.
+ fn first_data_lane(control: bool, lanes: usize) -> usize {
+@@ -1153,6 +1218,12 @@ pub(crate) struct Worker {
+     counters: Snapshot,
+     setup_due: Duration,
+     retry_due: Option<Duration>,
++    // Under daemon.balance_load: when this load window began and how long
++    // the worker has blocked in it.
++    load_since: Duration,
++    load_blocked: Duration,
++    // Set by route when it moved a flow by load, for the caller to count.
++    shifted: std::cell::Cell<bool>,
+     #[cfg(feature = "profile")]
+     phases: [u64; crate::profile::PHASES],
+ }
+@@ -1536,6 +1607,9 @@ impl Worker {
+             counters,
+             setup_due: Duration::ZERO,
+             retry_due: None,
++            load_since: Duration::ZERO,
++            load_blocked: Duration::ZERO,
++            shifted: std::cell::Cell::new(false),
+             #[cfg(feature = "profile")]
+             phases: [0; crate::profile::PHASES],
+             shared,
+@@ -1656,6 +1730,12 @@ impl Worker {
+                 // Work queued before the flag was visible got no wake; take it now.
+                 block = self.incoming.iter_mut().flatten().all(Consumer::is_empty);
+             }
++            let loading = !self.shared.loads.is_empty();
++            let asleep = if block && loading {
++                Some(monotonic_now()?)
++            } else {
++                None
++            };
+             let waited = phase!(
+                 self,
+                 if block { 22 } else { 27 },
+@@ -1669,6 +1749,12 @@ impl Worker {
+             };
+             immediate = false;
+             let now = monotonic_now()?;
++            if loading {
++                self.note_load(
++                    asleep.map_or(Duration::ZERO, |at| now.saturating_sub(at)),
++                    now,
++                );
++            }
+             let start = event_start.min(count);
+             event_start = if start + 1 < count { start + 1 } else { 0 };
+             for event in events[start..count].iter().chain(&events[..start]) {
+@@ -2908,6 +2994,12 @@ impl Worker {
+                     frames,
+                     now,
+                 );
++                let moved = u64::from(self.shifted.take());
++                self.counters.flow_shifts = self.counters.flow_shifts.wrapping_add(moved);
++                self.sessions[session].totals.flow_shifts = self.sessions[session]
++                    .totals
++                    .flow_shifts
++                    .wrapping_add(moved);
+                 buffer.deadline = now + reassembly::FRAME_LIFETIME;
+                 if buffer.segments.is_some() {
+                     self.counters.tap_gso_reads = self.counters.tap_gso_reads.wrapping_add(1);
+@@ -2940,6 +3032,29 @@ impl Worker {
+         Ok(false)
+     }
+ 
++    /// Under daemon.balance_load: adds a blocking wait to this window's idle
++    /// time and, once a window has passed, publishes the share of it this
++    /// worker was busy for TAP readers placing flows.
++    fn note_load(&mut self, blocked: Duration, now: Duration) {
++        let Some(load) = self.shared.loads.get(self.id) else {
++            return;
++        };
++        if self.load_since.is_zero() {
++            // The first window starts here, not at the clock's origin.
++            self.load_since = now;
++            return;
++        }
++        self.load_blocked += blocked;
++        let window = now.saturating_sub(self.load_since);
++        if window < LOAD_WINDOW {
++            return;
++        }
++        let idle = self.load_blocked.min(window).as_micros() * 100 / window.as_micros();
++        load.store(100 - idle as u8, Ordering::Relaxed);
++        self.load_since = now;
++        self.load_blocked = Duration::ZERO;
++    }
++
+     /// Chooses a TAP read's transmit lane and, for a striped flow, its stripe
+     /// number and first sequence; `frames` is how many frames the read holds.
+     fn route(
+@@ -2973,12 +3088,23 @@ impl Worker {
+                 hash,
+                 first..lanes,
+                 ms,
+-                |lane| {
+-                    backlog
+-                        .and_then(|marks| marks.get(lane))
+-                        .filter(|mark| backlogged(mark, ms))
+-                        .and(stripes)
++                |entry| {
++                    let lane = entry & !SHIFTED;
++                    let marks = backlog?;
++                    marks.get(lane).filter(|mark| backlogged(mark, ms))?;
++                    stripes
+                         .and_then(|stripes| claim_stripe(stripes, ms))
++                        .map(|number| STRIPED | number)
++                        .or_else(|| {
++                            let stamp = self.shared.shifts.get(session)?;
++                            if entry & SHIFTED != 0 {
++                                return None;
++                            }
++                            let loads = &self.shared.loads;
++                            let to = shift_lane(loads, marks, stamp, lane, first..lanes, ms)?;
++                            self.shifted.set(true);
++                            Some(SHIFTED | to)
++                        })
+                 },
+             )
+         } else {
+@@ -7582,7 +7708,7 @@ mod tests {
+         assert_eq!(lane, 1);
+         let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 11, |lane| {
+             assert_eq!(lane, 1);
+-            Some(3)
++            Some(STRIPED | 3)
+         });
+         assert_eq!(lane, STRIPED | 3);
+         // The entry keeps its stripe without asking again, until it goes idle.
+@@ -7627,6 +7753,118 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn a_flow_on_a_busy_workers_lane_moves_once_to_the_least_busy_one() {
++        use std::sync::atomic::AtomicUsize;
++        let loads: Vec<_> = [10, 60, 80, 40].into_iter().map(AtomicU8::new).collect();
++        let marks: Vec<_> = (0..6).map(|_| AtomicU64::new(0)).collect();
++        let stamp = AtomicU64::new(0);
++        // From lane 2, lane 3's worker is the least busy with room.
++        assert_eq!(shift_lane(&loads, &marks, &stamp, 2, 1..4, 1000), Some(3));
++        // The session moves nothing more until SHIFT_MS has passed.
++        let next = 1000 + SHIFT_MS;
++        assert_eq!(shift_lane(&loads, &marks, &stamp, 2, 1..4, next - 1), None);
++        // A lane that refused a frame lately is no target, and a refusal
++        // that is not costs the session no turn.
++        mark_refusal(&marks[3], next - STRIPE_EPISODE_MS + 1);
++        assert!(refusing(&marks[3], next));
++        assert_eq!(shift_lane(&loads, &marks, &stamp, 2, 1..4, next), Some(1));
++        let later = next + SHIFT_MS;
++        assert!(!refusing(&marks[3], later));
++        // Nor is a lane whose worker is busier than LOAD_ROOM, nor the
++        // flow's own lane.
++        loads[3].store(LOAD_ROOM + 1, Ordering::Relaxed);
++        assert_eq!(shift_lane(&loads, &marks, &stamp, 1, 1..4, later), None);
++        loads[3].store(LOAD_ROOM, Ordering::Relaxed);
++        assert_eq!(shift_lane(&loads, &marks, &stamp, 1, 1..4, later), Some(3));
++        // Lanes past the worker count share their owners' loads: lane 4 is
++        // worker 0's, the least busy.
++        assert_eq!(
++            shift_lane(&loads, &marks, &stamp, 2, 1..6, later + SHIFT_MS),
++            Some(4)
++        );
++        // A move at millisecond zero still stamps the session.
++        let stamp = AtomicU64::new(0);
++        assert_eq!(shift_lane(&loads, &marks, &stamp, 2, 1..4, 0), Some(1));
++        assert_eq!(shift_lane(&loads, &marks, &stamp, 2, 1..4, 1), None);
++        // Without loads or marks nothing moves.
++        assert_eq!(shift_lane(&[], &marks, &stamp, 2, 1..4, 5000), None);
++        assert_eq!(shift_lane(&loads, &[], &stamp, 2, 1..4, 5000), None);
++
++        let slots: Vec<_> = (0..FLOW_SLOTS).map(|_| AtomicU64::new(0)).collect();
++        let cursor = AtomicUsize::new(0);
++        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 10, |_| unreachable!());
++        assert_eq!(lane, 1);
++        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 11, |entry| {
++            assert_eq!(entry, 1);
++            Some(SHIFTED | 3)
++        });
++        assert_eq!(lane, 3);
++        // The entry keeps the mark through later stamps, so a second offer
++        // sees it, and declining keeps the new lane.
++        for at in [12, 13] {
++            let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, at, |entry| {
++                assert_eq!(entry, SHIFTED | 3);
++                None
++            });
++            assert_eq!(lane, 3);
++        }
++        // A moved flow can still be striped.
++        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 14, |_| Some(STRIPED | 2));
++        assert_eq!(lane, STRIPED | 2);
++        // Once idle the flow takes the next lane in turn, unmarked.
++        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 14 + FLOW_IDLE_MS, |_| None);
++        assert_eq!(lane, 2);
++        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 15 + FLOW_IDLE_MS, |entry| {
++            assert_eq!(entry, 2);
++            None
++        });
++        assert_eq!(lane, 2);
++    }
++
++    #[test]
++    fn a_reader_moves_a_flow_by_the_loads_workers_publish() {
++        let ms = Duration::from_millis;
++        let (shared, [mut worker, mut other]) = test_workers_built(3, true, true);
++        let frame = crate::tap::test_common::tcp::frame(false, 1, 1, 0x10, &[], &[7; 100]);
++        assert_eq!(worker.route(0, false, &frame, 1, ms(1000)), (1, None));
++        // The first call only starts a window; a full one publishes the share
++        // not spent blocked, and a part of one publishes nothing.
++        other.note_load(ms(50), ms(1000));
++        assert_eq!(shared.loads[1].load(Ordering::Relaxed), 0);
++        other.note_load(ms(4), ms(1040));
++        assert_eq!(shared.loads[1].load(Ordering::Relaxed), 0);
++        other.note_load(ms(6), ms(1100));
++        assert_eq!(shared.loads[1].load(Ordering::Relaxed), 90);
++        // A wait longer than its window counts as the whole window.
++        worker.note_load(Duration::ZERO, ms(1000));
++        worker.note_load(ms(500), ms(1100));
++        assert_eq!(shared.loads[0].load(Ordering::Relaxed), 0);
++        // The flow stays on lane 1 until that lane's owner has refused frames
++        // for STRIPE_PRESS_MS; then it moves to lane 2, whose worker is idle.
++        assert_eq!(worker.route(0, false, &frame, 1, ms(1100)), (1, None));
++        other.mark_refusal(0, 1, ms(1085));
++        other.mark_refusal(0, 1, ms(1100));
++        assert!(!worker.shifted.get());
++        assert_eq!(worker.route(0, false, &frame, 1, ms(1101)), (2, None));
++        assert!(worker.shifted.take());
++        // It does not move back when lane 2 backs up and lane 1 clears.
++        shared.loads[1].store(5, Ordering::Relaxed);
++        worker.mark_refusal(0, 2, ms(1280));
++        worker.mark_refusal(0, 2, ms(1300));
++        assert_eq!(
++            worker.route(0, false, &frame, 1, ms(1101 + SHIFT_MS)),
++            (2, None)
++        );
++        assert!(!worker.shifted.get());
++        // Another flow on lane 2 moves to lane 1 now.
++        let mut second = frame.clone();
++        second[35] ^= 1;
++        assert_eq!(worker.route(0, false, &second, 1, ms(1300)), (2, None));
++        assert_eq!(worker.route(0, false, &second, 1, ms(1302)), (1, None));
++        assert!(worker.shifted.take());
++    }
++
+     #[test]
+     fn control_lane_keeps_data_off_lane_zero() {
+         use std::sync::atomic::AtomicUsize;
+@@ -9505,6 +9743,15 @@ mod tests {
+ 
+     /// Two workers; `flows` gives them the shared flow table.
+     fn test_workers_with(tx_lanes: usize, flows: bool) -> (Arc<Shared>, [Worker; 2]) {
++        test_workers_built(tx_lanes, flows, false)
++    }
++
++    /// As test_workers_with; `loading` adds what daemon.balance_load shares.
++    fn test_workers_built(
++        tx_lanes: usize,
++        flows: bool,
++        loading: bool,
++    ) -> (Arc<Shared>, [Worker; 2]) {
+         use crate::config::{Config, Daemon, Endpoint, Peer, Session as ConfigSession};
+         use std::{
+             net::Ipv6Addr,
+@@ -9583,6 +9830,14 @@ mod tests {
+             backlog: (0..2)
+                 .map(|_| (0..tx_lanes).map(|_| AtomicU64::new(0)).collect())
+                 .collect(),
++            loads: (0..2)
++                .filter(|_| loading)
++                .map(|_| AtomicU8::new(0))
++                .collect(),
++            shifts: (0..2)
++                .filter(|_| loading)
++                .map(|_| AtomicU64::new(0))
++                .collect(),
+         });
+         let workers: [Worker; 2] = std::array::from_fn(|id| {
+             let mut worker = Worker::new(id, Arc::clone(&shared), Control::new()).unwrap();

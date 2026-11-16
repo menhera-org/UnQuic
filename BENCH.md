@@ -1931,6 +1931,112 @@ worker's own lane included, and stay for as long as they are active.
 Leaving the reader's lane out would only move the limit to the worker
 that both transmits and receives. Raising it properly means weighing
 each worker's whole load and moving flows that are already running.
+The next section measures both halves of that guess.
+
+## Which worker receives which lane, with four workers (November 16)
+
+The overload above is short of balance, so three ways of changing the
+balance were probed on `0a15d20` at the same point: sixteen QinQ flows
+each way, four workers, 8 Gbit/s offered each way, two points a round.
+Figures are Gbit/s delivered in both directions together, the mean of
+the points with their range. In the result files `rxtrim` is `0a15d20`.
+
+**Fixed shares of the transmit lanes.** Each arm is `0a15d20` with one
+line changed: a new flow takes its data lane from a sixteen-entry table
+instead of in turn. Stated beforehand: if any fixed split delivers 10%
+more than lanes in turn, placement by load is worth building. Four points
+each ([results](benches/four-workers-static-lane-shares.json), arms
+`w457`, `w619`, `w088` and `w808`):
+
+| Flows on data lanes 1, 2, 3 | Delivered | Frames missing, worse direction |
+| --- | --- | --- |
+| In turn, 5 or 6 each (`0a15d20`) | 14.28 (13.86–14.47) | 10.0–23.0% |
+| 4, 5, 7 | 14.31 (14.00–14.77) | 7.0–11.8% |
+| 6, 1, 9 | 15.40 (15.31–15.56) | 1.9–3.7% |
+| 0, 8, 8: the reader's own lane empty | 12.26 (12.09–12.68) | 21.4–25.2% |
+| 8, 0, 8: the middle lane empty | 15.66 (15.54–15.72) | 0.7–2.9% |
+
+The best split gains 9.7% here and 8–10% in two later sets of eight
+points, and the offer limits it: 15.66 of 16.0 Gbit/s arrive. Taking the
+reader's own lane away costs 14%.
+
+The lane formulas explain the table. A lane's transmit owner is
+`(lane − 1) mod n`; its receive owner is `(cookie_low32 + lane − 1) mod
+n`, fixed at the lane's first packet and mirrored by the socket steering
+program. With this session's cookie the peer's data lanes 1, 2 and 3
+arrive at workers 0, 1 and 2 and its control lane at worker 3, and the
+kernel hands every QinQ frame to worker 1's TAP queue. So worker 1 reads
+the TAP, transmits lane 1 and receives the peer's lane 2; worker 2
+transmits and receives; worker 3 only transmits; worker 0 receives and
+sends the ACKs. With lane 2 empty on both sides each worker has one heavy
+job: workers 1 and 3 sent 21.8–21.9 GB each over two points and workers 0
+and 2 received 21.9–22.0 GB each. With lane 1 empty, worker 2 transmits
+half the flows and receives the other daemon's half.
+
+**Moving flows by what a daemon sees of itself (rejected).** Two forms of
+a `daemon.balance_load` switch tried to find that split at run time.
+Stated beforehand: on, it delivers 5% more than off, eight points each.
+
+- In the first, each worker published the share of every 100 ms it had
+  not spent blocked, and a TAP reader moved an active flow, once, from a
+  lane whose worker was 75% busy to the lane of the least busy worker if
+  that one was 25 points lower, one flow per session every 200 ms. On:
+  14.33 (13.90–14.73); off: 14.06 (13.44–14.38); `0a15d20`: 14.02. That
+  is 1.9%, for 296% of a core per daemon against 276%. Past saturation
+  every data lane's worker is 75% busy at some moment, so all sixteen
+  flows moved at every point, and worker 3 ended refusing 44,024 frames
+  where it had refused hundreds
+  ([results](benches/four-workers-balance-load-busy.json), arms `bl` and
+  `bl-load`).
+- In the second, a flow moved only off a lane whose owner had refused
+  frames for 10 ms, to a lane that was not refusing and whose worker was
+  at most 70% busy
+  ([patch](benches/balance-load-rejected.patch)). On: 14.53
+  (13.86–14.91); `0a15d20`: 14.23 (13.67–14.67), which is 2.1%. It moved
+  3–7 flows in two points. The frames are lost at the reader's TAP queue,
+  and no lane's refusals show that
+  ([results](benches/four-workers-balance-load-refusals.json), arm
+  `bl2-load`).
+
+Neither can see the cause. The lane to empty is the one the peer's
+reading worker receives, and only the peer knows which that is. Both
+forms also reorder each flow they move, once.
+
+**Rotating the receive owners.** A receiver can change its own side
+without the sender. Each arm adds a constant to the receive-owner formula
+and to the steering program. Stated beforehand: the rotation that gives
+the TAP reader the peer's control lane delivers 5% more than `0a15d20`,
+and the other two, which leave a data lane on the reader, gain nothing.
+Eight points each at 8 Gbit/s offered each way and six at 10
+([results](benches/four-workers-receive-owner-rotation.json),
+[at 10 Gbit/s](benches/four-workers-receive-owner-rotation-10g.json),
+arms `rot1` to `rot3`):
+
+| Receive owners rotated by | The reader also receives | 8 Gbit/s offered | 10 Gbit/s offered |
+| --- | --- | --- | --- |
+| 0 (`0a15d20`) | a data lane | 14.19 (13.72–14.87) | 14.39 (13.75–15.19) |
+| 1 | a data lane | 14.18 (13.30–14.80) | |
+| 2 | the control lane only | 15.28 (14.99–15.53) | 16.21 (15.71–16.67) |
+| 3 | a data lane | 14.29 (13.73–15.11) | |
+| 0, with flows split 8, 0, 8 | nothing | 15.42 (15.20–15.70) | 15.78 (15.32–16.29) |
+
+The last row's first figure is the fixed split's run beside the second
+switch above. The one rotation gains 7.7% at 8 Gbit/s offered and 12.6%
+at 10, with every point above every point of `0a15d20`, and it moves no
+flow. It uses
+the idle cores: 299% of a core per daemon against 278%, and 340% against
+282% at the higher offer. The limit then is a worker that transmits and
+receives, which refused 71,582 frames in two points at 10 Gbit/s offered.
+
+A constant rotation is not a candidate, though. Which worker reads the
+TAP is known only once traffic flows, and a lane's receive owner is fixed
+at its first packet, which may come first. What can land is moving a receive
+lane to another worker while it runs: when one worker reads nearly all of
+a session's TAP frames and also receives a data lane, exchange that
+lane's owner with the control lane's. Packets that reach the wrong worker
+are already forwarded to the owner, so the exchange needs the lane's
+reassembly and ACK state handed over and the steering constant changed to
+match. That is the next step for the four-core target.
 
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 

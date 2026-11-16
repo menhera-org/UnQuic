@@ -866,6 +866,19 @@ slots gone, CPU per delivered bit on this point fell by about 9% over
 the afternoon. The table above predates that and awaits a new profile.
 The wakes left are work for their target.
 
+**Balance across four workers (November 16).** Past saturation the box is
+short of balance before it is short of cycles. A lane's receive owner is
+`(cookie_low32 + lane − 1) mod n`, so the session cookie decides which
+worker receives what, and nothing aligns that with the worker the kernel
+hands a session's TAP frames to. In three rotations of four that worker
+reads the TAP, transmits a lane and receives a data lane as well. Giving
+the reader the peer's control lane instead
+delivered 8–13% more at overload (BENCH.md). The reader is known only
+once traffic flows, so the alignment has to happen at run time: a receive
+lane's owner must be able to change while the lane is in use. Moving
+flows between transmit lanes cannot do it, because the sender does not
+know which of its lanes the peer's reader receives.
+
 **Memory bandwidth.** Each payload byte is copied five times by the CPU
 across the two boxes: the sender's TAP read and UDP send, then the
 receiver's UDP receive, reassembly copy and TAP write. Per box that is 12.5
