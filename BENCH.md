@@ -1107,11 +1107,25 @@ they were admitted,
 and the writer wrote 2% of frames out of sequence with nothing lost on
 the path, which means the lanes drifted more than the 5 ms hold apart.
 
-Striping therefore helps a flow that keeps offering load whatever the
-tunnel does, such as the UDP generator or an aggregate inside another
-tunnel, and not a lone TCP flow here. What limits one TCP flow is the
-next thing to find: the receive-socket overflows first, then the lane
-skew under bursts.
+That loss belongs to this container, not to TCP. The kernel dropped 67
+and 94 coalesced receive batches for want of buffer (`Udp6RcvbufErrors`),
+the known cost of running without `CAP_NET_ADMIN`; nothing was lost on
+the path itself (2,173,558 packets sent, 2,173,556 received). On the
+remote host, where each receive socket gets its buffer (16 MiB reported),
+the same unstriped TCP flow with two workers per daemon delivered 1.77 /
+2.05 Gbit/s with no frame expired, no repair and no overflow
+([results](benches/tcp-one-flow-remote.json)). There the flow is held by
+its transmit worker, at 73% and 92%, with the reading worker at 59–65%,
+and by the 96 and 160 frames that worker refused.
+
+So with adequate buffers one TCP flow is worker-bound, as the UDP flow
+is, and striping's premise holds for it. Whether striping lifts it is
+still unmeasured: this host cannot give the daemon its buffers, and the
+remote host has eight CPUs, too few for two four-worker daemons and
+their generators (with two workers there is no second transmit worker
+to stripe onto). The 2% of frames the writer wrote out of sequence
+here, with nothing lost on the path, is a separate fault to look at:
+the lanes drifted more than the 5 ms hold apart under TCP's bursts.
 
 ## Twice the receive slots in the same storage (November 15, landed)
 

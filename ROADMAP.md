@@ -412,15 +412,18 @@ Decisions only the user can make, each blocking a remaining goal:
    38–64% to about 2 Gbit/s each way. Shared millisecond stamps also
    tolerate a stamp slightly ahead of the reading worker's clock now.
    With that build every striped run of the UDP flow delivers 1.93–2.23
-   Gbit/s in both directions. One TCP flow gains nothing, though: it is
-   not held by a worker but by loss inside the tunnel. TCP's bursts
-   overflow the receiving daemon's 416 KiB receive socket, sent frames
-   expire unacknowledged, and TCP backs off near 0.7–1.0 Gbit/s with its
-   transmit worker at 73%. `stripe_flows` stays off by default; it suits
-   flows that keep offering load, such as an aggregate inside another
-   tunnel. Next: what limits one TCP flow (the receive-socket overflows
-   first, then lane skew under bursts), since that, not striping, stands
-   between a single TCP stream and the 5 Gbit/s gate.
+   Gbit/s in both directions. One TCP flow gained nothing in the local
+   container, but that says little: without `CAP_NET_ADMIN` its receive
+   sockets hold 416 KiB, TCP's bursts overflow them, and the flow backs
+   off near 0.7–1.0 Gbit/s before any worker is busy. On the remote
+   host, with full buffers and two workers per daemon, the same
+   unstriped TCP flow delivers 1.77 / 2.05 Gbit/s and is held by its
+   transmit worker (73% and 92%), so striping's premise holds for TCP
+   too. Measuring it needs a host with both the buffers and the CPUs
+   for four workers per daemon; neither test host has both.
+   `stripe_flows` stays off by default until then. Open under TCP's
+   bursts: lanes drifting more than the 5 ms hold apart (2% of frames
+   written out of sequence with nothing lost).
 8. Decided November 14: `daemon.offload_frames` stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should
