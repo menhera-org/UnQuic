@@ -96,6 +96,14 @@ item is structural: the feedback loop costs seven wakes per ACK datagram
 because the controller owner is a worker apart from the lanes' workers
 ([BENCH.md](BENCH.md#where-the-wakes-come-from-november-16)).
 
+Next targets in the daemon's own code, by cycles per frame event in
+that profile: output coalescing around the TAP write (about 320, the
+`flush_taps` phase less its syscall), the reassembly copy and slot scan
+in receive admission (260–285 and 123–133), recovery staging (225–240)
+and TAP input expansion (190–210). Each is small against the syscalls,
+so each needs the small-frame point as well as the full-size one to
+show.
+
 ## November 13 checkpoint
 
 Balanced lanes' loopback loss came from ACKs waiting for packet numbers.
