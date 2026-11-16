@@ -4413,7 +4413,12 @@ impl Worker {
         for session in 0..self.sessions.len() {
             let readable = self.tap_capacity(session) != 0;
             let mut writable = false;
-            for slot in 0..LANES {
+            // Only slots that hold a lane; one returned below drops out of the
+            // session's mask, not out of this copy, which has passed it by then.
+            let mut occupied = self.sessions[session].rx_occupied;
+            while occupied != 0 {
+                let slot = occupied.trailing_zeros() as usize;
+                occupied &= occupied - 1;
                 let local = &mut self.sessions[session];
                 let Some(lane) = &mut local.rx[slot] else {
                     continue;
@@ -4453,10 +4458,18 @@ impl Worker {
                 writable |= self.run_writer(session, None, now);
             }
             let local = &mut self.sessions[session];
-            local.totals.reassembly_frames =
-                local.rx_totals.iter().map(|s| s.reassembly_frames).sum();
-            local.totals.reassembly_bytes =
-                local.rx_totals.iter().map(|s| s.reassembly_bytes).sum();
+            // An empty slot's totals are zero: they start so, and returning a
+            // lane resets them.
+            let (mut frames, mut bytes) = (0_u64, 0_u64);
+            let mut occupied = local.rx_occupied;
+            while occupied != 0 {
+                let totals = &local.rx_totals[occupied.trailing_zeros() as usize];
+                occupied &= occupied - 1;
+                frames = frames.wrapping_add(totals.reassembly_frames);
+                bytes = bytes.wrapping_add(totals.reassembly_bytes);
+            }
+            local.totals.reassembly_frames = frames;
+            local.totals.reassembly_bytes = bytes;
             if !writable {
                 local.tap_blocked = false;
             }
@@ -5788,12 +5801,13 @@ impl Worker {
                     due = due.min(input.deadline);
                 }
             }
-            for (slot, lane) in session
-                .rx
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, lane)| lane.as_ref().map(|lane| (slot, lane)))
-            {
+            let mut occupied = session.rx_occupied;
+            while occupied != 0 {
+                let slot = occupied.trailing_zeros() as usize;
+                occupied &= occupied - 1;
+                let Some(lane) = session.rx[slot].as_ref() else {
+                    continue;
+                };
                 if !self.feedback_free.is_empty()
                     && session.ack_inflight & (1 << slot) == 0
                     && session.returning & (1 << slot) == 0
@@ -6917,6 +6931,39 @@ mod tests {
         );
         let mut output = [0; 256];
         assert!(tap.recv(&mut output).is_err());
+    }
+
+    #[test]
+    fn flush_and_totals_reach_a_lane_in_the_last_slot() {
+        let (mut worker, tap) = receive_worker();
+        let last = LANES - 1;
+        let lane = worker.sessions[0].take_rx(0).unwrap();
+        worker.sessions[0].put_rx_at(last, lane).unwrap();
+        assert_eq!(worker.sessions[0].rx_occupied, 1 << last);
+        // One whole frame and the first half of another.
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        for (number, record) in [receive_piece(1, 0, &[1; 60]), receive_piece(2, 0, &[2; 30])]
+            .into_iter()
+            .enumerate()
+        {
+            let length = receive_bytes(number as u64 + 1, &[record], &mut bytes);
+            let datagram = Datagram::decode(&bytes[..length]).unwrap();
+            let lane = worker.sessions[0].rx[last].as_mut().unwrap();
+            assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Fresh);
+        }
+        // The fixture has other timers due at once, so the lane's ACK shows
+        // only as an upper bound on the worker's deadline.
+        assert!(worker.deadline(Duration::ZERO) <= Some(crate::ack::DELAY));
+        worker.flush_taps(Duration::ZERO).unwrap();
+        let mut output = [0; 256];
+        assert_eq!(tap.recv(&mut output).unwrap(), 60);
+        // The half frame stays and is counted, until it expires.
+        assert_eq!(worker.sessions[0].totals.reassembly_frames, 1);
+        assert_eq!(worker.sessions[0].totals.reassembly_bytes, 60);
+        worker.flush_taps(reassembly::FRAME_LIFETIME).unwrap();
+        assert_eq!(worker.sessions[0].totals.reassembly_frames, 0);
+        assert_eq!(worker.sessions[0].totals.reassembly_bytes, 0);
+        assert_eq!(worker.sessions[0].totals.expired_frames, 1);
     }
 
     #[test]

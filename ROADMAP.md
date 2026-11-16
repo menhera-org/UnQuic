@@ -96,6 +96,13 @@ item is structural: the feedback loop costs seven wakes per ACK datagram
 because the controller owner is a worker apart from the lanes' workers
 ([BENCH.md](BENCH.md#where-the-wakes-come-from-november-16)).
 
+A split of the TAP write phase then found 118 cycles per frame event in
+per-turn visits to all 64 receive slots. Walking only the occupied ones
+in the TAP flush, the reassembly totals and the deadline scan took 2.3–
+2.4% off CPU per delivered bit; the same idea had missed its bar on
+November 12 under the older paired method
+([BENCH.md](BENCH.md#occupied-receive-slots-in-the-tap-flush-and-the-deadline-scan-november-16-landed)).
+
 Next targets in the daemon's own code, by cycles per frame event in
 that profile: output coalescing around the TAP write (about 320, the
 `flush_taps` phase less its syscall), the reassembly copy and slot scan

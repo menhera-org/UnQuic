@@ -1619,6 +1619,29 @@ write beside the `tap_errors` count. With the failed round explained and
 not theirs,
 offload frames have met both bars set for the default.
 
+## Occupied receive slots in the TAP flush and the deadline scan (November 16, landed)
+
+A finer split of the TAP write phase at `6fcf89d` put 118 of its 940–990
+cycles per frame event outside the write path: every turn the worker
+visited all 64 receive slots of each session, summed two counters over
+all 64, and visited them again to find its next deadline, while one or
+two slots hold a lane. The same change was tried on November 12 after
+the ACK sweep got its occupied mask, and rejected at four pairs of six
+with a median of −2.4%; the note then said six alternating pairs could
+not tell a gain of that size from the order effect. Rotating rounds with
+a copy of HEAD can.
+
+The candidate walks the session's occupied mask in the TAP flush, in
+the reassembly totals and in the deadline scan. Stated beforehand: CPU
+per delivered bit about 2% lower on the full-size point, by the usual
+bar. [Results](benches/full-size-occupied-flush-deadline.json): lower
+than both HEAD and its copy in 5 of 6 rounds, −2.3% against HEAD and
+−2.4% against the copy at the median, with the copy at −0.1% against
+HEAD. The round that missed lost 1.2% of its frames to a host stall (290
+ms latency maxima in both directions, twelve stalled bins); HEAD had
+one like it in the same set. The change alters no deadline and no
+order of work, so the lossy path was not rerun.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames
