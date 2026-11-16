@@ -762,7 +762,11 @@ fn feedback_uses_newest_ranges_then_recovers_merged_older_ranges() {
     for number in (2..=66).step_by(2) {
         admit(&mut lane, number, &[Record::Probe], Duration::ZERO);
     }
-    let record = lane.take_ack(Duration::ZERO, &mut output).unwrap();
+    // Filling gaps is in order for the schedule, so the ACK waits out its delay.
+    assert!(lane.take_ack(Duration::ZERO, &mut output).is_none());
+    let record = lane
+        .take_ack(Duration::from_millis(1), &mut output)
+        .unwrap();
     let encoded = bytes(2, 1, &[record]);
     let decoded = Datagram::decode(&encoded).unwrap();
     let Some(Record::Ack {

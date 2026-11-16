@@ -195,18 +195,29 @@ impl Lane {
     /// the record's content and re-encode with a fresh number before retrying.
     /// Handshake records cannot use this established-lane encoder.
     pub fn record(&mut self, record: Record<'_>, output: &mut [u8]) -> Result<Packet, PackError> {
+        self.records(&[record], output)
+    }
+
+    /// Encodes several records as one baseline-sized datagram under one
+    /// packet number, in order; nothing is allocated when they do not fit.
+    pub fn records(
+        &mut self,
+        records: &[Record<'_>],
+        output: &mut [u8],
+    ) -> Result<Packet, PackError> {
         if self.header.packet_number == 0 {
             return Err(PackError::Exhausted);
         }
-        if matches!(record, Record::Data { total_len, .. } if total_len > u32::from(self.frame_limit))
-        {
+        if records.iter().any(|record| {
+            matches!(record, Record::Data { total_len, .. } if *total_len > u32::from(self.frame_limit))
+        }) {
             return Err(PackError::Frame);
         }
         let limit = output.len().min(BASE_UDP_PAYLOAD);
         let output = output
             .get_mut(..limit)
             .ok_or(PackError::Wire(WireError::BufferTooSmall))?;
-        let length = encode_datagram(self.header, &[record], output).map_err(PackError::Wire)?;
+        let length = encode_datagram(self.header, records, output).map_err(PackError::Wire)?;
         let number = self.header.packet_number;
         self.header.packet_number = number.checked_add(1).unwrap_or(0);
         Ok(Packet { number, length })

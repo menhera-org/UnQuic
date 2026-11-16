@@ -12,6 +12,11 @@ use std::time::Duration;
 
 /// Longest a receiver holds feedback for ACK-eliciting packets on one lane.
 pub(crate) const DELAY: Duration = Duration::from_millis(1);
+/// ACK-eliciting packets on one lane that make feedback due at once. A busy
+/// lane then sends an ACK per this many packets instead of per DELAY; each
+/// ACK costs a send here and a receive, a handoff and a controller update at
+/// the sender.
+const COUNT: u8 = 64;
 
 pub(crate) struct Schedule {
     pub highest: u64,
@@ -40,7 +45,7 @@ impl Schedule {
         }
         if eliciting {
             self.eliciting = self.eliciting.saturating_add(1);
-            self.schedule(if gap || self.eliciting >= 16 {
+            self.schedule(if gap || self.eliciting >= COUNT {
                 now
             } else {
                 now.saturating_add(DELAY)
@@ -97,20 +102,22 @@ mod tests {
     #[test]
     fn count_deadline_and_gap_use_accepted_packets_only() {
         let mut ack = Schedule::new();
-        for number in 1..16 {
+        let count = u64::from(COUNT);
+        for number in 1..count {
             ack.accepted(number, true, us(number));
         }
         assert_eq!(ack.deadline, Some(us(1001)));
         assert_eq!(ack.take(us(999)), None);
-        ack.accepted(16, true, us(999));
+        // The COUNT-th packet makes feedback due without waiting for DELAY.
+        ack.accepted(count, true, us(999));
         assert_eq!(ack.take(us(999)), Some(0));
         assert_eq!(ack.take(us(1001)), None);
-        ack.accepted(17, true, us(2000));
+        ack.accepted(count + 1, true, us(2000));
         assert_eq!(ack.take(us(2999)), None);
         assert_eq!(ack.take(us(3000)), Some(1000));
-        ack.accepted(19, true, us(4000));
+        ack.accepted(count + 3, true, us(4000));
         assert_eq!(ack.take(us(4000)), Some(0));
-        ack.accepted(18, true, us(4500));
+        ack.accepted(count + 2, true, us(4500));
         assert_eq!(ack.take(us(5500)), Some(1000));
     }
 

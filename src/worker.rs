@@ -5187,6 +5187,21 @@ impl Worker {
         record: Record<'_>,
         now: Duration,
     ) -> io::Result<Option<(u64, u16, Duration)>> {
+        self.send_records(session, &[record], now)
+    }
+
+    /// Sends control records as one datagram on the session's lane 0. More
+    /// than one is for records of one kind that travel alike, such as several
+    /// lanes' ACKs; the first decides how the datagram is treated.
+    fn send_records(
+        &mut self,
+        session: usize,
+        records: &[Record<'_>],
+        now: Duration,
+    ) -> io::Result<Option<(u64, u16, Duration)>> {
+        let Some(&record) = records.first() else {
+            return Ok(None);
+        };
         if self.sender_enabled() && matches!(record, Record::Probe) {
             self.request_probe(session, 0, BASE_UDP_PAYLOAD, false, None, now)?;
             return Ok(None);
@@ -5240,7 +5255,7 @@ impl Worker {
             }
             self.sessions[session].tx[0]
                 .as_mut()
-                .and_then(|lane| lane.record(record, bytes).ok())
+                .and_then(|lane| lane.records(records, bytes).ok())
         };
         let Some(packet) = packet else {
             return Ok(None);
@@ -5267,22 +5282,31 @@ impl Worker {
             {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
-            if let Record::Ack {
-                lane,
-                delay_us,
-                ranges,
-            } = record
-            {
-                // Finalize queue delay using the same clock as successful-send bookkeeping.
-                Record::Ack {
+            let mut start = wire::HEADER_LEN;
+            for &record in records {
+                let end = start + record.encoded_len();
+                if let Record::Ack {
                     lane,
+                    delay_us,
                     ranges,
-                    delay_us: delay_us
-                        .saturating_add(at.saturating_sub(now).as_micros().min(1000) as u32)
-                        .min(1000),
+                } = record
+                {
+                    // Finalize queue delay using the same clock as successful-send bookkeeping.
+                    Record::Ack {
+                        lane,
+                        ranges,
+                        delay_us: delay_us
+                            .saturating_add(at.saturating_sub(now).as_micros().min(1000) as u32)
+                            .min(1000),
+                    }
+                    .encode(
+                        bytes
+                            .get_mut(start..end)
+                            .ok_or(io::ErrorKind::InvalidData)?,
+                    )
+                    .map_err(io::Error::other)?;
                 }
-                .encode(&mut bytes[wire::HEADER_LEN..packet.length])
-                .map_err(io::Error::other)?;
+                start = end;
             }
             socket.send(&bytes[..packet.length], limit)?;
             Ok(at)

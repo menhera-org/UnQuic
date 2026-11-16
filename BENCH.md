@@ -1368,6 +1368,59 @@ rather than repair time, and the two arms of HEAD no longer differ
 either: offload frames were worse than ordinary ones in two rounds here
 and better in the third. The lifetime stays as it is.
 
+## Fewer, larger ACKs (November 16, landed)
+
+The per-frame budget of design section 13.1 has a line for ACK and
+control sends whose remedy reads "fewer, larger ACKs". Until now a lane
+sent an ACK after sixteen ACK-eliciting packets or 1 ms, and every ACK
+left as its own datagram. Two changes were measured as one. A lane now
+sends after 64 packets or 1 ms, and ACKs that are due together for
+several lanes of one session share a datagram while they fit: two ACKs
+of 32 ranges fill the base payload, and short ones ride eight to a
+datagram. The 1 ms delay, the immediate ACK on a new gap and the
+duplicate limit are unchanged, so a lane below 16,000 packets a second
+acknowledges as it did.
+
+Stated beforehand: CPU per delivered bit falls 2% or more on the
+full-size point. The bar was the usual efficiency one there, plus no
+more frames lost on the lossy point.
+
+Full-size point
+([results](benches/full-size-fewer-larger-acks.json)): lower than both
+HEAD and its copy in 5 of 6 rounds, −2.4% against HEAD and −1.9% against
+the copy at the median, with the copy at −0.4% against HEAD. The bar is
+met. Each daemon's control lane carried 30–31 MB over a run where it
+carried 69–73 MB. Much of what went was never used: over a set, senders
+on HEAD merged 520,000–540,000 arriving ACKs into one that still waited
+for its transmit owner (`ack_coalesced`), and 15,000–18,000 with the
+change. No arm deferred an ACK send, and the candidate dropped no ACK
+for want of a buffer where HEAD and its copy dropped 0–32.
+
+Two of the candidate's six rounds lost 0.15% and 0.08% of their frames
+where HEAD's worst round lost 0.04%. Both show the host's stall, not the
+change: latency maxima of 67–79 ms in both directions at once, and six
+or seven stalled bins in the worse one. HEAD lost 1.9% the same way in
+one round earlier in the day. A
+[second set](benches/full-size-fewer-larger-acks-second.json) was run to
+check. The candidate's worst round lost 0.046% there, against 0.019% for
+HEAD and 0.080% for its copy, and it was lower than both in 6 of 6
+rounds at −0.9% and −0.7%. Over the twelve rounds it is lower than both
+in 11, by −1.8% against HEAD and −1.6% against the copy at the median, a
+little short of the 2% guessed.
+
+Lossy point ([results](benches/lossy-path-fewer-larger-acks.json)):
+0.010%, 0.158% and 0.021% of frames lost at each round's worst point,
+against 0.100%, 0.216% and 0.113% for HEAD and 0.113%, 0.101% and 0.096%
+for its copy. Three rounds show that it loses no more; they are too few
+to say it loses less.
+
+The count alone had been measured first
+([first set](benches/full-size-ack-count-64.json),
+[second](benches/full-size-ack-count-64-second.json)): over twelve
+rounds −1.4% against HEAD and −1.2% against the copy, but lower than
+both in only 8, which misses the bar's round clause. Sharing datagrams
+is what carried it over.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames

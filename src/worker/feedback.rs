@@ -35,7 +35,16 @@ impl Feedback {
             ranges: [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES],
         }
     }
+
+    /// Bytes this feedback's ACK record takes in a datagram, as
+    /// `Record::encoded_len` counts them.
+    fn record_len(&self) -> usize {
+        12 + 16 * self.count
+    }
 }
+
+/// ACK records one control datagram carries at most: one lane's each.
+const ACK_BATCH: usize = 8;
 
 pub(super) enum Pending {
     Handshake(usize),
@@ -216,6 +225,16 @@ impl Worker {
             .max(now))
     }
 
+    /// Whether a queued ACK still has ranges to send for the connection and
+    /// receive owner that produced it.
+    fn ack_current(&self, feedback: &Feedback) -> bool {
+        feedback.count != 0
+            && self.matches(feedback.session, feedback.tag)
+            && self.shared.owners[feedback.session][usize::from(feedback.lane)]
+                .load(Ordering::Acquire)
+                == feedback.origin as u8 + 1
+    }
+
     pub(super) fn flush_control(&mut self, now: Duration) -> io::Result<()> {
         for _ in 0..self.pending_control.len().min(BATCH_SIZE) {
             let now = self.io_clock(now)()?;
@@ -283,46 +302,73 @@ impl Worker {
                     self.control_replies -= 1;
                 }
                 Pending::Ack(mut feedback) => {
-                    if feedback.count != 0
-                        && self.matches(feedback.session, feedback.tag)
-                        && self.shared.owners[feedback.session][usize::from(feedback.lane)]
-                            .load(Ordering::Acquire)
-                            == feedback.origin as u8 + 1
+                    if !self.ack_current(&feedback) {
+                        self.return_feedback(feedback, now)?;
+                        continue;
+                    }
+                    let session = feedback.session;
+                    let due = self.control_due(session, now)?;
+                    if due > now {
+                        feedback.due = due;
+                        self.pending_control.push_back(Pending::Ack(feedback));
+                        continue;
+                    }
+                    // Feedback queued right behind for the session's other
+                    // lanes rides in the same datagram while it fits.
+                    let mut room = BASE_UDP_PAYLOAD - wire::HEADER_LEN - feedback.record_len();
+                    let mut batch: [Option<Box<Feedback>>; ACK_BATCH] =
+                        std::array::from_fn(|_| None);
+                    batch[0] = Some(feedback);
+                    let mut count = 1;
+                    while count < ACK_BATCH
+                        && matches!(
+                            self.pending_control.front(),
+                            Some(Pending::Ack(next))
+                                if next.session == session
+                                    && next.due <= now
+                                    && next.record_len() <= room
+                                    && self.ack_current(next)
+                        )
                     {
-                        let due = self.control_due(feedback.session, now)?;
-                        if due > now {
-                            feedback.due = due;
-                            self.pending_control.push_back(Pending::Ack(feedback));
-                            continue;
-                        }
+                        let Some(Pending::Ack(next)) = self.pending_control.pop_front() else {
+                            break;
+                        };
+                        room -= next.record_len();
+                        batch[count] = Some(next);
+                        count += 1;
+                    }
+                    let mut records = [Record::Probe; ACK_BATCH];
+                    for (record, feedback) in records.iter_mut().zip(batch.iter().flatten()) {
                         let queued =
                             now.saturating_sub(feedback.created).as_micros().min(1000) as u32;
-                        let ranges = AckRanges::new(&feedback.ranges[..feedback.count])
-                            .map_err(io::Error::other)?;
-                        if let Some((_, _, started)) = self.send_record(
-                            feedback.session,
-                            Record::Ack {
-                                lane: feedback.lane,
-                                delay_us: (feedback.delay_us + queued).min(1000),
-                                ranges,
-                            },
-                            now,
-                        )? {
+                        *record = Record::Ack {
+                            lane: feedback.lane,
+                            delay_us: (feedback.delay_us + queued).min(1000),
+                            ranges: AckRanges::new(&feedback.ranges[..feedback.count])
+                                .map_err(io::Error::other)?,
+                        };
+                    }
+                    let sent = self.send_records(session, &records[..count], now)?;
+                    if let Some((_, _, started)) = sent {
+                        for mut feedback in batch.into_iter().flatten() {
                             feedback.sent = Some(started);
-                        } else {
-                            self.counters.ack_send_deferred =
-                                self.counters.ack_send_deferred.wrapping_add(1);
-                            let totals = &mut self.sessions[feedback.session].totals;
-                            totals.ack_send_deferred = totals.ack_send_deferred.wrapping_add(1);
-                            // take_ack consumed the schedule; retain its snapshot until submitted.
-                            feedback.due = self
-                                .control_due(feedback.session, now)?
-                                .max(now.saturating_add(RETRY));
+                            self.return_feedback(feedback, now)?;
+                        }
+                    } else {
+                        let deferred = count as u64;
+                        self.counters.ack_send_deferred =
+                            self.counters.ack_send_deferred.wrapping_add(deferred);
+                        let totals = &mut self.sessions[session].totals;
+                        totals.ack_send_deferred = totals.ack_send_deferred.wrapping_add(deferred);
+                        // take_ack consumed the schedule; retain each snapshot until submitted.
+                        let due = self
+                            .control_due(session, now)?
+                            .max(now.saturating_add(RETRY));
+                        for mut feedback in batch.into_iter().flatten() {
+                            feedback.due = due;
                             self.pending_control.push_back(Pending::Ack(feedback));
-                            continue;
                         }
                     }
-                    self.return_feedback(feedback, now)?;
                 }
             }
         }
@@ -474,6 +520,70 @@ mod tests {
             rx.recv(&mut bytes).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn queued_acks_of_one_session_share_a_datagram_while_they_fit() {
+        let (mut worker, _tap) = receive_worker();
+        let rx = socket(&mut worker);
+        let tag = worker.sessions[0].connection.unwrap().local_tag().get();
+        let now = Duration::from_millis(1);
+        // Four lanes this worker receives have feedback queued: three ACKs
+        // with every range, then a short one. Two full ACKs fill a datagram.
+        let full = MAX_ACK_RANGES;
+        for (lane, count) in [(7_u16, full), (8, full), (9, full), (10, 1)] {
+            worker.shared.owners[0][usize::from(lane)]
+                .store(worker.id as u8 + 1, Ordering::Release);
+            let mut feedback = worker.feedback_free.pop().unwrap();
+            feedback.session = 0;
+            feedback.tag = tag;
+            feedback.lane = lane;
+            feedback.slot = 1;
+            feedback.count = count;
+            feedback.delay_us = 0;
+            feedback.created = now;
+            feedback.sent = None;
+            feedback.due = now;
+            for (index, range) in feedback.ranges.iter_mut().enumerate() {
+                let start = 1000 - 4 * index as u64;
+                *range = AckRange {
+                    start,
+                    end: start + 1,
+                };
+            }
+            let record = Record::Ack {
+                lane,
+                delay_us: 0,
+                ranges: AckRanges::new(&feedback.ranges[..count]).unwrap(),
+            };
+            assert_eq!(feedback.record_len(), record.encoded_len());
+            worker.pending_control.push_back(Pending::Ack(feedback));
+        }
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        let mut datagrams = Vec::new();
+        let mut at = now;
+        while !worker.pending_control.is_empty() {
+            worker.flush_control(at).unwrap();
+            while let Ok((length, ..)) = rx.recv(&mut bytes) {
+                let lanes: Vec<(u16, usize)> = Datagram::decode(&bytes[..length])
+                    .unwrap()
+                    .records()
+                    .map(|record| match record {
+                        Record::Ack { lane, ranges, .. } => (lane, ranges.len()),
+                        other => panic!("unexpected {other:?}"),
+                    })
+                    .collect();
+                datagrams.push(lanes);
+            }
+            at = worker.feedback_deadline().unwrap_or(at).max(at);
+        }
+        assert_eq!(
+            datagrams,
+            [vec![(7, full), (8, full)], vec![(9, full), (10, 1)]]
+        );
+        // Every snapshot went back to the pool.
+        assert_eq!(worker.feedback_free.len(), BUFFERS);
     }
 
     #[test]

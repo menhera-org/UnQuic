@@ -72,6 +72,14 @@ less the receiver's ACK hold, that path loses 0.01–0.05% of its frames,
 a competing TCP flow keeps its share, and the full-size point does not
 move.
 
+Per-frame cost work resumed with the budget's ACK line. A lane now
+acknowledges after 64 packets instead of sixteen (or 1 ms, as before),
+and ACKs due together for a session's lanes share a datagram. The
+control lane carries less than half the bytes and CPU per delivered bit
+on the full-size point falls 1.6–1.8% over twelve rounds, with no more
+loss on the lossy path
+([BENCH.md](BENCH.md#fewer-larger-acks-november-16-landed)).
+
 ## November 13 checkpoint
 
 Balanced lanes' loopback loss came from ACKs waiting for packet numbers.
@@ -1696,7 +1704,7 @@ remaining expired frames without extending their deadlines. Regressions cover
 out-of-order admission, slot reuse, source lifetime, blocked sockets and several
 full expired batches sharing the cleanup budget.
 
-- `ack.rs`: ACK scheduling (16 packets or 1 ms, immediate on gap), at most
+- `ack.rs`: ACK scheduling (64 packets or 1 ms, immediate on gap), at most
   32 newest ranges, delay capped at 1000 µs, per-lane once-per-millisecond
   duplicate limit, and processing against retained sent entries only.
 - `loss.rs`: RFC 9002 RTT estimator and loss detection with the parameters
