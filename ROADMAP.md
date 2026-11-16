@@ -527,7 +527,15 @@ Decisions only the user can make, each blocking a remaining goal:
    waits for "TAPs ready". Open: `Tap::create` should verify that the
    device holds every queue and fail otherwise, since a rename or move
    by udev could do the same; and a refused TAP write should keep its
-   error code. With that round explained, offload frames have met both
+   error code. The check cannot go by name, because the stray device
+   has the same name and a TAP moved after its last attach has none in
+   the daemon's namespace. Each queue's descriptor has to be compared
+   with queue 0's: the name from `TUNGETIFF` and the namespace from
+   `TUNGETDEVNETNS` (compare the two descriptors' inodes) must both
+   match, and a mismatch fails creation, which closes the queues and so
+   removes the stray device. The MTU is also set by name through a
+   control socket and should go through queue 0's descriptor, as the
+   MAC already does. With that round explained, offload frames have met both
    bars for the default, which is again the user's call
    ([BENCH.md](BENCH.md#offload-frames-after-the-ack-change-and-a-round-of-refused-tap-writes-november-16)).
 
