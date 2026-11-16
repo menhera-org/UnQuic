@@ -1575,8 +1575,9 @@ and 0.74 of 4 Gbit/s at its two points, 14 and then 13 of its 16 flows
 missing entirely, while the other direction and both daemons' loss
 counters looked normal. The receiving daemon counted 1,041,644
 `tap_errors` in 1.23 million TAP writes: six of its eight workers had
-154,000–193,000 writes refused each, and the other two none. No other
-round of this set or of the lossy set counted one.
+154,000–193,000 writes refused each, and the other two none. Of the 166
+daemon runs with offload frames on that this session's logs still hold,
+two others counted TAP errors, three each; none came near this.
 
 The cause is not known. The refusals lasted the whole run on those six
 queues and nothing in the daemon's log marks them, which suggests the
