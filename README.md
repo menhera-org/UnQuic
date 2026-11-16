@@ -750,10 +750,10 @@ workers, on an endpoint that serves no other session, because one
 steering program serves a whole endpoint. With four workers and sixteen
 QinQ flows it delivered 3–7% more at 8 Gbit/s offered each way and 16%
 more at 10, and at light load it cost nothing. On a routed 4.5 ms path
-with 1% loss nine
-rounds did not settle whether it loses more frames, so it stays off by
-default (BENCH.md, decision 9 in ROADMAP.md). The wire format and the
-peer are unaffected.
+with 1% loss it lost about 0.02% of frames at a round's worst point
+where the daemon without it lost 0.01%, so it stays off by default and
+is meant for boxes that saturate with one reading worker (BENCH.md,
+decision 9 in ROADMAP.md). The wire format and the peer are unaffected.
 
 Flow hashing looks through one unfragmented IPv4, IPv6 or Ethernet
 encapsulation, including an IPv6 segment routing header before the inner

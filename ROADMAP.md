@@ -651,12 +651,15 @@ Decisions only the user can make, each blocking a remaining goal:
    Against it: a rotation hands every receive lane of the session to
    another worker while it carries traffic, the old owners forward
    packets for about a second, and it has run only on loopback points
-   for some tens of minutes. On the lossy path nine rounds did not settle
-   whether it loses more: no more in five of nine and less at the median
-   (0.015% against 0.027%), but the two worst rounds were its own (0.10%
-   and 0.14% against 0.08% at most). The recommendation is to leave it
-   off until a longer lossy set and a run on the two-host path, and to
-   turn it on if both hold
+   for some tens of minutes. On the lossy path it loses more: over 21
+   rounds the worst point lost 0.021% at the median against 0.009%, and
+   it was no worse in only 10 of them, which misses the bar set for it
+   (8 rounds of 12). The loss is small on either arm. A likely cause,
+   not yet measured, is that the ACKs for the daemon's own transmissions
+   now arrive at the worker with the longest turns. The recommendation
+   is to keep it off by default and turn it on for boxes that saturate
+   with one reading worker, and to look next at whether the control lane
+   can go to an idle worker while the reader still receives no data
    ([BENCH.md](BENCH.md#which-worker-receives-which-lane-with-four-workers-november-16)).
 
 ## November 11 checkpoint

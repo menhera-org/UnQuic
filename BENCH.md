@@ -2087,21 +2087,30 @@ it costs nothing: 40.6–42.2 CPU% per delivered Gbit/s on, 40.7–41.9 for
 −0.2% where `0a15d20` itself reads −0.7%, and the point that contains
 the rotation lost no frame in six rounds
 ([results](benches/rotate-lanes-full-size.json)). On the routed 4.5 ms
-path with 1% loss, nine rounds do not settle it
+path with 1% loss it loses more. Nine rounds did not settle that, so
+twelve more were run with the bar stated first: on loses no more than
+`0a15d20` at the round's worst point in at least 8 rounds of 12, with a
+median no higher
 ([first three](benches/rotate-lanes-lossy-path.json),
-[six more](benches/rotate-lanes-lossy-path-2.json)):
+[six more](benches/rotate-lanes-lossy-path-2.json),
+[the twelve](benches/rotate-lanes-lossy-path-3.json)):
 
-| Frames lost at each round's worst point | Range | Median |
-| --- | --- | --- |
-| `0a15d20` | 0.005–0.083% | 0.027% |
-| `rotate_lanes` on | 0.005–0.144% | 0.015% |
+| Frames lost at each round's worst point | First nine rounds | Median | The twelve | Median | All 21, median |
+| --- | --- | --- | --- | --- | --- |
+| `0a15d20` | 0.005–0.083% | 0.027% | 0.004–0.100% | 0.009% | 0.009% |
+| `rotate_lanes` on | 0.005–0.144% | 0.015% | 0.006–0.038% | 0.023% | 0.021% |
 
-On, it lost no more than `0a15d20` in five rounds of nine and less at the
-median, but the two worst rounds of the eighteen were both its own, at
-0.10% and 0.14%. That is not the "no more frames lost" a default has to
-show, and not evidence of harm either; this point's own spread is as
-wide. The switch stays off by default, and its default is left to the
-user.
+On, it lost no more in 5 rounds of the 12 and in 10 of all 21, and its
+median is about twice that of `0a15d20`. It misses the bar. The loss is
+small either way, and the largest single rounds are spread over both
+arms (0.10% and 0.14% on; 0.08%, 0.09% and 0.10% off), but a typical
+round with the switch on loses 0.02% where one without loses 0.01%. A
+likely cause, not yet measured: the peer's control lane carries the ACKs
+for this daemon's own transmissions, and the rotation puts it on the
+worker with the longest turns, so ACKs wait longer and the congestion
+controller's queue check, which is what loses frames on this path, sees
+more jitter. The switch stays off by default; its use is a box that
+saturates, and its default is left to the user.
 
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
