@@ -99,6 +99,64 @@ fn set_persist(fd: &OwnedFd, persist: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// The device behind a queue as the kernel names it: its interface name and,
+/// where the kernel can say (TUNGETDEVNETNS, Linux 5.2) and allows it, the
+/// device and inode numbers of its network namespace.
+type Device = ([libc::c_char; libc::IFNAMSIZ], Option<(u64, u64)>);
+
+fn device_of(fd: BorrowedFd<'_>) -> io::Result<Device> {
+    // SAFETY: a zeroed ifreq is valid output storage for TUNGETIFF.
+    let mut request: libc::ifreq = unsafe { zeroed() };
+    // SAFETY: TUNGETIFF writes the device name and flags into request.
+    cvt(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNGETIFF, &mut request) })?;
+    // TUNGETDEVNETNS, _IO('T', 227), takes no argument and returns a new
+    // descriptor for the device's namespace.
+    // SAFETY: the request reads and writes no memory.
+    let netns = match cvt(unsafe { libc::ioctl(fd.as_raw_fd(), 0x54e3 as _) }) {
+        Ok(netns) => {
+            // SAFETY: the ioctl just returned this descriptor to us alone.
+            let netns = unsafe { OwnedFd::from_raw_fd(netns) };
+            // SAFETY: a zeroed stat is valid output storage for fstat.
+            let mut stat: libc::stat = unsafe { zeroed() };
+            // SAFETY: fstat writes only the stat it is given.
+            cvt(unsafe { libc::fstat(netns.as_raw_fd(), &mut stat) })?;
+            Some((stat.st_dev as u64, stat.st_ino as u64))
+        }
+        Err(_) => None,
+    };
+    Ok((request.ifr_name, netns))
+}
+
+/// Fails unless every queue belongs to the first queue's device.
+///
+/// Queues attach by name, one at a time. If the device is renamed or moved to
+/// another namespace between two attaches, the kernel creates a second device
+/// under the old name for the later ones: reads then arrive on the first
+/// queue only and writes to the others go nowhere.
+fn same_device(queues: &[TapQueue]) -> io::Result<()> {
+    let Some((first, rest)) = queues.split_first() else {
+        return Ok(());
+    };
+    // A rename during the pass looks like a mismatch, so look again while the
+    // first queue's own identity keeps changing.
+    for _ in 0..4 {
+        let device = device_of(first.fd.as_fd())?;
+        let mut same = true;
+        for queue in rest {
+            same &= device_of(queue.fd.as_fd())? == device;
+        }
+        if same {
+            return Ok(());
+        }
+        if device_of(first.fd.as_fd())? == device {
+            break;
+        }
+    }
+    Err(invalid(
+        "TAP queues belong to different devices; was the TAP renamed or moved while its queues attached?",
+    ))
+}
+
 /// A persistent multiqueue TAP without packet information.
 fn ours(tun: &link::Tun) -> bool {
     tun.tap && !tun.pi && tun.multi_queue && tun.persist
@@ -174,6 +232,8 @@ impl Tap {
                 completed_checksums: 0,
             });
         }
+        // Before anything else addresses the device by name.
+        same_device(&tap.queues)?;
         request.ifr_ifru.ifru_mtu = mtu as libc::c_int;
         let control = udp_socket()?;
         // SAFETY: SIOCSIFMTU reads the interface name and integer MTU from ifreq.
@@ -258,6 +318,9 @@ impl Tap {
             });
         }
         let name = name.ok_or_else(|| invalid("no queues to adopt"))?;
+        // Two devices may share a name across namespaces.
+        same_device(&adopted)
+            .map_err(|_| invalid("handed-over queues belong to different devices"))?;
         Ok(Self {
             name,
             queues: adopted,

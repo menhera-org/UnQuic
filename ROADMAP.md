@@ -539,18 +539,14 @@ Decisions only the user can make, each blocking a remaining goal:
    offload-frame fault. The bench script moved the TAP to its namespace
    between the daemon's first queue attach and the rest, and the later
    attaches, made by name, created a second device. The script now
-   waits for "TAPs ready". Open: `Tap::create` should verify that the
-   device holds every queue and fail otherwise, since a rename or move
-   by udev could do the same; and a refused TAP write should keep its
-   error code. The check cannot go by name, because the stray device
-   has the same name and a TAP moved after its last attach has none in
-   the daemon's namespace. Each queue's descriptor has to be compared
-   with queue 0's: the name from `TUNGETIFF` and the namespace from
-   `TUNGETDEVNETNS` (compare the two descriptors' inodes) must both
-   match, and a mismatch fails creation, which closes the queues and so
-   removes the stray device. The MTU is also set by name through a
-   control socket and should go through queue 0's descriptor, as the
-   MAC already does. With that round explained, offload frames have met both
+   waits for "TAPs ready". Both daemon fixes landed the same day:
+   `Tap::create` compares each queue's device with the first queue's
+   (the name from `TUNGETIFF`, the namespace from `TUNGETDEVNETNS`) and
+   fails on a mismatch, which closes the queues and so removes the
+   stray device; and `tap_error_code` keeps the errno of the latest
+   refused TAP read or write. The MTU is still set by name through a
+   control socket, since a tun descriptor has no call for it, but the
+   check now runs first. With that round explained, offload frames have met both
    bars for the default, which is again the user's call
    ([BENCH.md](BENCH.md#offload-frames-after-the-ack-change-and-a-round-of-refused-tap-writes-november-16)).
 

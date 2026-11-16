@@ -2857,6 +2857,9 @@ impl Worker {
                     self.counters.tap_errors = self.counters.tap_errors.wrapping_add(1);
                     self.sessions[session].totals.tap_errors =
                         self.sessions[session].totals.tap_errors.wrapping_add(1);
+                    let code = error.raw_os_error().unwrap_or(0) as u64;
+                    self.counters.tap_error_code = code;
+                    self.sessions[session].totals.tap_error_code = code;
                     let local = &mut self.sessions[session];
                     if local.tap_registered
                         && let Some(tap) = &local.tap
@@ -4547,7 +4550,7 @@ impl Worker {
                         writable = true;
                         break;
                     }
-                    Err(_) => {
+                    Err(error) => {
                         self.counters.tap_errors =
                             self.counters.tap_errors.wrapping_add(attempted as u64);
                         local.totals.tap_errors =
@@ -4555,6 +4558,10 @@ impl Worker {
                         local.rx_totals[slot].tap_errors = local.rx_totals[slot]
                             .tap_errors
                             .wrapping_add(attempted as u64);
+                        let code = error.raw_os_error().unwrap_or(0) as u64;
+                        self.counters.tap_error_code = code;
+                        local.totals.tap_error_code = code;
+                        local.rx_totals[slot].tap_error_code = code;
                         local.rx_dirty |= 1_u64 << slot;
                     }
                 }
@@ -6966,10 +6973,27 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         assert_eq!(worker.counters.tap_errors, 1);
+        // The bad frame failed this daemon's own check, so no errno goes with it.
+        assert_eq!(worker.counters.tap_error_code, 0);
         assert_eq!(
             worker.sessions[0].rx[0].as_ref().unwrap().retained_frames(),
             0
         );
+        // A write the kernel refuses leaves its errno beside the count.
+        drop(tap);
+        let length = receive_bytes(5, &[receive_piece(5, 0, &[5; 60])], &mut bytes);
+        let datagram = Datagram::decode(&bytes[..length]).unwrap();
+        let lane = worker.sessions[0].rx[0].as_mut().unwrap();
+        assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Fresh);
+        worker.flush_rx(0, 0, Duration::ZERO);
+        assert_eq!(worker.counters.tap_errors, 2);
+        let code = worker.counters.tap_error_code;
+        assert!(
+            [libc::ECONNREFUSED, libc::EPIPE, libc::ENOTCONN].contains(&(code as i32)),
+            "{code}"
+        );
+        assert_eq!(worker.sessions[0].totals.tap_error_code, code);
+        assert_eq!(worker.sessions[0].rx_totals[0].tap_error_code, code);
     }
 
     #[test]

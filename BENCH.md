@@ -1611,10 +1611,11 @@ up, this was the only one short of its queues, so no other result
 recorded on November 16 was affected. The script now waits for the
 daemon's "TAPs ready" line before it moves the link. The daemon has the
 same exposure to anything that renames or moves a fresh TAP between two
-attaches, udev included, so after attaching it should check that the
-device holds every queue and fail startup otherwise; it should also
-keep the error code of a refused write, which it only counts today.
-Neither daemon change is done yet. With the failed round explained and
+attaches, udev included. Later the same day both daemon changes landed:
+`Tap::create` now compares every queue's device with the first queue's,
+by name and by network namespace, and fails if they differ, and
+`tap_error_code` keeps the errno of the latest refused TAP read or
+write beside the `tap_errors` count. With the failed round explained and
 not theirs,
 offload frames have met both bars set for the default.
 

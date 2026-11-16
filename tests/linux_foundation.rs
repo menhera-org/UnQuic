@@ -257,6 +257,36 @@ fn kernel_socket_and_tap_invariants() {
 
 #[test]
 #[ignore = "requires isolated container, /dev/net/tun, iproute2, CAP_NET_ADMIN and CAP_NET_RAW"]
+fn queues_of_same_named_taps_in_two_namespaces_are_one_device_to_nobody() {
+    use std::os::fd::{AsRawFd, OwnedFd};
+    // SAFETY: unshare changes only this test thread's network namespace.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
+    let elsewhere = namespace();
+    // A TAP moved away between two of create's attaches frees its name here,
+    // and the next attach by that name makes a second device.
+    let moved = Tap::create(c"uq-twin", 1500, 1, None).unwrap();
+    let path = format!("/proc/{}/fd/{}", std::process::id(), elsewhere.as_raw_fd());
+    ip(&["link", "set", "uq-twin", "netns", &path]);
+    let stray = Tap::create(c"uq-twin", 1500, 2, None).unwrap();
+    assert_eq!(moved.name(), stray.name());
+    // The stray's own queues are one device; mixed with the moved one they are not.
+    let mut stray = stray.into_queues().into_iter().map(|q| q.into_fd());
+    let mixed: Vec<OwnedFd> = moved
+        .into_queues()
+        .into_iter()
+        .map(|q| q.into_fd())
+        .chain(stray.next())
+        .collect();
+    assert_eq!(mixed.len(), 2);
+    assert!(Tap::adopt(mixed, 1500).is_err());
+    let alone = Tap::adopt(stray.collect(), 1500).unwrap();
+    assert_eq!(alone.queue_count(), 1);
+    drop(alone);
+    unquic::tap::remove(c"uq-twin").unwrap();
+}
+
+#[test]
+#[ignore = "requires isolated container, /dev/net/tun, iproute2, CAP_NET_ADMIN and CAP_NET_RAW"]
 fn handed_over_queues_are_adopted_by_device_not_name() {
     use std::os::fd::{FromRawFd, OwnedFd};
     // SAFETY: unshare changes only this test thread's network namespace.

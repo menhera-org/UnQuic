@@ -237,6 +237,10 @@ metrics! {
     tap_tso_fallbacks: sum,
     /// Frames discarded after permanent TAP write errors, plus TAP read errors.
     tap_errors: sum,
+    /// errno of the latest tap_errors event, the largest where workers or
+    /// lanes differ; zero with tap_errors nonzero means the frame failed
+    /// this daemon's own checks before any syscall.
+    tap_error_code: max,
 }
 
 fn sum(a: u64, b: u64) -> u64 {
