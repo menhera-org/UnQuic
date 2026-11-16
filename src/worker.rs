@@ -4739,7 +4739,7 @@ impl Worker {
                         .and_then(|buffer| buffer.bytes.get(..length))
                         .unwrap_or_default();
                     // Held slots mirror the writer's, so this only fails if they diverge.
-                    if !writer.accept(holder, bytes, now, STRIPE_HOLD, &mut deliver, &mut release) {
+                    if !writer.accept(holder, bytes, now, &mut deliver, &mut release) {
                         release(holder);
                     }
                 }

@@ -1084,8 +1084,10 @@ of its frames.
   apart from repairs, so the frame is then known to be late), until it is
   abandoned or expires on the lane that carries it, or until the oldest
   held frame has waited the hold limit, min(2 × smoothed RTT, 5 ms); then
-  the window skips the gap. A lane silent for the hold limit no longer
-  counts among the stripe's lanes. An abandoned
+  the window skips the gap. A lane counts among the stripe's lanes until
+  it has been silent for a second, as long as a stripe may idle, so a
+  flow that pauses between bursts keeps its lanes; the hold limit covers
+  a lane that has stopped. An abandoned
   or expired striped frame that never arrived cannot name its sequence, so
   the hold limit covers it. A full window skips the oldest gap at once.
   Held frames keep their own deadlines, and the reorder buffers are charged

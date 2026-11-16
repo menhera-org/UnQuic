@@ -1123,9 +1123,20 @@ is, and striping's premise holds for it. Whether striping lifts it is
 still unmeasured: this host cannot give the daemon its buffers, and the
 remote host has eight CPUs, too few for two four-worker daemons and
 their generators (with two workers there is no second transmit worker
-to stripe onto). The 2% of frames the writer wrote out of sequence
-here, with nothing lost on the path, is a separate fault to look at:
-the lanes drifted more than the 5 ms hold apart under TCP's bursts.
+to stripe onto).
+
+The 2% of frames the writer wrote out of sequence in the container's
+striped TCP run, far more than its 1,358 repairs, most likely came from
+the gap rule itself. It dropped a lane from a stripe after 5 ms of
+silence. TCP pauses between bursts, and when a burst resumed, the first
+lane to deliver counted as the only one, so the writer skipped ahead of
+frames still coming on the others. A lane now stays a member for as long
+as a stripe may idle, one second, and the hold limit covers a lane that
+has stopped. The UDP comparison is unchanged by it
+([results](benches/lossy-one-flow-striping-lane-members.json)): 1.80–
+2.17 Gbit/s striped against 0.76–1.06, with 43,000–78,000 frames
+reordered. Its effect on TCP is not verified: in eight more striped TCP
+runs here, striping did not engage once.
 
 ## Twice the receive slots in the same storage (November 15, landed)
 

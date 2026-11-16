@@ -129,13 +129,15 @@ impl Stripe {
         }
     }
 
-    /// The sequence every lane heard from within `limit` has reached; a lane
-    /// silent longer is forgotten, and the hold limit covers its frames.
-    fn passed(&mut self, now: Duration, limit: Duration) -> Option<u64> {
+    /// The sequence every lane of the stripe has reached. A lane counts for
+    /// as long as a stripe lives without frames, IDLE: a flow that pauses
+    /// between bursts keeps its lanes, so the first to resume does not skip
+    /// ahead of the others, and the hold limit covers a lane that stopped.
+    fn passed(&mut self, now: Duration) -> Option<u64> {
         let mut mark: Option<u64> = None;
         for slot in &mut self.sources {
             match slot {
-                Some(source) if now.saturating_sub(source.last) < limit => {
+                Some(source) if now.saturating_sub(source.last) < IDLE => {
                     mark = Some(mark.map_or(source.highest, |mark| mark.min(source.highest)));
                 }
                 Some(_) => *slot = None,
@@ -232,15 +234,14 @@ impl<H: Copy> Writer<H> {
 
     /// Takes a transfer buffer's frames at `now`, writing at once those that
     /// are in sequence or cannot wait, and skipping gaps that every lane
-    /// heard from within `limit` has passed. `bytes` must stay readable
-    /// through `handle` until `release` returns it. False, taking nothing,
-    /// when no holder slot is free.
+    /// of their stripe has passed. `bytes` must stay readable through
+    /// `handle` until `release` returns it. False, taking nothing, when no
+    /// holder slot is free.
     pub fn accept(
         &mut self,
         handle: H,
         bytes: &[u8],
         now: Duration,
-        limit: Duration,
         deliver: &mut impl FnMut(H, Range<usize>, bool),
         release: &mut impl FnMut(H),
     ) -> bool {
@@ -297,7 +298,7 @@ impl<H: Copy> Writer<H> {
             if touched & (1 << index) != 0
                 && self.stripes[index].as_mut().is_some_and(|stripe| {
                     stripe
-                        .passed(now, limit)
+                        .passed(now)
                         .is_some_and(|mark| stripe.window.skip_to(mark))
                 })
             {
@@ -435,11 +436,11 @@ mod tests {
         };
         let mut release = |handle: u8| released.push(handle);
         let at = Duration::ZERO;
-        assert!(writer.accept(0, &buffers[0], at, LIMIT, &mut deliver, &mut release));
+        assert!(writer.accept(0, &buffers[0], at, &mut deliver, &mut release));
         // Lane 2 has only reached 1, so 4 and 6 wait behind the missing 3.
-        assert!(writer.accept(1, &buffers[1], at, LIMIT, &mut deliver, &mut release));
+        assert!(writer.accept(1, &buffers[1], at, &mut deliver, &mut release));
         assert_eq!(writer.holding(), 1);
-        assert!(writer.accept(2, &buffers[2], at, LIMIT, &mut deliver, &mut release));
+        assert!(writer.accept(2, &buffers[2], at, &mut deliver, &mut release));
         assert_eq!(written, [1, 2, 3, 4, 5, 6]);
         // Frame 6, buffer 1's last, leaves during the third call, before
         // that call lets go of buffer 2.
@@ -461,6 +462,8 @@ mod tests {
             batch(1, &[frame(5, 8, 8)]),
             batch(2, &[frame(5, 4, 4)]),
             batch(1, &[frame(5, 11, 11)]),
+            batch(1, &[frame(5, 12, 12)]),
+            batch(1, &[frame(5, 14, 14)]),
         ];
         let mut deliver = |handle: u8, range: Range<usize>, _| {
             written.push(buffers[usize::from(handle)][range][STRIPE_TAG_LEN]);
@@ -472,7 +475,6 @@ mod tests {
                 handle,
                 &buffers[usize::from(handle)],
                 at,
-                LIMIT,
                 &mut deliver,
                 &mut release,
             );
@@ -480,15 +482,26 @@ mod tests {
         // Lane 1 has only reached 2, so 5, 6 and 7 wait for sequence 4.
         assert_eq!(writer.holding(), 2);
         // Once lane 1 delivers 8, every lane is past 4: it is skipped at once.
-        writer.accept(3, &buffers[3], at, LIMIT, &mut deliver, &mut release);
+        writer.accept(3, &buffers[3], at, &mut deliver, &mut release);
         assert_eq!(writer.holding(), 0);
         assert_eq!(writer.expire(at, LIMIT, &mut deliver, &mut release), None);
         // Its repair still arrives, out of sequence.
-        writer.accept(4, &buffers[4], at, LIMIT, &mut deliver, &mut release);
+        writer.accept(4, &buffers[4], at, &mut deliver, &mut release);
         assert_eq!(writer.totals().unordered, 1);
-        // Lanes silent for the hold limit no longer hold gaps back.
-        writer.accept(5, &buffers[5], LIMIT, LIMIT, &mut deliver, &mut release);
-        assert_eq!(written, [1, 2, 3, 5, 6, 7, 8, 4, 11]);
+        // Lanes 2 and 3 pause and lane 1 resumes alone. They still count, so
+        // sequence 11 waits out the hold limit instead of skipping 9 and 10
+        // at once, which would put a slower lane's frames out of sequence.
+        writer.accept(5, &buffers[5], LIMIT, &mut deliver, &mut release);
+        assert_eq!(writer.holding(), 1);
+        assert_eq!(
+            writer.expire(LIMIT * 2, LIMIT, &mut deliver, &mut release),
+            None
+        );
+        // A lane silent for as long as a stripe may idle no longer counts.
+        writer.accept(6, &buffers[6], IDLE / 2, &mut deliver, &mut release);
+        writer.accept(7, &buffers[7], IDLE, &mut deliver, &mut release);
+        assert_eq!(writer.holding(), 0);
+        assert_eq!(written, [1, 2, 3, 5, 6, 7, 8, 4, 11, 12, 14]);
     }
 
     #[test]
@@ -508,9 +521,9 @@ mod tests {
         };
         let mut release = |_| released += 1;
         let at = Duration::ZERO;
-        writer.accept(0, &buffers[0], at, limit, &mut deliver, &mut release);
+        writer.accept(0, &buffers[0], at, &mut deliver, &mut release);
         // Lane 2 has not passed sequence 2, so 3 and 4 wait for the hold limit.
-        writer.accept(1, &buffers[1], at, limit, &mut deliver, &mut release);
+        writer.accept(1, &buffers[1], at, &mut deliver, &mut release);
         let due = writer.expire(Duration::from_millis(1), limit, &mut deliver, &mut release);
         assert_eq!(due, Some(limit));
         assert_eq!(
@@ -518,18 +531,11 @@ mod tests {
             None
         );
         // The missing frame arrives late; a repeat of 4 is a duplicate.
-        writer.accept(2, &buffers[2], limit, limit, &mut deliver, &mut release);
+        writer.accept(2, &buffers[2], limit, &mut deliver, &mut release);
         assert_eq!(writer.totals().unordered, 1);
         assert_eq!(writer.totals().dropped, 1);
         // After a second of silence the number may start over at 1.
-        writer.accept(
-            3,
-            &buffers[3],
-            limit + IDLE,
-            limit,
-            &mut deliver,
-            &mut release,
-        );
+        writer.accept(3, &buffers[3], limit + IDLE, &mut deliver, &mut release);
         assert_eq!(written, [1, 3, 4, 2, 7]);
         assert_eq!(writer.holding(), 0);
         assert_eq!(released, 4);
@@ -625,7 +631,7 @@ mod tests {
             for (handle, buffer) in buffers.iter().enumerate() {
                 now += Duration::from_micros(random(100));
                 writer.expire(now, limit, &mut deliver, &mut release);
-                assert!(writer.accept(handle, buffer, now, limit, &mut deliver, &mut release));
+                assert!(writer.accept(handle, buffer, now, &mut deliver, &mut release));
             }
             writer.expire(now + limit, limit, &mut deliver, &mut release);
         }
@@ -664,17 +670,10 @@ mod tests {
         let mut release = |_: usize| released += 1;
         let at = Duration::ZERO;
         for (handle, buffer) in buffers.iter().enumerate().take(STRIPES) {
-            assert!(writer.accept(handle, buffer, at, LIMIT, &mut deliver, &mut release));
+            assert!(writer.accept(handle, buffer, at, &mut deliver, &mut release));
         }
         // A seventeenth stripe finds no slot: its frames go out unordered.
-        assert!(writer.accept(
-            STRIPES,
-            &buffers[STRIPES],
-            at,
-            LIMIT,
-            &mut deliver,
-            &mut release
-        ));
+        assert!(writer.accept(STRIPES, &buffers[STRIPES], at, &mut deliver, &mut release));
         assert_eq!(writer.totals().unordered, 2);
         assert_eq!(writer.holding(), STRIPES);
         assert_eq!((written, released), (STRIPES + 2, 1));
@@ -693,10 +692,10 @@ mod tests {
             })
             .collect();
         for (handle, buffer) in held.iter().enumerate().take(HOLDERS) {
-            assert!(holder.accept(handle, buffer, at, LIMIT, &mut |_, _, _| {}, &mut |_| {}));
+            assert!(holder.accept(handle, buffer, at, &mut |_, _, _| {}, &mut |_| {}));
         }
         assert!(!holder.can_accept());
         let last = &held[HOLDERS];
-        assert!(!holder.accept(HOLDERS, last, at, LIMIT, &mut |_, _, _| {}, &mut |_| {}));
+        assert!(!holder.accept(HOLDERS, last, at, &mut |_, _, _| {}, &mut |_| {}));
     }
 }

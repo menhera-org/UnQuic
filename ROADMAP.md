@@ -421,9 +421,12 @@ Decisions only the user can make, each blocking a remaining goal:
    transmit worker (73% and 92%), so striping's premise holds for TCP
    too. Measuring it needs a host with both the buffers and the CPUs
    for four workers per daemon; neither test host has both.
-   `stripe_flows` stays off by default until then. Open under TCP's
-   bursts: lanes drifting more than the 5 ms hold apart (2% of frames
-   written out of sequence with nothing lost).
+   `stripe_flows` stays off by default until then. The writer no longer
+   drops a lane from a stripe after 5 ms of silence, which let the
+   first lane to resume after a pause skip ahead of the others (the
+   likely cause of 2% of a striped TCP flow's frames leaving out of
+   sequence); a lane stays a member for a second. That fix is unit
+   tested and leaves the UDP result unchanged, but is unverified on TCP.
 8. Decided November 14: `daemon.offload_frames` stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should
