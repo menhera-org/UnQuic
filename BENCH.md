@@ -1592,13 +1592,24 @@ point and after it, where the peer's TAP and every healthy run show
 eight. So the device came up with a single queue, the other workers
 held descriptors that were not attached to it, and ordinary frames
 would have been lost the same way; offload frames only happened to be
-on. Why seven queues failed to attach, or were detached, is not known.
-The daemon counts a refused write without keeping its error code and
-does not check the device's queue count after creating it, so those are
-the first two things to add. Until the cause is found
-and fixed, offload frames cannot become the default whatever the
-averages say: a refused write loses the whole frame, and here it took
-most of a direction.
+on.
+
+The cause is a race between this script and the daemon's TAP creation.
+`Tap::create` attaches its queues one at a time by name, and only the
+first attach insists that the device be new. The script polls for the
+link and moves it into its namespace as soon as the name exists, which
+is after the first attach. When the move lands before the other
+attaches, they find no such name in the daemon's namespace and the
+kernel creates a second device there for them. The daemon ends with one
+queue on the moved device and seven on a device that is never brought
+up, and a write to a down TAP fails. The script should wait for the
+daemon's "TAPs ready" line before it moves the link. The daemon has the
+same exposure to anything that renames or moves a fresh TAP between two
+attaches, udev included, so after attaching it should check that the
+device holds every queue and fail startup otherwise; it should also
+keep the error code of a refused write, which it only counts today.
+Neither is done yet. With the failed round explained and not theirs,
+offload frames have met both bars set for the default.
 
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 

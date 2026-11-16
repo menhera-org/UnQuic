@@ -521,10 +521,14 @@ Decisions only the user can make, each blocking a remaining goal:
    that direction delivered nothing. That TAP had come up with one
    attached queue instead of eight (its qdisc dump shows one), so this
    is a startup fault that ordinary frames would have hit too, not an
-   offload-frame fault. Why the other queues were not attached is
-   unknown; the daemon should check the queue count after creating its
-   TAP and keep the error code of a refused write. Finding the cause
-   comes before any change of default
+   offload-frame fault. The bench script moved the TAP to its namespace
+   between the daemon's first queue attach and the rest, and the later
+   attaches, made by name, created a second device. Open: the script
+   should wait for "TAPs ready"; `Tap::create` should verify that the
+   device holds every queue and fail otherwise, since a rename or move
+   by udev could do the same; and a refused TAP write should keep its
+   error code. With that round explained, offload frames have met both
+   bars for the default, which is again the user's call
    ([BENCH.md](BENCH.md#offload-frames-after-the-ack-change-and-a-round-of-refused-tap-writes-november-16)).
 
 ## November 11 checkpoint
