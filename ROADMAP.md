@@ -100,7 +100,11 @@ Next targets in the daemon's own code, by cycles per frame event in
 that profile: output coalescing around the TAP write (about 320, the
 `flush_taps` phase less its syscall), the reassembly copy and slot scan
 in receive admission (260–285 and 123–133), recovery staging (225–240)
-and TAP input expansion (190–210). Each is small against the syscalls,
+and TAP input expansion (190–210). The first is not wasted attempts:
+with offload frames off a write carries twenty frames (13.6 million
+frames in 665,000–682,000 writes), so the 320 cycles are what building
+those runs costs, about 640 for each frame written, and `uso::write`
+is the place to split next. Each is small against the syscalls,
 so each needs the small-frame point as well as the full-size one to
 show.
 
