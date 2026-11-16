@@ -2092,7 +2092,10 @@ it costs nothing: 40.6–42.2 CPU% per delivered Gbit/s on, 40.7–41.9 for
 `0a15d20` and 41.1–41.7 for its copy; the median against the copy is
 −0.2% where `0a15d20` itself reads −0.7%, and the point that contains
 the rotation lost no frame in six rounds
-([results](benches/rotate-lanes-full-size.json)). On the routed 4.5 ms
+([results](benches/rotate-lanes-full-size.json)). With the switch off
+the committed build reads as `0a15d20` does, 40.8–41.6 against 41.0–41.8
+in four rounds
+([results](benches/rotate-lanes-off-full-size.json)). On the routed 4.5 ms
 path with 1% loss it loses more. Nine rounds did not settle that, so
 twelve more were run with the bar stated first: on loses no more than
 `0a15d20` at the round's worst point in at least 8 rounds of 12, with a
