@@ -15,8 +15,10 @@ pub(crate) const DELAY: Duration = Duration::from_millis(1);
 /// ACK-eliciting packets on one lane that make feedback due at once. A busy
 /// lane then sends an ACK per this many packets instead of per DELAY; each
 /// ACK costs a send here and a receive, a handoff and a controller update at
-/// the sender.
-const COUNT: u8 = 64;
+/// the sender. It stays under the 64 packets a sender reports to its
+/// controller in one pass, with room for those that arrive before the ACK is
+/// built: an ACK of more costs the sender a second report round trip.
+const COUNT: u8 = 48;
 
 pub(crate) struct Schedule {
     pub highest: u64,

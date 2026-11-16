@@ -1730,6 +1730,44 @@ ms). Lossy point
 0.171%, 0.101% and 0.006% for HEAD and 0.030%, 0.006% and 0.180% for
 its copy. The bar is met and both land.
 
+## An ACK that fits one report (November 16, landed)
+
+A split profile of `fc30954` put each daemon's busy cycles at 4,920 and
+5,100 per frame event, where `6fcf89d` spent 5,230 and 5,540, and its
+wakes at 1.2 million in a run where there had been 1.8 million. It also
+counted 1.8 controller reports for every ACK handed to a lane worker,
+and half of the report returns still woke their owner.
+
+A sender applies an ACK in passes of at most 64 packets, one report to
+the controller owner each, and waits for a report to come back before
+the next. The morning's change made a lane acknowledge after 64
+packets. An ACK built a moment later covers those and the few that
+arrived meanwhile, so it overflows one pass: of 267,000 ACKs a daemon
+completed in a run, 176,000 needed a second report, at 58.6 packets an
+ACK on average. The second pass carries the overflow or nothing but the
+end mark, and costs a report, a return that must wake, and their two
+wakes.
+
+The candidate acknowledges after 48 packets, which leaves room for the
+late arrivals. Stated beforehand: 2% or more off CPU per delivered bit
+on the full-size point by the usual bar, and no more loss on the lossy
+point. [Results](benches/full-size-ack-count-48.json): lower than both
+HEAD and its copy in 6 of 6 rounds, −5.8% against HEAD and −5.7%
+against the copy at the median, with the copy level with HEAD. The
+control lane carried 31.3 MB in a run against 30.9: on this point most
+ACKs leave on the 1 ms timer, so the smaller count adds few. Lossy
+point, two sets ([first](benches/lossy-path-ack-count-48.json),
+[second](benches/lossy-path-ack-count-48-second.json)): 0.004–0.077%
+lost at each round's worst point, median 0.010%, against 0.006–0.571%
+for HEAD and 0.004–0.099% for its copy. The first set alone had the
+candidate above both baselines in two rounds of three, which is why
+there is a second; over six rounds it loses no more.
+
+The gain is larger than the 1.6–1.8% the count of 64 bought in the
+morning, part of which this overhead had been eating. A report that
+held more than one pass's worth would allow a larger count again; that
+has not been tried.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames

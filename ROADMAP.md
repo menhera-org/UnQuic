@@ -120,6 +120,17 @@ by the other
 The wakes left are work for their target: frames to send, ACKs to
 apply, reports for the controller and ACKs for worker 0 to send.
 
+A profile of that build showed 1.8 controller reports per ACK. A sender
+reports at most 64 acknowledged packets in one pass, and the morning's
+ACK count of 64 made two ACKs in three overflow it by a few packets,
+which cost a second report, a second return and their wakes. With the
+count at 48 an ACK fits one pass: 5.7–5.8% off CPU per delivered bit in
+6 of 6 rounds, the control lane's volume unchanged
+([BENCH.md](BENCH.md#an-ack-that-fits-one-report-november-16-landed)).
+The same profile found that half of all worker turns end in a
+non-blocking poll and that four in five of those polls find nothing,
+1.7 million per daemon in a run; that is the next target.
+
 Next targets in the daemon's own code, by cycles per frame event in
 that profile: output coalescing around the TAP write (about 320, the
 `flush_taps` phase less its syscall), the reassembly copy and slot scan
@@ -1785,7 +1796,7 @@ remaining expired frames without extending their deadlines. Regressions cover
 out-of-order admission, slot reuse, source lifetime, blocked sockets and several
 full expired batches sharing the cleanup budget.
 
-- `ack.rs`: ACK scheduling (64 packets or 1 ms, immediate on gap), at most
+- `ack.rs`: ACK scheduling (48 packets or 1 ms, immediate on gap), at most
   32 newest ranges, delay capped at 1000 µs, per-lane once-per-millisecond
   duplicate limit, and processing against retained sent entries only.
 - `loss.rs`: RFC 9002 RTT estimator and loss detection with the parameters
