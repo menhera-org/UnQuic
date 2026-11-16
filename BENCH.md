@@ -1606,7 +1606,9 @@ up, and a write to a down TAP fails. The kernel's part was checked by
 hand in a container: create a multi-queue TAP, move it to another
 namespace, attach by the same name again, and the attach succeeds and
 leaves a second device of that name, down, in the old namespace. The
-race itself was not forced. The script now waits for the
+race itself was not forced. Of the 384 TAPs that the day's sets brought
+up, this was the only one short of its queues, so no other result
+recorded on November 16 was affected. The script now waits for the
 daemon's "TAPs ready" line before it moves the link. The daemon has the
 same exposure to anything that renames or moves a fresh TAP between two
 attaches, udev included, so after attaching it should check that the
