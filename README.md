@@ -679,10 +679,11 @@ segment. The receiver checks the descriptor, writes the run to its TAP with
 that header, or segments it in software when the TAP refuses the offload. On
 the full-size efficiency point, where nearly every TAP read is a 44-segment
 super-frame, it cut CPU per delivered Gbit/s 14.7% in all six rounds and
-lost no more frames. On a routed 4.5 ms path with 1% loss it lost more
-frames than ordinary frames do (11.6–18.7% against 4.9–12.8%), because a
-lost datagram keeps a whole run waiting for repair (BENCH.md), so it suits
-clean paths only. Receiving uses the ordinary reassembly slots; sending
+lost no more frames. On a routed 4.5 ms path with 1% loss it still loses
+more than ordinary frames do, because a frame that expires takes its whole
+run with it: 0.05–0.19% against 0.01–0.05% at each round's worst point
+since November 16, where both lost several percent before (BENCH.md).
+Receiving uses the ordinary reassembly slots; sending
 reserves about 420 KiB of coverage planes per worker. It stays off by
 default (decision 8 in ROADMAP.md).
 

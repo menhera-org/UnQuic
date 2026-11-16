@@ -113,7 +113,7 @@ Gbit/s at an offer-limited load instead.
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
 | Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Loopback throughput at an 8952-byte limit is measured: the 21G total rises 70–126%; on the routed decision workload at 5G delivery rises 50–56% at 36% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)). Real-path throughput at larger MTUs remains open. DATA-quoted PTB validation now has targeted kernel coverage. |
-| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | One flow at 7.5 ms with 0.5–1% random loss: about 1.0 Gbit/s per direction locally with hash lanes and the default queue-checked loss tolerance (0.91–1.05 at 1G and 5G offered on `424f4f8`, busiest thread 76–98%, [results](benches/lossy-one-flow-424f4f8.json)), 1.5–2.0 with the old per-reader balanced-lane tables only because the flow kept changing lanes, which the shared flow table ends (0.7–0.9 since November 13, [BENCH.md](#a-control-lane-for-acks-november-13)); 1.6 Gbit/s on the remote host, where a limit downstream of the sender caps it. At 5% loss draft 07 delivers under 10 Mbit/s of a 5G offer; `loss_threshold_permille = 100` raises that to about 0.45 Gbit/s ([BENCH.md](#a-configurable-loss-threshold-for-random-loss-november-12)) | One transmit worker caps one flow near 1 Gbit/s here even without loss, a third of it the kernel's software send path and a quarter userspace, so the gate needs striping with a receive reorder stage, a larger outer MTU or segmenting hardware ([BENCH.md](#what-holds-one-flow-near-1-gbits-november-13); ROADMAP decision 7); the 5% rows (still under a tenth of the offer; FEC or a different response), and a real-path measurement. |
+| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | One flow at 7.5 ms with 0.5–1% random loss: about 1.0 Gbit/s per direction locally with hash lanes and the default queue-checked loss tolerance (0.91–1.05 at 1G and 5G offered on `424f4f8`, busiest thread 76–98%, [results](benches/lossy-one-flow-424f4f8.json)), 1.5–2.0 with the old per-reader balanced-lane tables only because the flow kept changing lanes, which the shared flow table ends (0.7–0.9 since November 13, [BENCH.md](#a-control-lane-for-acks-november-13)); 1.6 Gbit/s on the remote host, where a limit downstream of the sender caps it. November 16: with `stripe_flows` on, one UDP flow delivers 2.1–2.4 Gbit/s per direction at 0.5–1% loss against 1.1–1.2 without ([BENCH.md](#striping-one-flow-across-transmit-workers-november-15)); sixteen flows at 2 Gbit/s each way on a 4.5 ms path with 1% loss lose 0.01–0.05% of their frames since the queue check uses each round's smallest RTT sample, where they lost about 1% ([BENCH.md](#where-the-lossy-point-loses-its-frames-november-16)). At 5% loss draft 07 delivers under 10 Mbit/s of a 5G offer; `loss_threshold_permille = 100` raises that to about 0.45 Gbit/s ([BENCH.md](#a-configurable-loss-threshold-for-random-loss-november-12)) | One transmit worker caps one flow near 1 Gbit/s here even without loss, a third of it the kernel's software send path and a quarter userspace, so the gate needs striping with a receive reorder stage, a larger outer MTU or segmenting hardware ([BENCH.md](#what-holds-one-flow-near-1-gbits-november-13); ROADMAP decision 7). Striping is built but off by default: the worker that reads the flow and writes its reverse direction then limits it near 2.2 Gbit/s, and it is unmeasured for TCP, which needs a host with full receive buffers and four workers per daemon. Also open: the 5% rows (still under a tenth of the offer; FEC or a different response), and a real-path measurement. |
 | Coexist with other traffic | Against one TCP CUBIC flow at a 1 Gbit/s, 7.5 ms token-bucket bottleneck: an even share with a one-BDP queue; with a quarter-BDP queue the queue-checked tolerance keeps TCP's share | Several competitors, other buffer depths and other TCP algorithms are unmeasured. |
 
 Unlimited loss remains high. TAP ingress drops, bounded worker queue drops,
@@ -1319,6 +1319,27 @@ HEAD in 3 of 6 rounds at a median of +0.1%, with HEAD's copy at +0.4%
 of the bar is met and the check lands. ProbeRTT's share of the remaining
 loss is left for a later look; after this change it is a share of a
 much smaller number.
+
+Two earlier comparisons were repeated on the build with the check
+(38e68ce).
+
+Offload frames on the lossy point, same bar as on November 15 (with them
+on, each round's worst point loses no more than with them off in two
+rounds of three; [results](benches/lossy-offload-smallest-rtt.json)):
+0.19%, 0.055% and 0.052% lost with them on against 0.048%, 0.023% and
+0.008% off. Not met, in none of three rounds: an offload frame that
+expires takes its whole run of up to twelve segments with it. Neither
+arm refused a datagram, and both deliver 3.91–3.95 Gbit/s. Decision 8
+stands, with the loss in question now under 0.2% where it was 11.6–
+18.7% on November 14.
+
+The striped single flow at 7.5 ms
+([results](benches/lossy-one-flow-striping-smallest-rtt.json)): 2.14 /
+2.25 and 2.32 / 2.39 Gbit/s at 0.5% loss and 2.23 / 2.26 and 2.26 / 2.45
+at 1%, against 1.10–1.17 unstriped, with 46,000–98,000 frames reordered
+against 21,000–42,000. Of the 5 Gbit/s offered, the striped flow now
+leaves 2–8% undelivered at the generator, where it left 8–18% before the
+check.
 
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 

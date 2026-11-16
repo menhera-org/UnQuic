@@ -59,8 +59,18 @@ November 16: striping came good on the single-flow target. The writer
 skips a gap as soon as every lane has passed it, batches its TAP writes
 through an outbox, and writes late repairs instead of dropping them.
 One flow at 7.5 ms with 0.5–1% loss now gets 2.0–2.2 Gbit/s in both
-directions against 0.8–1.2 unstriped, unless its writer lands on the
-worker that reads the TAP.
+directions against 0.8–1.2 unstriped; the rotation now keeps the
+reading worker out of the flow's transmit work.
+
+The same day the loss on lossy paths found its cause. About 1% of
+frames expired in the sender on a 4.5 ms path with 1% random loss, not
+for want of repairs but because BBR's short-term bound held the pacing
+rate at the offered load: the queue check behind `tolerate_random_loss`
+compared a round's largest RTT sample with min_rtt and tripped on host
+jitter in 88% of lossy rounds. Judged by the round's smallest sample,
+less the receiver's ACK hold, that path loses 0.01–0.05% of its frames,
+a competing TCP flow keeps its share, and the full-size point does not
+move.
 
 ## November 13 checkpoint
 
@@ -463,6 +473,17 @@ Decisions only the user can make, each blocking a remaining goal:
    still lose a little more than ordinary frames (worst points 1.37–1.55%
    against 1.06–1.69%) and bring back some refusals, so they stay off by
    default, though the gap fell from about six points to a fraction of one.
+
+   November 16: the loss both arms still showed came from the congestion
+   controller, not from receive capacity. Its queue check tripped on
+   host jitter, pinned pacing to the offered load and expired about 1%
+   of frames in the sender; judged by each round's smallest RTT sample,
+   ordinary frames lose 0.01–0.05% at the worst point on this path.
+   Offload frames then lose 0.05–0.19%, more in three rounds of three
+   because an expiry takes a whole run, with no datagram refused. By the
+   bar set for it the default stays off. With the loss this small on
+   either arm and 14.7% of CPU per bit at stake on clean paths, the
+   default is worth the user's second look.
 
 ## November 11 checkpoint
 
