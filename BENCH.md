@@ -2080,6 +2080,12 @@ each of the other three. It acts only on a
 session with a TAP queue for each worker whose endpoint serves no other
 session, since one steering program serves the whole endpoint.
 
+Below saturation it changes nothing with four workers either: at 4.8 and
+6.4 Gbit/s offered each way both arms deliver the same (9.46–9.50 and
+12.59–12.65 Gbit/s in total) for the same CPU (164–174% and 230–245% of
+a core per daemon), three rounds each
+([results](benches/four-workers-rotate-lanes-below-saturation.json)).
+
 Two checks bear on its default, both with eight workers, where the one
 reading worker gets the same rotation. On the full-size efficiency point
 it costs nothing: 40.6–42.2 CPU% per delivered Gbit/s on, 40.7–41.9 for
