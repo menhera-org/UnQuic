@@ -730,6 +730,31 @@ arrives late, as on any flow. `rx_striped_frames`,
 `stripe_unordered` and `stripe_drops` count received ones. A stripe ends
 when its flow's table entry goes idle for a second.
 
+A receive lane belongs to worker `(cookie_low32 + lane − 1) mod n`, where
+the cookie is the session's, and the socket steering program delivers each
+datagram to that worker. Nothing ties this to the worker that reads the
+session's TAP. Traffic the kernel cannot spread over TAP queues, such as
+QinQ frames, is all read by one worker. Unless the cookie happens to give
+that worker the peer's control lane, it also receives one of the peer's
+data lanes while it transmits a lane of its own, and it saturates first.
+`daemon.rotate_lanes`, off by default, corrects that at
+run time. Once a second worker 0 checks whether one worker made at least
+nine tenths of a session's TAP reads, and at least 1,000 of them. If so,
+it rotates the session's receive lanes so that this worker owns the
+peer's control lane and no data lane: each worker passes its lane to the
+next owner with its frames and ACK state, packets still arriving at the
+old owner follow it through the same queue, and a second later the
+steering program follows. A session rotates at most once in ten seconds.
+It applies only to a session with as many TAP queues as there are
+workers, on an endpoint that serves no other session, because one
+steering program serves a whole endpoint. With four workers and sixteen
+QinQ flows it delivered 3–7% more at 8 Gbit/s offered each way and 16%
+more at 10, and at light load it cost nothing. On a routed 4.5 ms path
+with 1% loss nine
+rounds did not settle whether it loses more frames, so it stays off by
+default (BENCH.md, decision 9 in ROADMAP.md). The wire format and the
+peer are unaffected.
+
 Flow hashing looks through one unfragmented IPv4, IPv6 or Ethernet
 encapsulation, including an IPv6 segment routing header before the inner
 packet. It retains the outer key and adds the inner addresses, protocol and

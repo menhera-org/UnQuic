@@ -187,7 +187,10 @@ impl ReceiveSocket {
         Ok(value as usize)
     }
 
-    pub(crate) fn steer_group(&self, members: usize) -> io::Result<()> {
+    /// Steers each datagram of this socket's reuseport group to member
+    /// `(cookie_low32 + lane − 1 + rotation) mod members`. Any member may
+    /// call it again; the new program replaces the group's at once.
+    pub(crate) fn steer_group(&self, members: usize, rotation: u32) -> io::Result<()> {
         if !(1..=64).contains(&members) {
             return Err(invalid("receive group requires 1..64 sockets"));
         }
@@ -204,6 +207,7 @@ impl ReceiveSocket {
             instruction(libc::BPF_MISC | libc::BPF_TAX, 0),
             instruction(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 16),
             instruction(libc::BPF_ALU | libc::BPF_ADD | libc::BPF_X, 0),
+            instruction(libc::BPF_ALU | libc::BPF_ADD | libc::BPF_K, rotation),
             instruction(libc::BPF_ALU | libc::BPF_MOD | libc::BPF_K, members as u32),
             instruction(libc::BPF_RET | libc::BPF_A, 0),
         ];
@@ -1396,23 +1400,32 @@ mod tests {
             for _ in 1..members {
                 group.push(ReceiveSocket::bind(address, None).unwrap());
             }
-            group[0].steer_group(members).unwrap();
-            assert!(group[0].steer_group(0).is_err());
-            assert!(group[0].steer_group(65).is_err());
+            group[0].steer_group(members, 0).unwrap();
+            assert!(group[0].steer_group(0, 0).is_err());
+            assert!(group[0].steer_group(65, 0).is_err());
             let sender = UdpSocket::bind("[::1]:0").unwrap();
-            for (lane, cookie) in [
-                (1_u16, 0_u32),
-                (2, 0),
-                (3, 0),
-                (4, 0),
-                (1, 1),
-                (2, u32::MAX),
-                (0, 0),
+            for (lane, cookie, rotation) in [
+                (1_u16, 0_u32, 0_u32),
+                (2, 0, 0),
+                (3, 0, 0),
+                (4, 0, 0),
+                (1, 1, 0),
+                (2, u32::MAX, 0),
+                (0, 0, 0),
+                // Another member replaces the live group's program.
+                (1, 0, 2),
+                (3, 0, 2),
+                (2, u32::MAX, 2),
+                (2, 0, 0),
             ] {
+                group[1].steer_group(members, rotation).unwrap();
                 let mut bytes = [0_u8; 64];
                 bytes[36..38].copy_from_slice(&lane.to_be_bytes());
                 bytes[16..20].copy_from_slice(&cookie.to_be_bytes());
-                let owner = cookie.wrapping_add(u32::from(lane).wrapping_sub(1)) as usize % members;
+                let owner = cookie
+                    .wrapping_add(u32::from(lane).wrapping_sub(1))
+                    .wrapping_add(rotation) as usize
+                    % members;
                 sender.send_to(&bytes, address).unwrap();
                 for (index, socket) in group.iter().enumerate() {
                     let mut received = [0; 64];

@@ -686,6 +686,43 @@ fn balanced_lane(
     }
 }
 
+/// How long a session keeps a rotation before worker 0 may change it.
+const ROTATE_HOLD: Duration = Duration::from_secs(10);
+/// TAP reads between two looks below which no worker counts as the reader.
+const ROTATE_READS: u64 = 1000;
+
+/// The rotation that gives the peer's control lane, wire lane 1, to the
+/// worker that made at least nine tenths of a session's TAP reads, if one
+/// did and made ROTATE_READS of them.
+fn reader_rotation(reads: &[u64], cookie_low: u32) -> Option<u8> {
+    let total: u128 = reads.iter().map(|&read| u128::from(read)).sum();
+    let (reader, &most) = reads.iter().enumerate().max_by_key(|&(_, &read)| read)?;
+    if most < ROTATE_READS || u128::from(most) * 10 < total * 9 {
+        return None;
+    }
+    let workers = reads.len() as u32;
+    Some(((reader as u32 + workers - cookie_low % workers) % workers) as u8)
+}
+
+/// The endpoint whose steering program follows `session`'s rotation, if the
+/// session can rotate: it has a TAP queue for each worker, and its endpoint
+/// serves no other session, because one program steers the whole endpoint.
+fn rotatable(config: &crate::config::Validated, session: usize, workers: usize) -> Option<usize> {
+    let endpoint = |session| {
+        config
+            .peer_for_session(session)
+            .and_then(|peer| config.endpoint_for_peer(peer))
+    };
+    let own = endpoint(session)?;
+    let sessions = &config.config().sessions;
+    (sessions.get(session)?.queue_count == workers
+        && (0..sessions.len())
+            .filter(|&other| endpoint(other) == Some(own))
+            .count()
+            == 1)
+        .then_some(own)
+}
+
 /// First lane that carries data: 1 under `daemon.control_lane` when another
 /// lane exists, so lane 0 keeps ACKs and control off data's packet history.
 fn first_data_lane(control: bool, lanes: usize) -> usize {
@@ -781,6 +818,14 @@ pub(crate) enum Event {
         session: usize,
         lane: Box<reassembly::Lane>,
     },
+    // A receive lane in use, handed to its new owner after a rotation.
+    Adopt {
+        session: usize,
+        tag: u128,
+        lane: Box<reassembly::Lane>,
+    },
+    // Worker 0 changed a session's rotation: hand over what moved.
+    Rotate,
     Barrier {
         session: usize,
         command: Command,
@@ -1153,6 +1198,12 @@ pub(crate) struct Worker {
     counters: Snapshot,
     setup_due: Duration,
     retry_due: Option<Duration>,
+    // Worker 0, under daemon.rotate_lanes: each worker's TAP reads per
+    // session at the last look, when each session last rotated, and per
+    // endpoint the rotation its steering program is due.
+    tap_seen: Vec<u64>,
+    rotated: Vec<Duration>,
+    steer_due: Vec<Option<u8>>,
     #[cfg(feature = "profile")]
     phases: [u64; crate::profile::PHASES],
 }
@@ -1536,6 +1587,9 @@ impl Worker {
             counters,
             setup_due: Duration::ZERO,
             retry_due: None,
+            tap_seen: vec![0; config.sessions.len() * count],
+            rotated: vec![Duration::ZERO; config.sessions.len()],
+            steer_due: vec![None; config.endpoints.len()],
             #[cfg(feature = "profile")]
             phases: [0; crate::profile::PHASES],
             shared,
@@ -2147,7 +2201,18 @@ impl Worker {
                 let Some(first) = group[0].take() else {
                     continue;
                 };
-                if first.steer_group(shared.workers()).is_err() {
+                // A group bound late steers by the rotation its session has.
+                let rotation = (0..config.sessions.len())
+                    .find(|&session| {
+                        rotatable(&shared.config, session, shared.workers()) == Some(index)
+                    })
+                    .map_or(0, |session| {
+                        shared.rotation[session].load(Ordering::Relaxed)
+                    });
+                if first
+                    .steer_group(shared.workers(), u32::from(rotation))
+                    .is_err()
+                {
                     // Kernel steering is optional; protocol ownership still routes every packet.
                     self.counters.socket_errors += 1;
                 }
@@ -2158,6 +2223,22 @@ impl Worker {
                     }
                 }
             }
+        }
+        if config.daemon.rotate_lanes {
+            if self.id == 0 {
+                for endpoint in 0..self.steer_due.len() {
+                    if let Some(rotation) = self.steer_due[endpoint].take()
+                        && let Some(receiver) = &self.receive[endpoint]
+                        && receiver
+                            .steer_group(shared.workers(), u32::from(rotation))
+                            .is_err()
+                    {
+                        self.counters.socket_errors += 1;
+                    }
+                }
+                self.choose_rotation(now);
+            }
+            self.hand_over()?;
         }
         for index in 0..config.peers.len() {
             let endpoint = self
@@ -2280,6 +2361,26 @@ impl Worker {
                         }
                     }
                     Event::LaneFree { session, lane } => self.sessions[session].free.push(lane),
+                    Event::Adopt { session, tag, lane } => {
+                        if self.matches(session, tag) {
+                            let id = lane.id();
+                            let slot = self.sessions[session].put_rx(lane)?;
+                            self.sessions[session].rx_index[usize::from(id)] = slot as u8 + 1;
+                            self.install_rx_counters(session, slot);
+                            // Its previous owner reported these already.
+                            let local = &mut self.sessions[session];
+                            if let Some(lane) = local.rx[slot].as_ref() {
+                                let totals = &mut local.rx_totals[slot];
+                                totals.expired_frames = lane.expired_frames();
+                                totals.rx_expired_incomplete_frames =
+                                    lane.expired_incomplete_frames();
+                                totals.duplicate_pieces = lane.duplicate_pieces();
+                            }
+                        } else {
+                            self.return_lane(session, lane)?;
+                        }
+                    }
+                    Event::Rotate => self.hand_over()?,
                     Event::Barrier {
                         session,
                         command,
@@ -2323,6 +2424,119 @@ impl Worker {
             }
         }
         Ok(more)
+    }
+
+    /// The worker that owns wire lane `lane` on `session`'s receive side:
+    /// `(cookie_low32 + lane − 1 + rotation) mod queues`, as the socket
+    /// steering program computes it.
+    fn rx_owner(&self, session: usize, lane: u16) -> usize {
+        let config = &self.shared.config.config().sessions[session];
+        let [.., a, b, c, d] = *config.cookie.as_bytes();
+        let rotation = self.shared.rotation[session].load(Ordering::Relaxed);
+        u32::from_be_bytes([a, b, c, d])
+            .wrapping_add(u32::from(lane).wrapping_sub(1))
+            .wrapping_add(u32::from(rotation)) as usize
+            % config.queue_count
+    }
+
+    /// Under daemon.rotate_lanes: sends each receive lane this worker holds
+    /// to the worker the session's rotation now gives it. The lane goes
+    /// first and its new owner is published after, so packets that still
+    /// arrive here follow it through the same queue.
+    fn hand_over(&mut self) -> io::Result<()> {
+        for session in 0..self.sessions.len() {
+            let Some(connection) = self.sessions[session].connection else {
+                continue;
+            };
+            let tag = connection.local_tag().get();
+            let mut occupied =
+                self.sessions[session].rx_occupied & !self.sessions[session].returning;
+            while occupied != 0 {
+                let slot = occupied.trailing_zeros() as usize;
+                occupied &= occupied - 1;
+                let Some(id) = self.sessions[session].rx[slot]
+                    .as_ref()
+                    .map(|lane| lane.id())
+                else {
+                    continue;
+                };
+                let owner = self.rx_owner(session, id);
+                let published =
+                    self.shared.owners[session][usize::from(id)].load(Ordering::Acquire);
+                if owner == self.id || usize::from(published) != self.id + 1 {
+                    continue;
+                }
+                // What the lane has counted so far stays in this worker's totals.
+                self.refresh_rx_counters(session, slot);
+                let Some(lane) = self.sessions[session].take_rx(slot) else {
+                    continue;
+                };
+                if let Err(Event::Adopt { lane, .. }) =
+                    self.push(owner, Event::Adopt { session, tag, lane })
+                {
+                    // The queue is full: keep the lane for the next attempt.
+                    self.sessions[session].put_rx_at(slot, lane)?;
+                    continue;
+                }
+                self.shared.owners[session][usize::from(id)]
+                    .store(owner as u8 + 1, Ordering::Release);
+                let local = &mut self.sessions[session];
+                local.rx_index[usize::from(id)] = 0;
+                local.ack_inflight &= !(1_u64 << slot);
+                local.rx_totals[slot] = Snapshot::default();
+                local.rx_dirty &= !(1_u64 << slot);
+                let index = (session * self.shared.workers() + self.id) * LANES + slot;
+                self.shared.receive_counters[index].replace(0, 0, &Snapshot::default());
+            }
+        }
+        Ok(())
+    }
+
+    /// Worker 0, under daemon.rotate_lanes: when one worker read nearly all
+    /// of a session's TAP frames since the last look, rotates the session's
+    /// receive lanes so that worker owns the peer's control lane.
+    fn choose_rotation(&mut self, now: Duration) {
+        let shared = Arc::clone(&self.shared);
+        let config = shared.config.config();
+        let workers = shared.workers();
+        for session in 0..self.sessions.len() {
+            let mut reads = [0_u64; 64];
+            for (worker, read) in reads.iter_mut().enumerate().take(workers) {
+                let counters = &shared.session_counters[session * workers + worker];
+                let total = counters
+                    .tap_ring_frames
+                    .get()
+                    .wrapping_add(counters.tap_read_calls.get());
+                let seen = &mut self.tap_seen[session * workers + worker];
+                *read = total.wrapping_sub(*seen);
+                *seen = total;
+            }
+            let Some(endpoint) = rotatable(&shared.config, session, workers) else {
+                continue;
+            };
+            if now < self.rotated[session] + ROTATE_HOLD {
+                continue;
+            }
+            let [.., a, b, c, d] = *config.sessions[session].cookie.as_bytes();
+            if let Some(rotation) =
+                reader_rotation(&reads[..workers], u32::from_be_bytes([a, b, c, d]))
+                && rotation != shared.rotation[session].load(Ordering::Relaxed)
+            {
+                self.rotate(session, endpoint, rotation, now);
+            }
+        }
+    }
+
+    /// Worker 0 publishes a session's new rotation and tells the others.
+    /// Steering follows at the next look, once the lanes have moved.
+    fn rotate(&mut self, session: usize, endpoint: usize, rotation: u8, now: Duration) {
+        self.shared.rotation[session].store(rotation, Ordering::Relaxed);
+        self.rotated[session] = now;
+        self.steer_due[endpoint] = Some(rotation);
+        for worker in 1..self.shared.workers() {
+            // A full queue only delays that worker to its own next look.
+            let _ = self.push(worker, Event::Rotate);
+        }
     }
 
     fn matches(&self, session: usize, tag: u128) -> bool {
@@ -2554,10 +2768,7 @@ impl Worker {
             lane.accept_striped_flows(
                 connection.striped_flows() && self.sessions[session].stripes.is_some(),
             );
-            let [.., a, b, c, d] = *header.cookie.as_bytes();
-            let cookie_low = u32::from_be_bytes([a, b, c, d]);
-            let owner = cookie_low.wrapping_add(u32::from(header.lane) - 1) as usize
-                % self.shared.config.config().sessions[session].queue_count;
+            let owner = self.rx_owner(session, header.lane);
             // Publication may precede installation; an early packet is dropped without ACK.
             self.shared.owners[session][lane_id].store(owner as u8 + 1, Ordering::Release);
             if owner != self.id {
@@ -7243,6 +7454,127 @@ mod tests {
 
     #[test]
     #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn a_rotated_receive_lane_moves_to_its_new_owner_with_its_frames() {
+        let (first, _tap) = receive_worker();
+        let mut second = Worker::new(1, Arc::clone(&first.shared), Control::new()).unwrap();
+        second.io_time = Some(Ok);
+        second.unpaced_fixture = true;
+        second
+            .command(
+                0,
+                Command {
+                    generation: 1,
+                    phase: Phase::Install,
+                    connection: first.sessions[0].connection,
+                },
+                0,
+            )
+            .unwrap();
+        let mut workers = [first, second];
+        for from in 0..2 {
+            let (tx, rx) = crate::spsc::channel();
+            workers[from].outgoing[1 - from] = Some(tx);
+            workers[1 - from].incoming[from] = Some(rx);
+        }
+        let lane = 9_u16;
+        let id = usize::from(lane);
+        let packet = |worker: &mut Worker, number: u64, sequence: u64| {
+            let mut buffer = worker.free.pop().unwrap();
+            buffer.length = wire::encode_datagram(
+                Header {
+                    cookie: crate::UnquicUuid::from_bytes([1; 16]),
+                    receive_tag: 1,
+                    lane,
+                    packet_number: number,
+                    record_area_len: 0,
+                },
+                &[Record::Data {
+                    frame_id: (u64::from(lane) << 48) | sequence,
+                    total_len: 60,
+                    offset: 0,
+                    bytes: &[sequence as u8; 60],
+                    offload: false,
+                    partial: false,
+                    striped: false,
+                }],
+                &mut buffer.bytes,
+            )
+            .unwrap();
+            buffer
+        };
+        let turn = |workers: &mut [Worker; 2]| {
+            for worker in workers.iter_mut() {
+                worker.drain_queues(Duration::ZERO).unwrap();
+                worker.drain_packets(Duration::ZERO).unwrap();
+            }
+        };
+        // Lane 9 registers on worker 1 and holds its first frame, which a
+        // second packet then repeats.
+        let first = packet(&mut workers[1], 1, 1);
+        workers[1].received.push_back(first);
+        workers[1].drain_packets(Duration::ZERO).unwrap();
+        turn(&mut workers);
+        turn(&mut workers);
+        let repeat = packet(&mut workers[1], 2, 1);
+        workers[1].received.push_back(repeat);
+        workers[1].drain_packets(Duration::ZERO).unwrap();
+        let slot = usize::from(workers[1].sessions[0].rx_index[id] - 1);
+        let repeated = workers[1].sessions[0].rx[slot]
+            .as_ref()
+            .unwrap()
+            .duplicate_pieces();
+        assert_eq!(repeated, 1);
+        let shared = Arc::clone(&workers[0].shared);
+        let owner = &shared.owners[0][id];
+        assert_eq!(owner.load(Ordering::Acquire), 2);
+        assert_ne!(workers[1].sessions[0].rx_index[id], 0);
+        // Without a rotation it stays.
+        workers[1].hand_over().unwrap();
+        assert_ne!(workers[1].sessions[0].rx_index[id], 0);
+        // Rotated by one it is worker 0's, but a full queue keeps it here.
+        shared.rotation[0].store(1, Ordering::Relaxed);
+        let queue = workers[1].outgoing[0].take();
+        workers[1].hand_over().unwrap();
+        assert_ne!(workers[1].sessions[0].rx_index[id], 0);
+        assert_eq!(owner.load(Ordering::Acquire), 2);
+        workers[1].outgoing[0] = queue;
+        workers[1].hand_over().unwrap();
+        assert_eq!(workers[1].sessions[0].rx_index[id], 0);
+        assert_eq!(workers[1].sessions[0].rx_occupied, 0);
+        assert_eq!(owner.load(Ordering::Acquire), 1);
+        // What the lane had counted stays with the old owner's totals.
+        assert_eq!(workers[1].sessions[0].totals.duplicate_pieces, repeated);
+        // A packet that still reaches the old owner follows the lane.
+        let second = packet(&mut workers[1], 3, 2);
+        workers[1].received.push_back(second);
+        workers[1].drain_packets(Duration::ZERO).unwrap();
+        turn(&mut workers);
+        // Worker 0 keeps what is its own, lane 7 of the fixture included.
+        workers[0].hand_over().unwrap();
+        assert_eq!(workers[0].sessions[0].rx_occupied.count_ones(), 2);
+        let slot = usize::from(workers[0].sessions[0].rx_index[id] - 1);
+        // The new owner does not count the lane's history again.
+        workers[0].refresh_rx_counters(0, slot);
+        assert_eq!(workers[0].sessions[0].totals.duplicate_pieces, 0);
+        assert_eq!(
+            workers[0].sessions[0].rx_totals[slot].duplicate_pieces,
+            repeated
+        );
+        let receiver = workers[0].sessions[0].rx[slot].as_mut().unwrap();
+        for sequence in [1_u64, 2] {
+            let frame = receiver.front(Duration::ZERO).unwrap();
+            assert_eq!(frame.id, (u64::from(lane) << 48) | sequence);
+            assert_eq!(frame.bytes, &[sequence as u8; 60]);
+            assert!(receiver.finish_front());
+        }
+        assert!(receiver.front(Duration::ZERO).is_none());
+        for worker in &workers {
+            assert_eq!(worker.counters.queue_drops, 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
     fn colliding_receive_flows_register_on_distinct_owners() {
         let (first, _tap) = receive_worker();
         let mut second = Worker::new(1, Arc::clone(&first.shared), Control::new()).unwrap();
@@ -7625,6 +7957,81 @@ mod tests {
                 assert_eq!(routes, [(1, None); 3]);
             }
         }
+    }
+
+    #[test]
+    fn the_tap_reader_is_given_the_peers_control_lane() {
+        // With cookie 3 and four workers the control lane starts on worker 3.
+        assert_eq!(reader_rotation(&[2, 5000, 0, 4], 3), Some(2));
+        assert_eq!(reader_rotation(&[5000, 0, 0, 0], 3), Some(1));
+        assert_eq!(reader_rotation(&[0, 0, 0, 5000], 3), Some(0));
+        assert_eq!(reader_rotation(&[0, 5000, 0], u32::MAX), Some(1));
+        // Too few reads name no reader, nor does a share under nine tenths.
+        assert_eq!(reader_rotation(&[0, ROTATE_READS - 1, 0, 0], 3), None);
+        assert_eq!(reader_rotation(&[0, ROTATE_READS, 0, 0], 3), Some(2));
+        assert_eq!(reader_rotation(&[1000, 9000, 0, 0], 3), Some(2));
+        assert_eq!(reader_rotation(&[1001, 9000, 0, 0], 3), None);
+        assert_eq!(reader_rotation(&[u64::MAX, u64::MAX], 0), None);
+        assert_eq!(reader_rotation(&[], 3), None);
+
+        let (shared, [mut first, mut second]) = test_workers();
+        for from in 0..2 {
+            let (tx, rx) = crate::spsc::channel();
+            let (sender, receiver) = if from == 0 {
+                (&mut first, &mut second)
+            } else {
+                (&mut second, &mut first)
+            };
+            sender.outgoing[1 - from] = Some(tx);
+            receiver.incoming[from] = Some(rx);
+        }
+        // The fixture's two sessions share an endpoint, and one steering
+        // program cannot rotate them apart.
+        assert_eq!(rotatable(&shared.config, 0, 2), None);
+        let mut alone = shared.config.config().clone();
+        alone.sessions.truncate(1);
+        let alone = alone.validate().unwrap();
+        assert_eq!(rotatable(&alone, 0, 2), Some(0));
+        // Nor does a session rotate without a TAP queue for each worker.
+        assert_eq!(rotatable(&alone, 0, 4), None);
+        assert_eq!(rotatable(&alone, 1, 2), None);
+        let now = Duration::from_secs(100);
+        shared.session_counters[1].tap_ring_frames.set(5000);
+        first.choose_rotation(now);
+        assert_eq!(shared.rotation[0].load(Ordering::Relaxed), 0);
+        assert_eq!(first.steer_due, [None]);
+
+        // The fixture's cookie is odd: wire lane 1 is worker 1's until the
+        // session rotates by one.
+        assert_eq!(first.rx_owner(0, 1), 1);
+        assert_eq!(first.rx_owner(0, 2), 0);
+        first.rotate(0, 0, 1, now);
+        assert_eq!(first.rx_owner(0, 1), 0);
+        assert_eq!(first.rx_owner(0, 2), 1);
+        assert_eq!(first.rx_owner(1, 1), 0);
+        assert_eq!((first.rotated[0], first.steer_due[0]), (now, Some(1)));
+        // The other worker is told, and holds nothing to hand over.
+        assert!(!second.incoming[0].as_mut().unwrap().is_empty());
+        second.drain_queues(now).unwrap();
+        assert!(second.incoming[0].as_mut().unwrap().is_empty());
+
+        // A lane that arrives for a connection since replaced is retired.
+        let free = first.sessions[0].free.len();
+        let lane = first.sessions[0].free.pop().unwrap();
+        second
+            .push(
+                0,
+                Event::Adopt {
+                    session: 0,
+                    tag: 5,
+                    lane,
+                },
+            )
+            .ok()
+            .unwrap();
+        first.drain_queues(now).unwrap();
+        assert_eq!(first.sessions[0].free.len(), free);
+        assert_eq!(first.sessions[0].rx_occupied, 0);
     }
 
     #[test]
@@ -9583,6 +9990,7 @@ mod tests {
             backlog: (0..2)
                 .map(|_| (0..tx_lanes).map(|_| AtomicU64::new(0)).collect())
                 .collect(),
+            rotation: (0..2).map(|_| AtomicU8::new(0)).collect(),
         });
         let workers: [Worker; 2] = std::array::from_fn(|id| {
             let mut worker = Worker::new(id, Arc::clone(&shared), Control::new()).unwrap();

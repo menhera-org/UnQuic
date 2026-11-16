@@ -78,6 +78,12 @@ pub struct Daemon {
     /// order on one worker before its TAP (design section 13.1, item 6).
     /// Sending striped flows is not implemented yet.
     pub stripe_flows: bool,
+    /// Off by default: when one worker reads nearly all of a session's TAP
+    /// frames, rotate the session's receive lanes among the workers so that
+    /// worker receives the peer's control lane and no data lane (design
+    /// section 13.1). Acts only on a session with as many TAP queues as
+    /// workers whose endpoint serves no other session.
+    pub rotate_lanes: bool,
 }
 impl Default for Daemon {
     fn default() -> Self {
@@ -92,6 +98,7 @@ impl Default for Daemon {
             offload_frames: false,
             partial_checksums: true,
             stripe_flows: false,
+            rotate_lanes: false,
         }
     }
 }

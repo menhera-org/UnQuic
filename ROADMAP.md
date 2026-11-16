@@ -173,12 +173,18 @@ gained 2% in both forms and was rejected. A receiver can: rotating its
 receive owners so that the reader gets only the peer's control lane
 delivered 7.7% more at 8 Gbit/s offered and 12.6% more at 10, moving no
 flow. As a constant that is no candidate, because the reading worker is
-known only once traffic flows. The next step for the four-core target is
-to move a receive lane between workers at run time: when one worker reads
-nearly all of a session's TAP frames and receives a data lane, exchange
-that lane's owner with the control lane's, hand over its reassembly and
-ACK state, and change the steering constant to match
+known only once traffic flows. So the rotation now happens at run time,
+behind `daemon.rotate_lanes`: when one worker makes nine tenths of a
+session's TAP reads, the session's receive lanes move one owner on, each
+with its reassembly and ACK state, until that worker holds the peer's
+control lane, and the steering program follows. On, it delivered 7.0%
+more at the overload point in a first set and 3.2% more in a repeat on
+the committed code, and 16.1% more at 10 Gbit/s offered each way
 ([BENCH.md](BENCH.md#which-worker-receives-which-lane-with-four-workers-november-16)).
+It is off by default; whether to turn it on is decision 9 below. Open
+beside it: it covers only a session alone on its endpoint with a TAP
+queue for each worker, and with the reader relieved the limit is a worker
+that both transmits and receives.
 
 Next targets in the daemon's own code, by cycles per frame event in
 that profile: output coalescing around the TAP write (about 320, the
@@ -633,6 +639,25 @@ Decisions only the user can make, each blocking a remaining goal:
    check now runs first. With that round explained, offload frames have met both
    bars for the default, which is again the user's call
    ([BENCH.md](BENCH.md#offload-frames-after-the-ack-change-and-a-round-of-refused-tap-writes-november-16)).
+9. Open since November 16: should `daemon.rotate_lanes` be on by default?
+   On, a session whose TAP one worker reads moves its receive lanes once,
+   so that this worker receives the peer's control lane and no data lane.
+   With four workers past saturation it delivered 3.2–7.0% more at 8
+   Gbit/s offered each way (5.1% over sixteen points) and 16.1% more at
+   10, where every point lay above every point with it off. It changes
+   nothing on the wire, moves no flow and keeps each
+   lane's frames in order. On the full-size efficiency point it costs
+   nothing (−0.2% at the median against a copy of the build without it).
+   Against it: a rotation hands every receive lane of the session to
+   another worker while it carries traffic, the old owners forward
+   packets for about a second, and it has run only on loopback points
+   for some tens of minutes. On the lossy path nine rounds did not settle
+   whether it loses more: no more in five of nine and less at the median
+   (0.015% against 0.027%), but the two worst rounds were its own (0.10%
+   and 0.14% against 0.08% at most). The recommendation is to leave it
+   off until a longer lossy set and a run on the two-host path, and to
+   turn it on if both hold
+   ([BENCH.md](BENCH.md#which-worker-receives-which-lane-with-four-workers-november-16)).
 
 ## November 11 checkpoint
 

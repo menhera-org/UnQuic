@@ -1935,9 +1935,10 @@ The next section measures both halves of that guess.
 
 ## Which worker receives which lane, with four workers (November 16)
 
-The overload above is short of balance, so three ways of changing the
-balance were probed on `0a15d20` at the same point: sixteen QinQ flows
-each way, four workers, 8 Gbit/s offered each way, two points a round.
+The overload above is short of balance, so the balance was changed in
+three ways on `0a15d20` at the same point, and the third was then built
+to work at run time. The point: sixteen QinQ flows each way, four
+workers, 8 Gbit/s offered each way, two points a round.
 Figures are Gbit/s delivered in both directions together, the mean of
 the points with their range. In the result files `rxtrim` is `0a15d20`.
 
@@ -1956,9 +1957,10 @@ each ([results](benches/four-workers-static-lane-shares.json), arms
 | 0, 8, 8: the reader's own lane empty | 12.26 (12.09–12.68) | 21.4–25.2% |
 | 8, 0, 8: the middle lane empty | 15.66 (15.54–15.72) | 0.7–2.9% |
 
-The best split gains 9.7% here and 8–10% in two later sets of eight
-points, and the offer limits it: 15.66 of 16.0 Gbit/s arrive. Taking the
-reader's own lane away costs 14%.
+The best split gains 9.7% here, just under the bar, and 8–10% in two
+later sets of eight points. The offer limits it: 15.66 of 16.0 Gbit/s
+arrive. That was taken as reason enough to go on. Taking the reader's own
+lane away costs 14%.
 
 The lane formulas explain the table. A lane's transmit owner is
 `(lane − 1) mod n`; its receive owner is `(cookie_low32 + lane − 1) mod
@@ -2030,13 +2032,76 @@ receives, which refused 71,582 frames in two points at 10 Gbit/s offered.
 
 A constant rotation is not a candidate, though. Which worker reads the
 TAP is known only once traffic flows, and a lane's receive owner is fixed
-at its first packet, which may come first. What can land is moving a receive
-lane to another worker while it runs: when one worker reads nearly all of
-a session's TAP frames and also receives a data lane, exchange that
-lane's owner with the control lane's. Packets that reach the wrong worker
-are already forwarded to the owner, so the exchange needs the lane's
+at its first packet, which may come first. What can land is rotating the
+receive lanes while they run. Packets that reach the wrong worker are
+already forwarded to the owner, so a rotation needs each lane's
 reassembly and ACK state handed over and the steering constant changed to
-match. That is the next step for the four-core target.
+match.
+
+**Rotation at run time (landed behind `daemon.rotate_lanes`).** Once a
+second worker 0 compares the workers' TAP reads for each session. When
+one worker made nine tenths of them, and at least 1,000, the session's
+receive lanes rotate so that this worker owns the peer's control lane:
+every worker sends each lane that changed owner to the new one and then
+publishes the owner, so packets still arriving at the old owner follow the
+lane through the same queue, and worker 0 attaches the steering program
+with the new constant a second later. Stated beforehand: on, it delivers
+5% more than `0a15d20` at the same overload point, each point including
+whatever the detection and the handover cost. Eight points each, then
+eight more on the committed code, and six at 10 Gbit/s offered each way
+([first set](benches/four-workers-rotate-lanes.json), arms `rl-rot` and
+`rot2`; [repeat](benches/four-workers-rotate-lanes-repeat-1.json),
+[its second half](benches/four-workers-rotate-lanes-repeat-2.json) and
+[10 Gbit/s](benches/four-workers-rotate-lanes-10g.json), arm `rl2-rot`):
+
+| | 8 Gbit/s offered, first set | Repeat | 10 Gbit/s offered |
+| --- | --- | --- | --- |
+| `0a15d20` | 14.08 (13.78–14.34) | 14.30 (13.71–14.86) | 14.12 (13.66–14.66) |
+| `rotate_lanes` on | 15.06 (14.76–15.26) | 14.76 (13.94–15.16) | 16.40 (16.06–17.01) |
+| Rotated by the constant 2 | 15.18 (14.81–15.39) | | 16.21 (15.71–16.67), the earlier set |
+
+The first set gained 7.0%, every point above every point of `0a15d20`
+and within 1% of the constant rotation it finds. That build predates
+three fixes from review (a moved lane's counters carried over once,
+steering kept per endpoint, the rotation applied to a socket group bound
+late), none of which touches the steady state. The repeat on the
+committed code gained 3.2%, which alone is short of the bar; the sixteen
+points together gain 5.1%. At this offer the rotated daemon is already
+limited by its two workers that transmit and receive, the busier of
+which refused 14,000–30,000 frames a round. At 10 Gbit/s offered each way
+it gains
+16.1% with every point above every point of `0a15d20`, and no direction
+delivers less than 7.75 Gbit/s where `0a15d20` falls to 5.63. The cores
+it uses were idle: 334% of a core per daemon against 276%.
+
+In every run the reading worker received 0.36–0.65 GB in the two points
+of a round, the two seconds before the rotation, against about 14 GB on
+each of the other three. It acts only on a
+session with a TAP queue for each worker whose endpoint serves no other
+session, since one steering program serves the whole endpoint.
+
+Two checks bear on its default, both with eight workers, where the one
+reading worker gets the same rotation. On the full-size efficiency point
+it costs nothing: 40.6–42.2 CPU% per delivered Gbit/s on, 40.7–41.9 for
+`0a15d20` and 41.1–41.7 for its copy; the median against the copy is
+−0.2% where `0a15d20` itself reads −0.7%, and the point that contains
+the rotation lost no frame in six rounds
+([results](benches/rotate-lanes-full-size.json)). On the routed 4.5 ms
+path with 1% loss, nine rounds do not settle it
+([first three](benches/rotate-lanes-lossy-path.json),
+[six more](benches/rotate-lanes-lossy-path-2.json)):
+
+| Frames lost at each round's worst point | Range | Median |
+| --- | --- | --- |
+| `0a15d20` | 0.005–0.083% | 0.027% |
+| `rotate_lanes` on | 0.005–0.144% | 0.015% |
+
+On, it lost no more than `0a15d20` in five rounds of nine and less at the
+median, but the two worst rounds of the eighteen were both its own, at
+0.10% and 0.14%. That is not the "no more frames lost" a default has to
+show, and not evidence of harm either; this point's own spread is as
+wide. The switch stays off by default, and its default is left to the
+user.
 
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 

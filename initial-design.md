@@ -879,6 +879,39 @@ lane's owner must be able to change while the lane is in use. Moving
 flows between transmit lanes cannot do it, because the sender does not
 know which of its lanes the peer's reader receives.
 
+**Receive-lane rotation (November 16 amendment; `daemon.rotate_lanes`,
+off by default).** Each session has a rotation `r`, zero at start, and a
+lane's receive owner is `(cookie_low32 + lane − 1 + r) mod n`. The
+steering program adds the same `r`, so the kernel keeps delivering each
+lane to its owner. There is no wire change and the peer is not involved.
+With four workers at overload it delivered 3–7% more at 8 Gbit/s offered
+each way and 16% more at 10 (BENCH.md).
+
+- **When.** Worker 0 looks once a second. If one worker made at least
+  nine tenths of a session's TAP reads since the last look, and at least
+  1,000 of them, worker 0 picks the `r` that gives that worker the peer's
+  control lane. A session rotates at most once in ten seconds.
+- **Where.** Only where steering can follow: the session has as many TAP
+  queues as there are workers, and its endpoint serves no other session,
+  because one steering program serves the whole endpoint.
+- **Handover.** Worker 0 publishes `r` and tells every worker; each also
+  looks for itself once a second. A worker takes each receive lane whose
+  owner changed out of its slot, as on retirement but without resetting
+  it, sends it to the new owner and then publishes that owner in the
+  owner table. The lane carries its frames in reassembly and its ACK
+  state. Packets that still reach the old owner are forwarded through the
+  same queue and so arrive behind the lane. A worker whose queue to the
+  new owner is full keeps the lane until its next look. An ACK in flight
+  for a moved lane returns to its pool without effect, and the new owner
+  acknowledges again. A lane that arrives after its connection was
+  replaced is retired.
+- **Steering.** Worker 0 attaches the program with the new `r` at its
+  next look, a second later, when the lanes have moved. Until then the
+  kernel delivers to the old owners, which forward.
+- **Order.** A lane has one owner at a time, and the old owner's TAP
+  writes are complete before the new owner's first, so a flow's frames
+  stay in order.
+
 **Memory bandwidth.** Each payload byte is copied five times by the CPU
 across the two boxes: the sender's TAP read and UDP send, then the
 receiver's UDP receive, reassembly copy and TAP write. Per box that is 12.5

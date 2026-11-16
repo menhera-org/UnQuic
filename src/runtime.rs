@@ -83,6 +83,9 @@ pub(crate) struct Shared {
     pub stripes: Vec<Box<[crate::worker::Stripe]>>,
     // Per session and transmit lane, its owner's backlog mark; empty with stripes.
     pub backlog: Vec<Box<[AtomicU64]>>,
+    // Per session, how far its receive lanes' owners are rotated; nonzero
+    // only under daemon.rotate_lanes. Worker 0 writes.
+    pub rotation: Vec<AtomicU8>,
 }
 
 impl Control {
@@ -444,6 +447,7 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
         },
         stripes,
         backlog,
+        rotation: (0..sessions).map(|_| AtomicU8::new(0)).collect(),
     });
     let mut workers = (0..count)
         .map(|id| Worker::new(id, Arc::clone(&shared), control.clone()))
@@ -555,7 +559,7 @@ fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
         flows
     };
     let shared = sessions
-        .checked_mul(65_536 + size_of::<Box<[AtomicU8]>>() + 1 + size_of::<AtomicU64>())?
+        .checked_mul(65_536 + size_of::<Box<[AtomicU8]>>() + 2 + size_of::<AtomicU64>())?
         .checked_add(workers.checked_mul(STACK_BYTES + size_of::<Counters>() + 256)?)?
         .checked_add(flows)?;
     // Config owns caller-supplied capacities; count those even when mostly empty.
