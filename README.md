@@ -335,6 +335,10 @@ ACK transactions finish first. Ordinary ACK admission also pauses until the
 accepted transactions and their resulting loss scans finish, so continuous ACK
 traffic cannot starve repair. A scan already in progress finishes before a fresh
 pass applies the newer ACK evidence. Waiting ACKs stay in bounded storage.
+An ACK that leaves no packet outstanding below its largest number owes no
+pass, since a pass could act on nothing; its report then comes back without
+waking a sleeping worker. A returned report or ACK box wakes its owner only
+when the owner sleeps with work held behind one.
 
 ACK, handshake and PROBE_REPLY sends share a 4 MiB/s outer-byte ceiling per
 path group, with a burst of sixteen datagrams. Worker zero owns each fixed

@@ -404,6 +404,10 @@ Use RFC 9002 sections 5 and 6 for RTT estimation, per-lane packet/time loss dete
 
 Bound ordinary ACK admission as well as loss-scan work. Finish already admitted
 ACK transactions, then their resulting loss passes before admitting more ACKs.
+(November 16: an ACK owes a pass only when a packet below its largest
+acknowledged number is still outstanding. Packet and time thresholds apply to
+nothing else, so on a path without loss or reordering no pass runs and nothing
+waits for the ACK's report to return.)
 Validate ACKs at the TX owner before enqueue. Valid queued ACKs protect covered
 packets during these preceding scans, including forced passes for a live
 connection. Keep scans finite and request another turn when the last fence

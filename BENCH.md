@@ -1488,9 +1488,12 @@ lane worker has one report box and cannot report its next ACK until the
 controller owner hands that box back, so a silent return leaves the
 worker asleep on a finished exchange: senders merged 422,000 arriving
 ACKs into ones still waiting, against 17,000, and about a million
-frames expired. The report return has to wake. The two other returns
-are 16% of wakes between them and would need the sleeper to say when it
-is waiting for a box.
+frames expired. The report return has to wake while that is so. The
+two other returns are 16% of wakes between them and would need the
+sleeper to say when it is waiting for a box. (Both were done later the
+same day, once the work behind the report box was found to be a loss
+pass that a clean path does not need; see "Box returns that wake only a
+waiting owner".)
 
 The Sent notice, 18–19% of wakes, looked the better target. The
 controller owner needs it at once only when it arms a lane's first probe
@@ -1641,6 +1644,45 @@ HEAD. The round that missed lost 1.2% of its frames to a host stall (290
 ms latency maxima in both directions, twelve stalled bins); HEAD had
 one like it in the same set. The change alters no deadline and no
 order of work, so the lossy path was not rerun.
+
+## Box returns that wake only a waiting owner (November 16, landed)
+
+A third of all wakes return a box to its pool, and the exploratory
+build that silenced them earlier in the day cost 4.8% and lost frames,
+because a lane worker's report box always had work behind it. That work
+was a loss pass. Every ACK owed one, to revisit older packets with the
+new ACK state, and the pass waited for the report to come back; it also
+fenced the worker's next ACK. Yet a pass after an ACK can only act on
+packets numbered below the largest acknowledged one, and on a clean
+path there are none.
+
+The candidate has three parts. When an ACK ends and no charged packet
+below its largest number is outstanding, with no older pass or forced
+sweep owed, the pass counts as made: the fence drops and no deadline is
+set. A worker about to sleep says whether a returned box must wake it:
+when its ACK pool is empty, or when its report box is out and anything
+is held behind it (a queued ACK, more of the ACK in progress, an owed
+pass, a loss deadline, a loss check, a retirement, a lane being
+drained). And a returned report or ACK box is pushed without the
+ordinary notification; the pusher wakes the owner only if it sleeps
+with that flag set, by the same store, fence and load on both sides
+that the ordinary notification uses. A refused push still wakes.
+Feedback boxes keep waking for now.
+
+Stated beforehand: 2% or more off CPU per delivered bit on the
+full-size point by the usual bar, and no more frames lost on the lossy
+point. Full-size point
+([results](benches/full-size-quiet-box-returns.json)): lower than both
+HEAD and its copy in 5 of 6 rounds, −3.1% against HEAD and −3.0%
+against the copy at the median, with the copy at +0.4% against HEAD.
+Latency tails and stalled bins match the baselines (stalled bins in 6
+of 12 points against 6 and 5), so nothing points to a missed wake.
+Lossy point ([results](benches/lossy-path-quiet-box-returns.json)):
+0.009%, 0.011% and 0.094% of frames lost at each round's worst point,
+against 0.066% and 0.149% for HEAD and 0.009%, 0.031% and 0.005% for
+its copy. HEAD's first lossy round is missing: both receivers died
+before the run, a fault of the benchmark script that has not been
+traced. The bar is met.
 
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 

@@ -103,6 +103,17 @@ in the TAP flush, the reassembly totals and the deadline scan took 2.3–
 November 12 under the older paired method
 ([BENCH.md](BENCH.md#occupied-receive-slots-in-the-tap-flush-and-the-deadline-scan-november-16-landed)).
 
+Silent box returns then came back in a form that works. The work
+behind a lane worker's report box was the loss pass every ACK owed, and
+a pass after an ACK can only act on packets below the largest
+acknowledged number. When none is outstanding the pass now counts as
+made, a sleeping worker says whether it waits for a box, and a returned
+report or ACK box wakes it only then: 3.0–3.1% off CPU per delivered
+bit, with the lossy point unchanged
+([BENCH.md](BENCH.md#box-returns-that-wake-only-a-waiting-owner-november-16-landed)).
+Feedback boxes, 8% of wakes, still wake on return; doing the same for
+them needs the lane's ACK deadline armed while its box is out.
+
 Next targets in the daemon's own code, by cycles per frame event in
 that profile: output coalescing around the TAP write (about 320, the
 `flush_taps` phase less its syscall), the reassembly copy and slot scan

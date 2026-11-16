@@ -568,6 +568,35 @@ fn sparse_outstanding_scan_budgets_empty_words_and_stops_at_its_original_end() {
 }
 
 #[test]
+fn outstanding_below_sees_only_charged_packets_under_the_number() {
+    let mut history = History::new().unwrap();
+    assert!(!history.outstanding_below(1, 8));
+    for number in 1..=6 {
+        sent(&mut history, number, true);
+    }
+    assert!(!history.outstanding_below(0, 8));
+    assert!(!history.outstanding_below(1, 8));
+    assert!(history.outstanding_below(2, 8));
+    // Acknowledged and lost packets below the number no longer count.
+    history
+        .acknowledge(ranges(&[AckRange { start: 1, end: 3 }]), |_| {})
+        .unwrap();
+    assert!(!history.outstanding_below(4, 8));
+    assert!(history.outstanding_below(5, 8));
+    history.lose(4).unwrap();
+    assert!(!history.outstanding_below(5, 8));
+    assert!(history.outstanding_below(7, 8));
+    // A number past everything sent is bounded by what was allocated.
+    assert!(history.outstanding_below(u64::MAX, 8));
+    // Out of budget before the answer is known reads as outstanding.
+    let mut sparse = History::new().unwrap();
+    sent(&mut sparse, SENT_CAPACITY as u64, true);
+    assert!(sparse.outstanding_below(SENT_CAPACITY as u64, 1));
+    assert!(!sparse.outstanding_below(SENT_CAPACITY as u64, 64));
+    assert!(sparse.outstanding_below(SENT_CAPACITY as u64 + 1, 64));
+}
+
+#[test]
 fn outstanding_scan_rechecks_ack_loss_and_eviction_between_steps() {
     let mut history = History::new().unwrap();
     for number in 1..=4 {

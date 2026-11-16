@@ -666,6 +666,25 @@ impl History {
         }
     }
 
+    /// Whether a charged packet numbered below `number` is still outstanding.
+    ///
+    /// Spends at most `budget` bitmap reads and answers true when they run
+    /// out first, so a caller that skips work on false never skips wrongly.
+    pub fn outstanding_below(&self, number: u64, mut budget: usize) -> bool {
+        let Some(end) = number.checked_sub(1) else {
+            return false;
+        };
+        if self.inflight_bytes == 0 || end < self.floor {
+            return false;
+        }
+        let mut scan = OutstandingScan {
+            next: Some(self.floor),
+            end: end.min(self.allocated),
+            skip_empty: false,
+        };
+        scan.advance(self, &mut budget).is_some() || !scan.is_complete()
+    }
+
     /// Visits outstanding charged packets synchronously in number order.
     ///
     /// Worker turns should use outstanding_scan to bound visits of empty words too.

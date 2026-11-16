@@ -23,6 +23,9 @@ pub(crate) struct Wake {
     fd: OwnedFd,
     /// Set by the owning worker before it blocks, cleared when it wakes.
     sleeping: std::sync::atomic::AtomicBool,
+    /// Set with `sleeping` when the owner blocks with work that waits for a
+    /// box another worker holds, so that the box's return must wake it.
+    returns: std::sync::atomic::AtomicBool,
 }
 
 impl Wake {
@@ -33,6 +36,7 @@ impl Wake {
             // SAFETY: fd is a newly created descriptor with one owner.
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
             sleeping: std::sync::atomic::AtomicBool::new(false),
+            returns: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -50,9 +54,23 @@ impl Wake {
         }
     }
 
-    /// Marks the owner as about to block. The caller must then recheck every
-    /// incoming queue and call [`Wake::awake`] instead of blocking if any has work.
-    fn sleep(&self) {
+    /// Wakes the owner for a box returned to its pool, but only if it sleeps
+    /// with work waiting for one; otherwise the box waits in its queue for
+    /// the owner's next turn. Pairs with [`Wake::sleep`] as notify_queued does.
+    pub(crate) fn notify_return(&self) -> io::Result<()> {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if self.sleeping.load(Ordering::Relaxed) && self.returns.load(Ordering::Relaxed) {
+            self.notify()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Marks the owner as about to block, and whether a returned box must
+    /// wake it. The caller must then recheck every incoming queue and call
+    /// [`Wake::awake`] instead of blocking if any has work.
+    fn sleep(&self, returns: bool) {
+        self.returns.store(returns, Ordering::Relaxed);
         self.sleeping.store(true, Ordering::Relaxed);
         std::sync::atomic::fence(Ordering::SeqCst);
     }
@@ -1130,6 +1148,8 @@ pub(crate) struct Worker {
     held: Vec<(usize, usize)>,
     hold: Duration,
     notifications: u64,
+    // Workers pushed a returned box this turn; see Wake::notify_return.
+    return_notifications: u64,
     counters: Snapshot,
     setup_due: Duration,
     retry_due: Option<Duration>,
@@ -1512,6 +1532,7 @@ impl Worker {
             held: Vec::with_capacity(batch_count),
             hold: Duration::from_micros(config.daemon.tx_hold_us.into()),
             notifications: 0,
+            return_notifications: 0,
             counters,
             setup_due: Duration::ZERO,
             retry_due: None,
@@ -1631,7 +1652,7 @@ impl Worker {
                     self.phases[21].wrapping_add(crate::profile::now().wrapping_sub(arming));
             }
             if block {
-                self.reactor.wake.sleep();
+                self.reactor.wake.sleep(self.wants_returns());
                 // Work queued before the flag was visible got no wake; take it now.
                 block = self.incoming.iter_mut().flatten().all(Consumer::is_empty);
             }
@@ -1803,9 +1824,27 @@ impl Worker {
         let Some(outgoing) = self.outgoing[worker].as_mut() else {
             return Err(event);
         };
-        outgoing.try_push(event).map(|()| {
-            self.notifications |= 1_u64 << worker;
-        })
+        // A box going back to its pool wakes its owner only if the owner
+        // sleeps waiting for one.
+        let returned = matches!(
+            &event,
+            Event::Sender(sender::Message::ReportReturn(_) | sender::Message::AckReturn(_))
+        );
+        match outgoing.try_push(event) {
+            Ok(()) if returned => {
+                self.return_notifications |= 1_u64 << worker;
+                Ok(())
+            }
+            Ok(()) => {
+                self.notifications |= 1_u64 << worker;
+                Ok(())
+            }
+            Err(event) => {
+                // Unwoken returns may have filled the queue of a sleeping owner.
+                self.notifications |= 1_u64 << worker;
+                Err(event)
+            }
+        }
     }
 
     fn release(&mut self, mut buffer: Box<Buffer>) {
@@ -1852,10 +1891,17 @@ impl Worker {
 
     fn flush_notifications(&mut self) -> io::Result<()> {
         let mut mask = std::mem::take(&mut self.notifications);
+        // Workers sent only returned boxes this turn.
+        let mut returns = std::mem::take(&mut self.return_notifications) & !mask;
         while mask != 0 {
             let worker = mask.trailing_zeros() as usize;
             mask &= mask - 1;
             self.shared.wakes[worker].notify_queued()?;
+        }
+        while returns != 0 {
+            let worker = returns.trailing_zeros() as usize;
+            returns &= returns - 1;
+            self.shared.wakes[worker].notify_return()?;
         }
         Ok(())
     }
@@ -10369,7 +10415,7 @@ mod tests {
         // A busy owner drains its queues on its next turn without a write.
         wake.notify_queued().unwrap();
         assert_eq!(reactor.wait(&mut events, 0).unwrap(), 0);
-        wake.sleep();
+        wake.sleep(false);
         wake.notify_queued().unwrap();
         assert_eq!(reactor.wait(&mut events, 0).unwrap(), 1);
         assert_eq!({ events[0].u64 }, WAKE_TOKEN);
@@ -10380,6 +10426,25 @@ mod tests {
         // Unconditional notifications still wake a busy owner.
         wake.notify().unwrap();
         assert_eq!(reactor.wait(&mut events, 0).unwrap(), 1);
+        reactor.drain(WAKE_TOKEN).unwrap();
+        // A returned box wakes only an owner that sleeps waiting for one.
+        wake.notify_return().unwrap();
+        wake.sleep(false);
+        wake.notify_return().unwrap();
+        assert_eq!(reactor.wait(&mut events, 0).unwrap(), 0);
+        wake.notify_queued().unwrap();
+        assert_eq!(reactor.wait(&mut events, 0).unwrap(), 1);
+        reactor.drain(WAKE_TOKEN).unwrap();
+        wake.awake();
+        wake.sleep(true);
+        wake.notify_return().unwrap();
+        assert_eq!(reactor.wait(&mut events, 0).unwrap(), 1);
+        reactor.drain(WAKE_TOKEN).unwrap();
+        wake.awake();
+        // The flag does not outlive the sleep it was set for.
+        wake.sleep(false);
+        wake.notify_return().unwrap();
+        assert_eq!(reactor.wait(&mut events, 0).unwrap(), 0);
     }
 
     #[test]
@@ -10413,7 +10478,7 @@ mod tests {
             if next == ITEMS {
                 break;
             }
-            wake.sleep();
+            wake.sleep(false);
             let block = rx.is_empty();
             // A lost wake would leave this wait to its one-second timeout.
             let count = reactor

@@ -55,6 +55,48 @@ fn workers_with_lanes(lanes: usize) -> ([Worker; 2], ReceiveSocket) {
     (workers, rx)
 }
 
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn returned_boxes_are_pushed_without_the_ordinary_notification() {
+    let (mut workers, _rx) = workers();
+    let worker = &mut workers[1];
+    let push = |worker: &mut Worker, message: Message| {
+        worker.notifications = 0;
+        worker.return_notifications = 0;
+        assert!(worker.push(0, Event::Sender(message)).is_ok());
+        (worker.notifications, worker.return_notifications)
+    };
+    let ack = worker.sender.ack_free.pop().unwrap();
+    assert_eq!(push(worker, Message::AckReturn(ack)), (0, 1));
+    let report = worker.sender.report.take().unwrap();
+    assert_eq!(push(worker, Message::ReportReturn(report)), (0, 1));
+    // Work for the target still asks for the ordinary wake.
+    let ack = worker.sender.ack_free.pop().unwrap();
+    assert_eq!(push(worker, Message::Ack(ack)), (1, 0));
+    assert_eq!(push(worker, Message::ProbeReplied { group: 0 }), (1, 0));
+    // Returns nobody woke for may have filled a sleeping worker's queue, so
+    // a refused push asks for the ordinary wake.
+    let mut refused = None;
+    while let Some(ack) = worker.sender.ack_free.pop() {
+        if let Err(event) = worker.push(0, Event::Sender(Message::AckReturn(ack))) {
+            refused = Some(event);
+            break;
+        }
+        worker.notifications = 0;
+    }
+    if refused.is_none() {
+        // The queue outlasted the pool; fill the rest with notices.
+        worker.notifications = 0;
+        while worker
+            .push(0, Event::Sender(Message::ProbeReplied { group: 0 }))
+            .is_ok()
+        {
+            worker.notifications = 0;
+        }
+    }
+    assert_eq!(worker.notifications, 1);
+}
+
 fn queue_frame(worker: &mut Worker, length: usize) {
     let mut frame = worker.free.pop().unwrap();
     frame.session = 0;
@@ -2264,48 +2306,82 @@ fn admitted_acks_finish_then_loss_progresses_under_continuous_ack_input() {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
-fn an_empty_history_still_drains_its_ack_loss_fence_before_replacement() {
-    let (mut workers, _rx) = workers();
-    let [peer, worker] = &mut workers;
-    let index = worker.sender_index(0, 1).unwrap();
-    worker.sender.lanes[index]
-        .history
-        .reserve(1, 1280, true, true)
-        .unwrap();
-    assert!(worker.sender.lanes[index].submitted(1, Duration::ZERO, None));
-    let now = Duration::from_millis(1);
-    let future = [AckRange { start: 2, end: 2 }];
-    worker
-        .incoming_ack(0, 1, 2, 0, AckRanges::new(&future).unwrap(), now)
-        .unwrap();
-    worker.begin_sender_ack().unwrap();
-    assert!(worker.sender.lanes[index].ack.is_none());
-    let valid = [AckRange { start: 1, end: 1 }];
-    worker
-        .incoming_ack(0, 1, 2, 0, AckRanges::new(&valid).unwrap(), now)
-        .unwrap();
-    worker.service_sender(now).unwrap();
-    let Some(Event::Sender(Message::Report(report))) = peer.incoming[1].as_mut().unwrap().try_pop()
-    else {
-        panic!("missing ACK report")
-    };
-    assert!(matches!(report.kind, ReportKind::Ack { end: Some(_), .. }));
-    worker
-        .sender_message(Message::ReportReturn(report), now)
-        .unwrap();
-    let lane = &mut worker.sender.lanes[index];
-    // Completing the ACK retired its only entry; the owed scan still pins the lane.
-    assert!(lane.history.is_retired());
-    assert!(!lane.idle(), "empty history must finish its owed scan");
-    assert_eq!(
-        lane.install(2).unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
-    );
-    for _ in 0..4 {
+fn an_ack_owes_a_loss_pass_only_for_packets_left_below_it() {
+    // An ACK of everything sent leaves the pass after it nothing to visit;
+    // one that leaves an older packet outstanding still owes it.
+    for hole in [false, true] {
+        let (mut workers, _rx) = workers();
+        let [peer, worker] = &mut workers;
+        let index = worker.sender_index(0, 1).unwrap();
+        let last = 1 + u64::from(hole);
+        for number in 1..=last {
+            worker.sender.lanes[index]
+                .history
+                .reserve(number, 1280, true, true)
+                .unwrap();
+            assert!(worker.sender.lanes[index].submitted(number, Duration::ZERO, None));
+        }
+        let now = Duration::from_millis(1);
+        let future = [AckRange {
+            start: last + 1,
+            end: last + 1,
+        }];
+        worker
+            .incoming_ack(0, 1, 2, 0, AckRanges::new(&future).unwrap(), now)
+            .unwrap();
+        worker.begin_sender_ack().unwrap();
+        assert!(worker.sender.lanes[index].ack.is_none());
+        let valid = [AckRange {
+            start: last,
+            end: last,
+        }];
+        worker
+            .incoming_ack(0, 1, 2, 0, AckRanges::new(&valid).unwrap(), now)
+            .unwrap();
         worker.service_sender(now).unwrap();
+        let Some(Event::Sender(Message::Report(report))) =
+            peer.incoming[1].as_mut().unwrap().try_pop()
+        else {
+            panic!("missing ACK report")
+        };
+        assert!(matches!(report.kind, ReportKind::Ack { end: Some(_), .. }));
+        // While the owner has the report, only an owed pass waits for it.
+        assert_eq!(worker.sender.lanes[index].loss_passes, u8::from(hole));
+        assert_eq!(worker.sender.loss_fences, usize::from(hole));
+        assert_eq!(worker.sender.lanes[index].waits_for_report(), hole);
+        assert_eq!(worker.wants_returns(), hole);
+        // An empty ACK pool wants its boxes back whatever the report's state.
+        let pool = std::mem::take(&mut worker.sender.ack_free);
+        assert!(worker.wants_returns());
+        worker.sender.ack_free = pool;
+        worker
+            .sender_message(Message::ReportReturn(report), now)
+            .unwrap();
+        let lane = &mut worker.sender.lanes[index];
+        if hole {
+            // The older packet is neither three numbers behind nor overdue yet:
+            // the pass runs, finds nothing lost and leaves its deadline.
+            assert_eq!(lane.deadline(), Some(now));
+            assert_eq!(
+                lane.install(2).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            for _ in 0..4 {
+                worker.service_sender(now).unwrap();
+            }
+            let lane = &worker.sender.lanes[index];
+            assert_eq!(lane.loss_passes, 0);
+            assert_eq!(worker.sender.loss_fences, 0);
+            assert!(lane.deadline().is_some_and(|due| due > now));
+            assert_eq!(lane.history.outstanding().count(), 1);
+        } else {
+            // Completing the ACK retired the only entry and nothing pins the lane.
+            assert!(lane.history.is_retired());
+            assert!(lane.idle());
+            assert_eq!(lane.deadline(), None);
+            lane.install(2).unwrap();
+        }
     }
-    assert!(worker.sender.lanes[index].idle());
-    worker.sender.lanes[index].install(2).unwrap();
 }
 
 #[test]
@@ -3516,7 +3592,7 @@ fn successful_pmtu_probe_overtakes_retained_suffix_without_reordering_data() {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
-fn ack_transfer_returns_before_final_report_and_reuses_without_changing_fences() {
+fn ack_transfer_returns_before_final_report_and_reuses_while_it_is_held() {
     let (mut workers, _rx) = workers();
     frame(&mut workers[1]);
     for _ in 0..8 {
@@ -3552,6 +3628,11 @@ fn ack_transfer_returns_before_final_report_and_reuses_without_changing_fences()
         matches!(report.kind, ReportKind::Ack { received, delay_us: 17, end: Some(_), .. } if received == now)
     );
     assert_eq!(report.count, 1);
+    // The lane's only packet is acknowledged, so the pass an ACK owes has
+    // nothing to visit and counts as made. advance_report was called
+    // directly here; release the fence as service_sender does.
+    assert_eq!(workers[1].sender.lanes[index].loss_passes, 0);
+    workers[1].sender.loss_fences -= 1;
     report.id.generation += 1;
     assert!(
         workers[1].sender.lanes[index]
@@ -3575,7 +3656,7 @@ fn ack_transfer_returns_before_final_report_and_reuses_without_changing_fences()
     assert_eq!(workers[1].sender.incoming.len(), 1);
     assert_eq!(workers[1].counters.ack_coalesced, ACK_BUFFERS as u64 - 1);
     assert_eq!(workers[1].sender.acks_pending, 1);
-    assert_eq!(workers[1].sender.loss_fences, 1);
+    assert_eq!(workers[1].sender.loss_fences, 0);
     let timing = workers[1].sender.lanes[index].ack.as_ref().unwrap();
     assert_eq!(timing.received, now);
     assert_eq!(timing.delay_us, 17);

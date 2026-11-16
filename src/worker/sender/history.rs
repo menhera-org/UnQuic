@@ -193,8 +193,22 @@ impl Lane {
                 if let Some(sent) = progress.rtt_sent_at {
                     self.rtt.sample(sent, ack.received, ack.delay_us);
                 }
-                // Finish this bounded pass before revisiting earlier packets with new RTT/ACK state.
-                self.loss_due = Some(now);
+                // Finish this bounded pass before revisiting earlier packets with new RTT/ACK
+                // state. The pass that follows an ACK can only act on packets below the
+                // largest acknowledged number; with none outstanding, and no older pass or
+                // forced sweep owed, it has nothing to visit and counts as made, which
+                // leaves nothing waiting for this report to come back.
+                if self.loss_passes == 1
+                    && self.scan.is_none()
+                    && self.forced_before.is_none()
+                    && !self.history.outstanding_below(self.largest_ack, 8)
+                {
+                    self.loss_passes = 0;
+                    self.loss_due = None;
+                } else {
+                    self.loss_due = Some(now);
+                }
+                self.ack_ending = true;
                 report.kind = ReportKind::Ack {
                     received: ack.received,
                     delay_us: ack.delay_us,
@@ -343,9 +357,25 @@ impl Lane {
         }
         self.report_pending = false;
         if matches!(report.kind, ReportKind::Ack { end: Some(_), .. }) {
+            self.ack_ending = false;
             Ok(self.ack.take())
         } else {
             Ok(None)
+        }
+    }
+
+    /// Whether this lane has work that starts, or resumes, only when the
+    /// worker's report box is back: the return must then wake a sleeper.
+    pub(in crate::worker) fn waits_for_report(&self) -> bool {
+        let owed = self.loss_passes != 0 || self.retire_due;
+        if self.report_pending {
+            // More of an ACK, or a pass queued behind the report in flight.
+            owed || (self.ack.is_some() && !self.ack_ending)
+                || self.scan.is_some()
+                || self.forced_before.is_some()
+                || self.loss_due.is_some()
+        } else {
+            owed || self.deadline().is_some()
         }
     }
 }

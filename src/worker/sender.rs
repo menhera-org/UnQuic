@@ -184,6 +184,8 @@ pub(super) struct Lane {
     pub(super) scan_cutoff: Option<Duration>,
     pub(super) ack: Option<AckTiming>,
     pub(super) ack_first: bool,
+    // The report in flight carries the end of this lane's ACK.
+    pub(super) ack_ending: bool,
     pub(super) report_pending: bool,
     // Complete an older scan, if any, then one pass using the admitted ACK.
     pub(super) loss_passes: u8,
@@ -210,6 +212,7 @@ impl Lane {
             scan_cutoff: None,
             ack: None,
             ack_first: true,
+            ack_ending: false,
             report_pending: false,
             loss_passes: 0,
             probes: [None; 2],
@@ -775,6 +778,26 @@ impl Worker {
             .sender
             .owner = Some(owner);
         Ok(())
+    }
+
+    /// Whether a box coming back to this worker must wake it from sleep. A
+    /// returned box otherwise waits in its queue for the worker's next turn.
+    ///
+    /// It must when no ACK box is left for arriving feedback, and when work
+    /// is held behind the report box while the owner has it: deadlines are
+    /// not armed then (see `feedback_deadline`), so only the return restarts
+    /// that work.
+    pub(super) fn wants_returns(&self) -> bool {
+        self.sender.ack_free.is_empty()
+            || (self.sender.report.is_none()
+                && (!self.sender.incoming.is_empty()
+                    || self.sender.checks_pending != 0
+                    || self.sender.reclaim.is_some()
+                    || self.sender.lanes.iter().any(|lane| {
+                        // A lane without a connection is being drained.
+                        lane.waits_for_report()
+                            || (!lane.idle() && self.sessions[lane.session].connection.is_none())
+                    })))
     }
 
     pub(super) fn sender_enabled(&self) -> bool {
