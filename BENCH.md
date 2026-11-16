@@ -1579,11 +1579,20 @@ counters looked normal. The receiving daemon counted 1,041,644
 daemon runs with offload frames on that this session's logs still hold,
 two others counted TAP errors, three each; none came near this.
 
-The cause is not known. The refusals lasted the whole run on those six
-queues and nothing in the daemon's log marks them, which suggests the
-queues' offload state at startup, not the frames. The daemon counts a
-refused write without keeping its error code, so the first step is to
-record that code. Until the cause is found
+The cause is not known, but the logs give a lead. In the 17 healthy
+daemon runs of these two sets the TAP's input all arrived on worker 3's
+queue. In the failing one it all arrived on worker 0's queue, and
+worker 0's was the only queue whose writes succeeded; the device
+counted exactly those 192,878 writes as received and no errors or
+drops. That is what a TAP with one attached queue looks like: the
+kernel steers every flow to queue 0 and refuses writes on a detached
+queue's descriptor before they reach the device. If so, the fault is in
+how the queues come up, the other six were detached from the start, and
+ordinary frames would have been lost the same way; offload frames only
+happened to be on. This is a hypothesis, not a finding. The daemon
+counts a refused write without keeping its error code, so the first
+step is to record that code and the device's queue count at startup.
+Until the cause is found
 and fixed, offload frames cannot become the default whatever the
 averages say: a refused write loses the whole frame, and here it took
 most of a direction.
