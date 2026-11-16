@@ -1341,6 +1341,22 @@ against 21,000–42,000. Of the 5 Gbit/s offered, the striped flow now
 leaves 2–8% undelivered at the generator, where it left 8–18% before the
 check.
 
+What is left on the lossy point looked like second repairs: a frame
+lives four smoothed RTTs, 20 ms at least, a repair cycle takes about
+2.4, and an offload frame of thirteen datagrams needs a second one far
+more often than an ordinary frame. An exploratory build with six RTTs
+and 30 ms at least was compared on that point, with offload frames off
+and on ([results](benches/lossy-frame-lifetime-6rtt-exploratory.json)).
+The hypothesis, a several-fold drop for both, did not hold for ordinary
+frames: 0.13%, 0.19% and 0.06% lost at each round's worst point against
+0.007%, 0.04% and 0.07%. Offload frames lost less in three rounds of
+three, 0.002–0.046% against 0.009–0.047%. At this level a run's loss is
+a few bursts of frames that were never sent (170–5,700 of 13.6 million),
+which fits the host's periodic stalls and the few ProbeRTT episodes
+rather than repair time, and the two arms of HEAD no longer differ
+either: offload frames were worse than ordinary ones in two rounds here
+and better in the third. The lifetime stays as it is.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames
