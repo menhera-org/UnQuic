@@ -1790,6 +1790,24 @@ find something now waits for the next turn, which adds a turn. The
 second, empty turn is the cost worth removing, and it comes from phases
 that report progress after handing work to another worker.
 
+## ACKs due on a shared tick (November 16, exploratory, rejected)
+
+A lane holds an ACK for 1 ms after its first unacknowledged packet, so
+the lanes of a session fall due at different moments and worker 0 sends
+them one by one. An exploratory build made held ACKs fall due at the
+next multiple of 1 ms on the shared clock
+([patch](benches/ack-shared-tick-exploratory.patch)), expecting them to
+reach worker 0 together, share datagrams, and reach the sender's
+controller together. Stated beforehand: 3% or more by the usual bar.
+[Results](benches/full-size-ack-shared-tick-exploratory.json): lower
+than both HEAD and its copy in 2 of 6 rounds, −1.1% against HEAD and
++0.3% against the copy, and the control lane carried 32.3 MB against
+32.5, so the ACKs did not merge. Worker 0 wakes for the first box and
+sends it before the others arrive, and a lane above 48,000 packets a
+second still fires on its packet count between ticks and then again at
+the tick. Rejected; merging would need worker 0 to wait for the rest,
+which is a delay the tick was meant to avoid.
+
 ## Four workers up to and past saturation (November 16)
 
 The day's changes were measured on the full-size point, where eight
