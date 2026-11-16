@@ -1768,6 +1768,28 @@ morning, part of which this overhead had been eating. A report that
 held more than one pass's worth would allow a larger count again; that
 has not been tried.
 
+## Skipping the poll after a blocking wait (November 16, rejected)
+
+The same profile counted how a daemon's 4.2 million worker turns in a
+run end: 2.06 million in a blocking wait and 2.14 million in a
+non-blocking poll, of which 1.72 million found nothing. The usual
+pattern is a wake, a turn that does the work and polls, and a turn that
+finds nothing and blocks. The poll phase held 183 cycles per frame
+event, 3.5% of the busy total, so skipping the poll of the first turn
+after a blocking wait looked worth about 2%: whatever became ready
+meanwhile is still ready at the next wait, one turn later.
+
+Stated beforehand: 2% or more by the usual bar, and no more loss on the
+lossy point. [Results](benches/full-size-skip-poll-after-blocking-wait.json):
+lower than both HEAD and its copy in 1 of 6 rounds, +0.4% against HEAD
+and −0.2% against the copy at the median.
+[Rejected](benches/skip-poll-after-blocking-wait-rejected.patch); the
+lossy set was stopped. A poll that returns nothing costs less process
+time than its cycle count suggested, and the one poll in five that did
+find something now waits for the next turn, which adds a turn. The
+second, empty turn is the cost worth removing, and it comes from phases
+that report progress after handing work to another worker.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames

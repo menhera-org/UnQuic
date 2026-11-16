@@ -1,0 +1,79 @@
+diff --git a/src/worker.rs b/src/worker.rs
+index 42490cf..c16663b 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -1582,6 +1582,7 @@ impl Worker {
+         tighten_timer_slack();
+         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 128];
+         let mut immediate = true;
++        let mut woken = false;
+         let mut event_start = 0;
+         let mut publish_due = Duration::ZERO;
+         let mut publish_turns = 0_u8;
+@@ -1656,11 +1657,15 @@ impl Worker {
+                 // Work queued before the flag was visible got no wake; take it now.
+                 block = self.incoming.iter_mut().flatten().all(Consumer::is_empty);
+             }
+-            let waited = phase!(
+-                self,
+-                if block { 22 } else { 27 },
+-                self.reactor.wait_until(&mut events, block, deadline)
+-            );
++            let waited = if skip_poll(block, &mut woken) {
++                Ok(0)
++            } else {
++                phase!(
++                    self,
++                    if block { 22 } else { 27 },
++                    self.reactor.wait_until(&mut events, block, deadline)
++                )
++            };
+             self.reactor.wake.awake();
+             let count = match waited {
+                 Ok(count) => count,
+@@ -5892,6 +5897,20 @@ impl Worker {
+     }
+ }
+ 
++/// Whether this turn may go on without asking the kernel for events.
++///
++/// A worker woken from a blocking wait usually needs one more turn for what
++/// it found, and four in five of the non-blocking polls between those two
++/// turns found nothing new. Whatever did become ready is still ready when the
++/// worker next waits, at the end of the following turn, blocking or not: only
++/// the first turn after a blocking wait skips, so a busy worker polls as
++/// often as before. `woken` carries whether the last wait blocked.
++fn skip_poll(block: bool, woken: &mut bool) -> bool {
++    let skip = !block && *woken;
++    *woken = block;
++    skip
++}
++
+ /// Whether a turn may block in epoll and therefore needs its timer armed.
+ ///
+ /// Pending work, or a deadline already due at the turn's start, runs on the
+@@ -10417,6 +10436,24 @@ mod tests {
+         assert!(!should_block(true, Some(now + Duration::from_secs(1)), now));
+     }
+ 
++    #[test]
++    fn only_the_first_turn_after_a_blocking_wait_skips_its_poll() {
++        let mut woken = false;
++        // A worker that has not blocked polls on every busy turn.
++        assert!(!skip_poll(false, &mut woken));
++        assert!(!skip_poll(false, &mut woken));
++        // A blocking wait is never skipped, and the busy turn after it is.
++        assert!(!skip_poll(true, &mut woken));
++        assert!(skip_poll(false, &mut woken));
++        // The turn after that waits again, by polling or by blocking.
++        assert!(!skip_poll(false, &mut woken));
++        assert!(!skip_poll(false, &mut woken));
++        assert!(!skip_poll(true, &mut woken));
++        assert!(!skip_poll(true, &mut woken));
++        assert!(skip_poll(false, &mut woken));
++        assert!(!skip_poll(true, &mut woken));
++    }
++
+     #[test]
+     #[ignore = "kernel polling test; run in a disposable container"]
+     fn queued_notifications_wake_only_a_sleeping_owner() {

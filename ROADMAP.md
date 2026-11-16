@@ -129,7 +129,11 @@ count at 48 an ACK fits one pass: 5.7–5.8% off CPU per delivered bit in
 ([BENCH.md](BENCH.md#an-ack-that-fits-one-report-november-16-landed)).
 The same profile found that half of all worker turns end in a
 non-blocking poll and that four in five of those polls find nothing,
-1.7 million per daemon in a run; that is the next target.
+1.7 million per daemon in a run. Skipping the first poll after a
+blocking wait measured nothing and was rejected
+([BENCH.md](BENCH.md#skipping-the-poll-after-a-blocking-wait-november-16-rejected));
+the empty second turn itself, asked for by phases that count a message
+handed to another worker as progress, is the target that remains.
 
 Next targets in the daemon's own code, by cycles per frame event in
 that profile: output coalescing around the TAP write (about 320, the
