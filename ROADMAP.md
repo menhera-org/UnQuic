@@ -759,6 +759,16 @@ Decisions only the user can make, each blocking a remaining goal:
    check now runs first. With that round explained, offload frames have met both
    bars for the default, which is again the user's call
    ([BENCH.md](BENCH.md#offload-frames-after-the-ack-change-and-a-round-of-refused-tap-writes-november-16)).
+
+   November 19, on the build with the larger frame budget: on the lossy
+   point offload frames use 8.5% less CPU per delivered bit in six rounds
+   of six, and their worst-point loss (0.22% at the median, 0.65% at
+   most) lies inside what two arms of the default differ by (0.03% and
+   0.20%). They also made the 20 Gbit/s gate in five runs of five where
+   the default made four, and they are what lets eight workers pass
+   5 Gbit/s on the lossy path. The recommendation is now to turn them on
+   by default; the decision is still the user's
+   ([BENCH.md](BENCH.md#the-switches-on-the-lossy-efficiency-point-november-19)).
 9. Open since November 16: should `daemon.rotate_lanes` be on by default?
    On, a session whose TAP one worker reads moves its receive lanes once,
    so that this worker receives the peer's control lane and no data lane.
@@ -787,7 +797,12 @@ Decisions only the user can make, each blocking a remaining goal:
    little. A variant that gives the reader the peer's empty lane instead
    of its control lane was 1% ahead on three rounds and was not kept
    ([BENCH.md](BENCH.md#a-reader-that-transmits-nothing-november-19-landed)).
-   The lossy-path question is not remeasured on the new build.
+   The lossy-path question was remeasured on the new build the same
+   evening: on the lossy point rotation reads +3.4% CPU per bit, where a
+   second arm of the default reads +3.2%, and its worst-point loss
+   (0.12% at the median) lies between the two default arms' 0.03% and
+   0.20%. Nothing there speaks for or against it now
+   ([BENCH.md](BENCH.md#the-switches-on-the-lossy-efficiency-point-november-19)).
 10. Open since November 19: where should frames wait when the lanes are
    held back for a moment? Since a TAP reader with six or more other data
    lanes transmits none itself, it reads on while lane owners queue what

@@ -2841,6 +2841,29 @@ the target line. The design's list (L2TPv3 with fragmentation,
 WireGuard carrying L2, SoftEther) and its sixty-second, five-run
 procedure remain to be done where those modules can load.
 
+## The switches on the lossy efficiency point (November 19)
+
+Decisions 8 and 9 rest on a lossy point that was last measured before
+the queue check judged rounds by their smallest RTT. The point again on
+`34aced8`: eight workers, sixteen QinQ flows of 1522-byte frames as
+44-segment GSO at 2 Gbit/s each way, routed 4.5 ms path with 1% loss,
+six rounds in rotation ([results](benches/lossy-efficiency-switches-nov19.json);
+arm `copy` there is `4b9b3b5`, before the larger frame budget):
+
+| Arm | CPU per delivered Gbit/s, median | Against the default | Worst-point frames missing, median and largest |
+| --- | --- | --- | --- |
+| Default | 90.9% | | 0.03%, 0.06% |
+| Default, a second arm | 95.0% | +3.2%, lower in 1 of 6 | 0.20%, 2.77% |
+| `4b9b3b5` | 93.3% | +2.8%, lower in 1 of 6 | 0.07%, 0.24% |
+| `offload_frames` | 83.4% | −8.5%, lower in 6 of 6 | 0.22%, 0.65% |
+| `rotate_lanes` | 94.8% | +3.4%, lower in 1 of 6 | 0.12%, 0.44% |
+
+Every arm delivers 1.94–1.98 Gbit/s each way. Two arms of the same
+binary differ by 3% in CPU and by 0.03% against 0.20% in median loss, so
+only the offload frames' CPU saving stands out of the noise. Their loss
+no longer does, and neither does anything about lane rotation or the
+frame budget on this point.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames
