@@ -1,0 +1,136 @@
+benches/tunnel_summary.sh over each 20 s point; arm/round/point. Kernel VXLAN over IPv6 with a
+1600-byte underlay (KERNEL_TUNNEL=vxlan) against UnQuic 34aced8 with a 1500-byte underlay, on the
+routed test path. Busy cores are the whole system: load generators, daemons and soft interrupts.
+
+== A. Clean routed path, thirty-two QinQ 1522-byte flows as 44-segment GSO; 4, 8, 12 and 21 Gbit/s requested each way
+-- kernel VXLAN, eight generator and eight receiver processes a side on eight CPUs each
+vx/r1/0: offered 4.00 + 4.00, delivered 3.93 + 3.90 Gbit/s, missing 1.62% 2.40%, 6.0 cores busy, 0.77 per Gbit/s
+vx/r1/1: offered 7.83 + 7.86, delivered 4.89 + 4.80 Gbit/s, missing 37.54% 39.01%, 8.6 cores busy, 0.89 per Gbit/s
+vx/r1/2: offered 10.55 + 10.53, delivered 5.52 + 5.10 Gbit/s, missing 47.65% 51.58%, 9.5 cores busy, 0.89 per Gbit/s
+vx/r1/3: offered 18.37 + 18.35, delivered 4.38 + 4.17 Gbit/s, missing 76.19% 77.26%, 16.0 cores busy, 1.87 per Gbit/s
+vx/r2/0: offered 4.00 + 4.00, delivered 3.90 + 3.90 Gbit/s, missing 2.55% 2.37%, 5.3 cores busy, 0.68 per Gbit/s
+vx/r2/1: offered 7.09 + 7.43, delivered 5.44 + 5.02 Gbit/s, missing 23.26% 32.40%, 7.3 cores busy, 0.70 per Gbit/s
+vx/r2/2: offered 10.55 + 10.53, delivered 4.97 + 4.89 Gbit/s, missing 52.87% 53.58%, 9.5 cores busy, 0.96 per Gbit/s
+vx/r2/3: offered 18.35 + 18.30, delivered 4.17 + 4.20 Gbit/s, missing 77.25% 77.06%, 16.3 cores busy, 1.95 per Gbit/s
+vx2/r1/0: offered 4.00 + 4.00, delivered 3.97 + 3.93 Gbit/s, missing 0.61% 1.63%, 5.3 cores busy, 0.67 per Gbit/s
+vx2/r1/1: offered 7.38 + 7.87, delivered 5.05 + 4.87 Gbit/s, missing 31.59% 38.14%, 7.8 cores busy, 0.79 per Gbit/s
+vx2/r1/2: offered 10.55 + 10.54, delivered 4.91 + 4.82 Gbit/s, missing 53.50% 54.28%, 9.5 cores busy, 0.98 per Gbit/s
+vx2/r1/3: offered 18.33 + 18.29, delivered 4.24 + 4.17 Gbit/s, missing 76.87% 77.23%, 16.5 cores busy, 1.96 per Gbit/s
+vx2/r2/0: offered 4.00 + 4.00, delivered 3.47 + 3.49 Gbit/s, missing 13.13% 12.84%, 5.2 cores busy, 0.75 per Gbit/s
+vx2/r2/1: offered 7.41 + 7.86, delivered 5.20 + 4.83 Gbit/s, missing 29.82% 38.54%, 7.7 cores busy, 0.77 per Gbit/s
+vx2/r2/2: offered 10.54 + 10.54, delivered 5.01 + 4.81 Gbit/s, missing 52.53% 54.32%, 9.8 cores busy, 1.00 per Gbit/s
+vx2/r2/3: offered 18.39 + 18.32, delivered 4.25 + 4.25 Gbit/s, missing 76.90% 76.77%, 16.1 cores busy, 1.89 per Gbit/s
+-- UnQuic, sixteen workers (arms warm and uq are the same binary)
+uq/r1/0: offered 3.99 + 3.99, delivered 3.99 + 3.99 Gbit/s, missing 0.12% 0.09%, 8.9 cores busy, 1.12 per Gbit/s
+uq/r1/1: offered 8.00 + 8.00, delivered 7.99 + 7.98 Gbit/s, missing 0.08% 0.20%, 15.5 cores busy, 0.97 per Gbit/s
+uq/r1/2: offered 11.96 + 11.95, delivered 9.91 + 10.35 Gbit/s, missing 17.12% 13.41%, 22.3 cores busy, 1.10 per Gbit/s
+uq/r1/3: offered 20.94 + 20.85, delivered 10.01 + 10.24 Gbit/s, missing 52.20% 50.89%, 23.2 cores busy, 1.15 per Gbit/s
+uq/r2/0: offered 4.00 + 4.00, delivered 4.00 + 4.00 Gbit/s, missing 0.00% 0.00%, 9.1 cores busy, 1.14 per Gbit/s
+uq/r2/1: offered 7.99 + 7.99, delivered 7.98 + 7.95 Gbit/s, missing 0.20% 0.51%, 15.7 cores busy, 0.99 per Gbit/s
+uq/r2/2: offered 11.98 + 11.95, delivered 9.97 + 10.10 Gbit/s, missing 16.81% 15.42%, 21.9 cores busy, 1.09 per Gbit/s
+uq/r2/3: offered 20.95 + 20.87, delivered 9.96 + 10.24 Gbit/s, missing 52.48% 50.93%, 22.8 cores busy, 1.13 per Gbit/s
+warm/r1/0: offered 4.00 + 4.00, delivered 4.00 + 4.00 Gbit/s, missing 0.00% 0.00%, 8.8 cores busy, 1.10 per Gbit/s
+warm/r1/1: offered 7.99 + 7.99, delivered 7.96 + 7.95 Gbit/s, missing 0.36% 0.47%, 16.0 cores busy, 1.01 per Gbit/s
+warm/r1/2: offered 11.95 + 11.95, delivered 9.89 + 10.23 Gbit/s, missing 17.23% 14.47%, 22.3 cores busy, 1.11 per Gbit/s
+warm/r1/3: offered 20.91 + 20.84, delivered 10.19 + 10.05 Gbit/s, missing 51.29% 51.80%, 23.3 cores busy, 1.15 per Gbit/s
+warm/r2/0: offered 4.00 + 4.00, delivered 4.00 + 4.00 Gbit/s, missing 0.05% 0.01%, 8.6 cores busy, 1.08 per Gbit/s
+warm/r2/1: offered 8.00 + 7.99, delivered 7.98 + 7.98 Gbit/s, missing 0.18% 0.17%, 15.7 cores busy, 0.98 per Gbit/s
+warm/r2/2: offered 11.96 + 11.98, delivered 10.09 + 10.09 Gbit/s, missing 15.64% 15.72%, 21.8 cores busy, 1.08 per Gbit/s
+warm/r2/3: offered 20.95 + 20.92, delivered 10.01 + 10.26 Gbit/s, missing 52.23% 50.94%, 22.4 cores busy, 1.10 per Gbit/s
+
+== B. Same flows, 7.5 ms RTT and 1% loss; 1, 5.5, 6 and 6.5 Gbit/s requested each way
+-- kernel VXLAN
+vx/r1/0: offered 1.00 + 1.00, delivered 0.99 + 0.99 Gbit/s, missing 0.99% 1.15%, 2.9 cores busy, 1.47 per Gbit/s
+vx/r1/1: offered 5.49 + 5.49, delivered 4.85 + 4.97 Gbit/s, missing 11.67% 9.40%, 7.7 cores busy, 0.78 per Gbit/s
+vx/r1/2: offered 5.95 + 5.94, delivered 5.06 + 5.10 Gbit/s, missing 14.91% 14.12%, 8.4 cores busy, 0.83 per Gbit/s
+vx/r1/3: offered 6.09 + 6.04, delivered 5.57 + 5.46 Gbit/s, missing 8.56% 9.49%, 8.3 cores busy, 0.75 per Gbit/s
+vx/r2/0: offered 1.00 + 1.00, delivered 0.98 + 0.98 Gbit/s, missing 1.56% 1.64%, 2.8 cores busy, 1.42 per Gbit/s
+vx/r2/1: offered 5.49 + 5.49, delivered 5.06 + 5.09 Gbit/s, missing 7.96% 7.24%, 8.4 cores busy, 0.83 per Gbit/s
+vx/r2/2: offered 5.89 + 5.94, delivered 5.13 + 5.08 Gbit/s, missing 12.78% 14.43%, 8.3 cores busy, 0.81 per Gbit/s
+vx/r2/3: offered 6.19 + 6.05, delivered 5.70 + 5.48 Gbit/s, missing 7.96% 9.33%, 8.2 cores busy, 0.73 per Gbit/s
+vx2/r1/0: offered 1.00 + 1.00, delivered 0.99 + 0.99 Gbit/s, missing 1.02% 1.07%, 2.7 cores busy, 1.36 per Gbit/s
+vx2/r1/1: offered 5.50 + 5.50, delivered 4.87 + 4.82 Gbit/s, missing 11.37% 12.21%, 7.4 cores busy, 0.76 per Gbit/s
+vx2/r1/2: offered 5.95 + 5.94, delivered 5.02 + 5.14 Gbit/s, missing 15.65% 13.42%, 8.1 cores busy, 0.80 per Gbit/s
+vx2/r1/3: offered 6.01 + 6.07, delivered 5.47 + 5.52 Gbit/s, missing 9.05% 9.17%, 8.0 cores busy, 0.73 per Gbit/s
+vx2/r2/0: offered 1.00 + 1.00, delivered 0.99 + 0.99 Gbit/s, missing 1.16% 1.23%, 2.8 cores busy, 1.42 per Gbit/s
+vx2/r2/1: offered 5.49 + 5.49, delivered 4.97 + 5.06 Gbit/s, missing 9.55% 7.85%, 7.6 cores busy, 0.76 per Gbit/s
+vx2/r2/2: offered 5.97 + 5.95, delivered 4.67 + 5.12 Gbit/s, missing 21.82% 13.97%, 7.9 cores busy, 0.81 per Gbit/s
+vx2/r2/3: offered 6.14 + 6.12, delivered 5.62 + 5.61 Gbit/s, missing 8.49% 8.36%, 8.4 cores busy, 0.75 per Gbit/s
+-- UnQuic, sixteen workers, defaults (fs) and loss_threshold_permille = 100 (fslt)
+fs/r1/0: offered 1.00 + 1.00, delivered 1.00 + 1.00 Gbit/s, missing 0.25% 0.13%, 4.4 cores busy, 2.20 per Gbit/s
+fs/r1/1: offered 5.50 + 5.50, delivered 5.36 + 5.24 Gbit/s, missing 2.47% 4.77%, 15.6 cores busy, 1.47 per Gbit/s
+fs/r1/2: offered 6.00 + 6.00, delivered 5.83 + 5.81 Gbit/s, missing 2.79% 3.15%, 17.8 cores busy, 1.53 per Gbit/s
+fs/r1/3: offered 6.50 + 6.50, delivered 6.11 + 6.19 Gbit/s, missing 6.04% 4.64%, 19.3 cores busy, 1.57 per Gbit/s
+fs/r2/0: offered 1.00 + 1.00, delivered 1.00 + 1.00 Gbit/s, missing 0.06% 0.17%, 4.4 cores busy, 2.20 per Gbit/s
+fs/r2/1: offered 5.50 + 5.50, delivered 5.26 + 5.40 Gbit/s, missing 4.22% 1.76%, 16.2 cores busy, 1.52 per Gbit/s
+fs/r2/2: offered 6.00 + 6.00, delivered 5.77 + 5.85 Gbit/s, missing 3.75% 2.54%, 17.5 cores busy, 1.51 per Gbit/s
+fs/r2/3: offered 6.50 + 6.50, delivered 5.88 + 6.13 Gbit/s, missing 9.46% 5.65%, 18.9 cores busy, 1.57 per Gbit/s
+fs/r3/0: offered 1.00 + 1.00, delivered 1.00 + 1.00 Gbit/s, missing 0.09% 0.06%, 4.3 cores busy, 2.15 per Gbit/s
+fs/r3/1: offered 5.50 + 5.50, delivered 5.28 + 5.02 Gbit/s, missing 4.02% 8.75%, 16.4 cores busy, 1.59 per Gbit/s
+fs/r3/2: offered 5.98 + 5.98, delivered 5.57 + 5.73 Gbit/s, missing 6.90% 4.20%, 18.7 cores busy, 1.66 per Gbit/s
+fs/r3/3: offered 6.50 + 6.50, delivered 6.09 + 6.12 Gbit/s, missing 6.32% 5.83%, 19.2 cores busy, 1.57 per Gbit/s
+fslt/r1/0: offered 1.00 + 1.00, delivered 1.00 + 1.00 Gbit/s, missing 0.05% 0.07%, 4.3 cores busy, 2.15 per Gbit/s
+fslt/r1/1: offered 5.50 + 5.50, delivered 5.47 + 5.42 Gbit/s, missing 0.47% 1.42%, 15.8 cores busy, 1.45 per Gbit/s
+fslt/r1/2: offered 6.00 + 5.99, delivered 5.98 + 5.95 Gbit/s, missing 0.34% 0.73%, 17.7 cores busy, 1.48 per Gbit/s
+fslt/r1/3: offered 6.50 + 6.50, delivered 6.46 + 6.42 Gbit/s, missing 0.48% 1.19%, 19.5 cores busy, 1.51 per Gbit/s
+fslt/r2/0: offered 1.00 + 1.00, delivered 1.00 + 1.00 Gbit/s, missing 0.17% 0.11%, 5.3 cores busy, 2.66 per Gbit/s
+fslt/r2/1: offered 5.49 + 5.49, delivered 5.39 + 5.35 Gbit/s, missing 1.77% 2.64%, 16.3 cores busy, 1.52 per Gbit/s
+fslt/r2/2: offered 5.99 + 6.00, delivered 5.90 + 5.82 Gbit/s, missing 1.37% 2.92%, 17.9 cores busy, 1.53 per Gbit/s
+fslt/r2/3: offered 6.49 + 6.50, delivered 6.45 + 6.38 Gbit/s, missing 0.62% 1.84%, 19.4 cores busy, 1.51 per Gbit/s
+fslt/r3/0: offered 1.00 + 1.00, delivered 1.00 + 1.00 Gbit/s, missing 0.06% 0.05%, 4.4 cores busy, 2.20 per Gbit/s
+fslt/r3/1: offered 5.49 + 5.50, delivered 5.36 + 5.42 Gbit/s, missing 2.44% 1.51%, 17.1 cores busy, 1.59 per Gbit/s
+fslt/r3/2: offered 5.99 + 5.99, delivered 5.87 + 5.97 Gbit/s, missing 2.05% 0.45%, 17.5 cores busy, 1.48 per Gbit/s
+fslt/r3/3: offered 6.50 + 6.50, delivered 6.45 + 6.41 Gbit/s, missing 0.81% 1.41%, 19.8 cores busy, 1.54 per Gbit/s
+
+== C. Sixteen flows of bridged individual 1522-byte QinQ frames, 4.5 ms RTT and 0.1% loss; 0.5, 0.5, 2 and 5 Gbit/s requested each way
+-- kernel VXLAN, four generator processes a side on four CPUs
+vx/r1/0: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.10% 0.10%, 3.9 cores busy, 3.92 per Gbit/s
+vx/r1/1: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.10% 0.10%, 3.6 cores busy, 3.61 per Gbit/s
+vx/r1/2: offered 1.98 + 1.98, delivered 1.98 + 1.98 Gbit/s, missing 0.10% 0.10%, 8.9 cores busy, 2.25 per Gbit/s
+vx/r1/3: offered 3.54 + 3.58, delivered 3.01 + 3.04 Gbit/s, missing 14.98% 15.21%, 10.9 cores busy, 1.80 per Gbit/s
+vx/r2/0: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.09% 0.10%, 3.6 cores busy, 3.61 per Gbit/s
+vx/r2/1: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.10% 0.10%, 4.6 cores busy, 4.62 per Gbit/s
+vx/r2/2: offered 1.99 + 1.98, delivered 1.98 + 1.98 Gbit/s, missing 0.10% 0.10%, 8.8 cores busy, 2.22 per Gbit/s
+vx/r2/3: offered 3.55 + 3.58, delivered 2.96 + 3.00 Gbit/s, missing 16.74% 15.99%, 10.8 cores busy, 1.81 per Gbit/s
+vx2/r1/0: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.09% 0.10%, 3.5 cores busy, 3.51 per Gbit/s
+vx2/r1/1: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.11% 0.10%, 3.5 cores busy, 3.51 per Gbit/s
+vx2/r1/2: offered 1.99 + 1.98, delivered 1.98 + 1.98 Gbit/s, missing 0.10% 0.10%, 8.7 cores busy, 2.20 per Gbit/s
+vx2/r1/3: offered 3.59 + 3.60, delivered 2.96 + 2.98 Gbit/s, missing 17.69% 17.17%, 10.7 cores busy, 1.80 per Gbit/s
+vx2/r2/0: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.10% 0.10%, 3.6 cores busy, 3.61 per Gbit/s
+vx2/r2/1: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.10% 0.10%, 3.5 cores busy, 3.51 per Gbit/s
+vx2/r2/2: offered 1.99 + 1.98, delivered 1.98 + 1.98 Gbit/s, missing 0.10% 0.10%, 8.8 cores busy, 2.22 per Gbit/s
+vx2/r2/3: offered 3.59 + 3.60, delivered 3.07 + 3.14 Gbit/s, missing 14.31% 12.88%, 11.0 cores busy, 1.77 per Gbit/s
+-- UnQuic, four workers (arms a and b are the same binary)
+a/r1/0: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.00% 0.01%, 6.8 cores busy, 6.82 per Gbit/s
+a/r1/1: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.01% 0.01%, 8.2 cores busy, 8.26 per Gbit/s
+a/r1/2: offered 1.99 + 1.99, delivered 1.98 + 1.96 Gbit/s, missing 0.30% 1.71%, 11.8 cores busy, 2.99 per Gbit/s
+a/r1/3: offered 4.97 + 4.98, delivered 2.47 + 2.52 Gbit/s, missing 50.25% 49.40%, 14.3 cores busy, 2.86 per Gbit/s
+a/r2/0: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.00% 0.01%, 6.6 cores busy, 6.62 per Gbit/s
+a/r2/1: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.00% 0.00%, 6.9 cores busy, 6.91 per Gbit/s
+a/r2/2: offered 1.99 + 1.99, delivered 1.95 + 1.97 Gbit/s, missing 1.59% 0.85%, 11.9 cores busy, 3.03 per Gbit/s
+a/r2/3: offered 4.97 + 4.98, delivered 2.61 + 2.51 Gbit/s, missing 47.51% 49.59%, 14.6 cores busy, 2.85 per Gbit/s
+b/r1/0: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.01% 0.00%, 6.7 cores busy, 6.72 per Gbit/s
+b/r1/1: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.00% 0.02%, 7.7 cores busy, 7.74 per Gbit/s
+b/r1/2: offered 1.99 + 1.99, delivered 1.96 + 1.97 Gbit/s, missing 1.65% 0.84%, 11.9 cores busy, 3.03 per Gbit/s
+b/r1/3: offered 4.97 + 4.98, delivered 2.30 + 2.70 Gbit/s, missing 53.80% 45.72%, 14.2 cores busy, 2.84 per Gbit/s
+b/r2/0: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.01% 0.01%, 7.6 cores busy, 7.64 per Gbit/s
+b/r2/1: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.02% 0.04%, 7.3 cores busy, 7.34 per Gbit/s
+b/r2/2: offered 1.99 + 1.99, delivered 1.98 + 1.97 Gbit/s, missing 0.68% 1.24%, 11.8 cores busy, 2.99 per Gbit/s
+b/r2/3: offered 4.97 + 4.98, delivered 2.54 + 2.18 Gbit/s, missing 48.83% 56.21%, 14.4 cores busy, 3.05 per Gbit/s
+-- UnQuic, eight workers (arms warm and uq are the same binary)
+uq/r1/0: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.00% 0.00%, 7.9 cores busy, 7.94 per Gbit/s
+uq/r1/1: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.00% 0.02%, 8.7 cores busy, 8.76 per Gbit/s
+uq/r1/2: offered 1.99 + 1.98, delivered 1.98 + 1.98 Gbit/s, missing 0.59% 0.13%, 18.1 cores busy, 4.57 per Gbit/s
+uq/r1/3: offered 4.97 + 4.93, delivered 4.43 + 4.32 Gbit/s, missing 11.00% 12.43%, 22.2 cores busy, 2.54 per Gbit/s
+uq/r2/0: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.00% 0.00%, 8.1 cores busy, 8.12 per Gbit/s
+uq/r2/1: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.00% 0.00%, 8.2 cores busy, 8.22 per Gbit/s
+uq/r2/2: offered 1.99 + 1.98, delivered 1.97 + 1.96 Gbit/s, missing 1.08% 0.96%, 17.5 cores busy, 4.46 per Gbit/s
+uq/r2/3: offered 4.98 + 4.92, delivered 4.37 + 3.97 Gbit/s, missing 12.13% 19.34%, 22.1 cores busy, 2.65 per Gbit/s
+warm/r1/0: offered 0.49 + 0.49, delivered 0.49 + 0.49 Gbit/s, missing 0.52% 0.13%, 9.2 cores busy, 9.35 per Gbit/s
+warm/r1/1: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.00% 0.00%, 8.4 cores busy, 8.44 per Gbit/s
+warm/r1/2: offered 1.98 + 1.98, delivered 1.97 + 1.98 Gbit/s, missing 0.43% 0.20%, 17.1 cores busy, 4.33 per Gbit/s
+warm/r1/3: offered 4.98 + 4.95, delivered 4.12 + 4.51 Gbit/s, missing 17.22% 8.90%, 22.3 cores busy, 2.58 per Gbit/s
+warm/r2/0: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.00% 0.00%, 7.8 cores busy, 7.82 per Gbit/s
+warm/r2/1: offered 0.50 + 0.50, delivered 0.50 + 0.50 Gbit/s, missing 0.00% 0.00%, 8.5 cores busy, 8.53 per Gbit/s
+warm/r2/2: offered 1.99 + 1.98, delivered 1.97 + 1.96 Gbit/s, missing 1.01% 0.94%, 16.3 cores busy, 4.14 per Gbit/s
+warm/r2/3: offered 4.97 + 4.94, delivered 3.93 + 4.62 Gbit/s, missing 21.01% 6.48%, 22.5 cores busy, 2.63 per Gbit/s

@@ -66,7 +66,15 @@ Still open, in the order they now matter:
 
 1. The acceptance profile of design section 14.2 has to be frozen by the
    user: hardware, core budget, flow count and frame mix. The runs above
-   are one profile on one host.
+   are one profile on one host. A first comparison of the kind that
+   section asks for now exists: on the same routed test path a kernel
+   VXLAN tunnel stops near 5 Gbit/s each way where sixteen workers carry
+   10, it loses 7–22% of its frames on the lossy path at 5.5–6 Gbit/s
+   where the daemon loses 0.3–9%, and it costs about half the CPU per
+   bit below its ceiling
+   ([BENCH.md](BENCH.md#against-a-kernel-vxlan-tunnel-on-the-same-test-bed-november-19)).
+   L2TPv3, WireGuard and SoftEther, and the margin that counts as large,
+   are still to do.
 2. The 5 Gbit/s gate over a lossy 4.5–7.5 ms path. In a first look
    sixteen workers deliver 5.0–5.3 Gbit/s each way at 5.5 offered with 1%
    loss, with no worker above 57% of a core

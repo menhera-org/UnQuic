@@ -2773,6 +2773,74 @@ they lost about 0.5%. Four workers are full from 2 Gbit/s offered each way, wher
 sixteen-flow rows now carry 96–98% of the offer. The p99 delay at
 overload stays under 37 ms, bounded by the frame lifetime.
 
+## Against a kernel VXLAN tunnel on the same test bed (November 19)
+
+Design section 14.2 asks for comparisons with kernel tunnels, and none
+had been run. `KERNEL_TUNNEL=vxlan` now makes the harness put one kernel
+VXLAN tunnel over IPv6 where the daemons were, named and bridged like
+their TAP, on the same routed path with the same load tool. L2TPv3 and
+WireGuard were not available in the test container, so VXLAN stands in
+for a kernel L2 tunnel. It gets a 1600-byte underlay and
+so never fragments, which a 1500-byte access line would not allow it.
+The daemon keeps its 1500-byte underlay. `sweep_report` reads daemon
+counters, so both sides are read by `benches/tunnel_summary.sh`, which
+counts frames in the load tool's output and the busy CPU of the whole
+system, load generators and soft interrupts included. Its rates run a
+little above the report tool's, which measures a steady window. Two
+rounds of two arms each, 20 s a point
+([every point](benches/kernel-tunnel-comparison.txt)).
+
+Clean routed path, thirty-two QinQ flows of 1522-byte frames as
+44-segment GSO, sixteen daemon workers:
+
+| Requested each way | VXLAN delivered each way | Missing | Cores busy | UnQuic delivered | Missing | Cores busy |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4 Gbit/s | 3.47–3.97 | 0.6–13% | 5.2–6.0 | 3.99–4.00 | 0.0–0.1% | 8.6–9.1 |
+| 8 | 4.80–5.44 of 7.1–7.9 offered | 23–39% | 7.3–8.6 | 7.95–7.99 | 0.1–0.5% | 15.5–16.0 |
+| 12 | 4.81–5.52 of 10.5 | 48–54% | 9.5–9.8 | 9.89–10.35 | 13–17% | 21.8–22.3 |
+| 21 | 4.17–4.38 of 18.3 | 76–77% | 16.0–16.5 | 9.96–10.26 | 51–52% | 22.4–23.3 |
+
+The same flows over 7.5 ms with 1% loss:
+
+| Requested each way | VXLAN delivered | Missing | Cores busy | UnQuic, defaults | Missing | Cores busy | UnQuic, loss threshold 100 | Missing |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 Gbit/s | 0.98–0.99 | 1.0–1.6% | 2.7–2.9 | 1.00 | 0.06–0.25% | 4.3–4.4 | 1.00 | 0.05–0.17% |
+| 5.5 | 4.82–5.09 | 7.2–12.2% | 7.4–8.4 | 5.02–5.40 | 1.8–8.8% | 15.6–16.4 | 5.35–5.47 | 0.5–2.6% |
+| 6.0 | 4.67–5.14 | 12.8–21.8% | 7.9–8.4 | 5.57–5.85 | 2.5–6.9% | 17.5–18.7 | 5.82–5.98 | 0.3–2.9% |
+| 6.5 | 5.46–5.70 of 6.0–6.2 offered | 8.0–9.5% | 8.0–8.4 | 5.88–6.19 | 4.6–9.5% | 18.9–19.3 | 6.38–6.46 | 0.5–1.8% |
+
+Sixteen flows of bridged individual frames over 4.5 ms with 0.1% loss,
+the decision workload:
+
+| Requested each way | VXLAN delivered | Missing | Cores busy | UnQuic, four workers | Missing | Cores busy | UnQuic, eight workers | Missing | Cores busy |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.5 Gbit/s | 0.50 | 0.09–0.11% | 3.5–4.6 | 0.50 | 0.00–0.04% | 6.9–8.2 | 0.50 | 0.00–0.02% | 7.8–8.7 |
+| 2 | 1.98 | 0.10% | 8.7–8.9 | 1.95–1.98 | 0.3–1.7% | 11.8–11.9 | 1.96–1.98 | 0.1–1.1% | 16.3–18.1 |
+| 5 | 2.96–3.14 of 3.5–3.6 offered | 13–18% | 10.7–11.0 | 2.18–2.70 | 46–56% | 14.2–14.6 | 3.93–4.62 | 6.5–21% | 22.1–22.5 |
+
+On this test bed the kernel tunnel stops near 5 Gbit/s each way with GSO
+traffic, and the daemon with sixteen workers carries 10. Below that
+ceiling the kernel tunnel is the cheaper one: 0.7–0.8 cores per Gbit/s at
+4 Gbit/s each way against 1.1, and about half the daemon's CPU on the
+lossy path. What the daemon buys with it shows where the path loses or
+the load is high. At 1 Gbit/s over 1% loss it delivers all but
+0.05–0.25% of the frames, where the tunnel loses the path's 1% and more.
+At 5.5–6 Gbit/s the tunnel is at its ceiling and loses 7–22%, and the
+daemon loses 2–9% with defaults and 0.3–2.9% with the loss threshold
+raised.
+
+With individual frames the two are close for the same cores. The kernel
+tunnel carries 3.0 Gbit/s each way on about 11 busy cores, four daemon
+workers 2.2–2.7 on 14, and eight workers 3.9–4.6 on 22. So the 2–2.7
+Gbit/s that four workers reach on the decision workload is within a
+quarter of what a bare kernel tunnel does on this bed, which is one more
+sign that the bed, and not only the daemon, sets that number.
+
+This is one competitor on one host, with an underlay it would not get on
+the target line. The design's list (L2TPv3 with fragmentation,
+WireGuard carrying L2, SoftEther) and its sixty-second, five-run
+procedure remain to be done where those modules can load.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames

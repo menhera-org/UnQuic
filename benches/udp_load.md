@@ -168,6 +168,18 @@ With `OUTER_ROUTED=1`, `COMPETING_TCP=1` runs one netcat TCP stream from the
 left outer namespace to the right one for each load point, sharing that
 bottleneck with the tunnel; `competing-bytes` holds the bytes received in the
 point's seconds.
+With `OUTER_ROUTED=1` and `UDP_LOAD`, `KERNEL_TUNNEL=vxlan` runs a baseline:
+one kernel VXLAN tunnel over the routed path takes the daemons' place, named,
+addressed and bridged like their TAP. No daemon starts and the DAEMON argument
+is unused. The router links get a 1600-byte MTU, so the tunnel carries a
+1522-byte frame whole and never fragments, which favours it over a 1500-byte
+access line. The tunnel transmits inside the load generators' system calls,
+so give them CPUs with `GENERATOR_LEFT_CPUS` and its three siblings.
+`sweep_report` needs daemon counters and cannot read such a run;
+`sh benches/tunnel_summary.sh POINT...` prints offered and delivered rates and
+missing frames from the load tool's per-flow counts, and the busy CPU of the
+whole system between a point's `before` and `sent` snapshots, for tunnel and
+daemon runs alike.
 Flow j runs from port 51000 + j to 52000 + j in both directions by default.
 tun's symmetric flow hash then gives both directions of flow j the same hash,
 so tun reads a flow on the queue the daemon last wrote its other direction on.

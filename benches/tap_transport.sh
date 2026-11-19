@@ -44,6 +44,14 @@ fi
 case "${GENERATOR_PROCESSES:-1}" in 1|2|4|8) ;; *) echo "GENERATOR_PROCESSES must be 1, 2, 4 or 8" >&2; exit 2;; esac
 [ "${GENERATOR_PROCESSES:-1}" = 1 ] || [ -n "${UDP_LOAD:-}" ] || { echo "GENERATOR_PROCESSES requires UDP_LOAD" >&2; exit 2; }
 [ "$(($3 % ${GENERATOR_PROCESSES:-1}))" = 0 ] || { echo "FLOWS must be a multiple of GENERATOR_PROCESSES" >&2; exit 2; }
+# KERNEL_TUNNEL=vxlan is a baseline: one kernel VXLAN tunnel over the routed
+# path takes the daemons' place. DAEMON is then unused, and the report tool
+# cannot read the result; the load tool's JSON and the CPU snapshots can.
+case "${KERNEL_TUNNEL:-}" in
+    '') ;;
+    vxlan) [ "${OUTER_ROUTED:-0}" = 1 ] && [ -n "${UDP_LOAD:-}" ] || { echo "KERNEL_TUNNEL needs OUTER_ROUTED=1 and UDP_LOAD" >&2; exit 2; };;
+    *) echo "KERNEL_TUNNEL must be vxlan" >&2; exit 2;;
+esac
 mkdir "$5"
 # A private mount namespace keeps ip-netns bind mounts out of the caller.
 exec unshare -m -n --propagation private sh -s -- "$@" <<'BENCH'
@@ -169,6 +177,9 @@ ip link set lo up
 # Routed veths carry the largest configured outer packet; loopback already does.
 outer_mtu=$((${OUTER_PAYLOAD_LIMIT:-1232} + 48))
 [ "$outer_mtu" -ge 1500 ] || outer_mtu=1500
+# The baseline gets an underlay that carries a whole encapsulated frame, so it
+# never fragments; that favours it over a 1500-byte access line.
+[ -z "${KERNEL_TUNNEL:-}" ] || outer_mtu=1600
 if [ "${OUTER_ROUTED:-0}" = 1 ]; then
     for side in left right; do
         if [ "$side" = left ]; then n=1; peer=2; else n=2; peer=1; fi
@@ -240,10 +251,27 @@ mac = "02:00:00:00:$mac_prefix:$mac"
 queue_count = $workers
 CONFIG
 done
-nsenter --net="$left_netns" taskset -c "${DAEMON_LEFT_CPUS:-0-$((workers - 1))}" "$daemon" run "$out/left.toml" > "$out/left.log" 2>&1 &
-left=$!
-nsenter --net="$right_netns" taskset -c "${DAEMON_RIGHT_CPUS:-$workers-$((workers * 2 - 1))}" "$daemon" run "$out/right.toml" > "$out/right.log" 2>&1 &
-right=$!
+if [ -n "${KERNEL_TUNNEL:-}" ]; then
+    for side in left right; do
+        if [ "$side" = left ]; then local=1; remote=2; else local=2; remote=1; fi
+        mac_prefix=00
+        [ "${INNER_BRIDGE:-0}" = 0 ] || mac_prefix=01
+        # Named and addressed like the daemon's TAP, so the rest of the setup is shared.
+        outer "$side" ip link add "uq-$side" address "02:00:00:00:$mac_prefix:0$local" mtu 1508 type vxlan \
+            id 77 local "fd77:ff:$local::1" remote "fd77:ff:$remote::1" dstport 4789
+        echo 'TAPs ready' > "$out/$side.log"
+    done
+    # Stand-ins for the daemons' process IDs; they ignore the snapshot signal.
+    sh -c 'trap "" USR1; exec sleep 1000000' &
+    left=$!
+    sh -c 'trap "" USR1; exec sleep 1000000' &
+    right=$!
+else
+    nsenter --net="$left_netns" taskset -c "${DAEMON_LEFT_CPUS:-0-$((workers - 1))}" "$daemon" run "$out/left.toml" > "$out/left.log" 2>&1 &
+    left=$!
+    nsenter --net="$right_netns" taskset -c "${DAEMON_RIGHT_CPUS:-$workers-$((workers * 2 - 1))}" "$daemon" run "$out/right.toml" > "$out/right.log" 2>&1 &
+    right=$!
+fi
 for side in left right; do
     attempts=0
     # Wait for the daemon's line, not only the link: the name exists after the
@@ -321,6 +349,8 @@ snapshot() {
     right_count=$(grep -c '^unquic: worker [0-9][0-9]* Snapshot {.* }$' "$base/right.log" || :)
     left_count=$((left_count + workers))
     right_count=$((right_count + workers))
+    # A kernel tunnel prints no counters to wait for.
+    [ -z "${KERNEL_TUNNEL:-}" ] || { left_count=0; right_count=0; }
     kill -USR1 "$left" "$right"
     if [ -n "${UDP_LOAD:-}" ] && [ "$1" != after ]; then
         kill -USR1 $servers
