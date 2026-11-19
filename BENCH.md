@@ -2714,8 +2714,31 @@ pre-recovery build's 5.87 / 5.74 with eight workers. Eight workers
 unlimited deliver what they did L→R and a quarter more R→L, their busiest
 worker at 95–99% of a core. At 40M the eight-worker 64-byte row still
 loses 13–25% of its frames. The two directions have changed places there
-since November 12, which points at the worker tun's hash gives the load
-to more than at the frame cost.
+since November 12.
+
+A profile of that row ([worker lines](benches/small-frames-nov19-profile.txt))
+shows where its load sits. Untagged UDP stays on the lane of the worker
+that reads it, and tun's hash gives the sixteen flows to the eight queues
+unevenly: two workers of each daemon are full, one of them with nearly
+two thirds of its time in transmit work, while three transmit nothing.
+Placing these flows through the balanced flow table instead, as QinQ
+flows are placed, was measured and rejected
+([eight workers](benches/small-frames-balanced-rejected-w8.json),
+[sixteen](benches/small-frames-balanced-rejected-w16.json), two rounds
+against `1f28d42` and its copy):
+
+| Workers, request | Reader's lane, M frames/s L→R / R→L | Balanced |
+| --- | --- | --- |
+| 8, 40M | 2.61–2.73 / 2.73–2.95 | 2.56–2.67 / 2.39–2.67 |
+| 8, unlimited | 3.24–3.52 / 3.98–4.15 | 2.61–4.09 / 2.27–3.35 |
+| 16, 40M | 3.35 / 3.58, missing 5.9–6.9% / 0.0–0.1% | 3.52–3.58 / 3.58, missing 0.2–0.8% / 0.2–0.5% |
+| 16, unlimited | 8.47–8.75 / 6.25–6.48 | 5.51–6.19 / 6.31–7.61 |
+
+Balanced lanes carry the offer only where there is CPU to spare, at
+sixteen workers and 40M, and they cost about 10% more CPU there. Everywhere
+else the handoff to another worker costs more than the balance returns.
+The eight-worker 40M row is near its capacity as it is: 7.3 M frames/s
+at 1.7 cores per million is 12.4 of the two daemons' sixteen cores.
 
 ## The decision workload on the current build (November 19)
 

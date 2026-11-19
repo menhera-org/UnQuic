@@ -108,8 +108,11 @@ Still open, in the order they now matter:
    ([BENCH.md](BENCH.md#small-frame-rows-on-the-current-build-november-19)).
    Still open there: eight workers lose 13–25% of 64-byte frames at an
    offer their total CPU could carry, with some workers at 96–97% of a
-   core and the daemon at 60–65% of its eight. Which work piles up on
-   those workers has not been profiled on this build.
+   core and the daemon at 60–65% of its eight. Untagged UDP stays on its
+   reader's lane, and tun's hash fills two workers while three transmit
+   nothing; spreading those flows through the balanced table was measured
+   and rejected, because the handoff costs more than the balance returns
+   wherever CPU is short.
 
 ## November 15 checkpoint
 
