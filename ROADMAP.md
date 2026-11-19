@@ -97,8 +97,19 @@ Still open, in the order they now matter:
    ([BENCH.md](BENCH.md#four-workers-on-the-lossy-path-and-what-the-routed-test-bed-costs-november-19)).
 3. The per-frame budget for a four-core box (design section 13.1), about
    5,200 cycles per frame event against 2,200–3,150.
-4. The small-frame rows and the overload plateau, not remeasured since
-   November 12.
+4. The small-frame rows and the overload plateau were remeasured on
+   November 19. On the decision workload every 5 Gbit/s total is above
+   its 2 Gbit/s total, and the rows deliver 16–84% more than on
+   November 12
+   ([BENCH.md](BENCH.md#the-decision-workload-on-the-current-build-november-19)).
+   Small frames cost 1.6–1.9 cores per million frames/s where they cost
+   1.85–2.24, and sixteen workers deliver 7.5–8.5 / 5.6–6.4 M 64-byte
+   frames/s unlimited
+   ([BENCH.md](BENCH.md#small-frame-rows-on-the-current-build-november-19)).
+   Still open there: eight workers lose 13–25% of 64-byte frames at an
+   offer their total CPU could carry, with some workers at 96–97% of a
+   core and the daemon at 60–65% of its eight. Which work piles up on
+   those workers has not been profiled on this build.
 
 ## November 15 checkpoint
 
