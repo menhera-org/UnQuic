@@ -896,6 +896,9 @@ struct Session {
     rx_totals: Vec<Snapshot>,
     tx_totals: Vec<Snapshot>,
     ack_inflight: u64,
+    // Outer bytes each receive lane took in since its last ACK was collected;
+    // they earn the group's control allowance (design section 9).
+    ack_received: Vec<u64>,
     rx_dirty: u64,
     tx_dirty: u64,
     // Present only with daemon.stripe_flows.
@@ -1430,6 +1433,7 @@ impl Worker {
                 rx_totals: vec![Snapshot::default(); LANES],
                 tx_totals: vec![Snapshot::default(); config.peers[peer].tx_lanes],
                 ack_inflight: 0,
+                ack_received: vec![0; LANES],
                 rx_dirty: 0,
                 tx_dirty: 0,
                 stripes: config
@@ -1821,6 +1825,7 @@ impl Worker {
         };
         let lane = lane.id();
         local.rx_totals[slot] = Snapshot::default();
+        local.ack_received[slot] = 0;
         local.rx_dirty &= !(1_u64 << slot);
         let index = (session * self.shared.workers() + self.id) * LANES + slot;
         self.shared.receive_counters[index].replace(
@@ -2803,6 +2808,7 @@ impl Worker {
         local.rx_totals[slot].rx_outer_bytes = local.rx_totals[slot]
             .rx_outer_bytes
             .wrapping_add((length + 48) as u64);
+        local.ack_received[slot] = local.ack_received[slot].saturating_add((length + 48) as u64);
         local.rx_dirty |= 1_u64 << slot;
         let lane = local.rx[slot].as_mut().ok_or(io::ErrorKind::InvalidData)?;
         let mut admission = lane.admit(&datagram, now);

@@ -16,6 +16,9 @@ pub(crate) struct Feedback {
     created: Duration,
     sent: Option<Duration>,
     due: Duration,
+    // Outer bytes the lane received since its previous ACK, until worker 0
+    // credits them to the group's control allowance.
+    received: u64,
     ranges: [AckRange; MAX_ACK_RANGES],
 }
 
@@ -32,6 +35,7 @@ impl Feedback {
             created: Duration::ZERO,
             sent: None,
             due: Duration::ZERO,
+            received: 0,
             ranges: [AckRange { start: 0, end: 0 }; MAX_ACK_RANGES],
         }
     }
@@ -112,9 +116,25 @@ impl Worker {
         });
     }
 
+    /// Worker 0 queues an ACK for sending and credits its path group's
+    /// control allowance with the traffic the ACK's lane received.
+    fn queue_ack(&mut self, mut feedback: Box<Feedback>) {
+        let received = std::mem::take(&mut feedback.received);
+        if let Some(budget) = self
+            .shared
+            .config
+            .peer_for_session(feedback.session)
+            .and_then(|peer| self.shared.config.path_group_for_peer(peer))
+            .and_then(|group| self.control_budgets.get_mut(group))
+        {
+            budget.earn(received);
+        }
+        self.pending_control.push_back(Pending::Ack(feedback));
+    }
+
     pub(super) fn receive_feedback(&mut self, feedback: Box<Feedback>) -> io::Result<()> {
         if feedback.count != 0 && self.id == 0 {
-            self.pending_control.push_back(Pending::Ack(feedback));
+            self.queue_ack(feedback);
         } else if feedback.count == 0 && feedback.origin == self.id {
             if self.matches(feedback.session, feedback.tag) {
                 let local = &mut self.sessions[feedback.session];
@@ -245,8 +265,9 @@ impl Worker {
             feedback.sent = None;
             feedback.due = now;
             local.ack_inflight |= 1 << slot;
+            feedback.received = std::mem::take(&mut local.ack_received[slot]);
             if self.id == 0 {
-                self.pending_control.push_back(Pending::Ack(feedback));
+                self.queue_ack(feedback);
             } else if let Err(Event::Feedback(_)) = self.push(0, Event::Feedback(feedback)) {
                 return Err(io::Error::other("reserved feedback queue slot disappeared"));
             }
@@ -744,6 +765,61 @@ mod tests {
         assert!(worker.pending_control.is_empty());
         assert_eq!(worker.feedback_free.len(), BUFFERS);
         assert_eq!(worker.control_replies, 0);
+    }
+
+    #[test]
+    #[ignore = "kernel descriptor test; run in a disposable container"]
+    fn an_ack_of_received_traffic_does_not_wait_for_the_fixed_rate() {
+        let (mut worker, _) = receive_worker();
+        worker
+            .command(1, worker.sessions[0].installed.unwrap(), 0)
+            .unwrap();
+        let rx = socket(&mut worker);
+        let now = Duration::from_millis(10);
+        let reply = Record::ProbeReply {
+            lane: 7,
+            packet_number: 1,
+            payload_len: 52,
+        };
+        let mut bytes = [0; BASE_UDP_PAYLOAD];
+        // Sixteen replies fill the fixed-rate burst.
+        for _ in 0..16 {
+            assert!(worker.send_record(1, reply, now).unwrap().is_some());
+            rx.recv(&mut bytes).unwrap();
+        }
+        let due = worker.control_budgets[0].deadline().unwrap();
+        assert!(due > now);
+        let length = receive_bytes(1, &[receive_piece(1, 0, &[0; 60])], &mut bytes);
+        assert_eq!(
+            worker.sessions[0].rx[0]
+                .as_mut()
+                .unwrap()
+                .admit(&Datagram::decode(&bytes[..length]).unwrap(), now - RETRY),
+            Admission::Fresh
+        );
+        // Since its last ACK the lane took in thirty-two times the largest
+        // control datagram, which pays for one of any size: its ACK goes at
+        // once although the burst is full.
+        worker.sessions[0].ack_received[0] = 1280 * 32;
+        worker.collect_acks(now).unwrap();
+        assert_eq!(worker.sessions[0].ack_received[0], 0);
+        worker.flush_control(now).unwrap();
+        let length = rx.recv(&mut bytes).unwrap().0;
+        assert!(matches!(
+            Datagram::decode(&bytes[..length]).unwrap().records().next(),
+            Some(Record::Ack { .. })
+        ));
+        assert!(worker.pending_control.is_empty());
+        // What is left pays for no datagram of any size, and the burst is
+        // still full: a reply waits.
+        assert_eq!(worker.control_budgets[0].deadline(), Some(due));
+        worker.queue_reply(1, 1, 7, 1, 52, now);
+        worker.flush_control(now).unwrap();
+        assert_eq!(worker.pending_control.len(), 1);
+        assert_eq!(
+            rx.recv(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

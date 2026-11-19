@@ -25,12 +25,24 @@ pub struct Limits {
 
 const RATE: u64 = 4 * 1024 * 1024;
 const BURST: usize = 16;
+/// Largest control datagram, in outer bytes.
+const MAX_CONTROL: usize = 1280;
+/// Received outer bytes that earn one byte of control beyond RATE.
+const SHARE: u64 = 32;
+/// Most earned allowance kept, in received bytes: one burst of the largest datagrams.
+const EARNED: u64 = (BURST * MAX_CONTROL) as u64 * SHARE;
 
 /// A single path group's successful control transmissions, owned by worker zero.
+///
+/// The ceiling is RATE plus a thirty-second of the outer bytes the group
+/// received (design section 9): a fixed rate alone cannot carry the ACKs of
+/// tens of Gbit/s.
 pub(crate) struct Control {
     finishes: [Duration; BURST],
     head: usize,
     len: usize,
+    // Received outer bytes not yet spent on control, capped at EARNED.
+    earned: u64,
 }
 
 impl Control {
@@ -39,12 +51,21 @@ impl Control {
             finishes: [Duration::ZERO; BURST],
             head: 0,
             len: 0,
+            earned: 0,
         }
     }
 
-    /// Earliest slot release when the literal sixteen-packet burst is full.
+    /// Credits `received` outer bytes of traffic the group is acknowledging.
+    /// An idle group keeps at most one burst of what it earned.
+    pub fn earn(&mut self, received: u64) {
+        self.earned = self.earned.saturating_add(received).min(EARNED);
+    }
+
+    /// Earliest slot release when the literal sixteen-packet burst is full and
+    /// received traffic has not paid for another datagram of any size.
     pub fn deadline(&self) -> Option<Duration> {
-        (self.len == BURST).then(|| self.finishes[self.head])
+        (self.len == BURST && self.earned < MAX_CONTROL as u64 * SHARE)
+            .then(|| self.finishes[self.head])
     }
 
     /// Runs one nonblocking send if budget permits; failures consume no service.
@@ -55,8 +76,16 @@ impl Control {
         now: Duration,
         send: impl FnOnce() -> io::Result<Duration>,
     ) -> io::Result<Duration> {
-        if !(100..=1280).contains(&outer_bytes) {
+        if !(100..=MAX_CONTROL).contains(&outer_bytes) {
             return Err(io::ErrorKind::InvalidInput.into());
+        }
+        // Received traffic pays first, which leaves the fixed rate to
+        // handshakes, replies and ACKs that acknowledge little.
+        let cost = outer_bytes as u64 * SHARE;
+        if self.earned >= cost {
+            let started = send()?;
+            self.earned -= cost;
+            return Ok(started);
         }
         while self.len != 0 && self.finishes[self.head] <= now {
             self.head = (self.head + 1) % BURST;
@@ -189,6 +218,56 @@ mod tests {
         assert_eq!(
             control
                 .send(1280, Duration::ZERO, || panic!("overflowing send"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn received_traffic_pays_for_control_beyond_the_fixed_rate() {
+        let mut control = Control::new();
+        let now = Duration::from_secs(1);
+        for _ in 0..BURST {
+            control.send(1280, now, || Ok(now)).unwrap();
+        }
+        let due = control.deadline().unwrap();
+        // One byte short of a 200-byte datagram's price pays for nothing.
+        control.earn(200 * SHARE - 1);
+        assert_eq!(
+            control
+                .send(200, now, || panic!("unpaid send"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        control.earn(1);
+        // A failed send keeps what was earned; a successful one spends its price
+        // and leaves the fixed-rate burst as it was.
+        assert_eq!(
+            control
+                .send(200, now, || Err::<Duration, _>(io::ErrorKind::Other.into()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(control.send(200, now, || Ok(now)).unwrap(), now);
+        assert_eq!((control.earned, control.len), (0, BURST));
+        assert_eq!(control.deadline(), Some(due));
+        // While a datagram of any size is paid for, nothing waits for the burst.
+        control.earn(1280 * SHARE);
+        assert_eq!(control.deadline(), None);
+        // An idle group keeps one burst of the largest datagrams, no more.
+        control.earn(u64::MAX);
+        assert_eq!(control.earned, EARNED);
+        for _ in 0..BURST {
+            control.send(1280, now, || Ok(now)).unwrap();
+        }
+        assert_eq!(control.earned, 0);
+        assert_eq!(control.deadline(), Some(due));
+        assert_eq!(
+            control
+                .send(100, now, || panic!("unpaid send"))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
