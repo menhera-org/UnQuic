@@ -1,0 +1,51 @@
+Profile build of 34aced8 (features bin,uuid-compat,profile) on the full-size efficiency point: eight workers,
+sixteen QinQ flows of 1522-byte frames as 44-segment GSO at 4 Gbit/s each way on loopback, two 20 s points.
+Phase shares are of busy cycles over the whole run; frame events are tap_gso_frames + tap_uso_frames.
+prof     r1 p0  3.95 +  3.95 =  7.91 G | off  4.00  4.00 | CPU  165%  162% busiest  26  25 | miss  0.0%  0.0% | 
+prof     r1 p1  3.95 +  3.96 =  7.91 G | off  4.00  4.00 | CPU  163%  162% busiest  25  25 | miss  0.0%  0.0% | 
+== left
+ 20.97% service_sender
+ 17.85% flush_frames
+ 16.52% flush_taps
+ 12.00% drain_packets
+  9.35% read_socket
+  6.55% read_tap
+  4.37% drain_tap_inputs
+  2.88% poll
+  2.81% flush_notifications
+  2.02% flush_control
+  1.56% reactor_drain
+  1.48% drain_queues
+  0.86% collect_acks
+  0.62% arm
+  0.16% flush_sender_messages
+workers 8, busy 16.1% of wall, busy cycles 1.161e+11
+sendmmsg cycles/calls/datagrams [23020732468, 584074, 15431201]
+tap_gso_frames 13582272
+tap_gso_reads 308688
+tap_read_calls 140992
+tap_uso_frames 13583632
+tap_write_calls 686622
+== right
+ 20.56% service_sender
+ 18.49% flush_frames
+ 16.49% flush_taps
+ 11.79% drain_packets
+  9.16% read_socket
+  6.38% read_tap
+  4.38% drain_tap_inputs
+  2.87% flush_notifications
+  2.79% poll
+  2.07% flush_control
+  1.67% reactor_drain
+  1.51% drain_queues
+  0.88% collect_acks
+  0.72% arm
+  0.24% flush_sender_messages
+workers 8, busy 15.7% of wall, busy cycles 1.136e+11
+sendmmsg cycles/calls/datagrams [22923246990, 567399, 15429675]
+tap_gso_frames 13585792
+tap_gso_reads 308768
+tap_read_calls 135035
+tap_uso_frames 13580208
+tap_write_calls 689033

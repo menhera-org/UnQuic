@@ -103,8 +103,12 @@ Still open, in the order they now matter:
    loopback. Routed runs with four workers are therefore a floor, and the
    four-core gate needs the box
    ([BENCH.md](BENCH.md#four-workers-on-the-lossy-path-and-what-the-routed-test-bed-costs-november-19)).
-3. The per-frame budget for a four-core box (design section 13.1), about
-   5,200 cycles per frame event against 2,200–3,150.
+3. The per-frame budget for a four-core box (design section 13.1). A
+   profile of November 19 reads about 4,200 cycles per frame event
+   against 2,200–3,150, down from 5,200–5,500 three days earlier; about
+   2,200 of them are sends, receives and TAP reads and writes, which the
+   test bed inflates and only the box can settle
+   ([BENCH.md](BENCH.md#the-per-frame-cost-on-november-19)).
 4. The small-frame rows and the overload plateau were remeasured on
    November 19. On the decision workload every 5 Gbit/s total is above
    its 2 Gbit/s total, and the rows deliver 16–84% more than on

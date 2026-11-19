@@ -863,7 +863,10 @@ told the controller owner of a send it already timed, and a worker now
 gets neither unless it sleeps waiting for exactly that. With the pass an
 ACK cannot need skipped as well, and per-turn visits to empty receive
 slots gone, CPU per delivered bit on this point fell by about 9% over
-the afternoon. The table above predates that and awaits a new profile.
+the afternoon. The table above predates that. (November 19: a profile of
+`34aced8` on the same point reads 4,180–4,270 cycles per frame event, about
+2,200 of them in the four system-call rows and 335 in wakes, polls and
+timers; BENCH.md has the phases.)
 The wakes left are work for their target.
 
 **Balance across four workers (November 16).** Past saturation the box is

@@ -2841,6 +2841,33 @@ the target line. The design's list (L2TPv3 with fragmentation,
 WireGuard carrying L2, SoftEther) and its sixty-second, five-run
 procedure remain to be done where those modules can load.
 
+## The per-frame cost on November 19
+
+A profile build of `34aced8` on the full-size efficiency point (eight
+workers, sixteen QinQ flows as 44-segment GSO at 4 Gbit/s each way on
+loopback, [counts](benches/frame-cost-nov19.txt)) costs the two daemons
+4,270 and 4,180 busy cycles per frame event. The same point cost 5,230–
+5,540 at `6fcf89d` on the morning of November 16 and about 7,000 on
+November 13. The budget of design section 13.1 is 2,200–3,150. By
+profile phase, left daemon, cycles per frame event:
+
+| Phase | Cycles | Mostly |
+| --- | --- | --- |
+| `service_sender` and `flush_frames` | 1,660 | 850 in `sendmmsg` (1,490 a datagram); planning, claiming, ACK application and recovery staging share the rest |
+| `flush_taps` | 705 | TAP writes, 20 frames to a write |
+| `drain_packets` | 515 | receive admission and the reassembly copy |
+| `read_socket` | 400 | `recvmmsg` |
+| `read_tap` and `drain_tap_inputs` | 465 | TAP reads of 44 frames each, and their expansion |
+| `poll`, `flush_notifications`, `reactor_drain`, `arm` | 335 | waits, eventfd wakes and timers; 710 on November 16 |
+| `flush_control` | 85 | ACK and control sends |
+| `drain_queues`, `collect_acks` and the rest | 110 | |
+
+Sends, TAP writes, socket reads and TAP reads hold about 2,200 of the
+4,270, and waits and wakes another 335. This test bed still inflates
+them: loopback segments in software, and a TAP write runs the inner
+stack all the way to the load tool's socket. The rest, about 1,700, is
+the daemon's own code.
+
 ## The switches on the lossy efficiency point (November 19)
 
 Decisions 8 and 9 rest on a lossy point that was last measured before
