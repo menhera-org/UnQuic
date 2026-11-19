@@ -38,6 +38,13 @@ changed on the wire. Three changes landed:
   the lanes are held back, which shows on the lossy path as more frames
   expired and less delay; that trade is decision 10 below.
 
+A fourth came out of the lossy path later that day. **A frame budget
+that follows the memory limit:** a session kept 8192 retained transmit
+frames however much memory it was allowed, and on a 7.5 ms path at
+5.5 Gbit/s the frames in flight used most of each owner's share. Startup
+now takes two or four times as many where `memory_limit` pays for them.
+It is item 2 of the list below.
+
 How the cause was found is in
 [BENCH.md](BENCH.md#sixteen-workers-at-the-gate-point-november-19): the
 receive sockets, the control ceiling, BBR's window and wake-up latency
@@ -62,13 +69,26 @@ Still open, in the order they now matter:
    are one profile on one host.
 2. The 5 Gbit/s gate over a lossy 4.5–7.5 ms path. In a first look
    sixteen workers deliver 5.0–5.3 Gbit/s each way at 5.5 offered with 1%
-   loss, in all six runs at 7.5 ms and four of six at 4.5 ms, with no
-   worker above 57% of a core; frames are lost in the sender, and a trace
-   has to say why
+   loss, with no worker above 57% of a core
    ([BENCH.md](BENCH.md#the-lossy-path-at-55-gbits-offered-november-19-first-look)).
-   Four workers deliver 2.4–2.7 Gbit/s per direction on the decision
-   workload at 5G offered, CPU-bound at 95–98% of every core; one flow
-   stays near 1.0–1.4 Gbit/s on one worker (2.0–2.2 with `stripe_flows`).
+   A trace then named what the sender loses there
+   ([BENCH.md](BENCH.md#what-the-lossy-path-loses-at-55-gbits-november-19-traced)):
+   bursts of loss on one lane when a receiving worker stalls for a few
+   milliseconds and this container's 416 KiB socket overflows, which BBR
+   reads as congestion; a frame quota that the frames in flight had mostly
+   used up; BBR's wait before it probes after the warm-up point; and
+   ProbeRTT. The quota is fixed: a session's retained transmit frames now
+   follow `memory_limit`, 8192 times one, two or four, and at 7.5 ms that
+   takes a third off the missing frames
+   ([BENCH.md](BENCH.md#frame-slots-that-follow-the-memory-limit-november-19-landed)).
+   The bursts yield to `loss_threshold_permille = 100`, which stays off by
+   default (decision 11). With both, sixteen workers lose 0.2–2.9% of
+   their frames at 6 Gbit/s offered and deliver 5.7–5.9 Gbit/s each way,
+   and 6.1–6.3 at 6.5 offered. Without the threshold they deliver 5.4–5.8
+   at 6 offered. What the gate still lacks is the box: four workers deliver
+   about 2.5 Gbit/s per direction on the decision workload at 5G offered,
+   CPU-bound at 96–98% of every core, and one flow stays near 1.0–1.4
+   Gbit/s on one worker (2.0–2.2 with `stripe_flows`).
 3. The per-frame budget for a four-core box (design section 13.1), about
    5,200 cycles per frame event against 2,200–3,150.
 4. The small-frame rows and the overload plateau, not remeasured since
@@ -755,6 +775,22 @@ Decisions only the user can make, each blocking a remaining goal:
    is for. If the old behaviour is wanted, a small buffer credit for a
    reader that only reads would bring it back; it is not built
    ([BENCH.md](BENCH.md#a-reader-that-transmits-nothing-november-19-landed)).
+11. Open since November 19: should `loss_threshold_permille` be higher
+   than 20 where receive buffers cannot be raised? A lane's receive
+   socket that overflows drops half of a few hundred packets at once.
+   With many lanes that is 2–6% of one round's inflight for the whole
+   path group, so BBR cuts its bounds as for congestion, and on the
+   local lossy path at 5.5–6.5 Gbit/s that costs more frames than the
+   path's own 1% loss. At 100 the sixteen-worker runs lose 0.2–2.9% of
+   their frames at 6 Gbit/s offered where they lose 2.5–6.9% at 20. It
+   happens here because an unprivileged container keeps 416 KiB receive
+   sockets; with `CAP_NET_ADMIN` the daemon gets 8 MiB and a stall of a
+   few milliseconds does not fill them, which is not yet measured.
+   Against a higher default: on November 12 it cost one flow 3% in one
+   direction at 1% loss, and coexistence was measured at 100 only
+   against one TCP flow. The recommendation is to leave the default at
+   20 and set 100 on hosts that cannot raise their buffers
+   ([BENCH.md](BENCH.md#what-the-lossy-path-loses-at-55-gbits-november-19-traced)).
 
 ## November 11 checkpoint
 

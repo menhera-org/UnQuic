@@ -1,0 +1,30 @@
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -413,6 +413,8 @@
+ const RECEIVE_BYTES: usize = 65_536;
+ // Absorb a synchronized GSO burst before bounding fresh work; an oversized source needs an empty lane.
+ const FRESH_BYTES: usize = 2 * 1024 * 1024;
++// Measured at 4 and 2, and at 1 (off) with FRESH_BYTES at 768 KiB.
++const WAIT_SHARE: u32 = 4;
+ // A bounded GRO backlog must not consume the transmit pool (or vice versa).
+ const RECEIVE_BUFFERS: usize = 8;
+ const _: () = assert!(RECEIVE_BUFFERS <= BATCH_SIZE && RECEIVE_BUFFERS < BUFFERS);
+@@ -3392,7 +3394,17 @@
+         let index = if self.sender_enabled() {
+             let index = self.sender_index(session, buffer.lane)?;
+             let queued = self.sender.lanes[index].unsent_bytes;
+-            if queued != 0 && fresh > FRESH_BYTES.saturating_sub(queued) {
++            // A frame's deadline is its TAP read plus `lifetime`.
++            let waited = self.sessions[session].batches[lane]
++                .as_ref()
++                .and_then(|batch| batch.pending.front())
++                .and_then(|front| self.frames.frame(front))
++                .map_or(Duration::ZERO, |frame| {
++                    now.saturating_add(lifetime).saturating_sub(frame.deadline)
++                });
++            if queued != 0
++                && (fresh > FRESH_BYTES.saturating_sub(queued) || waited > lifetime / WAIT_SHARE)
++            {
+                 let local = &mut self.sessions[session];
+                 for totals in [
+                     &mut self.counters,

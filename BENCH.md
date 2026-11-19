@@ -96,8 +96,9 @@ comparison below.
 
 ## Current performance gaps
 
-Updated November 12, and the first row on November 19; the first four rows
-and the last two are current, the others keep earlier evidence. L→R / R→L pairs are simultaneous. Run-to-run
+Updated November 12, and the first row and the 5 Gbit/s row on November 19;
+the first four rows and the last two are current, the others keep earlier
+evidence. L→R / R→L pairs are simultaneous. Run-to-run
 noise is large: identical binaries differ by up to 7.5% in loopback total and
 up to 18% in one direction (A/A, November 12), so single differences of a few
 percent mean nothing. Efficiency changes are judged by CPU per delivered
@@ -113,7 +114,7 @@ Gbit/s at an offer-limited load instead.
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
 | Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Loopback throughput at an 8952-byte limit is measured: the 21G total rises 70–126%; on the routed decision workload at 5G delivery rises 50–56% at 36% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)). Real-path throughput at larger MTUs remains open. DATA-quoted PTB validation now has targeted kernel coverage. |
-| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | One flow at 7.5 ms with 0.5–1% random loss: about 1.0 Gbit/s per direction locally with hash lanes and the default queue-checked loss tolerance (0.91–1.05 at 1G and 5G offered on `424f4f8`, busiest thread 76–98%, [results](benches/lossy-one-flow-424f4f8.json)), 1.5–2.0 with the old per-reader balanced-lane tables only because the flow kept changing lanes, which the shared flow table ends (0.7–0.9 since November 13, [BENCH.md](#a-control-lane-for-acks-november-13)); 1.6 Gbit/s on the remote host, where a limit downstream of the sender caps it. November 16: with `stripe_flows` on, one UDP flow delivers 2.1–2.4 Gbit/s per direction at 0.5–1% loss against 1.1–1.2 without ([BENCH.md](#striping-one-flow-across-transmit-workers-november-15)); sixteen flows at 2 Gbit/s each way on a 4.5 ms path with 1% loss lose 0.01–0.05% of their frames since the queue check uses each round's smallest RTT sample, where they lost about 1% ([BENCH.md](#where-the-lossy-point-loses-its-frames-november-16)). At 5% loss draft 07 delivers under 10 Mbit/s of a 5G offer; `loss_threshold_permille = 100` raises that to about 0.45 Gbit/s ([BENCH.md](#a-configurable-loss-threshold-for-random-loss-november-12)) | One transmit worker caps one flow near 1 Gbit/s here even without loss, a third of it the kernel's software send path and a quarter userspace, so the gate needs striping with a receive reorder stage, a larger outer MTU or segmenting hardware ([BENCH.md](#what-holds-one-flow-near-1-gbits-november-13); ROADMAP decision 7). Striping is built but off by default: the worker that reads the flow and writes its reverse direction then limits it near 2.2 Gbit/s, and it is unmeasured for TCP, which needs a host with full receive buffers and four workers per daemon. Also open: the 5% rows (still under a tenth of the offer; FEC or a different response), and a real-path measurement. |
+| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | November 19: sixteen workers per daemon and thirty-two GSO flows deliver 5.4–5.8 Gbit/s each way at 6 Gbit/s offered over the local routed path with 1% loss, at 4.5 and at 7.5 ms, and 5.7–5.9 with `loss_threshold_permille = 100`, losing 0.2–2.9% of frames ([BENCH.md](#frame-slots-that-follow-the-memory-limit-november-19-landed)). Four workers deliver about 2.5 Gbit/s each way of bridged individual frames at 5 Gbit/s offered, CPU-bound. Earlier: One flow at 7.5 ms with 0.5–1% random loss: about 1.0 Gbit/s per direction locally with hash lanes and the default queue-checked loss tolerance (0.91–1.05 at 1G and 5G offered on `424f4f8`, busiest thread 76–98%, [results](benches/lossy-one-flow-424f4f8.json)), 1.5–2.0 with the old per-reader balanced-lane tables only because the flow kept changing lanes, which the shared flow table ends (0.7–0.9 since November 13, [BENCH.md](#a-control-lane-for-acks-november-13)); 1.6 Gbit/s on the remote host, where a limit downstream of the sender caps it. November 16: with `stripe_flows` on, one UDP flow delivers 2.1–2.4 Gbit/s per direction at 0.5–1% loss against 1.1–1.2 without ([BENCH.md](#striping-one-flow-across-transmit-workers-november-15)); sixteen flows at 2 Gbit/s each way on a 4.5 ms path with 1% loss lose 0.01–0.05% of their frames since the queue check uses each round's smallest RTT sample, where they lost about 1% ([BENCH.md](#where-the-lossy-point-loses-its-frames-november-16)). At 5% loss draft 07 delivers under 10 Mbit/s of a 5G offer; `loss_threshold_permille = 100` raises that to about 0.45 Gbit/s ([BENCH.md](#a-configurable-loss-threshold-for-random-loss-november-12)) | One transmit worker caps one flow near 1 Gbit/s here even without loss, a third of it the kernel's software send path and a quarter userspace, so the gate needs striping with a receive reorder stage, a larger outer MTU or segmenting hardware ([BENCH.md](#what-holds-one-flow-near-1-gbits-november-13); ROADMAP decision 7). Striping is built but off by default: the worker that reads the flow and writes its reverse direction then limits it near 2.2 Gbit/s, and it is unmeasured for TCP, which needs a host with full receive buffers and four workers per daemon. Also open: the 5% rows (still under a tenth of the offer; FEC or a different response), and a real-path measurement. |
 | Coexist with other traffic | Against one TCP CUBIC flow at a 1 Gbit/s, 7.5 ms token-bucket bottleneck: an even share with a one-BDP queue; with a quarter-BDP queue the queue-checked tolerance keeps TCP's share | Several competitors, other buffer depths and other TCP algorithms are unmeasured. |
 
 Unlimited loss remains high. TAP ingress drops, bounded worker queue drops,
@@ -2446,6 +2447,171 @@ This is a first look, not the gate: 20 s points, one loss rate, GSO
 traffic and no bridge. The profile the gate should use (flow count,
 direction, loss model, cores) is the user's to freeze, and a local path
 does not establish real-access performance.
+
+## What the lossy path loses at 5.5 Gbit/s (November 19, traced)
+
+A `trace` build of the same tree ran the 7.5 ms point of the first look
+once and delivered 5.02 + 4.98 Gbit/s of 5.37 + 5.39 offered, with 4.9%
+and 5.6% of frames missing
+([controller series, cuts and counts](benches/sixteen-workers-lossy-5g-trace.txt)).
+The path did what it was told: netem dropped 1.01% of what it carried and
+its queue never overflowed. The table sorts each 250 ms interval of the
+left sender's 20 s by what bound its controller in that interval:
+
+| What bound the sender | Intervals | Frames expired before any send | Expired after a send |
+| --- | --- | --- | --- |
+| The first second after the 1 Gbit/s warm-up | 4 | 139,440 | 84,200 |
+| ProbeRTT | 1 | 22,611 | 31,450 |
+| `bw_shortterm` set | 39 | 15,479 | 183,019 |
+| The window at 0.85 × `inflight_longterm` | 14 | 9,310 | 89,750 |
+| Nothing | 24 | 648 | 8,848 |
+
+The right sender reads much the same. Four causes share the loss.
+
+**Losses that come in bursts on one lane.** About thirty times in the
+20 s the left sender declared 90–390 packets lost within 8 ms, where 1%
+random loss gives about 40. In the two bursts looked at, 222 and 220 of
+those packets were on one or two lanes, about half of 200–450
+consecutive packet numbers. While the first of them arrived, one worker
+of the receiving daemon wrote no trace record for 7.6 ms. This container
+caps a receive socket at 416 KiB, about 180 datagrams, and a lane here
+receives that many in 5–6 ms, so a worker that stalls for a few
+milliseconds loses half of what arrives until it has drained the socket.
+`Udp6RcvbufErrors` counts these drops in GRO skbs of about six datagrams
+each (120 and 748 for the two daemons), so it understates them.
+
+BBR takes such a round for congestion, as draft 07 says it should: the
+round lost more than 2% of its inflight. Outside a probe that sets
+`bw_shortterm` to the round's delivery rate, which here is the offered
+load. Inside a probe it cuts `inflight_longterm`, six times in this run.
+Either bound leaves no rate to drain what queued in the meantime until
+the next probe lifts it, up to 63 rounds later. Frames then leave near
+the end of their lifetime. Their ACK arrives after it, which is the
+table's last column, and a frame that loses one of its two packets is
+not repaired in time.
+
+**The frame quota.** A session kept 8192 frame slots per direction,
+divided evenly among its transmit owners: 512 each with sixteen workers.
+At 5.5 Gbit/s a lane with three of the thirty-two flows sends 44,000
+frames a second and has about 370 of them unacknowledged on this path,
+so three TAP reads of 44 frames fit behind them. A read that does not
+fit is refused whole: 4,697 and 4,575 reads at the two daemons in this
+run, up to 200,000 frames each, and three times as many at 6.5 Gbit/s
+offered. The lane had the rate for those frames a few milliseconds later.
+[The next section](#frame-slots-that-follow-the-memory-limit-november-19-landed)
+removes this one.
+
+**The step from the warm-up point.** BBR held 2.1 Gbit/s as its bandwidth
+when 5.5 arrived. ProbeBW_CRUISE probes after 63 rounds at most on this
+path, so it paced at 2.1 for 400 ms, and ProbeBW_UP then took 150 ms to
+reach 9.5. That is draft 07 meeting a step sharper than forwarded
+traffic makes, and it costs 0.7–2.5% of the point's frames.
+
+**ProbeRTT.** Every 10 s the window falls to half a BDP of `max_bw` for
+200 ms. At this load that is a third less than the flow keeps in flight.
+An episode expires 22,000–36,000 frames unsent and sends as many again
+too late for their ACK.
+
+`loss_threshold_permille = 100` keeps a burst on one lane from counting
+as congestion for the whole group. A traced run with it had
+`bw_shortterm` set in 3 and 7 of its intervals where the default had 39
+and 37, and the window bound in 6 and 0 where it had 14 and 18. Outside
+the first second and ProbeRTT its senders expired 3,994 and 725 frames
+before a send, against 25,437 and 53,522.
+
+A ladder of offered rates, 20 s each after the warm-up point, three
+rounds per arm
+([7.5 ms](benches/sixteen-workers-lossy-ladder-7.5ms.json),
+[4.5 ms](benches/sixteen-workers-lossy-ladder-4.5ms.json); the first
+default round at 7.5 ms failed in the harness and is left out):
+
+| Path | Offered each way | Default: delivered each way | Missing | Threshold 100: delivered | Missing |
+| --- | --- | --- | --- | --- | --- |
+| 7.5 ms | 5.5 Gbit/s | 5.09–5.17 | 4.5–5.9% | 5.24–5.33 | 1.2–3.2% |
+| | 6.0 | 5.43–5.70 | 3.3–7.9% | 5.70–5.75 | 2.6–3.3% |
+| | 6.5 | 5.77–6.03 | 5.7–9.7% | 5.99–6.12 | 4.3–6.3% |
+| 4.5 ms | 5.5 | 5.06–5.24 | 3.1–4.8% | 5.26–5.34 | 0.5–2.3% |
+| | 6.0 | 5.32–5.74 | 2.8–9.3% | 5.70–5.84 | 1.0–3.1% |
+| | 6.5 | 5.44–5.98 | 6.0–13.4% | 5.95–6.27 | 1.8–6.8% |
+
+From 6 Gbit/s offered every run, here and in the next section's sets,
+delivers more than 5.1 Gbit/s each way on both paths, with no worker
+above 68% of a core. The threshold stays
+at 20 by default: the bursts it absorbs come from this container's
+receive buffers, and a daemon with `CAP_NET_ADMIN` gets 8 MiB sockets
+that a 7 ms stall does not fill. Whether to raise it where the buffers
+cannot be raised is a deployment choice (ROADMAP decision 11).
+
+## Frame slots that follow the memory limit (November 19, landed)
+
+The frame quota above was a fixed 8192 retained transmit frames per
+session, 12.5 MB of full-size frames, which design section 13 sizes as
+20 ms of payload at 5 Gbit/s. On a 7.5 ms path a frame lives 31 ms, and
+the frames in flight alone are 8.5 ms of the stream. The same section
+says such bounds should follow the configured memory ceiling, and now
+this one does. Startup takes the largest of four, two or one times 8192
+that `memory_limit` pays for, about 46 MiB a step for one session, and
+that still leaves every session its own share of each owner's store. An
+owner's share stays at 8192 or below, the size of one store. With one
+session the default 256 MiB pays for 16,384 frames on four workers; the
+1 GiB these sixteen-worker runs set pays for 32,768, which is 2,048 for
+each owner where it was 512. Nothing changes on the wire or per frame.
+
+The ladder again with the larger budget (`fs`), alone and with the loss
+threshold at 100, three rounds per arm
+([7.5 ms](benches/frame-scale-lossy-7.5ms.json),
+[4.5 ms](benches/frame-scale-lossy-4.5ms.json); the first default round
+at 7.5 ms again failed in the harness). Delivered Gbit/s each way, and
+frames missing:
+
+| Path, offered | `4b9b3b5` | Larger budget | Threshold 100 | Both |
+| --- | --- | --- | --- | --- |
+| 7.5 ms, 5.5 | 4.95–5.14, 4.9–7.7% | 4.93–5.32, 1.8–8.8% | 5.22–5.34, 1.1–3.3% | 5.22–5.38, 0.5–2.6% |
+| 7.5 ms, 6.0 | 5.41–5.71, 3.2–8.1% | 5.44–5.75, 2.5–6.9% | 5.61–5.79, 1.9–4.9% | 5.73–5.88, 0.3–2.9% |
+| 7.5 ms, 6.5 | 5.56–5.79, 9.3–13.1% | 5.77–6.09, 4.6–9.5% | 5.68–6.14, 4.0–9.3% | 6.26–6.35, 0.5–1.8% |
+| 4.5 ms, 5.5 | 4.95–5.34, 1.4–8.2% | 4.98–5.34, 1.3–8.0% | 5.26–5.37, 0.4–2.2% | 5.05–5.41, 0.0–1.4% |
+| 4.5 ms, 6.0 | 5.16–5.76, 2.2–11.7% | 5.53–5.74, 2.6–6.1% | 5.82–5.86, 0.5–1.3% | 5.84–5.89, 0.2–1.1% |
+| 4.5 ms, 6.5 | 5.83–6.01, 5.9–8.7% | 5.87–6.04, 5.5–8.2% | 6.17–6.29, 1.6–3.4% | 6.08–6.25, 2.2–4.6% |
+
+At 7.5 ms the larger budget alone cuts the missing frames by about a
+third and adds 0.2–0.3 Gbit/s at 6.5 offered. With the threshold as well
+the path loses 0.3–2.9% where it lost 3–13%, and delivers 6.3 Gbit/s
+each way at 6.5 offered. At 4.5 ms the frames in flight took a smaller
+share of the old quota and the budget changes nothing; the threshold
+does the work there.
+
+Elsewhere the budget changes nothing that these runs can measure. Each
+row compares `4b9b3b5`, a byte copy of it run as a separate arm, and the
+larger budget:
+
+| Check | `4b9b3b5` | Its copy | Larger budget |
+| --- | --- | --- | --- |
+| Gate point, sixteen workers, 21 Gbit/s offered each way, total delivered ([first](benches/frame-scale-gate-1.json), [second](benches/frame-scale-gate-variants.json), [third, the committed binary](benches/frame-scale-gate-final.json)) | 40.28–40.71 Gbit/s in 14 runs | 39.71–40.72 in 11 | 39.89–40.70 in 12 |
+| Full-size efficiency point, CPU per delivered Gbit/s against `4b9b3b5`, six rounds ([results](benches/frame-scale-efficiency.json)) | | +0.2% and +0.4%, two copies | +0.9%, lower in 2 of 6 |
+| Four workers, 4.8 Gbit/s offered each way, ten rounds, total and CPU of both daemons ([results](benches/frame-scale-four-workers.json)) | 9.49 Gbit/s at 350% of a core | 9.50 at 347% | 9.50 at 346% and 347% |
+| Four workers, 8 Gbit/s offered, mean total of ten rounds | 14.08 | 13.88 | 13.96 with 16,384 frames, 14.03 with 32,768 |
+| Decision workload, 2 Gbit/s offered each way, total, three rounds ([results](benches/frame-scale-decision.json)) | 3.87–3.93 | 3.87–3.91 | 3.86–3.93 |
+| Decision workload, 5 Gbit/s offered | 5.11–5.34 | 4.73–5.18 | 4.94–5.07 |
+
+The gate rows leave out runs that foreign load on the host disturbed. It
+shows as a worker of one daemon above 88% of a core where 81–84% is
+normal, and as 3–4 Gbit/s missing in one direction on every arm,
+`4b9b3b5` included: four runs of the second set, and
+[a fourth set](benches/frame-scale-gate-disturbed.json) for its first
+ten minutes, which is not used at all.
+
+Two ways to keep a lane's backlog short under the larger budget were
+measured in the second gate set and rejected
+([patch](benches/unsent-wait-bound-rejected.patch)). A lane that refuses
+new reads once its oldest waiting frame has waited a quarter of the
+frame lifetime delivered 40.27 Gbit/s in total on average, and with
+half the lifetime 40.08, against 40.52 for `4b9b3b5` and 40.47 for the
+budget alone. The unsent-byte bound at 768 KiB in place of 2 MiB
+delivered 39.25.
+
+The third gate set and the four-worker set ran the committed binary. The
+others ran the build before the rule that keeps each session's share of
+a store, which changes nothing with one session.
 
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 

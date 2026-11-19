@@ -316,7 +316,7 @@ Each active receive lane has a 65536-packet sliding window and a separate 65536-
 
 Do not deduplicate using only a time-limited completion cache. Window advancement may discard unusually reordered traffic; this is bounded loss, never duplicate Ethernet delivery. Only the owning worker changes these windows. Retired-lane bits reject the whole lane before frame lookup, so its windows can be freed safely. For still-active lanes, preserve the lower bounds even through long idle periods.
 
-Initial resource limits are 8192 retained transmit frames and 8192 receive frames (incomplete plus queued complete) per session, with 64 MiB of payload storage per direction and at most 64 active lanes per direction. The daemon's default total transport-memory ceiling is 256 MiB, including metadata, histories, and queues; caller-provided ceilings may raise or lower it. Refuse reservations beyond either limit. The sender also keeps at most 65536 sent-packet entries per lane; if advancing would overwrite an unresolved entry, apply backpressure rather than forget its inflight charge. On startup validate fixed allocations against the ceiling. Unknown cookies allocate nothing; pending handshakes, lane tables and worker queues are bounded separately. These are initial implementation limits, not performance claims.
+Initial resource limits are 8192 retained transmit frames and 8192 receive frames (incomplete plus queued complete) per session, with 64 MiB of payload storage per direction and at most 64 active lanes per direction. The daemon's default total transport-memory ceiling is 256 MiB, including metadata, histories, and queues; caller-provided ceilings may raise or lower it. Refuse reservations beyond either limit. The sender also keeps at most 65536 sent-packet entries per lane; if advancing would overwrite an unresolved entry, apply backpressure rather than forget its inflight charge. On startup validate fixed allocations against the ceiling. Unknown cookies allocate nothing; pending handshakes, lane tables and worker queues are bounded separately. These are initial implementation limits, not performance claims. (November 19 amendment: the retained transmit frames follow the memory ceiling. A session keeps 8192, 16,384 or 32,768 of them, the most that `memory_limit` pays for and that its owners' stores hold without taking slots from another session; one session costs about 46 MiB for each 8192. A lane's slots hold the frames it has in flight as well as those that wait behind them. At 5.5 Gbit/s over a 7.5 ms path the frames in flight took three quarters of an even share of 8192, and the lane refused TAP reads it could have sent a few milliseconds later; BENCH.md. The 64 MiB payload bound and the receive limits are unchanged.)
 
 Bound sampling metadata in a shared fixed pool. Keep complete sampling state for
 each retained, unacknowledged charged transmission, including declared losses.
@@ -1333,8 +1333,10 @@ If a comparison already reaches the available underlay ceiling, report that fact
 **Current status (November 19):** stages 1 and 4 are complete. Stages 2 and 3
 are implemented. The local rate of 20 Gbit/s each way was first reached on
 November 19 with sixteen workers per daemon, by a margin of one or two
-percent and before its acceptance profile is frozen; the gate of 5 Gbit/s
-over the lossy access path remains open, and stage 5 measured
+percent and before its acceptance profile is frozen. Sixteen workers also
+deliver 5.4–5.8 Gbit/s each way over a local routed path with 1% loss at
+6 Gbit/s offered, but the gate of 5 Gbit/s over the lossy access path is
+set for a box of two to four cores and remains open, and stage 5 measured
 optimisation is in progress. ROADMAP.md and BENCH.md track both. Offload
 frames (section 6) are implemented behind `daemon.offload_frames`, off by
 default. The record

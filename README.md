@@ -412,7 +412,12 @@ continuous arrivals cannot postpone the switch indefinitely. Half the bounded
 journal capacity is reserved for repairs.
 Recovery storage counts toward `memory_limit`; configurations with many sessions
 or lanes may require an explicit higher ceiling. Startup rejects an oversized
-configuration instead of silently reducing its quotas. A release runtime
+configuration instead of silently reducing its quotas. Where the ceiling has
+room, startup doubles or quadruples each session's retained transmit
+frames, from 8192 to 16,384 or 32,768, at about 46 MiB per session for each
+8192. Frames in flight hold slots as well as frames that wait, so a fast path
+of several milliseconds needs the larger budget: with four workers and one
+session the default 256 MiB pays for 16,384, and 310 MiB for 32,768. A release runtime
 regression drops each direction's original frame prefix and first repair,
 requires delivery through the second repair, and replays the late original
 without duplicate TAP delivery or hot-path allocation.
@@ -503,7 +508,10 @@ These conservative reservations can reject large configurations before startup.
 Fixed receive storage permits at most 4096 frames and 36,954,112 reserved frame
 bytes per session, below the 8192-frame/64-MiB directional ceilings. Transmit
 reservations divide the frame and 64-MiB byte budgets among the union of the
-session's TAP readers and transmit owners. Each worker preallocates the sum
+session's TAP readers and transmit owners. The frame budget is 8192 times one,
+two or four, the largest factor `memory_limit` pays for that still leaves
+every session its own share of each store; an owner's share never exceeds
+8192. Each worker preallocates the sum
 of its participating sessions' frame quotas, capped at 8192 shared views,
 plus source metadata for its 128 pool buffers. Workers outside a session's
 TAP/transmit ownership set reserve no views for that session. A view holds a rewritten header of at most 128 bytes and a range in
@@ -897,8 +905,9 @@ deliver again within 1.35 seconds, with no duplicate frame.
 
 Release forwarding, reconnect, allocation and routed-MTU regression tests pass.
 Sixteen workers per daemon first delivered 20 Gbit/s each way on
-November 19; the lossy-path gate remains open. BENCH.md records the
-measurements.
+November 19, and deliver 5.4–5.8 Gbit/s each way over a local routed path
+with 1% loss at 6 Gbit/s offered. The lossy-path gate is set for two to
+four cores and remains open. BENCH.md records the measurements.
 
 ## TAP read batching
 
