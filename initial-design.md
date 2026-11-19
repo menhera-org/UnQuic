@@ -1334,10 +1334,9 @@ If a comparison already reaches the available underlay ceiling, report that fact
 are implemented. The local rate of 20 Gbit/s each way was first reached on
 November 19 with sixteen workers per daemon, by a margin of one or two
 percent and before its acceptance profile is frozen. Sixteen workers also
-deliver 5.4–5.8 Gbit/s each way over a local routed path with 1% loss at
-6 Gbit/s offered, but the gate of 5 Gbit/s over the lossy access path is
-set for a box of two to four cores and remains open, and stage 5 measured
-optimisation is in progress. ROADMAP.md and BENCH.md track both. Offload
+pass 5 Gbit/s each way over a local routed path with loss, but the gate of
+5 Gbit/s over the lossy access path is set for a box of two to four cores
+and remains open, and stage 5 measured optimisation is in progress. ROADMAP.md and BENCH.md track both. Offload
 frames (section 6) are implemented behind `daemon.offload_frames`, off by
 default. The record
 below is chronological. Implemented foundations are

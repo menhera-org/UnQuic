@@ -905,9 +905,9 @@ deliver again within 1.35 seconds, with no duplicate frame.
 
 Release forwarding, reconnect, allocation and routed-MTU regression tests pass.
 Sixteen workers per daemon first delivered 20 Gbit/s each way on
-November 19, and deliver 5.4–5.8 Gbit/s each way over a local routed path
-with 1% loss at 6 Gbit/s offered. The lossy-path gate is set for two to
-four cores and remains open. BENCH.md records the measurements.
+November 19, and they pass 5 Gbit/s each way over a local routed path
+with loss. The lossy-path gate is set for two to four cores and remains
+open. BENCH.md records the measurements.
 
 ## TAP read batching
 

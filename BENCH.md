@@ -2613,6 +2613,30 @@ The third gate set and the four-worker set ran the committed binary. The
 others ran the build before the rule that keeps each session's share of
 a store, which changes nothing with one session.
 
+## ACK counts above 48 at the gate point (November 19, exploratory)
+
+A lane acknowledges after 48 packets because 64 once overflowed the
+sender's report. One report per ACK removed that limit, so counts of 64,
+96 and 128 were built on `4b9b3b5` and run at the gate point, five
+rounds in rotation ([results](benches/ack-count-gate.json)). Six of the
+twenty-five runs delivered under 39 Gbit/s in total, two of `4b9b3b5`,
+one of its copy and three of the count of 64, on a host that was
+disturbed all evening; they are left out.
+
+| ACK count | Total delivered, Gbit/s | CPU of both daemons |
+| --- | --- | --- |
+| 48, `4b9b3b5` | 40.42–40.65 | 1,861–1,913% |
+| 48, its copy | 40.03–40.25 | 1,864–1,901% |
+| 64 | 40.47–40.52 | 1,881% |
+| 96 | 39.65–40.60 | 1,837–1,880% |
+| 128 | 40.03–40.68 | 1,848–1,872% |
+
+A lane at this rate reaches 48 packets in 0.4 ms, so 96 halves its ACKs
+and 128 leaves them to the 1 ms timer. That saves the daemons about 1.5%
+of their CPU and delivers nothing more: ACK volume no longer limits the
+gate. The count stays at 48, which keeps feedback finer on lossy paths,
+where the larger counts were not measured.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames
