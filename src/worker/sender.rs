@@ -120,6 +120,52 @@ pub(super) enum ReportKind {
     Retire,
 }
 
+/// What the controller needs of the packets one ACK newly acknowledged,
+/// however many they are: the transmit owner adds them up as it settles
+/// them, so the ACK costs its lane one report and not one for every
+/// BATCH_SIZE packets.
+#[derive(Clone, Copy, Default)]
+pub(super) struct AckSummary {
+    /// Packets that released an inflight charge and elicit ACKs.
+    pub(super) settled: u32,
+    /// Outer bytes of the sampled packets.
+    pub(super) newly: u64,
+    /// The sampled packet sent last, by time and then send order.
+    pub(super) newest: Option<SendRecord>,
+    /// Whether a sampled packet was anything but a path-MTU probe.
+    pub(super) data: bool,
+}
+
+impl AckSummary {
+    /// Adds one acknowledged packet.
+    pub(super) fn add(&mut self, settled: bool, record: Option<&SendRecord>) {
+        self.settled = self.settled.saturating_add(u32::from(settled));
+        let Some(record) = record else { return };
+        self.newly = self.newly.saturating_add(u64::from(record.bytes));
+        self.data |= !record.pmtu;
+        if self
+            .newest
+            .is_none_or(|old| (record.sent_ns, record.order) > (old.sent_ns, old.order))
+        {
+            self.newest = Some(*record);
+        }
+    }
+
+    /// Adds the packets another summary counted.
+    pub(super) fn merge(&mut self, other: &Self) {
+        self.settled = self.settled.saturating_add(other.settled);
+        self.newly = self.newly.saturating_add(other.newly);
+        self.data |= other.data;
+        if let Some(record) = other.newest
+            && self
+                .newest
+                .is_none_or(|old| (record.sent_ns, record.order) > (old.sent_ns, old.order))
+        {
+            self.newest = Some(record);
+        }
+    }
+}
+
 /// Independent of send completions: frozen feedback cannot consume their storage.
 pub(crate) struct Report {
     origin: usize,
@@ -128,6 +174,8 @@ pub(crate) struct Report {
     pub(super) kind: ReportKind,
     pub(super) count: usize,
     pub(super) entries: [Entry; BATCH_SIZE],
+    // An ACK's packets as its lane settled them; its report carries no entries.
+    pub(super) sum: AckSummary,
 }
 
 impl Report {
@@ -139,6 +187,7 @@ impl Report {
             kind: ReportKind::Retire,
             count: 0,
             entries: [Entry::default(); BATCH_SIZE],
+            sum: AckSummary::default(),
         }
     }
 }
@@ -194,6 +243,8 @@ pub(super) struct Lane {
     pub(super) forced_before: Option<Duration>,
     pub(super) scan_cutoff: Option<Duration>,
     pub(super) ack: Option<AckTiming>,
+    // The packets of the ACK being applied that are settled so far.
+    pub(super) ack_sum: AckSummary,
     pub(super) ack_first: bool,
     // The report in flight carries the end of this lane's ACK.
     pub(super) ack_ending: bool,
@@ -224,6 +275,7 @@ impl Lane {
             forced_before: None,
             scan_cutoff: None,
             ack: None,
+            ack_sum: AckSummary::default(),
             ack_first: true,
             ack_ending: false,
             report_pending: false,
@@ -1074,13 +1126,21 @@ impl Worker {
         Ok(())
     }
 
-    /// Copies each entry's send record for the owner, then settles locally:
-    /// ACKs and losses release their inflight charge, and ACKs and retirement
-    /// return the record handle. A lost packet keeps its record for a late ACK.
+    /// Settles a staged report locally: ACKs and losses release their inflight
+    /// charge, and ACKs and retirement return the record handle. A lost packet
+    /// keeps its record for a late ACK, and a loss report copies each entry's
+    /// send record for the owner. An ACK's packets are added to its lane's
+    /// summary instead and their entries dropped; the report that ends the
+    /// ACK takes the summary of all of them to the owner.
     pub(super) fn settle_report(&mut self, report: &mut Report) -> io::Result<()> {
+        let ack = matches!(report.kind, ReportKind::Ack { .. });
+        let mut sum = AckSummary::default();
         let mut released = 0;
         for entry in &mut report.entries[..report.count] {
             let Some(handle) = entry.sample else {
+                if ack {
+                    sum.add(entry.settled, None);
+                }
                 continue;
             };
             entry.record = self
@@ -1090,6 +1150,9 @@ impl Worker {
                 .ok_or_else(|| io::Error::other("missing send record"))?;
             if entry.settled && !matches!(report.kind, ReportKind::Retire) {
                 released += u64::from(entry.record.bytes);
+            }
+            if ack {
+                sum.add(entry.settled, Some(&entry.record));
             }
             if !matches!(report.kind, ReportKind::Loss) {
                 self.sender.records.release(handle);
@@ -1101,6 +1164,20 @@ impl Worker {
                 .get(report.group)
                 .ok_or(io::ErrorKind::InvalidData)?
                 .release(released);
+        }
+        if let ReportKind::Ack { first, end, .. } = &mut report.kind {
+            let lane = usize::from(report.id.lane)
+                .checked_sub(1)
+                .ok_or(io::ErrorKind::InvalidData)?;
+            let index = self.sender_index(report.id.session, lane)?;
+            let total = &mut self.sender.lanes[index].ack_sum;
+            total.merge(&sum);
+            report.count = 0;
+            if end.is_some() {
+                // One report is the whole ACK to the owner.
+                *first = true;
+                report.sum = std::mem::take(total);
+            }
         }
         Ok(())
     }

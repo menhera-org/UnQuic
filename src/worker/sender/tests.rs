@@ -148,6 +148,18 @@ fn a_routine_sent_notice_skips_the_wake_only_for_a_session_the_owner_times() {
     assert_eq!(worker.notifications, 1);
 }
 
+/// Addresses a hand-built report as its lane would: settlement finds the
+/// lane's ACK summary by it.
+fn address(report: &mut Report, lane: &Lane) {
+    report.group = lane.group;
+    report.id = PacketId {
+        session: lane.session,
+        generation: lane.generation,
+        lane: lane.lane,
+        number: 0,
+    };
+}
+
 fn queue_frame(worker: &mut Worker, length: usize) {
     let mut frame = worker.free.pop().unwrap();
     frame.session = 0;
@@ -787,7 +799,12 @@ fn crossed_group_acks_finish_before_loss_checks_use_the_only_report() {
                 .unwrap()
         );
         assert!(matches!(report.kind, ReportKind::Ack { end: None, .. }));
-        owner.report(report).unwrap();
+        // Part of an ACK is settled where it is; only its end goes to the owner.
+        worker.recovery.staged = Some(report);
+        assert!(worker.stage_recovery().unwrap());
+        assert!(worker.sender.report.is_some());
+        // One unit of the pass went to entering the range.
+        assert_eq!(worker.sender.lanes[index].ack_sum.settled, 63);
     }
     let mut outgoing = VecDeque::with_capacity(16);
     for _ in 0..2 {
@@ -1673,11 +1690,13 @@ fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
         );
     }
     let mut report = worker.sender.report.take().unwrap();
+    let index = worker.sender_index(0, 1).unwrap();
+    address(&mut report, &worker.sender.lanes[index]);
     report.kind = ReportKind::Ack {
         received: Duration::from_millis(2),
         delay_us: 0,
         first: true,
-        end: None,
+        end: Some(AckProgress::default()),
     };
     // One additional physical copy keeps two mappings per frame after staging two ACKs.
     assert!(worker.recovery.journal.reserve_packet(3, &pieces));
@@ -1781,11 +1800,13 @@ fn acknowledged_retained_frames_free_in_the_ack_pass() {
         assert_eq!(worker.sender.records.take().unwrap().get(), handle);
     }
     let mut report = worker.sender.report.take().unwrap();
+    let index = worker.sender_index(0, 1).unwrap();
+    address(&mut report, &worker.sender.lanes[index]);
     report.kind = ReportKind::Ack {
         received: Duration::from_millis(2),
         delay_us: 0,
         first: true,
-        end: None,
+        end: Some(AckProgress::default()),
     };
     report.count = 1;
     report.entries[0] = Entry {
@@ -2251,7 +2272,6 @@ fn admitted_acks_finish_then_loss_progresses_under_continuous_ack_input() {
         }];
         let mut accepted_done = false;
         let mut other_done = false;
-        let mut chunks = 0;
         let mut lost = false;
         let mut resumed = false;
         let mut held = None;
@@ -2288,10 +2308,12 @@ fn admitted_acks_finish_then_loss_progresses_under_continuous_ack_input() {
                         if report.id.session == 1 {
                             other_done |= end.is_some();
                         } else if !accepted_done {
-                            chunks += 1;
-                            if end.is_some() {
-                                accepted_done = true;
-                            }
+                            // Three passes of BATCH_SIZE packets settle the
+                            // ACK locally; one report then tells the owner.
+                            assert!(end.is_some());
+                            assert_eq!((report.count, report.sum.settled), (0, 129));
+                            assert!(turn >= 2, "the ACK cannot fit two passes");
+                            accepted_done = true;
                         } else if lost && end.is_some() {
                             resumed = true;
                         }
@@ -2320,7 +2342,7 @@ fn admitted_acks_finish_then_loss_progresses_under_continuous_ack_input() {
                 break;
             }
         }
-        assert!(chunks >= 3, "fixture must span multiple ACK reports");
+        assert!(accepted_done);
         assert!(
             lost,
             "continuous ACK admission starved an immediately eligible packet loss"

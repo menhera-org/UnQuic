@@ -414,8 +414,13 @@ impl Worker {
             self.settle_report(&mut report)?;
             self.counters.recovery_staged_reports =
                 self.counters.recovery_staged_reports.wrapping_add(1);
-            if matches!(report.kind, sender::ReportKind::Retire) {
-                // Retirement only frees this worker's records; the owner has nothing to apply.
+            if matches!(
+                report.kind,
+                sender::ReportKind::Retire | sender::ReportKind::Ack { end: None, .. }
+            ) {
+                // Retirement only frees this worker's records, and part of an
+                // ACK only adds to its lane's summary: the owner has nothing
+                // to apply, so the lane goes on without waiting for it.
                 self.report_returned(report)?;
                 return Ok(true);
             }

@@ -70,6 +70,7 @@ impl Lane {
             .largest_ack
             .max(ranges.iter().map(|r| r.end).max().unwrap_or(0));
         self.ack_first = true;
+        self.ack_sum = AckSummary::default();
         self.ack = Some(AckTiming {
             received: ack.received,
             delay_us: ack.delay_us,

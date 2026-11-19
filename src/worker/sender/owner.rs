@@ -602,6 +602,19 @@ impl Owner {
                 ReportKind::Retire => {}
             }
         }
+        if matches!(report.kind, ReportKind::Ack { .. }) {
+            // The lane's own sum of the ACK's packets, in place of entries.
+            settled = settled.saturating_add(report.sum.settled);
+            if let Some(newest) = report.sum.newest {
+                let sum = &mut state.sum;
+                sum.newly = sum.newly.saturating_add(report.sum.newly);
+                sum.pmtu_only &= !report.sum.data;
+                let key = (newest.sent_ns, newest.order);
+                if sum.newest.is_none_or(|old| key > (old.sent_ns, old.order)) {
+                    sum.newest = Some(newest);
+                }
+            }
+        }
         // Sends reported before this owner installed the lane were never counted.
         let id = report.id;
         let settled = settled.min(
