@@ -61,6 +61,8 @@ pub(crate) struct AddressRequest {
 
 pub(crate) struct Shared {
     pub config: Validated,
+    // How many stores' worth of frame slots a session's owners share.
+    pub frame_scale: usize,
     pub wakes: Vec<Arc<Wake>>,
     pub owners: Vec<Box<[AtomicU8]>>,
     pub status: Vec<AtomicU8>,
@@ -364,13 +366,7 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
         .map(|s| s.queue_count)
         .max()
         .unwrap_or(1);
-    let required = storage_bytes(&config, count).ok_or(io::ErrorKind::OutOfMemory)?;
-    if required > config.config().daemon.memory_limit {
-        return Err(io::Error::new(
-            io::ErrorKind::OutOfMemory,
-            "transport storage exceeds memory_limit",
-        ));
-    }
+    let frame_scale = frame_scale(&config, count)?;
     let sessions = config.config().sessions.len();
     let peers = config.config().peers.len();
     let endpoints = config.config().endpoints.len();
@@ -418,6 +414,7 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
     };
     let shared = Arc::new(Shared {
         config,
+        frame_scale,
         wakes,
         owners: (0..sessions)
             .map(|_| (0..65_536).map(|_| AtomicU8::new(0)).collect())
@@ -515,7 +512,23 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
     result
 }
 
-fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
+/// The most frame slots per session that `memory_limit` pays for. Retained
+/// frames are what a lane has in flight plus what waits behind them, so a
+/// long or fast path needs more than one store's worth (design section 13).
+fn frame_scale(config: &Validated, workers: usize) -> io::Result<usize> {
+    let limit = config.config().daemon.memory_limit;
+    crate::worker::FRAME_SCALES
+        .into_iter()
+        .find(|&scale| storage_bytes(config, workers, scale).is_some_and(|bytes| bytes <= limit))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "transport storage exceeds memory_limit",
+            )
+        })
+}
+
+fn storage_bytes(config: &Validated, workers: usize, frame_scale: usize) -> Option<usize> {
     let raw = config.config();
     let sessions = raw.sessions.len();
     let commands = spsc::CAPACITY * size_of::<AddressRequest>() + 512;
@@ -604,7 +617,7 @@ fn storage_bytes(config: &Validated, workers: usize) -> Option<usize> {
         .checked_add(raw.peers.len().checked_mul(2 * size_of::<usize>())?)?
         .checked_add(sessions.checked_mul(128)?)?;
     [
-        Worker::storage_bytes(config, workers)?,
+        Worker::storage_bytes(config, workers, frame_scale)?,
         commands,
         lane_counters,
         totals,
@@ -710,30 +723,92 @@ mod tests {
             queue_count: 8,
         });
         let normal = config.clone().validate().unwrap();
-        let normal_bytes = storage_bytes(&normal, 8).unwrap();
+        let normal_bytes = storage_bytes(&normal, 8, 1).unwrap();
         assert!(normal_bytes <= normal.config().daemon.memory_limit);
 
         config.peers[0].tx_lanes = 64;
         let larger = config.clone().validate().unwrap();
-        let larger_bytes = storage_bytes(&larger, 8).unwrap();
+        let larger_bytes = storage_bytes(&larger, 8, 1).unwrap();
         assert!(larger_bytes > larger.config().daemon.memory_limit);
         assert!(larger_bytes > normal_bytes);
+        assert_eq!(
+            frame_scale(&larger, 8).unwrap_err().kind(),
+            io::ErrorKind::OutOfMemory
+        );
 
         config.daemon.memory_limit = larger_bytes;
         let explicit = config.clone().validate().unwrap();
-        assert_eq!(storage_bytes(&explicit, 8), Some(larger_bytes));
+        assert_eq!(storage_bytes(&explicit, 8, 1), Some(larger_bytes));
         assert_eq!(explicit.config().peers[0].tx_lanes, 64);
         assert_eq!(explicit.config().sessions[0].queue_count, 8);
     }
 
     #[test]
+    fn frame_slots_grow_with_the_memory_limit() {
+        use crate::config::{Endpoint, Peer, Session};
+        let mut config = Config::default();
+        config.endpoints.push(Endpoint {
+            name: "rx".into(),
+            listen_address: Ipv6Addr::LOCALHOST,
+            listen_port: 40000,
+            scope_id: 0,
+            bind_device: None,
+        });
+        config.peers.push(Peer {
+            name: "peer".into(),
+            endpoint: "rx".into(),
+            address: Some(Ipv6Addr::LOCALHOST),
+            peer_port: 40001,
+            scope_id: 0,
+            tx_lanes: 4,
+            outer_payload_limit: 1452,
+            path_group: None,
+        });
+        config.sessions.push(Session {
+            name: "scale-test".into(),
+            peer: "peer".into(),
+            cookie: crate::UnquicUuid::from_bytes([1; 16]),
+            tap_name: None,
+            inner_mtu: 1500,
+            mac: None,
+            queue_count: 4,
+        });
+        let bytes = |scale| storage_bytes(&config.clone().validate().unwrap(), 4, scale).unwrap();
+        let [one, two, four] = [bytes(1), bytes(2), bytes(4)];
+        assert!(one < two && two < four);
+        // The limit that pays for exactly a scale selects it; a byte less, the one below.
+        for (limit, scale) in [(one, 1), (two - 1, 1), (two, 2), (four - 1, 2), (four, 4)] {
+            config.daemon.memory_limit = limit;
+            let validated = config.clone().validate().unwrap();
+            assert_eq!(frame_scale(&validated, 4).unwrap(), scale);
+        }
+        config.daemon.memory_limit = usize::MAX;
+        assert_eq!(
+            frame_scale(&config.clone().validate().unwrap(), 4).unwrap(),
+            4
+        );
+        // With a second session each owner's store holds two quotas, so only double fits.
+        let mut second = config.sessions[0].clone();
+        second.name = "other".into();
+        second.cookie = crate::UnquicUuid::from_bytes([2; 16]);
+        config.sessions.push(second);
+        assert_eq!(
+            frame_scale(&config.clone().validate().unwrap(), 4).unwrap(),
+            2
+        );
+        config.sessions.pop();
+        config.daemon.memory_limit = one - 1;
+        assert!(frame_scale(&config.validate().unwrap(), 4).is_err());
+    }
+
+    #[test]
     fn accounting_includes_reserved_config_capacity_and_worker_queues() {
         let empty = Config::default().validate().unwrap();
-        let baseline = storage_bytes(&empty, 1).unwrap();
+        let baseline = storage_bytes(&empty, 1, 1).unwrap();
         let mut reserved = Config::default();
         reserved.peers.reserve(10_000);
         let reserved = reserved.validate().unwrap();
-        assert!(storage_bytes(&reserved, 1).unwrap() > baseline + 1_000_000);
-        assert!(storage_bytes(&empty, 4).unwrap() > baseline * 4);
+        assert!(storage_bytes(&reserved, 1, 1).unwrap() > baseline + 1_000_000);
+        assert!(storage_bytes(&empty, 4, 1).unwrap() > baseline * 4);
     }
 }

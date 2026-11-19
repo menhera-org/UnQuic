@@ -435,8 +435,19 @@ const _: () = assert!(LANES * reassembly::FRAME_CAPACITY <= 8192);
 const _: () =
     assert!(LANES * reassembly::FRAME_CAPACITY * reassembly::SLOT_LEN <= 64 * 1024 * 1024);
 
-const fn frame_quota(workers: usize) -> usize {
-    frames::CAPACITY / workers
+/// Factors by which a session's frame slots may exceed one store's worth,
+/// largest first; the runtime takes the first that fits `memory_limit`.
+pub(crate) const FRAME_SCALES: [usize; 3] = [4, 2, 1];
+
+/// Frames one owner retains for a session: `scale` even shares of a store,
+/// and never more than a store holds.
+const fn frame_quota(workers: usize, scale: usize) -> usize {
+    let quota = scale * frames::CAPACITY / workers;
+    if quota > frames::CAPACITY {
+        frames::CAPACITY
+    } else {
+        quota
+    }
 }
 
 /// Free buffers TAP reads leave beyond the receive reserve when other workers
@@ -449,19 +460,28 @@ const fn owner_reserve(workers: usize) -> usize {
 }
 
 // A worker can retain frames only for sessions where it reads TAP or owns TX lanes.
-fn frame_capacity(config: &crate::config::Config, workers: usize, id: usize) -> Option<usize> {
+// A scale above one is refused where the sessions' quotas would no longer fit one
+// store together: a larger budget must not come out of another session's share.
+fn frame_capacity(
+    config: &crate::config::Config,
+    workers: usize,
+    id: usize,
+    scale: usize,
+) -> Option<usize> {
     if workers == 0 || id >= workers {
         return None;
     }
     config.sessions.iter().try_fold(0_usize, |slots, session| {
         let peer = config.peers.iter().find(|peer| peer.name == session.peer)?;
         let owners = session.queue_count.max(peer.tx_lanes.min(workers));
-        let quota = frames::CAPACITY.checked_div(owners)?;
-        Some(if id < owners {
-            slots.saturating_add(quota).min(frames::CAPACITY)
-        } else {
-            slots
-        })
+        if owners == 0 {
+            return None;
+        }
+        if id >= owners {
+            return Some(slots);
+        }
+        let slots = slots.saturating_add(frame_quota(owners, scale));
+        (scale == 1 || slots <= frames::CAPACITY).then_some(slots.min(frames::CAPACITY))
     })
 }
 
@@ -1258,7 +1278,11 @@ macro_rules! phase {
 }
 
 impl Worker {
-    pub fn storage_bytes(validated: &crate::config::Validated, workers: usize) -> Option<usize> {
+    pub fn storage_bytes(
+        validated: &crate::config::Validated,
+        workers: usize,
+        frame_scale: usize,
+    ) -> Option<usize> {
         let config = validated.config();
         let mut per_worker = size_of::<Self>()
             .checked_add(crate::tap::Reader::storage_bytes()?)?
@@ -1328,7 +1352,7 @@ impl Worker {
             }
         }
         let frame_storage = (0..workers).try_fold(0_usize, |bytes, id| {
-            let capacity = frame_capacity(config, workers, id)?;
+            let capacity = frame_capacity(config, workers, id, frame_scale)?;
             bytes
                 .checked_add(frames::Store::storage_bytes(capacity))?
                 .checked_add(
@@ -1604,14 +1628,15 @@ impl Worker {
             free,
             returns: (0..count).map(|_| Vec::with_capacity(BUFFERS)).collect(),
             frames: {
-                let capacity =
-                    frame_capacity(config, count, id).ok_or(io::ErrorKind::InvalidInput)?;
+                let capacity = frame_capacity(config, count, id, shared.frame_scale)
+                    .ok_or(io::ErrorKind::InvalidInput)?;
                 let mut store = frames::Store::new(capacity)?;
                 store.reserve_wide(offload_slots(config, capacity))?;
                 store
             },
             recovery: recovery::Recovery::new(
-                frame_capacity(config, count, id).ok_or(io::ErrorKind::InvalidInput)?,
+                frame_capacity(config, count, id, shared.frame_scale)
+                    .ok_or(io::ErrorKind::InvalidInput)?,
             )?,
             received: VecDeque::with_capacity(count * BUFFERS),
             ready: VecDeque::with_capacity(batch_count),
@@ -2978,6 +3003,10 @@ impl Worker {
         Ok(Some(buffer))
     }
 
+    fn frame_quota(&self, workers: usize) -> usize {
+        frame_quota(workers, self.shared.frame_scale)
+    }
+
     fn tap_capacity(&self, session: usize) -> usize {
         let local = &self.sessions[session];
         // Only this worker's own unexpanded reads hold its TAP back. Frames other
@@ -2995,7 +3024,10 @@ impl Worker {
         self.free
             .len()
             .saturating_sub(RECEIVE_BUFFERS - self.rx_retained + 1 + owner_reserve(workers))
-            .min(frame_quota(workers).saturating_sub(local.tx_retained + 2))
+            .min(
+                self.frame_quota(workers)
+                    .saturating_sub(local.tx_retained + 2),
+            )
             .min(self.frames.available().saturating_sub(1))
             .min(
                 (64 * 1024 * 1024 / workers).saturating_sub(local.tx_bytes + MAX_FRAME_LEN) / 65535,
@@ -3126,13 +3158,13 @@ impl Worker {
                 };
                 let local = &self.sessions[session];
                 let workers = local.tx_workers;
-                if local.tx_retained >= frame_quota(workers)
+                if local.tx_retained >= self.frame_quota(workers)
                     || local.tx_bytes + length > 64 * 1024 * 1024 / workers
                 {
                     trace_event!(
                         self.id,
                         ADMIT_DROP,
-                        if local.tx_retained >= frame_quota(workers) {
+                        if local.tx_retained >= self.frame_quota(workers) {
                             1
                         } else {
                             2
@@ -3310,7 +3342,7 @@ impl Worker {
         if local.tap_inputs.len() == BUFFERS
             || (foreign
                 && (self.free.len() <= RECEIVE_BUFFERS - self.rx_retained + 1
-                    || local.tx_retained + 3 > frame_quota(local.tx_workers)
+                    || local.tx_retained + 3 > self.frame_quota(local.tx_workers)
                     || local.tx_bytes + buffer.length + MAX_FRAME_LEN
                         > 64 * 1024 * 1024 / local.tx_workers))
         {
@@ -3321,7 +3353,7 @@ impl Worker {
                     3
                 } else if self.free.len() <= RECEIVE_BUFFERS - self.rx_retained + 1 {
                     4
-                } else if local.tx_retained + 3 > frame_quota(local.tx_workers) {
+                } else if local.tx_retained + 3 > self.frame_quota(local.tx_workers) {
                     5
                 } else {
                     6
@@ -3340,7 +3372,7 @@ impl Worker {
                 0
             } else if self.free.len() <= RECEIVE_BUFFERS - self.rx_retained + 1 {
                 1
-            } else if local.tx_retained + 3 > frame_quota(local.tx_workers) {
+            } else if local.tx_retained + 3 > self.frame_quota(local.tx_workers) {
                 2
             } else {
                 3
@@ -3436,7 +3468,9 @@ impl Worker {
             return false;
         };
         let local = &self.sessions[input.session];
-        let remaining = frame_quota(local.tx_workers).saturating_sub(local.tx_retained);
+        let remaining = self
+            .frame_quota(local.tx_workers)
+            .saturating_sub(local.tx_retained);
         if remaining == 0
             || self.frames.available() == 0
             || self.fresh_full(input.session, input.lane)
@@ -6488,7 +6522,7 @@ mod tests {
                 break;
             }
         }
-        let quota = frame_quota(worker.sessions[0].tx_workers);
+        let quota = worker.frame_quota(worker.sessions[0].tx_workers);
         assert_eq!(pending(&worker).len(), quota - 1);
         assert_eq!(worker.sessions[0].tx_retained, quota);
         assert_eq!(worker.sessions[0].tx_bytes, input.len());
@@ -8485,7 +8519,7 @@ mod tests {
                 assert_eq!(worker.counters.queue_drops, 0);
             }
 
-            let quota = frame_quota(workers[1].sessions[0].tx_workers);
+            let quota = workers[1].frame_quota(workers[1].sessions[0].tx_workers);
             let bytes = 64 * 1024 * 1024 / workers[1].sessions[0].tx_workers;
             for (reserved_frames, reserved_bytes) in
                 [(quota - 2, 0), (0, bytes - MAX_FRAME_LEN - 59)]
@@ -8889,9 +8923,9 @@ mod tests {
     fn frame_storage_follows_each_sessions_actual_owners() {
         use crate::config::{Config, Peer, Session};
         let mut config = Config::default();
-        assert_eq!(frame_capacity(&config, 8, 0), Some(0));
-        assert_eq!(frame_capacity(&config, 0, 0), None);
-        assert_eq!(frame_capacity(&config, 8, 8), None);
+        assert_eq!(frame_capacity(&config, 8, 0, 1), Some(0));
+        assert_eq!(frame_capacity(&config, 0, 0, 1), None);
+        assert_eq!(frame_capacity(&config, 8, 8, 1), None);
         config.peers.push(Peer {
             name: "peer".into(),
             endpoint: "ep".into(),
@@ -8920,8 +8954,16 @@ mod tests {
                     let expected = frames::CAPACITY / owners;
                     for id in 0..workers {
                         assert_eq!(
-                            frame_capacity(&config, workers, id),
+                            frame_capacity(&config, workers, id, 1),
                             Some(if id < owners { expected } else { 0 })
+                        );
+                        assert_eq!(
+                            frame_capacity(&config, workers, id, 4),
+                            Some(if id < owners {
+                                (4 * expected).min(frames::CAPACITY)
+                            } else {
+                                0
+                            })
                         );
                     }
                     // Another session contributes only its own quota, up to the pool cap.
@@ -8931,8 +8973,15 @@ mod tests {
                     for id in 0..workers {
                         let first = if id < owners { expected } else { 0 };
                         assert_eq!(
-                            frame_capacity(&config, workers, id),
+                            frame_capacity(&config, workers, id, 1),
                             Some((first + frames::CAPACITY / workers).min(frames::CAPACITY))
+                        );
+                        // Four times as much only where both sessions still fit.
+                        let first = (4 * first).min(frames::CAPACITY);
+                        let second = frame_quota(workers, 4);
+                        assert_eq!(
+                            frame_capacity(&config, workers, id, 4),
+                            (first + second <= frames::CAPACITY).then_some(first + second)
                         );
                     }
                     config.sessions.pop();
@@ -8940,18 +8989,24 @@ mod tests {
             }
         }
         config.peers.clear();
-        assert_eq!(frame_capacity(&config, 8, 0), None);
+        assert_eq!(frame_capacity(&config, 8, 0, 1), None);
     }
 
     #[test]
     fn origin_reservations_bound_every_session_direction() {
         for workers in 1..=64 {
-            assert!(frame_quota(workers) * workers <= 8192);
+            for scale in FRAME_SCALES {
+                assert!(frame_quota(workers, scale) * workers <= scale * 8192);
+                assert!(frame_quota(workers, scale) <= frames::CAPACITY);
+            }
             assert!((64 * 1024 * 1024 / workers) * workers <= 64 * 1024 * 1024);
-            assert!(frame_quota(workers) <= frames::CAPACITY);
         }
-        assert_eq!(frame_quota(1), frames::CAPACITY);
-        assert_eq!(frame_quota(64), 128);
+        assert_eq!(frame_quota(1, 1), frames::CAPACITY);
+        assert_eq!(frame_quota(64, 1), 128);
+        // A larger scale gives each owner more, up to one whole store.
+        assert_eq!(frame_quota(16, 4), 2048);
+        assert_eq!(frame_quota(4, 4), frames::CAPACITY);
+        assert_eq!(frame_quota(2, 4), frames::CAPACITY);
     }
 
     #[test]
@@ -10043,6 +10098,7 @@ mod tests {
         let config = config.validate().unwrap();
         let shared = Arc::new(Shared {
             config,
+            frame_scale: 1,
             wakes: (0..2).map(|_| Arc::new(Wake::new().unwrap())).collect(),
             owners: (0..2)
                 .map(|_| (0..65_536).map(|_| AtomicU8::new(0)).collect())
