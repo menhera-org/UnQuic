@@ -1,0 +1,46 @@
+Profile build of a00f251 (features bin,uuid-compat,profile), four workers per daemon, left daemon.
+Phase shares are of busy cycles over the whole run; the sendmmsg counters are daemon totals.
+
+== Decision workload: routed 4.5 ms, 0.1% loss, bridged individual QinQ frames, sixteen flows,
+   20 s each at 0.5, 2 and 5 Gbit/s offered each way
+prof     r2 p0  0.49 +  0.49 =  0.99 G | off  0.50  0.50 | CPU  212%  212% busiest  67  66 | miss  0.0%  0.0% | 
+prof     r2 p1  1.96 +  1.97 =  3.93 G | off  1.99  1.99 | CPU  352%  360% busiest  98  98 | miss  0.4%  0.3% | 
+prof     r2 p2  2.46 +  2.57 =  5.03 G | off  4.97  4.97 | CPU  352%  345% busiest  97  96 | miss 49.9% 47.8% | 
+ 22.30% flush_frames
+ 19.14% flush_taps
+ 17.74% service_sender
+ 15.99% read_tap
+  6.40% read_socket
+  4.43% drain_queues
+  3.64% drain_packets
+  2.37% poll
+  1.98% flush_notifications
+  1.82% drain_tap_inputs
+  1.37% flush_control
+  1.14% reactor_drain
+  0.55% arm
+  0.36% collect_acks
+sendmmsg cycles/calls/datagrams [98413093860, 1445153, 10452713]
+tap_read_calls 2070464
+tap_uso_batches 1852324
+tap_uso_frames 6734604
+tap_write_calls 3743837
+
+== Loopback, sixteen QinQ flows as 44-segment GSO, 20 s each at 4.8 and 8 Gbit/s offered each way
+prof     r1 p0  4.75 +  4.75 =  9.50 G | off  4.80  4.79 | CPU  176%  175% busiest  59  59 | miss  0.0%  0.0% | 
+prof     r1 p1  6.40 +  7.26 = 13.66 G | off  7.99  7.99 | CPU  272%  272% busiest  98  96 | miss 19.0%  8.1% | 
+ 20.49% flush_frames
+ 17.98% flush_taps
+ 17.29% service_sender
+ 12.51% drain_packets
+  9.48% read_socket
+  7.11% read_tap
+  4.34% drain_tap_inputs
+  2.87% poll
+  2.65% flush_control
+  1.63% flush_notifications
+  1.46% drain_queues
+  0.92% reactor_drain
+  0.65% collect_acks
+  0.32% arm
+sendmmsg cycles/calls/datagrams [29925163976, 725116, 21734129]

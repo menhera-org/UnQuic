@@ -2637,6 +2637,48 @@ of their CPU and delivers nothing more: ACK volume no longer limits the
 gate. The count stays at 48, which keeps feedback finer on lossy paths,
 where the larger counts were not measured.
 
+## Four workers on the lossy path, and what the routed test bed costs (November 19)
+
+Four workers per daemon on the routed 7.5 ms path with 1% loss, sixteen
+QinQ flows of 1522-byte frames as 44-segment GSO, 20 s a point after a
+1 Gbit/s warm-up, two rounds on `a00f251`
+([results](benches/four-workers-lossy-gso.json)). Delivered Gbit/s each
+way:
+
+| `daemon` switches | 4 Gbit/s offered each way | 5.5 offered |
+| --- | --- | --- |
+| none | 2.35–3.13 | 2.93–3.16 |
+| none, a second arm | 2.71–2.85 | 2.72–2.93 |
+| `loss_threshold_permille = 100` | 2.45–3.01 | 2.32–3.32 |
+| `offload_frames` | 2.90–3.24 | 2.89–3.53 |
+| both | 2.89–3.20 | 2.83–3.32 |
+
+Each daemon uses 240–315% of its four cores, with its busiest worker at
+88–96%. On loopback the same four workers deliver about 7 Gbit/s each
+way at 8 offered, 13.9–14.1 in total. Most of the difference is the path
+emulation, which
+runs on the daemons' own cores. A profile build
+([counts](benches/routed-send-cost-profile.txt)) puts `sendmmsg` at 1,377
+cycles per outer datagram on loopback and at 9,415 on the routed path,
+29% of a daemon's busy cycles on the decision workload: each datagram is
+segmented at the veth, forwarded through the router namespace and queued
+in netem inside the sender's system call. The receive half, from netem's
+timer to the receiving socket, runs as soft interrupts on whichever
+daemon core armed the timer, which is one way a worker comes to stall
+for milliseconds. Moving that work to other cores would take RPS or
+threaded NAPI, and the unprivileged container refuses both writes.
+
+So with four workers a routed run here measures the emulated router as
+much as the daemon. It gives a floor for a four-core box, and whether
+such a box carries 5 Gbit/s over its access line is a question for the
+box and its NICs.
+
+The same profile on the decision workload: with sixteen flows of
+individual frames interleaved on four lanes, a TAP write carries 2.3
+frames on average (3.6 in the half of the writes that coalesce), and
+four workers are saturated from 2 Gbit/s offered each way, where they
+deliver 1.96–1.97.
+
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 
 Decision 8 kept offload frames off because two-slot runs lost more frames

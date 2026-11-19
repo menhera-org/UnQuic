@@ -88,7 +88,13 @@ Still open, in the order they now matter:
    at 6 offered. What the gate still lacks is the box: four workers deliver
    about 2.5 Gbit/s per direction on the decision workload at 5G offered,
    CPU-bound at 96–98% of every core, and one flow stays near 1.0–1.4
-   Gbit/s on one worker (2.0–2.2 with `stripe_flows`).
+   Gbit/s on one worker (2.0–2.2 with `stripe_flows`). With GSO traffic
+   four workers deliver about 3 Gbit/s each way on the routed path against
+   about 7 on loopback, because the emulated router runs on the daemons'
+   cores: a send costs 9,400 cycles per datagram there and 1,400 on
+   loopback. Routed runs with four workers are therefore a floor, and the
+   four-core gate needs the box
+   ([BENCH.md](BENCH.md#four-workers-on-the-lossy-path-and-what-the-routed-test-bed-costs-november-19)).
 3. The per-frame budget for a four-core box (design section 13.1), about
    5,200 cycles per frame event against 2,200–3,150.
 4. The small-frame rows and the overload plateau, not remeasured since
