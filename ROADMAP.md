@@ -7,6 +7,73 @@ read that section before writing code. Keep the "Current status" paragraph in
 section 15 of the design and the "Implementation status" section of
 [README.md](README.md) true after every step.
 
+## November 19 checkpoint
+
+The local gate's rate was reached for the first time. With sixteen
+workers per daemon the loopback check delivers 20.1–20.7 Gbit/s of inner
+UDP payload each way at 21 Gbit/s offered in five of five 60-second runs
+with `offload_frames`, and 19.9–20.5 without it in four runs of five, where
+`d30cf96` delivered 12.8–17.8 / 10.3–13.4 Gbit/s
+([BENCH.md](BENCH.md#one-report-per-ack-november-19-landed)). Nothing
+changed on the wire. Three changes landed:
+
+- **One report per ACK.** A lane applied an ACK in passes of 64 packets,
+  and each pass was a round trip with the controller owner before the
+  next could start. A lane at 1 Gbit/s needs more than 1,500 of them a
+  second; with workers that sleep between events it got fewer, its ACKs
+  merged and fell further behind, and every lane stopped near 1 Gbit/s
+  while round-trip samples still read 0.1 ms. A lane now settles the
+  whole ACK itself and sends the controller one summary. Alone this
+  lifts the sixteen-worker check from about 29 to 33.5 Gbit/s in total,
+  four workers past saturation by 5.6% and the decision workload at 5G
+  by 4–8%, and it costs nothing on the efficiency points.
+- **A control ceiling that follows received traffic**, as design section
+  9 specified: 4 MiB/s plus a thirty-second of the outer bytes received.
+  At 20 Gbit/s each way ACKs take about 4 MiB/s, so the fixed ceiling sat
+  exactly at the gate.
+- **A reader that transmits nothing.** With at least six other data
+  lanes a TAP reader places no new flow on its own lane. The reader then
+  reads what is offered, and the check goes from 33.5 to 40.5 Gbit/s in
+  total. Four workers are unaffected. It changes where frames wait when
+  the lanes are held back, which shows on the lossy path as more frames
+  expired and less delay; that trade is decision 10 below.
+
+How the cause was found is in
+[BENCH.md](BENCH.md#sixteen-workers-at-the-gate-point-november-19): the
+receive sockets, the control ceiling, BBR's window and wake-up latency
+each looked like the limit and none was. A histogram of the time from a
+packet's send to the release of its inflight charge showed two thirds of
+the bytes waiting 2–10 ms inside the sender.
+
+The rate is reached with a margin of one or two percent, which is also how
+much this host varies: a set on an earlier build read 18.0–19.9 Gbit/s in
+one direction without `offload_frames`. Each daemon keeps eight to ten of
+its sixteen cores busy. `rotate_lanes` adds about 15% of ceiling at
+26 Gbit/s offered each way (46.8–47.6 Gbit/s in total against 37.9–42.8)
+and evens the directions, which bears on decision 9. A spin-before-sleep
+option and a rotation that gives the reader the peer's empty lane were
+measured on the way and not kept: neither adds anything once an ACK costs
+one report.
+
+Still open, in the order they now matter:
+
+1. The acceptance profile of design section 14.2 has to be frozen by the
+   user: hardware, core budget, flow count and frame mix. The runs above
+   are one profile on one host.
+2. The 5 Gbit/s gate over a lossy 4.5–7.5 ms path. In a first look
+   sixteen workers deliver 5.0–5.3 Gbit/s each way at 5.5 offered with 1%
+   loss, in all six runs at 7.5 ms and four of six at 4.5 ms, with no
+   worker above 57% of a core; frames are lost in the sender, and a trace
+   has to say why
+   ([BENCH.md](BENCH.md#the-lossy-path-at-55-gbits-offered-november-19-first-look)).
+   Four workers deliver 2.4–2.7 Gbit/s per direction on the decision
+   workload at 5G offered, CPU-bound at 95–98% of every core; one flow
+   stays near 1.0–1.4 Gbit/s on one worker (2.0–2.2 with `stripe_flows`).
+3. The per-frame budget for a four-core box (design section 13.1), about
+   5,200 cycles per frame event against 2,200–3,150.
+4. The small-frame rows and the overload plateau, not remeasured since
+   November 12.
+
 ## November 15 checkpoint
 
 Per-frame cost on the full-size efficiency point fell about 12% in two
@@ -429,6 +496,11 @@ Decisions only the user can make, each blocking a remaining goal:
    buffers, which this host cannot raise and a root deployment does not
    have. Is a measurement on a host with more CPUs and larger buffers
    available, or should the gate be judged on the 9000-byte path?
+   November 19: the rate was reached on this host at a 1500-byte outer
+   path with sixteen workers per daemon (checkpoint above). The small
+   buffers still overflow 1,000–38,000 times in a 60-second run and each
+   overflow costs repairs, so the question is now how much margin the gate
+   should show, and on what hardware and core budget.
 4. Should `daemon.tx_hold_us` default to 200? It saves 5–6% of CPU per
    delivered bit at 0.5 Gbit/s and about 3% at 2G, leaves 5G unchanged and
    no longer shows a loss of its own, but it
@@ -661,6 +733,28 @@ Decisions only the user can make, each blocking a remaining goal:
    with one reading worker, and to look next at whether the control lane
    can go to an idle worker while the reader still receives no data
    ([BENCH.md](BENCH.md#which-worker-receives-which-lane-with-four-workers-november-16)).
+   November 19: with sixteen workers it adds about 15% of ceiling at
+   26 Gbit/s offered each way and evens the two directions (46.8–47.6
+   Gbit/s in total against 37.9–42.8); at 21 Gbit/s offered it changes
+   little. A variant that gives the reader the peer's empty lane instead
+   of its control lane was 1% ahead on three rounds and was not kept
+   ([BENCH.md](BENCH.md#a-reader-that-transmits-nothing-november-19-landed)).
+   The lossy-path question is not remeasured on the new build.
+10. Open since November 19: where should frames wait when the lanes are
+   held back for a moment? Since a TAP reader with six or more other data
+   lanes transmits none itself, it reads on while lane owners queue what
+   it hands them, and frames older than their lifetime (20 ms on a 4.5 ms
+   path) expire in the sender. Before, the reader stopped reading as soon
+   as its own lane backed up, and frames waited in the kernel's TAP ring,
+   where no deadline runs. On the routed 4.5 ms path with 1% loss and
+   eight workers the first loses 0.03–0.05% of frames at a round's worst
+   point where the second lost 0.01%, with the largest delay about 10 ms
+   lower and 2–3% less CPU per bit. Four-worker boxes are not affected.
+   The recommendation is to keep the new behaviour: it is what lets one
+   reader carry 20 Gbit/s, and a bounded delay is what the frame lifetime
+   is for. If the old behaviour is wanted, a small buffer credit for a
+   reader that only reads would bring it back; it is not built
+   ([BENCH.md](BENCH.md#a-reader-that-transmits-nothing-november-19-landed)).
 
 ## November 11 checkpoint
 
@@ -851,7 +945,10 @@ rules apply to all of them.
    stage 5, where the 5% rows need forward error correction or a
    loss-agnostic response.
 5. **Close the stage 2 gate:** 20 Gbit/s each direction locally at inner MTU
-   1500, plus the small-frame burst rows. On November 10 the loopback overload
+   1500, plus the small-frame burst rows. November 19: the rate is reached
+   with sixteen workers per daemon (checkpoint at the top); the margin, the
+   frozen profile and the small-frame rows remain. The history of the check
+   follows. On November 10 the loopback overload
    check delivers 5.77 / 2.81 Gbit/s at 21 Gbit/s requested, after draft 07's
    three-quantum offload budget lifted the window-limited R→L sender by 71%
    ([BENCH.md](BENCH.md#three-quantum-offload-budget-november-10)). On

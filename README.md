@@ -13,7 +13,7 @@ NTT NGN is one deployment and performance validation environment.
 - Use `libc` for syscalls and socket options where appropriate; use `const fn` wherever a function can be one.
 - Receive admission: bound receive sockets accept packets by cookie, wire validity and protocol state, regardless of source address or port. Peer addresses select transmit destinations only.
 - Performance contract: no locks or allocations in hot paths. State transitions make no syscalls; workers batch I/O, notifications and timer updates. Performance claims require measurements.
-- Performance targets: local container tests must sustain at least 20 Gbit/s in each direction simultaneously at inner MTU 1500, with CPU use reported. The deployment target is at least 5 Gbit/s over real routed IPv6 10G-EPON access lines with 4.5–7.5 ms RTT and nonzero packet loss. Neither target has been demonstrated; section 14.2 of the design defines the acceptance work.
+- Performance targets: local container tests must sustain at least 20 Gbit/s in each direction simultaneously at inner MTU 1500, with CPU use reported. The deployment target is at least 5 Gbit/s over real routed IPv6 10G-EPON access lines with 4.5–7.5 ms RTT and nonzero packet loss. The local rate was first reached on November 19, with sixteen workers per daemon and a margin of one or two percent (BENCH.md); its acceptance profile is not frozen, and the deployment target has not been demonstrated. Section 14.2 of the design defines the acceptance work.
 - No async runtime: plain pinned threads with batched syscalls. `tokio` gives one syscall per packet, no GSO/GRO, cross-core task migration, and 1 ms timers, all wrong for a few always-busy sockets. See section 10 of the design.
 - Platform contract: assume the Linux kernel and only the interfaces, files, and permissions needed by the selected features, such as `/dev/net/tun` for TAP creation and `/etc/resolv.conf` when using `iphost`'s system resolver. Its configurable `ipv6`, `ra`, and `dhcpv6` modes bypass system resolvers. Document each additional host assumption with the feature that needs it. Make no assumptions about the surrounding userspace: no required XDG or other freedesktop.org conventions, GNU userspace, Android or ChromeOS facilities, systemd, or D-Bus dependencies. Binaries are built for `*-unknown-linux-musl` targets.
 - Library I/O: the transport core reads no ordinary files or environment variables and writes no diagnostics. Kernel interfaces such as `/dev/net/tun`, sockets, and ioctls are allowed. The optional iphost layer uses the selected resolver's operating-system facilities; see [resolver requirements](config-model.md#daemon-resolver-selection). Application configuration-file handling and command-line I/O belong to the caller or daemon.
@@ -344,8 +344,20 @@ packets wakes the controller owner only when no lane of its session is being
 timed, when it restarts from idle or when it changes the datagram size. A
 worker that hands work to another does not take a further turn for it.
 
+An ACK costs its lane one report to the controller owner, whatever it
+covers. The lane settles the acknowledged packets in passes of at most 64,
+releasing their inflight charge and frame coverage as it goes, and adds up
+what the controller needs: settled packets, delivered bytes, the newest
+send record and whether anything but a path-MTU probe was delivered. The
+pass that ends the ACK sends that summary. Loss reports still carry one
+entry per packet.
+
 ACK, handshake and PROBE_REPLY sends share a 4 MiB/s outer-byte ceiling per
-path group, with a burst of sixteen datagrams. Worker zero owns each fixed
+path group, with a burst of sixteen datagrams. Received traffic raises the
+ceiling: each ACK reaches worker zero with the outer bytes its lane received
+since the lane's previous ACK, a thirty-second of them may be sent as
+control beyond the fixed rate, and an idle group keeps at most sixteen
+maximum-size datagrams of that allowance. Worker zero owns each
 scheduler; successful sends alone consume its budget. A throttled handshake
 retains one flight per session and wakes at the next budget deadline.
 Successful submission updates the handshake retry clock and token budget;
@@ -755,6 +767,13 @@ where the daemon without it lost 0.01%, so it stays off by default and
 is meant for boxes that saturate with one reading worker (BENCH.md,
 decision 9 in ROADMAP.md). The wire format and the peer are unaffected.
 
+A TAP reader places no new flow on a lane it transmits itself while at
+least six other data lanes remain, so a worker that reads a whole session
+keeps its core for reading. With fewer lanes, as with four workers, flows
+take the lanes in turn as before. Sessions whose TAP queues all carry
+traffic lose nothing by it, since the other readers still fill each
+worker's lane.
+
 Flow hashing looks through one unfragmented IPv4, IPv6 or Ethernet
 encapsulation, including an IPv6 segment routing header before the inner
 packet. It retains the outer key and adds the inner addresses, protocol and
@@ -819,8 +838,9 @@ with fixed vectors under `tests/vectors/bbr-07`. It counts newly acknowledged
 physical transmissions, including late originals and repairs, and preserves
 one ACK sample across bounded processing turns. It distinguishes application
 bubbles from host-queue limitation. The pure BBRv3 controller implements draft-07's
-model and state machine. Worker integration includes recovery, and the
-performance gates remain unfinished. Each path group's budget keeps one bit per
+model and state machine. Worker integration includes recovery. The local
+rate gate was first met on November 19 and the lossy-path gate remains
+open. Each path group's budget keeps one bit per
 worker holding unsent data. New data that finds no bit set, inflight below the
 window, none of the worker's own frames awaiting repair and no refused
 admission since the worker last held data starts draft 07's
@@ -876,7 +896,8 @@ test that drops all traffic until both ends degrade sees both directions
 deliver again within 1.35 seconds, with no duplicate frame.
 
 Release forwarding, reconnect, allocation and routed-MTU regression tests pass.
-The performance gates remain open; BENCH.md records the replacement sender's
+Sixteen workers per daemon first delivered 20 Gbit/s each way on
+November 19; the lossy-path gate remains open. BENCH.md records the
 measurements.
 
 ## TAP read batching

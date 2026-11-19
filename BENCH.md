@@ -96,8 +96,8 @@ comparison below.
 
 ## Current performance gaps
 
-Updated November 12; the first four rows and the last two are current, the
-others keep earlier evidence. L→R / R→L pairs are simultaneous. Run-to-run
+Updated November 12, and the first row on November 19; the first four rows
+and the last two are current, the others keep earlier evidence. L→R / R→L pairs are simultaneous. Run-to-run
 noise is large: identical binaries differ by up to 7.5% in loopback total and
 up to 18% in one direction (A/A, November 12), so single differences of a few
 percent mean nothing. Efficiency changes are judged by CPU per delivered
@@ -105,7 +105,7 @@ Gbit/s at an offer-limited load instead.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | Loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98%. With sixteen workers per daemon and thirty-two flows: 7.11 / 7.03 Gbit/s, no thread above 75%, limited by receive-socket overflow under the container's 416 KiB buffer ([BENCH.md](#sixteen-workers-per-daemon-november-11-exploratory)). Over a 9000-byte outer path: 10.27 / 13.90 Gbit/s with QinQ and 10.78 / 17.82 with one tag at sixteen workers, 13.36 / 11.77 with QinQ at eight, at 34–45% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)) | At a 1500-byte outer path the per-bit cost must roughly halve; a 9000-byte path halves it but no thread then saturates, and reordering and overflows rise. One left worker does two jobs: it reads every L→R frame from the TAP (QinQ input all lands on one queue) and receives the R→L lanes it owns. L→R senders idle for its input; its socket overflows and R→L loses packets, so BBR cuts. More receive buffers move capacity from L→R to R→L (+11% total, L→R −14%); letting tun spread reads costs 23% more CPU per bit ([BENCH.md](#receive-buffers-for-a-busy-reader-november-11)). Next: keep receive work off the TAP reader, or split TAP reading inside the daemon. |
+| At least 20 Gbit/s each way at inner MTU 1500 | November 19: sixteen workers per daemon deliver 20.1–20.7 Gbit/s each way in five of five 60 s runs with `offload_frames`, and in four of five without it (the fifth reads 19.90 one way), at 800–863% and 942–996% of a core per daemon, thirty-two QinQ flows at 21 Gbit/s offered ([BENCH.md](#one-report-per-ack-november-19-landed)). Before that: loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98%. With sixteen workers per daemon and thirty-two flows: 7.11 / 7.03 Gbit/s, no thread above 75%, limited by receive-socket overflow under the container's 416 KiB buffer ([BENCH.md](#sixteen-workers-per-daemon-november-11-exploratory)). Over a 9000-byte outer path: 10.27 / 13.90 Gbit/s with QinQ and 10.78 / 17.82 with one tag at sixteen workers, 13.36 / 11.77 with QinQ at eight, at 34–45% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)) | November 19: the margin over 20 is one or two percent, as large as this host's own variation, and the acceptance profile (hardware, core budget, flow count, frame mix) is not frozen. It takes sixteen workers per daemon, eight to ten cores of them busy. Earlier: at a 1500-byte outer path the per-bit cost must roughly halve; a 9000-byte path halves it but no thread then saturates, and reordering and overflows rise. One left worker does two jobs: it reads every L→R frame from the TAP (QinQ input all lands on one queue) and receives the R→L lanes it owns. L→R senders idle for its input; its socket overflows and R→L loses packets, so BBR cuts. More receive buffers move capacity from L→R to R→L (+11% total, L→R −14%); letting tun spread reads costs 23% more CPU per bit ([BENCH.md](#receive-buffers-for-a-busy-reader-november-11)). Next: keep receive work off the TAP reader, or split TAP reading inside the daemon. |
 | Goodput must plateau under excess traffic | Decision workload (four workers, 4.5 ms), `3178088`: sixteen flows deliver 1.62 / 1.64 Gbit/s at 2G offered and 2.03 / 1.58 at 5G; four flows 1.31 / 1.73 and 0.92 / 1.38 ([BENCH.md](#decision-workload-baseline-november-12-evening)). With the read margin (`3b9e86f`) every 5G total matches or exceeds its 2G total: four flows 1.21 / 2.07 at 5G, sixteen 2.03 / 1.77 ([BENCH.md](#owners-refusing-each-other-a-read-margin-landed)). Workers run at 77–99% of a core | Lossy four-flow L→R still falls 10% from 2G to 5G, and overloaded p99 delay rose with the extra delivery. Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
 | TCP through the tunnel | Loopback, eight workers, eight iperf3 streams each way: 9.2–9.9 Gbit/s in total at about 1 core per Gbit/s, about 1% of segments retransmitted ([BENCH.md](#tap-queue-length-and-overload-delay)) | Losses come from receive-socket overflows under the container's 416 KiB buffers; the daemon cannot raise them without `CAP_NET_ADMIN`. |
 | Small-frame overload must remain efficient | Untagged 64-byte frames, sixteen flows, current build: 3.24–3.43 / 3.27–3.48 M frames/s unlimited with eight workers and 4.23–4.53 / 4.16–4.57 M with sixteen, against 5.87 / 5.74 M for the pre-recovery build; QinQ 128-byte frames 2.18–2.31 / 3.32–3.53 M; 1.85–1.95 cores per M frames/s against 1.28–1.33 ([BENCH.md](#small-frame-rows-at-the-current-build-november-12)) | About 45% more CPU per frame since recovery and BBR, spread across transmit bookkeeping with no single large target; four candidates cut 0–3% at overload, and the expiry heap landed at −4.2% CPU per frame offer-limited ([BENCH.md](#where-the-small-frame-cost-comes-from-november-12)). One to one and a half of eight workers per daemon idle because tun's queue hash leaves them no transmit work; balanced lanes do not change this. High ingress loss persists; mixed traffic and non-coalescible frames remain unverified. |
@@ -2127,6 +2127,325 @@ worker with the longest turns, so ACKs wait longer and the congestion
 controller's queue check, which is what loses frames on this path, sees
 more jitter. The switch stays off by default; its use is a box that
 saturates, and its default is left to the user.
+
+## Sixteen workers at the gate point (November 19)
+
+The local gate asks for 20 Gbit/s each way at inner MTU 1500. The point
+measured here is the loopback overload check with sixteen workers per
+daemon: thirty-two QinQ flows of 1522-byte frames each way, sent as
+44-segment GSO, a 4 Gbit/s warm-up point and then 21 Gbit/s offered each
+way for 20 s, a 1452-byte outer payload limit, a 500-frame TAP ring and a
+1 GiB `memory_limit`. Each daemon and its load processes have one 20-core
+socket. Figures are inner UDP payload delivered L→R + R→L in Gbit/s; a
+1522-byte frame carries 1472 bytes of it.
+
+`d30cf96`, two rounds
+([results](benches/sixteen-workers-gate-d30cf96.json)):
+
+| `daemon` switches | Delivered | CPU per daemon | Busiest thread, left / right |
+| --- | --- | --- | --- |
+| none | 15.5 + 10.0, 15.7 + 10.6 | 644–675% | 90–93% / 76–84% |
+| `offload_frames` | 16.6 + 11.0, 16.6 + 11.8 | 567–674% | 87–93% / 74–81% |
+| `rotate_lanes` | 14.3 + 12.2 (one round; the other lost its snapshot) | 667–681% | 86% / 75% |
+| both | 16.0 + 11.3, 14.6 + 12.4 | 631–671% | 86–91% / 73–79% |
+
+Every QinQ frame reaches one TAP queue, so one worker reads the whole
+session. It runs at 87–93% of a core, 65–73% of it in the kernel, while
+most of the other fifteen run at 30–40%, and the frames that go missing are
+dropped at the TAP ring: 150,040 of 803,171 super-frames L→R in one
+round and 339,193 of 805,091 R→L. A profile puts a TAP read of a 64 KiB
+super-frame at about 26,700 cycles, 12.7 µs, on this host. That is half
+of the reader's busy time; its own transmit lane and the data lane it
+receives take most of the rest. At 20 Gbit/s the reads alone need about
+half a core, so a worker that only reads has room.
+
+The reader was then relieved in a diagnostic build
+([patch](benches/sixteen-workers-gate-diagnostics.patch), switched by an
+environment variable): new flows skip the lane it transmits. Delivery
+fell, with `offload_frames` on in every arm
+([results](benches/sixteen-workers-gate-reader-freed.json); `x0` is the
+control, `x1` skips the lane, `x2` stops lane owners from holding a
+reader's buffer credit, `x3` does both, and an `r` adds `rotate_lanes`):
+
+| Arm | Delivered | CPU per daemon | Sources dropped at admission, left / right |
+| --- | --- | --- | --- |
+| control | 16.5 + 11.9, 16.9 + 14.7 | 617–681% | 180–646 / 252–512 |
+| reader's lane skipped | 14.2 + 12.6, 13.9 + 12.8 | 790–826% | 72,674–78,847 / 40,505–42,388 |
+| credit never held | 16.5 + 11.8, 16.4 + 11.6 | 607–670% | 361–570 / 326–1,556 |
+| both | 14.3 + 12.0, 13.6 + 11.8 | 790–833% | 213,663–234,960 / 271,599–272,552 |
+
+The reader then reads as much as before at 71% of a core, and the lanes
+drop what it hands them: every lane sends about 1.0 Gbit/s whatever it
+is offered, with workers half idle. Four guesses at the cause were
+tested in the same build and none moved delivery: the control ceiling
+raised sixteenfold
+([results](benches/sixteen-workers-gate-control-rate.json), `x4`, `x5`
+with the lane skipped), 32 receive buffers per worker instead of 8
+([results](benches/sixteen-workers-gate-receive-buffers.json), arms
+`x8`, `x12`, `x13`), a receive-socket read between the long phases of a
+turn, and both together
+([results](benches/sixteen-workers-gate-socket-drain.json), arms `x24`,
+`x29`). The raised ceiling did show that ACKs were pinned at it:
+worker 0 sent 3.91–3.93 MiB/s of the 4 MiB/s allowed, and 8.4 MiB/s
+once it could.
+
+A trace of that run shows a sender bounded by its window, not its pacing
+rate: BBR's `max_bw` reads 25–53 Gbit/s while 12–17 Gbit/s are
+delivered, 5–9 MB are in flight against a window of 6–13 MB set by
+`inflight_longterm`, and smoothed RTT stays under 0.2 ms. Workers that
+never sleep changed the picture. A build that polls instead of blocking
+delivered 18.1–19.3 + 15.5–15.7 with the lane skipped, and one that
+polls for 100 µs after its last work before blocking 20.2–20.3 +
+13.4–15.6 at about 1,150% of a core per daemon
+([results](benches/sixteen-workers-gate-spin.json), arms `s0` to `s200`
+by the microseconds polled, `busy` for no blocking at all). So something
+in the feedback loop waited on sleeping workers.
+
+A histogram of the time from a packet's send to the release of its
+inflight charge found it
+([counts](benches/sixteen-workers-gate-time-in-flight.txt), bytes per
+worker in nine classes, acknowledged then lost;
+[runs](benches/sixteen-workers-gate-time-in-flight.json)). Share of
+acknowledged bytes by that time, both points of one round at 21 Gbit/s
+offered:
+
+| Build | Sender | Under 0.5 ms | 0.5–2 ms | 2–5 ms | 5–10 ms | Over 10 ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| `d30cf96` behaviour (`h`) | left, 18.5 Gbit/s | 94.4% | 5.0% | 0.6% | 0.0% | 0.0% |
+| | right, 11.6 Gbit/s | 35.5% | 12.2% | 12.1% | 26.4% | 13.8% |
+| Reader's lane skipped (`n`) | left, 12.2 Gbit/s | 10.3% | 14.7% | 32.8% | 33.1% | 9.0% |
+| | right, 11.7 Gbit/s | 13.8% | 18.0% | 29.2% | 29.3% | 9.6% |
+
+Two thirds of the bytes wait 2–10 ms for their release while RTT
+samples, taken when an ACK arrives, read 60–140 µs. The wait is inside
+the sender. A lane applies an ACK in passes of at most 64 packets, each
+pass fills the worker's one report, and the lane goes on only when the
+controller owner has applied that report and sent it back. A lane can
+thus settle 64 packets per round trip with worker 0. A lane at 1 Gbit/s
+sends about 100,000 packets a second, so it needs more than 1,500 round
+trips a second; when both ends of the round trip sleep between events
+it gets fewer, ACKs wait and merge, each merged ACK needs several round
+trips, and the lane is held to what the round trips settle, about
+1 Gbit/s. The receive sockets, the control ceiling and BBR were only
+where it showed.
+
+## One report per ACK (November 19, landed)
+
+A lane now settles an ACK of any size itself and tells the controller
+owner once. Each pass of at most 64 packets releases its inflight charge
+and frame coverage as before and adds to a summary on the lane: settled
+packets, newly delivered bytes, the newest send record and whether
+anything but a path-MTU probe was delivered. A pass that does not end
+the ACK returns the report box to its worker at once; the pass that ends
+it sends the summary. The controller draws the same rate sample from it
+as from the entries it used to add up. Loss reports keep one entry per
+packet.
+
+At the gate point of the section above, three rounds each with
+`offload_frames` on
+([results](benches/sixteen-workers-gate-ack-summary.json); `onlyE` is
+this change alone, `noB` adds the control ceiling below, `noA` adds the
+reader's lane below instead, `full` has all three):
+
+| Build | Delivered L→R + R→L | Total | CPU per daemon |
+| --- | --- | --- | --- |
+| `d30cf96` | 15.9–17.8 + 12.0–12.1 | 27.9–29.8 | 610–745% |
+| One report per ACK | 16.4–16.9 + 16.7–16.8 | 33.1–33.6 | 659–677% |
+| and the control ceiling | 15.4–16.9 + 17.1–18.1 | 33.4–34.2 | 657–697% |
+| and the reader's lane | 20.3–20.4 + 20.3 | 40.6–40.7 | 797–837% |
+| all three | 20.3–20.5 + 20.0–20.4 | 40.3–40.9 | 811–827% |
+
+Alone it lifts the weaker direction from 12 to 16.7 Gbit/s and leaves
+both at what the reading worker can read, 93–96% of a core. With the
+reader's lane spared as well the daemons deliver what is offered less
+0.4–2.5%. With the default configuration, `offload_frames` off, the
+same build delivers 20.19–20.26 + 20.21–20.31 Gbit/s in three rounds of
+three at 941–953% of a core per daemon, where `d30cf96` delivers
+12.8–14.9 + 10.3–11.5
+([results](benches/sixteen-workers-gate-default-config.json)). Median
+one-way delay at that point is 0.35–0.41 ms against 16–24 ms, because
+the TAP ring no longer stands full; the 99th percentile is 15–21 ms
+against 29–57. Each daemon's resident memory peaks at 298 MB under the
+1 GiB limit.
+
+These are the first runs to meet the local gate's rate, at least
+20 Gbit/s of inner payload each way at inner MTU 1500 (20.2 Gbit/s of
+UDP payload is 20.9 of Ethernet frames).
+
+**Sixty-second runs.** Design section 14.2 asks for five runs of 60 s.
+Final tree, the same point with 60 s a point, five runs per arm with the
+arms in rotating order
+([results](benches/sixteen-workers-gate-60s.json)):
+
+| `daemon` switches | Delivered L→R + R→L, run by run | Runs with 20 or more each way | CPU per daemon | Median delay | 99th percentile |
+| --- | --- | --- | --- | --- | --- |
+| none | 20.51 + 20.38, 19.90 + 20.06, 20.50 + 20.53, 20.49 + 20.50, 20.30 + 20.27 | 4 of 5 | 942–996% | 0.36–0.41 ms | 14–26 ms |
+| `rotate_lanes` | 20.52 + 20.50, 19.85 + 20.13, 20.43 + 20.45, 20.40 + 20.54, 20.51 + 20.58 | 4 of 5 | 940–991% | 0.29–0.36 ms | 11–27 ms |
+| `offload_frames` | 20.25 + 20.11, 20.56 + 20.54, 20.53 + 20.46, 20.33 + 20.36, 20.65 + 20.67 | 5 of 5 | 800–863% | 0.31–0.36 ms | 12–24 ms |
+| both | 20.47 + 20.59, 20.54 + 20.39, 20.31 + 20.57, 20.54 + 20.64, 19.44 + 19.75 | 4 of 5 | 799–847% | 0.26–0.35 ms | 9–31 ms |
+
+No frame arrived twice or damaged. The daemons deliver all but 0.3–5% of the
+21 Gbit/s offered, so the margin over 20 is one or two percent, and the
+runs that fall short do so by less than one: 19.85–19.90 in one
+direction, and in the last row's fifth run the generator itself offered
+only 20.58 L→R. The host's own variation is as large as that margin. An
+earlier set on a build of the same three changes read 19.87–20.34 +
+17.96–19.91 with no switch and 19.72–20.61 + 19.73–20.52 with
+`offload_frames`
+([no switch](benches/sixteen-workers-gate-60s-default.json),
+[`offload_frames`](benches/sixteen-workers-gate-60s-offload.json)); part
+of the host carries other load, and the receive sockets, held to 416 KiB
+in this container, overflow 1,000–38,000 times a run. With
+`offload_frames` the profile is met in every run of the later set and in
+four of five of the earlier; without it the rate is reached but not
+held in every run. The frozen acceptance profile (hardware, core budget,
+flow count) is still the user's to set.
+
+Checks on the points the project judges changes by, HEAD against the
+build with all three changes:
+
+| Point | `d30cf96` | Candidate | |
+| --- | --- | --- | --- |
+| Full-size efficiency, eight workers, CPU% per delivered Gbit/s, six rounds ([results](benches/ack-summary-full-size.json)) | 41.40 (40.82–41.66); its copy 41.16 | 40.74 (40.48–41.36) | −1.45% against HEAD in 6 of 6 rounds, −1.14% against the copy in 5 of 6 |
+| The same with `offload_frames`, four rounds ([results](benches/ack-summary-full-size-offload.json)) | 35.32 (35.01–35.88) | 34.93 (34.57–35.67) | −0.93%, 4 of 4 |
+| Small frames, six rounds ([results](benches/ack-summary-small-frames.json)) | 938.1; its copy 950.1 | 946.9 | +0.36% against HEAD, +0.20% against the copy: noise |
+| Four workers, 8 Gbit/s offered each way, Gbit/s in total over eight points ([results](benches/ack-summary-four-workers.json)) | 13.80 (13.01–14.43) | 14.57 (13.64–15.44) | +5.6% |
+| Decision workload, sixteen flows at 5 Gbit/s offered each way, total over three points ([results](benches/ack-summary-decision-5g.json)) | 4.62–4.77 | 4.80–5.26 | +7.9% at the mean |
+| The same with 0.1% loss ([results](benches/ack-summary-decision-5g-loss-1.json)) | 4.43–4.88 | 4.76–5.15 | +4% |
+| One flow at 7.5 ms with 0.5% and 1% loss, four workers, per direction ([0.5%](benches/ack-summary-one-flow-loss-5.json), [1%](benches/ack-summary-one-flow-loss-10.json)) | 0.90–1.40 | 0.90–1.40 | unchanged: one worker's CPU holds it |
+
+On the routed 4.5 ms path with 1% loss the change alone loses what
+`d30cf96` loses; the table in the section on the reader's lane has the
+six rounds.
+
+## A control ceiling that follows received traffic (November 19, landed)
+
+Design section 9 specified a ceiling for ACK and PROBE_REPLY traffic of
+4 MiB/s plus a thirty-second of the outer bytes received; the code kept
+only the fixed part. Each ACK now reaches worker 0 with the outer
+bytes its lane received since the lane's previous ACK. Thirty-two
+received bytes pay for one byte of control beyond the fixed rate, and
+an idle path group keeps at most sixteen maximum-size datagrams of that
+allowance, the size of the fixed burst.
+
+At the gate point ACKs need about what the fixed ceiling allowed. With
+the report change and the reader's lane spared, worker 0 sends 3.44–3.70
+MiB/s under the fixed ceiling and 3.63–4.25 MiB/s with this change
+(arms `noA` and `full` of the table above), and delivery is the same,
+40.6–40.7 against 40.3–40.9 Gbit/s in total. Before the report change
+the diagnostic build held ACKs at 3.91–3.93 MiB/s and sent 8.4 MiB/s
+once the ceiling was raised. So this change buys no rate at 20 Gbit/s
+each way; it removes a limit that sits exactly there. On the lossy path
+it changes nothing (arm `noB` below).
+
+## A reader that transmits nothing (November 19, landed)
+
+A TAP reader places no new flow on a lane it transmits itself while at
+least six other data lanes remain. A worker that reads a whole session
+spends half its time in TAP reads at 16 Gbit/s and has no room for a
+lane of its own beyond that. The threshold comes from
+the costs: reading takes about a third of what transmitting the same
+bytes does, so with six lanes to share the transmit work the reader is
+the busiest worker even with none of its own, and with fewer the others
+would be. Four workers have three data lanes and keep taking them in
+turn, which is why the four-worker rows above only show the report
+change.
+
+At the gate point it is the step from 33.4–34.2 to 40.3–40.9 Gbit/s in
+total (rows three and five of the table above). Alone, before the report
+change, it lost 13%, because the lanes could not send what a freed
+reader handed them (the diagnostic table of the first section).
+
+It has a cost on the lossy path. Routed 4.5 ms path, 1% loss, eight
+workers, sixteen flows, 2 Gbit/s each way, six rounds of two points per
+arm; a round's worst point is the larger of its four per-direction
+losses ([results](benches/ack-summary-lossy-path-split.json)):
+
+| Build | Frames lost at the worst point, median (range) | Largest one-way delay, rounds without a host stall | CPU% per delivered Gbit/s |
+| --- | --- | --- | --- |
+| `d30cf96` | 0.009% (0.004–0.038%) | 34–40 ms | 93.4 |
+| One report per ACK | 0.008% (0.006–0.063%) | 35–38 ms | 93.6 |
+| and the control ceiling | 0.009% (0.006–0.085%) | 36–41 ms | 92.3 |
+| One report per ACK and the reader's lane | 0.047% (0.022–0.144%) | 25–29 ms | 90.3 |
+| all three | 0.026% (0.020–0.204%) | 25–30 ms | 91.6 |
+
+Six earlier rounds of HEAD against all three read 0.018% (0.005–0.399%)
+and 0.106% (0.029–0.612%)
+([results](benches/ack-summary-lossy-path.json)); the twelve together,
+0.010% and 0.053%. So with the reader's lane spared a round's worst
+point loses about 0.03–0.05% of its frames where it lost 0.01%, the
+largest delay falls by about 10 ms, and CPU per delivered bit falls
+2–3%. The frames are lost in the sender, before any send or after one
+that was not acknowledged in time.
+
+The likely cause is where frames wait while BBR holds the lanes back
+for a moment. A reader that transmits a lane stops reading the TAP as
+soon as that lane cannot take one of its own reads, so frames wait in
+the kernel's TAP ring, where no deadline runs, and arrive up to 40 ms
+old. A reader with no lane keeps reading until the lane owners hold
+about 8 MiB of its buffer credit; those frames carry their 20 ms
+deadline from the read and expire. Which is better depends on the
+traffic, and it is the user's call (ROADMAP decision 10): the short TAP
+ring the README recommends makes the first behaviour drop frames too.
+A tighter credit for a reader that only reads would bring the old
+behaviour back and has not been built.
+
+**`rotate_lanes` with sixteen workers.** At 26 Gbit/s offered each way
+the reader's remaining job, receiving one of the peer's data lanes,
+becomes the limit, and the two directions settle unevenly. Three rounds
+each, default configuration otherwise
+([results](benches/sixteen-workers-rotate-lanes-26g.json); `oldrot` behaves as
+the committed rule does, `rot` is a variant that gives the reader the lanes of
+the worker that received least, which is the lane the peer's reader
+leaves empty):
+
+| | Delivered L→R + R→L | Total |
+| --- | --- | --- |
+| `rotate_lanes` off | 21.7–24.1 + 16.3–18.6 | 37.9–42.8 |
+| on | 24.2–24.3 + 22.5–23.4 | 46.8–47.6 |
+| on, the variant | 23.6–24.0 + 23.6–23.8 | 47.2–47.8 |
+
+Rotation raises the ceiling by about 15% and evens the directions, as
+it did with four workers. The variant is 1% ahead on three rounds,
+which settles nothing, so the committed rule stays. This bears on
+ROADMAP decision 9.
+
+## The lossy path at 5.5 Gbit/s offered (November 19, first look)
+
+The second gate asks for 5 Gbit/s over a routed path of 4.5–7.5 ms with
+nonzero loss. It had been measured with four workers, which deliver
+2.4–2.7 Gbit/s per direction on the decision workload at 5 Gbit/s
+offered with every core at 95–98%, and with one flow, which one worker's
+CPU holds at 1.0–1.4. With the three changes above and sixteen workers
+per daemon the routed path with 1% loss was offered 5.5 Gbit/s each way:
+thirty-two QinQ flows of 1522-byte frames as 44-segment GSO, a 1 Gbit/s
+warm-up point and then 20 s at 5.5, three rounds per arm
+([4.5 ms](benches/sixteen-workers-lossy-5g-4.5ms.json),
+[7.5 ms](benches/sixteen-workers-lossy-5g-7.5ms.json),
+[eight workers and sixteen flows at 4.5 ms](benches/eight-workers-lossy-5g-4.5ms.json)):
+
+| Path, workers | `daemon` switches | Delivered L→R + R→L, round by round | CPU per daemon | Frames missing |
+| --- | --- | --- | --- | --- |
+| 4.5 ms, sixteen | none | 5.27 + 5.31, 4.72 + 5.03, 5.29 + 5.22 | 630–673% | 1.7–12.4% |
+| | `offload_frames` | 4.98 + 4.69, 5.33 + 5.19, 5.16 + 5.06 | 572–600% | 1.3–13.0% |
+| 7.5 ms, sixteen | none | 5.17 + 5.17, 5.12 + 5.07, 5.27 + 5.03 | 652–702% | 2.3–6.8% |
+| | `offload_frames` | 5.04 + 5.18, 5.18 + 5.11, 5.29 + 5.01 | 599–624% | 2.1–7.3% |
+| 4.5 ms, eight | none | 4.55 + 4.29, 4.53 + 3.96, 4.23 + 4.44 | 477–513% | 16–27% |
+| | `offload_frames` | 5.16 + 4.89, 4.97 + 4.96, 5.03 + 5.16 | 497–532% | 5.0–9.9% |
+
+Sixteen workers deliver 5.0 Gbit/s or more each way in all six runs at
+7.5 ms and in four of six at 4.5 ms, with no worker above 57% of a
+core. Eight workers reach it only with `offload_frames`, at 84–89% on
+their busiest worker. What is missing with sixteen is lost in the
+sender: at 7.5 ms without offload frames each daemon expires 82,000 to
+320,000 frames before any send and 184,000 to 773,000 after a send that
+was not acknowledged in time, in 20 s. CPU is not what holds the sender
+back at those moments; a trace has to say what does.
+
+This is a first look, not the gate: 20 s points, one loss rate, GSO
+traffic and no bridge. The profile the gate should use (flow count,
+direction, loss model, cores) is the user's to freeze, and a local path
+does not establish real-access performance.
 
 ## Offload frames on the lossy path after FRAME_ABANDON (November 14)
 

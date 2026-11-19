@@ -1,0 +1,271 @@
+diff --git a/src/pacing.rs b/src/pacing.rs
+index e5aa2f5..f8c2a2b 100644
+--- a/src/pacing.rs
++++ b/src/pacing.rs
+@@ -71,7 +71,7 @@ impl Control {
+         } else {
+             self.finishes[(tail + BURST - 1) % BURST].max(now)
+         };
+-        let service = Duration::from_nanos((outer_bytes as u64 * 1_000_000_000).div_ceil(RATE));
++        let service = Duration::from_nanos((outer_bytes as u64 * 1_000_000_000).div_ceil(if crate::worker::xflag(4) { RATE * 16 } else { RATE }));
+         start
+             .checked_add(service)
+             .ok_or(io::ErrorKind::WouldBlock)?;
+diff --git a/src/worker.rs b/src/worker.rs
+index 5def87e..2cad00f 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -673,7 +673,10 @@ fn balanced_lane(
+         if active && old_tag != tag {
+             return hash as usize % lanes;
+         }
+-        let lane = first + cursor.fetch_add(1, Ordering::Relaxed) % (lanes - first);
++        let mut lane = first + cursor.fetch_add(1, Ordering::Relaxed) % (lanes - first);
++        if lanes - first > 2 && XSKIP.with(|skip| skip.get()) == lane {
++            lane = first + cursor.fetch_add(1, Ordering::Relaxed) % (lanes - first);
++        }
+         match slot.compare_exchange(
+             old,
+             tag << 32 | (lane as u64) << 24 | now,
+@@ -686,6 +689,57 @@ fn balanced_lane(
+     }
+ }
+ 
++thread_local! {
++    // Experiment: the lane a reading worker leaves out of new-flow placement.
++    static XSKIP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
++}
++
++thread_local! {
++    static XLAST: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
++}
++
++thread_local! {
++    static XLAT: std::cell::RefCell<[[u64; 9]; 2]> = const { std::cell::RefCell::new([[0; 9]; 2]) };
++}
++
++pub(crate) fn xlat(loss: bool, sent_ns: u64, bytes: u64) {
++    let now = monotonic_now().map_or(0, |d| d.as_nanos() as u64);
++    let us = now.saturating_sub(sent_ns) / 1000;
++    let bucket = match us {
++        0..=99 => 0,
++        100..=199 => 1,
++        200..=499 => 2,
++        500..=999 => 3,
++        1000..=1999 => 4,
++        2000..=4999 => 5,
++        5000..=9999 => 6,
++        10000..=19999 => 7,
++        _ => 8,
++    };
++    XLAT.with(|x| x.borrow_mut()[usize::from(loss)][bucket] += bytes);
++}
++
++fn xlat_report(id: usize) {
++    XLAT.with(|x| eprintln!("unquic: xlat worker {id} {:?}", x.borrow()));
++}
++
++/// Experiment: receive buffers a worker may hold unprocessed.
++fn rxb() -> usize {
++    if xflag(8) { 32 } else { RECEIVE_BUFFERS }
++}
++
++/// Experiment switches from the UQ_X environment variable (scratch builds only).
++pub(crate) fn xflag(bit: u32) -> bool {
++    static X: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
++    *X.get_or_init(|| {
++        std::env::var("UQ_X")
++            .ok()
++            .and_then(|v| v.parse().ok())
++            .unwrap_or(0)
++    }) & bit
++        != 0
++}
++
+ /// How long a session keeps a rotation before worker 0 may change it.
+ const ROTATE_HOLD: Duration = Duration::from_secs(10);
+ /// TAP reads between two looks below which no worker counts as the reader.
+@@ -1636,6 +1690,8 @@ impl Worker {
+         tighten_timer_slack();
+         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 128];
+         let mut immediate = true;
++        let xspin = Duration::from_micros(std::env::var("UQ_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
++        let mut xwork = Duration::ZERO;
+         let mut event_start = 0;
+         let mut publish_due = Duration::ZERO;
+         let mut publish_turns = 0_u8;
+@@ -1648,12 +1704,14 @@ impl Worker {
+             more |= phase!(self, 2, self.distribute_receivers());
+             more |= phase!(self, 3, self.addresses(now))?;
+             more |= phase!(self, 4, self.service_sender(now))?;
++            self.xdrain()?;
+             phase!(self, 5, self.progress_barriers(now))?;
+             phase!(self, 6, self.timers(now))?;
+             more |= phase!(self, 7, self.mtu_timers(now))?;
+             more |= phase!(self, 8, self.drain_packets(now))?;
+             phase!(self, 9, self.drain_tap_inputs(now))?;
+             more |= phase!(self, 10, self.flush_frames(now))?;
++            self.xdrain()?;
+             phase!(self, 11, self.flush_returns());
+             more |= phase!(
+                 self,
+@@ -1661,6 +1719,7 @@ impl Worker {
+                 (0..self.sessions.len()).any(|session| self.tap_can_expand(session))
+             );
+             phase!(self, 13, self.flush_taps(now))?;
++            self.xdrain()?;
+             phase!(self, 14, self.collect_acks(now))?;
+             phase!(self, 15, self.flush_control(now))?;
+             more |= phase!(self, 16, self.flush_sender_messages(now))?;
+@@ -1699,7 +1758,12 @@ impl Worker {
+             } else {
+                 self.retry_due = None;
+             }
+-            let mut block = should_block(more || immediate, deadline, now);
++            if more || immediate {
++                xwork = now;
++            }
++            let mut block = !xflag(32)
++                && should_block(more || immediate, deadline, now)
++                && now >= xwork + xspin;
+             #[cfg(feature = "profile")]
+             {
+                 self.phases[21] =
+@@ -1722,6 +1786,9 @@ impl Worker {
+                 Err(error) => return Err(error),
+             };
+             immediate = false;
++            if count != 0 {
++                xwork = now;
++            }
+             let now = monotonic_now()?;
+             let start = event_start.min(count);
+             event_start = if start + 1 < count { start + 1 } else { 0 };
+@@ -1760,6 +1827,7 @@ impl Worker {
+         }
+         #[cfg(feature = "profile")]
+         crate::profile::report(self.id, &self.phases);
++        xlat_report(self.id);
+         self.publish_counters();
+         if self.control.handing_over() {
+             // A successor adopts these; closing them is not the device's end anyway.
+@@ -2519,7 +2587,7 @@ impl Worker {
+             }
+             let [.., a, b, c, d] = *config.sessions[session].cookie.as_bytes();
+             if let Some(rotation) =
+-                reader_rotation(&reads[..workers], u32::from_be_bytes([a, b, c, d]))
++                reader_rotation(&reads[..workers], u32::from_be_bytes([a, b, c, d])).map(|r| if xflag(64) { ((r as usize + workers - 7) % workers) as u8 } else { r })
+                 && rotation != shared.rotation[session].load(Ordering::Relaxed)
+             {
+                 self.rotate(session, endpoint, rotation, now);
+@@ -2546,7 +2614,7 @@ impl Worker {
+     }
+ 
+     fn receive_interest(&mut self, more: bool) -> io::Result<()> {
+-        let enabled = self.rx_retained < RECEIVE_BUFFERS && !self.free.is_empty();
++        let enabled = self.rx_retained < rxb() && !self.free.is_empty();
+         // Only suppress readiness when waiting for foreign buffers; local work already yields.
+         if enabled == self.receive_enabled || (!enabled && more) {
+             return Ok(());
+@@ -2564,9 +2632,26 @@ impl Worker {
+         Ok(())
+     }
+ 
++    fn xdrain(&mut self) -> io::Result<()> {
++        if !xflag(16) || !self.receive_enabled {
++            return Ok(());
++        }
++        let now = monotonic_now()?;
++        if now < XLAST.with(|last| last.get()) + Duration::from_micros(50) {
++            return Ok(());
++        }
++        for endpoint in 0..self.receive.len() {
++            if self.receive[endpoint].is_some() {
++                self.read_socket(endpoint, now)?;
++            }
++        }
++        Ok(())
++    }
++
+     fn read_socket(&mut self, endpoint: usize, now: Duration) -> io::Result<()> {
++        XLAST.with(|last| last.set(now));
+         let mut clock = self.io_clock(now);
+-        let available = (RECEIVE_BUFFERS - self.rx_retained).min(self.free.len());
++        let available = (rxb() - self.rx_retained).min(self.free.len()).min(RECEIVE_BUFFERS);
+         let mut buffers: [Option<Box<Buffer>>; RECEIVE_BUFFERS] = std::array::from_fn(|index| {
+             if index >= available {
+                 return None;
+@@ -2957,7 +3042,7 @@ impl Worker {
+         // Leave a slab, a frame view and byte credit so queued inputs can progress.
+         self.free
+             .len()
+-            .saturating_sub(RECEIVE_BUFFERS - self.rx_retained + 1 + owner_reserve(workers))
++            .saturating_sub(rxb() - self.rx_retained + 1 + owner_reserve(workers))
+             .min(frame_quota(workers).saturating_sub(local.tx_retained + 2))
+             .min(self.frames.available().saturating_sub(1))
+             .min(
+@@ -3175,6 +3260,7 @@ impl Worker {
+         let lane = if let Some(cursor) = self.shared.flow_cursors.get(session)
+             && !self.shared.flows.is_empty()
+             && strict_lane(frame, self.id, workers, queues, lanes)
++            && { XSKIP.with(|skip| skip.set(if xflag(1) { self.id } else { usize::MAX })); true }
+         {
+             let hash = pack::flow_hash(frame);
+             balanced_lane(
+@@ -3272,7 +3358,7 @@ impl Worker {
+         let foreign = buffer.origin != self.id;
+         if local.tap_inputs.len() == BUFFERS
+             || (foreign
+-                && (self.free.len() <= RECEIVE_BUFFERS - self.rx_retained + 1
++                && (self.free.len() <= rxb() - self.rx_retained + 1
+                     || local.tx_retained + 3 > frame_quota(local.tx_workers)
+                     || local.tx_bytes + buffer.length + MAX_FRAME_LEN
+                         > 64 * 1024 * 1024 / local.tx_workers))
+@@ -3282,7 +3368,7 @@ impl Worker {
+                 ADMIT_DROP,
+                 if local.tap_inputs.len() == BUFFERS {
+                     3
+-                } else if self.free.len() <= RECEIVE_BUFFERS - self.rx_retained + 1 {
++                } else if self.free.len() <= rxb() - self.rx_retained + 1 {
+                     4
+                 } else if local.tx_retained + 3 > frame_quota(local.tx_workers) {
+                     5
+@@ -3301,7 +3387,7 @@ impl Worker {
+             #[cfg(feature = "profile")]
+             crate::profile::ADMISSION[if local.tap_inputs.len() == BUFFERS {
+                 0
+-            } else if self.free.len() <= RECEIVE_BUFFERS - self.rx_retained + 1 {
++            } else if self.free.len() <= rxb() - self.rx_retained + 1 {
+                 1
+             } else if local.tx_retained + 3 > frame_quota(local.tx_workers) {
+                 2
+@@ -3417,7 +3503,7 @@ impl Worker {
+             .map_or(input.length, |s| s.next_len(input.length));
+         local.tx_bytes + length <= 64 * 1024 * 1024 / local.tx_workers
+             && (self.slab_space(input.session, length)
+-                || (remaining >= 2 && self.free.len() > RECEIVE_BUFFERS - self.rx_retained))
++                || (remaining >= 2 && self.free.len() > rxb() - self.rx_retained))
+     }
+ 
+     fn tap_can_expand(&self, session: usize) -> bool {
+@@ -3456,7 +3542,7 @@ impl Worker {
+     }
+ 
+     fn hold_tx_credit(&self, buffer: &Buffer) -> bool {
+-        buffer.tx_reserved
++        !xflag(2) && buffer.tx_reserved
+             && !buffer.rx_reserved
+             && self.matches(buffer.session, buffer.tag)
+             && self.fresh_full(buffer.session, buffer.lane)
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index ce3a948..9e491ff 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -1090,6 +1090,7 @@ impl Worker {
+                 .ok_or_else(|| io::Error::other("missing send record"))?;
+             if entry.settled && !matches!(report.kind, ReportKind::Retire) {
+                 released += u64::from(entry.record.bytes);
++                crate::worker::xlat(matches!(report.kind, ReportKind::Loss), entry.record.sent_ns, u64::from(entry.record.bytes));
+             }
+             if !matches!(report.kind, ReportKind::Loss) {
+                 self.sender.records.release(handle);

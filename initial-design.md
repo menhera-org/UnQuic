@@ -515,7 +515,7 @@ The first shared-owner implementation issued per-batch grants from the controlle
 
 Before any rate sweep, show equivalence with the ordered sampler: extend the 4,374-case chronological oracle and the draft-07 vectors to concurrent workers, including partial sends, reordered reports and losses.
 
-The implementation differs from the outline above in these details. Records are 64 bytes in a per-worker slab of 65,535, addressed by the handle each sent-history entry keeps; that handle also keys the worker's recovery journal. Each worker has one bounded report, returned after the controller applies it. A PTO round's allowance travels with its probe command, and workers drop commands from a round older than the published one. Each successful syscall also sends the controller owner a summary of its packets for the PTO timers, MTU and window-use evidence. A probe takes the place of an unclaimed DATA plan, which keeps its reservations. A claim refused by a full window retries after 50 µs.
+The implementation differs from the outline above in these details. Records are 64 bytes in a per-worker slab of 65,535, addressed by the handle each sent-history entry keeps; that handle also keys the worker's recovery journal. Each worker has one bounded report, returned after the controller applies it. (November 19: an ACK is one report whatever it covers. A lane settles an ACK in passes of at most 64 packets, releasing their inflight charge and frame coverage as it goes, and adds up what the controller needs: settled packets, newly delivered bytes, the newest send record and whether anything but a path-MTU probe was delivered. Only the pass that ends the ACK sends the report. Until then each pass was a report of its own, so a lane could settle 64 packets per round trip with the controller owner, and a lane whose ACKs grew past 64 packets fell behind: at about 100,000 packets a second per lane, with workers that sleep between events, two thirds of the bytes waited 2 to 10 ms for their release while round-trip samples read under 0.2 ms, and each lane stopped near 1 Gbit/s. BENCH.md.) A PTO round's allowance travels with its probe command, and workers drop commands from a round older than the published one. Each successful syscall also sends the controller owner a summary of its packets for the PTO timers, MTU and window-use evidence. A probe takes the place of an unclaimed DATA plan, which keeps its reservations. A claim refused by a full window retries after 50 µs.
 
 Application-limited bubbles follow draft 07's prerequisites without a shared queue length (November 10 amendment). Each worker counts its unsent fresh bytes per path group and holds one bit in the group's atomic mask while it has any. New data that finds the mask empty, inflight below the published window, none of the worker's own frames waiting for repair, and no admission refused since it last held unsent data marks the bubble at the published delivered count plus inflight. Sends stamp their records application-limited until the published delivered count passes that marker; ProbeRTT's bubble still comes from the controller's sampler, and a send joins either. A later mark replaces an earlier one, as in the draft. A worker cannot see other workers' pending repairs. Without this, ACKs of sparse traffic before a load counted as full rounds and could end Startup before any load arrived (BENCH.md).
 
@@ -523,7 +523,7 @@ When a claim submits its entire prefix, retain the prepared but never-attempted 
 
 Initially pace in userspace using monotonic deadlines and `timerfd`, without requiring an `fq` qdisc or host networking changes. Workers send only with current grants. Cap the combined outstanding burst allowance at the smaller of BBR's send quantum and 64 maximum-size datagrams, spread across workers; GSO aggregates obey that limit too. Under the replacement sender this cap applies to each pacing claim instead; claims from several workers overlap only as far as the shared pacing clock allows. Timestamp at successful nonblocking socket submission and bound queued socket work. This is a testable baseline; kernel pacing remains a measured optimization. [S11]
 
-ACK-only and PROBE_REPLY traffic can proceed without data-window credit to avoid feedback deadlock, but share a separate 4 MiB/s ceiling per path group with a 16-datagram burst. Coalesce pending ACKs and discard stale feedback when bounded queues fill; do not invent delivery progress. Handshake messages use the per-session one-per-second retry/reply limits and this same control ceiling. This is a ceiling, not a fixed send rate. All these bytes remain visible in counters. Under the replacement sender, each receive owner sends its ACKs on its own transmit lane rather than through worker 0, spreading ACK reception across the peer's workers; that worker's control ceiling is 4 MiB/s plus 1/32 of the outer bytes it received for the sessions it acknowledges over the same interval. Handshake limits are unchanged. Worker/controller scheduling must give bounded service to feedback, fresh frames, and repairs; sender queue expiry drops whole unsent frames where possible.
+ACK-only and PROBE_REPLY traffic can proceed without data-window credit to avoid feedback deadlock, but share a separate 4 MiB/s ceiling per path group with a 16-datagram burst. Coalesce pending ACKs and discard stale feedback when bounded queues fill; do not invent delivery progress. Handshake messages use the per-session one-per-second retry/reply limits and this same control ceiling. This is a ceiling, not a fixed send rate. All these bytes remain visible in counters. Under the replacement sender, each receive owner was to send its ACKs on its own transmit lane rather than through worker 0, spreading ACK reception across the peer's workers, under a control ceiling of 4 MiB/s plus 1/32 of the outer bytes it received for the sessions it acknowledges over the same interval. Sending from receive owners was measured on November 10 and rejected (BENCH.md), so worker 0 still sends every ACK. The ceiling follows the received traffic since November 19: each ACK reaches worker 0 with the outer bytes its lane received since the lane's previous ACK, a thirty-second of them is control the path group may send beyond the 4 MiB/s, and an idle group keeps at most sixteen maximum-size datagrams of that allowance. At 20 Gbit/s each way ACKs alone take about 4 MiB/s. Handshake limits are unchanged. Worker/controller scheduling must give bounded service to feedback, fresh frames, and repairs; sender queue expiry drops whole unsent frames where possible.
 
 BBRv3 receives receiver-pressure losses as well as network losses; no static 5 Gbit/s pacing rate is inferred from deployment measurements. Keep outer ECN disabled and outer DSCP zero in v1, preserving inner fields. ECN needs an explicit wire feedback extension before enabling it. Controller-disabled modes are confined to isolated experiments and cannot pass production acceptance. The real-NGN throughput and latency profile, including random and burst loss and competing traffic, remains a release gate.
 
@@ -911,6 +911,26 @@ each way and 16% more at 10 (BENCH.md).
 - **Order.** A lane has one owner at a time, and the old owner's TAP
   writes are complete before the new owner's first, so a flow's frames
   stay in order.
+
+**A reader that transmits nothing (November 19 amendment).** With
+sixteen workers the reading worker is the limit before any lane is: it
+reads every frame of the session, which costs about a third of what
+transmitting them does, and it carried a transmit lane of its own on top.
+A TAP reader therefore places no new flow on a lane it transmits itself
+while at least six other data lanes remain. With six others to share the
+transmit work the reader is the busiest worker even with none of its own;
+with fewer, as on a four-worker box, the others would be, and lanes stay
+in turn as before. Where every worker reads its own TAP queue the rule
+costs nothing, because the other readers still fill each worker's lane.
+With the ACK change of section 9 this brought sixteen workers from
+15.9–17.8 / 12.0–12.1 Gbit/s to 20.3–20.5 / 20.0–20.4 at 21 Gbit/s
+offered each way. It also changes where frames wait when the lanes are
+held back: a reader with a lane of its own stops reading when that lane
+backs up, and frames then wait in the TAP ring with no deadline running;
+a reader without one reads on until the lane owners hold its buffer
+credit, and frames past their lifetime expire. On the routed 4.5 ms path
+with 1% loss a round's worst point lost 0.03–0.05% of its frames where it
+had lost 0.01%, and the largest delay fell by about 10 ms (BENCH.md).
 
 **Memory bandwidth.** Each payload byte is copied five times by the CPU
 across the two boxes: the sender's TAP read and UDP send, then the
@@ -1310,10 +1330,12 @@ If a comparison already reaches the available underlay ceiling, report that fact
 
 # 15 Implementation stages
 
-**Current status (November 13):** stages 1 and 4 are complete. Stages 2 and 3
-are implemented, but their performance gates (20 Gbit/s each way locally and
-5 Gbit/s over the lossy access path) remain open, and stage 5 measured
-optimisation is in progress; ROADMAP.md and BENCH.md track both. Offload
+**Current status (November 19):** stages 1 and 4 are complete. Stages 2 and 3
+are implemented. The local rate of 20 Gbit/s each way was first reached on
+November 19 with sixteen workers per daemon, by a margin of one or two
+percent and before its acceptance profile is frozen; the gate of 5 Gbit/s
+over the lossy access path remains open, and stage 5 measured
+optimisation is in progress. ROADMAP.md and BENCH.md track both. Offload
 frames (section 6) are implemented behind `daemon.offload_frames`, off by
 default. The record
 below is chronological. Implemented foundations are
