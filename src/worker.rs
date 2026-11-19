@@ -609,9 +609,40 @@ fn stripe_read(
     (lane, old & SEQUENCE_MASK)
 }
 
-/// Pins a flow to the lane it first received, assigning new flows round-robin
-/// across the data lanes `first..lanes` so a few heavy flows do not share one
-/// transmit worker. Every reader shares the table, so a flow the kernel moves
+/// Other data lanes a session needs before a TAP reader stops placing new
+/// flows on the lanes it transmits itself. Reading costs a worker about a
+/// third of what transmitting the same bytes does, so with six other lanes
+/// to share the transmit work a worker that reads a whole TAP is the
+/// busiest even with none of its own; with fewer, the others are (design
+/// section 13.1).
+const SPARE_LANES: usize = 6;
+
+/// A new flow's data lane, the next in turn. Lanes `own` names, those the
+/// reading worker transmits itself, are passed over while SPARE_LANES others
+/// remain: a worker that reads every frame of a session then keeps its
+/// capacity for reading, and one of many readers loses nothing, because the
+/// other readers still fill its lanes.
+fn next_lane(
+    cursor: &std::sync::atomic::AtomicUsize,
+    data: std::ops::Range<usize>,
+    own: impl Fn(usize) -> bool,
+) -> usize {
+    let turn = cursor.fetch_add(1, Ordering::Relaxed);
+    let others = data.clone().filter(|&lane| !own(lane)).count();
+    if others >= SPARE_LANES && others < data.len() {
+        data.clone()
+            .filter(|&lane| !own(lane))
+            .nth(turn % others)
+            .unwrap_or(data.start)
+    } else {
+        data.start + turn % data.len().max(1)
+    }
+}
+
+/// Pins a flow to the lane it first received, assigning new flows the lane
+/// `turn` yields, round-robin across the data lanes `first..lanes`, so a few
+/// heavy flows do not share one transmit worker. Every reader shares the
+/// table, so a flow the kernel moves
 /// to another TAP queue keeps its lane. Each entry holds a 32-bit key tag, the
 /// lane and a 24-bit millisecond stamp. A flow whose entry another active flow
 /// holds falls back to its hash lane among all `lanes`, as does every flow
@@ -619,7 +650,7 @@ fn stripe_read(
 /// stripe slot, which the entry then keeps and this returns with the STRIPED bit.
 fn balanced_lane(
     slots: &[AtomicU64],
-    cursor: &std::sync::atomic::AtomicUsize,
+    mut turn: impl FnMut() -> usize,
     key: u64,
     hash: u64,
     data: std::ops::Range<usize>,
@@ -673,7 +704,7 @@ fn balanced_lane(
         if active && old_tag != tag {
             return hash as usize % lanes;
         }
-        let lane = first + cursor.fetch_add(1, Ordering::Relaxed) % (lanes - first);
+        let lane = turn();
         match slot.compare_exchange(
             old,
             tag << 32 | (lane as u64) << 24 | now,
@@ -3185,7 +3216,7 @@ impl Worker {
             let hash = pack::flow_hash(frame);
             balanced_lane(
                 &self.shared.flows,
-                cursor,
+                || next_lane(cursor, first..lanes, |lane| lane % workers == self.id),
                 hash ^ (session as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
                 hash,
                 first..lanes,
@@ -7797,6 +7828,59 @@ mod tests {
         assert_eq!(worker.counters.tap_read_requests, 2);
     }
 
+    /// `balanced_lane` for a reader that transmits none of the data lanes.
+    fn balanced_flow(
+        slots: &[AtomicU64],
+        cursor: &std::sync::atomic::AtomicUsize,
+        key: u64,
+        hash: u64,
+        data: Range<usize>,
+        ms: u64,
+        stripe: impl FnMut(usize) -> Option<usize>,
+    ) -> usize {
+        let turn = || next_lane(cursor, data.clone(), |_| false);
+        balanced_lane(slots, turn, key, hash, data.clone(), ms, stripe)
+    }
+
+    #[test]
+    fn a_reader_spares_its_own_lanes_only_with_enough_others() {
+        use std::sync::atomic::AtomicUsize;
+        // Fifteen data lanes: the reader's lane 7 gets no new flow and the
+        // others share them evenly.
+        let cursor = AtomicUsize::new(0);
+        let mut flows = [0_usize; 16];
+        for _ in 0..28 {
+            flows[next_lane(&cursor, 1..16, |lane| lane == 7)] += 1;
+        }
+        assert_eq!((flows[0], flows[7]), (0, 0));
+        assert!(
+            (1..16)
+                .filter(|&lane| lane != 7)
+                .all(|lane| flows[lane] == 2)
+        );
+        // Exactly SPARE_LANES others still spare it: eight workers and a control lane.
+        let cursor = AtomicUsize::new(0);
+        let lanes: Vec<_> = (0..7)
+            .map(|_| next_lane(&cursor, 1..8, |lane| lane == 3))
+            .collect();
+        assert_eq!(lanes, [1, 2, 4, 5, 6, 7, 1]);
+        // Fewer others: lanes in turn, the reader's included, as with four workers.
+        let cursor = AtomicUsize::new(0);
+        let lanes: Vec<_> = (0..4)
+            .map(|_| next_lane(&cursor, 1..4, |lane| lane == 2))
+            .collect();
+        assert_eq!(lanes, [1, 2, 3, 1]);
+        // A worker that transmits no data lane, or every one, changes nothing.
+        for own in [false, true] {
+            let cursor = AtomicUsize::new(5);
+            let lanes: Vec<_> = (0..3).map(|_| next_lane(&cursor, 1..9, |_| own)).collect();
+            assert_eq!(lanes, [6, 7, 8]);
+        }
+        // More lanes than workers: every lane of the reader is spared.
+        let cursor = AtomicUsize::new(0);
+        assert!((0..64).all(|_| next_lane(&cursor, 1..32, |lane| lane % 16 == 7) % 16 != 7));
+    }
+
     #[test]
     fn balanced_flows_take_lanes_in_turn_and_keep_them_while_active() {
         use std::sync::atomic::AtomicUsize;
@@ -7809,50 +7893,50 @@ mod tests {
         let cursor = AtomicUsize::new(0);
         // Four new flows spread across four lanes whatever their hashes.
         let lanes: Vec<_> = (1..=4)
-            .map(|key| balanced_lane(&slots, &cursor, key, 0, 0..4, 10, |_| None))
+            .map(|key| balanced_flow(&slots, &cursor, key, 0, 0..4, 10, |_| None))
             .collect();
         assert_eq!(lanes, [0, 1, 2, 3]);
         // An active flow keeps its lane.
-        assert_eq!(balanced_lane(&slots, &cursor, 2, 0, 0..4, 900, |_| None), 1);
+        assert_eq!(balanced_flow(&slots, &cursor, 2, 0, 0..4, 900, |_| None), 1);
         // After a full idle period a flow may move: none of its frames remain.
         assert_eq!(
-            balanced_lane(&slots, &cursor, 2, 0, 0..4, 900 + FLOW_IDLE_MS, |_| None),
+            balanced_flow(&slots, &cursor, 2, 0, 0..4, 900 + FLOW_IDLE_MS, |_| None),
             0
         );
         // A flow whose entry another active flow holds takes its hash lane and
         // leaves that flow's lane alone.
         let slots = table();
         let cursor = AtomicUsize::new(3);
-        assert_eq!(balanced_lane(&slots, &cursor, 7, 0, 0..4, 0, |_| None), 3);
+        assert_eq!(balanced_flow(&slots, &cursor, 7, 0, 0..4, 0, |_| None), 3);
         let other = 7 + (2 << 32);
         assert_eq!(
-            balanced_lane(&slots, &cursor, other, 6, 0..4, 5, |_| None),
+            balanced_flow(&slots, &cursor, other, 6, 0..4, 5, |_| None),
             2
         );
-        assert_eq!(balanced_lane(&slots, &cursor, 7, 0, 0..4, 10, |_| None), 3);
+        assert_eq!(balanced_flow(&slots, &cursor, 7, 0, 0..4, 10, |_| None), 3);
         // Once the holder goes idle the other flow takes the entry.
         assert_eq!(
-            balanced_lane(&slots, &cursor, other, 6, 0..4, 10 + FLOW_IDLE_MS, |_| None),
+            balanced_flow(&slots, &cursor, other, 6, 0..4, 10 + FLOW_IDLE_MS, |_| None),
             0
         );
         // A lane that no longer exists is reassigned.
         let slots = table();
         let cursor = AtomicUsize::new(3);
-        assert_eq!(balanced_lane(&slots, &cursor, 9, 0, 0..4, 0, |_| None), 3);
-        assert!(balanced_lane(&slots, &cursor, 9, 0, 0..2, 1, |_| None) < 2);
+        assert_eq!(balanced_flow(&slots, &cursor, 9, 0, 0..4, 0, |_| None), 3);
+        assert!(balanced_flow(&slots, &cursor, 9, 0, 0..2, 1, |_| None) < 2);
         // The 24-bit stamp wraps without making an active flow look idle.
         let slots = table();
         let cursor = AtomicUsize::new(1);
         let wrap = FLOW_MS_MASK + 1;
         assert_eq!(
-            balanced_lane(&slots, &cursor, 4, 0, 0..4, wrap - 10, |_| None),
+            balanced_flow(&slots, &cursor, 4, 0, 0..4, wrap - 10, |_| None),
             1
         );
         assert_eq!(
-            balanced_lane(&slots, &cursor, 4, 0, 0..4, wrap + 5, |_| None),
+            balanced_flow(&slots, &cursor, 4, 0, 0..4, wrap + 5, |_| None),
             1
         );
-        assert_eq!(balanced_lane(&[], &cursor, 1, 5, 0..4, 0, |_| None), 1);
+        assert_eq!(balanced_flow(&[], &cursor, 1, 5, 0..4, 0, |_| None), 1);
     }
 
     #[test]
@@ -7916,23 +8000,23 @@ mod tests {
         let slots: Vec<_> = (0..FLOW_SLOTS).map(|_| AtomicU64::new(0)).collect();
         let cursor = AtomicUsize::new(0);
         // A new flow takes a lane without asking to stripe.
-        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 10, |_| unreachable!());
+        let lane = balanced_flow(&slots, &cursor, 9, 0, 1..4, 10, |_| unreachable!());
         assert_eq!(lane, 1);
-        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 11, |lane| {
+        let lane = balanced_flow(&slots, &cursor, 9, 0, 1..4, 11, |lane| {
             assert_eq!(lane, 1);
             Some(3)
         });
         assert_eq!(lane, STRIPED | 3);
         // The entry keeps its stripe without asking again, until it goes idle.
-        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 12, |_| unreachable!());
+        let lane = balanced_flow(&slots, &cursor, 9, 0, 1..4, 12, |_| unreachable!());
         assert_eq!(lane, STRIPED | 3);
-        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 12 + FLOW_IDLE_MS, |_| None);
+        let lane = balanced_flow(&slots, &cursor, 9, 0, 1..4, 12 + FLOW_IDLE_MS, |_| None);
         assert_eq!(lane, 2);
         // Declining keeps the lane.
-        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 13 + FLOW_IDLE_MS, |_| None);
+        let lane = balanced_flow(&slots, &cursor, 9, 0, 1..4, 13 + FLOW_IDLE_MS, |_| None);
         assert_eq!(lane, 2);
         // So does a reader whose turn began before the entry's last stamp.
-        let lane = balanced_lane(&slots, &cursor, 9, 0, 1..4, 11 + FLOW_IDLE_MS, |_| None);
+        let lane = balanced_flow(&slots, &cursor, 9, 0, 1..4, 11 + FLOW_IDLE_MS, |_| None);
         assert_eq!(lane, 2);
     }
 
@@ -8050,7 +8134,7 @@ mod tests {
         let slots: Vec<_> = (0..FLOW_SLOTS).map(|_| AtomicU64::new(0)).collect();
         let cursor = AtomicUsize::new(0);
         let lanes: Vec<_> = (1..=4)
-            .map(|key| balanced_lane(&slots, &cursor, key, 0, 1..4, 10, |_| None))
+            .map(|key| balanced_flow(&slots, &cursor, key, 0, 1..4, 10, |_| None))
             .collect();
         assert_eq!(lanes, [1, 2, 3, 1]);
         // A lane-0 choice moves to a data lane by hash; others and single lanes stay.
