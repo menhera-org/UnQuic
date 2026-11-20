@@ -113,6 +113,12 @@ Still open, in the order they now matter:
    2,200 of them are sends, receives and TAP reads and writes, which the
    test bed inflates and only the box can settle
    ([BENCH.md](BENCH.md#the-per-frame-cost-on-november-19)).
+   Balance matters as much as cycles there: with `rotate_lanes` and
+   `offload_frames` four workers carry 10 Gbit/s each way on loopback,
+   against 6.5–7 by default, and use 18% less CPU below saturation.
+   Both are off by default and both now carry a recommendation to turn
+   them on (decisions 8 and 9)
+   ([BENCH.md](BENCH.md#four-workers-with-lane-rotation-and-offload-frames-november-20)).
 4. The small-frame rows and the overload plateau were remeasured on
    November 19. On the decision workload every 5 Gbit/s total is above
    its 2 Gbit/s total, and the rows deliver 16–84% more than on
@@ -777,6 +783,9 @@ Decisions only the user can make, each blocking a remaining goal:
    5 Gbit/s on the lossy path. The recommendation is now to turn them on
    by default; the decision is still the user's
    ([BENCH.md](BENCH.md#the-switches-on-the-lossy-efficiency-point-november-19)).
+   November 20: with four workers they add 17–21% past saturation alone
+   and 42% together with `rotate_lanes`, and save 15% of the CPU below it
+   ([BENCH.md](BENCH.md#four-workers-with-lane-rotation-and-offload-frames-november-20)).
 9. Open since November 16: should `daemon.rotate_lanes` be on by default?
    On, a session whose TAP one worker reads moves its receive lanes once,
    so that this worker receives the peer's control lane and no data lane.
@@ -811,6 +820,16 @@ Decisions only the user can make, each blocking a remaining goal:
    (0.12% at the median) lies between the two default arms' 0.03% and
    0.20%. Nothing there speaks for or against it now
    ([BENCH.md](BENCH.md#the-switches-on-the-lossy-efficiency-point-november-19)).
+   November 20, four workers on loopback, six rounds: rotation alone
+   delivers 14–19% more past saturation and steadies it (15.19–15.46
+   Gbit/s in total at 8 offered each way against 12.95–13.99), and with
+   offload frames 42% more: 19.5–19.8 at 10 offered and 10.0–10.6 each
+   way at 12–14, using 85–90% of the four cores where the default leaves
+   a quarter idle. On the routed lossy path the pair adds about 18%.
+   That is the case rotation was built for, and the recommendation is
+   now to turn it on by default together with offload frames, at least
+   for sessions it covers; the decision is the user's
+   ([BENCH.md](BENCH.md#four-workers-with-lane-rotation-and-offload-frames-november-20)).
 10. Open since November 19: where should frames wait when the lanes are
    held back for a moment? Since a TAP reader with six or more other data
    lanes transmits none itself, it reads on while lane owners queue what

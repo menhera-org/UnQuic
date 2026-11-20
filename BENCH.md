@@ -2841,6 +2841,51 @@ the target line. The design's list (L2TPv3 with fragmentation,
 WireGuard carrying L2, SoftEther) and its sixty-second, five-run
 procedure remain to be done where those modules can load.
 
+## Four workers with lane rotation and offload frames (November 20)
+
+Four workers are what the target boxes have, and past saturation they
+run short of balance before cycles: one worker reads the whole TAP and
+carries transmit and receive lanes too, while the others idle. Two
+switches act on that, each off by default (decisions 8 and 9), and they
+had not been measured together. `rotate_lanes` gives the reading worker
+the peer's control lane to receive in place of a data lane, and
+`offload_frames` cuts what each frame costs every worker. Loopback,
+sixteen QinQ flows of 1522-byte frames as 44-segment GSO on `02d0367`,
+six rounds in rotation
+([results](benches/four-workers-switches-nov20.json)). Total Gbit/s
+delivered, mean and range, and CPU per daemon:
+
+| Offered each way | Default, two arms | `rotate_lanes` | `offload_frames` | Both |
+| --- | --- | --- | --- | --- |
+| 4.8 Gbit/s | 9.35 and 9.50, 177–189% | 9.50, 167–183% | 9.50, 150–159% | 9.50, 147–156% |
+| 8 | 13.51 and 13.50 (12.95–13.99), 260–290% | 15.34 (15.19–15.46), 304–315% | 15.74 (15.50–15.84), 256–267% | 15.82 (15.80–15.83), 252–266% |
+| 10 | 13.84 and 13.91 (13.17–14.50), 264–302% | 16.44 (16.28–16.61), 338–357% | 16.78 (16.33–17.28), 272–290% | 19.64 (19.49–19.75), 309–327% |
+
+Each switch alone adds 14–21% past saturation. Together they add 42% at
+10 Gbit/s offered, and the busiest worker of a daemon is then at 82–96%
+of a core where it was at 98–99%. Below saturation the pair saves 18% of
+the CPU. A ladder above that, three rounds
+([results](benches/four-workers-switches-ladder-nov20.json)):
+
+| Offered each way | Default: delivered each way | Both switches | CPU per daemon with both |
+| --- | --- | --- | --- |
+| 10 Gbit/s | 6.26–7.39 | 9.36–9.88 | 311–320% |
+| 12 | 5.18–7.90 | 10.24–10.61 | 341–356% |
+| 14 | 5.15–7.89 | 10.04–10.43 | 339–360% |
+
+So four workers carry 10 Gbit/s each way on loopback with both switches,
+at 85–90% of their four cores, where the default carries 6.5–7 with a
+quarter of its cores idle. On the routed 7.5 ms path with 1% loss, three rounds
+([results](benches/four-workers-switches-lossy-nov20.json)), the pair
+helps less, because the emulated router's cost there falls on every
+worker alike:
+
+| Offered each way | Default: delivered each way | Both switches | Both, and loss threshold 100 |
+| --- | --- | --- | --- |
+| 4 Gbit/s | 2.60–2.96 | 3.23–3.40 | 3.12–3.35 |
+| 5.5 | 2.44–2.91 | 3.06–3.43 | 3.09–3.37 |
+| 7 | 2.35–3.05 | 2.85–3.44 | 3.12–3.38 |
+
 ## Sixty-second runs on the lossy path (November 20)
 
 Design section 14.2 proposes five runs of at least 60 s for each
