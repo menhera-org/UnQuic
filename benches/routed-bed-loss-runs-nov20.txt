@@ -1,0 +1,35 @@
+The routed netem bed, four workers, 7.5 ms and 1% loss, 5.5 Gbit/s offered each way, loss_threshold_permille = 100,
+trace build of b2c88ec. LOSS records of the left daemon by transmit lane, grouped into runs of consecutive packet numbers.
+
+-- one shared netem per direction (the bed as committed)
+lane 2: 26452 lost of 1596010 (1.66%), longest run 208
+  run length   1      2     3-5    6-20  21-100 101-1000 >1000
+  runs     15592    142     54    194    205      3      0
+  packets  15592    284    205   2286   7614    471      0
+lane 3: 36566 lost of 1389991 (2.63%), longest run 1175
+  run length   1      2     3-5    6-20  21-100 101-1000 >1000
+  runs     13055    151     42    177    214     36      3
+  packets  13055    302    155   2251   8614   8854   3335
+lane 4: 23852 lost of 1466149 (1.63%), longest run 493
+  run length   1      2     3-5    6-20  21-100 101-1000 >1000
+  runs     13986    162     50    167    145      9      0
+  packets  13986    324    188   2045   5447   1862      0
+
+Router veth transmit drops in that point: left 30283, right 25305 (of 4.5 and 4.3 million datagrams).
+At 1 Gbit/s offered: 1745 and 1830. Sixteen workers at 5.4 and 5.84 offered: 3381-8217 of 10.0-10.9 million.
+
+-- receive steering to eight path CPUs, eight veth queues, one netem per queue
+lane 2: 18467 lost of 1753148 (1.05%), longest run 550
+  run length   1      2     3-5    6-20  21-100 101-1000 >1000
+  runs     15262    169      1      2      8      9      0
+  packets  15262    338      3     13    433   2418      0
+lane 3: 14878 lost of 1468289 (1.01%), longest run 464
+  run length   1      2     3-5    6-20  21-100 101-1000 >1000
+  runs     13030    125      2      1      7      5      0
+  packets  13030    250      9     13    357   1219      0
+lane 4: 16523 lost of 1544260 (1.07%), longest run 793
+  run length   1      2     3-5    6-20  21-100 101-1000 >1000
+  runs     15133    133      2      0      3      3      0
+  packets  15133    266      6      0     93   1025      0
+
+Router veth transmit drops in that point: 1469 and 1155. Path CPUs busy in softirq: 97%, 82%, 5%, 4%, others idle.

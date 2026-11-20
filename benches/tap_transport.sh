@@ -20,6 +20,24 @@ done
 [ "${OUTER_QUEUE_PACKETS:-8192}" -ge 1 ] || exit 2
 # A competing outer TCP flow needs the routed outer path it shares.
 case "${COMPETING_TCP:-0}" in 0) ;; 1) [ "${OUTER_ROUTED:-0}" = 1 ] || exit 2;; *) exit 2;; esac
+# OUTER_RELAY=/absolute/path_relay takes the place of the router's forwarding
+# and netem: each daemon sends to the relay, whose four threads spin on the four
+# OUTER_RELAY_CPUS. It applies the delay and independent loss, nothing else.
+case "${OUTER_RELAY:-}" in
+    '') ;;
+    /*)
+        [ "${OUTER_ROUTED:-0}" = 1 ] && [ -z "${KERNEL_TUNNEL:-}" ] && [ "${COMPETING_TCP:-0}" = 0 ] &&
+            [ "${OUTER_RATE_MBIT:-0}" -eq 0 ] && [ "${OUTER_LOSS_BURST:-1}" -eq 1 ] &&
+            [ "${OUTER_REORDER_PERMILLE:-0}" -eq 0 ] ||
+            { echo "OUTER_RELAY needs OUTER_ROUTED=1 and offers only delay and independent loss" >&2; exit 2; }
+        case "${OUTER_RELAY_CPUS:-}" in
+            *[!0-9,]*|,*|*,|*,,*|*,*,*,*,*) echo "OUTER_RELAY_CPUS must name four CPUs" >&2; exit 2;;
+            *,*,*,*) ;;
+            *) echo "OUTER_RELAY_CPUS must name four CPUs" >&2; exit 2;;
+        esac
+        ;;
+    *) echo "OUTER_RELAY must be an absolute path" >&2; exit 2;;
+esac
 # Netem reorders by letting datagrams skip the delay, so reordering needs one.
 [ "${OUTER_REORDER_PERMILLE:-0}" -le 1000 ] || exit 2
 [ "${OUTER_REORDER_PERMILLE:-0}" -eq 0 ] || [ "${OUTER_DELAY_US:-0}" -gt 0 ] || exit 2
@@ -103,9 +121,10 @@ servers=
 clients=
 competing=
 captures=
+relay=
 processes=${GENERATOR_PROCESSES:-1}
 cleanup() {
-    for pid in $clients $servers $competing $captures "$left" "$right"; do
+    for pid in $clients $servers $competing $captures "$left" "$right" "$relay"; do
         [ -z "$pid" ] || kill "$pid" 2>/dev/null || :
     done
     wait || :
@@ -194,7 +213,9 @@ if [ "${OUTER_ROUTED:-0}" = 1 ]; then
         netip "uq-out-$side" -6 neigh add "fd77:ff:$n::2" lladdr "02:77:ff:00:0$n:02" nud permanent dev uq-path
         ip -6 neigh add "fd77:ff:$n::1" lladdr "02:77:ff:00:0$n:01" nud permanent dev "uq-r-$side"
         # Segment before router netem so loss applies to individual datagrams.
-        nsenter --net="/run/netns/uq-out-$side" ethtool -K uq-path gso off tso off tx-udp-segmentation off
+        # The relay splits trains itself, so a send reaches it as one buffer.
+        [ -n "${OUTER_RELAY:-}" ] ||
+            nsenter --net="/run/netns/uq-out-$side" ethtool -K uq-path gso off tso off tx-udp-segmentation off
         # Use one endpoint NAPI queue; per-CPU backlogs reorder delayed traffic.
         ethtool -K "uq-r-$side" gro off tso off
         nsenter --net="/run/netns/uq-out-$side" ethtool -K uq-path gro on
@@ -208,11 +229,20 @@ if [ "${OUTER_ROUTED:-0}" = 1 ]; then
         fi
         nsenter --net="/run/netns/uq-out-$side" ethtool -k uq-path > "$out/$side.outer-offloads"
         grep -q '^generic-receive-offload: on' "$out/$side.outer-offloads"
+        [ -z "${OUTER_RELAY:-}" ] || continue
         grep -q '^generic-segmentation-offload: off' "$out/$side.outer-offloads"
         grep -q '^tx-udp-segmentation: off' "$out/$side.outer-offloads"
         netem "uq-r-$side"
     done
-    sysctl -qw net.ipv6.conf.all.forwarding=1
+    if [ -n "${OUTER_RELAY:-}" ]; then
+        # Each side sends to the relay's address on its own link, at the port its peer listens on.
+        "$OUTER_RELAY" "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" \
+            '[fd77:ff:1::2]:40101' '[fd77:ff:2::2]:40100' '[fd77:ff:1::1]:40100' '[fd77:ff:2::1]:40101' \
+            "$OUTER_RELAY_CPUS" > "$out/relay.log" 2>&1 &
+        relay=$!
+    else
+        sysctl -qw net.ipv6.conf.all.forwarding=1
+    fi
     left_netns=/run/netns/uq-out-left
     right_netns=/run/netns/uq-out-right
 else
@@ -226,6 +256,7 @@ for side in left right; do
     host=::1
     if [ "${OUTER_ROUTED:-0}" = 1 ]; then
         if [ "$side" = left ]; then listen=fd77:ff:1::1; host=fd77:ff:2::1; else listen=fd77:ff:2::1; host=fd77:ff:1::1; fi
+        [ -z "${OUTER_RELAY:-}" ] || host="${listen%1}2"
     fi
     mac_prefix=00
     [ "${INNER_BRIDGE:-0}" = 0 ] || mac_prefix=01
@@ -384,6 +415,21 @@ snapshot() {
         outer right cat /proc/net/snmp6 > "$out/$1.outer-right"
         tc -s -d qdisc show dev uq-r-left > "$out/$1.qdisc-left"
         tc -s -d qdisc show dev uq-r-right > "$out/$1.qdisc-right"
+        # A full endpoint receive ring shows as transmit drops on the router's veth.
+        ip -s link show uq-r-left > "$out/$1.router-left-link"
+        ip -s link show uq-r-right > "$out/$1.router-right-link"
+        if [ -n "$relay" ]; then
+            # The relay prints two lines of running totals for each signal.
+            lines=$(grep -c '' "$base/relay.log" || :)
+            kill -USR1 "$relay"
+            attempts=0
+            while [ "$(grep -c '' "$base/relay.log" || :)" -lt "$((lines + 2))" ]; do
+                attempts=$((attempts + 1))
+                [ "$attempts" -lt 500 ] || { echo "relay report timeout" >&2; exit 1; }
+                sleep 0.01
+            done
+            tail -n 2 "$base/relay.log" > "$out/$1.relay"
+        fi
         for side in left right; do
             # The left outer namespace's uq-path egress is the L→R bottleneck.
             outer "$side" tc -s -d qdisc show dev uq-path > "$out/$1.bottleneck-$side"
@@ -424,7 +470,9 @@ printf '%s\n' "${VLAN_DEPTH:-0}" > "$out/vlan-depth"
 printf '%s\n' "${SRV6:-0}" > "$out/srv6"
 printf '%s\n' "${INNER_BRIDGE:-0}" > "$out/inner-bridge"
 printf '%s\n' "$frame" > "$out/frame-bytes"
-printf 'routed=%s\none_way_delay_us=%s\nloss_permille=%s\nloss_burst=%s\nreorder_permille=%s\nrate_mbit=%s\nqueue_packets=%s\ncompeting_tcp=%s\n' "${OUTER_ROUTED:-0}" "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" "${OUTER_LOSS_BURST:-1}" "${OUTER_REORDER_PERMILLE:-0}" "${OUTER_RATE_MBIT:-0}" "${OUTER_QUEUE_PACKETS:-8192}" "${COMPETING_TCP:-0}" > "$out/outer-path"
+relayed=0
+[ -z "${OUTER_RELAY:-}" ] || relayed=1
+printf 'routed=%s\none_way_delay_us=%s\nloss_permille=%s\nloss_burst=%s\nreorder_permille=%s\nrate_mbit=%s\nqueue_packets=%s\ncompeting_tcp=%s\nrelay=%s\n' "${OUTER_ROUTED:-0}" "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" "${OUTER_LOSS_BURST:-1}" "${OUTER_REORDER_PERMILLE:-0}" "${OUTER_RATE_MBIT:-0}" "${OUTER_QUEUE_PACKETS:-8192}" "${COMPETING_TCP:-0}" "$relayed" > "$out/outer-path"
 printf '%s\n' "${DAEMON_TOML:-}" > "$out/daemon-toml"
 base=$out
 index=0

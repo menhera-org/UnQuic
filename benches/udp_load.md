@@ -180,6 +180,45 @@ so give them CPUs with `GENERATOR_LEFT_CPUS` and its three siblings.
 missing frames from the load tool's per-flow counts, and the busy CPU of the
 whole system between a point's `before` and `sent` snapshots, for tunnel and
 daemon runs alike.
+
+With `OUTER_ROUTED=1`, `OUTER_RELAY=/absolute/path_relay` emulates the path in
+user space with the tool built from `examples/path_relay.rs`. The router then
+neither forwards nor runs netem. Each daemon's peer address is the relay's
+address on its own link, and the relay forwards to the other daemon. For each
+direction one thread reads eight reuseport sockets and decides every
+datagram's loss, and a second forwards the survivors `OUTER_DELAY_US` later.
+`OUTER_RELAY_CPUS=A,B,C,D` names the CPUs of the left-to-right reader and
+forwarder and then of the right-to-left pair. All four spin, so give them
+cores nothing else uses. The endpoint links keep UDP segmentation: a segmented
+send reaches the relay as one buffer, and the relay forwards each run of
+surviving datagrams as one segmented send. The relay offers the delay and
+independent loss only. Burst loss, reordering, the rate bottleneck, the
+competing flow and the kernel tunnel need netem.
+
+Use the relay when the daemons' cores must not pay for the path. With netem a
+sending worker segments, forwards and enqueues every datagram inside its own
+system call, and delivery into the peer's sockets runs in softirq on whichever
+core dequeued the datagram. With the relay a worker pays for its send and
+receive system calls. The relay's CPUs carry the delivery too, as the
+interrupt cores of a network card would, so a result leaves out the receive
+softirq that a small box runs on the daemon's own cores.
+
+Each snapshot's `relay` file holds the relay's running totals, one line per
+direction: datagrams `received` in `messages` socket buffers, `lost` by
+policy, `forwarded`, `refused` (truncated, larger than 8952 bytes, or rejected
+by the kernel), `overflow`, `full` (turns on which all 2048 buffers of the
+delay line were in use), `late` (messages forwarded more than 100 µs after
+their time) and `max_late_us` since the previous report. `overflow` counts
+socket buffers the kernel dropped before the relay read them, and one buffer
+can hold a train of datagrams. That loss comes from the test bed: a container
+cannot raise the receive buffer, so check the count before reading a result.
+
+Routed snapshots also keep the router veths' counters as `router-left-link`
+and `router-right-link`. With netem, their transmit drops count datagrams that
+left the delay line and found the endpoint veth's receive ring full. The ring
+holds 256 packets on Linux 6.8. Neither the qdisc nor the endpoint counts
+these drops, and they come in runs.
+
 Flow j runs from port 51000 + j to 52000 + j in both directions by default.
 tun's symmetric flow hash then gives both directions of flow j the same hash,
 so tun reads a flow on the queue the daemon last wrote its other direction on.
@@ -255,3 +294,7 @@ validation. Run its ignored tests inside a disposable container with
 iproute2, tun and network capabilities. They check both IP families, four
 concurrent sockets, ordinary and segmented sends, GRO, small/MTU/jumbo
 payloads, byte corruption and the TAP offload prerequisite.
+
+`cargo test --release --target x86_64-unknown-linux-musl --example path_relay`
+checks the relay on loopback: the loss rate, the delay and order of forwarded
+datagrams, full loss, and the refusal of a datagram larger than it forwards.

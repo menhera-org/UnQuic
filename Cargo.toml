@@ -46,6 +46,10 @@ harness = false
 name = "udp_load"
 test = true
 
+[[example]]
+name = "path_relay"
+test = true
+
 [profile.release]
 opt-level = 3
 lto = true
