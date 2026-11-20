@@ -2886,6 +2886,13 @@ worker alike:
 | 5.5 | 2.44–2.91 | 3.06–3.43 | 3.09–3.37 |
 | 7 | 2.35–3.05 | 2.85–3.44 | 3.12–3.38 |
 
+On the decision workload neither switch changes anything, three rounds
+([results](benches/four-workers-switches-decision-nov20.json)): its
+frames arrive one by one, so there is nothing for an offload frame to
+carry, and all four workers are full already. At 5 Gbit/s offered each
+way the default delivers 4.63–5.06 Gbit/s in total, rotation 4.53–4.81
+and both 4.79–5.10.
+
 ## Sixty-second runs on the lossy path (November 20)
 
 Design section 14.2 proposes five runs of at least 60 s for each
