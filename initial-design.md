@@ -893,7 +893,11 @@ each way and 16% more at 10 (BENCH.md).
 - **When.** Worker 0 looks once a second. If one worker made at least
   nine tenths of a session's TAP reads since the last look, and at least
   1,000 of them, worker 0 picks the `r` that gives that worker the peer's
-  control lane. A session rotates at most once in ten seconds.
+  control lane. A session rotates at most once in ten seconds. With two
+  workers (November 20) worker 0 instead picks the `r` that gives worker
+  0 the peer's data lane, whatever the reads say: worker 1 transmits the
+  only data lane, and the reader rule could leave it receiving that lane
+  too.
 - **Where.** Only where steering can follow: the session has as many TAP
   queues as there are workers, and its endpoint serves no other session,
   because one steering program serves the whole endpoint.
@@ -1333,13 +1337,15 @@ If a comparison already reaches the available underlay ceiling, report that fact
 
 # 15 Implementation stages
 
-**Current status (November 19):** stages 1 and 4 are complete. Stages 2 and 3
+**Current status (November 20):** stages 1 and 4 are complete. Stages 2 and 3
 are implemented. The local rate of 20 Gbit/s each way was first reached on
 November 19 with sixteen workers per daemon, by a margin of one or two
 percent and before its acceptance profile is frozen. Sixteen workers also
-pass 5 Gbit/s each way over a local routed path with loss, but the gate of
-5 Gbit/s over the lossy access path is set for a box of two to four cores
-and remains open, and stage 5 measured optimisation is in progress. ROADMAP.md and BENCH.md track both. Offload
+pass 5 Gbit/s each way over a local routed path with loss, and since
+November 20 four workers do when the path's emulation runs on other cores.
+The gate of 5 Gbit/s over the lossy access path is set for a box of two to
+four cores on a real line and remains open, and stage 5 measured
+optimisation is in progress. ROADMAP.md and BENCH.md track both. Offload
 frames (section 6) are implemented behind `daemon.offload_frames`, on by
 default since November 20. The record
 below is chronological. Implemented foundations are

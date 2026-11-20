@@ -766,7 +766,9 @@ peer's control lane and no data lane: each worker passes its lane to the
 next owner with its frames and ACK state, packets still arriving at the
 old owner follow it through the same queue, and a second later the
 steering program follows. A session rotates at most once in ten seconds.
-It applies only to a session with as many TAP queues as there are
+Two workers are a case of their own: worker 1 transmits the only data
+lane, so worker 0 takes the peer's data lane whoever reads the TAP.
+Rotation applies only to a session with as many TAP queues as there are
 workers, on an endpoint that serves no other session, because one
 steering program serves a whole endpoint. With four workers and sixteen
 QinQ flows it delivers 14–19% more past saturation, and with offload
@@ -907,8 +909,9 @@ deliver again within 1.35 seconds, with no duplicate frame.
 Release forwarding, reconnect, allocation and routed-MTU regression tests pass.
 Sixteen workers per daemon first delivered 20 Gbit/s each way on
 November 19, and they pass 5 Gbit/s each way over a local routed path
-with loss. The lossy-path gate is set for two to four cores and remains
-open. BENCH.md records the measurements.
+with loss. Since November 20 four workers pass it too when the path's
+emulation runs on other cores. The lossy-path gate is set for two to four
+cores on a real line and remains open. BENCH.md records the measurements.
 
 ## TAP read batching
 

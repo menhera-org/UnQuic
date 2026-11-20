@@ -742,10 +742,17 @@ const ROTATE_HOLD: Duration = Duration::from_secs(10);
 /// TAP reads between two looks below which no worker counts as the reader.
 const ROTATE_READS: u64 = 1000;
 
-/// The rotation that gives the peer's control lane, wire lane 1, to the
-/// worker that made at least nine tenths of a session's TAP reads, if one
-/// did and made ROTATE_READS of them.
+/// The rotation a session's receive lanes should have, if the reads name one.
+///
+/// With two workers, worker 1 transmits every data frame, on wire lane 2, so
+/// worker 0 gets the peer's data lane whoever reads the TAP. With more, the
+/// peer's control lane, wire lane 1, goes to the worker that made at least
+/// nine tenths of the session's TAP reads, if one did and made ROTATE_READS
+/// of them.
 fn reader_rotation(reads: &[u64], cookie_low: u32) -> Option<u8> {
+    if reads.len() == 2 {
+        return Some((cookie_low.wrapping_add(1) % 2) as u8);
+    }
     let total: u128 = reads.iter().map(|&read| u128::from(read)).sum();
     let (reader, &most) = reads.iter().enumerate().max_by_key(|&(_, &read)| read)?;
     if most < ROTATE_READS || u128::from(most) * 10 < total * 9 {
@@ -8095,8 +8102,14 @@ mod tests {
         assert_eq!(reader_rotation(&[0, ROTATE_READS, 0, 0], 3), Some(2));
         assert_eq!(reader_rotation(&[1000, 9000, 0, 0], 3), Some(2));
         assert_eq!(reader_rotation(&[1001, 9000, 0, 0], 3), None);
-        assert_eq!(reader_rotation(&[u64::MAX, u64::MAX], 0), None);
+        assert_eq!(reader_rotation(&[u64::MAX, u64::MAX, 0], 0), None);
         assert_eq!(reader_rotation(&[], 3), None);
+        // Two workers: the peer's data lane, wire lane 2, goes to worker 0,
+        // which transmits no data, whoever reads the TAP and however little.
+        for (reads, cookie) in [([0, 0], 0), ([5000, 0], 3), ([0, 5000], u32::MAX)] {
+            let rotation = u32::from(reader_rotation(&reads, cookie).unwrap());
+            assert_eq!(cookie.wrapping_add(1).wrapping_add(rotation) % 2, 0);
+        }
 
         let (shared, [mut first, mut second]) = test_workers();
         for from in 0..2 {

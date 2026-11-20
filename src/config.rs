@@ -81,7 +81,8 @@ pub struct Daemon {
     /// On by default since November 20: when one worker reads nearly all of a
     /// session's TAP frames, rotate the session's receive lanes among the
     /// workers so that worker receives the peer's control lane and no data
-    /// lane (design section 13.1). Acts only on a session with as many TAP
+    /// lane (design section 13.1). With two workers, worker 0 receives the
+    /// peer's data lane instead. Acts only on a session with as many TAP
     /// queues as workers whose endpoint serves no other session.
     pub rotate_lanes: bool,
 }
