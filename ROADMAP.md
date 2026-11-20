@@ -826,8 +826,10 @@ Decisions only the user can make, each blocking a remaining goal:
    offload frames 42% more: 19.5–19.8 at 10 offered and 10.0–10.6 each
    way at 12–14, using 85–90% of the four cores where the default leaves
    a quarter idle. On the routed lossy path the pair adds about 18%.
-   Rotation has now run for 99 points of 20 s, loopback and routed with
-   loss, without an invalid, duplicate or out-of-window frame.
+   With eight workers the pair delivers the same on 12–15% less CPU, and
+   with sixteen it adds 13% at 26 Gbit/s offered each way. Rotation has
+   now run for 114 points of 20 s, loopback and routed with loss, without
+   an invalid, duplicate or out-of-window frame.
    That is the case rotation was built for, and the recommendation is
    now to turn it on by default together with offload frames, at least
    for sessions it covers; the decision is the user's

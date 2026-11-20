@@ -2893,7 +2893,24 @@ carry, and all four workers are full already. At 5 Gbit/s offered each
 way the default delivers 4.63–5.06 Gbit/s in total, rotation 4.53–4.81
 and both 4.79–5.10.
 
-In all of these sets and the lossy efficiency set below, 99 points of
+With more workers the pair still pays, on loopback, three rounds each
+([eight workers](benches/eight-workers-switches-nov20.json),
+[sixteen](benches/sixteen-workers-switches-nov20.json)):
+
+| Workers, offered each way | Default: delivered each way | CPU per daemon | Both switches | CPU per daemon |
+| --- | --- | --- | --- | --- |
+| 8, 8 Gbit/s | 7.89–7.91 | 323–349% | 7.90–7.91 | 289–305% |
+| 8, 12 | 11.74–11.85 | 481–521% | 11.80–11.81 | 426–435% |
+| 8, 16 | 15.11–15.49, busiest worker 92–97% | 604–639% | 15.47–15.69, busiest 80–83% | 527–548% |
+| 16, 21 | 18.53–19.98 | 920–993% | 19.73–20.29 | 814–869% |
+| 16, 26 | 19.94–21.86 | 982–1,093% | 23.36–24.66 | 959–1,026% |
+
+Eight workers deliver the same with 12–15% less CPU and keep a sixth of
+it in hand at 16 Gbit/s offered, where the default's busiest worker is
+full. Sixteen workers gain 13% at 26 Gbit/s offered each way, 47.4–48.7
+Gbit/s in total against 41.8–42.9.
+
+In all of these sets and the lossy efficiency set below, 114 points of
 20 s ran with rotation on, loopback and routed, and the load tool, which
 checks every payload byte, counted no invalid, duplicate or out-of-window
 frame on any arm.
