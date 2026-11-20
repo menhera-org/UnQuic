@@ -2841,6 +2841,73 @@ the target line. The design's list (L2TPv3 with fragmentation,
 WireGuard carrying L2, SoftEther) and its sixty-second, five-run
 procedure remain to be done where those modules can load.
 
+## Sixty-second runs on the lossy path (November 20)
+
+Design section 14.2 proposes five runs of at least 60 s for each
+profile. Sixteen workers on `02d0367`, thirty-two QinQ flows of 1522-byte
+frames as 44-segment GSO, 6 Gbit/s offered each way for 60 s from a cold
+start, 1% loss, five runs per arm in rotation
+([7.5 ms](benches/sixteen-workers-lossy-60s-7.5ms.json),
+[4.5 ms](benches/sixteen-workers-lossy-60s-4.5ms.json)):
+
+| Path | `daemon` switches | Delivered Gbit/s each way | Frames missing | CPU per daemon | Busiest worker |
+| --- | --- | --- | --- | --- | --- |
+| 7.5 ms | none | 5.49–5.76 | 3.5–7.1% | 760–800% | 59–68% |
+| | none, a second arm | 5.01–5.75 | 3.6–16.1% | 710–790% | 57–66% |
+| | `loss_threshold_permille = 100` | 5.76–5.94 | 0.4–3.5% | 746–774% | 59–68% |
+| | `offload_frames` | 5.46–5.81 | 2.7–8.4% | 689–703% | 54–62% |
+| | both | 5.84–5.96 | 0.1–2.0% | 635–693% | 52–57% |
+| 4.5 ms | none | 5.52–5.81 | 2.6–7.2% | 761–797% | 58–64% |
+| | none, a second arm | 5.57–5.80 | 2.8–6.4% | 766–785% | 59–65% |
+| | `loss_threshold_permille = 100` | 5.71–5.94 | 0.5–3.4% | 748–790% | 59–67% |
+| | `offload_frames` | 5.30–5.87 | 1.6–10.8% | 675–709% | 53–56% |
+| | both | 5.75–5.96 | 0.2–3.5% | 648–690% | 49–55% |
+
+All twenty runs with default settings deliver more than 5 Gbit/s each
+way: 5.01 and 5.12 in two of them and 5.36 or more in the other
+eighteen. With both switches every run delivers 5.75 or more and loses
+0.1–3.5% of its frames, on a seventh less CPU. That is the rate of the
+second gate on this host with sixteen workers. The gate itself names a
+box of two to four cores and a real access line, and the profile it
+freezes (flows, loss model, frame mix) is still the user's to set.
+
+## Sixty-second runs at the gate point (November 20)
+
+The same procedure at the first gate's point on `02d0367`: sixteen
+workers, thirty-two QinQ flows, a 60 s point at 4 Gbit/s each way and
+then 60 s at 21 offered, fifteen runs in a row, ten with default
+settings and five with `offload_frames`
+([results](benches/sixteen-workers-gate-60s-nov20.json); arms `def` and
+`def2` are the same). In the order they ran:
+
+| Start, UTC | Settings | Delivered L→R + R→L, Gbit/s | Frames missing | CPU of both daemons, % | Receive-socket overflows |
+| --- | --- | --- | --- | --- | --- |
+| 00:51 | default | 20.41 + 20.41 | 2.0% / 1.4% | 1,972 | 40,041 |
+| 00:53 | default | 20.32 + 20.46 | 2.5% / 1.4% | 1,958 | 35,473 |
+| 00:55 | `offload_frames` | 20.71 + 20.71 | 0.7% / 0.4% | 1,680 | 15,679 |
+| 00:57 | default | 20.35 + 20.39 | 2.5% / 1.4% | 1,955 | 41,602 |
+| 00:59 | `offload_frames` | 19.66 + 19.54 | 3.1% / 5.6% | 1,671 | 41,715 |
+| 01:01 | default | 20.48 + 20.60 | 1.8% / 0.8% | 1,967 | 36,905 |
+| 01:03 | `offload_frames` | 20.21 + 20.37 | 2.3% / 1.9% | 1,680 | 25,075 |
+| 01:05 | default | 18.96 + 19.27 | 7.8% / 6.1% | 1,862 | 74,774 |
+| 01:07 | default | 20.03 + 20.15 | 3.8% / 2.6% | 1,934 | 47,224 |
+| 01:10 | default | 19.34 + 19.92 | 7.2% / 3.4% | 1,938 | 75,276 |
+| 01:12 | default | 19.94 + 20.15 | 3.8% / 2.6% | 1,948 | 54,172 |
+| 01:14 | `offload_frames` | 17.20 + 17.63 | 16.9% / 13.9% | 1,515 | 42,987 |
+| 01:16 | default | 18.78 + 19.26 | 9.6% / 6.0% | 1,900 | 79,666 |
+| 01:18 | `offload_frames` | 19.08 + 19.61 | 7.6% / 4.2% | 1,651 | 37,768 |
+| 01:20 | default | 16.03 + 15.55 | 22.8% / 24.4% | 1,687 | 124,066 |
+
+For the first twelve minutes the default delivers 20.3–20.6 Gbit/s each
+way in four runs of four, and offload frames 20.2–20.7 in two of three.
+From 01:05 the same binaries deliver less run by run while the load
+tools still offer 20.6–21.0: the daemons get less CPU, their receive
+sockets overflow two to three times as often, and BBR backs off. That
+is the host and not the build, as an earlier set that evening showed in
+the other order, bad for its first ten minutes and normal after. A set
+that this host leaves alone for its whole half hour is still owed, and
+the margin over 20 Gbit/s stays at one to three percent when it does.
+
 ## The per-frame cost on November 19
 
 A profile build of `34aced8` on the full-size efficiency point (eight

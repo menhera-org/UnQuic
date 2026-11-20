@@ -93,7 +93,11 @@ Still open, in the order they now matter:
    default (decision 11). With both, sixteen workers lose 0.2–2.9% of
    their frames at 6 Gbit/s offered and deliver 5.7–5.9 Gbit/s each way,
    and 6.1–6.3 at 6.5 offered. Without the threshold they deliver 5.4–5.8
-   at 6 offered. What the gate still lacks is the box: four workers deliver
+   at 6 offered. In 60 s runs at 6 offered, five per arm on each delay,
+   all twenty default runs deliver more than 5 Gbit/s each way, and with
+   the threshold and offload frames every run delivers 5.75 or more
+   ([BENCH.md](BENCH.md#sixty-second-runs-on-the-lossy-path-november-20)).
+   What the gate still lacks is the box: four workers deliver
    about 2.5 Gbit/s per direction on the decision workload at 5G offered,
    CPU-bound at 96–98% of every core, and one flow stays near 1.0–1.4
    Gbit/s on one worker (2.0–2.2 with `stripe_flows`). With GSO traffic
