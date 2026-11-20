@@ -33,9 +33,39 @@ What the two change, each against the old defaults on one binary
   CPU. TCP through the tunnel gains; one flow of individual frames and the
   decision workload do not move.
 
-Still open, in the order they now matter: the list of the November 19
-checkpoint below stands, with its items 2 and 4 further along than it
-says. The four-core gate over a lossy access line still needs the box.
+Later that day the lossy path got a test bed that does not run on the
+daemons' cores
+([BENCH.md](BENCH.md#the-lossy-path-through-a-relay-november-20-landed)).
+The netem bed charged the path to the sending worker's system call, and
+it dropped datagrams in runs at a veth ring that no counter showed: with
+four workers 0.6% on top of the configured 1%. A relay in user space
+(`examples/path_relay.rs`, `OUTER_RELAY` in the harness) applies the
+delay and the loss on four CPUs of its own.
+
+- Four workers deliver more than 5 Gbit/s each way in ten 60 s runs of
+  ten at 6 Gbit/s offered, 1% loss and default settings: 5.11–5.56 at
+  7.5 ms and 5.51–5.91 at 4.5 ms, on 306–329% of four cores. The netem
+  bed showed about 3.
+- Two workers deliver 2.5–2.7 Gbit/s each way there, up from 1.8–2.1,
+  since worker 0 takes the peer's data lane in a two-worker session
+  ([BENCH.md](BENCH.md#two-workers-the-peers-data-lane-goes-to-worker-0-november-20-landed)).
+  On loopback they now carry 5 Gbit/s each way with a fifth of a core
+  to spare.
+
+The relay result is the second gate's rate with the gate's delay, loss
+and number of cores. Two things separate it from the gate: the receive
+softirq of the last hop runs on the relay's CPUs, and the line is
+emulated. Both need the box.
+
+Still open, in the order they now matter:
+
+1. The transmit side under loss. At 1% loss a frame costs the
+   transmitting worker about four times the user-space work it costs on
+   a clean path, and that worker is what stops two and four workers on
+   the lossy path. Profile it on the relay bed first.
+2. The list of the November 19 checkpoint below, with its items 2 and 4
+   further along than it says. The four-core gate over a lossy access
+   line still needs the box.
 
 ## November 19 checkpoint
 
