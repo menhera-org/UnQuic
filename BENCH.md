@@ -3027,6 +3027,36 @@ the other order, bad for its first ten minutes and normal after. A set
 that this host leaves alone for its whole half hour is still owed, and
 the margin over 20 Gbit/s stays at one to three percent when it does.
 
+The set again on `b2c88ec`, where offload frames and lane rotation are
+the default, with five runs that turn both off
+([results](benches/sixteen-workers-gate-60s-defaults-nov20.json)):
+
+| Start, UTC | Settings | Delivered L→R + R→L, Gbit/s | Frames missing | CPU of both daemons, % | Receive-socket overflows |
+| --- | --- | --- | --- | --- | --- |
+| 04:25 | default | 20.11 + 20.21 | 3.2% / 2.9% | 1,683 | 30,331 |
+| 04:27 | default | 19.88 + 19.86 | 4.3% / 4.4% | 1,676 | 35,572 |
+| 04:29 | both off | 20.42 + 20.51 | 1.8% / 1.4% | 1,988 | 48,266 |
+| 04:32 | default | 20.56 + 20.51 | 1.1% / 0.9% | 1,700 | 22,299 |
+| 04:34 | both off | 20.44 + 20.43 | 1.7% / 1.7% | 1,989 | 43,300 |
+| 04:36 | default | 20.64 + 20.62 | 0.7% / 0.8% | 1,696 | 22,453 |
+| 04:38 | both off | 20.30 + 20.30 | 2.4% / 2.0% | 1,982 | 46,828 |
+| 04:40 | default | 17.84 + 18.26 | 13.0% / 10.7% | 1,646 | 65,410 |
+| 04:42 | default | 19.96 + 20.07 | 3.8% / 3.0% | 1,666 | 32,936 |
+| 04:44 | default | 20.51 + 20.61 | 1.4% / 0.9% | 1,701 | 23,073 |
+| 04:46 | default | 20.53 + 20.67 | 1.3% / 0.8% | 1,696 | 20,548 |
+| 04:48 | both off | 20.23 + 20.08 | 2.6% / 3.3% | 1,978 | 53,052 |
+| 04:50 | default | 19.43 + 19.64 | 5.9% / 4.6% | 1,650 | 41,948 |
+| 04:53 | both off | 19.23 + 19.46 | 6.2% / 5.3% | 1,916 | 62,311 |
+| 04:55 | default | 20.46 + 20.64 | 1.7% / 0.8% | 1,691 | 21,524 |
+
+With the new defaults the daemons use 15% less CPU. Six of the ten
+default runs deliver 20.1–20.7 Gbit/s each way, and the five that the
+host leaves alone (those with about 22,000 overflows) deliver 20.5–20.7,
+a margin of 2.3–3.3% where the old defaults have 0.4–2.5%. Two more miss
+20 by under 1% and two fall well short, each with half again to three
+times the overflows; one of the five runs with both switches off does
+the same. The host still decides which runs pass.
+
 ## The per-frame cost on November 19
 
 A profile build of `34aced8` on the full-size efficiency point (eight
