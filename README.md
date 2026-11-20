@@ -417,7 +417,7 @@ room, startup doubles or quadruples each session's retained transmit
 frames, from 8192 to 16,384 or 32,768, at about 46 MiB per session for each
 8192. Frames in flight hold slots as well as frames that wait, so a fast path
 of several milliseconds needs the larger budget: with four workers and one
-session the default 256 MiB pays for 16,384, and 310 MiB for 32,768. A release runtime
+session the default 256 MiB pays for 16,384, and 311 MiB for 32,768. A release runtime
 regression drops each direction's original frame prefix and first repair,
 requires delivery through the second repair, and replays the late original
 without duplicate TAP delivery or hot-path allocation.
@@ -698,7 +698,7 @@ false for draft 07's window. On the decision workload at 0.5 Gbit/s it
 kept every ProbeRTT episode off its window and, with host stalls counted
 out, halved the remaining loss (BENCH.md).
 
-`daemon.offload_frames`, off by default, advertises the optional handshake
+`daemon.offload_frames`, on by default since November 20, advertises the optional handshake
 feature that carries TAP GSO super-frames as offload frames (design section
 6). When both peers advertise it, the sender cuts each super-frame into runs
 of whole segments, at most 18,044 bytes each (12 segments of a 1500-byte
@@ -708,13 +708,14 @@ segment. The receiver checks the descriptor, writes the run to its TAP with
 that header, or segments it in software when the TAP refuses the offload. On
 the full-size efficiency point, where nearly every TAP read is a 44-segment
 super-frame, it cut CPU per delivered Gbit/s 14.7% in all six rounds and
-lost no more frames. On a routed 4.5 ms path with 1% loss it still loses
-more than ordinary frames do, because a frame that expires takes its whole
-run with it: 0.05–0.19% against 0.01–0.05% at each round's worst point
-since November 16, where both lost several percent before (BENCH.md).
+lost no more frames. On a routed 4.5 ms path with 1% loss a frame that
+expires takes its whole run with it, and until November 16 that showed as
+more loss than ordinary frames had. Since then the difference lies inside
+what two runs of the same settings differ by, and offload frames use 8.5%
+less CPU per delivered bit there (BENCH.md).
 Receiving uses the ordinary reassembly slots; sending
-reserves about 420 KiB of coverage planes per worker. It stays off by
-default (decision 8 in ROADMAP.md).
+reserves about 420 KiB of coverage planes per worker. Set it to false to
+send one frame per segment (decision 8 in ROADMAP.md).
 
 `daemon.partial_checksums`, on by default, advertises the optional handshake
 feature that leaves transport checksums partial (design section 6). When
@@ -757,7 +758,7 @@ session's TAP. Traffic the kernel cannot spread over TAP queues, such as
 QinQ frames, is all read by one worker. Unless the cookie happens to give
 that worker the peer's control lane, it also receives one of the peer's
 data lanes while it transmits a lane of its own, and it saturates first.
-`daemon.rotate_lanes`, off by default, corrects that at
+`daemon.rotate_lanes`, on by default since November 20, corrects that at
 run time. Once a second worker 0 checks whether one worker made at least
 nine tenths of a session's TAP reads, and at least 1,000 of them. If so,
 it rotates the session's receive lanes so that this worker owns the
@@ -768,12 +769,12 @@ steering program follows. A session rotates at most once in ten seconds.
 It applies only to a session with as many TAP queues as there are
 workers, on an endpoint that serves no other session, because one
 steering program serves a whole endpoint. With four workers and sixteen
-QinQ flows it delivered 3–7% more at 8 Gbit/s offered each way and 16%
-more at 10, and at light load it cost nothing. On a routed 4.5 ms path
-with 1% loss it lost about 0.02% of frames at a round's worst point
-where the daemon without it lost 0.01%, so it stays off by default and
-is meant for boxes that saturate with one reading worker (BENCH.md,
-decision 9 in ROADMAP.md). The wire format and the peer are unaffected.
+QinQ flows it delivers 14–19% more past saturation, and with offload
+frames 42% more; at light load it costs nothing, and on a routed path
+with loss its effect lies inside what two runs of the same settings
+differ by (BENCH.md, decision 9 in ROADMAP.md). Set it to false to keep
+every receive lane on the worker its cookie names. The wire format and
+the peer are unaffected.
 
 A TAP reader places no new flow on a lane it transmits itself while at
 least six other data lanes remain, so a worker that reads a whole session

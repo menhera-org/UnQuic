@@ -60,12 +60,12 @@ pub struct Daemon {
     /// lane 0 carries only ACKs and control, so data never fills the packet
     /// history they number from. Data uses the other lanes.
     pub control_lane: bool,
-    /// Off by default: advertise optional feature `OFFLOAD_FRAMES`. When both
-    /// peers advertise it, each sends a TAP GSO super-frame as offload frames
-    /// of up to 12 or so segments instead of one frame per segment, with the
-    /// transport checksum left partial (design section 6). Receiving needs no
-    /// extra memory; sending reserves 64 sets of coverage planes per worker,
-    /// about 420 KiB.
+    /// On by default since November 20: advertise optional feature
+    /// `OFFLOAD_FRAMES`. When both peers advertise it, each sends a TAP GSO
+    /// super-frame as offload frames of up to 12 or so segments instead of
+    /// one frame per segment, with the transport checksum left partial
+    /// (design section 6). Receiving needs no extra memory; sending reserves
+    /// 64 sets of coverage planes per worker, about 420 KiB.
     pub offload_frames: bool,
     /// On by default since November 15: advertise optional feature
     /// `PARTIAL_CHECKSUMS`. When both peers advertise it, frames the sender
@@ -78,11 +78,11 @@ pub struct Daemon {
     /// order on one worker before its TAP (design section 13.1, item 6).
     /// Sending striped flows is not implemented yet.
     pub stripe_flows: bool,
-    /// Off by default: when one worker reads nearly all of a session's TAP
-    /// frames, rotate the session's receive lanes among the workers so that
-    /// worker receives the peer's control lane and no data lane (design
-    /// section 13.1). Acts only on a session with as many TAP queues as
-    /// workers whose endpoint serves no other session.
+    /// On by default since November 20: when one worker reads nearly all of a
+    /// session's TAP frames, rotate the session's receive lanes among the
+    /// workers so that worker receives the peer's control lane and no data
+    /// lane (design section 13.1). Acts only on a session with as many TAP
+    /// queues as workers whose endpoint serves no other session.
     pub rotate_lanes: bool,
 }
 impl Default for Daemon {
@@ -95,10 +95,10 @@ impl Default for Daemon {
             tx_hold_us: 0,
             probe_rtt_ack_delay: true,
             control_lane: true,
-            offload_frames: false,
+            offload_frames: true,
             partial_checksums: true,
             stripe_flows: false,
-            rotate_lanes: false,
+            rotate_lanes: true,
         }
     }
 }

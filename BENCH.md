@@ -97,8 +97,8 @@ comparison below.
 ## Current performance gaps
 
 Updated November 12, and the first four rows and the 5 Gbit/s row on
-November 19; those and the last two are current, the others keep earlier
-evidence. L→R / R→L pairs are simultaneous. Run-to-run
+November 19 and 20; those and the last two are current, the others keep
+earlier evidence. L→R / R→L pairs are simultaneous. Run-to-run
 noise is large: identical binaries differ by up to 7.5% in loopback total and
 up to 18% in one direction (A/A, November 12), so single differences of a few
 percent mean nothing. Efficiency changes are judged by CPU per delivered
@@ -109,7 +109,7 @@ Gbit/s at an offer-limited load instead.
 | At least 20 Gbit/s each way at inner MTU 1500 | November 19: sixteen workers per daemon deliver 20.1–20.7 Gbit/s each way in five of five 60 s runs with `offload_frames`, and in four of five without it (the fifth reads 19.90 one way), at 800–863% and 942–996% of a core per daemon, thirty-two QinQ flows at 21 Gbit/s offered ([BENCH.md](#one-report-per-ack-november-19-landed)). Before that: loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98%. With sixteen workers per daemon and thirty-two flows: 7.11 / 7.03 Gbit/s, no thread above 75%, limited by receive-socket overflow under the container's 416 KiB buffer ([BENCH.md](#sixteen-workers-per-daemon-november-11-exploratory)). Over a 9000-byte outer path: 10.27 / 13.90 Gbit/s with QinQ and 10.78 / 17.82 with one tag at sixteen workers, 13.36 / 11.77 with QinQ at eight, at 34–45% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)) | November 19: the margin over 20 is one or two percent, as large as this host's own variation, and the acceptance profile (hardware, core budget, flow count, frame mix) is not frozen. It takes sixteen workers per daemon, eight to ten cores of them busy. Earlier: at a 1500-byte outer path the per-bit cost must roughly halve; a 9000-byte path halves it but no thread then saturates, and reordering and overflows rise. One left worker does two jobs: it reads every L→R frame from the TAP (QinQ input all lands on one queue) and receives the R→L lanes it owns. L→R senders idle for its input; its socket overflows and R→L loses packets, so BBR cuts. More receive buffers move capacity from L→R to R→L (+11% total, L→R −14%); letting tun spread reads costs 23% more CPU per bit ([BENCH.md](#receive-buffers-for-a-busy-reader-november-11)). Next: keep receive work off the TAP reader, or split TAP reading inside the daemon. |
 | Goodput must plateau under excess traffic | November 19, `1f28d42`: on the decision workload every 5G total is 0.8–2.0 Gbit/s above its 2G total; sixteen flows deliver 1.92–1.96 Gbit/s each way at 2G offered and 2.16–2.73 at 5G, four flows 1.70–1.95 and 2.32–2.90 ([BENCH.md](#the-decision-workload-on-the-current-build-november-19)). Earlier: decision workload (four workers, 4.5 ms), `3178088`: sixteen flows deliver 1.62 / 1.64 Gbit/s at 2G offered and 2.03 / 1.58 at 5G; four flows 1.31 / 1.73 and 0.92 / 1.38 ([BENCH.md](#decision-workload-baseline-november-12-evening)). With the read margin (`3b9e86f`) every 5G total matches or exceeds its 2G total: four flows 1.21 / 2.07 at 5G, sixteen 2.03 / 1.77 ([BENCH.md](#owners-refusing-each-other-a-read-margin-landed)). Workers run at 77–99% of a core | Lossy four-flow L→R still falls 10% from 2G to 5G, and overloaded p99 delay rose with the extra delivery. Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
 | TCP through the tunnel | Loopback, eight workers, eight iperf3 streams each way: 9.2–9.9 Gbit/s in total at about 1 core per Gbit/s, about 1% of segments retransmitted ([BENCH.md](#tap-queue-length-and-overload-delay)) | Losses come from receive-socket overflows under the container's 416 KiB buffers; the daemon cannot raise them without `CAP_NET_ADMIN`. |
-| Small-frame overload must remain efficient | November 19, `1f28d42`: untagged 64-byte frames, sixteen flows, unlimited: 3.24–3.35 / 4.15–4.32 M frames/s with eight workers and 7.50–8.52 / 5.62–6.42 M with sixteen, at 1.6–1.8 cores per M frames/s ([BENCH.md](#small-frame-rows-on-the-current-build-november-19)). November 12: untagged 64-byte frames, sixteen flows: 3.24–3.43 / 3.27–3.48 M frames/s unlimited with eight workers and 4.23–4.53 / 4.16–4.57 M with sixteen, against 5.87 / 5.74 M for the pre-recovery build; QinQ 128-byte frames 2.18–2.31 / 3.32–3.53 M; 1.85–1.95 cores per M frames/s against 1.28–1.33 ([BENCH.md](#small-frame-rows-at-the-current-build-november-12)) | About 45% more CPU per frame since recovery and BBR, spread across transmit bookkeeping with no single large target; four candidates cut 0–3% at overload, and the expiry heap landed at −4.2% CPU per frame offer-limited ([BENCH.md](#where-the-small-frame-cost-comes-from-november-12)). One to one and a half of eight workers per daemon idle because tun's queue hash leaves them no transmit work; balanced lanes do not change this. High ingress loss persists; mixed traffic and non-coalescible frames remain unverified. |
+| Small-frame overload must remain efficient | November 20, with offload frames on by default: untagged 64-byte frames, sixteen flows, unlimited: 11.8–12.8 / 13.2 M frames/s with eight workers and 12.6–12.7 / 13.6–14.1 M with sixteen, at 0.44–0.57 cores per M frames/s, and the 40M rows arrive complete ([BENCH.md](#offload-frames-and-lane-rotation-on-by-default-november-20-landed)). November 19, `1f28d42`, without them: 3.24–3.35 / 4.15–4.32 M frames/s with eight workers and 7.50–8.52 / 5.62–6.42 M with sixteen, at 1.6–1.8 cores per M frames/s ([BENCH.md](#small-frame-rows-on-the-current-build-november-19)). November 12: untagged 64-byte frames, sixteen flows: 3.24–3.43 / 3.27–3.48 M frames/s unlimited with eight workers and 4.23–4.53 / 4.16–4.57 M with sixteen, against 5.87 / 5.74 M for the pre-recovery build; QinQ 128-byte frames 2.18–2.31 / 3.32–3.53 M; 1.85–1.95 cores per M frames/s against 1.28–1.33 ([BENCH.md](#small-frame-rows-at-the-current-build-november-12)) | About 45% more CPU per frame since recovery and BBR, spread across transmit bookkeeping with no single large target; four candidates cut 0–3% at overload, and the expiry heap landed at −4.2% CPU per frame offer-limited ([BENCH.md](#where-the-small-frame-cost-comes-from-november-12)). One to one and a half of eight workers per daemon idle because tun's queue hash leaves them no transmit work; balanced lanes do not change this. High ingress loss persists; mixed traffic and non-coalescible frames remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input and output offloads improve matched TCP sweeps; single-stream output coalescing reaches 2.01 / 2.26 Gbit/s, still below the deployment target. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
@@ -2914,6 +2914,51 @@ In all of these sets and the lossy efficiency set below, 114 points of
 20 s ran with rotation on, loopback and routed, and the load tool, which
 checks every payload byte, counted no invalid, duplicate or out-of-window
 frame on any arm.
+
+## Offload frames and lane rotation on by default (November 20, landed)
+
+`daemon.offload_frames` and `daemon.rotate_lanes` are on by default from
+this commit. The four-worker result above was the reason to look; what
+follows is every other point the two had not been measured on together,
+each against the old defaults on the same binary, `02d0367`.
+
+| Point | Old defaults | Both on |
+| --- | --- | --- |
+| Full-size efficiency point, CPU per delivered Gbit/s, six rounds ([results](benches/defaults-nov20-efficiency.json)) | 41.6%; a second arm −0.4% | 36.1%, −12.6%, lower in 6 of 6 |
+| Lossy efficiency point, the same ([results](benches/defaults-nov20-lossy-efficiency.json)) | 95.1%; a second arm −2.4% | 82.6%, −13.4%, lower in 6 of 6 |
+| Its worst-point frames missing, median | 0.07% and 0.03% | 0.04%, and never above 0.05% |
+| Sixteen workers, 1% loss, 6 Gbit/s offered each way for 60 s, three runs, 7.5 ms ([counts](benches/defaults-nov20-lossy-and-tcp.txt)) | 5.50–5.74 Gbit/s each way, 4.3–8.2% missing, 17.5 cores busy | 5.65–5.77, 3.8–5.8%, 16.1 cores |
+| The same at 4.5 ms | 5.45–5.75, 4.2–9.2%, 17.2–18.3 cores | 5.65–5.80, 3.3–5.8%, 15.4–15.7 cores |
+| One bridged flow, 7.5 ms and 1% loss, 5 Gbit/s offered ([results](benches/defaults-nov20-one-flow.json)) | 0.95–1.17 Gbit/s each way | 0.98–1.15 |
+| Eight TCP streams each way, eight workers, loopback, three runs | 20.4, 20.5 and 24.8 Gbit/s in total | 22.6, 28.1 and 34.3 |
+
+Small frames gain most, because sixty-four of them now travel as one
+offload frame. Sixteen flows, 64 segments per send, two rounds
+([64 bytes, eight workers](benches/defaults-nov20-small-64-w8.json),
+[sixteen](benches/defaults-nov20-small-64-w16.json),
+[128 bytes with QinQ](benches/defaults-nov20-small-128-qinq.json)).
+M frames/s L→R / R→L, and CPU of the two daemons:
+
+| Frame, workers, request | Old defaults | CPU | Both on | CPU |
+| --- | --- | --- | --- | --- |
+| 64, 8, 40M | 2.67 / 2.84, a fifth to a quarter missing | 481–489% / 502–509% | 3.58 / 3.58, none missing | 206–209% / 213–222% |
+| 64, 8, unlimited | 3.18 / 3.69–3.92 | 631–636% / 663–675% | 11.8–12.8 / 13.2 | 545–570% / 565–567% |
+| 64, 16, 40M | 3.30–3.35 / 3.58 | 652–658% / 627–637% | 3.58 / 3.58 | 278–279% / 290–291% |
+| 64, 16, unlimited | 8.07–8.24 / 6.08–6.14 | 1,244–1,252% / 1,150% | 12.6–12.7 / 13.6–14.1 | 748–780% / 767–792% |
+| 128 QinQ, 8, 40M | 1.01 / 1.01 | 180–181% / 179% | 1.01 / 1.01 | 100–104% / 101–102% |
+| 128 QinQ, 8, unlimited | 3.54–3.85 / 3.00–3.29 | 719–720% / 714–715% | 11.4–12.2 / 11.0–11.2 | 647–668% / 650–652% |
+
+With sixteen workers, and with QinQ, the unlimited rows deliver 90–99%
+of what the load tools manage to offer, so those are the generators'
+ceiling as much as the daemon's. A small frame costs 0.44–0.57 cores per
+million frames/s with both on, where it cost 1.6–2.0.
+
+Nothing measured speaks against the change. The one flow of individual
+frames and the decision workload do not move, because neither has
+super-frames to carry or an idle worker to use. Offload frames are
+negotiated, so a peer that does not advertise them still gets one frame
+per segment, and rotation acts only on a session alone on its endpoint
+with a TAP queue for each worker.
 
 ## Sixty-second runs on the lossy path (November 20)
 

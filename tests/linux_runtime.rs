@@ -498,8 +498,13 @@ fn workers_forward_both_directions_and_reconnect_after_restart() {
         scope_id: 0,
         bind_device: None,
     });
+    let mut right_config = config("uq-right", 40101, 40100);
+    // This test counts segments expanded one frame each; offload frames,
+    // which carry them in runs, have their own test below.
+    left_config.daemon.offload_frames = false;
+    right_config.daemon.offload_frames = false;
     let mut left = Running::start(left_config);
-    let mut right = Running::start(config("uq-right", 40101, 40100));
+    let mut right = Running::start(right_config);
     until(Duration::from_secs(5), || {
         left.control.ready() && right.control.ready()
     });

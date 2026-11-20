@@ -7,6 +7,36 @@ read that section before writing code. Keep the "Current status" paragraph in
 section 15 of the design and the "Implementation status" section of
 [README.md](README.md) true after every step.
 
+## November 20 checkpoint
+
+`daemon.offload_frames` and `daemon.rotate_lanes` are on by default
+(decisions 8 and 9). The user's instruction of November 19 was to reach
+the targets without stopping for decisions, so both were taken on their
+measurements; either switch set to false restores the old behaviour.
+
+What the two change, each against the old defaults on one binary
+([BENCH.md](BENCH.md#offload-frames-and-lane-rotation-on-by-default-november-20-landed)):
+
+- Four workers, the size of the target boxes, carry 10 Gbit/s each way on
+  loopback where they carried 6.5–7, and use 18% less CPU below
+  saturation. One worker used to saturate with a quarter of the cores idle
+  ([BENCH.md](BENCH.md#four-workers-with-lane-rotation-and-offload-frames-november-20)).
+- CPU per delivered bit falls 12.6% on the full-size efficiency point and
+  13.4% on the lossy one, in six rounds of six each, with no more loss.
+- Small frames: sixteen flows of 64-byte frames at 40 Mbit/s each arrive
+  complete on eight workers at 43% of the CPU, where a fifth to a quarter
+  was lost, and unlimited they deliver 12–13 M frames/s where they
+  delivered 3–4. A small frame costs 0.44–0.57 cores per million frames/s
+  where it cost 1.6–2.0.
+- Sixteen workers gain 13% at 26 Gbit/s offered each way, and on the lossy
+  path at 6 Gbit/s offered deliver 5.65–5.80 Gbit/s each way on 9% less
+  CPU. TCP through the tunnel gains; one flow of individual frames and the
+  decision workload do not move.
+
+Still open, in the order they now matter: the list of the November 19
+checkpoint below stands, with its items 2 and 4 further along than it
+says. The four-core gate over a lossy access line still needs the box.
+
 ## November 19 checkpoint
 
 The local gate's rate was reached for the first time. With sixteen
@@ -704,7 +734,9 @@ Decisions only the user can make, each blocking a remaining goal:
    likely cause of 2% of a striped TCP flow's frames leaving out of
    sequence); a lane stays a member for a second. That fix is unit
    tested and leaves the UDP result unchanged, but is unverified on TCP.
-8. Decided November 14: `daemon.offload_frames` stays off by default, for
+8. Decided November 20: `daemon.offload_frames` is on by default (the end
+   of this item has the grounds). The record up to then follows. Decided
+   November 14: it stays off by default, for
    clean paths only, until receive capacity under loss improves. Next is
    receive without the reassembly copy. The question was whether it should
    be on by default.
@@ -786,7 +818,17 @@ Decisions only the user can make, each blocking a remaining goal:
    November 20: with four workers they add 17–21% past saturation alone
    and 42% together with `rotate_lanes`, and save 15% of the CPU below it
    ([BENCH.md](BENCH.md#four-workers-with-lane-rotation-and-offload-frames-november-20)).
-9. Open since November 16: should `daemon.rotate_lanes` be on by default?
+
+   Decided November 20: on by default. With `rotate_lanes` they cut CPU
+   per delivered bit 12.6% on the clean efficiency point and 13.4% on the
+   lossy one with no more loss, and carry small frames at a quarter of
+   the cost. The user had asked on November 19 that the targets be
+   reached without stopping for decisions, so this one was taken on
+   those measurements; `offload_frames = false` undoes it
+   ([BENCH.md](BENCH.md#offload-frames-and-lane-rotation-on-by-default-november-20-landed)).
+9. Decided November 20: `daemon.rotate_lanes` is on by default (the end of
+   this item has the grounds). It was open since November 16: should it be
+   on by default?
    On, a session whose TAP one worker reads moves its receive lanes once,
    so that this worker receives the peer's control lane and no data lane.
    With four workers past saturation it delivered 3.2–7.0% more at 8
@@ -830,9 +872,11 @@ Decisions only the user can make, each blocking a remaining goal:
    with sixteen it adds 13% at 26 Gbit/s offered each way. Rotation has
    now run for 114 points of 20 s, loopback and routed with loss, without
    an invalid, duplicate or out-of-window frame.
-   That is the case rotation was built for, and the recommendation is
-   now to turn it on by default together with offload frames, at least
-   for sessions it covers; the decision is the user's
+   That is the case rotation was built for.
+
+   Decided November 20: on by default, together with offload frames and
+   on the same standing instruction; `rotate_lanes = false` undoes it.
+   Both kernel suites ran with it on
    ([BENCH.md](BENCH.md#four-workers-with-lane-rotation-and-offload-frames-november-20)).
 10. Open since November 19: where should frames wait when the lanes are
    held back for a moment? Since a TAP reader with six or more other data

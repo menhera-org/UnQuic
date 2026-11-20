@@ -883,7 +883,7 @@ flows between transmit lanes cannot do it, because the sender does not
 know which of its lanes the peer's reader receives.
 
 **Receive-lane rotation (November 16 amendment; `daemon.rotate_lanes`,
-off by default).** Each session has a rotation `r`, zero at start, and a
+on by default since November 20).** Each session has a rotation `r`, zero at start, and a
 lane's receive owner is `(cookie_low32 + lane − 1 + r) mod n`. The
 steering program adds the same `r`, so the kernel keeps delivering each
 lane to its owner. There is no wire change and the peer is not involved.
@@ -1340,8 +1340,8 @@ percent and before its acceptance profile is frozen. Sixteen workers also
 pass 5 Gbit/s each way over a local routed path with loss, but the gate of
 5 Gbit/s over the lossy access path is set for a box of two to four cores
 and remains open, and stage 5 measured optimisation is in progress. ROADMAP.md and BENCH.md track both. Offload
-frames (section 6) are implemented behind `daemon.offload_frames`, off by
-default. The record
+frames (section 6) are implemented behind `daemon.offload_frames`, on by
+default since November 20. The record
 below is chronological. Implemented foundations are
 `UnquicUuid` parsing/provisioning, duplicate-checked cookie indexing,
 `MacAddress` validation, IPv6 sockets with separate receive/transmit APIs, and

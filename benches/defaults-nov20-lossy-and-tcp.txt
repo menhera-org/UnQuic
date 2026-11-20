@@ -1,0 +1,31 @@
+Arms def (rotate_lanes and offload_frames off, as 02d0367 has them) and rotoff (both on), binary 02d0367.
+
+== Sixteen workers, thirty-two QinQ GSO flows, 6 Gbit/s offered each way for 60 s, 1% loss; benches/tunnel_summary.sh
+-- 7.5 ms (rotofflt adds loss_threshold_permille = 100)
+def/r1: offered 5.99 + 5.99, delivered 5.57 + 5.59 Gbit/s, missing 7.00% 6.69%, 17.6 cores busy, 1.58 per Gbit/s
+def/r2: offered 5.99 + 6.00, delivered 5.64 + 5.74 Gbit/s, missing 5.88% 4.34%, 17.6 cores busy, 1.55 per Gbit/s
+def/r3: offered 6.00 + 5.99, delivered 5.50 + 5.52 Gbit/s, missing 8.23% 7.84%, 17.5 cores busy, 1.59 per Gbit/s
+rotoff/r1: offered 6.00 + 6.00, delivered 5.68 + 5.65 Gbit/s, missing 5.28% 5.83%, 16.2 cores busy, 1.43 per Gbit/s
+rotoff/r2: offered 6.00 + 6.00, delivered 5.75 + 5.67 Gbit/s, missing 4.09% 5.41%, 16.1 cores busy, 1.41 per Gbit/s
+rotoff/r3: offered 6.00 + 6.00, delivered 5.70 + 5.77 Gbit/s, missing 4.99% 3.82%, 16.0 cores busy, 1.40 per Gbit/s
+rotofflt/r1: offered 6.00 + 6.00, delivered 5.88 + 5.92 Gbit/s, missing 1.96% 1.21%, 15.8 cores busy, 1.34 per Gbit/s
+rotofflt/r2: offered 6.00 + 6.00, delivered 5.90 + 5.94 Gbit/s, missing 1.67% 0.98%, 15.8 cores busy, 1.34 per Gbit/s
+rotofflt/r3: offered 6.00 + 6.00, delivered 5.95 + 5.96 Gbit/s, missing 0.80% 0.66%, 15.1 cores busy, 1.27 per Gbit/s
+-- 4.5 ms
+def/r1: offered 6.00 + 6.00, delivered 5.45 + 5.47 Gbit/s, missing 9.17% 8.80%, 18.3 cores busy, 1.68 per Gbit/s
+def/r2: offered 6.00 + 6.00, delivered 5.66 + 5.66 Gbit/s, missing 5.57% 5.60%, 17.2 cores busy, 1.52 per Gbit/s
+def/r3: offered 6.00 + 6.00, delivered 5.67 + 5.75 Gbit/s, missing 5.39% 4.20%, 17.2 cores busy, 1.51 per Gbit/s
+rotoff/r1: offered 6.00 + 6.00, delivered 5.73 + 5.80 Gbit/s, missing 4.39% 3.28%, 15.6 cores busy, 1.35 per Gbit/s
+rotoff/r2: offered 6.00 + 6.00, delivered 5.73 + 5.72 Gbit/s, missing 4.43% 4.70%, 15.7 cores busy, 1.37 per Gbit/s
+rotoff/r3: offered 6.00 + 6.00, delivered 5.65 + 5.78 Gbit/s, missing 5.81% 3.63%, 15.4 cores busy, 1.35 per Gbit/s
+rotofflt/r1: offered 6.00 + 6.00, delivered 5.92 + 5.95 Gbit/s, missing 1.29% 0.82%, 14.9 cores busy, 1.26 per Gbit/s
+rotofflt/r2: offered 6.00 + 6.00, delivered 5.94 + 5.93 Gbit/s, missing 0.99% 1.17%, 14.9 cores busy, 1.26 per Gbit/s
+rotofflt/r3: offered 6.00 + 6.00, delivered 5.91 + 5.95 Gbit/s, missing 1.47% 0.76%, 15.0 cores busy, 1.26 per Gbit/s
+
+== Eight workers, eight iperf3 TCP streams each way on loopback, 20 s: received Gbit/s L>R and R>L, sender retransmits
+def r1 lr 10.18 rl 10.17 retransmits 25055 36061
+def r2 lr 11.73 rl 8.72 retransmits 42063 28416
+def r3 lr 14.64 rl 10.16 retransmits 26291 43262
+rotoff r1 lr 11.19 rl 11.37 retransmits 52041 50142
+rotoff r2 lr 21.51 rl 12.75 retransmits 52768 24796
+rotoff r3 lr 13.66 rl 14.43 retransmits 48793 41799
