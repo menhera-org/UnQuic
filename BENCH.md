@@ -2893,6 +2893,11 @@ carry, and all four workers are full already. At 5 Gbit/s offered each
 way the default delivers 4.63–5.06 Gbit/s in total, rotation 4.53–4.81
 and both 4.79–5.10.
 
+In all of these sets and the lossy efficiency set below, 99 points of
+20 s ran with rotation on, loopback and routed, and the load tool, which
+checks every payload byte, counted no invalid, duplicate or out-of-window
+frame on any arm.
+
 ## Sixty-second runs on the lossy path (November 20)
 
 Design section 14.2 proposes five runs of at least 60 s for each
