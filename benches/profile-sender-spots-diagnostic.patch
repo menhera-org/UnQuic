@@ -1,0 +1,120 @@
+diff --git a/src/profile.rs b/src/profile.rs
+index c12610b..9b340a9 100644
+--- a/src/profile.rs
++++ b/src/profile.rs
+@@ -105,5 +105,20 @@ pub fn report(worker: usize, phases: &[u64; PHASES]) {
+             100.0 * phases[index] as f64 / total.max(1) as f64
+         ));
+     }
++    let spots: Vec<String> = SPOTS.iter().map(|s| format!("{}/{}", s[0].load(std::sync::atomic::Ordering::Relaxed), s[1].load(std::sync::atomic::Ordering::Relaxed))).collect();
++    line.push_str(&format!(" spots {}", spots.join(",")));
+     eprintln!("{line}");
+ }
++
++/// Diagnostic spots inside a phase, process-wide: cycles and visits.
++pub static SPOTS: [[std::sync::atomic::AtomicU64; 2]; 16] =
++    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 16];
++
++/// Charges the time since `started` to spot `index` and returns the time now.
++pub fn spot(index: usize, started: u64) -> u64 {
++    use std::sync::atomic::Ordering::Relaxed;
++    let now = now();
++    SPOTS[index][0].fetch_add(now.wrapping_sub(started), Relaxed);
++    SPOTS[index][1].fetch_add(1, Relaxed);
++    now
++}
+diff --git a/src/worker/sender.rs b/src/worker/sender.rs
+index 93e7aa1..c506b5e 100644
+--- a/src/worker/sender.rs
++++ b/src/worker/sender.rs
+@@ -1339,7 +1339,13 @@ impl Worker {
+         if !self.sender_enabled() {
+             return Ok(false);
+         }
++        #[cfg(feature = "profile")]
++        let mut lap = crate::profile::now();
+         let mut more = self.flush_sender_messages(now)?;
++        #[cfg(feature = "profile")]
++        {
++            lap = crate::profile::spot(0, lap);
++        }
+         let ack_blocked = self.sender.checks_pending != 0 || self.sender.loss_fences != 0;
+         self.begin_sender_ack()?;
+         for group in 0..self.sender.fresh.len() {
+@@ -1348,10 +1354,18 @@ impl Worker {
+                 self.sender.fresh[group] = false;
+             }
+         }
++        #[cfg(feature = "profile")]
++        {
++            lap = crate::profile::spot(1, lap);
++        }
+         let mut budget = BATCH_SIZE;
+         if self.sender.acks_pending == 0 {
+             more |= self.advance_loss_checks(now, &mut budget)?;
+         }
++        #[cfg(feature = "profile")]
++        {
++            lap = crate::profile::spot(2, lap);
++        }
+         for _ in 0..self.sender.lanes.len().min(BATCH_SIZE) {
+             if budget == 0 {
+                 more = true;
+@@ -1409,6 +1423,10 @@ impl Worker {
+                 self.sender.report = Some(report);
+             }
+         }
++        #[cfg(feature = "profile")]
++        {
++            lap = crate::profile::spot(3, lap);
++        }
+         // Pending work can only go on with the report box at hand; with the
+         // box on its way to the owner, its return restarts it.
+         more |= budget == 0
+@@ -1421,6 +1439,10 @@ impl Worker {
+             && !self.sender.incoming.is_empty()
+             && self.sender.report.is_some();
+         more |= self.stage_recovery()?;
++        #[cfg(feature = "profile")]
++        {
++            lap = crate::profile::spot(4, lap);
++        }
+         if self.sender.owner.is_some() {
+             // Apply local feedback before the shared owner considers fresh grants.
+             more |= self.flush_sender_messages(now)?;
+@@ -1431,6 +1453,10 @@ impl Worker {
+             }
+         }
+         more |= self.flush_sender_messages(now)?;
++        #[cfg(feature = "profile")]
++        {
++            lap = crate::profile::spot(5, lap);
++        }
+         // Probes park an unclaimed DATA plan rather than wait behind it: under
+         // pacing-limited load such a plan almost always occupies the job slot.
+         if self.parkable() {
+@@ -1532,10 +1558,23 @@ impl Worker {
+             self.request_abandon(now)?;
+             more |= !self.sender.abandons.is_empty();
+         }
+-        if self.sender.job.is_some() && self.claim_sender(now)? == Claimed::Ready {
++        #[cfg(feature = "profile")]
++        {
++            lap = crate::profile::spot(6, lap);
++        }
++        let claimed = self.sender.job.is_some() && self.claim_sender(now)? == Claimed::Ready;
++        #[cfg(feature = "profile")]
++        {
++            lap = crate::profile::spot(7, lap);
++        }
++        if claimed {
+             self.use_sender_permit(now)?;
+             more = true;
+         }
++        #[cfg(feature = "profile")]
++        {
++            lap = crate::profile::spot(8, lap);
++        }
+         Ok(more)
+     }
+ 

@@ -211,6 +211,9 @@ pub(super) struct Store {
     recovery: Vec<FrameRecovery>,
     // Coverage planes lent to offload frames' recovery state while they live.
     wide: Vec<Box<WidePlanes>>,
+    // Planes reserved in all, and how many offload frames may hold one at once.
+    wide_total: usize,
+    wide_limit: usize,
     free_frames: Vec<usize>,
     links: Vec<Link>,
     // Min-heap of (deadline key, frame slot); keys live here so sifts stay in one array.
@@ -253,6 +256,8 @@ impl Store {
             frames: std::iter::repeat_with(|| None).take(capacity).collect(),
             recovery,
             wide: Vec::new(),
+            wide_total: 0,
+            wide_limit: 0,
             free_frames: (0..capacity).rev().collect(),
             links: vec![Link::EMPTY; capacity],
             expiry: Vec::with_capacity(capacity),
@@ -271,6 +276,8 @@ impl Store {
             .map_err(io::Error::other)?;
         self.wide
             .extend(std::iter::repeat_with(WidePlanes::new).take(count));
+        self.wide_total = self.wide.len();
+        self.wide_limit = self.wide_total;
         Ok(())
     }
 
@@ -278,9 +285,25 @@ impl Store {
         self.free_frames.len()
     }
 
-    /// Offload frames that can still be inserted.
+    /// The fewest planes worth reserving, and the floor of the allowance.
+    pub const WIDE_MIN: usize = 64;
+
+    /// Offload frames that can still be inserted: free planes within the
+    /// allowance that `note_holed` and `release` move.
     pub fn wide_available(&self) -> usize {
-        self.wide.len()
+        let held = self.wide_total.saturating_sub(self.wide.len());
+        self.wide_limit.saturating_sub(held)
+    }
+
+    /// Halves the allowance of offload frames, down to WIDE_MIN, if feedback
+    /// holed frame `index` since `was` was read from its recovery state. Its
+    /// receiver holds such a frame in up to four of a lane's 128 slots until
+    /// a repair arrives, where an ordinary frame holds one. Each offload
+    /// frame released whole raises the allowance by one again.
+    pub fn note_holed(&mut self, index: usize, was: bool) {
+        if !was && self.recovery(index).is_some_and(FrameRecovery::holed) {
+            self.wide_limit = (self.wide_limit / 2).max(Self::WIDE_MIN.min(self.wide_total));
+        }
     }
 
     /// Unsent bytes of a queue's frames, counted until `cap` is reached.
@@ -437,6 +460,9 @@ impl Store {
         if frame.offload
             && let Some(recovery) = self.recovery.get_mut(index)
         {
+            if !recovery.holed() {
+                self.wide_limit = (self.wide_limit + 1).min(self.wide_total);
+            }
             self.wide.extend(recovery.detach());
         }
         let source = self.sources.get_mut(frame.source)?.as_mut()?;
@@ -668,6 +694,54 @@ mod tests {
         }
         assert!(store.unpin(source).is_some());
         assert_eq!(store.available(), 1);
+    }
+
+    #[test]
+    fn holed_offload_frames_halve_the_allowance_and_whole_ones_raise_it() {
+        let mut store = Store::new(4).unwrap();
+        store.reserve_wide(400).unwrap();
+        let source = store.insert_source(buffer(6000)).ok().unwrap();
+        let offload = |id| Frame {
+            offload: true,
+            ..frame(source, 0..3000, id)
+        };
+        let [first, second, third] = [1, 2, 3].map(|id| store.insert_frame(offload(id)).unwrap());
+        let ordinary = store.insert_frame(frame(source, 0..3000, 4)).unwrap();
+        for index in [first, second, third, ordinary] {
+            assert!(store.recovery_mut(index).unwrap().submitted(0..3000, 0));
+        }
+        assert_eq!(store.wide_available(), 397);
+        let acknowledge = |store: &mut Store, index, range| {
+            let was = store.recovery(index).unwrap().holed();
+            let recovery = store.recovery_mut(index).unwrap();
+            assert!(recovery.acknowledge(range, 0).is_some());
+            store.note_holed(index, was);
+            store.wide_available()
+        };
+        let lose = |store: &mut Store, index| {
+            let was = store.recovery(index).unwrap().holed();
+            assert!(store.recovery_mut(index).unwrap().lost(0..1000, 0));
+            store.note_holed(index, was);
+            store.wide_available()
+        };
+        // In-order ACKs hole nothing.
+        assert_eq!(acknowledge(&mut store, first, 0..1000), 397);
+        // An ACK ahead of an earlier piece does, once however many follow.
+        assert_eq!(acknowledge(&mut store, first, 2000..3000), 197);
+        assert_eq!(acknowledge(&mut store, first, 1000..1500), 197);
+        // So does a loss, down to the floor, and an ordinary frame never counts.
+        assert_eq!(lose(&mut store, second), 97);
+        assert_eq!(lose(&mut store, ordinary), 97);
+        assert_eq!(lose(&mut store, third), Store::WIDE_MIN - 3);
+        // A holed frame's release frees its plane; only a whole one raises the allowance.
+        for (index, available) in [(ordinary, 61), (first, 62), (second, 63), (third, 64)] {
+            assert!(store.release(index).is_none());
+            assert_eq!(store.wide_available(), available);
+        }
+        let whole = store.insert_frame(offload(5)).unwrap();
+        assert_eq!(store.wide_available(), 63);
+        assert!(store.release(whole).is_none());
+        assert_eq!(store.wide_available(), 65);
     }
 
     #[test]

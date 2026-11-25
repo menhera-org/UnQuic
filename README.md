@@ -713,9 +713,17 @@ expires takes its whole run with it, and until November 16 that showed as
 more loss than ordinary frames had. Since then the difference lies inside
 what two runs of the same settings differ by, and offload frames use 8.5%
 less CPU per delivered bit there (BENCH.md).
-Receiving uses the ordinary reassembly slots; sending
-reserves about 420 KiB of coverage planes per worker. Set it to false to
-send one frame per segment (decision 8 in ROADMAP.md).
+Receiving uses the ordinary reassembly slots. Sending reserves coverage
+planes for 64 offload frames per worker, about 420 KiB, and for an eighth
+of the worker's frame slots where `memory_limit` still has room once the
+frame slots are paid for: 3.3 MiB per worker with four workers under the
+default limit. A lane whose round trip holds more runs than it
+has planes sends the rest one frame per segment. Loss narrows that: an
+offload frame with a hole holds up to four of its receive lane's 128 slots
+until a repair arrives, so each one a worker sees halves the number of
+planes it may use at once, down to 64, and each offload frame that
+completes whole gives one back. Set `offload_frames` to false to send one
+frame per segment always (decision 8 in ROADMAP.md).
 
 `daemon.partial_checksums`, on by default, advertises the optional handshake
 feature that leaves transport checksums partial (design section 6). When

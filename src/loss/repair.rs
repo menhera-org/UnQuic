@@ -206,6 +206,13 @@ impl FrameRecovery {
         self.unacked as usize
     }
 
+    /// Whether an offload frame has left in-order acknowledgement: a piece
+    /// was lost, or acknowledged ahead of an earlier one. Its receiver then
+    /// holds the frame with a hole until a repair arrives.
+    pub const fn holed(&self) -> bool {
+        self.wide.is_some() && (self.dirty != 0 || !self.clean)
+    }
+
     /// Checks a proposed submission without mutation: zero is fresh, one/two repair.
     ///
     /// Fresh pieces extend the submitted prefix. Repairs require the previous

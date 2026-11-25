@@ -485,17 +485,34 @@ fn frame_capacity(
     })
 }
 
-/// Offload frames one worker can retain at once under `daemon.offload_frames`,
-/// each with 24 KiB of coverage planes: about 4 MiB of super-frames, several
-/// round trips of one worker's share at tens of Gbit/s on a short path.
-const OFFLOAD_SLOTS: usize = 64;
-
-fn offload_slots(config: &crate::config::Config, capacity: usize) -> usize {
-    if config.daemon.offload_frames {
-        OFFLOAD_SLOTS.min(capacity)
-    } else {
+/// Coverage planes, 7 KiB each, that one worker reserves for offload frames
+/// under `daemon.offload_frames`. `wide` gives one for an eighth of its frame
+/// slots: a run of twelve segments takes one slot where its segments would
+/// take twelve, so that covers the bytes the frame slots were sized for.
+/// Otherwise it has WIDE_MIN, and a lane whose round trip holds more runs
+/// than that sends the rest one frame per segment.
+fn offload_slots(config: &crate::config::Config, capacity: usize, wide: bool) -> usize {
+    if !config.daemon.offload_frames {
         0
+    } else if wide {
+        (capacity / 8).max(frames::Store::WIDE_MIN).min(capacity)
+    } else {
+        frames::Store::WIDE_MIN.min(capacity)
     }
+}
+
+/// Bytes the wide plane pools add to `Worker::storage_bytes`, which counts
+/// the least. The memory limit pays for them only after the frame slots.
+pub(crate) fn wide_surplus(
+    config: &crate::config::Config,
+    workers: usize,
+    frame_scale: usize,
+) -> Option<usize> {
+    (0..workers).try_fold(0_usize, |bytes, id| {
+        let capacity = frame_capacity(config, workers, id, frame_scale)?;
+        let planes = offload_slots(config, capacity, true) - offload_slots(config, capacity, false);
+        bytes.checked_add(planes.checked_mul(frames::Store::WIDE_BYTES)?)
+    })
 }
 
 /// Entries in the `balance_flows` table every TAP reader shares: 128 KiB.
@@ -1363,7 +1380,8 @@ impl Worker {
             bytes
                 .checked_add(frames::Store::storage_bytes(capacity))?
                 .checked_add(
-                    offload_slots(config, capacity).checked_mul(frames::Store::WIDE_BYTES)?,
+                    offload_slots(config, capacity, false)
+                        .checked_mul(frames::Store::WIDE_BYTES)?,
                 )?
                 .checked_add(recovery::Recovery::storage_bytes(capacity)?)
         })?;
@@ -1638,7 +1656,7 @@ impl Worker {
                 let capacity = frame_capacity(config, count, id, shared.frame_scale)
                     .ok_or(io::ErrorKind::InvalidInput)?;
                 let mut store = frames::Store::new(capacity)?;
-                store.reserve_wide(offload_slots(config, capacity))?;
+                store.reserve_wide(offload_slots(config, capacity, shared.wide_planes))?;
                 store
             },
             recovery: recovery::Recovery::new(
@@ -3634,7 +3652,8 @@ impl Worker {
             0
         };
         // A run of whole segments travels as one offload frame when the
-        // connection negotiated them and coverage planes are free for it.
+        // connection negotiated them and the store's allowance of coverage
+        // planes has one free for it.
         let before = segments;
         let mut header = [0; frames::HEADER_BYTES];
         let run = match segments.as_mut() {
@@ -8933,6 +8952,55 @@ mod tests {
     }
 
     #[test]
+    fn offload_planes_follow_the_frame_slots() {
+        use crate::config::{Peer, Session};
+        let mut config = crate::config::Config::default();
+        assert!(config.daemon.offload_frames);
+        // Wide: an eighth of the slots, at least WIDE_MIN and never more than the slots.
+        assert_eq!(
+            offload_slots(&config, frames::CAPACITY, true),
+            frames::CAPACITY / 8
+        );
+        assert_eq!(offload_slots(&config, 4096, true), 512);
+        assert_eq!(offload_slots(&config, 512, true), frames::Store::WIDE_MIN);
+        assert_eq!(offload_slots(&config, 100, true), frames::Store::WIDE_MIN);
+        // Otherwise WIDE_MIN whatever the slots.
+        assert_eq!(offload_slots(&config, 4096, false), frames::Store::WIDE_MIN);
+        for wide in [false, true] {
+            assert_eq!(offload_slots(&config, 32, wide), 32);
+            assert_eq!(offload_slots(&config, 0, wide), 0);
+        }
+        // The surplus is what the wide pools hold beyond the least, over all workers.
+        config.peers.push(Peer {
+            name: "peer".into(),
+            endpoint: "ep".into(),
+            address: None,
+            peer_port: 40000,
+            scope_id: 0,
+            tx_lanes: 4,
+            outer_payload_limit: 8952,
+            path_group: None,
+        });
+        config.sessions.push(Session {
+            name: "tap".into(),
+            peer: "peer".into(),
+            cookie: crate::UnquicUuid::from_bytes([1; 16]),
+            tap_name: None,
+            inner_mtu: 1500,
+            mac: None,
+            queue_count: 4,
+        });
+        let plane = frames::Store::WIDE_BYTES;
+        assert_eq!(wide_surplus(&config, 4, 2), Some(4 * (512 - 64) * plane));
+        assert_eq!(wide_surplus(&config, 4, 4), Some(4 * (1024 - 64) * plane));
+        assert_eq!(wide_surplus(&config, 4, 1), Some(4 * (256 - 64) * plane));
+        assert_eq!(wide_surplus(&config, 0, 1), Some(0));
+        config.daemon.offload_frames = false;
+        assert_eq!(offload_slots(&config, 4096, true), 0);
+        assert_eq!(wide_surplus(&config, 4, 2), Some(0));
+    }
+
+    #[test]
     fn frame_storage_follows_each_sessions_actual_owners() {
         use crate::config::{Config, Peer, Session};
         let mut config = Config::default();
@@ -10112,6 +10180,7 @@ mod tests {
         let shared = Arc::new(Shared {
             config,
             frame_scale: 1,
+            wide_planes: false,
             wakes: (0..2).map(|_| Arc::new(Wake::new().unwrap())).collect(),
             owners: (0..2)
                 .map(|_| (0..65_536).map(|_| AtomicU8::new(0)).collect())

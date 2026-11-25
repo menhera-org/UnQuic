@@ -249,8 +249,24 @@ by ignoring the unknown bit.
   today's; ordinary frames
   take the lowest free slots and offload frames the highest free run.
   Senders keep offload frames' coverage in a bounded pool of wide planes,
-  64 per worker, charged to `memory_limit`; when it runs out, segments go
-  as ordinary frames.
+  charged to `memory_limit`; when it runs out, segments go as ordinary
+  frames. The pool held 64 planes per worker until November 25. Where
+  `memory_limit` still has room once the frame slots are paid for, it now
+  holds planes for an eighth of the worker's frame slots: a run of twelve
+  segments takes one slot where its segments would take twelve, and with
+  64 planes a lane whose round trip held more runs than that sent the
+  rest as ordinary frames.
+- A receive lane has 128 slots, and an offload frame with a missing piece
+  holds up to four of them until its repair arrives, where an ordinary
+  frame holds one. So a sending worker keeps an allowance of planes in
+  use, at first the whole pool (November 25). An offload frame whose
+  acknowledgements leave prefix order, or that has a loss, is holed: that
+  is what a hole at the receiver looks like from the sender. Each frame
+  that becomes holed halves the allowance, down to 64, and each offload
+  frame released without one raises it by one. At a loss rate of one
+  datagram in a hundred the allowance stays at 64, which bounds the frames
+  in flight and so the holes the sender has not seen yet; at one in a
+  thousand it stays near two hundred.
 - Integrity of a partial-checksum frame in transit rests on the outer UDP
   checksum, as for any tunnel carrying offloaded traffic.
 

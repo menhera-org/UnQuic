@@ -1,0 +1,59 @@
+The same offer through the relay with and without its delay (7.5 ms round trip) and its loss (1%), on 54eb67f.
+Sixteen QinQ flows of 1522-byte frames as 44-segment GSO; the second of two 20 s points.
+Columns as in the sweep summaries: delivered L>R + R>L, offered, CPU per daemon, busiest worker, frames missing.
+
+== 4 workers
+d0-l0       3.96 +  3.95 =  7.91 G | off  4.00  4.00 | CPU  149%  148% busiest  42  42 | miss  0.0%  0.0% | sockovf 122 23 | qdrop 2
+d3750-l0    3.95 +  3.95 =  7.90 G | off  4.00  4.00 | CPU  192%  188% busiest  59  58 | miss  0.1%  0.0% | sockovf 50 288 | qdrop 1
+d0-l10      2.85 +  2.99 =  5.84 G | off  4.00  4.00 | CPU  165%  165% busiest  47  47 | miss 28.0% 24.3% | sockovf 0 0 | qdrop 1020
+d3750-l10   3.93 +  3.91 =  7.83 G | off  4.00  3.99 | CPU  232%  228% busiest  72  69 | miss  0.7%  1.1% | sockovf 484 89 | qdrop 1
+
+== 2 workers
+d0-l0       1.98 +  1.98 =  3.95 G | off  2.00  2.00 | CPU   67%   65% busiest  37  37 | miss  0.0%  0.0% | sockovf 280 19 | qdrop 0
+d3750-l0    1.96 +  1.96 =  3.92 G | off  2.00  2.00 | CPU   95%   95% busiest  53  52 | miss  0.6%  0.8% | sockovf 384 96 | qdrop 4
+d0-l10      0.91 +  0.73 =  1.65 G | off  2.00  2.00 | CPU   58%   57% busiest  32  29 | miss 53.8% 62.8% | sockovf 0 0 | qdrop 3223
+d3750-l10   1.93 +  1.84 =  3.77 G | off  2.00  2.00 | CPU  102%  103% busiest  56  56 | miss  2.5%  6.9% | sockovf 49 104 | qdrop 1
+
+Two workers at 2 Gbit/s each way, profile build with benches/profile-sender-spots-diagnostic.patch (two equal points).
+Phase cycles of worker 1, which transmits, in units of 1e9, then the spots inside service_sender for the whole daemon:
+spot 0 first message flush, 1 ACK intake, 2 loss checks, 3 lanes loop (ACKs applied to the sent history),
+4 stage_recovery (acknowledged pieces applied to frames), 5 owner and message flush, 6 probes, 7 claim, 8 send.
+
+-- d0-l0
+  21.72 BUSY (of 90.5)   10.50 service_sender    7.33 flush_frames    1.09 poll    0.63 read_socket    0.63 drain_tap_inputs    0.36 flush_notifications    0.36 drain_packets
+  spot 0: 0.02e9 cycles in 1121261 visits
+  spot 1: 0.35e9 cycles in 1121261 visits
+  spot 2: 0.09e9 cycles in 1121261 visits
+  spot 3: 0.95e9 cycles in 1121261 visits
+  spot 4: 1.65e9 cycles in 1121261 visits
+  spot 5: 0.30e9 cycles in 1121261 visits
+  spot 6: 0.10e9 cycles in 1121261 visits
+  spot 7: 0.16e9 cycles in 1121261 visits
+  spot 8: 7.39e9 cycles in 1121261 visits
+  second point, worker 1: tx_offload_frames 308362 tx_partial_frames 300 recovery_staged_reports 76723 send_grants 108776
+
+-- d3750-l0
+  37.83 BUSY (of 89.4)   23.16 service_sender    4.11 poll    3.85 flush_frames    2.59 drain_tap_inputs    0.80 read_socket    0.72 arm    0.54 flush_returns
+  spot 0: 0.05e9 cycles in 2856614 visits
+  spot 1: 0.48e9 cycles in 2856614 visits
+  spot 2: 0.16e9 cycles in 2856614 visits
+  spot 3: 4.33e9 cycles in 2856614 visits
+  spot 4: 3.86e9 cycles in 2856614 visits
+  spot 5: 0.45e9 cycles in 2856614 visits
+  spot 6: 0.20e9 cycles in 2856614 visits
+  spot 7: 0.63e9 cycles in 2856614 visits
+  spot 8: 13.39e9 cycles in 2856614 visits
+  second point, worker 1: tx_offload_frames 153130 tx_partial_frames 1672299 recovery_staged_reports 90175 send_grants 99434
+
+-- d3750-l10
+  41.86 BUSY (of 89.3)   22.85 service_sender    6.34 flush_frames    4.73 poll    3.03 drain_tap_inputs    0.89 read_socket    0.54 flush_notifications    0.54 drain_packets
+  spot 0: 0.07e9 cycles in 3552573 visits
+  spot 1: 0.41e9 cycles in 3552573 visits
+  spot 2: 0.19e9 cycles in 3552573 visits
+  spot 3: 4.97e9 cycles in 3552573 visits
+  spot 4: 4.24e9 cycles in 3552573 visits
+  spot 5: 0.60e9 cycles in 3552573 visits
+  spot 6: 0.24e9 cycles in 3552573 visits
+  spot 7: 0.74e9 cycles in 3552573 visits
+  spot 8: 11.97e9 cycles in 3552573 visits
+  second point, worker 1: tx_offload_frames 136264 tx_partial_frames 1788385 recovery_staged_reports 142816 send_grants 125515

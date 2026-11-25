@@ -63,6 +63,8 @@ pub(crate) struct Shared {
     pub config: Validated,
     // How many stores' worth of frame slots a session's owners share.
     pub frame_scale: usize,
+    // Whether workers reserve the wide pools of offload-frame planes.
+    pub wide_planes: bool,
     pub wakes: Vec<Arc<Wake>>,
     pub owners: Vec<Box<[AtomicU8]>>,
     pub status: Vec<AtomicU8>,
@@ -367,6 +369,7 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
         .max()
         .unwrap_or(1);
     let frame_scale = frame_scale(&config, count)?;
+    let wide_planes = wide_planes(&config, count, frame_scale);
     let sessions = config.config().sessions.len();
     let peers = config.config().peers.len();
     let endpoints = config.config().endpoints.len();
@@ -415,6 +418,7 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
     let shared = Arc::new(Shared {
         config,
         frame_scale,
+        wide_planes,
         wakes,
         owners: (0..sessions)
             .map(|_| (0..65_536).map(|_| AtomicU8::new(0)).collect())
@@ -526,6 +530,20 @@ fn frame_scale(config: &Validated, workers: usize) -> io::Result<usize> {
                 "transport storage exceeds memory_limit",
             )
         })
+}
+
+/// Whether `memory_limit` also pays for the wide pools of offload-frame
+/// planes once it has paid for `frame_scale`. They come second, so they never
+/// cost a configuration frame slots or its start.
+fn wide_planes(config: &Validated, workers: usize, frame_scale: usize) -> bool {
+    storage_bytes(config, workers, frame_scale)
+        .zip(crate::worker::wide_surplus(
+            config.config(),
+            workers,
+            frame_scale,
+        ))
+        .and_then(|(bytes, surplus)| bytes.checked_add(surplus))
+        .is_some_and(|bytes| bytes <= config.config().daemon.memory_limit)
 }
 
 fn storage_bytes(config: &Validated, workers: usize, frame_scale: usize) -> Option<usize> {
@@ -725,6 +743,10 @@ mod tests {
         let normal = config.clone().validate().unwrap();
         let normal_bytes = storage_bytes(&normal, 8, 1).unwrap();
         assert!(normal_bytes <= normal.config().daemon.memory_limit);
+        // The default limit has no room left for wide plane pools here, and
+        // the daemon starts without them.
+        assert_eq!(frame_scale(&normal, 8).unwrap(), 1);
+        assert!(!wide_planes(&normal, 8, 1));
 
         config.peers[0].tx_lanes = 64;
         let larger = config.clone().validate().unwrap();
@@ -776,6 +798,18 @@ mod tests {
         let bytes = |scale| storage_bytes(&config.clone().validate().unwrap(), 4, scale).unwrap();
         let [one, two, four] = [bytes(1), bytes(2), bytes(4)];
         assert!(one < two && two < four);
+        // The default limit pays for double with four workers, as README.md
+        // says, and for the wide plane pools on top.
+        let default = Config::default().daemon.memory_limit;
+        assert!(two <= default && default < four);
+        let validated = config.clone().validate().unwrap();
+        assert!(wide_planes(&validated, 4, 2));
+        // A limit that pays for the frame slots alone keeps them and goes without.
+        config.daemon.memory_limit = two;
+        let validated = config.clone().validate().unwrap();
+        assert_eq!(frame_scale(&validated, 4).unwrap(), 2);
+        assert!(!wide_planes(&validated, 4, 2));
+        config.daemon.memory_limit = default;
         // The limit that pays for exactly a scale selects it; a byte less, the one below.
         for (limit, scale) in [(one, 1), (two - 1, 1), (two, 2), (four - 1, 2), (four, 4)] {
             config.daemon.memory_limit = limit;

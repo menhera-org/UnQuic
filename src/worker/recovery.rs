@@ -359,6 +359,7 @@ impl Worker {
                     .recovery_mut(index)
                     .ok_or(io::ErrorKind::InvalidData)?;
                 let range = usize::from(piece.start)..usize::from(piece.end);
+                let holed = state.holed();
                 match report.kind {
                     sender::ReportKind::Ack { .. } => {
                         state
@@ -372,6 +373,7 @@ impl Worker {
                     }
                     sender::ReportKind::Retire => {}
                 }
+                self.frames.note_holed(index, holed);
                 if !matches!(report.kind, sender::ReportKind::Loss) {
                     self.recovery
                         .journal

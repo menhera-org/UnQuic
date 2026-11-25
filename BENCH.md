@@ -3200,6 +3200,107 @@ that is the next thing to profile.
 A unit test covers the rule, and both kernel suites pass with it: 127
 tests each on Linux 6.8 and 7.0.
 
+## What a path's delay costs the sender, and offload planes for it (November 20 to 25, landed)
+
+The relay bed applies delay and loss separately, which netem's own cost
+never allowed. The same offer through it on `54eb67f`, sixteen QinQ
+flows as 44-segment GSO, the second of two 20 s points
+([rows](benches/delay-cost-factorial-nov20.txt)):
+
+| Path | Four workers, 4 Gbit/s each way | Two workers, 2 Gbit/s each way |
+| --- | --- | --- |
+| No delay, no loss | 148–149% CPU per daemon | 65–67% |
+| 7.5 ms | 188–192% | 95% |
+| 7.5 ms and 1% loss | 228–232% | 102–103% |
+| 1% loss, no delay | delivers 2.85–2.99 of the 4 | delivers 0.73–0.91 of the 2 |
+
+Delay alone costs four workers 28% more CPU and two workers 45% more,
+and loss adds less. The last row is a separate finding and is open: at a
+round trip of a tenth of a millisecond one lost datagram is more than 2%
+of what is in flight, so every loss ends a loss round that cuts, and the
+daemon delivers three quarters of its offer or less with its workers
+half idle.
+
+Where the delay goes was read from a profile build with `service_sender`
+split ([patch](benches/profile-sender-spots-diagnostic.patch)), two
+workers at 2 Gbit/s each way. The transmitting worker's busy cycles go
+from 21.7 to 37.8 ×10⁹ over the run. Applying ACKs to the sent history
+goes from 130 to 585 cycles per acknowledged packet, and applying
+acknowledged pieces to their frames from 220 to 520. Both revisit state
+one round trip after it was written, when it has left the cache, which
+no loopback efficiency point ever showed. The worker loop also turns 2.5
+times as often.
+
+The counters showed something simpler as well. With the delay half the
+segments left as ordinary frames: 1.67 million of them beside 153,000
+offload frames in 20 s, where the path without delay sent 300 beside
+308,000. A worker could retain 64 offload frames at once, and at
+2 Gbit/s a 7.5 ms round trip holds about 120.
+
+**A pool that follows the frame slots.** A worker now reserves coverage
+planes for an eighth of its frame slots where `memory_limit` still has
+room once the frame slots are paid for: 512 planes and 3.3 MiB per worker
+with four workers under the default limit. Eight workers under the
+default limit have no room and keep 64, so no configuration that
+started before fails to start or loses slots.
+
+The larger pool alone was not safe under loss (arm `pool` in
+[four workers](benches/offload-pool-four-workers-1pct-nov20.json),
+[two workers](benches/offload-pool-two-workers-1pct-nov20.json)). At 1%
+loss four workers used 212–220% CPU at 4 offered where they used
+222–230%, but two workers delivered 2.15–2.33 Gbit/s each way at 3
+offered where they delivered 2.53–2.68, and receivers refused
+4,000–87,000 datagrams a point at 5.5 and 7 offered where they refused under 9,000. A
+receive lane has 128 slots. An offload frame with one piece lost holds
+four of them until its repair arrives, and at 1% loss one run of twelve
+segments in nine has such a piece.
+
+**An allowance of planes.** The sender can see a hole: a frame whose
+ACKs leave prefix order, or that has a loss. Each offload frame that
+becomes holed halves the number of planes the worker may have in use,
+down to 64, and each offload frame released whole raises it by one. At
+1% loss the allowance stays at 64, the old bound, and at 0.1% near two
+hundred. A cap on the count of holed frames was tried first (arm `new`
+in the two files above, and
+[eight against sixteen](benches/offload-hole-caps-two-workers-nov20.json)).
+It cost two workers 3–4% at 1% loss, because the sender learns of a hole
+a round trip late and a count of known holes does not bound the frames
+in flight.
+
+The landed build against `54eb67f`, four workers at 7.5 ms through the
+relay, two rounds on November 25
+([no loss](benches/offload-allowance-clean-nov25.json),
+[0.1%](benches/offload-allowance-0.1pct-nov25.json)):
+
+| Loss | Offered each way | CPU per daemon before | After | Delivered each way before | After |
+| --- | --- | --- | --- | --- | --- |
+| None | 4 | 186–198% | 177–186% | 3.88–3.93 | 3.81–3.92 |
+| | 5.5 | 272–281% | 251–268% | 5.05–5.36 | 5.06–5.39 |
+| 0.1% | 4 | 201–208% | 199–203% | 3.85–3.92 | 3.85–3.94 |
+| | 5.5 | 287–298% | 278–282% | 5.35–5.42 | 5.22–5.38 |
+| | 7 | 321–332% | 318–323% | 5.42–5.62 | 5.66–6.39 |
+
+It saves 5–6% CPU on the clean path and 2–5% at 0.1% loss, and at 7
+offered and 0.1% loss it delivers 5.66–6.39 Gbit/s each way where the
+old build delivered 5.42–5.62. On November 20, when this machine was
+quieter, the pool with the cap of eight had saved 11–12% on the clean
+path and 6–7% at 0.1%
+([no loss](benches/offload-pool-cap-clean-nov20.json),
+[0.1%](benches/offload-pool-cap-0.1pct-nov20.json)). The allowance gives
+part of that back on this bed, whose capped receive sockets hole frames
+without any path loss.
+
+At 1% loss the build behaves as before. Two workers at 3 Gbit/s offered
+deliver 2.54–2.72 each way against 2.55–2.67
+([results](benches/offload-allowance-two-workers-1pct-nov25.json), right
+to left; another tenant starved the relay's other reader that day, and
+the left-to-right rows of both arms are void).
+
+What remains of the delay's cost is the cold state behind every ACK and
+the extra loop turns. Unit tests cover the pool, its place after the
+frame slots in the memory limit, and the allowance, and both kernel
+suites pass with it: 127 tests each on Linux 6.8 and 7.0.
+
 ## The per-frame cost on November 19
 
 A profile build of `34aced8` on the full-size efficiency point (eight
