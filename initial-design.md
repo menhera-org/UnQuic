@@ -1353,12 +1353,13 @@ If a comparison already reaches the available underlay ceiling, report that fact
 
 # 15 Implementation stages
 
-**Current status (November 20):** stages 1 and 4 are complete. Stages 2 and 3
+**Current status (November 25):** stages 1 and 4 are complete. Stages 2 and 3
 are implemented. The local rate of 20 Gbit/s each way was first reached on
 November 19 with sixteen workers per daemon, by a margin of one or two
 percent and before its acceptance profile is frozen. Sixteen workers also
 pass 5 Gbit/s each way over a local routed path with loss, and since
 November 20 four workers do when the path's emulation runs on other cores.
+Runs across a real path of the target network began on November 25.
 The gate of 5 Gbit/s over the lossy access path is set for a box of two to
 four cores on a real line and remains open, and stage 5 measured
 optimisation is in progress. ROADMAP.md and BENCH.md track both. Offload

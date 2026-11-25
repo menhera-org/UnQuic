@@ -286,6 +286,53 @@ The checksum prerequisite is visible in
 Linux 6.8 requires both USO flags in
 [TUNSETOFFLOAD](https://github.com/torvalds/linux/blob/v6.8/drivers/net/tun.c#L2752-L2755).
 
+## Two hosts over a real path
+
+`benches/pair_side.sh` runs one daemon of a pair on a real host and its real
+path, where `tap_transport.sh` runs both daemons in one container. Start it
+as root on both hosts with the same settings and the same `START`:
+
+```sh
+unshare -m --propagation private sh pair_side.sh left /abs/unquic /abs/udp_load /abs/out \
+    LOCAL_IPV6 PEER_IPV6 START
+```
+
+and `right` on the other host with the two addresses swapped. `START` is the
+epoch second at which both sides start the first point's senders, far enough
+ahead for both daemons to start and connect; ten seconds is ample. Each
+later point starts `DURATION + 10` seconds after the one before it, so the
+hosts need no connection to each other besides the path under test, only
+clocks that agree to a fraction of a second. The settings are environment
+variables: `WORKERS`, `FLOWS`, `DURATION`, `BITRATE` (bits/s per flow, one
+value per point), `SEGMENTS`, `VLAN_DEPTH`, `GENERATOR_PROCESSES`,
+`DAEMON_TOML`, `OUTER_PAYLOAD_LIMIT`, `PORT` (40100), `TAP_TXQUEUELEN` (500)
+and the comma-separated CPU lists `DAEMON_CPUS`, `GENERATOR_CPUS` and
+`RECEIVER_CPUS`. Left-to-right flows use the same ports as in
+`tap_transport.sh`, and right-to-left flows the ports 2000 above them.
+
+The daemon's sockets use the host's network as it is. The script changes two
+things, both for its own lifetime. The daemon's TAP appears in the host's
+namespace for the moment before the script moves it into a private one,
+which dies with the script and takes the persistent TAP with it. And with
+`OUTER_UDP_GRO=1` the script turns on `gro` and `rx-udp-gro-forwarding` on
+the device that routes to the peer, and puts back what it found on exit. A
+veth delivers every datagram to the daemon singly without both, and a
+network card with GRO needs neither. The script needs `ip`, `nsenter`,
+`taskset`, `ethtool` and `awk`.
+
+Each point directory holds the load tool's reports and the side's `before`,
+`sent` and `after` snapshots: daemon log, process and thread CPU, the host's
+`/proc/stat` and IPv6 counters, and the outer device's and the TAP's link
+counters. `sh benches/pair_merge.sh LEFT_OUT RIGHT_OUT RUN` copies the two
+sides' point directories into one tree that `sweep_report` reads as a
+repeat. The report's rates then cover the window between the `before` and
+`sent` snapshots, about half a second longer than the senders ran, so they
+read a few percent low on short points; the missing-frame shares are exact.
+
+`OUT` keeps each side's addresses and device names, in `*.toml`,
+`*.outer-device` and the link snapshots. Publish the report's output, which
+has none of them, and keep `OUT` private.
+
 ## Checks
 
 `cargo test --release --target x86_64-unknown-linux-musl --example udp_load`

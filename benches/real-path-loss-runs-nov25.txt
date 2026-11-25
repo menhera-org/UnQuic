@@ -1,0 +1,30 @@
+LOSS records of the two senders on the real path of November 25, by transmit lane, grouped into runs of
+consecutive packet numbers. Four workers, 3 Gbit/s offered each way for 10 s, trace build of the allowance change.
+
+-- left sender, toward the host with 16 MiB receive sockets: the path itself
+lane 2: 44 lost of 280166 (0.02%), longest run 2
+  run length   1      2     3-5    6-20  21-100 101-1000 >1000
+  runs        20     12      0      0      0      0      0
+  packets     20     24      0      0      0      0      0
+lane 3: 35 lost of 244340 (0.01%), longest run 4
+  run length   1      2     3-5    6-20  21-100 101-1000 >1000
+  runs        11      4      5      0      0      0      0
+  packets     11      8     16      0      0      0      0
+lane 4: 28 lost of 280060 (0.01%), longest run 3
+  run length   1      2     3-5    6-20  21-100 101-1000 >1000
+  runs        16      3      2      0      0      0      0
+  packets     16      6      6      0      0      0      0
+
+-- right sender, toward the host whose receive sockets are capped at 416 KiB
+lane 2: 1771 lost of 518038 (0.34%), longest run 294
+  run length   1      2     3-5    6-20  21-100 101-1000 >1000
+  runs        14      7     13     43     22      2      0
+  packets     14     14     55    499    782    407      0
+lane 3: 2213 lost of 570733 (0.39%), longest run 76
+  run length   1      2     3-5    6-20  21-100 101-1000 >1000
+  runs         5      8     17     58     35      0      0
+  packets      5     16     78    750   1364      0      0
+lane 4: 1100 lost of 390407 (0.28%), longest run 65
+  run length   1      2     3-5    6-20  21-100 101-1000 >1000
+  runs         5      5     10     37     17      0      0
+  packets      5     10     38    430    617      0      0

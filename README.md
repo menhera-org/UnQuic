@@ -918,8 +918,10 @@ Release forwarding, reconnect, allocation and routed-MTU regression tests pass.
 Sixteen workers per daemon first delivered 20 Gbit/s each way on
 November 19, and they pass 5 Gbit/s each way over a local routed path
 with loss. Since November 20 four workers pass it too when the path's
-emulation runs on other cores. The lossy-path gate is set for two to four
-cores on a real line and remains open. BENCH.md records the measurements.
+emulation runs on other cores. The first runs across a real path of the
+target network were made on November 25, between two shared container
+hosts that limit them. The lossy-path gate is set for two to four cores on
+a real line and remains open. BENCH.md records the measurements.
 
 ## TAP read batching
 

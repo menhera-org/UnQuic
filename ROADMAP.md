@@ -7,6 +7,51 @@ read that section before writing code. Keep the "Current status" paragraph in
 section 15 of the design and the "Implementation status" section of
 [README.md](README.md) true after every step.
 
+## November 25 checkpoint
+
+Real-path tests now run beside development. `benches/pair_side.sh` runs
+one daemon of a pair on each of two real hosts, and
+`benches/pair_merge.sh` lays their results out for `sweep_report`
+([benches/udp_load.md](benches/udp_load.md)). Host names, addresses and
+anything else that locates a test host stay out of this repository.
+
+The first runs cross a real path of the target network between two
+shared container hosts
+([BENCH.md](BENCH.md#across-a-real-access-path-november-25)). The path
+has an MTU of 1500, a round trip of 7.0–8.2 ms and loses 0.01–0.02% of
+its datagrams.
+
+- One way, toward the host with 16 MiB receive sockets, four workers
+  deliver 4.0 Gbit/s with nothing missing and 3.6–4.7 at 5 offered, and
+  eight workers deliver 5.46. The path carries the gate's rate. The
+  sending host's kernel path to its bridge takes most of its workers'
+  time.
+- The other way the daemon stays at 1.1–1.5 Gbit/s, because that host's
+  receive sockets are capped at 416 KiB and it cannot raise them from
+  inside its container.
+
+One change landed on the way: offload-frame planes follow the frame
+slots under an allowance that loss halves
+([BENCH.md](BENCH.md#what-a-paths-delay-costs-the-sender-and-offload-planes-for-it-november-20-to-25-landed)).
+It came out of measuring delay and loss apart on the relay bed: a 7.5 ms
+round trip alone costs a sender 28–45% more CPU than no delay.
+
+Still open, in the order they now matter:
+
+1. The test hosts. The gate's 5 Gbit/s each way needs a host pair whose
+   receive buffers can be raised and whose path to the line does not run
+   on the daemon's cores. Raising the capped host's buffer limit is a
+   setting of the machine it runs on.
+2. Loss on a path of well under a millisecond: a lost datagram is then
+   more than 2% of what is in flight, every loss ends a loss round, and
+   the daemon delivers three quarters of its offer or less with idle
+   workers.
+3. The cold state behind every ACK on a path with delay: 585 cycles per
+   acknowledged packet against 130 without delay, and 520 against 220 to
+   apply its pieces.
+4. A receive lane's 128 slots, which bound offload frames under loss.
+5. The lists of the checkpoints below.
+
 ## November 20 checkpoint
 
 `daemon.offload_frames` and `daemon.rotate_lanes` are on by default
