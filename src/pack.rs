@@ -1131,8 +1131,8 @@ mod tests {
             .flat_map(|packet| batch.pieces(packet).unwrap().map(|(_, range)| range))
             .collect();
         assert_eq!(ranges.last().unwrap().end, 18_044);
-        for index in 0..ranges.len() {
-            assert_eq!(batch.prefixes[index][1], 1, "offload flag on every piece");
+        for prefix in &batch.prefixes[..ranges.len()] {
+            assert_eq!(prefix[1], 1, "offload flag on every piece");
         }
         // Ordinary frames keep the negotiated ceiling on an offload lane.
         let ordinary = FrameInput {
@@ -1184,8 +1184,8 @@ mod tests {
             .map(|packet| batch.pieces(packet).unwrap().count())
             .sum();
         assert!(pieces >= 2);
-        for index in 0..pieces {
-            assert_eq!(batch.prefixes[index][1], 2, "partial flag on every piece");
+        for prefix in &batch.prefixes[..pieces] {
+            assert_eq!(prefix[1], 2, "partial flag on every piece");
         }
     }
 
@@ -1233,8 +1233,8 @@ mod tests {
             .map(|packet| batch.pieces(packet).unwrap().count())
             .sum();
         assert!(pieces >= 2);
-        for index in 0..pieces {
-            assert_eq!(batch.prefixes[index][1], 4, "striped flag on every piece");
+        for prefix in &batch.prefixes[..pieces] {
+            assert_eq!(prefix[1], 4, "striped flag on every piece");
         }
     }
 

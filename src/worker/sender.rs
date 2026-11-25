@@ -880,10 +880,13 @@ impl Worker {
 
     pub(super) fn sender_enabled(&self) -> bool {
         #[cfg(test)]
-        if self.unpaced_fixture {
-            return false;
+        {
+            !self.unpaced_fixture
         }
-        true
+        #[cfg(not(test))]
+        {
+            true
+        }
     }
 
     pub(super) fn sender_index(&self, session: usize, lane: usize) -> io::Result<usize> {

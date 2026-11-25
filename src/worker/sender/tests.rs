@@ -1704,8 +1704,8 @@ fn repair_reports_budget_whole_packets_and_cleanup_before_handle_reuse() {
         assert_eq!(worker.sender.records.take().unwrap().get(), handle);
     }
     report.count = 3;
-    for ordinal in 0..3 {
-        report.entries[ordinal] = Entry {
+    for (ordinal, entry) in report.entries.iter_mut().take(3).enumerate() {
+        *entry = Entry {
             number: ordinal as u64 + 1,
             sample: NonZeroU16::new(ordinal as u16 + 1),
             settled: true,
