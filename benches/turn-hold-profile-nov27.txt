@@ -1,0 +1,54 @@
+# Relay bed, two workers per daemon, 7.5 ms round trip, single frames, 0.5 Gbit/s each way, two 20 s points,
+# a `profile` build. hold = turn_hold_us 200 (default), off = turn_hold_us 0.
+# Each phase as a share of the cycles the workers were not waiting, left daemon then right daemon,
+# then the left daemon's sendmmsg totals (cycles, calls, datagrams).
+hold     r1 p0  0.49 +  0.49 =  0.98 G | off  0.50  0.50 | CPU   63%   60% busiest  33  33 | miss  0
+hold     r1 p1  0.49 +  0.49 =  0.99 G | off  0.50  0.50 | CPU   64%   61% busiest  33  33 | miss  0
+off      r1 p0  0.49 +  0.49 =  0.98 G | off  0.50  0.50 | CPU   72%   70% busiest  36  36 | miss  0
+off      r1 p1  0.49 +  0.49 =  0.99 G | off  0.50  0.50 | CPU   74%   71% busiest  38  37 | miss  0
+
+## hold
+# left daemon
+ 40.72% flush_taps
+ 25.15% read_tap
+ 17.76% flush_frames
+  5.59% read_socket
+  3.79% drain_packets
+  3.19% service_sender
+  1.40% poll
+  1.40% flush_control
+  0.40% arm
+# right daemon
+ 42.77% flush_taps
+ 26.00% read_tap
+ 13.84% flush_frames
+  6.29% read_socket
+  3.98% drain_packets
+  3.14% service_sender
+  1.68% poll
+  1.26% flush_control
+  0.42% arm
+sendmmsg cycles/calls/datagrams [5617214418, 251974, 1989330]
+
+## off
+# left daemon
+ 35.84% flush_taps
+ 24.91% read_tap
+ 21.51% flush_frames
+  7.35% read_socket
+  3.23% service_sender
+  3.23% drain_packets
+  1.25% poll
+  1.25% flush_control
+  0.36% flush_notifications
+# right daemon
+ 37.28% flush_taps
+ 25.62% read_tap
+ 18.46% flush_frames
+  8.28% read_socket
+  3.39% drain_packets
+  3.01% service_sender
+  1.32% poll
+  1.32% flush_control
+  0.38% arm
+sendmmsg cycles/calls/datagrams [7774755830, 431721, 2126543]

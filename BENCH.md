@@ -4002,6 +4002,17 @@ runs ([rows](benches/turn-hold-tcp-nov27.txt)), gets 2.5–3.3 Gbit/s left to
 right and 2.6–3.5 right to left with the hold, and 1.9–4.1 and 1.8–3.8
 without; the totals average 6.0 and 5.8.
 
+**What is left is the kernel's.** A `profile` build on the relay bed with
+the hold on ([rows](benches/turn-hold-profile-nov27.txt)) spends 41–43% of
+its busy cycles writing frames to the TAP, 25–26% reading them from it,
+14–18% packing and sending datagrams, 6% reading its sockets and 1–2%
+polling. That is over nine tenths in phases that are one kernel call after
+another. Reassembly, the sender's accounting and control take under a tenth
+together. A `sendmmsg` call now carries 7.9 datagrams where it carried 4.9,
+at 2,800 cycles a datagram where each cost 3,700. Going further means fewer
+kernel entries per frame at the TAP, and for frames that arrive and leave
+one at a time on sixteen flows the daemon has no more of them to merge.
+
 **The missing frames in the last column are not the hold's.** They come in
 both arms, at 0.5 Gbit/s as at 2, and with trains at 1 Gbit/s where the
 busiest worker is 20% busy: 6 of 20 points without the hold, 4 of 20 with
@@ -4035,6 +4046,56 @@ and then. Both senders' windows fill because one direction's data and the
 other direction's acknowledgements are gone, and the daemon resumes within
 tens of milliseconds of the path's return. The relay bed has no such
 outage, which is why it never showed one.
+
+A second run showed two receivers losing the same instants. The same sender
+sent 0.5 Gbit/s to each of two addresses on the receiving machine for 600 s:
+the endpoint, and a second container behind the same card. Every side
+sampled its interface's packet counters ten times a second. The endpoint
+lost 0.498% and the second container 0.500%. Both stopped receiving at the
+same instants, for about 0.4 s each time (three such stretches coincide to
+the tenth of a second), while the sender's rate never dipped, and neither
+container's interface counted a dropped or missed packet. This entry first
+concluded that the receiving machine lost them. That run could not tell the
+receiving machine from anything before it, and the conclusion was wrong.
+
+**It is the sending side's gateway, on a half-hour schedule.** Two more
+runs sent 0.5 Gbit/s right to left, for 600 s and 900 s, while each
+endpoint sent ICMPv6 echoes ten times a second: to its own default gateway
+in both runs, and in the longer one also to the second hop on its side, to
+the other side's gateway (its ninth hop of ten) and from the right endpoint
+to the left one. The left endpoint also sampled its interface's byte
+counter in the longer run, which met eleven events while it was read. In
+each of the eleven:
+
+- the left interface's byte rate fell from 500 Mbit/s to between 3 and 17;
+- the right endpoint's echoes to its own gateway, which answers in 0.05 ms,
+  came back 150–190 ms late, several together, twice about 0.4 s apart;
+- the left endpoint's echoes to that same gateway, across the carrier's
+  network, were late by 150–190 ms at the same instants;
+- the left gateway answered every echo in its usual 2.1–2.6 ms, and so did
+  the hop behind it, bar eight single echoes of 50–69 ms at other times;
+- no echo was lost: 62,898 were answered in the longer run and 11,896 in
+  the shorter.
+
+So the right side's gateway stops answering and forwarding for about
+0.17 s, twice, and then releases what it held. Ten echoes a second it holds
+whole. Half a gigabit a second it cannot hold: each event cost every flow
+about 0.04 s of its datagrams, 0.056% and 0.059% of the two runs, which had
+eight and twelve events under load.
+
+It needs no load, and it keeps a schedule. With both endpoints idle for
+600 s the same echoes were late in eight events, and each of the eight fell
+1800 s after one of the eight of the shorter loaded run, seven to within
+0.2 s and one to 0.6 s. Counted from each half hour of the clock, the two
+loaded runs and that idle one put 21 events at fixed seconds in the 1,530 s
+of the half hour they covered. A fourth pass, echoes only, tested that: it
+covered seven of those seconds one cycle after the longer loaded run, and
+all seven events came, each within 0.5 s of its second, from both endpoints
+at once ([rows](benches/real-path-plain-udp-outage-nov27.txt)). The left
+side, its gateway and the receiving machine take no part in it. The left
+gateway's own echoes were late once in three of the four passes, by up to
+317 ms, at times that match none of the events. What the right gateway does
+at those seconds only its own logs can say.
 
 What the daemon loses in such a second is the traffic of that second: its
 senders cannot send, and frames the TAP offers meanwhile are dropped at the

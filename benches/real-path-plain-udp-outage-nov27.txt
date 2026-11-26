@@ -26,3 +26,59 @@ flow 13 received 1607953 next 1613879 missing 5926 reordered 0 socket_overflow 0
 flow 14 received 1607835 next 1613782 missing 5947 reordered 0 socket_overflow 0
 flow 15 received 1607910 next 1613879 missing 5969 reordered 0 socket_overflow 0
 flow 16 received 1607880 next 1613879 missing 5999 reordered 0 socket_overflow 0
+#
+# Right to left again, 600 s, to two addresses on the receiving machine at once: the endpoint
+# and a second container behind the same card. Eight flows of 62.5 Mbit/s to each. Each side
+# sampled its interface packet counters every 0.1 s; times are seconds from the first sample.
+to the endpoint: sent 25820856 received 25692258 lost 0.498%
+to the second container: sent 25823064 received 25694043 lost 0.500%
+sender: 2.0 s of low rate from +0.0 s
+sender: 5.4 s of low rate from +602.0 s (to the end)
+sender: mean 85040 packets/s over 5220 samples; rx_dropped +0, rx_missed_errors +0
+endpoint: 2.0 s of low rate from -0.1 s
+endpoint: 0.4 s of low rate from +100.0 s
+endpoint: 0.4 s of low rate from +121.7 s
+endpoint: 0.4 s of low rate from +203.8 s
+endpoint: 0.4 s of low rate from +489.7 s
+endpoint: 5.4 s of low rate from +602.0 s (to the end)
+endpoint: mean 24120 packets/s over 4738 samples; rx_dropped +0, rx_missed_errors +0
+second container: 2.2 s of low rate from -0.3 s
+second container: 0.4 s of low rate from +100.0 s
+second container: 0.4 s of low rate from +121.7 s
+second container: 0.4 s of low rate from +203.8 s
+second container: 0.4 s of low rate from +223.2 s
+second container: 5.3 s of low rate from +602.0 s (to the end)
+second container: mean 24222 packets/s over 4962 samples; rx_dropped +0, rx_missed_errors +0
+# The stretches at +0.0 and at the end are before the load starts and after it stops.
+#
+# Echo passes. ICMPv6 echoes ten times a second from both endpoints; "right" sends the load.
+# Times are seconds past the half hour of the clock, so that passes line up; after each time,
+# in brackets, the echoes over 50 ms in that event and the largest round trip.
+#
+# Pass 1: right to left, 0.5 Gbit/s in eight flows, 600 s; echoes from second 1221 to 29.
+sent 25818928 received 25804398 lost 0.056%
+right endpoint to its own gateway: 5848 answered, 0 unanswered; over 50 ms at 1355.2 (3, 153 ms) 1366.0 (4, 167 ms) 1392.8 (5, 196 ms) 1472.8 (2, 147 ms) 1489.2 (4, 157 ms) 1567.2 (5, 179 ms) 1755.7 (3, 149 ms) 1760.7 (4, 169 ms)
+left endpoint to its own gateway: 6048 answered, 0 unanswered; over 50 ms at 1243.6 (17, 317 ms)
+#
+# Pass 2: the same load for 900 s; echoes from second 284 to 1192.
+sent 38729018 received 38706319 lost 0.059%
+left interface below 300 Mbit/s at (second: lowest Mbit/s): 357: 14 382: 12 500: 13 510: 15 526: 13 737: 17 799: 3 894: 15 968: 15 978: 12 1076: 11
+right endpoint to its own gateway: 8733 answered, 0 unanswered; over 50 ms at 356.8 (4, 177 ms) 382.3 (2, 152 ms) 499.9 (4, 173 ms) 510.5 (4, 174 ms) 526.2 (4, 157 ms) 737.4 (4, 179 ms) 799.5 (2, 147 ms) 894.4 (4, 164 ms) 967.6 (5, 187 ms) 978.2 (4, 155 ms) 1075.6 (5, 183 ms)
+right endpoint to its second hop: 9035 answered, 0 unanswered; over 50 ms at 356.8 (4, 180 ms) 382.3 (4, 194 ms) 499.9 (3, 151 ms) 510.5 (4, 180 ms) 525.9 (4, 237 ms) 737.4 (4, 183 ms) 799.5 (4, 196 ms) 894.4 (4, 186 ms) 967.5 (5, 198 ms) 978.2 (4, 171 ms) 1075.6 (5, 214 ms) 1180.2 (5, 221 ms) 1190.9 (3, 164 ms)
+right endpoint to the left gateway: 9017 answered, 0 unanswered; over 50 ms at 356.6 (5, 222 ms) 382.0 (6, 202 ms) 499.7 (5, 227 ms) 510.3 (5, 232 ms) 525.9 (5, 168 ms) 737.2 (5, 237 ms) 799.3 (6, 205 ms) 894.2 (5, 221 ms) 967.5 (6, 201 ms) 977.9 (5, 231 ms) 1075.6 (5, 226 ms) 1180.2 (5, 168 ms) 1190.6 (6, 202 ms)
+right endpoint to the left endpoint: 9025 answered, 0 unanswered; over 50 ms at 356.6 (5, 231 ms) 382.3 (4, 186 ms) 499.6 (6, 203 ms) 510.3 (6, 217 ms) 525.9 (5, 165 ms) 737.1 (5, 199 ms) 799.3 (6, 207 ms) 894.2 (6, 202 ms) 967.6 (6, 200 ms) 977.9 (5, 203 ms) 1075.6 (6, 209 ms) 1180.2 (5, 165 ms) 1190.7 (5, 207 ms)
+left endpoint to its own gateway: 9029 answered, 0 unanswered; over 50 ms at no time
+left endpoint to its second hop: 9036 answered, 0 unanswered; over 50 ms at 361.3 (1, 55 ms) 491.4 (1, 68 ms) 531.3 (1, 54 ms) 541.4 (1, 51 ms) 551.3 (1, 55 ms) 581.4 (1, 57 ms) 641.4 (1, 66 ms) 841.4 (1, 50 ms)
+left endpoint to the right gateway: 9023 answered, 0 unanswered; over 50 ms at 356.8 (4, 184 ms) 382.2 (4, 183 ms) 499.9 (2, 151 ms) 510.5 (4, 160 ms) 525.9 (5, 188 ms) 737.4 (4, 161 ms) 799.5 (4, 185 ms) 894.4 (4, 176 ms) 967.9 (4, 163 ms) 977.9 (5, 187 ms) 1075.9 (4, 165 ms) 1180.4 (4, 169 ms) 1190.9 (3, 153 ms)
+#
+# Pass 3: no load, echoes only, from second 1246 to 46.
+right endpoint to its own gateway: 5771 answered, 0 unanswered; over 50 ms at 1355.1 (3, 159 ms) 1365.9 (3, 148 ms) 1392.8 (5, 147 ms) 1473.4 (4, 186 ms) 1489.2 (4, 181 ms) 1567.4 (4, 194 ms) 1755.7 (3, 148 ms) 1760.6 (3, 157 ms)
+right endpoint to its second hop: 5970 answered, 0 unanswered; over 50 ms at 1354.9 (5, 208 ms) 1365.7 (5, 189 ms) 1392.8 (5, 210 ms) 1473.4 (3, 176 ms) 1488.9 (6, 240 ms) 1567.2 (5, 211 ms) 1755.4 (5, 226 ms) 1760.4 (5, 207 ms)
+left endpoint to its own gateway: 5967 answered, 0 unanswered; over 50 ms at 36.7 (4, 312 ms)
+left endpoint to the right gateway: 5958 answered, 0 unanswered; over 50 ms at 1354.9 (5, 180 ms) 1366.0 (3, 156 ms) 1393.0 (3, 155 ms) 1473.4 (4, 152 ms) 1489.2 (3, 147 ms) 1567.4 (4, 158 ms) 1755.7 (3, 150 ms) 1760.4 (5, 157 ms)
+#
+# Pass 4: no load, echoes only, from second 219 to 879, one half hour after pass 2.
+right endpoint to its own gateway: 6348 answered, 0 unanswered; over 50 ms at 356.8 (4, 165 ms) 382.2 (4, 161 ms) 499.9 (3, 147 ms) 510.0 (5, 147 ms) 525.9 (5, 176 ms) 737.4 (3, 150 ms) 799.5 (4, 178 ms)
+right endpoint to its second hop: 6566 answered, 0 unanswered; over 50 ms at 356.8 (4, 189 ms) 381.9 (6, 194 ms) 499.9 (4, 222 ms) 510.2 (4, 202 ms) 525.9 (5, 227 ms) 737.2 (5, 217 ms) 799.5 (3, 160 ms)
+left endpoint to its own gateway: 6566 answered, 0 unanswered; over 50 ms at 289.1 (12, 317 ms)
+left endpoint to the right gateway: 6556 answered, 0 unanswered; over 50 ms at 356.8 (3, 157 ms) 382.2 (4, 160 ms) 499.9 (3, 154 ms) 510.0 (5, 155 ms) 525.9 (5, 180 ms) 737.4 (4, 159 ms) 799.5 (4, 196 ms)
