@@ -1955,7 +1955,7 @@ RA/DHCPv6 operation on real resolver networks remains unverified.
 - Test: a unit test that parses the example configuration from section 12
   and a rejection test for each `validate()` rule.
 
-## Stage 2: batched transport — in progress
+## Stage 2: batched transport — implemented; acceptance profile not frozen
 
 Goal: the packet rate and CPU baseline of section 13 can be measured. Final
 local acceptance requires at least 20 Gbit/s in each direction simultaneously
@@ -2092,7 +2092,7 @@ diagnostic runs have zero outer reordering and ordinary loss declarations.
 This fixes the lab path, not the transport's outstanding throughput gaps.
 BENCH.md retains the original results and the before/after evidence.
 
-## Stage 3: recovery and congestion control
+## Stage 3: recovery and congestion control — implemented
 
 Goal: a production candidate under loss.
 
@@ -2433,7 +2433,7 @@ full expired batches sharing the cleanup budget.
   routed IPv6 10G-EPON with nonzero packet loss. Record independent and burst
   loss separately; simulated results still require validation on real access lines.
 
-## Stage 4: composition and robustness
+## Stage 4: composition and robustness — complete
 
 - Validate Ubuntu 26.04/Linux 7.0 as a deployment target while keeping support
   distribution- and init-system-independent. Check version-sensitive TAP,
@@ -2468,7 +2468,7 @@ full expired batches sharing the cleanup budget.
   whose name and queue count are unchanged, closes the rest and creates what
   is new. Unrelated sessions keep their TAP devices and reconnect; design
   section 12 states that gap. A container test covers a kept, a removed and a
-  new session and a rejected file (Linux 6.8 so far).
+  new session and a rejected file (Linux 6.8 and 7.0).
 - Resolved: the routed PMTU test's 1500-byte phase failed in three of five
   local runs on Linux 6.8. The group controller took its maximum datagram
   from whichever lane sent last, so once the busy lane fell to 1500 the send
@@ -2575,7 +2575,7 @@ full expired batches sharing the cleanup budget.
   `[Unit]`, `[Install]` and `[Service]` lines of section 12.1. No systemd
   linkage. Done: `unquic systemd-unit`, checked line by line in a unit test.
 
-## Stage 5: measured optimisation
+## Stage 5: measured optimisation — in progress
 
 If evidence shows no further improvement is feasible at an earlier step,
 record the blocker and proceed with the remaining stages. Return here to the
@@ -2689,11 +2689,19 @@ November 10 evidence for that list, all in BENCH.md:
   ([BENCH.md](BENCH.md#where-the-lossy-point-loses-its-frames-november-16)).
   The 5% loss rows still need FEC or a loss-agnostic response.
 
-## Stage 6: protocol freeze
+## Stage 6: protocol freeze — open
 
 Publish the wire vectors from 1a and 3 as fixed test files, resolve every
 "open" row of section 16, repeat the full container suite, and record the
 acceptance profile of section 14.2.
+
+As of November 27 the wire vectors are fixed test files for every record
+type, the three DATA flags and the optional feature bits
+(`tests/vectors/wire-v1`), and the container suites pass on Linux 6.8 and
+7.0. State-machine vectors are not written. The rows of section 16 that
+are still open need the user's decisions: the numeric competitive margin,
+and the hardware, core budget, flow count, direction and loss profile the
+two throughput requirements are frozen at.
 
 ## What not to do
 
