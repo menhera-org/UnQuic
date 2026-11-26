@@ -42,10 +42,23 @@ Three sender changes landed from this work
   direction lost 5–9% of its first ten seconds, a 16 Mbit/s flow beside
   it 42–95%, and twelve lanes on four workers never climbed at all.
 
+Later on November 26 that card was set to hash UDP by ports, and the
+direction rose from 1.9 to 2.5–2.9 Gbit/s; the path itself gives about
+4.3 of plain UDP that way, with 4% lost at 4
+([BENCH.md](BENCH.md#the-real-path-with-udp-hashed-by-ports-and-where-its-cpu-goes-november-26)).
+
 Open, ahead of the list below:
 
-1. The real path's right-to-left direction, which waits on the receiving
-   machine's card hashing UDP by ports.
+1. CPU per delivered bit. Target boxes include four slow cores of the
+   N5105 class, and the real-path runs spend 46% of a fast core per
+   Gbit/s to send and 31% to receive. Three quarters of that is kernel
+   time in `sendmmsg`, the socket read and the TAP calls, a datagram at
+   a time, and plain UDP costs the same there: it needs a card that
+   segments and coalesces UDP, or a host setting that lets the test
+   hosts' cards do it. The daemon's own share is about 1,900 cycles a
+   datagram to send and 1,300 to receive on a 7 ms path, and that is the
+   part to cut here: the cold state behind every ACK first (item 3 of
+   the list below).
 2. A new session's first load on a path with random loss. Startup can end
    on that loss below the offered rate, and the climb from there costs
    several percent of the first point in some runs (5% in one of two at

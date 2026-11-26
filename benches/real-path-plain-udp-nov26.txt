@@ -39,3 +39,11 @@ TCP
   right to left, 8 streams  3.73 Gbit/s received, 1476 retransmits
   right to left, 1 stream   0.66 Gbit/s received, 181 retransmits
   left to right, 8 streams  2.97 Gbit/s received, 1141 retransmits
+
+Later the same day, after the receiving machine's card was set to hash UDP by ports as
+well as addresses. Right to left, 44-segment trains, to one address
+  offered 3.00  sent 3.00  delivered 2.97  lost 1.015%
+  offered 4.00  sent 4.00  delivered 3.85  lost 3.788%
+  offered 5.00  sent 5.00  delivered 4.32  lost 13.638%
+The sixteen flows lose alike (0.7-1.3% each at 3.00, 2.6-5.7% at 4.00), and several
+cores of the receiving machine handle them.

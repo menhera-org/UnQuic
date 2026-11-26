@@ -115,7 +115,7 @@ Gbit/s at an offer-limited load instead.
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
 | Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Loopback throughput at an 8952-byte limit is measured: the 21G total rises 70–126%; on the routed decision workload at 5G delivery rises 50–56% at 36% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)). Real-path throughput at larger MTUs remains open. DATA-quoted PTB validation now has targeted kernel coverage. |
-| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | November 19: sixteen workers per daemon and thirty-two GSO flows deliver 5.4–5.8 Gbit/s each way at 6 Gbit/s offered over the local routed path with 1% loss, at 4.5 and at 7.5 ms, and 5.7–5.9 with `loss_threshold_permille = 100`, losing 0.2–2.9% of frames ([BENCH.md](#frame-slots-that-follow-the-memory-limit-november-19-landed)). November 20: with the path emulated by a relay on other cores, four workers and sixteen GSO flows deliver 5.11–5.56 Gbit/s each way at 7.5 ms and 5.51–5.91 at 4.5 ms in ten 60 s runs of ten at 6 offered and 1% loss, and two workers deliver 2.5–2.7 ([BENCH.md](#the-lossy-path-through-a-relay-november-20-landed)). November 25, the first runs across a real path of the target network (MTU 1500, 7.0–8.2 ms, 0.01–0.02% loss) between two shared container hosts: four workers deliver 4.0 Gbit/s one way with nothing missing and 3.6–4.7 at 5 offered, eight deliver 5.46, and the other direction stays at 1.1–1.5 behind one host's 416 KiB receive sockets ([BENCH.md](#across-a-real-access-path-november-25)). November 26, with that host's buffers raised and both hosts on macvlan: four workers deliver 5.49 Gbit/s one way at 6 offered, and the other way stays at 1.4–1.9 because the receiving machine's card puts every lane on one receive queue, which limits plain UDP the same way ([BENCH.md](#the-real-path-after-the-hosts-changes-november-26)). Four workers deliver about 2.5 Gbit/s each way of bridged individual frames at 5 Gbit/s offered, CPU-bound. Earlier: One flow at 7.5 ms with 0.5–1% random loss: about 1.0 Gbit/s per direction locally with hash lanes and the default queue-checked loss tolerance (0.91–1.05 at 1G and 5G offered on `424f4f8`, busiest thread 76–98%, [results](benches/lossy-one-flow-424f4f8.json)), 1.5–2.0 with the old per-reader balanced-lane tables only because the flow kept changing lanes, which the shared flow table ends (0.7–0.9 since November 13, [BENCH.md](#a-control-lane-for-acks-november-13)); 1.6 Gbit/s on the remote host, where a limit downstream of the sender caps it. November 16: with `stripe_flows` on, one UDP flow delivers 2.1–2.4 Gbit/s per direction at 0.5–1% loss against 1.1–1.2 without ([BENCH.md](#striping-one-flow-across-transmit-workers-november-15)); sixteen flows at 2 Gbit/s each way on a 4.5 ms path with 1% loss lose 0.01–0.05% of their frames since the queue check uses each round's smallest RTT sample, where they lost about 1% ([BENCH.md](#where-the-lossy-point-loses-its-frames-november-16)). At 5% loss draft 07 delivers under 10 Mbit/s of a 5G offer; `loss_threshold_permille = 100` raises that to about 0.45 Gbit/s ([BENCH.md](#a-configurable-loss-threshold-for-random-loss-november-12)) | One transmit worker caps one flow near 1 Gbit/s here even without loss, a third of it the kernel's software send path and a quarter userspace, so the gate needs striping with a receive reorder stage, a larger outer MTU or segmenting hardware ([BENCH.md](#what-holds-one-flow-near-1-gbits-november-13); ROADMAP decision 7). Striping is built but off by default: the worker that reads the flow and writes its reverse direction then limits it near 2.2 Gbit/s, and it is unmeasured for TCP, which needs a host with full receive buffers and four workers per daemon. Also open: the 5% rows (still under a tenth of the offer; FEC or a different response), and the real path's second direction, which waits on a setting of the receiving machine's card. |
+| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | November 19: sixteen workers per daemon and thirty-two GSO flows deliver 5.4–5.8 Gbit/s each way at 6 Gbit/s offered over the local routed path with 1% loss, at 4.5 and at 7.5 ms, and 5.7–5.9 with `loss_threshold_permille = 100`, losing 0.2–2.9% of frames ([BENCH.md](#frame-slots-that-follow-the-memory-limit-november-19-landed)). November 20: with the path emulated by a relay on other cores, four workers and sixteen GSO flows deliver 5.11–5.56 Gbit/s each way at 7.5 ms and 5.51–5.91 at 4.5 ms in ten 60 s runs of ten at 6 offered and 1% loss, and two workers deliver 2.5–2.7 ([BENCH.md](#the-lossy-path-through-a-relay-november-20-landed)). November 25, the first runs across a real path of the target network (MTU 1500, 7.0–8.2 ms, 0.01–0.02% loss) between two shared container hosts: four workers deliver 4.0 Gbit/s one way with nothing missing and 3.6–4.7 at 5 offered, eight deliver 5.46, and the other direction stays at 1.1–1.5 behind one host's 416 KiB receive sockets ([BENCH.md](#across-a-real-access-path-november-25)). November 26, with that host's buffers raised and both hosts on macvlan: four workers deliver 5.49 Gbit/s one way at 6 offered, and the other way stays at 1.4–1.9 because the receiving machine's card puts every lane on one receive queue, which limits plain UDP the same way ([BENCH.md](#the-real-path-after-the-hosts-changes-november-26)). With the card set to hash UDP by ports later that day, that direction carries 2.5–2.9, where its path gives 4.3 of plain UDP at best; and three quarters of both daemons' CPU on these hosts is kernel time per datagram ([BENCH.md](#the-real-path-with-udp-hashed-by-ports-and-where-its-cpu-goes-november-26)). Four workers deliver about 2.5 Gbit/s each way of bridged individual frames at 5 Gbit/s offered, CPU-bound. Earlier: One flow at 7.5 ms with 0.5–1% random loss: about 1.0 Gbit/s per direction locally with hash lanes and the default queue-checked loss tolerance (0.91–1.05 at 1G and 5G offered on `424f4f8`, busiest thread 76–98%, [results](benches/lossy-one-flow-424f4f8.json)), 1.5–2.0 with the old per-reader balanced-lane tables only because the flow kept changing lanes, which the shared flow table ends (0.7–0.9 since November 13, [BENCH.md](#a-control-lane-for-acks-november-13)); 1.6 Gbit/s on the remote host, where a limit downstream of the sender caps it. November 16: with `stripe_flows` on, one UDP flow delivers 2.1–2.4 Gbit/s per direction at 0.5–1% loss against 1.1–1.2 without ([BENCH.md](#striping-one-flow-across-transmit-workers-november-15)); sixteen flows at 2 Gbit/s each way on a 4.5 ms path with 1% loss lose 0.01–0.05% of their frames since the queue check uses each round's smallest RTT sample, where they lost about 1% ([BENCH.md](#where-the-lossy-point-loses-its-frames-november-16)). At 5% loss draft 07 delivers under 10 Mbit/s of a 5G offer; `loss_threshold_permille = 100` raises that to about 0.45 Gbit/s ([BENCH.md](#a-configurable-loss-threshold-for-random-loss-november-12)) | One transmit worker caps one flow near 1 Gbit/s here even without loss, a third of it the kernel's software send path and a quarter userspace, so the gate needs striping with a receive reorder stage, a larger outer MTU or segmenting hardware ([BENCH.md](#what-holds-one-flow-near-1-gbits-november-13); ROADMAP decision 7). Striping is built but off by default: the worker that reads the flow and writes its reverse direction then limits it near 2.2 Gbit/s, and it is unmeasured for TCP, which needs a host with full receive buffers and four workers per daemon. Also open: the 5% rows (still under a tenth of the offer; FEC or a different response), and CPU per delivered bit: 46% of a fast core per Gbit/s to send and 31% to receive on the real path, too much for a box with four slow cores unless its card segments and coalesces UDP. |
 | Coexist with other traffic | Against one TCP CUBIC flow at a 1 Gbit/s, 7.5 ms token-bucket bottleneck: an even share with a one-BDP queue; with a quarter-BDP queue the queue-checked tolerance keeps TCP's share | Several competitors, other buffer depths and other TCP algorithms are unmeasured. |
 
 Unlimited loss remains high. TAP ingress drops, bounded worker queue drops,
@@ -3590,6 +3590,65 @@ new session's first point sometimes loses several percent while Startup
 ends on random loss below the offered rate (5.2% in one of two rounds
 here, and 39% in one earlier run of the old build). That ramp is listed
 in ROADMAP.md.
+
+## The real path with UDP hashed by ports, and where its CPU goes (November 26)
+
+Later the same day the receiving machine's card was set to hash UDP by
+ports as well as addresses. `836057a`, four workers, 10 s points.
+
+| Right to left | Before | After |
+| --- | --- | --- |
+| Plain UDP at 3, 4, 5 offered ([runs](benches/real-path-plain-udp-nov26.txt)) | 2.33, 2.67, 2.75 | 2.97, 3.85, 4.32 with 1.0%, 3.8%, 13.6% lost |
+| Daemon alone at 3, 4, 5 offered ([four and twelve lanes](benches/real-path-port-hash-right-to-left-nov26.json), [again](benches/real-path-port-hash-loss-threshold-nov26.json)) | 1.93 | 2.53–2.73, 2.83–2.93, 2.67–2.74 |
+| Daemon with both directions loaded, at 3 offered ([results](benches/real-path-port-hash-both-ways-nov26.json)) | 1.36–1.58 | 2.20–2.42 |
+
+The three data lanes now arrive on three cores of the receiving machine.
+Plain UDP's sixteen flows lose alike, 0.7–1.3% each at 3 offered and
+2.6–5.7% at 4, so what remains in this direction is the path: it carries
+about 4.3 Gbit/s of plain UDP at best, and the daemon's controller stops
+where a round's loss passes 2%. Twelve lanes deliver the same as four
+(2.49, 2.98, 2.55), and so does `loss_threshold_permille = 100` (2.75,
+2.72, 3.10). With both directions loaded the other direction delivers
+4.11–4.58 at 5 offered, and this one falls to 1.3 there while the left
+daemon, at 220–246% with receive sockets overflowing, sends and receives
+at once.
+
+**Where the CPU goes.** A profile build with one direction at 4 offered
+(3.83 delivered) and thread CPU times from the same run:
+
+| | Sender | Receiver |
+| --- | --- | --- |
+| Daemon CPU | 175% | 120% |
+| Per delivered Gbit/s | 46% of a core | 31% of a core |
+| Kernel share of the workers' CPU time | 81% | 71% |
+| Busy cycles per datagram | 9,470 | 6,140 |
+| of them in `sendmmsg` | 6,950 | |
+| sending ACKs | | 280 |
+| in the socket read | | 2,450 |
+| in the TAP write | | 2,140 |
+| in the TAP read | 590 | |
+| admission and the reassembly copy | | 800 |
+| everything else | 1,930 | 470 |
+
+Three quarters of what the two daemons spend is kernel time in four
+system calls, a datagram at a time: neither host's card segments UDP for
+the sender or coalesces it for the receiver. The daemon does not inflate
+that. The load tool alone, sending plain 44-segment UDP trains from the
+same hosts, spends 3.6 µs of CPU a datagram on the left host and 2.4 on
+the right, and the daemon's `sendmmsg` costs 3.5 µs and 2.1 µs a
+datagram there. Receiving plain UDP costs the load tool 2.1–2.6 µs a
+datagram.
+
+So on these hosts 5 Gbit/s each way is 430,000 datagrams a second each
+way through that kernel path, about two and a half cores before the
+daemon's own work, and a box with four slow cores cannot do it this way.
+What decides it on a target box is its card: one that segments UDP on
+transmit and coalesces it on receive turns each of those per-datagram
+costs into a per-train cost, as loopback and the relay bed already do
+here (1,490 cycles a datagram in `sendmmsg` on loopback against 6,950).
+The daemon's own share, about 1,900 cycles a datagram to send and 1,300
+to receive on this path, is what the entries below this one keep
+cutting.
 
 ## The per-frame cost on November 19
 
