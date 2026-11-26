@@ -3650,6 +3650,36 @@ The daemon's own share, about 1,900 cycles a datagram to send and 1,300
 to receive on this path, is what the entries below this one keep
 cutting.
 
+The same build on the relay bed shows what a path with segmentation and
+coalescing costs. Two workers at 2 Gbit/s each way over 7.5 ms use
+69–70% of a core per daemon, 17.6% of a core for each Gbit/s carried in
+or out, where the real-path hosts need 46% to send one and 31% to
+receive it. One datagram out and one in cost 7,020 busy cycles
+([breakdown](benches/cycle-breakdown-nov26.txt),
+[results](benches/sender-spots-relay-nov26.json)):
+
+| Where | Cycles | |
+| --- | --- | --- |
+| `sendmmsg` | 1,554 | a datagram of a 35-datagram call |
+| TAP writes | 1,756 | this bed's inner stack up to the load tool's socket |
+| Socket read | 761 | coalesced |
+| TAP reads | 749 | |
+| ACK and control sends | 184 | |
+| Planning and packing frames | 470 | the daemon's own code from here down |
+| Receive admission and the reassembly copy | 577 | |
+| Recovery staging | 271 | applying an ACK's pieces to frames sent 7.5 ms ago |
+| The rest of the sender's ACK and controller work | 220 | |
+| Waits, wakes, queues, timers and TAP input expansion | 480 | |
+
+The four kinds of system call hold 5,000 of the 7,020 here as well. That
+is 3,510 cycles a frame event against the 2,200–3,150 of design section
+13.1, and the daemon's own code is about 1,000 of them. Recovery staging
+is its largest piece that a path's delay inflates. At these costs 5 Gbit/s each
+way is 1.8 fast cores a box on a path like the relay bed's and 3.9 on
+one like the real hosts', so on a box of four slow cores the card's UDP
+offloads decide whether the gate is in reach, more than anything left in
+the daemon.
+
 ## The per-frame cost on November 19
 
 A profile build of `34aced8` on the full-size efficiency point (eight

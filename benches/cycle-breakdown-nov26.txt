@@ -1,0 +1,37 @@
+Busy cycles per datagram, November 26, profile builds of 836057a.
+
+Relay bed (the bed segments UDP trains itself and the receiver gets them coalesced):
+two workers, 7.5 ms round trip, no loss, sixteen QinQ flows at 2 Gbit/s each way for
+40 s, the sender-spot patch of benches/profile-sender-spots-diagnostic.patch applied.
+Left daemon: 5.186e10 busy cycles, 7,388,095 datagrams sent and about as many received,
+69-70% of a core, so 7,020 cycles for one datagram out and one in.
+
+  flush_frames        2,024   of it sendmmsg 1,554 (212,634 calls); planning and packing 470
+  flush_taps          1,756   TAP writes
+  read_socket           761   recvmmsg, coalesced
+  read_tap              749   TAP reads
+  drain_packets         577   receive admission and the reassembly copy
+  service_sender        491   recovery staging 271, ACK application 75, starting an ACK 48,
+                              controller and messages 37, permitted sends 29, the rest 28
+  flush_control         184   ACK and control sends
+  poll                  172
+  notifications, TAP input expansion, reactor, queues, ACK collection, timers  307
+
+Real path (neither card segments UDP for the sender or coalesces it for the receiver):
+four workers, one direction at 4 Gbit/s offered, 3.83 delivered, 10 s; sender and
+receiver are different hosts, so each column is one datagram on one side.
+
+                         sender   receiver
+  all busy cycles         9,470      6,140
+  sendmmsg                6,950
+  sending ACKs                         280
+  socket read                        2,450
+  TAP write                          2,140
+  TAP read                  590
+  admission and copy                   800
+  everything else         1,930        470
+  kernel share of worker CPU time  81%  71%
+
+Plain UDP from the load tool between the same hosts, CPU time per datagram:
+  send 3.6 us from one host and 2.4 us from the other; receive 2.1-2.6 us.
+The daemon's sendmmsg on those hosts: 3.5 us and 2.1 us a datagram.
