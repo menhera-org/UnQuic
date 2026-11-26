@@ -135,6 +135,37 @@ fn provisioning_and_configuration_errors_have_clean_cli_output() {
     let diagnostic = String::from_utf8_lossy(&output.stderr);
     assert!(diagnostic.contains("invalid TOML"));
     assert!(!diagnostic.contains("secret-invalid-cookie"));
+    // check-config judges a file as a start would, without opening a device.
+    let check = |text: &str| {
+        let file = ConfigFile::new(text);
+        Command::new(binary())
+            .arg("check-config")
+            .arg(&file.0)
+            .output()
+            .unwrap()
+    };
+    let text = config("uq-check", 40100, 40101, "::1", "");
+    let accepted = check(&text);
+    assert!(accepted.status.success());
+    assert!(accepted.stdout.is_empty() && accepted.stderr.is_empty());
+    for (bad, reason) in [
+        ("sessions = 1".to_owned(), "invalid TOML"),
+        (
+            format!("[daemon]\nmemory_limit = 4096\n{text}"),
+            "memory_limit",
+        ),
+    ] {
+        let refused = check(&bad);
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains(reason));
+    }
+}
+
+fn session(name: &str, cookie: u8) -> String {
+    format!(
+        "[[sessions]]\nname = '{name}'\npeer = 'peer'\n\
+cookie = '00112233-4455-4677-8899-aabbccddee{cookie:02x}'\ninner_mtu = 1500\n"
+    )
 }
 
 fn config(name: &str, listen: u16, peer: u16, host: &str, resolver: &str) -> String {
@@ -499,7 +530,9 @@ fn restart_whose_exec_fails_after_a_passing_probe_resumes_on_the_same_queues() {
         assert!(signalled.success());
     };
     // The successor passes the probe, then vanishes, so the exec itself fails.
-    install(Some("#!/bin/sh\nrm -f \"$0\"\necho unquic-adopt 1\n"));
+    install(Some(
+        "#!/bin/sh\nif [ \"$1\" = adopt-version ]; then echo unquic-adopt 1; else rm -f \"$0\"; fi\n",
+    ));
     restart();
     until(|| logged("re-exec failed") == 1);
     assert!(!copy.exists() && !reexecuted());
@@ -522,6 +555,101 @@ fn restart_whose_exec_fails_after_a_passing_probe_resumes_on_the_same_queues() {
         .unwrap();
     assert!(removed.success());
     let _ = fs::remove_dir_all(&directory);
+}
+
+#[test]
+#[ignore = "requires disposable container with tun, iproute2 and network namespace capabilities"]
+fn reload_applies_a_changed_session_set_and_keeps_the_taps_that_stay() {
+    use std::os::unix::fs::MetadataExt;
+    // This thread and the daemon it starts use a disposable namespace.
+    check_namespace();
+    let net = UdpSocket::bind("[::]:0").unwrap();
+    let pid_path = std::env::temp_dir().join(format!("unquic-reload-{}.pid", std::process::id()));
+    let base = config("uq-keep", 40700, 40701, "::1", "");
+    let file = ConfigFile::new(&format!("{base}{}", session("uq-gone", 1)));
+    let started = Command::new(binary())
+        .arg("start")
+        .arg(&file.0)
+        .arg(&pid_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(started.success());
+    let pid: i32 = fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    common::add_vlan(&net, c"uq-keep", 7);
+    let index = |name: &std::ffi::CStr| {
+        // SAFETY: the name is NUL-terminated; the call only queries this namespace.
+        unsafe { libc::if_nametoindex(name.as_ptr()) }
+    };
+    let kept = (index(c"uq-keep"), index(c"uq-keep.7"));
+    assert!(kept.0 != 0 && kept.1 != 0 && index(c"uq-gone") != 0);
+    // status prints the daemon's report: workers, then sessions and peers by name.
+    let status = || {
+        let output = Command::new(binary())
+            .arg("status")
+            .arg(&pid_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let report = status();
+    for line in [
+        "unquic: version ",
+        "unquic: worker 0 Snapshot {",
+        "unquic: session uq-keep SessionStatus { state: ",
+        "unquic: session uq-gone SessionStatus { state: ",
+        "unquic: peer peer Snapshot {",
+    ] {
+        assert!(report.lines().any(|l| l.starts_with(line)), "{line}");
+    }
+    assert!(!report.contains("00112233-4455-4677-8899"));
+    // A second report replaces the first.
+    assert!(status().contains("unquic: session uq-gone "));
+    let inode = || fs::metadata(&pid_path).map(|m| m.ino()).ok();
+    let published = inode();
+    let reload = |text: &str| {
+        fs::write(&file.0, text).unwrap();
+        // SAFETY: the PID file names the daemon this test started.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
+    };
+    // A file the successor rejects leaves the daemon and its PID file as they are.
+    reload("sessions = 1");
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(inode(), published);
+    // SAFETY: signal 0 only asks whether the daemon still runs.
+    assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+    // One session stays, one goes and one is new.
+    reload(&format!("{base}{}", session("uq-new", 2)));
+    until(|| inode().is_some_and(|now| Some(now) != published));
+    assert_eq!(fs::read_to_string(&pid_path).unwrap(), format!("{pid}\n"));
+    assert_eq!((index(c"uq-keep"), index(c"uq-keep.7")), kept);
+    assert_ne!(index(c"uq-new"), 0);
+    let report = status();
+    assert!(report.contains("unquic: session uq-new ") && !report.contains("uq-gone"));
+    let remove = |name: &str| {
+        let removed = Command::new(binary())
+            .args(["remove-tap", name])
+            .status()
+            .unwrap();
+        assert!(removed.success());
+    };
+    // The session that went left its TAP behind with no queue attached, as a
+    // shutdown does, so removing it takes effect at once.
+    assert_ne!(index(c"uq-gone"), 0);
+    remove("uq-gone");
+    until(|| index(c"uq-gone") == 0);
+    // SAFETY: the PID file names the daemon this test started.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    until(|| !pid_path.exists());
+    assert!(!PathBuf::from(format!("{}.status", pid_path.display())).exists());
+    remove("uq-keep");
+    remove("uq-new");
 }
 
 fn check_namespace() {

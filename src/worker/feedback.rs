@@ -430,6 +430,20 @@ impl Worker {
                     }
                     let sent = self.send_records(session, &records[..count], now)?;
                     if let Some((_, _, started)) = sent {
+                        #[cfg(feature = "trace")]
+                        if let Some(first) = &batch[0] {
+                            trace_event!(
+                                self.id,
+                                ACK_SENT,
+                                0,
+                                [
+                                    session << 16 | usize::from(first.lane),
+                                    first.ranges[0].end,
+                                    count,
+                                    now.saturating_sub(first.created).as_micros()
+                                ]
+                            );
+                        }
                         for mut feedback in batch.into_iter().flatten() {
                             feedback.sent = Some(started);
                             self.return_feedback(feedback, now)?;

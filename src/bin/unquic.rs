@@ -57,9 +57,14 @@ fn signals() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     action.sa_sigaction = restart_signal as *const () as usize;
-    // SAFETY: as above.
-    if unsafe { libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut()) } < 0 {
-        return Err(io::Error::last_os_error());
+    // DECISION(2026-11-27): SIGHUP reloads by the same re-exec as SIGUSR2. Why: the successor
+    //   reads the file anew and adopts the TAPs of unchanged sessions. Rejected: changing
+    //   sessions inside running workers (their per-session state is fixed at start).
+    for signal in [libc::SIGUSR2, libc::SIGHUP] {
+        // SAFETY: as above.
+        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(())
 }
@@ -79,7 +84,7 @@ fn resolve(job: config::Lookup, control: Control) {
                     }
                     Err(error) => eprintln!(
                         "unquic: peer {} resolver unavailable: {}",
-                        job.peer,
+                        job.name,
                         error.kind()
                     ),
                 }
@@ -102,7 +107,7 @@ fn resolve(job: config::Lookup, control: Control) {
                 Err(error) => {
                     eprintln!(
                         "unquic: peer {} address rejected: {}",
-                        job.peer,
+                        job.name,
                         error.kind()
                     );
                     pending = None;
@@ -234,6 +239,70 @@ fn adopt_back(
         .collect()
 }
 
+/// This build's version, the running kernel's release and how many CPUs the
+/// daemon may use: what a reader of a report needs before its numbers.
+fn host_line() -> String {
+    // SAFETY: zeroed utsname and cpu_set_t are valid output storage; uname
+    // NUL-terminates the release it writes.
+    let (release, cpus) = unsafe {
+        let mut name: libc::utsname = std::mem::zeroed();
+        let release = if libc::uname(&mut name) == 0 {
+            std::ffi::CStr::from_ptr(name.release.as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            String::from("unknown")
+        };
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        let cpus = if libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) == 0 {
+            libc::CPU_COUNT(&set)
+        } else {
+            0
+        };
+        (release, cpus)
+    };
+    format!(
+        "unquic: version {} kernel {release} allowed_cpus {cpus}\n",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// The SIGUSR1 report: the host line, each worker's totals, each session's
+/// state and totals with those of its lanes, then each peer's totals.
+/// Sessions and peers go by their configured names, the public labels; no
+/// cookie or address appears.
+fn report_text(config: &unquic::config::Config, control: &Control) -> String {
+    use std::fmt::Write;
+    let mut text = host_line();
+    let mut worker = 0;
+    while let Some(totals) = control.worker_counters(worker) {
+        let _ = writeln!(text, "unquic: worker {worker} {totals:?}");
+        worker += 1;
+    }
+    for (index, session) in config.sessions.iter().enumerate() {
+        let name = &session.name;
+        if let (Some(status), Some(totals)) =
+            (control.session(index), control.session_counters(index))
+        {
+            let _ = writeln!(text, "unquic: session {name} {status:?} {totals:?}");
+        }
+        for lane in 1..=64 {
+            if let Some(lane) = control.transmit_lane_counters(index, lane) {
+                let _ = writeln!(text, "unquic: session {name} transmit {lane:?}");
+            }
+            if let Some(lane) = control.receive_lane_counters(index, lane) {
+                let _ = writeln!(text, "unquic: session {name} receive {lane:?}");
+            }
+        }
+    }
+    for (index, peer) in config.peers.iter().enumerate() {
+        if let Some(totals) = control.peer_counters(index) {
+            let _ = writeln!(text, "unquic: peer {} {totals:?}", peer.name);
+        }
+    }
+    text
+}
+
 fn serve(loaded: config::Loaded, mut launch: Launch) -> io::Result<()> {
     signals()?;
     let binary = std::env::current_exe()?;
@@ -260,10 +329,13 @@ fn serve(loaded: config::Loaded, mut launch: Launch) -> io::Result<()> {
         let mut restarting = false;
         while !transport.is_finished() {
             if REPORT.swap(false, Ordering::Relaxed) {
-                let mut worker = 0;
-                while let Some(snapshot) = control.worker_counters(worker) {
-                    eprintln!("unquic: worker {worker} {snapshot:?}");
-                    worker += 1;
+                let text = report_text(&loaded.config, &control);
+                eprint!("{text}");
+                // `unquic status` reads the same report from beside the PID file.
+                if let Some(path) = &launch.pid_path
+                    && let Err(error) = daemon::publish(&daemon::status_path(path), &text)
+                {
+                    eprintln!("unquic: status file: {error}");
                 }
                 #[cfg(feature = "trace")]
                 if let Some(trace) = &mut trace {
@@ -279,8 +351,13 @@ fn serve(loaded: config::Loaded, mut launch: Launch) -> io::Result<()> {
                 break;
             }
             if RESTART.swap(false, Ordering::Relaxed) {
-                // A successor that cannot adopt these queues never stops this daemon.
-                match restart::probe(&binary) {
+                // A successor that cannot adopt these queues, or rejects the
+                // configuration file as it is now, never stops this daemon.
+                let probed = match launch.args.get(1) {
+                    Some(config) => restart::probe(&binary, config),
+                    None => Err(io::ErrorKind::InvalidInput.into()),
+                };
+                match probed {
                     Ok(()) => {
                         restarting = true;
                         control.handover();
@@ -358,8 +435,10 @@ fn serve(loaded: config::Loaded, mut launch: Launch) -> io::Result<()> {
     }
 }
 
-const USAGE: &str = "unquic gen-uuid | unquic run <config.toml> | \
+const USAGE: &str = "unquic gen-uuid | unquic check-config <config.toml> | \
+unquic run <config.toml> | \
 unquic start <config.toml> <pid-file> | unquic restart <pid-file> | \
+unquic status <pid-file> | \
 unquic systemd-unit <config.toml> <pid-file> | unquic remove-tap <name> | unquic adopt-version";
 
 fn absolute(path: std::ffi::OsString) -> io::Result<std::path::PathBuf> {
@@ -369,7 +448,7 @@ fn absolute(path: std::ffi::OsString) -> io::Result<std::path::PathBuf> {
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "start and systemd-unit need absolute paths",
+            "PID and daemon configuration files need absolute paths",
         ))
     }
 }
@@ -386,7 +465,14 @@ fn execute() -> io::Result<u8> {
             io::stdout().lock().write_all(restart::VERSION.as_bytes())?;
         }
         (Some(command), Some(pid_file), None, None) if command == "restart" => {
-            restart::signal(&absolute(pid_file)?)?;
+            restart::signal(&absolute(pid_file)?, libc::SIGUSR2)?;
+        }
+        (Some(command), Some(pid_file), None, None) if command == "status" => {
+            let text = restart::status(&absolute(pid_file)?)?;
+            io::stdout().lock().write_all(text.as_bytes())?;
+        }
+        (Some(command), Some(path), None, None) if command == "check-config" => {
+            runtime::check(config::Loaded::parse(&std::fs::read_to_string(path)?)?.config)?;
         }
         (Some(command), Some(path), None, None) if command == "run" => {
             let loaded = config::Loaded::parse(&std::fs::read_to_string(path)?)?;

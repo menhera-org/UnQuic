@@ -140,24 +140,35 @@ impl Readiness {
     }
 }
 
+/// Replaces `path` with `text` through a rename: readers see either the old
+/// file or the whole new one, and each replacement is a new inode.
+pub fn publish(path: &Path, text: &str) -> io::Result<()> {
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(format!(".{}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&temporary)?;
+    let written = file
+        .write_all(text.as_bytes())
+        .and_then(|()| fs::rename(&temporary, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    written
+}
+
+/// Where the daemon publishing `pid_file` writes its SIGUSR1 report.
+pub fn status_path(pid_file: &Path) -> PathBuf {
+    let mut path = pid_file.as_os_str().to_owned();
+    path.push(".status");
+    path.into()
+}
+
 impl PidFile {
     pub fn publish(path: &Path) -> io::Result<Self> {
-        let pid = std::process::id();
-        let mut temporary = path.as_os_str().to_owned();
-        temporary.push(format!(".{pid}.tmp"));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(&temporary)?;
-        // Readers see either no file or the whole PID.
-        let written = file
-            .write_all(format!("{pid}\n").as_bytes())
-            .and_then(|()| fs::rename(&temporary, path));
-        if written.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        written.map(|()| Self(path.to_owned()))
+        publish(path, &format!("{}\n", std::process::id())).map(|()| Self(path.to_owned()))
     }
 }
 
@@ -166,6 +177,7 @@ impl Drop for PidFile {
         if fs::read_to_string(&self.0).is_ok_and(|text| text == format!("{}\n", std::process::id()))
         {
             let _ = fs::remove_file(&self.0);
+            let _ = fs::remove_file(status_path(&self.0));
         }
     }
 }
@@ -202,6 +214,7 @@ Before=network.target
 Type=forking
 PIDFile={pid}
 ExecStart={binary} start {config} {pid}
+ExecReload={binary} restart {pid}
 TimeoutStartSec=infinity
 Restart=on-failure
 
@@ -228,6 +241,7 @@ mod tests {
             "Type=forking",
             "PIDFile=/run/unquic.pid",
             "ExecStart=/usr/bin/unquic start /etc/unquic.toml /run/unquic.pid",
+            "ExecReload=/usr/bin/unquic restart /run/unquic.pid",
             "TimeoutStartSec=infinity",
             "Restart=on-failure",
             "RequiredBy=network.target",
@@ -271,8 +285,13 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             format!("{}\n", std::process::id())
         );
+        // A report published beside the PID file goes with it.
+        let status = status_path(&path);
+        publish(&status, "one\n").unwrap();
+        publish(&status, "two\n").unwrap();
+        assert_eq!(fs::read_to_string(&status).unwrap(), "two\n");
         drop(pid);
-        assert!(!path.exists());
+        assert!(!path.exists() && !status.exists());
         let pid = PidFile::publish(&path).unwrap();
         // Another daemon has replaced the file: leave it alone.
         fs::write(&path, "1\n").unwrap();

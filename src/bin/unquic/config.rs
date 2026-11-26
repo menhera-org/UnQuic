@@ -158,6 +158,8 @@ impl ResolverConfig {
 #[derive(Clone)]
 pub struct Lookup {
     pub peer: usize,
+    /// The peer's configured name, its label in diagnostics.
+    pub name: String,
     pub host: IpHost,
     pub resolver: ResolverConfig,
     pub scope_id: u32,
@@ -191,6 +193,7 @@ impl Loaded {
                 host @ IpHost::Fqdn(_) => {
                     lookups.push(Lookup {
                         peer: index,
+                        name: peer.name.clone(),
                         host,
                         resolver: peer.resolver,
                         scope_id: peer.scope_id,
@@ -268,6 +271,7 @@ mod tests {
             assert_eq!(loaded.config.sessions[0].queue_count, 1);
             assert_eq!(loaded.config.daemon.memory_limit, 256 * 1024 * 1024);
             assert!(loaded.config.daemon.tolerate_random_loss);
+            assert_eq!(loaded.config.daemon.turn_hold_us, 200);
             assert_eq!(loaded.config.daemon.loss_threshold_permille, 20);
             assert!(loaded.config.daemon.balance_flows);
             assert_eq!(loaded.config.daemon.tx_hold_us, 0);
@@ -429,6 +433,7 @@ mod tests {
                 "daemon.loss_threshold_permille",
             ),
             ("tx_hold_us = 1001", "daemon.tx_hold_us"),
+            ("turn_hold_us = 1001", "daemon.turn_hold_us"),
         ] {
             let bad = format!("[daemon]\n{setting}\n{text}");
             assert_eq!(

@@ -1,6 +1,6 @@
 //! Handover format version 1 (design section 11): re-exec with TAP queues.
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     io::{self, Read},
     os::{
@@ -94,12 +94,40 @@ pub fn entry(sessions: &[Session<'_>]) -> io::Result<Option<Inherited>> {
         // SAFETY: the predecessor passed this open descriptor to us alone.
         fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
     }
-    let mut slots: Vec<Vec<Option<OwnedFd>>> = sessions
+    let mut fds: Vec<Option<OwnedFd>> = fds.into_iter().map(Some).collect();
+    let mut taps = Vec::with_capacity(sessions.len());
+    for (session, places) in sessions.iter().zip(assign(&names, sessions)?) {
+        let queues: Option<Vec<OwnedFd>> = places.and_then(|places| {
+            places
+                .into_iter()
+                .map(|place| fds.get_mut(place).and_then(Option::take))
+                .collect()
+        });
+        taps.push(match queues {
+            Some(queues) => Some(unquic::tap::Tap::adopt(queues, session.mtu)?),
+            None => None,
+        });
+    }
+    // Queues nobody adopted close here, before the runtime attaches by name.
+    drop(fds);
+    let pid_file = pid_file.filter(|path| !path.is_empty()).map(PathBuf::from);
+    Ok(Some(Inherited { taps, pid_file }))
+}
+
+/// Sorts the announced queue names into the configured sessions: for each
+/// session the positions of its queues in queue order, or None when the
+/// session must attach by name instead.
+// DECISION(2026-11-27): a successor adopts the sessions whose name and queue count it still
+//   configures and closes every other announced queue. Why: a reload re-executes on a changed
+//   file, and a session that is new, gone or resized must not stop the daemon. Rejected:
+//   refusing any mismatch (the daemon dies on the first changed session).
+fn assign(names: &[&str], sessions: &[Session<'_>]) -> io::Result<Vec<Option<Vec<usize>>>> {
+    let mut slots: Vec<Vec<Option<usize>>> = sessions
         .iter()
-        .map(|session| (0..session.queues).map(|_| None).collect())
+        .map(|session| vec![None; session.queues])
         .collect();
     let keys: Vec<String> = sessions.iter().map(|session| hex(session.name)).collect();
-    for (name, fd) in names.into_iter().zip(fds) {
+    for (place, name) in names.iter().enumerate() {
         let mut fields = name.split('.');
         let (Some("tap"), Some(queue), Some(total), Some(key), None) = (
             fields.next(),
@@ -110,38 +138,34 @@ pub fn entry(sessions: &[Session<'_>]) -> io::Result<Option<Inherited>> {
         ) else {
             return Err(invalid("unknown handover descriptor name"));
         };
-        let session = keys
-            .iter()
-            .position(|k| k == key)
-            .ok_or_else(|| invalid("handover names an unconfigured session"))?;
         let (Ok(queue), Ok(total)) = (queue.parse::<usize>(), total.parse::<usize>()) else {
             return Err(invalid("invalid handover queue"));
         };
-        let slot = slots[session]
-            .get_mut(queue)
-            .filter(|_| total == sessions[session].queues)
-            .ok_or_else(|| invalid("handover queue count differs from the configuration"))?;
-        if slot.replace(fd).is_some() {
+        // A session that is gone, or whose queue count changed, adopts nothing.
+        let slot = keys
+            .iter()
+            .position(|k| k == key)
+            .filter(|&session| sessions.get(session).is_some_and(|s| s.queues == total))
+            .and_then(|session| slots.get_mut(session)?.get_mut(queue));
+        if let Some(slot) = slot
+            && slot.replace(place).is_some()
+        {
             return Err(invalid("duplicate handover queue"));
         }
     }
-    let mut taps = Vec::with_capacity(sessions.len());
-    for (session, slots) in sessions.iter().zip(slots) {
-        let queues: Option<Vec<OwnedFd>> = slots.into_iter().collect();
-        let queues = queues.ok_or_else(|| invalid("handover lacks a configured queue"))?;
-        taps.push(Some(unquic::tap::Tap::adopt(queues, session.mtu)?));
-    }
-    let pid_file = pid_file.filter(|path| !path.is_empty()).map(PathBuf::from);
-    Ok(Some(Inherited { taps, pid_file }))
+    Ok(slots
+        .into_iter()
+        .map(|queues| queues.into_iter().collect())
+        .collect())
 }
 
-/// Runs `binary adopt-version` and requires exactly [`VERSION`] within three seconds.
-pub fn probe(binary: &Path) -> io::Result<()> {
+/// Runs `binary` with `args` for at most three seconds. Returns whether it
+/// succeeded and the first 64 bytes it printed; its diagnostics go to ours.
+fn ask(binary: &Path, args: &[&OsStr]) -> io::Result<(bool, Vec<u8>)> {
     let mut child = Command::new(binary)
-        .arg("adopt-version")
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
         .spawn()?;
     let deadline = Instant::now() + Duration::from_secs(3);
     let status = loop {
@@ -151,7 +175,7 @@ pub fn probe(binary: &Path) -> io::Result<()> {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "adoption probe"));
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "successor probe"));
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -159,13 +183,24 @@ pub fn probe(binary: &Path) -> io::Result<()> {
     if let Some(stdout) = child.stdout.as_mut() {
         stdout.take(64).read_to_end(&mut output)?;
     }
-    if status.success() && output == VERSION.as_bytes() {
-        Ok(())
-    } else {
-        Err(io::Error::other(
+    Ok((status.success(), output))
+}
+
+/// Requires `binary adopt-version` to print exactly [`VERSION`] and
+/// `binary check-config <config>` to accept the file as it is now.
+// DECISION(2026-11-27): the successor binary checks the configuration before the handover.
+//   Why: a file the successor rejects would end the daemon after its workers stopped.
+//   Rejected: parsing it in the running daemon (an upgraded binary may read other keys).
+pub fn probe(binary: &Path, config: &OsStr) -> io::Result<()> {
+    if ask(binary, &["adopt-version".as_ref()])? != (true, VERSION.as_bytes().to_vec()) {
+        return Err(io::Error::other(
             "successor speaks another adoption protocol",
-        ))
+        ));
     }
+    if !ask(binary, &["check-config".as_ref(), config])?.0 {
+        return Err(io::Error::other("successor rejects the configuration file"));
+    }
+    Ok(())
 }
 
 /// Execs `binary` with `queues` as descriptors 3 onward, announced as version 1
@@ -236,8 +271,30 @@ pub fn exec(
     }
 }
 
-/// Asks the daemon named by `pid_file` to restart, as `rs-l2tpd --restart` does.
-pub fn signal(pid_file: &Path) -> io::Result<()> {
+/// Asks the daemon named by `pid_file` for its report and returns it once the
+/// daemon has replaced its status file, within three seconds.
+pub fn status(pid_file: &Path) -> io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let path = super::daemon::status_path(pid_file);
+    let inode = || fs::metadata(&path).map(|file| file.ino()).ok();
+    let before = inode();
+    signal(pid_file, libc::SIGUSR1)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while inode().is_none_or(|now| Some(now) == before) {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the daemon published no status",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::read_to_string(&path)
+}
+
+/// Sends `signal` to the daemon named by `pid_file`, which is checked as
+/// `rs-l2tpd --restart` checks its own.
+pub fn signal(pid_file: &Path, signal: libc::c_int) -> io::Result<()> {
     let mut text = String::new();
     fs::File::open(pid_file)?
         .take(33)
@@ -249,7 +306,7 @@ pub fn signal(pid_file: &Path) -> io::Result<()> {
         .filter(|&pid| pid > 1)
         .ok_or_else(|| invalid("invalid PID file"))?;
     // SAFETY: kill only sends a signal to the named process.
-    if unsafe { libc::kill(pid, libc::SIGUSR2) } < 0 {
+    if unsafe { libc::kill(pid, signal) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -266,12 +323,52 @@ mod tests {
     }
 
     #[test]
+    fn a_successor_adopts_only_sessions_it_still_configures_unchanged() {
+        let session = |name, queues| Session {
+            name,
+            queues,
+            mtu: 1500,
+        };
+        let (a, b, gone) = (hex("a"), hex("b"), hex("gone"));
+        let names = [
+            format!("tap.0.2.{a}"),
+            format!("tap.0.1.{gone}"),
+            format!("tap.1.2.{a}"),
+            format!("tap.0.1.{b}"),
+        ];
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        // Unchanged, resized, new: only the first adopts, in queue order.
+        let sessions = [session("a", 2), session("b", 2), session("new", 1)];
+        assert_eq!(
+            assign(&names, &sessions).unwrap(),
+            [Some(vec![0, 2]), None, None]
+        );
+        // A session missing one of its queues attaches by name.
+        assert_eq!(assign(&names[..1], &[session("a", 2)]).unwrap(), [None]);
+        // A queue index past the count is nobody's.
+        assert_eq!(
+            assign(&[&format!("tap.2.2.{a}")], &[session("a", 2)]).unwrap(),
+            [None]
+        );
+        for bad in [
+            vec!["sock.0.1.61"],
+            vec!["tap.0.1"],
+            vec!["tap.0.1.61.x"],
+            vec!["tap.x.1.61"],
+            vec!["tap.0.x.61"],
+            vec!["tap.0.1.61", "tap.0.1.61"],
+        ] {
+            assert!(assign(&bad, &[session("a", 1)]).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn pid_files_must_hold_one_plain_pid() {
         let path = std::env::temp_dir().join(format!("unquic-signal-{}", std::process::id()));
         for text in ["", "1\n", "12a\n", "123", "99999999999\n"] {
             fs::write(&path, text).unwrap();
             assert_eq!(
-                signal(&path).unwrap_err().kind(),
+                signal(&path, libc::SIGUSR2).unwrap_err().kind(),
                 io::ErrorKind::InvalidInput,
                 "{text:?}"
             );

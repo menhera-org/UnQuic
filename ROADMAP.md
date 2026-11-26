@@ -7,6 +7,61 @@ read that section before writing code. Keep the "Current status" paragraph in
 section 15 of the design and the "Implementation status" section of
 [README.md](README.md) true after every step.
 
+## November 27 checkpoint
+
+CPU for single frames. Frames that reach the TAP one at a time cost
+32,800 cycles per frame carried each way where trains cost 8,900, nearly
+all of it kernel calls made for about four frames each.
+`daemon.turn_hold_us`, 200 by default, lets a worker that drained its
+inputs and took in little wait up to that long before it polls again. It
+cuts a daemon's CPU 15–30% on single frames at 0.5 to 2 Gbit/s each way
+across the real path, for 0.2 ms more delay, and costs trains nothing at
+1 Gbit/s each way. Its first form held a worker whose socket read had come
+back full and lost 6–22% of the frames in 5 of 16 points at 1.5–2 Gbit/s;
+the landed form does not hold then
+([BENCH.md](BENCH.md#larger-worker-turns-for-single-frames-november-27-landed)).
+
+The daemon's remaining features, all with tests:
+
+- Reload. SIGHUP, SIGUSR2, `unquic restart` and the unit's `ExecReload=`
+  re-execute the daemon on the file as it is now, after the successor
+  binary has accepted it with `unquic check-config`. The new image adopts
+  the TAP queues of sessions whose name and queue count are unchanged,
+  closes the rest and creates what is new. Every session reconnects, so
+  this preserves an unrelated session's device and not its transport
+  state; design section 12 says so.
+- Status. SIGUSR1 now reports the host line, every worker, every session
+  with its state, totals and lanes, and every peer, by their configured
+  names. A daemon with a PID file also writes the report beside it, and
+  `unquic status <pid-file>` asks for one and prints it.
+- The `feedback_delay_ns` gauge reports the ACK delay behind the latest
+  round-trip sample. Resolver diagnostics name the peer, not its index.
+- Wire vectors for the three optional extensions: DATA flags 1, 2 and 4
+  and a HELLO advertising all three (`tests/vectors/wire-v1`).
+
+Open, ahead of the lists below:
+
+1. A stall of about a second on the real path, in both directions at once,
+   with or without the hold, at 0.5 Gbit/s of single frames as at 2, and
+   with trains: 6 of 20 points without the hold and 4 of 20 with it lost
+   more than 2.1% of their frames on November 27, most of them in such a
+   stall. Both senders' windows fill within 40 ms and almost no
+   acknowledgement is applied for hundreds of milliseconds; frames expire
+   with no loss declared, and the senders' TAP queues drop what they
+   cannot read. Every byte sent in such a point reached the other side's
+   sockets, bar 0.1–0.4% right to left. The relay bed never shows it. Why
+   acknowledgements stop is unknown; the `trace` feature now records ACKs
+   sent and seen and long sleeps to find out.
+2. Four slow cores are still unmeasured (item 1 of the checkpoint below).
+3. Not built: systemd notification and descriptor storage, DEB and RPM
+   packages, host details beyond the report's first line (card, driver,
+   offloads), qualification on Linux 5.0, path-MTU decisions from ACK and
+   loss feedback.
+4. Decisions that are the user's: the numeric competitive margin and the
+   frozen hardware, core budget and flow counts of design section 16; the
+   privilege model the unit should run under; whether `tx_hold_us` should
+   default on, and whether `turn_hold_us` should stay at 200.
+
 ## November 26 checkpoint
 
 The two real-path hosts changed since the checkpoint below: the capped
@@ -1427,7 +1482,8 @@ rules apply to all of them.
    under receive pressure. Four-slot runs saved another 7.7% on that point
    but collapsed on a lossy path, losing 52–92% of frames, so runs stay at
    two slots; even those lose more frames under loss than ordinary frames.
-   Whether to turn it on by default is decision 8, decided off.
+   Whether to turn it on by default is decision 8, decided off at the time
+   and turned on by default on November 20 (see that checkpoint).
    Receive without the reassembly copy was tried in four builds on November
    14 and rejected: each cost 15–20% because TAP writes stopped coalescing,
    for a cause not yet found
@@ -1671,7 +1727,12 @@ The target layout. Create files when their step arrives, not before.
 | `src/spsc.rs` | Bounded single-producer single-consumer queue | 1e |
 | `src/worker.rs` | Pinned worker loop: epoll, eventfd, timerfd | 1e |
 | `src/runtime.rs` | `run()`, `Control` handle, thread ownership | 1e |
-| `src/bin/unquic.rs` | Daemon and `gen-uuid` (feature `bin`) | 1f |
+| `src/bin/unquic.rs` | Daemon commands, signals and the status report (feature `bin`) | 1f, extended in 4 |
+| `src/bin/unquic/config.rs` | TOML file and resolver selection | 1f |
+| `src/bin/unquic/daemon.rs` | Double fork, readiness, PID and status files, unit template | 4 |
+| `src/bin/unquic/restart.rs` | Handover format 1: probe, re-exec, adoption, reload | 4 |
+| `src/dns.rs` | Hostname resolution above the transport (feature `dns`) | 1f |
+| `src/tap/link.rs` | rtnetlink queries for TAP reattachment and queue length | 4 |
 | `src/reassembly.rs` | Receive windows, frame assembly, TAP write queue | 1e, extended in 2 |
 | `src/pack.rs` | Flow selection, segmentation and record packing | 1e, extended in 2 |
 | `src/ack.rs` | ACK generation and processing | 3 |
@@ -1680,7 +1741,9 @@ The target layout. Create files when their step arrives, not before.
 | `src/bbr.rs` | BBRv3 (draft 07) | 3 |
 | `src/pacing.rs` | Grants, pacing deadlines, control ceiling | 3 |
 | `src/pacing/budget.rs` | Section 9 replacement: published state, atomic inflight and pacing, per-ACK sampler | 3 |
+| `src/stripe.rs`, `src/reorder.rs` | Striped flows: handing frames to a stripe's writer and restoring their order | 5 |
 | `src/trace.rs` | Diagnostics-only event rings (feature `trace`) | done |
+| `src/profile.rs` | Diagnostics-only cycle accounting of worker phases (feature `profile`) | done |
 
 ## Stage 1: socket and device foundation — complete
 
@@ -2396,6 +2459,13 @@ full expired batches sharing the cleanup budget.
   once probed makes the exec fail, the daemon resumes on the kept queues with
   its VLAN upper intact, and a later restart hands them to a real successor
   (Linux 6.8 and 7.0).
+  Configuration reload is done as a restart (November 27): SIGHUP acts as
+  SIGUSR2, the daemon first has the successor binary check the file
+  (`unquic check-config`), and the new image adopts the queues of sessions
+  whose name and queue count are unchanged, closes the rest and creates what
+  is new. Unrelated sessions keep their TAP devices and reconnect; design
+  section 12 states that gap. A container test covers a kept, a removed and a
+  new session and a rejected file (Linux 6.8 so far).
 - Resolved: the routed PMTU test's 1500-byte phase failed in three of five
   local runs on Linux 6.8. The group controller took its maximum datagram
   from whichever lane sent last, so once the busy lane fell to 1500 the send

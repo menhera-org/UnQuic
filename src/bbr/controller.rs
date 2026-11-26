@@ -262,7 +262,8 @@ impl Controller {
         Ok(controller)
     }
 
-    /// Deviation from draft 07, off by default. Outside bandwidth probing, a
+    /// Deviation from draft 07, off in a new controller; the daemon turns it
+    /// on unless `daemon.tolerate_random_loss` says otherwise. Outside bandwidth probing, a
     /// loss round then cuts the short-term bounds only when the ACK that ends
     /// it shows more than the loss threshold that already stops probing (2%
     /// unless set by [`Controller::set_loss_threshold`]), or when every
@@ -281,7 +282,8 @@ impl Controller {
         self.loss_threshold = permille.clamp(LOSS_THRESHOLD, 200);
     }
 
-    /// Deviation from draft 07, off by default: ProbeRTT's window covers half
+    /// Deviation from draft 07, off in a new controller; the daemon turns it
+    /// on unless `daemon.probe_rtt_ack_delay` says otherwise: ProbeRTT's window covers half
     /// of max_bw over min_rtt plus the receiver's maximum ACK delay, the time
     /// a steady offer's bytes actually stay in flight, instead of over min_rtt
     /// alone. Sending at half the bandwidth still drains the bottleneck queue.

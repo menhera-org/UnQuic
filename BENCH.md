@@ -3923,6 +3923,111 @@ right and right to left:
 The direct rows were taken a few minutes after the tunnel's and their
 iperf3 processes were not pinned.
 
+## Larger worker turns for single frames (November 27, landed)
+
+Frames that reach the TAP one at a time cost the daemon several times what
+the same bytes cost in a train. On the relay bed (two workers, 7.5 ms round
+trip, 0.5 Gbit/s each way) a `profile` build spends 32,800 cycles per frame
+carried each way, against 8,900 for 44-segment trains. The cycles are
+kernel calls made for very few frames each: a TAP write costs 9,416 cycles
+a call, and 98% of the time to flush frames to the TAP is that call; a TAP
+read pass costs 26,299 cycles for about four frames and four empty reads;
+a `sendmmsg` costs about 21,000 cycles for five datagrams. A worker turns
+for about every four frames whatever the rate, because each arrival wakes
+it. `daemon.tx_hold_us` does not change that: it holds a lane's tail, and
+the worker still wakes for every arrival.
+
+`daemon.turn_hold_us`, 200 by default, makes the turns fewer and larger. A
+turn that drained its sockets and its TAP queue, took in less than sixteen
+full frames' worth of input and ends with nothing pending sleeps until that
+long after its start, or until its next deadline if that is sooner, and
+only then polls. A turn that took in nothing, a turn with work pending and
+a turn whose read came back full behave as before.
+
+Relay bed, two workers, single frames, no loss, one round
+([rows](benches/turn-hold-single-frames-nov27.json)); daemon CPU on the left
+and right side as a share of one core, and the median one-way delay:
+
+| Hold | 0.5 Gbit/s each way | 1 Gbit/s each way | Median delay at 0.5, 1 |
+| --- | --- | --- | --- |
+| off | 82%, 76% | 144%, 139% | 3.87 ms, 3.87 ms |
+| 100 µs | 80%, 74% | 125%, 115% | 3.97–4.00 ms |
+| 200 µs | 67%, 61% | 109%, 102% | 4.06–4.13 ms |
+| 300 µs | 62%, 58% | 107%, 99% | 4.16–4.26 ms |
+
+Delivery and loss do not change. With 1% loss on the same bed, 0.5 Gbit/s
+each way, four rounds of two points
+([rows](benches/turn-hold-lossy-single-frames-nov27.json)), 200 µs takes the
+daemons from 76–80% and 73–76% of a core to 66–69% and 63–65%, and loses
+0.21% of frames at the mean against 0.59% without it; single points range
+from 0.0% to 0.8% with the hold and from 0.1% to 1.7% without, so the hold
+loses no more. With 44-segment trains at 1 and 2 Gbit/s each way, two
+rounds, CPU is the same to within three points of a core, with and without
+1% loss. Without loss the hold's arm misses 0.2–0.3% of frames at 2 Gbit/s
+against 0.1–0.2%; at 1% loss both arms range from 0.1% to 1.9%.
+
+**A first form of the hold was wrong.** It judged a turn by the bytes it
+read alone. A socket read takes at most eight datagram units a turn, so a
+worker whose read came back full, with more queued behind it, still slept,
+and under the hold it could receive only eight units every 200 µs. On the
+relay bed, where the rows above were taken with that form, a unit is a
+whole train and nothing showed. Across the real path
+(four workers, the settings of the entries above;
+[rows](benches/turn-hold-real-path-nov27.txt)) at 1.5 and 2 Gbit/s of
+single frames each way, 5 of 16 points with that form lost 6–22% of their
+frames, against none above 2.1% in 10 points without the hold. A read that
+comes back full now counts the turn as large, on the sockets and on the TAP.
+
+The hold as landed, across the real path, single frames, off and on in the
+same batches, daemon CPU on the left and right host:
+
+| Offered each way | off | 200 µs | Points with more than 2.1% of frames missing, off and 200 µs |
+| --- | --- | --- | --- |
+| 0.5 | 130–140%, 97–99% | 108–114%, 84–91% | 1 of 2, 0 of 2 |
+| 1 | 206–210%, 145–164% | 156–164%, 123–127% | 1 of 2, 0 of 2 |
+| 1.5 | 237–279%, 206–225% | 185–201%, 149–157% | 2 of 8, 0 of 8 |
+| 2 | 227–280%, 204–256% | 208–236%, 180–199% | 2 of 8, 4 of 8 |
+
+The hold costs 15–30% less CPU at every rate, and 44-segment trains at
+1 Gbit/s each way cost the same with it and without (66–71% and 48–59%
+against 66% and 54–55%). On the relay bed with every datagram separate on
+the wire ([rows](benches/turn-hold-fixed-local-nov27.json)) it takes 1 Gbit/s
+each way from 145–148% and 137–138% of a core to 109–111% and 103–105%.
+
+Trains at 3 Gbit/s offered each way, above what the right-to-left
+direction carries, deliver 4.91–5.71 Gbit/s in total with the hold and
+5.14–5.75 without in six rounds: 4% less at the mean, inside the spread
+between rounds. TCP through the tunnel, four iperf3 streams each way, six
+runs ([rows](benches/turn-hold-tcp-nov27.txt)), gets 2.5–3.3 Gbit/s left to
+right and 2.6–3.5 right to left with the hold, and 1.9–4.1 and 1.8–3.8
+without; the totals average 6.0 and 5.8.
+
+**The missing frames in the last column are not the hold's.** They come in
+both arms, at 0.5 Gbit/s as at 2, and with trains at 1 Gbit/s where the
+busiest worker is 20% busy: 6 of 20 points without the hold, 4 of 20 with
+it. Most are one stall of about a second in both directions at once. A
+trace of one shows both senders' bytes in flight rising from about 2 MB to
+their windows (5.5 and 4.8 MB) within 40 ms, because acknowledgements thin
+out on both sides at the same instant; then each side applies almost no
+acknowledgement for hundreds of milliseconds, with round-trip samples of
+150–390 ms when one arrives, while its workers stay awake and blocked on the
+window. Thousands of frames expire after they were sent and no loss is
+declared. The daemons' counters show where the frames went: every byte
+either side sent in that point reached the other side's sockets, bar
+0.1–0.4% right to left, and each daemon read 7% fewer frames from its TAP
+than in a clean point. The frames were dropped at the TAP's queue while the
+senders could not send.
+
+Why acknowledgements stop is open. The relay bed shows no such stall in any
+run, so the trigger belongs to the real path or its hosts. One reading fits
+every number above: the right-to-left direction stops carrying anything for
+about a second, which costs few bytes because both senders are blocked by
+then. Plain UDP at 1 Gbit/s, 60 s right to left and 30 s left to right half
+an hour later, lost nothing, which neither shows such an outage nor
+excludes one. The `trace` feature now records each ACK datagram sent, each
+ACK record read and each sleep of a millisecond or more, so the next traced
+stall shows which side stopped.
+
 ## The per-frame cost on November 19
 
 A profile build of `34aced8` on the full-size efficiency point (eight

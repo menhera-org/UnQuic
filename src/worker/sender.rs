@@ -577,6 +577,16 @@ impl Worker {
         if lane == 0 || usize::from(lane) > self.sessions[session].tx.len() {
             return Ok(());
         }
+        trace_event!(
+            self.id,
+            ACK_SEEN,
+            0,
+            [
+                session << 16 | usize::from(lane),
+                ranges.iter().next().map_or(0, |range| range.end),
+                ranges.len()
+            ]
+        );
         let Some(mut ack) = self.sender.ack_free.pop() else {
             trace_event!(self.id, ACK_DROP, 0, [session << 16 | usize::from(lane)]);
             self.counters.queue_drops = self.counters.queue_drops.wrapping_add(1);
@@ -2577,11 +2587,13 @@ impl Worker {
 impl Worker {
     pub(super) fn publish_sender(&mut self) {
         self.counters.rtt_ns = 0;
+        self.counters.feedback_delay_ns = 0;
         self.counters.bytes_in_flight = 0;
         self.counters.pacing_bytes_per_second = 0;
         for local in &mut self.sessions {
             local.totals.bytes_in_flight = 0;
             local.totals.rtt_ns = 0;
+            local.totals.feedback_delay_ns = 0;
         }
         for lane in &self.sender.lanes {
             let local = &mut self.sessions[lane.session];
@@ -2590,11 +2602,19 @@ impl Worker {
             totals.rtt_ns = lane.rtt.minimum().map_or(0, |_| {
                 lane.rtt.smoothed().as_nanos().min(u64::MAX as u128) as u64
             });
+            totals.feedback_delay_ns =
+                lane.rtt.feedback_delay().as_nanos().min(u64::MAX as u128) as u64;
             local.tx_dirty |= 1_u64 << (lane.lane - 1);
             local.totals.bytes_in_flight += totals.bytes_in_flight;
             local.totals.rtt_ns = local.totals.rtt_ns.max(totals.rtt_ns);
+            local.totals.feedback_delay_ns =
+                local.totals.feedback_delay_ns.max(totals.feedback_delay_ns);
             self.counters.bytes_in_flight += totals.bytes_in_flight;
             self.counters.rtt_ns = self.counters.rtt_ns.max(totals.rtt_ns);
+            self.counters.feedback_delay_ns = self
+                .counters
+                .feedback_delay_ns
+                .max(totals.feedback_delay_ns);
         }
         if let Some(owner) = &self.sender.owner {
             for group in 0..self.shared.config.path_groups() {

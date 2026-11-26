@@ -17,8 +17,8 @@ NTT NGN is one deployment and performance validation environment.
 - No async runtime: plain pinned threads with batched syscalls. `tokio` gives one syscall per packet, no GSO/GRO, cross-core task migration, and 1 ms timers, all wrong for a few always-busy sockets. See section 10 of the design.
 - Platform contract: assume the Linux kernel and only the interfaces, files, and permissions needed by the selected features, such as `/dev/net/tun` for TAP creation and `/etc/resolv.conf` when using `iphost`'s system resolver. Its configurable `ipv6`, `ra`, and `dhcpv6` modes bypass system resolvers. Document each additional host assumption with the feature that needs it. Make no assumptions about the surrounding userspace: no required XDG or other freedesktop.org conventions, GNU userspace, Android or ChromeOS facilities, systemd, or D-Bus dependencies. Binaries are built for `*-unknown-linux-musl` targets.
 - Library I/O: the transport core reads no ordinary files or environment variables and writes no diagnostics. Kernel interfaces such as `/dev/net/tun`, sockets, and ioctls are allowed. The optional iphost layer uses the selected resolver's operating-system facilities; see [resolver requirements](config-model.md#daemon-resolver-selection). Application configuration-file handling and command-line I/O belong to the caller or daemon.
-- Future optional integration: systemd support without linking to systemd or D-Bus libraries, DEB/RPM packaging, and restarts that preserve TAPs by retaining and handing over their file descriptors, following rs-l2tpd's descriptor-preservation approach. These additions must leave standalone operation and the library I/O boundary intact.
-- Planned daemon readiness: every configured TAP interface exists, whether newly created or adopted. The daemon forks and its original parent exits successfully only at readiness, so any init system or launcher can wait for that exit status. This works without systemd and does not wait for network connectivity or peer handshakes. When used, the optional embedded systemd unit makes `network.target` require the daemon and wait for its readiness; the daemon must not depend on that target, on `network-online.target` or on any wait-online service.
+- Optional integration: restarts and reloads preserve TAPs by retaining and handing over their file descriptors, following rs-l2tpd's descriptor-preservation approach, and the daemon prints a systemd unit without linking to systemd or D-Bus libraries. systemd notification and descriptor storage, and DEB/RPM packaging, are not built. Such additions must leave standalone operation and the library I/O boundary intact.
+- Daemon readiness: every configured TAP interface exists, whether newly created or adopted. The daemon forks and its original parent exits successfully only at readiness, so any init system or launcher can wait for that exit status. This works without systemd and does not wait for network connectivity or peer handshakes. When used, the optional embedded systemd unit makes `network.target` require the daemon and wait for its readiness; the daemon must not depend on that target, on `network-online.target` or on any wait-online service.
 - TAP configuration: creation accepts `Option<MacAddress>`. The in-tree `MacAddress` type accepts nonzero unicast addresses, whether globally or locally administered. `None` derives a stable address in Menhera's `60:a4:34:4x:xx:xx` MAC-M range from the current UTS hostname and interface name using SHA-256. UnQuic sets the configured MTU and optional MAC but leaves administrative state, addressing and bridge membership to the caller or network manager (for example, systemd-networkd or ifupdown). Transport state controls carrier, independently of administrative state.
 - Design: see [initial-design.md](initial-design.md). Implementation order and per-step acceptance: see [ROADMAP.md](ROADMAP.md).
 
@@ -71,8 +71,13 @@ paths must be absolute.
 for the running binary: `Type=forking` with that `PIDFile=`,
 `TimeoutStartSec=infinity`, `Restart=on-failure`, `Before=network.target`,
 `RequiredBy=network.target`, and no dependency on that target or on
-`network-online.target`. Nothing links against systemd. Configuration reload
-remains pending.
+`network-online.target`. Its `ExecReload=` runs `unquic restart` on the PID
+file, so `systemctl reload` applies an edited configuration file as described
+under "Reloading the configuration" below. Nothing links against systemd.
+
+`unquic check-config config.toml` reads a file as a start would and exits 0
+when the daemon could start on it: the file parses, every field is valid, and
+its storage fits `memory_limit`. It opens no device or socket.
 
 ## Implementation status
 
@@ -116,7 +121,41 @@ and 7.0, and another checks that a successor answering another adoption
 protocol leaves the daemon running unchanged. A third removes the binary after
 it passes the probe: the exec fails, the daemon resumes on the queues it kept
 without losing the VLAN upper, and a later restart hands those queues to a real
-successor. Library code no longer calls `unwrap`, `expect`, `panic!` or
+successor.
+
+### Reloading the configuration
+
+SIGHUP, SIGUSR2, `unquic restart <pid-file>` and `systemctl reload` all do the
+same thing: the daemon re-executes on the configuration file as it is now.
+Before it stops anything, it runs the binary with `check-config` on that file.
+If the binary rejects the file, the daemon logs the refusal and keeps running
+on its old configuration.
+
+The new image adopts the TAP queues of every session whose name and queue
+count are unchanged. Those devices keep their ifindex, MAC, attachments and
+upper devices. Every session reconnects, because UDP sockets and transport
+state restart, so forwarding pauses until the new handshakes complete. How
+long that takes is not measured.
+
+- A new session gets its TAP created, or reattached if a device of that name
+  was left behind.
+- A session removed from the file leaves its TAP behind with no queue
+  attached, as a shutdown does. `unquic remove-tap <name>` deletes it.
+- A session whose `queue_count` changed closes its queues and reattaches the
+  same device by name, as a stop and a start would.
+- `tap_name` and `mac` describe a device at creation, and an adopted device
+  keeps its MTU. To change any of the three on an existing device, use
+  `ip link`, or remove the TAP and reload.
+
+`check-config` cannot foresee every failure. A listen port that another
+process holds, or a TAP name taken by another kind of device, fails after the
+handover and ends the daemon with its TAPs left in place; under the printed
+unit, systemd then starts it again. A container test changes the session set
+under a running daemon and checks that the kept TAP and its VLAN upper keep
+their ifindex, that the new TAP appears, that the removed session's TAP is
+released, and that a rejected file leaves the daemon untouched.
+
+Library code no longer calls `unwrap`, `expect`, `panic!` or
 `unreachable!`. Each parser of untrusted bytes takes 200,000 random and
 mutated inputs in a test without panicking, and indexing on those paths is
 checked. Packet-derived values reach no unchecked index in the workers, and a
@@ -226,7 +265,7 @@ with pending work, or whose next deadline has already passed, polls
 instead.
 
 `reassembly::Lane` now reserves a complete datagram before applying its records,
-with 64 fixed frame slots and separate 65536-entry packet and frame windows.
+with 128 fixed frame slots and separate 65536-entry packet and frame windows.
 Permanent lower bounds and terminal bits prevent delivery after replay, expiry,
 abandonment or window reuse. Complete frames remain queued through TAP
 backpressure until delivery, discard or the original 100 ms deadline. Overlapping
@@ -422,10 +461,9 @@ regression drops each direction's original frame prefix and first repair,
 requires delivery through the second repair, and replays the late original
 without duplicate TAP delivery or hot-path allocation.
 
-Complete BBRv3 integration,
-descriptor adoption and daemon process integration remain unfinished. No throughput
-target has been demonstrated. [BENCH.md](BENCH.md) records the release
-TAP-to-TAP baseline, including severe overload loss, small-frame rates and CPU.
+[BENCH.md](BENCH.md) records the measurements against the performance
+targets, including severe overload loss, small-frame rates and CPU; its table
+of current gaps says which targets are met and on what evidence.
 
 ## Runtime lifecycle and ownership
 
@@ -444,8 +482,9 @@ errors. The library emits no logs.
 An idle control handle does not own TAP queues. Keeping it after run returns
 retains configuration, counter storage and wake descriptors, allowing final
 statistics to be read. Drop all handle clones to release that storage. The
-runtime creates or reattaches persistent TAPs; descriptor adoption and daemon
-re-exec handover are not implemented.
+runtime creates or reattaches persistent TAPs, and `runtime::run_adopting`
+runs on TAPs a previous process handed over. `runtime::check` reports what
+run would refuse before it opens a device.
 
 Readiness means every configured TAP exists. Administrative state remains the
 network manager's responsibility. Receive bindings and missing transmit sockets
@@ -499,8 +538,8 @@ without that margin, owners that also read the TAP filled their pools with
 their own reads and refused handoffs, and four flows delivered less at 5 Gbit/s
 offered than at 2. Reservations
 stay charged until a buffer returns to its originating worker. This prevents
-receive backlog from starving transmit batches. Each lane has
-64 frame slots. The memory check includes these stores, handoff rings, indices,
+receive backlog from starving transmit batches. Each receive lane has
+128 frame slots. The memory check includes these stores, handoff rings, indices,
 configuration capacities, thread stacks and an allocator allowance. This is a
 reservation check, not a process RSS limit or a limit on kernel socket buffers.
 These conservative reservations can reject large configurations before startup.
@@ -686,6 +725,18 @@ one MSS; otherwise held frames would hide every idle moment from BBR. At
 200 µs it cut CPU per delivered Gbit/s 5.5% at 0.5 Gbit/s on the decision
 workload and left 5 Gbit/s unchanged. Its apparent extra loss turned out to
 come from test-host stalls and BBR's ProbeRTT, not from the hold (BENCH.md).
+
+Frames that arrive one at a time cost several times what the same bytes
+cost in a GSO train, because a worker then turns for every four frames or
+so and each turn pays a TAP read, a `sendmmsg` and their wakes.
+`daemon.turn_hold_us`, 200 by default since November 27 and at most 1000,
+makes those turns fewer and larger: a turn that drained its sockets and its
+TAP queue and took in less than sixteen frames' worth of input waits until
+that long after its start before it polls again. An idle worker, one with
+pending work and one whose read came back full never wait. At 200 µs it cut
+a daemon's CPU 20–30% on single frames at 0.5 to 2 Gbit/s each way across a
+real path, for about 0.2 ms more one-way delay, and cost trains nothing at
+1 Gbit/s each way (BENCH.md). Set it to 0 to turn it off.
 It adds about 33 µs to the median one-way delay and 0.2 ms at p99, so it
 stays off until that trade is decided.
 
@@ -1162,9 +1213,17 @@ kernel memory, also outside `daemon.memory_limit`. Both forcing options need
 `CAP_NET_ADMIN` in the initial user namespace: as root inside an
 unprivileged container they still fall back.
 
-Send SIGUSR1 to the foreground daemon to print independently sampled worker
-counters to stderr. Formatting runs in the daemon's supervisory thread, outside
-the workers and signal handler. The benchmark script captures these before and
+Send SIGUSR1 to the daemon to print a report to stderr: one line with the
+build's version, the kernel release and the number of CPUs the daemon may
+use, then each worker's independently sampled counters, each session's
+state, carrier, generation and totals followed by its transmit and receive
+lanes, and each peer's totals. Sessions and peers appear under their
+configured names; cookies and addresses do not appear. A daemon that has a
+PID file also writes the report to `<pid-file>.status`, replacing it whole
+each time and removing it on clean exit, and `unquic status <pid-file>`
+sends the signal, waits up to three seconds for the new file and prints it.
+Formatting runs in the daemon's supervisory thread, outside the workers and
+signal handler. The benchmark script captures the worker lines before and
 after traffic. Malformed and unknown-cookie input that cannot
 be attributed to a session, receive-bind failures and affinity failures remain
 worker-only. Peer socket-setup failures appear in worker and peer totals; they

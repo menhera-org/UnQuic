@@ -1270,6 +1270,10 @@ pub(crate) struct Worker {
     // Lanes in tx_held, and how long an idle lane may wait (daemon.tx_hold_us).
     held: Vec<(usize, usize)>,
     hold: Duration,
+    // Input bytes of the turn in progress, and how long a turn that took in
+    // little waits before the next poll (daemon.turn_hold_us).
+    moved: usize,
+    turn_hold: Duration,
     notifications: u64,
     // Workers pushed a returned box this turn; see Wake::notify_return.
     return_notifications: u64,
@@ -1667,6 +1671,8 @@ impl Worker {
             ready: VecDeque::with_capacity(batch_count),
             held: Vec::with_capacity(batch_count),
             hold: Duration::from_micros(config.daemon.tx_hold_us.into()),
+            moved: 0,
+            turn_hold: Duration::from_micros(config.daemon.turn_hold_us.into()),
             notifications: 0,
             return_notifications: 0,
             counters,
@@ -1790,11 +1796,22 @@ impl Worker {
                 self.phases[21] =
                     self.phases[21].wrapping_add(crate::profile::now().wrapping_sub(arming));
             }
+            // DECISION(2026-11-27): a turn that took in under HOLD_BYTES waits out turn_hold from
+            //   its start before the next poll. Why: at moderate rates of single frames a worker
+            //   turned for every four frames, and each turn pays a TAP read, a sendmmsg and their
+            //   wakes; fewer, larger turns cost up to 30% less CPU. Rejected: holding every turn
+            //   (a backlogged worker then loses capacity); holding an idle worker (pure delay).
+            let moved = std::mem::take(&mut self.moved);
+            if block && let Some(until) = hold_until(moved, self.turn_hold, now, deadline) {
+                phase!(self, 22, sleep_until(until));
+            }
             if block {
                 self.reactor.wake.sleep(self.wants_returns(now));
                 // Work queued before the flag was visible got no wake; take it now.
                 block = self.incoming.iter_mut().flatten().all(Consumer::is_empty);
             }
+            #[cfg(feature = "trace")]
+            let blocked = monotonic_now()?;
             let waited = phase!(
                 self,
                 if block { 22 } else { 27 },
@@ -1808,6 +1825,20 @@ impl Worker {
             };
             immediate = false;
             let now = monotonic_now()?;
+            #[cfg(feature = "trace")]
+            if block && now.saturating_sub(blocked) >= Duration::from_millis(1) {
+                trace_event!(
+                    self.id,
+                    SLEPT,
+                    0,
+                    [
+                        now.saturating_sub(blocked).as_nanos(),
+                        deadline.map_or(u64::MAX, |due| due.saturating_sub(blocked).as_nanos()
+                            as u64),
+                        count
+                    ]
+                );
+            }
             let start = event_start.min(count);
             event_start = if start + 1 < count { start + 1 } else { 0 };
             for event in events[start..count].iter().chain(&events[..start]) {
@@ -2650,6 +2681,14 @@ impl Worker {
         Ok(())
     }
 
+    // FAILED(2026-11-27): judging a turn by the bytes it read alone -> a socket read takes at
+    //   most RECEIVE_BUFFERS units, so a worker with a queue behind a full read still held,
+    //   received 8 units per hold, and ACKs lagged until both windows filled. Now: a read that
+    //   comes back full counts the turn as large.
+    fn read_full(&mut self) {
+        self.moved = self.moved.saturating_add(HOLD_BYTES);
+    }
+
     fn read_socket(&mut self, endpoint: usize, now: Duration) -> io::Result<()> {
         let mut clock = self.io_clock(now);
         let available = (RECEIVE_BUFFERS - self.rx_retained).min(self.free.len());
@@ -2694,6 +2733,9 @@ impl Worker {
                 0
             }
         };
+        if count == available {
+            self.read_full();
+        }
         for (index, buffer) in buffers.iter_mut().enumerate().take(available) {
             let Some(mut buffer) = buffer.take() else {
                 continue;
@@ -2716,6 +2758,7 @@ impl Worker {
                 } else {
                     buffer.length.div_ceil(buffer.segment_size).max(1)
                 };
+                self.moved += buffer.length;
                 self.counters.rx_outer_bytes = self
                     .counters
                     .rx_outer_bytes
@@ -3107,6 +3150,9 @@ impl Worker {
                     .tap_read_fallbacks
                     .wrapping_add(u64::from(!reader.enabled));
             }
+            if frames as usize == count {
+                self.read_full();
+            }
             for ((buffer, result), segments) in buffers
                 .into_iter()
                 .zip(batch.results)
@@ -3123,6 +3169,9 @@ impl Worker {
                 self.sessions[session].tap_read_limit = 1;
             }
         } else {
+            // This path reads until the TAP is empty or it runs out of room,
+            // and only the first is a reason to hold the turn.
+            let mut drained = false;
             for _ in 0..BATCH_SIZE {
                 if self.tap_capacity(session) == 0 {
                     break;
@@ -3148,8 +3197,12 @@ impl Worker {
                         length
                     });
                 if self.read_tap_result(session, now, buffer, result)? {
+                    drained = true;
                     break;
                 }
+            }
+            if !drained {
+                self.read_full();
             }
         }
         let completed = self.sessions[session]
@@ -3176,6 +3229,7 @@ impl Worker {
         match result {
             Ok(length) => {
                 buffer.length = length;
+                self.moved += length;
                 buffer.session = session;
                 let Some(connection) = self.sessions[session].connection else {
                     self.release(buffer);
@@ -6204,6 +6258,47 @@ impl Worker {
     }
 }
 
+/// Input below which a turn counts as small: sixteen full frames.
+const HOLD_BYTES: usize = 16 * 1500;
+
+/// When a turn that started at `now` and took in `moved` bytes should poll
+/// again, if it should wait at all: `hold` after its start, or at the next
+/// deadline if that comes first. A turn that took in nothing was woken by a
+/// timer or another worker and blocks as usual; one that took in a batch
+/// has more coming and must not wait.
+fn hold_until(
+    moved: usize,
+    hold: Duration,
+    now: Duration,
+    deadline: Option<Duration>,
+) -> Option<Duration> {
+    if hold.is_zero() || moved == 0 || moved >= HOLD_BYTES {
+        return None;
+    }
+    let until = now.saturating_add(hold);
+    Some(deadline.map_or(until, |due| due.min(until)))
+}
+
+/// Sleeps until the monotonic time `until`, or until a signal arrives.
+fn sleep_until(until: Duration) {
+    let Ok(seconds) = until.as_secs().try_into() else {
+        return;
+    };
+    let value = libc::timespec {
+        tv_sec: seconds,
+        tv_nsec: until.subsec_nanos().into(),
+    };
+    // SAFETY: value is initialized, and an absolute sleep takes no remainder pointer.
+    unsafe {
+        libc::clock_nanosleep(
+            libc::CLOCK_MONOTONIC,
+            libc::TIMER_ABSTIME,
+            &value,
+            std::ptr::null_mut(),
+        );
+    }
+}
+
 /// Whether a turn may block in epoll and therefore needs its timer armed.
 ///
 /// Pending work, or a deadline already due at the turn's start, runs on the
@@ -7773,6 +7868,17 @@ mod tests {
                 .all(|buffer| buffer.deadline == Duration::from_millis(2))
         );
         assert_eq!(worker.rx_retained, RECEIVE_BUFFERS);
+        // The read came back full with more queued: no turn hold may follow it.
+        assert!(worker.moved >= HOLD_BYTES);
+        assert_eq!(
+            hold_until(
+                worker.moved,
+                Duration::from_micros(200),
+                Duration::ZERO,
+                None
+            ),
+            None
+        );
         worker.read_socket(0, Duration::ZERO).unwrap();
         assert_eq!(worker.received.len(), RECEIVE_BUFFERS);
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
@@ -11040,6 +11146,33 @@ mod tests {
             workers[1].sessions[1].rx_totals[0].rx_outer_bytes,
             146 + 130
         );
+    }
+
+    #[test]
+    fn only_a_small_turn_holds_and_never_past_a_deadline() {
+        let now = Duration::from_millis(10);
+        let hold = Duration::from_micros(200);
+        let small = 4 * 1500;
+        assert_eq!(hold_until(small, hold, now, None), Some(now + hold));
+        // A deadline before the hold's end is kept; one after it does not extend it.
+        let soon = now + Duration::from_micros(50);
+        assert_eq!(hold_until(small, hold, now, Some(soon)), Some(soon));
+        let late = now + Duration::from_millis(5);
+        assert_eq!(hold_until(small, hold, now, Some(late)), Some(now + hold));
+        // No input, a batch, or the switch off: no wait.
+        assert_eq!(hold_until(0, hold, now, None), None);
+        assert_eq!(hold_until(HOLD_BYTES, hold, now, None), None);
+        assert_eq!(
+            hold_until(HOLD_BYTES - 1, hold, now, None),
+            Some(now + hold)
+        );
+        assert_eq!(hold_until(small, Duration::ZERO, now, None), None);
+        // The sleep itself returns at once for a time already past.
+        let before = monotonic_now().unwrap();
+        sleep_until(before);
+        sleep_until(before + Duration::from_micros(300));
+        let slept = monotonic_now().unwrap() - before;
+        assert!(slept >= Duration::from_micros(300) && slept < Duration::from_millis(100));
     }
 
     #[test]

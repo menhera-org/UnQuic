@@ -342,6 +342,28 @@ pub fn run(config: Config, control: Control) -> io::Result<()> {
     run_adopting(config, control, Vec::new())
 }
 
+/// Fails as [`run`] would before it opens any device: on an invalid
+/// configuration, or on storage above `memory_limit`.
+pub fn check(config: Config) -> io::Result<()> {
+    plan(config).map(drop)
+}
+
+/// The validated configuration, its worker count and its frame scale.
+fn plan(config: Config) -> io::Result<(Validated, usize, usize)> {
+    let config = config
+        .validate()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let count = config
+        .config()
+        .sessions
+        .iter()
+        .map(|s| s.queue_count)
+        .max()
+        .unwrap_or(1);
+    let frame_scale = frame_scale(&config, count)?;
+    Ok((config, count, frame_scale))
+}
+
 /// Like [`run`], but session `i` uses `adopted[i]` when it is `Some`, a TAP
 /// handed over by a previous process (see [`Tap::adopt`]), instead of
 /// creating or reattaching one. Each adopted TAP must have the session's
@@ -358,17 +380,7 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
         }
     }
     let _finish = Finish(control.clone());
-    let config = config
-        .validate()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let count = config
-        .config()
-        .sessions
-        .iter()
-        .map(|s| s.queue_count)
-        .max()
-        .unwrap_or(1);
-    let frame_scale = frame_scale(&config, count)?;
+    let (config, count, frame_scale) = plan(config)?;
     let wide_planes = wide_planes(&config, count, frame_scale);
     let sessions = config.config().sessions.len();
     let peers = config.config().peers.len();
@@ -697,6 +709,12 @@ mod tests {
     fn memory_ceiling_and_single_use_fail_before_opening_devices() {
         let mut config = Config::default();
         config.daemon.memory_limit = 1;
+        // check reports the same failure without a Control or a device.
+        assert_eq!(
+            check(config.clone()).unwrap_err().kind(),
+            io::ErrorKind::OutOfMemory
+        );
+        assert!(check(Config::default()).is_ok());
         let control = Control::new();
         assert_eq!(
             run(config, control.clone()).unwrap_err().kind(),

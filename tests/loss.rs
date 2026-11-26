@@ -26,7 +26,10 @@ fn initial_estimates_and_first_sample_ignore_ack_delay() {
     assert_eq!(rtt.variance(), us(166_500));
     assert_eq!(rtt.pto_period(0), us(1_000_000));
     assert_eq!(rtt.frame_lifetime(), us(100_000));
-    assert!(rtt.sample(us(10_000), us(17_500), 1000));
+    assert_eq!(rtt.feedback_delay(), Duration::ZERO);
+    assert!(rtt.sample(us(10_000), us(17_500), 700));
+    // The estimate ignores the first delay; the gauge still reports it.
+    assert_eq!(rtt.feedback_delay(), us(700));
     assert_eq!(rtt.latest(), us(7500));
     assert_eq!(rtt.minimum(), Some(us(7500)));
     assert_eq!(rtt.smoothed(), us(7500));
@@ -40,6 +43,7 @@ fn delay_is_capped_and_variation_uses_previous_smoothed_rtt() {
     let mut rtt = Rtt::default();
     assert!(rtt.sample(us(0), us(10_000), 0));
     assert!(rtt.sample(us(20_000), us(33_000), u32::MAX));
+    assert_eq!(rtt.feedback_delay(), us(1000));
     assert_eq!(rtt.minimum(), Some(us(10_000)));
     assert_eq!(rtt.latest(), us(13_000));
     assert_eq!(rtt.smoothed(), us(10_250));

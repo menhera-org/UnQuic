@@ -690,11 +690,16 @@ It follows rs-l2tpd's adoption protocol with TAP queues in place of sockets.
   when it is a multiqueue TAP without packet information owned by this user;
   otherwise startup fails rather than adopting another device.
 - Trigger. `unquic restart <pid-file>` checks the PID file as `rs-l2tpd
-  --restart` does and sends the daemon SIGUSR2.
+  --restart` does and sends the daemon SIGUSR2. SIGHUP has the same effect
+  (November 27), so a restart is also how the daemon reloads its
+  configuration file.
 - Probe. Before anything stops, the daemon runs the resolved executable with
   `adopt-version`; it must print exactly `unquic-adopt 1` and a newline and
-  exit 0 within three seconds. Any other result keeps the running daemon
-  unchanged and is logged.
+  exit 0 within three seconds. It then runs the executable with `check-config`
+  and the configuration file's path, which must exit 0 within three seconds
+  (November 27): the successor judges the file, because an upgraded binary
+  may read keys the running one does not know. Any other result keeps the
+  running daemon unchanged and is logged.
 - Exec. Workers stop and UDP sockets close; TAP queue descriptors stay open.
   The daemon execs the same arguments with the queues as descriptors 3 onward
   in configuration order, session by session and queue by queue, announced
@@ -706,13 +711,20 @@ It follows rs-l2tpd's adoption protocol with TAP queues in place of sockets.
   failed exec leaves the caller's table unchanged and the daemon restarts its
   workers on the original queues.
 - Adoption. The new process accepts the announcement only when the marker
-  names its own PID. For each configured session it requires exactly the
-  configured number of named queues, each a multiqueue TAP without packet
+  names its own PID. It adopts a configured session's queues when the
+  announcement names that session with the configured queue count and
+  carries every one of its queues, each a multiqueue TAP without packet
   information per `TUNGETIFF`, all reporting one device; it adopts them
   without renaming or changing MTU, MAC or administrative state, and reports
-  readiness as soon as every session has its queues. Missing, extra or
-  mismatched descriptors are a startup failure, which leaves the persistent
-  TAPs in place.
+  readiness as soon as every session has its queues. Since November 27 the
+  configuration may have changed between the two images, so the new process
+  closes every other announced queue, which leaves those persistent TAPs in
+  place, and creates or reattaches by name the TAP of each session that
+  adopted nothing: a session that is new, or whose queue count changed. A
+  session that left the file keeps its device until an explicit removal. A
+  malformed announcement or a descriptor that is not such a TAP queue is
+  still a startup failure. Until November 27 any missing, extra or mismatched
+  descriptor was one.
 
 **No production panics:** production library and daemon code must not panic.
 Validate fallible inputs and operations, propagate or handle errors, and preserve
@@ -759,7 +771,11 @@ Expose per-session, per-peer, and per-lane counters for delivered frame bytes, o
 
 Record kernel version, CPU model, active cores and frequency, NIC/driver, queue mapping, offload state, binding scope, and effective socket-buffer limits in diagnostic output. Include socket overflow and softnet/NIC drops in performance investigations.
 
+**Report as implemented (November 27).** On SIGUSR1 the daemon prints one line with its version, the kernel release and the number of CPUs it may use, then the counters of every worker, session (with its state, carrier and generation), lane and peer, under their configured names. With a PID file it also writes the report to `<pid-file>.status`, which `unquic status <pid-file>` requests and prints. Socket-buffer limits and fallbacks are among the worker counters. The CPU model, its frequency, and each card's driver, queue mapping and offload state are not in the report; the benchmark scripts record them, and README.md's operational checks say how to read them.
+
 Bound every queue, ACK history, incomplete-frame table, completion cache, and retained transmit-buffer set. Define behavior on allocation pressure, device removal, interface renaming, DNS failure, path change, and daemon restart. Configuration reload must preserve unrelated sessions.
+
+**Reload as implemented (November 27).** A reload is a restart through the handover of section 11: the daemon checks the file with the successor binary, then re-executes on it. This preserves less than the requirement above asks for. An unrelated session keeps its TAP device, with its ifindex, MAC, attachments and upper devices, but its transport state restarts and it reconnects, so its forwarding pauses until a new handshake completes; that pause is not yet measured. Workers fix their per-session and per-peer state when they start, and changing sessions inside running workers would put that state behind new synchronization on the forwarding path. Revisit if a deployment with many sessions needs reloads that do not interrupt the others.
 
 Keep privileges limited to what is needed to create/configure TAPs and bind sockets; allow attaching to appropriately provisioned devices. The daemon must run directly without a service manager. Future optional systemd integration may implement notification and descriptor-store protocols directly over Unix sockets with descriptor passing, without linking against systemd or D-Bus libraries. Keep this integration in the daemon and preserve the library I/O boundary. DEB/RPM packaging may supply service units and distribution-specific installation hooks; these must not become prerequisites for standalone operation. The exact privilege model is an implementation decision.
 
@@ -769,7 +785,7 @@ Readiness means that all configured TAP interfaces exist, whether newly created 
 
 Follow rs-l2tpd's daemon startup model: double-fork, let the original parent wait for the daemon's readiness report, and exit that parent successfully only after all configured TAPs exist. If startup fails or the daemon dies before readiness, the parent reports failure. Any init system, supervisor, or launcher can wait for this parent exit status; daemon operation and this readiness signal do not require systemd or a notification service. Publish the daemon PID file before the parent reports success. Keep process management, PID-file handling, and readiness reporting in the daemon; the library exposes the TAP state needed to determine readiness without using files, environment variables, or stdio for that report. Foreground operation remains available for launchers that supervise the process directly.
 
-The future optional systemd integration consumes this same parent-exit readiness signal. When used, the embedded unit and packaged copies must share one template: `Before=network.target` in `[Unit]`, `RequiredBy=network.target` in `[Install]`, and `Type=forking`, `PIDFile=`, `TimeoutStartSec=infinity`, and `Restart=on-failure` in `[Service]`. Enabling the unit makes `network.target` require the service, so startup through `network.target` pulls in the daemon, the ordering makes the target wait for the configured TAPs to exist, and a daemon that fails to start fails the target. `network-online.target` is not named: systemd orders it after `network.target`. The service must not require, want, or be ordered after `network.target`, `network-online.target` or any wait-online service; the daemon must not wait for connectivity that may itself depend on those TAPs. The user set these lines on November 26; before that the unit named both targets.
+The future optional systemd integration consumes this same parent-exit readiness signal. When used, the embedded unit and packaged copies must share one template: `Before=network.target` in `[Unit]`, `RequiredBy=network.target` in `[Install]`, and `Type=forking`, `PIDFile=`, `ExecReload=` (the binary's `restart` on the PID file, added November 27), `TimeoutStartSec=infinity`, and `Restart=on-failure` in `[Service]`. Enabling the unit makes `network.target` require the service, so startup through `network.target` pulls in the daemon, the ordering makes the target wait for the configured TAPs to exist, and a daemon that fails to start fails the target. `network-online.target` is not named: systemd orders it after `network.target`. The service must not require, want, or be ordered after `network.target`, `network-online.target` or any wait-online service; the daemon must not wait for connectivity that may itself depend on those TAPs. The user set these lines on November 26; before that the unit named both targets.
 
 # 13 Performance budget
 
@@ -1353,8 +1369,11 @@ If a comparison already reaches the available underlay ceiling, report that fact
 
 # 15 Implementation stages
 
-**Current status (November 26):** stages 1 and 4 are complete. Stages 2 and 3
-are implemented. The local rate of 20 Gbit/s each way was first reached on
+**Current status (November 27):** stages 1 and 4 are complete. Stages 2 and 3
+are implemented. The daemon reloads its configuration by the handover of
+section 11, reports worker, session, lane and peer counters with session
+state on request, and checks a configuration file without starting
+(section 12). The local rate of 20 Gbit/s each way was first reached on
 November 19 with sixteen workers per daemon, by a margin of one or two
 percent and before its acceptance profile is frozen. Sixteen workers also
 pass 5 Gbit/s each way over a local routed path with loss, and since
@@ -1373,7 +1392,8 @@ below is chronological. Implemented foundations are
 persistent multiqueue TAP creation, reattachment, explicit removal and frame
 I/O. The version-1 wire codec
 validates complete datagrams before dispatch and has fixed byte vectors for all
-eleven record types in tests/vectors/wire-v1. TAP creation accepts an
+eleven record types, the three DATA flags and the optional feature bits in
+tests/vectors/wire-v1. TAP creation accepts an
 optional MAC and leaves administrative state unchanged. Tests cover the public
 types, loopback socket invariants and live TAP behavior in an isolated network
 namespace; see README.md for commands and coverage limits. The pure handshake
@@ -1483,8 +1503,9 @@ DATA, and retry history pressure after 1 ms. PTO probes retain priority.
 Stalled PTO rounds rotate installed sessions before lanes, preventing an
 unanswered lane from monopolizing the group's probes. Selection is constant
 time and preserves the aggregate two-probe allowance and existing backoff.
-Payload retention and selective repair are connected; complete congestion-control
-integration and the performance gates remain unfinished.
+Payload retention, selective repair and the BBRv3 controller of section 9 are
+connected. BENCH.md's table of current gaps says which performance gates are
+met.
 Per-lane MTU discovery now starts DATA at 1232 bytes
 and probes up to the configured ceiling, defaulting to 8952 bytes. Limits and
 gauges reflect confirmation rather than operator assertions. Release routed

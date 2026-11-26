@@ -23,7 +23,14 @@ Handshake packets have zero tag, lane, and packet number.
 | confirm.hex | The initiator/responder pair above |
 | ready.hex | The initiator/responder pair above |
 | lane_retire.hex | Lane 0x5678 |
+| data_offload.hex | DATA flags 1: the same frame as an offload frame of 2964 bytes, offset 0, carrying its 10-byte descriptor (partial checksum, TCP over IPv6, 74 header bytes, 1440-byte segments, checksum at 54 + 16) |
+| data_partial.hex | DATA flags 2: data.hex's piece of a frame with a partial checksum |
+| data_striped.hex | DATA flags 4: the same frame as a striped frame of 22 bytes, offset 0, carrying its 8-byte tag (stripe 5, sequence 1) |
+| hello_features.hex | hello.hex advertising optional features 7: `OFFLOAD_FRAMES`, `PARTIAL_CHECKSUMS` and `STRIPED_FLOWS` |
 
 HELLO and CHALLENGE advertise receive port 40000, frame ceiling 9022, and zero
-mandatory/optional feature bits. These fixtures describe v1's current encoding;
-production protocol freeze and state-machine vectors remain later roadmap work.
+mandatory/optional feature bits unless the table says otherwise. The last four
+rows fix the optional extensions' encodings (design section 6): a peer that
+advertises none of them never receives a flagged DATA record. These fixtures
+describe v1's current encoding; state-machine vectors remain later roadmap
+work.

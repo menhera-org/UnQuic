@@ -51,6 +51,17 @@ pub struct Daemon {
     /// frames waits up to this many microseconds (at most 1000) for more, so
     /// light traffic packs frame tails together at the cost of that latency.
     pub tx_hold_us: u32,
+    /// 200 by default since November 27; 0 turns it off. A worker turn that
+    /// drained its sockets and TAP queue and took in less than sixteen
+    /// frames' worth of input waits until this many microseconds (at most
+    /// 1000) after its start before it polls again, so a moderate rate of
+    /// single frames is handled in fewer, larger turns. An idle worker, one
+    /// with a backlog and one whose read came back full never wait.
+    // DECISION(2026-11-27): turn_hold_us defaults to 200. Why: on the real path it cuts a
+    //   daemon's CPU 20-30% on single frames at 0.5-2 Gbit/s each way for about 0.2 ms of
+    //   delay, and in 24 points beside 24 without it it stalled no more often (BENCH.md).
+    //   Rejected: 300 (little more saved, more delay); off (the CPU is the user's priority).
+    pub turn_hold_us: u32,
     /// On by default since November 12, a deviation from BBR draft 07: the
     /// ProbeRTT window covers half the bandwidth over min_rtt plus the
     /// receiver's 1 ms ACK delay, not over min_rtt alone, so a steady offer
@@ -73,10 +84,11 @@ pub struct Daemon {
     /// and the receiving TAP's kernel completes it, so neither daemon sums
     /// the payload.
     pub partial_checksums: bool,
-    /// Off by default, not yet complete: advertise optional feature
-    /// `STRIPED_FLOWS` and receive striped frames, restoring each stripe's
-    /// order on one worker before its TAP (design section 13.1, item 6).
-    /// Sending striped flows is not implemented yet.
+    /// Off by default, experimental: advertise optional feature
+    /// `STRIPED_FLOWS`. Where both peers advertise it, a flow that one
+    /// transmit worker cannot carry is striped across the session's data
+    /// lanes, and the receiver restores each stripe's order on one worker
+    /// before its TAP (design section 13.1, item 6).
     pub stripe_flows: bool,
     /// On by default since November 20: when one worker reads nearly all of a
     /// session's TAP frames, rotate the session's receive lanes among the
@@ -94,6 +106,7 @@ impl Default for Daemon {
             loss_threshold_permille: 20,
             balance_flows: true,
             tx_hold_us: 0,
+            turn_hold_us: 200,
             probe_rtt_ack_delay: true,
             control_lane: true,
             offload_frames: true,
@@ -293,6 +306,13 @@ impl Config {
         if self.daemon.tx_hold_us > 1000 {
             return Err(ConfigError {
                 field: "daemon.tx_hold_us",
+                index: None,
+                reason: "must be at most 1000",
+            });
+        }
+        if self.daemon.turn_hold_us > 1000 {
+            return Err(ConfigError {
+                field: "daemon.turn_hold_us",
                 index: None,
                 reason: "must be at most 1000",
             });

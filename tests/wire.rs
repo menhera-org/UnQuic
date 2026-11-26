@@ -169,32 +169,99 @@ fn roundtrip(bytes: &[u8]) {
     assert_eq!(output, bytes);
 }
 
+/// Checks one fixture byte for byte against the datagram and record encoders.
+fn fixture(expected: &[u8], record: Record<'_>, eliciting: bool, name: &str) {
+    let header = header(record.is_handshake());
+    let mut output = [0xcc; 1024];
+    let n = encode_datagram(header, &[record], &mut output).unwrap();
+    assert_eq!(&output[..n], expected, "{name}");
+    let decoded = Header::decode(expected).unwrap();
+    assert_eq!(
+        decoded,
+        Header {
+            record_area_len: (n - HEADER_LEN) as u16,
+            ..header
+        }
+    );
+    let mut encoded_header = [0; HEADER_LEN];
+    decoded.encode(&mut encoded_header);
+    assert_eq!(&encoded_header, &expected[..HEADER_LEN]);
+    roundtrip(expected);
+
+    let n = record.encode(&mut output).unwrap();
+    assert_eq!(&output[..n], &expected[HEADER_LEN..]);
+    assert_eq!(record.encoded_len(), n);
+    assert_eq!(record.ack_eliciting(), eliciting, "{name}");
+}
+
 #[test]
 fn handwritten_vectors_cover_every_record_and_common_header() {
     for kind in 0..VECTORS.len() {
-        let expected = vector(kind);
-        let record = record(kind);
-        let header = header(record.is_handshake());
-        let mut output = [0xcc; 1024];
-        let n = encode_datagram(header, &[record], &mut output).unwrap();
-        assert_eq!(&output[..n], expected, "record {kind}");
-        let decoded = Header::decode(&expected).unwrap();
-        assert_eq!(
-            decoded,
-            Header {
-                record_area_len: (n - HEADER_LEN) as u16,
-                ..header
-            }
+        fixture(
+            &vector(kind),
+            record(kind),
+            matches!(kind, 1 | 5 | 7 | 10),
+            &format!("record {kind}"),
         );
-        let mut encoded_header = [0; HEADER_LEN];
-        decoded.encode(&mut encoded_header);
-        assert_eq!(&encoded_header, &expected[..HEADER_LEN]);
-        roundtrip(&expected);
+    }
+}
 
-        let n = record.encode(&mut output).unwrap();
-        assert_eq!(&output[..n], &expected[HEADER_LEN..]);
-        assert_eq!(record.encoded_len(), n);
-        assert_eq!(record.ack_eliciting(), matches!(kind, 1 | 5 | 7 | 10));
+#[test]
+fn handwritten_vectors_cover_data_flags_and_feature_bits() {
+    let bytes = |text: &str| -> Vec<u8> {
+        text.split_whitespace()
+            .map(|part| u8::from_str_radix(part, 16).unwrap())
+            .collect()
+    };
+    let data = |total_len, offset, bytes, flags: u8| Record::Data {
+        frame_id: FRAME,
+        total_len,
+        offset,
+        bytes,
+        offload: flags & 1 != 0,
+        partial: flags & 2 != 0,
+        striped: flags & 4 != 0,
+    };
+    // A virtio-net descriptor: partial checksum, TCP over IPv6, 74 header
+    // bytes, 1440-byte segments, checksum at 54 + 16.
+    let descriptor = [1, 4, 0, 74, 5, 160, 0, 54, 0, 16];
+    // Stripe 5, sequence 1.
+    let tag = [0, 5, 0, 0, 0, 0, 0, 1];
+    for (name, text, record, eliciting) in [
+        (
+            "data_offload",
+            include_str!("vectors/wire-v1/data_offload.hex"),
+            data(2964, 0, &descriptor[..], 1),
+            true,
+        ),
+        (
+            "data_partial",
+            include_str!("vectors/wire-v1/data_partial.hex"),
+            data(14, 10, &[0xde, 0xad, 0xbe, 0xef][..], 2),
+            true,
+        ),
+        (
+            "data_striped",
+            include_str!("vectors/wire-v1/data_striped.hex"),
+            data(22, 0, &tag[..], 4),
+            true,
+        ),
+        (
+            "hello_features",
+            include_str!("vectors/wire-v1/hello_features.hex"),
+            Record::Hello {
+                initiator: I,
+                params: Params {
+                    optional_features: unquic::wire::OFFLOAD_FRAMES
+                        | unquic::wire::PARTIAL_CHECKSUMS
+                        | unquic::wire::STRIPED_FLOWS,
+                    ..PARAMS
+                },
+            },
+            false,
+        ),
+    ] {
+        fixture(&bytes(text), record, eliciting, name);
     }
 }
 

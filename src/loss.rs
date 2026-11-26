@@ -23,6 +23,7 @@ pub struct Rtt {
     minimum: Option<Duration>,
     smoothed: Duration,
     variance: Duration,
+    feedback_delay: Duration,
 }
 
 impl Default for Rtt {
@@ -39,7 +40,14 @@ impl Rtt {
             minimum: None,
             smoothed: INITIAL,
             variance: Duration::from_micros(166_500),
+            feedback_delay: Duration::ZERO,
         }
+    }
+
+    /// How long the peer said it held the ACK behind the latest sample,
+    /// capped as the estimator caps it; zero before feedback.
+    pub const fn feedback_delay(&self) -> Duration {
+        self.feedback_delay
     }
 
     /// Latest raw sample, or the initial estimate before feedback.
@@ -74,6 +82,8 @@ impl Rtt {
             return false;
         };
         self.latest = latest;
+        let delay = Duration::from_micros(u64::from(delay_us)).min(MAX_ACK_DELAY);
+        self.feedback_delay = delay;
         let Some(minimum) = self.minimum else {
             self.minimum = Some(latest);
             self.smoothed = latest;
@@ -82,7 +92,6 @@ impl Rtt {
         };
         let minimum = minimum.min(latest);
         self.minimum = Some(minimum);
-        let delay = Duration::from_micros(u64::from(delay_us)).min(MAX_ACK_DELAY);
         let adjusted = if latest - minimum >= delay {
             latest - delay
         } else {

@@ -1,0 +1,14 @@
+# Real path, four workers per daemon, four iperf3 TCP streams each way at once, 10 s runs, two runs per session.
+# off = turn_hold_us 0, new = turn_hold_us 200 (the default). Received Gbit/s and sender retransmits each way; daemon CPU left and right.
+new      r1/0  | L>R  3.24 G retr   1714 | R>L  2.58 G retr   2700 | daemon CPU  206%  155%
+new      r1/1  | L>R  2.51 G retr    222 | R>L  3.47 G retr   8139 | daemon CPU  205%  172%
+new      r2/0  | L>R  2.63 G retr   1174 | R>L  3.29 G retr   4905 | daemon CPU  192%  170%
+new      r2/1  | L>R  2.88 G retr   2105 | R>L  3.25 G retr   8775 | daemon CPU  201%  171%
+new      r3/0  | L>R  3.25 G retr   1506 | R>L  3.12 G retr   8932 | daemon CPU  234%  174%
+new      r3/1  | L>R  2.89 G retr   6046 | R>L  2.94 G retr  12336 | daemon CPU  205%  161%
+off      r1/0  | L>R  2.88 G retr   1780 | R>L  3.44 G retr  14024 | daemon CPU  246%  192%
+off      r1/1  | L>R  2.68 G retr  16964 | R>L  3.76 G retr   4405 | daemon CPU  244%  199%
+off      r2/0  | L>R  2.29 G retr   5137 | R>L  2.05 G retr   5115 | daemon CPU  161%  139%
+off      r2/1  | L>R  1.91 G retr    483 | R>L  3.76 G retr   4322 | daemon CPU  185%  181%
+off      r3/0  | L>R  3.61 G retr   5164 | R>L  1.79 G retr   5006 | daemon CPU  219%  170%
+off      r3/1  | L>R  4.05 G retr    667 | R>L  2.48 G retr  10097 | daemon CPU  268%  197%

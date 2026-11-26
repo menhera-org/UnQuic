@@ -63,6 +63,14 @@ pub const ACK_BEGIN: u64 = 18;
 /// 3 owner input queue full, 4 owner buffer reserve, 5 owner frame quota, 6 owner byte quota:
 /// lane key, retained frames, retained bytes, free buffers.
 pub const ADMIT_DROP: u64 = 19;
+/// Worker 0 submitted a datagram of ACK records: first record's lane key and highest range
+/// end, records in the datagram, microseconds since that record's snapshot was taken.
+pub const ACK_SENT: u64 = 20;
+/// A worker read an ACK record from a received datagram: lane key, highest range end, ranges.
+pub const ACK_SEEN: u64 = 21;
+/// A worker blocked for a millisecond or more: nanoseconds blocked, nanoseconds its deadline
+/// lay ahead when it blocked (u64::MAX without one), events it woke with.
+pub const SLEPT: u64 = 22;
 
 /// The lane's next queued frame already passed its deadline; the expiry pass must remove it.
 pub const HOLD_FRONT_EXPIRED: u64 = 1;

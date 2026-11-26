@@ -3788,6 +3788,10 @@ fn ack_transfer_returns_before_final_report_and_reuses_while_it_is_held() {
         matches!(report.kind, ReportKind::Ack { received, delay_us: 17, end: Some(_), .. } if received == now)
     );
     assert_eq!(report.count, 1);
+    // The RTT sample kept the delay the ACK reported, and the sender publishes it.
+    workers[1].publish_sender();
+    assert_eq!(workers[1].counters.feedback_delay_ns, 17_000);
+    assert_eq!(workers[1].sessions[0].totals.feedback_delay_ns, 17_000);
     // The lane's only packet is acknowledged, so the pass an ACK owes has
     // nothing to visit and counts as made. advance_report was called
     // directly here; release the fence as service_sender does.
