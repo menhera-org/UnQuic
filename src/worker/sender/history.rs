@@ -116,6 +116,10 @@ impl Lane {
     /// pass leaves the rest of what is in flight unvisited: on a path of some
     /// milliseconds that is a thousand packets or more after every ACK.
     fn loss_scan(&self) -> crate::ack::OutstandingScan {
+        // DECISION(2026-11-26): a loss pass without a forced cutoff stops below the largest ACK.
+        //   Why: thresholds apply only there, and visiting the whole flight after every ACK
+        //   kept workers turning on any path with delay. Rejected: scanning everything in
+        //   flight each time (6-20% of a daemon's CPU).
         if self.scan_cutoff.is_some() {
             self.history.outstanding_scan()
         } else {

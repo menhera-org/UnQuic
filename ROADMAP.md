@@ -58,7 +58,13 @@ Open, ahead of the list below:
    hosts' cards do it. The daemon's own share is about 1,900 cycles a
    datagram to send and 1,300 to receive on a 7 ms path, and that is the
    part to cut here: the cold state behind every ACK first (item 3 of
-   the list below).
+   the list below). One target's card (`mlx4`) cannot segment UDP, and
+   its daemon may sit behind VLAN or macvlan sub-interfaces or behind a
+   container that routes to it. On the test bed those shapes cost the
+   daemon nothing extra to send, and 35–50% more CPU to receive unless
+   `rx-udp-gro-forwarding` is on for the card
+   ([BENCH.md](BENCH.md#daemons-behind-sub-interfaces-and-a-routing-container-november-26)).
+   What that card costs per datagram sent has to be measured on the box.
 2. A new session's first load on a path with random loss. Startup can end
    on that loss below the offered rate, and the climb from there costs
    several percent of the first point in some runs (5% in one of two at

@@ -1999,9 +1999,11 @@ impl Worker {
             Ok(bytes) => match budget.charge(bytes, window) {
                 Some(prior) => match budget.pace(bytes, state.rate, now) {
                     Ok(()) => {
-                        // Control sent while no worker holds unsent data says nothing of
-                        // the path's rate. Unmarked, an idle session's liveness probes
-                        // would end Startup at their own few packets a second.
+                        // DECISION(2026-11-26): control sent with nothing unsent is application-limited.
+                        //   Why: an idle session's liveness probes were full rate samples and
+                        //   ended Startup three seconds after the handshake, at their own few
+                        //   packets a second. Rejected: exempting only MTU probes in the
+                        //   controller (liveness probes still counted).
                         if !matches!(job.kind, JobKind::Data) && budget.unsupplied() {
                             budget.application_limited(&state);
                         }

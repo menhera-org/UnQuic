@@ -1,0 +1,24 @@
+What a daemon pays when its sockets are not on the outer link itself, November 26.
+Profile build of 836057a, relay bed, two workers per daemon, 7.5 ms round trip, no loss,
+sixteen QinQ flows at 2 Gbit/s each way, two 20 s points (the second is listed).
+OUTER_WIRE=1: the relay's side of each link segments its trains, so datagrams cross the
+link one by one and the endpoint's coalescing decides what the daemon receives.
+Cycles are the left daemon's, per datagram sent (7.35-7.40 million a run, and as many
+received). All runs deliver 1.97 Gbit/s each way.
+
+                                              daemon CPU   busiest   busy cycles  socket read  sendmmsg
+shape (OUTER_SUBIF, OUTER_GRO_FWD)            left right   worker    a datagram   a datagram   a datagram
+on the link itself                             72%   67%    44%        7,270        1,105        1,542
+VLAN device in the link's namespace (vlan)     73%   68%    44%        7,405        1,103        1,570
+macvlan child in its own namespace (macvlan)   97%   93%    67-68%     9,554        2,867        1,542
+  with rx-udp-gro-forwarding on the link       70%   68%    43-44%     7,233        1,103        1,557
+routing namespace, then a macvlan pair in
+bridge mode to the daemon's namespace (l3)    102%   99%    72-73%     9,975        3,030        1,627
+  with rx-udp-gro-forwarding on the link       72%   66%    43-44%     7,423        1,102        1,647
+
+Without OUTER_WIRE a veth hands the relay's trains over whole and all shapes cost the
+same (66-70% and 62-65%, socket read 760-780 cycles a datagram), which no card does.
+
+Not in these numbers: the kernel's own work to receive, route and deliver each
+datagram. On this bed it runs on the relay's cores. On a box it runs on the box's
+cores, once a datagram without forwarded coalescing and once a train with it.

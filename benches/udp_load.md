@@ -270,6 +270,17 @@ CPUs 16-19. Verify the host's topology before using any layout.
 `TX_LANES` sets both peers' `tx_lanes` to something other than the worker
 count.
 
+`OUTER_SUBIF` (with `OUTER_ROUTED=1`) puts each daemon's sockets behind its
+outer link the way deployments do. `vlan` is a VLAN device in the link's own
+namespace. `macvlan` is a macvlan child moved into a namespace of its own,
+like a container on its host's card. `l3` gives the link to a namespace that
+routes, and joins that to the daemon's namespace by a macvlan pair in bridge
+mode on a dummy device. `OUTER_GRO_FWD=1` turns `rx-udp-gro-forwarding` on
+for the link. `OUTER_WIRE=1` (with `OUTER_RELAY`) makes the relay's side of
+each link segment its trains, so datagrams cross the link one by one as from
+a card; without it a veth hands the trains over whole and none of the above
+changes what a daemon receives. Each output's `outer-path` records the three.
+
 `TAP_TXQUEUELEN` sets the test TAP queue length (1–10,000; default 10,000).
 With USO input, each entry can hold a whole super-frame, so record this value
 and compare shorter queues before attributing a decline to the transport.

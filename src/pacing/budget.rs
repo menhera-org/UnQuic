@@ -252,6 +252,9 @@ impl Budget {
             if now < next {
                 return Err(Duration::from_nanos(next));
             }
+            // DECISION(2026-11-26): a late pacing claim keeps its lateness, up to half its interval.
+            //   Why: a worker that sleeps until its turn lost every late wake and sent below the
+            //   published rate. Rejected: starting each interval at the claim (that loss).
             // A group that never sent has no missed time to count.
             let late = if next == 0 { 0 } else { now - next };
             match self.hot.next_send.compare_exchange_weak(

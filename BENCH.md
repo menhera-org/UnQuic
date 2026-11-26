@@ -3680,6 +3680,54 @@ one like the real hosts', so on a box of four slow cores the card's UDP
 offloads decide whether the gate is in reach, more than anything left in
 the daemon.
 
+## Daemons behind sub-interfaces and a routing container (November 26)
+
+A target box may put the daemon behind a VLAN or macvlan sub-interface of
+its card, or in a container that a second, routing container reaches
+through a macvlan pair in bridge mode. Its card may also be one whose
+driver cannot segment UDP on transmit: `mlx4` in Linux 6.8 offers
+checksums and TCP segmentation only, hashes UDP by ports by default, and
+leaves receive coalescing to the kernel's GRO. On such a box the send
+side segments in software at the card, and the receive side depends on
+where the kernel can see the daemon's socket.
+
+`benches/tap_transport.sh` gained `OUTER_SUBIF` for these shapes,
+`OUTER_GRO_FWD` for the card's `rx-udp-gro-forwarding` switch, and
+`OUTER_WIRE`, which makes datagrams cross the bed's links one by one. The
+relay bed had been handing trains over whole, which no card does, and
+that hid everything below. Profile build of `836057a`, two workers,
+7.5 ms, 2 Gbit/s each way, all delivered
+([numbers](benches/subif-receive-cost-nov26.txt)):
+
+| The daemon's sockets are | Daemon CPU, left and right | Busiest worker | Cycles a datagram in the socket read | in `sendmmsg` |
+| --- | --- | --- | --- | --- |
+| on the link itself | 72%, 67% | 44% | 1,105 | 1,542 |
+| on a VLAN device in the link's namespace | 73%, 68% | 44% | 1,103 | 1,570 |
+| on a macvlan child in a namespace of its own | 97%, 93% | 67–68% | 2,867 | 1,542 |
+| the same with `rx-udp-gro-forwarding` on the link | 70%, 68% | 43–44% | 1,103 | 1,557 |
+| behind a routing namespace and a macvlan pair in bridge mode | 102%, 99% | 72–73% | 3,030 | 1,627 |
+| the same with `rx-udp-gro-forwarding` on the link | 72%, 66% | 43–44% | 1,102 | 1,647 |
+
+- **A daemon in another namespace receives every datagram singly unless
+  the card forwards coalesced UDP.** The kernel coalesces for a socket it
+  finds in the card's namespace; what it forwards stays single unless
+  `rx-udp-gro-forwarding` is on. Without the switch the socket read costs
+  2.6–2.8 times as much and the daemon 35–50% more CPU; with it both
+  shapes cost what the link itself costs.
+- **A VLAN device in the card's namespace costs nothing.**
+- **Sending through the extra hops costs 1–7%**, because a train crosses
+  the sub-interface, the route and the macvlan pair as one packet and is
+  segmented once, at the link.
+
+These are the daemon's cycles only. The kernel's work to receive, route
+and deliver runs on the relay's cores on this bed. On a box it runs on
+the box's own cores, once a datagram without the switch and once a train
+with it, so the switch matters more there than these rows show. What a
+card without UDP segmentation costs to send is not measured here either:
+it needs the box.
+
+## The per-frame cost on November 19
+
 ## The per-frame cost on November 19
 
 A profile build of `34aced8` on the full-size efficiency point (eight

@@ -70,6 +70,29 @@ case "${KERNEL_TUNNEL:-}" in
     vxlan) [ "${OUTER_ROUTED:-0}" = 1 ] && [ -n "${UDP_LOAD:-}" ] || { echo "KERNEL_TUNNEL needs OUTER_ROUTED=1 and UDP_LOAD" >&2; exit 2; };;
     *) echo "KERNEL_TUNNEL must be vxlan" >&2; exit 2;;
 esac
+# OUTER_SUBIF puts each daemon's sockets behind its outer link the way
+# deployments do. vlan is a VLAN device in the link's own namespace. macvlan
+# is a macvlan child moved into a namespace of its own, like a container on
+# its host's card. l3 is a container that owns the link and routes, with a
+# macvlan pair in bridge mode leading on to the daemon's namespace.
+# OUTER_GRO_FWD=1 turns rx-udp-gro-forwarding on for the link; without it a
+# daemon in another namespace receives every datagram singly.
+case "${OUTER_SUBIF:-}" in
+    '') ;;
+    vlan|macvlan|l3)
+        [ "${OUTER_ROUTED:-0}" = 1 ] && [ -z "${KERNEL_TUNNEL:-}" ] && [ "${COMPETING_TCP:-0}" = 0 ] ||
+            { echo "OUTER_SUBIF needs OUTER_ROUTED=1 without KERNEL_TUNNEL or COMPETING_TCP" >&2; exit 2; };;
+    *) echo "OUTER_SUBIF must be vlan, macvlan or l3" >&2; exit 2;;
+esac
+case "${OUTER_GRO_FWD:-0}" in 0) ;; 1) [ "${OUTER_ROUTED:-0}" = 1 ] || exit 2;; *) exit 2;; esac
+# OUTER_WIRE=1 makes the relay's side of each link segment UDP trains, so
+# datagrams reach the endpoint one by one as from a wire and the endpoint's
+# own coalescing decides what the daemon receives.
+# DECISION(2026-11-26): OUTER_WIRE is an option and the relay bed's default stays a whole train.
+#   Why: a veth hands trains over unsegmented, which no card does and which hid what a
+#   sub-interface costs; earlier relay results were taken that way and stay comparable.
+#   Rejected: segmenting always (would change every recorded relay row).
+case "${OUTER_WIRE:-0}" in 0) ;; 1) [ -n "${OUTER_RELAY:-}" ] || { echo "OUTER_WIRE needs OUTER_RELAY" >&2; exit 2; };; *) exit 2;; esac
 mkdir "$5"
 # A private mount namespace keeps ip-netns bind mounts out of the caller.
 exec unshare -m -n --propagation private sh -s -- "$@" <<'BENCH'
@@ -134,6 +157,8 @@ cleanup() {
     ip netns del uq-gen-right 2>/dev/null || :
     ip netns del uq-out-left 2>/dev/null || :
     ip netns del uq-out-right 2>/dev/null || :
+    ip netns del uq-box-left 2>/dev/null || :
+    ip netns del uq-box-right 2>/dev/null || :
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -163,6 +188,14 @@ inner() {
 }
 left_netns=/proc/self/ns/net
 right_netns=/proc/self/ns/net
+# The namespace of a side's outer link, which a macvlan child's daemon is not in.
+left_lower=/proc/self/ns/net
+right_lower=/proc/self/ns/net
+lower() {
+    case "$1" in left) namespace=$left_lower;; right) namespace=$right_lower;; esac
+    shift
+    nsenter --net="$namespace" "$@"
+}
 outer() {
     case "$1" in left) namespace=$left_netns;; right) namespace=$right_netns;; esac
     shift
@@ -205,20 +238,84 @@ if [ "${OUTER_ROUTED:-0}" = 1 ]; then
         ip netns add "uq-out-$side"
         ip link add "uq-r-$side" type veth peer name uq-path netns "uq-out-$side"
         ip link set "uq-r-$side" address "02:77:ff:00:0$n:02" mtu "$outer_mtu" up
-        ip -6 addr add "fd77:ff:$n::2/64" dev "uq-r-$side" nodad
         netip "uq-out-$side" link set lo up
-        netip "uq-out-$side" link set uq-path address "02:77:ff:00:0$n:01" mtu "$outer_mtu" up
-        netip "uq-out-$side" -6 addr add "fd77:ff:$n::1/64" dev uq-path nodad
-        netip "uq-out-$side" -6 route add "fd77:ff:$peer::/64" via "fd77:ff:$n::2"
-        netip "uq-out-$side" -6 neigh add "fd77:ff:$n::2" lladdr "02:77:ff:00:0$n:02" nud permanent dev uq-path
-        ip -6 neigh add "fd77:ff:$n::1" lladdr "02:77:ff:00:0$n:01" nud permanent dev "uq-r-$side"
+        # router is the router's device for this link, box the namespace of
+        # the daemon's sockets and subdev the device they use.
+        router=uq-r-$side
+        box=uq-out-$side
+        subdev=uq-path
+        gate=fd77:ff:$n::2
+        gate_mac=02:77:ff:00:0$n:02
+        case "${OUTER_SUBIF:-}" in
+            vlan)
+                netip "$box" link set uq-path address "02:77:ff:00:0$n:01" mtu "$outer_mtu" up
+                ip link add link "uq-r-$side" name "uq-v-$side" type vlan id 100
+                ip link set "uq-v-$side" up
+                netip "$box" link add link uq-path name uq-sub type vlan id 100
+                netip "$box" link set uq-sub up
+                router=uq-v-$side
+                subdev=uq-sub
+                ;;
+            macvlan)
+                # The child takes the address the router knows; the link beneath gets another.
+                netip "$box" link set uq-path address "02:77:ff:00:0$n:03" mtu "$outer_mtu" up
+                netip "$box" link add link uq-path name uq-sub address "02:77:ff:00:0$n:01" type macvlan mode bridge
+                box=uq-box-$side
+                ip netns add "$box"
+                netip "uq-out-$side" link set uq-sub netns "$box"
+                netip "$box" link set lo up
+                netip "$box" link set uq-sub up
+                subdev=uq-sub
+                ;;
+            l3)
+                # The link's namespace routes. Two macvlan children in bridge mode on
+                # a dummy device join it to the daemon's namespace, which reaches
+                # everything else through it and keeps the address the path knows.
+                netip "$box" link set uq-path address "02:77:ff:00:0$n:01" mtu "$outer_mtu" up
+                netip "$box" link add uq-lan mtu "$outer_mtu" type dummy
+                netip "$box" link set uq-lan up
+                netip "$box" link add link uq-lan name uq-mid address "02:77:fe:00:0$n:02" type macvlan mode bridge
+                netip "$box" link add link uq-lan name uq-sub address "02:77:fe:00:0$n:01" type macvlan mode bridge
+                netip "$box" link set uq-mid up
+                netip "$box" -6 addr add "fd77:fe:$n::2/64" dev uq-mid nodad
+                netip "$box" -6 neigh add "fd77:fe:$n::1" lladdr "02:77:fe:00:0$n:01" nud permanent dev uq-mid
+                netip "$box" -6 route add "fd77:ff:$n::1/128" via "fd77:fe:$n::1" dev uq-mid
+                netip "$box" -6 neigh add "fd77:ff:$n::2" lladdr "02:77:ff:00:0$n:02" nud permanent dev uq-path
+                netip "$box" -6 route add "fd77:ff:$n::2/128" dev uq-path
+                netip "$box" -6 route add "fd77:ff:$peer::/64" via "fd77:ff:$n::2" dev uq-path
+                nsenter --net="/run/netns/$box" sysctl -qw net.ipv6.conf.all.forwarding=1
+                box=uq-box-$side
+                ip netns add "$box"
+                netip "uq-out-$side" link set uq-sub netns "$box"
+                netip "$box" link set lo up
+                netip "$box" link set uq-sub up
+                netip "$box" -6 addr add "fd77:fe:$n::1/64" dev uq-sub nodad
+                subdev=uq-sub
+                gate=fd77:fe:$n::2
+                gate_mac=02:77:fe:00:0$n:02
+                ;;
+            *) netip "$box" link set uq-path address "02:77:ff:00:0$n:01" mtu "$outer_mtu" up;;
+        esac
+        ip -6 addr add "fd77:ff:$n::2/64" dev "$router" nodad
+        ip -6 neigh add "fd77:ff:$n::1" lladdr "02:77:ff:00:0$n:01" nud permanent dev "$router"
+        if [ "${OUTER_SUBIF:-}" = l3 ]; then
+            netip "$box" -6 addr add "fd77:ff:$n::1/128" dev "$subdev" nodad
+            netip "$box" -6 route add "fd77:ff:$n::2/128" via "$gate"
+        else
+            netip "$box" -6 addr add "fd77:ff:$n::1/64" dev "$subdev" nodad
+        fi
+        netip "$box" -6 route add "fd77:ff:$peer::/64" via "$gate"
+        netip "$box" -6 neigh add "$gate" lladdr "$gate_mac" nud permanent dev "$subdev"
         # Segment before router netem so loss applies to individual datagrams.
         # The relay splits trains itself, so a send reaches it as one buffer.
         [ -n "${OUTER_RELAY:-}" ] ||
             nsenter --net="/run/netns/uq-out-$side" ethtool -K uq-path gso off tso off tx-udp-segmentation off
         # Use one endpoint NAPI queue; per-CPU backlogs reorder delayed traffic.
         ethtool -K "uq-r-$side" gro off tso off
+        [ "${OUTER_WIRE:-0}" = 0 ] || ethtool -K "uq-r-$side" gso off tx-udp-segmentation off
         nsenter --net="/run/netns/uq-out-$side" ethtool -K uq-path gro on
+        [ "${OUTER_GRO_FWD:-0}" = 0 ] ||
+            nsenter --net="/run/netns/uq-out-$side" ethtool -K uq-path rx-udp-gro-forwarding on
         ethtool -k "uq-r-$side" > "$out/$side.router-offloads"
         grep -q '^tcp-segmentation-offload: off' "$out/$side.router-offloads"
         if [ "${OUTER_RATE_MBIT:-0}" -ne 0 ]; then
@@ -243,8 +340,15 @@ if [ "${OUTER_ROUTED:-0}" = 1 ]; then
     else
         sysctl -qw net.ipv6.conf.all.forwarding=1
     fi
-    left_netns=/run/netns/uq-out-left
-    right_netns=/run/netns/uq-out-right
+    left_lower=/run/netns/uq-out-left
+    right_lower=/run/netns/uq-out-right
+    left_netns=$left_lower
+    right_netns=$right_lower
+    case "${OUTER_SUBIF:-}" in macvlan|l3)
+        left_netns=/run/netns/uq-box-left
+        right_netns=/run/netns/uq-box-right
+        ;;
+    esac
 else
     netem lo
 fi
@@ -432,9 +536,9 @@ snapshot() {
         fi
         for side in left right; do
             # The left outer namespace's uq-path egress is the L→R bottleneck.
-            outer "$side" tc -s -d qdisc show dev uq-path > "$out/$1.bottleneck-$side"
-            outer "$side" ethtool -S uq-path > "$out/$1.$side-veth"
-            outer "$side" ip -s link show uq-path > "$out/$1.$side-outer-link"
+            lower "$side" tc -s -d qdisc show dev uq-path > "$out/$1.bottleneck-$side"
+            lower "$side" ethtool -S uq-path > "$out/$1.$side-veth"
+            lower "$side" ip -s link show uq-path > "$out/$1.$side-outer-link"
         done
     elif [ "${OUTER_DELAY_US:-0}" -ne 0 ] || [ "${OUTER_LOSS_PERMILLE:-0}" -ne 0 ]; then
         tc -s -d qdisc show dev lo > "$out/$1.qdisc"
@@ -473,6 +577,7 @@ printf '%s\n' "$frame" > "$out/frame-bytes"
 relayed=0
 [ -z "${OUTER_RELAY:-}" ] || relayed=1
 printf 'routed=%s\none_way_delay_us=%s\nloss_permille=%s\nloss_burst=%s\nreorder_permille=%s\nrate_mbit=%s\nqueue_packets=%s\ncompeting_tcp=%s\nrelay=%s\n' "${OUTER_ROUTED:-0}" "${OUTER_DELAY_US:-0}" "${OUTER_LOSS_PERMILLE:-0}" "${OUTER_LOSS_BURST:-1}" "${OUTER_REORDER_PERMILLE:-0}" "${OUTER_RATE_MBIT:-0}" "${OUTER_QUEUE_PACKETS:-8192}" "${COMPETING_TCP:-0}" "$relayed" > "$out/outer-path"
+printf 'subif=%s\ngro_fwd=%s\nwire=%s\n' "${OUTER_SUBIF:-}" "${OUTER_GRO_FWD:-0}" "${OUTER_WIRE:-0}" >> "$out/outer-path"
 printf '%s\n' "${DAEMON_TOML:-}" > "$out/daemon-toml"
 base=$out
 index=0
