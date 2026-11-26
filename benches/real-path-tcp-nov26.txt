@@ -1,0 +1,32 @@
+TCP across the real path, November 26: iperf3 3.20, default settings, no rate limit, the
+same number of streams in both directions at once, 10 s. One round.
+
+Through the daemon (836057a, four workers; benches/pair_side.sh with IPERF_PROTOCOL=tcp),
+two consecutive runs of each stream count on one session; the first run of a session
+includes its start. Received Gbit/s, sender retransmits, daemon CPU left and right.
+  1 stream each way
+    r1/0  | L>R  0.83 G retr      8 | R>L  1.97 G retr    657 | daemon CPU  100%  107%
+    r1/1  | L>R  2.28 G retr    634 | R>L  2.38 G retr   1753 | daemon CPU  152%  134%
+  4 streams each way
+    r1/0  | L>R  2.89 G retr    756 | R>L  2.87 G retr   1836 | daemon CPU  222%  182%
+    r1/1  | L>R  2.75 G retr    997 | R>L  3.02 G retr   2708 | daemon CPU  219%  179%
+  16 streams each way
+    r1/0  | L>R  2.99 G retr  26557 | R>L  3.14 G retr   5054 | daemon CPU  251%  211%
+    r1/1  | L>R  2.52 G retr  13858 | R>L  3.06 G retr  12352 | daemon CPU  240%  204%
+
+Through a static kernel L2TPv3 pseudowire over IPv6 with fragmentation (KERNEL_TUNNEL=l2tp),
+the same way; there is no daemon, so no daemon CPU.
+  1 stream each way
+    r1/0  | L>R  1.70 G retr      3 | R>L  0.05 G retr    200
+    r1/1  | L>R  1.65 G retr      1 | R>L  0.12 G retr    749
+  4 streams each way
+    r1/0  | L>R  1.84 G retr     37 | R>L  0.01 G retr   1326
+    r1/1  | L>R  1.86 G retr    122 | R>L  0.01 G retr   1179
+  16 streams each way
+    r1/0  | L>R  1.23 G retr   1577 | R>L  0.04 G retr   4068
+    r1/1  | L>R  1.38 G retr   1438 | R>L  0.04 G retr   3955
+
+Directly between the two hosts, no tunnel, a few minutes later:
+  1 streams each way | L>R 2.96 G retr 5 | R>L 0.40 G retr 554
+  4 streams each way | L>R 3.37 G retr 0 | R>L 1.60 G retr 182
+  16 streams each way | L>R 2.48 G retr 317 | R>L 2.42 G retr 2618

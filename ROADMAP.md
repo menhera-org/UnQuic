@@ -57,6 +57,15 @@ delivers 3.0 and 2.9 at 3 offered there. Fed single frames, the daemon
 uses 1.7–1.9 times the pseudowire's visible CPU; fed the trains its TAP
 accepts, half to two thirds of it.
 
+TCP through the tunnel on that path
+([BENCH.md](BENCH.md#tcp-through-the-tunnel-across-the-real-path-november-26)):
+one iperf3 stream each way gets 2.3–2.4 Gbit/s, four 2.8–3.0 and sixteen
+2.5–3.1, both directions at once. Toward the direction that loses
+datagrams that is more than TCP gets without a tunnel (0.40 with one
+stream, 1.60 with four), because the streams see the losses repaired.
+Sixteen streams retransmit ten to twenty times as much as four for no
+more delivery, which is unexamined.
+
 Open, ahead of the list below:
 
 1. CPU per delivered bit. Target boxes include four slow cores of the

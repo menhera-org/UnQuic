@@ -14,6 +14,8 @@
 # SEGMENTS VLAN_DEPTH GENERATOR_PROCESSES DAEMON_CPUS GENERATOR_CPUS
 # RECEIVER_CPUS (comma-separated lists) DAEMON_TOML OUTER_PAYLOAD_LIMIT PORT
 # TAP_TXQUEUELEN SESSION_COOKIE OUTER_UDP_GRO BITRATE_LEFT BITRATE_RIGHT TX_LANES.
+# IPERF_PROTOCOL=tcp runs iperf3 through the tunnel in place of the load tool:
+# FLOWS TCP streams each way at once, BITRATE bits/s a stream or 0 for no limit.
 # KERNEL_TUNNEL=l2tp is a baseline: a static kernel L2TPv3 Ethernet pseudowire
 # between the two addresses takes the daemon's place, over IPv6 itself or,
 # with L2TP_ENCAP=udp, over UDP on PORT. Its packets exceed the path's MTU and
@@ -33,7 +35,9 @@ processes=${GENERATOR_PROCESSES:-2}
 depth=${VLAN_DEPTH:-2}
 segments=${SEGMENTS:-44}
 port=${PORT:-40100}
-[ "$((flows % processes))" = 0 ] || exit 2
+tcp=
+case "${IPERF_PROTOCOL:-}" in '') ;; tcp) tcp=1;; *) echo "IPERF_PROTOCOL must be tcp" >&2; exit 2;; esac
+[ -n "$tcp" ] || [ "$((flows % processes))" = 0 ] || exit 2
 share=$((flows / processes))
 payload=1472
 name=uq-pair
@@ -162,7 +166,8 @@ in_ns ip neigh add "10.77.0.$peer" lladdr "02:00:00:00:00:0$peer" nud permanent 
 snapshot() {
     count=$(grep -c '^unquic: worker [0-9][0-9]* Snapshot {.* }$' "$out/$side.log" || :)
     kill -USR1 "$pid"
-    if [ "$1" != after ] && [ -n "$servers" ]; then
+    # The load tool's receivers record a sample on the signal; iperf3 would die of it.
+    if [ "$1" != after ] && [ -n "$servers" ] && [ -z "$tcp" ]; then
         kill -USR1 $servers 2>/dev/null || :
     fi
     attempts=0
@@ -206,6 +211,15 @@ for rate in $rates; do
     # Left to right uses ports 51000.. to 52000..; right to left adds 2000 to both.
     until_time "$((at - 3))"
     k=0
+    if [ -n "$tcp" ]; then
+        prefix=
+        [ "$reverse" = 1 ] || prefix=reverse-
+        # One test and out; the limit ends a server whose client never came.
+        nsenter --net="$inner" taskset -c "$RECEIVER_CPUS" timeout "$((duration + 15))" \
+            iperf3 -s -1 -J -B "10.77.0.$n" > "$point/${prefix}server.json" &
+        servers="$servers $!"
+        k=$processes
+    fi
     while [ "$k" -lt "$processes" ]; do
         suffix=
         [ "$k" = 0 ] || suffix=-$k
@@ -223,6 +237,15 @@ for rate in $rates; do
     snapshot before
     until_time "$at"
     k=0
+    if [ -n "$tcp" ]; then
+        prefix=
+        [ "$reverse" = 0 ] || prefix=reverse-
+        set -- -c "10.77.0.$peer" -B "10.77.0.$n" -P "$flows" -t "$duration" -J --connect-timeout 3000
+        [ "$rate" = 0 ] || set -- "$@" -b "$rate"
+        nsenter --net="$inner" taskset -c "$GENERATOR_CPUS" iperf3 "$@" > "$point/${prefix}client.json" &
+        clients="$clients $!"
+        k=$processes
+    fi
     while [ "$k" -lt "$processes" ]; do
         suffix=
         [ "$k" = 0 ] || suffix=-$k

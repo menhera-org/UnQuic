@@ -326,6 +326,12 @@ loads one direction while the other carries a trickle; both lists need as
 many points as `BITRATE`. Left-to-right flows use the same ports as in
 `tap_transport.sh`, and right-to-left flows the ports 2000 above them.
 
+`IPERF_PROTOCOL=tcp` runs iperf3 through the tunnel in place of the load
+tool: `FLOWS` TCP streams each way at once, `BITRATE` bits/s a stream or 0
+for no limit, each side's client on its `GENERATOR_CPUS` and its server on
+its `RECEIVER_CPUS`. The reports are iperf3's own JSON under the same file
+names, which `sweep_report` does not read.
+
 `KERNEL_TUNNEL=l2tp` is a baseline without the daemon: the script sets up a
 static kernel L2TPv3 Ethernet pseudowire between the two addresses, over
 IPv6 itself or with `L2TP_ENCAP=udp` over UDP on `PORT`, and runs the same

@@ -109,7 +109,7 @@ Gbit/s at an offer-limited load instead.
 | --- | --- | --- |
 | At least 20 Gbit/s each way at inner MTU 1500 | November 19: sixteen workers per daemon deliver 20.1–20.7 Gbit/s each way in five of five 60 s runs with `offload_frames`, and in four of five without it (the fifth reads 19.90 one way), at 800–863% and 942–996% of a core per daemon, thirty-two QinQ flows at 21 Gbit/s offered ([BENCH.md](#one-report-per-ack-november-19-landed)). Before that: loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98%. With sixteen workers per daemon and thirty-two flows: 7.11 / 7.03 Gbit/s, no thread above 75%, limited by receive-socket overflow under the container's 416 KiB buffer ([BENCH.md](#sixteen-workers-per-daemon-november-11-exploratory)). Over a 9000-byte outer path: 10.27 / 13.90 Gbit/s with QinQ and 10.78 / 17.82 with one tag at sixteen workers, 13.36 / 11.77 with QinQ at eight, at 34–45% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)) | November 19: the margin over 20 is one or two percent, as large as this host's own variation, and the acceptance profile (hardware, core budget, flow count, frame mix) is not frozen. It takes sixteen workers per daemon, eight to ten cores of them busy. Earlier: at a 1500-byte outer path the per-bit cost must roughly halve; a 9000-byte path halves it but no thread then saturates, and reordering and overflows rise. One left worker does two jobs: it reads every L→R frame from the TAP (QinQ input all lands on one queue) and receives the R→L lanes it owns. L→R senders idle for its input; its socket overflows and R→L loses packets, so BBR cuts. More receive buffers move capacity from L→R to R→L (+11% total, L→R −14%); letting tun spread reads costs 23% more CPU per bit ([BENCH.md](#receive-buffers-for-a-busy-reader-november-11)). Next: keep receive work off the TAP reader, or split TAP reading inside the daemon. |
 | Goodput must plateau under excess traffic | November 19, `1f28d42`: on the decision workload every 5G total is 0.8–2.0 Gbit/s above its 2G total; sixteen flows deliver 1.92–1.96 Gbit/s each way at 2G offered and 2.16–2.73 at 5G, four flows 1.70–1.95 and 2.32–2.90 ([BENCH.md](#the-decision-workload-on-the-current-build-november-19)). Earlier: decision workload (four workers, 4.5 ms), `3178088`: sixteen flows deliver 1.62 / 1.64 Gbit/s at 2G offered and 2.03 / 1.58 at 5G; four flows 1.31 / 1.73 and 0.92 / 1.38 ([BENCH.md](#decision-workload-baseline-november-12-evening)). With the read margin (`3b9e86f`) every 5G total matches or exceeds its 2G total: four flows 1.21 / 2.07 at 5G, sixteen 2.03 / 1.77 ([BENCH.md](#owners-refusing-each-other-a-read-margin-landed)). Workers run at 77–99% of a core | Lossy four-flow L→R still falls 10% from 2G to 5G, and overloaded p99 delay rose with the extra delivery. Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
-| TCP through the tunnel | Loopback, eight workers, eight iperf3 streams each way: 9.2–9.9 Gbit/s in total at about 1 core per Gbit/s, about 1% of segments retransmitted ([BENCH.md](#tap-queue-length-and-overload-delay)) | Losses come from receive-socket overflows under the container's 416 KiB buffers; the daemon cannot raise them without `CAP_NET_ADMIN`. |
+| TCP through the tunnel | Loopback, eight workers, eight iperf3 streams each way: 9.2–9.9 Gbit/s in total at about 1 core per Gbit/s, about 1% of segments retransmitted ([BENCH.md](#tap-queue-length-and-overload-delay)). November 26, across the real path: one iperf3 stream each way gets 2.3–2.4 Gbit/s, four 2.8–3.0 and sixteen 2.5–3.1, both directions at once, where direct TCP toward the lossy direction gets 0.40 with one stream and 1.60 with four ([BENCH.md](#tcp-through-the-tunnel-across-the-real-path-november-26)) | Losses come from receive-socket overflows under the container's 416 KiB buffers; the daemon cannot raise them without `CAP_NET_ADMIN`. On the real path sixteen streams each way retransmit ten to twenty times as much as four for no more delivery, unexamined. |
 | Small-frame overload must remain efficient | November 20, with offload frames on by default: untagged 64-byte frames, sixteen flows, unlimited: 11.8–12.8 / 13.2 M frames/s with eight workers and 12.6–12.7 / 13.6–14.1 M with sixteen, at 0.44–0.57 cores per M frames/s, and the 40M rows arrive complete ([BENCH.md](#offload-frames-and-lane-rotation-on-by-default-november-20-landed)). November 19, `1f28d42`, without them: 3.24–3.35 / 4.15–4.32 M frames/s with eight workers and 7.50–8.52 / 5.62–6.42 M with sixteen, at 1.6–1.8 cores per M frames/s ([BENCH.md](#small-frame-rows-on-the-current-build-november-19)). November 12: untagged 64-byte frames, sixteen flows: 3.24–3.43 / 3.27–3.48 M frames/s unlimited with eight workers and 4.23–4.53 / 4.16–4.57 M with sixteen, against 5.87 / 5.74 M for the pre-recovery build; QinQ 128-byte frames 2.18–2.31 / 3.32–3.53 M; 1.85–1.95 cores per M frames/s against 1.28–1.33 ([BENCH.md](#small-frame-rows-at-the-current-build-november-12)) | About 45% more CPU per frame since recovery and BBR, spread across transmit bookkeeping with no single large target; four candidates cut 0–3% at overload, and the expiry heap landed at −4.2% CPU per frame offer-limited ([BENCH.md](#where-the-small-frame-cost-comes-from-november-12)). One to one and a half of eight workers per daemon idle because tun's queue hash leaves them no transmit work; balanced lanes do not change this. High ingress loss persists; mixed traffic and non-coalescible frames remain unverified. |
 | VLAN-heavy deployment | Single- and double-tag output coalescing works. Earlier pre-recovery sixty-second QinQ points have zero reordering; one earlier refill point has thirteen reordered frames (0.0003125%). Single-tag unlimited traffic reports 32–36%. SRv6 reaches 5.24 / 5.98 Gbit/s unlimited | QinQ remains asymmetric. Single-tag lane migration/reordering remains a concern. SRv6 does not show a general throughput gain from compact storage. TCP input and output offloads improve matched TCP sweeps; single-stream output coalescing reaches 2.01 / 2.26 Gbit/s, still below the deployment target. |
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
@@ -3884,6 +3884,44 @@ machines and in no number here. With the trains a TAP accepts and the
 pseudowire's device does not, the daemon carries the same traffic for
 half to two thirds of the pseudowire's visible CPU and goes on to
 3 Gbit/s each way.
+
+## TCP through the tunnel across the real path (November 26)
+
+`benches/pair_side.sh` gained `IPERF_PROTOCOL=tcp`: iperf3 through the
+tunnel, the same number of streams each way at once, no rate limit. Same
+hosts, settings and build as the entries above, 10 s runs, one round; the
+daemon's rows are the second run on a session, after its start
+([all rows](benches/real-path-tcp-nov26.txt)). Received Gbit/s, left to
+right and right to left:
+
+| Streams each way | Through the daemon | Daemon CPU, left and right | Direct, no tunnel | Through the L2TPv3 pseudowire |
+| --- | --- | --- | --- | --- |
+| 1 | 2.28, 2.38 | 152%, 134% | 2.96, 0.40 | 1.65, 0.12 |
+| 4 | 2.75, 3.02 | 219%, 179% | 3.37, 1.60 | 1.86, 0.01 |
+| 16 | 2.52, 3.06 | 240%, 204% | 2.48, 2.42 | 1.38, 0.04 |
+
+- **One TCP stream gets 2.3–2.4 Gbit/s each way through the daemon.**
+  TCP's segmentation offload feeds the TAP whole trains and the far TAP
+  hands the receiver whole trains back, so one flow is no longer held
+  near 1 Gbit/s as a flow of single frames is.
+- **Right to left the tunnel carries more TCP than the path does
+  directly.** That direction loses datagrams, and a direct stream backs
+  off to 0.40 Gbit/s and four to 1.60. Through the daemon the same
+  streams see a path whose losses are repaired, and get 2.38 and 3.02.
+  Left to right, where the path loses little, one direct stream is ahead
+  at 2.96 against 2.28.
+- **Both directions together, the daemon carries 4.7 Gbit/s of TCP in two
+  streams and 5.6–5.8 in eight or thirty-two**, for 1.3 to 2.4 cores a
+  daemon; the direct rows total 3.4, 5.0 and 4.9.
+- **The pseudowire carries 1.4–1.9 Gbit/s one way and next to nothing
+  the other**, for the reasons of the entry above: TCP backs off but
+  cannot get its fragments past the full reassembly store.
+- Sixteen streams each way retransmit ten to twenty times as much through
+  the daemon as four do (13,858–26,557 against 756–997 left to right)
+  for no more delivery. That is unexamined.
+
+The direct rows were taken a few minutes after the tunnel's and their
+iperf3 processes were not pinned.
 
 ## The per-frame cost on November 19
 
