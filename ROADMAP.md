@@ -69,10 +69,15 @@ Open, ahead of the list below:
    22.5% and 28–29% of a core per Gbit/s where it cost 30% and 31%, and
    four workers carry 5.99 Gbit/s one way at 7 offered
    ([BENCH.md](BENCH.md#the-real-path-with-coalesced-udp-forwarded-by-the-cards-november-26)).
-   The received trains are 13.8 and 3.8 datagrams long where 44 are
-   sent; the cards' `gro_flush_timeout` and `napi_defer_hard_irqs` are
-   the settings for that and are untried. Sending, at 46% of a core per
-   Gbit/s on one host, is now the larger part.
+   The received trains were 13.8 and 3.8 datagrams long where 44 are
+   sent. With the cards' `gro_flush_timeout` and `napi_defer_hard_irqs`
+   set they are 32–34, and receiving costs 15–19% of a core per Gbit/s,
+   for 0.6–0.9 ms more round trip on a quiet path. Sending, at 46% of a
+   core per Gbit/s on one host, is now three quarters of the cost, and
+   four fifths of it is the kernel segmenting and transmitting each
+   datagram at a card that cannot segment UDP. That part is outside the
+   daemon as it is built: it needs such a card, or a send path that
+   bypasses the kernel's, which is a design decision.
 2. A new session's first load on a path with random loss. Startup can end
    on that loss below the offered rate, and the climb from there costs
    several percent of the first point in some runs (5% in one of two at

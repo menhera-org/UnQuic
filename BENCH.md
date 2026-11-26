@@ -3764,6 +3764,38 @@ Sending is now the larger part by far: 46% of a core for each Gbit/s on
 the left host, 3.5 µs a datagram in `sendmmsg`, against 22.5% to receive
 one.
 
+Those two settings were then made on both cards
+([both ways](benches/real-path-napi-defer-both-ways-nov26.json),
+[one way](benches/real-path-napi-defer-left-to-right-nov26.json)):
+
+| | Forwarding alone | With the poll settings |
+| --- | --- | --- |
+| Plain UDP, datagrams in a received message, left host and right host | 13.8, 3.8 | 32.4, 33.7 |
+| Receiving daemon, right host, 3.83 Gbit/s: CPU | 110% | 59% |
+| its socket read, cycles a datagram | 2,408 | 799 |
+| Receiving daemon's CPU for each Gbit/s, right host and left host | 28–29%, 22.5% | 15%, 19% |
+| Left to right alone at 5, 6, 7 offered | 4.78, 5.26, 5.99 | 4.79, 5.59, 5.61 |
+| its receiver's CPU | 137%, 150%, 166% | 74%, 84%, 85% |
+| Both ways at 4 offered: delivered left to right, right to left | 3.67–3.72, 2.26–2.59 | 3.39–3.62, 2.10–2.55 |
+| Daemon CPU left and right at 4 offered | 223–228%, 196–203% | 214–218%, 166–174% |
+| Idle round trip | 7.6–9.2 ms | 8.5–9.5 ms |
+
+Received trains are now three quarters of what was sent, and receiving
+costs half of what it did: 15–19% of a core for each Gbit/s, close to
+the relay bed's figure. The price is 0.6–0.9 ms on a quiet path's round
+trip, the two waits of a lone datagram and its reply.
+
+Delivery with both directions loaded does not rise, because the sender
+decides it. With receiving at 15%, sending at 46% of a core for each
+Gbit/s is three quarters of what a Gbit/s costs end to end on these
+hosts, and all but a fifth of that is the kernel segmenting and
+transmitting each datagram at a card that cannot segment UDP itself.
+
+One new session's first point lost 31% of its frames at 3 offered in
+these runs and another 6–8% at 2, where four others lost 0–2%. First
+points lost up to 6% before the settings too, so this is the open ramp
+item of the entry above, but its worst case is now worse.
+
 ## The per-frame cost on November 19
 
 A profile build of `34aced8` on the full-size efficiency point (eight
