@@ -188,9 +188,9 @@ fn unit_path(path: &Path) -> io::Result<&str> {
 }
 
 /// The unit template of design section 12.1 for this binary and paths.
-// DECISION(2026-11-27): the unit is ordered before network.target and wanted by it alone.
-//   Why: the user's instruction of that date. Rejected: RequiredBy and Before for both
-//   network.target and network-online.target (a daemon failure then failed both targets).
+// DECISION(2026-11-27): the unit is ordered before network.target and required by it alone.
+//   Why: the user's instructions of that date. Rejected: naming network-online.target too
+//   (it follows network.target by itself); WantedBy (a failed daemon would not fail the target).
 pub fn unit(binary: &Path, config: &Path, pid_file: &Path) -> io::Result<String> {
     let (binary, config, pid) = (unit_path(binary)?, unit_path(config)?, unit_path(pid_file)?);
     Ok(format!(
@@ -206,7 +206,7 @@ TimeoutStartSec=infinity
 Restart=on-failure
 
 [Install]
-WantedBy=network.target
+RequiredBy=network.target
 "
     ))
 }
@@ -230,7 +230,7 @@ mod tests {
             "ExecStart=/usr/bin/unquic start /etc/unquic.toml /run/unquic.pid",
             "TimeoutStartSec=infinity",
             "Restart=on-failure",
-            "WantedBy=network.target",
+            "RequiredBy=network.target",
         ] {
             assert!(text.lines().any(|l| l == line), "{line}");
         }
@@ -240,7 +240,7 @@ mod tests {
             "After=",
             "Requires=",
             "Wants=",
-            "RequiredBy=",
+            "WantedBy=",
             "wait-online",
             "network-online",
         ] {
