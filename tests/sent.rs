@@ -1342,3 +1342,34 @@ fn reservation_capacity_and_unsampled_retirement_follow_the_floor() {
     assert_eq!(history.retire_unsampled(64), 0);
     assert_eq!(history.floor(), 4);
 }
+
+#[test]
+fn outstanding_scan_below_stops_under_the_number() {
+    let mut history = History::new().unwrap();
+    assert!(history.outstanding_scan_below(5).is_complete());
+    for number in 1..=200 {
+        sent(&mut history, number, true);
+    }
+    let visit = |history: &History, number| {
+        let mut scan = history.outstanding_scan_below(number);
+        let mut budget = usize::MAX;
+        std::iter::from_fn(|| scan.advance(history, &mut budget))
+            .map(|packet| packet.number)
+            .collect::<Vec<_>>()
+    };
+    assert!(visit(&history, 0).is_empty());
+    assert!(visit(&history, 1).is_empty());
+    assert_eq!(visit(&history, 4), [1, 2, 3]);
+    assert_eq!(visit(&history, u64::MAX).len(), 200);
+    // The pass spends its budget below the number, not on the flight above it.
+    let mut scan = history.outstanding_scan_below(4);
+    let mut budget = 8;
+    while scan.advance(&history, &mut budget).is_some() {}
+    assert!(scan.is_complete());
+    assert!(budget >= 4);
+    // Resolved packets below the number are skipped like any others.
+    history
+        .acknowledge(ranges(&[AckRange { start: 1, end: 2 }]), |_| {})
+        .unwrap();
+    assert_eq!(visit(&history, 4), [3]);
+}

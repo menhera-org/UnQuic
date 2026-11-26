@@ -7,6 +7,50 @@ read that section before writing code. Keep the "Current status" paragraph in
 section 15 of the design and the "Implementation status" section of
 [README.md](README.md) true after every step.
 
+## November 26 checkpoint
+
+The two real-path hosts changed since the checkpoint below: the capped
+host's receive sockets now reach 16 MiB, and both hosts attach to their
+machines' network cards by macvlan
+([BENCH.md](BENCH.md#the-real-path-after-the-hosts-changes-november-26)).
+
+- Left to right, four workers deliver 5.49 Gbit/s at 6 offered across
+  the real path, with the sender's busiest worker at 89% and its
+  controller never short of window, and 4.5–4.7 at 5 offered while the
+  other direction is loaded too. The gate's rate is met in the
+  direction where only the daemon's own cores limit it.
+- Right to left the daemon delivers 1.9 Gbit/s alone and 1.4–1.7 beside
+  the other direction, and plain UDP without the daemon does no better:
+  2.0 Gbit/s cleanly, 2.3–2.7 with a fifth to half lost. The receiving
+  machine's card hashes UDP by addresses alone, so every lane lands on
+  one receive queue. The same 4 Gbit/s split over two destination
+  addresses arrives whole. This is a setting of that machine
+  (`rx-flow-hash` with ports); README.md's operational checks now name
+  it.
+
+Three sender changes landed from this work
+([BENCH.md](BENCH.md#three-sender-changes-from-the-delay-and-real-path-work-november-25-and-26-landed)):
+
+- A loss pass that follows an ACK stops below the largest acknowledged
+  packet. It used to visit everything in flight and kept a sender's
+  workers turning on any path with delay: 6–20% of a daemon's CPU.
+- A pacing claim made late keeps its schedule, up to half its interval.
+  Workers that now sleep between ACKs lost that time before.
+- A probe sent while no data waits is application-limited. An idle
+  session's liveness probes used to end Startup three seconds after the
+  handshake, so every first load climbed from a few Mbit/s: a loaded
+  direction lost 5–9% of its first ten seconds, a 16 Mbit/s flow beside
+  it 42–95%, and twelve lanes on four workers never climbed at all.
+
+Open, ahead of the list below:
+
+1. The real path's right-to-left direction, which waits on the receiving
+   machine's card hashing UDP by ports.
+2. A new session's first load on a path with random loss. Startup can end
+   on that loss below the offered rate, and the climb from there costs
+   several percent of the first point in some runs (5% in one of two at
+   1% loss, 39% in one earlier run).
+
 ## November 25 checkpoint
 
 Real-path tests now run beside development. `benches/pair_side.sh` runs

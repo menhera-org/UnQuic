@@ -129,6 +129,21 @@ fn charges_respect_the_window_and_pacing_starts_at_the_claim() {
 }
 
 #[test]
+fn a_late_claim_keeps_its_schedule_up_to_half_an_interval() {
+    let budget = Budget::new();
+    let ms = Duration::from_millis;
+    assert_eq!(budget.pace(1000, 1_000_000, ms(10)), Ok(()));
+    // Due at 11 ms and claimed 0.3 ms late: the next interval still ends at 12 ms.
+    let late = ms(11) + Duration::from_micros(300);
+    assert_eq!(budget.pace(1000, 1_000_000, late), Ok(()));
+    assert_eq!(budget.pace(1, 1_000_000, late), Err(ms(12)));
+    // Claimed 5 ms late: half an interval comes back, no more.
+    assert_eq!(budget.pace(1000, 1_000_000, ms(17)), Ok(()));
+    let next = ms(17) + Duration::from_micros(500);
+    assert_eq!(budget.pace(1, 1_000_000, ms(17)), Err(next));
+}
+
+#[test]
 fn only_new_data_in_an_idle_group_below_the_window_starts_a_bubble() {
     let budget = Budget::new();
     let mut state = Published {

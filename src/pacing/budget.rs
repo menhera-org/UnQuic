@@ -236,7 +236,10 @@ impl Budget {
     }
 
     /// Claims pacing credit for bytes at rate, or returns the earliest retry time.
-    /// Like the grant ledger, a claim starts the next interval at now.
+    /// A claim made after its time keeps the lateness, up to half its own
+    /// interval, as Linux pacing does for timer drift: a worker that sleeps
+    /// until its turn then sends at the published rate, and an idle group
+    /// saves up no more than half a claim.
     pub fn pace(&self, bytes: u64, rate: u64, now: Duration) -> Result<(), Duration> {
         if rate == 0 {
             return Err(Duration::MAX);
@@ -249,9 +252,11 @@ impl Budget {
             if now < next {
                 return Err(Duration::from_nanos(next));
             }
+            // A group that never sent has no missed time to count.
+            let late = if next == 0 { 0 } else { now - next };
             match self.hot.next_send.compare_exchange_weak(
                 next,
-                now.saturating_add(cost),
+                (now - late.min(cost / 2)).saturating_add(cost),
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {

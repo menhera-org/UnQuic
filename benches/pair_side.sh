@@ -13,7 +13,7 @@
 # Environment: WORKERS FLOWS DURATION BITRATE (bits/s per flow, one per point)
 # SEGMENTS VLAN_DEPTH GENERATOR_PROCESSES DAEMON_CPUS GENERATOR_CPUS
 # RECEIVER_CPUS (comma-separated lists) DAEMON_TOML OUTER_PAYLOAD_LIMIT PORT
-# TAP_TXQUEUELEN SESSION_COOKIE OUTER_UDP_GRO.
+# TAP_TXQUEUELEN SESSION_COOKIE OUTER_UDP_GRO BITRATE_LEFT BITRATE_RIGHT TX_LANES.
 set -eu
 [ "$#" -eq 7 ] || { echo "usage: $0 SIDE DAEMON UDP_LOAD OUT LOCAL6 PEER6 START" >&2; exit 2; }
 side=$1 daemon=$2 load=$3 out=$4 local6=$5 peer6=$6 start=$7
@@ -80,7 +80,7 @@ name = "peer"
 endpoint = "rx"
 host = "$peer6"
 peer_port = $port
-tx_lanes = $workers
+tx_lanes = ${TX_LANES:-$workers}
 outer_payload_limit = ${OUTER_PAYLOAD_LIMIT:-1452}
 [[sessions]]
 name = "$name"
@@ -154,7 +154,14 @@ snapshot() {
     in_ns tc -s qdisc show dev "$name" > "$point/$1.$side-tapqdisc"
 }
 index=0
-for rate in ${BITRATE:-62500000}; do
+# BITRATE_LEFT or BITRATE_RIGHT gives that side's senders rates of their own,
+# for a load of one direction; both sides need the same number of points.
+rates=${BITRATE:-62500000}
+case "$side" in
+    left) rates=${BITRATE_LEFT:-$rates};;
+    right) rates=${BITRATE_RIGHT:-$rates};;
+esac
+for rate in $rates; do
     point=$out/$index
     mkdir "$point"
     echo "$rate" > "$point/bitrate"

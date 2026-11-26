@@ -96,8 +96,9 @@ comparison below.
 
 ## Current performance gaps
 
-Updated November 12, and the first four rows and the 5 Gbit/s row on
-November 19 and 20; those and the last two are current, the others keep
+Updated November 12, the first four rows and the 5 Gbit/s row on
+November 19 and 20, and the 5 Gbit/s row again on November 26; those and
+the last two are current, the others keep
 earlier evidence. L→R / R→L pairs are simultaneous. Run-to-run
 noise is large: identical binaries differ by up to 7.5% in loopback total and
 up to 18% in one direction (A/A, November 12), so single differences of a few
@@ -114,7 +115,7 @@ Gbit/s at an offer-limited load instead.
 | Establish the CPU-limited forwarding ceiling | Process/thread CPU, source reads, TAP writes, overflow and queue counters are recorded. A sampled profile found retained foreign buffers starving a reader while owners held free buffers | No theoretical or measured zero-loss CPU ceiling is established. Socket placement, scheduling, kernel cost and inner-generator limits remain separate variables. |
 | Prevent split-count amplification of outer loss | A release runtime regression loses each direction's original frame prefix and first repair, delivers via the second repair, then replays the original without duplicate TAP delivery or hot allocations | Sustained independent/burst loss and the real-path target remain unverified. A frame can still expire or exhaust its two-repair allowance. |
 | Use larger confirmed path MTUs | Discovery runs up to 8952-byte UDP payloads. Linux 6.8 and 7.0 tests cover PTB, silent filters, shared sessions, external TAP moves/renames, and reconnect. The both-kernel routed tests confirm 9000→1500→1280→9000 without outer fragments | Loopback throughput at an 8952-byte limit is measured: the 21G total rises 70–126%; on the routed decision workload at 5G delivery rises 50–56% at 36% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)). Real-path throughput at larger MTUs remains open. DATA-quoted PTB validation now has targeted kernel coverage. |
-| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | November 19: sixteen workers per daemon and thirty-two GSO flows deliver 5.4–5.8 Gbit/s each way at 6 Gbit/s offered over the local routed path with 1% loss, at 4.5 and at 7.5 ms, and 5.7–5.9 with `loss_threshold_permille = 100`, losing 0.2–2.9% of frames ([BENCH.md](#frame-slots-that-follow-the-memory-limit-november-19-landed)). November 20: with the path emulated by a relay on other cores, four workers and sixteen GSO flows deliver 5.11–5.56 Gbit/s each way at 7.5 ms and 5.51–5.91 at 4.5 ms in ten 60 s runs of ten at 6 offered and 1% loss, and two workers deliver 2.5–2.7 ([BENCH.md](#the-lossy-path-through-a-relay-november-20-landed)). November 25, the first runs across a real path of the target network (MTU 1500, 7.0–8.2 ms, 0.01–0.02% loss) between two shared container hosts: four workers deliver 4.0 Gbit/s one way with nothing missing and 3.6–4.7 at 5 offered, eight deliver 5.46, and the other direction stays at 1.1–1.5 behind one host's 416 KiB receive sockets ([BENCH.md](#across-a-real-access-path-november-25)). Four workers deliver about 2.5 Gbit/s each way of bridged individual frames at 5 Gbit/s offered, CPU-bound. Earlier: One flow at 7.5 ms with 0.5–1% random loss: about 1.0 Gbit/s per direction locally with hash lanes and the default queue-checked loss tolerance (0.91–1.05 at 1G and 5G offered on `424f4f8`, busiest thread 76–98%, [results](benches/lossy-one-flow-424f4f8.json)), 1.5–2.0 with the old per-reader balanced-lane tables only because the flow kept changing lanes, which the shared flow table ends (0.7–0.9 since November 13, [BENCH.md](#a-control-lane-for-acks-november-13)); 1.6 Gbit/s on the remote host, where a limit downstream of the sender caps it. November 16: with `stripe_flows` on, one UDP flow delivers 2.1–2.4 Gbit/s per direction at 0.5–1% loss against 1.1–1.2 without ([BENCH.md](#striping-one-flow-across-transmit-workers-november-15)); sixteen flows at 2 Gbit/s each way on a 4.5 ms path with 1% loss lose 0.01–0.05% of their frames since the queue check uses each round's smallest RTT sample, where they lost about 1% ([BENCH.md](#where-the-lossy-point-loses-its-frames-november-16)). At 5% loss draft 07 delivers under 10 Mbit/s of a 5G offer; `loss_threshold_permille = 100` raises that to about 0.45 Gbit/s ([BENCH.md](#a-configurable-loss-threshold-for-random-loss-november-12)) | One transmit worker caps one flow near 1 Gbit/s here even without loss, a third of it the kernel's software send path and a quarter userspace, so the gate needs striping with a receive reorder stage, a larger outer MTU or segmenting hardware ([BENCH.md](#what-holds-one-flow-near-1-gbits-november-13); ROADMAP decision 7). Striping is built but off by default: the worker that reads the flow and writes its reverse direction then limits it near 2.2 Gbit/s, and it is unmeasured for TCP, which needs a host with full receive buffers and four workers per daemon. Also open: the 5% rows (still under a tenth of the offer; FEC or a different response), and a real-path measurement. |
+| At least 5 Gbit/s over routed IPv6 10G-EPON, RTT 4.5–7.5 ms, with nonzero loss | November 19: sixteen workers per daemon and thirty-two GSO flows deliver 5.4–5.8 Gbit/s each way at 6 Gbit/s offered over the local routed path with 1% loss, at 4.5 and at 7.5 ms, and 5.7–5.9 with `loss_threshold_permille = 100`, losing 0.2–2.9% of frames ([BENCH.md](#frame-slots-that-follow-the-memory-limit-november-19-landed)). November 20: with the path emulated by a relay on other cores, four workers and sixteen GSO flows deliver 5.11–5.56 Gbit/s each way at 7.5 ms and 5.51–5.91 at 4.5 ms in ten 60 s runs of ten at 6 offered and 1% loss, and two workers deliver 2.5–2.7 ([BENCH.md](#the-lossy-path-through-a-relay-november-20-landed)). November 25, the first runs across a real path of the target network (MTU 1500, 7.0–8.2 ms, 0.01–0.02% loss) between two shared container hosts: four workers deliver 4.0 Gbit/s one way with nothing missing and 3.6–4.7 at 5 offered, eight deliver 5.46, and the other direction stays at 1.1–1.5 behind one host's 416 KiB receive sockets ([BENCH.md](#across-a-real-access-path-november-25)). November 26, with that host's buffers raised and both hosts on macvlan: four workers deliver 5.49 Gbit/s one way at 6 offered, and the other way stays at 1.4–1.9 because the receiving machine's card puts every lane on one receive queue, which limits plain UDP the same way ([BENCH.md](#the-real-path-after-the-hosts-changes-november-26)). Four workers deliver about 2.5 Gbit/s each way of bridged individual frames at 5 Gbit/s offered, CPU-bound. Earlier: One flow at 7.5 ms with 0.5–1% random loss: about 1.0 Gbit/s per direction locally with hash lanes and the default queue-checked loss tolerance (0.91–1.05 at 1G and 5G offered on `424f4f8`, busiest thread 76–98%, [results](benches/lossy-one-flow-424f4f8.json)), 1.5–2.0 with the old per-reader balanced-lane tables only because the flow kept changing lanes, which the shared flow table ends (0.7–0.9 since November 13, [BENCH.md](#a-control-lane-for-acks-november-13)); 1.6 Gbit/s on the remote host, where a limit downstream of the sender caps it. November 16: with `stripe_flows` on, one UDP flow delivers 2.1–2.4 Gbit/s per direction at 0.5–1% loss against 1.1–1.2 without ([BENCH.md](#striping-one-flow-across-transmit-workers-november-15)); sixteen flows at 2 Gbit/s each way on a 4.5 ms path with 1% loss lose 0.01–0.05% of their frames since the queue check uses each round's smallest RTT sample, where they lost about 1% ([BENCH.md](#where-the-lossy-point-loses-its-frames-november-16)). At 5% loss draft 07 delivers under 10 Mbit/s of a 5G offer; `loss_threshold_permille = 100` raises that to about 0.45 Gbit/s ([BENCH.md](#a-configurable-loss-threshold-for-random-loss-november-12)) | One transmit worker caps one flow near 1 Gbit/s here even without loss, a third of it the kernel's software send path and a quarter userspace, so the gate needs striping with a receive reorder stage, a larger outer MTU or segmenting hardware ([BENCH.md](#what-holds-one-flow-near-1-gbits-november-13); ROADMAP decision 7). Striping is built but off by default: the worker that reads the flow and writes its reverse direction then limits it near 2.2 Gbit/s, and it is unmeasured for TCP, which needs a host with full receive buffers and four workers per daemon. Also open: the 5% rows (still under a tenth of the offer; FEC or a different response), and the real path's second direction, which waits on a setting of the receiving machine's card. |
 | Coexist with other traffic | Against one TCP CUBIC flow at a 1 Gbit/s, 7.5 ms token-bucket bottleneck: an even share with a one-BDP queue; with a quarter-BDP queue the queue-checked tolerance keeps TCP's share | Several competitors, other buffer depths and other TCP algorithms are unmeasured. |
 
 Unlimited loss remains high. TAP ingress drops, bounded worker queue drops,
@@ -3375,6 +3376,220 @@ receive buffers it can raise, which is a setting of the machine it runs
 on, and both hosts need a path to the line that does not charge its
 forwarding to the daemon's cores. Until then the rows above are the
 real-path baseline that later changes are compared with.
+
+## The real path after the hosts' changes (November 26)
+
+Both things the entry above asked of the hosts have changed. The left
+host's receive sockets now reach 16 MiB, and both hosts attach to their
+machines' network cards by macvlan, without a veth and a bridge. No
+receive socket overflowed in any run below. Neither interface coalesces
+UDP for the daemon yet.
+
+Four workers, sixteen QinQ flows of 1522-byte frames as 44-segment GSO,
+10 s points, `eb0f845` with default settings.
+
+Both directions loaded, two rounds
+([results](benches/real-path-loss-scan-ab-nov26.json), the `old` rows):
+
+| Offered each way, Gbit/s | Left to right: delivered | Right to left: delivered | Left daemon CPU | Right daemon CPU |
+| --- | --- | --- | --- | --- |
+| 2 | 1.84–1.86 | 1.38–1.54 | 139–142% | 135–144% |
+| 3 | 2.85–2.86 | 1.52–1.57 | 179–186% | 163–168% |
+| 4 | 3.78–3.79 | 1.54–1.60 | 223–228% | 192–207% |
+| 5 | 3.64–4.15 | 1.50–1.68 | 229–251% | 193–216% |
+
+One direction loaded and 16 Mbit/s the other way, a trace build of the
+same source
+([left to right](benches/real-path-left-to-right-nov26.json),
+[right to left](benches/real-path-right-to-left-nov26.json)):
+
+| Direction | Offered, Gbit/s | Delivered | Missing | Sender CPU, busiest worker | Receiver CPU |
+| --- | --- | --- | --- | --- | --- |
+| Left to right | 5 | 4.54 | 5.1% | 220%, 73% | 121% |
+| | 6 | 5.49 | 4.3% | 257%, 89% | 146% |
+| Right to left | 3 | 1.93 | 33.0% | 107%, 31% | 65% |
+| | 5 | 1.93 | 59.3% | 117%, 34% | 64% |
+
+Each direction's first row is its run's first point and includes the
+ramp from a new session.
+
+**Left to right, four workers carry 5.49 Gbit/s across the real path.**
+The trace shows a sender that waits for its pacing time and almost never
+for its window: the controller's bandwidth estimate stays at 7.6–10.2
+Gbit/s on the wire, the minimum RTT is 7.2 ms, and the lanes lose at
+most 0.03% of their datagrams in a second. The busiest sending worker is
+at 89%. On this path, in this direction, the daemon's own cores are the
+limit.
+
+**Right to left the receiving machine's network card is the limit, and
+it limits plain UDP the same way.** With the daemon out of the picture,
+`udp_load` sent sixteen UDP flows on distinct ports from one host's outer
+address to the other's
+([all runs](benches/real-path-plain-udp-nov26.txt)):
+
+| Plain UDP, payload Gbit/s | Offered | Delivered | Lost |
+| --- | --- | --- | --- |
+| Left to right | 4 | 3.99 | 0.08% |
+| | 6 | 5.88 | 0.1% |
+| Right to left | 2 | 1.97 | 1.4% |
+| | 3 | 2.33 | 22% |
+| | 4 | 2.67 | 33% |
+| | 5 | 2.75 | 45% |
+| Right to left, half to each of two destination addresses | 4 | 3.96 | 1% |
+
+Right to left, the delivered rate does not depend on the length of the
+sender's trains (2.5–2.7 Gbit/s at 3 offered with 44, 12 or 4 segments)
+or on the number of sending processes. It depends on the destination
+address. The receiving machine's own counters show one core handling
+every datagram sent to one address, two cores when the same load is
+split over two addresses that its card serves, and several cores for
+eight TCP streams, which deliver 3.73 Gbit/s in the same direction. The
+card hashes UDP by the two addresses alone, so the distinct source ports
+the daemon gives its lanes (design R05) all land on one receive queue.
+That queue takes 2 Gbit/s of full datagrams cleanly and loses a fifth or
+more above that.
+
+The daemon's 1.93 Gbit/s is that queue's clean rate. Its controller
+reads a bandwidth of 2.4–2.9 Gbit/s on the wire, sees 0.1–1.2% of its
+datagrams lost whenever it probes above that, and leaves most of both
+daemons idle: the sender uses 107–117% of its four cores and the
+receiver 64–65%. With both directions loaded the same queue also takes
+the ACKs for the other direction, and the row falls to 1.4–1.7.
+
+What follows for the gate:
+
+- The path carries the gate's rate in both directions: 5.9 Gbit/s of
+  plain UDP one way and 3.96 of 4.00 offered the other.
+- The daemon meets 5 Gbit/s with four workers in the direction where
+  nothing but its own cores limits it.
+- The other direction needs the receiving machine's card to hash UDP by
+  ports as well as addresses, which is a setting of that machine and
+  outside the daemon. Until then that direction measures the card.
+
+Twelve transmit lanes on four workers did not get around the queue and
+exposed a fault of their own: on November 25 two of three such runs
+collapsed to under 0.02 Gbit/s with the controller's pacing rate at
+14–70 Mbit/s. The same configuration delivers 2.94 Gbit/s each way at 3
+offered on loopback. The entry below finds the cause and removes it.
+
+## Three sender changes from the delay and real-path work (November 25 and 26, landed)
+
+Three faults, each found by a measurement above and each a few lines to
+remove. They land together because the first exposed the second.
+
+### A loss pass stops below the largest acknowledged packet
+
+On a path with delay a sender's worker loop turns 2.5–3.5 times as often
+as on loopback (the delay entry above). Counting why a lane asked for
+another turn found one cause. After every ACK the lane started a loss
+pass over everything it had in flight, 64 packets a turn. A loss
+threshold can only apply to a packet numbered below the largest
+acknowledged one, and on a 7.5 ms path a thousand packets or more sit
+above it. The pass visited them all, found nothing, and kept the worker
+turning until the next ACK started the next pass.
+
+A pass that no forced cutoff asks for now stops below the largest
+acknowledged number (`History::outstanding_scan_below`). A forced pass,
+which a PTO starts, still visits everything.
+
+### A late pacing claim keeps its schedule
+
+The first change let workers sleep between ACKs, and sleeping showed a
+second fault. The pacer started each interval at the moment of the
+claim, so a worker that woke a few tens of microseconds after its turn
+lost that time for good. At 2–3 Gbit/s a 65 kB claim lasts 170–260 µs,
+so every late wake costs a visible share of one, and it showed as sender
+queue drops near a worker's limit. The spinning loss pass had hidden it:
+a worker that never sleeps is never late.
+
+A claim made after its time now keeps the lateness, up to half its own
+interval (`Budget::pace`). Linux's fq and TCP's internal pacing give the
+same credit for timer drift. An idle group saves up no more than half a
+claim.
+
+### An idle session's probes are application-limited
+
+Traces of the real-path runs showed every session leaving Startup before
+its first frame. A connected session sends one small liveness probe a
+second. Their ACKs were ordinary rate samples, three of them without
+growth ended Startup, and three seconds after the handshake the
+controller cruised on a bandwidth of 0.5 MB/s. When load arrived twelve
+seconds later it met a pacing rate of 2–3 Mbit/s and a window of 6 kB,
+and climbed from there in the steps of bandwidth probing.
+
+- A loaded direction lost 5–9% of its first 10 s point.
+- A 16 Mbit/s flow of 44-segment trains in the other direction lost
+  42–95% of its first point in five runs, and half or more of the
+  second in two of them: each train lasts under 100 ms, too short for a
+  probing phase to raise the estimate.
+- Twelve lanes on four workers never climbed. Their requests expired
+  waiting for pacing time, so nothing was sent in the phases that could
+  have raised the rate. This was the collapse the entry above ends on.
+
+The controller already refused to end Startup on MTU probes. A probe or
+other control datagram claimed while no worker holds unsent data now
+marks the application-limited bubble, as new data does, so its sample
+cannot end Startup or lower the bandwidth estimate.
+
+### What they change
+
+Relay bed, 7.5 ms round trip, sixteen QinQ flows, 20 s points; "scan" is
+the first change alone, "all" the three together:
+
+| Workers, loss | Offered each way, Gbit/s | Old: delivered, missing | New: delivered, missing | Old CPU per daemon | New CPU per daemon |
+| --- | --- | --- | --- | --- | --- |
+| 2, none ([results](benches/loss-scan-pacing-two-workers-nov26.json)) | 3 | 2.96, 0.0–0.2% | scan 2.95–2.96, 0.2–0.4%; with pacing 2.96, 0.0–0.2% | 116–125% | 92–103% |
+| 4, 0.1% ([results](benches/loss-scan-four-workers-0.1pct-nov25.json)) | 5.5 | 5.32–5.37, 1.1–2.0% | scan 5.35–5.37, 1.1–1.4% | 269–283% | 247–252% |
+| | 7 | 5.59–6.12, 11–19% | scan 6.39–6.73, 2.5–7.6% | 321–330% | 301–307% |
+| 2, 1% ([results](benches/loss-scan-two-workers-1pct-nov26.json)) | 2 | 1.83–1.97, 0.4–7.6% | scan 1.94–1.97, 0.3–1.6% | 97–106% | 86–95% |
+| 4, 1% ([results](benches/sender-changes-relay-1pct-nov26.json)) | 3 | 2.94–2.96, 0.1–0.9% | all 2.92–2.96, 0.1–1.6% | 169–192% | 145–165% |
+| | 4 | 3.92–3.95, 0.0–0.7% | all 3.90–3.95, 0.1–1.2% | 228–247% | 204–216% |
+
+Delivery is the same within the bed's noise and the daemons use 6–20%
+less CPU; at 7 offered and 0.1% loss the freed turns deliver 0.6 Gbit/s
+more each way. With two workers at 3 offered the scan alone drops
+273–432 frames at the senders' queues in a point where the old build
+drops 35–268, and the pacing credit brings that to 52–233. In five
+earlier four-worker rounds at 1% loss and 3 offered the scan alone read
+0.3–1.6% missing left to right against the old build's 0.1–0.3%, and
+0.0–4.6% against 0.0–3.2% the other way
+([first](benches/loss-scan-four-workers-1pct-ramp-nov26.json),
+[second](benches/loss-scan-four-workers-1pct-nov26.json)); three rounds
+of the scan against the scan with pacing read 0.0–1.3% and 0.2–1.2%
+([results](benches/loss-scan-pacing-four-workers-1pct-nov26.json)), and
+the row above, with all three, shows no such gap. On loopback, where no
+pass was ever long, old and new are the same: four workers deliver
+2.97 Gbit/s each way at 3 offered with nothing missing at 110–113% per
+daemon ([results](benches/sender-changes-loopback-nov26.json)).
+
+Real path, four workers, 10 s points:
+
+| Run | Old | New |
+| --- | --- | --- |
+| Both ways at 3 and 4 offered, two rounds ([scan](benches/real-path-loss-scan-ab-nov26.json)): left to right | 2.85–2.86, 3.78–3.79 | scan 2.74–2.86, 3.62–3.78 |
+| Same, daemon CPU left and right at 4 offered | 223–228%, 192–207% | scan 209–213%, 175–177% |
+| Right to left alone at 3 offered, three rounds ([scan](benches/real-path-loss-scan-lossy-direction-nov26.json)) | 1.56–1.69, sender 98–105% | scan 1.57–1.72, sender 80–96% |
+| Left to right alone at 6 offered, two rounds ([pacing](benches/real-path-pacing-credit-one-way-nov26.json)) | scan 4.71–5.04, 11–18% missing | with pacing 5.36–5.41, 6% missing |
+| Left to right alone, first point of a session at 5 offered ([startup](benches/real-path-startup-fix-nov26.json)) | 4.38–4.57, 4.6–8.6% missing | all 4.78, 0.1% missing |
+| The 16 Mbit/s flow the other way in that point | 42–95% missing | all 0.0% missing |
+| Twelve lanes, right to left alone at 3 and 4 offered ([first](benches/real-path-twelve-lanes-nov26.json), [second](benches/real-path-twelve-lanes-both-nov26.json)) | 0.00–0.01 in two runs of three | all 1.69–1.75, 1.76–1.79 |
+| Twelve lanes, left to right alone at 3 and 4 offered (the second file) | not run | all 2.87, 3.83 |
+| Both ways, all three against old, two rounds ([results](benches/real-path-sender-changes-nov26.json)): left to right at 3, a session's first point | 2.63–2.70, 4.8–7.9% missing | all 2.86, 0.0% missing |
+| Same, at 4 offered | 3.74–3.77, 0.0–0.2% missing | all 3.50–3.71, 0.6–7.7% missing |
+| Same, at 5 offered | 3.52–4.32, 8.5–25.5% missing | all 4.51–4.66, 0.8–4.0% missing |
+| Same, right to left at 3, 4 and 5 offered | 1.36–1.45, 1.40–1.54, 0.89–1.16 | all 1.53, 1.37–1.51, 1.29–1.33 |
+
+With the pacing credit and both directions loaded, two rounds read the
+same as the scan alone within that day's noise
+([results](benches/real-path-pacing-credit-both-ways-nov26.json)). After
+the third change a trace shows both controllers still in Startup when
+the first point begins, twelve seconds after the handshake.
+
+One thing these runs show and do not fix: on the relay bed's 1% path a
+new session's first point sometimes loses several percent while Startup
+ends on random loss below the offered rate (5.2% in one of two rounds
+here, and 39% in one earlier run of the old build). That ramp is listed
+in ROADMAP.md.
 
 ## The per-frame cost on November 19
 

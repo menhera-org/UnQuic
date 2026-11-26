@@ -100,14 +100,27 @@ impl Lane {
         if self.ack.is_some() || self.report_pending || self.scan.is_some() {
             return Err(io::ErrorKind::WouldBlock.into());
         }
-        self.scan = Some(self.history.outstanding_scan());
         self.scan_cutoff = self.forced_before.take();
         if force {
             self.scan_cutoff = Some(self.scan_cutoff.map_or(before, |old| old.max(before)));
         }
+        self.scan = Some(self.loss_scan());
         self.scan_due = None;
         self.loss_due = None;
         Ok(())
+    }
+
+    /// A pass over what the cutoff just set can declare lost. A forced cutoff
+    /// reaches every outstanding packet. Without one only the thresholds
+    /// apply, and they apply to packets below the largest ACK alone, so the
+    /// pass leaves the rest of what is in flight unvisited: on a path of some
+    /// milliseconds that is a thousand packets or more after every ACK.
+    fn loss_scan(&self) -> crate::ack::OutstandingScan {
+        if self.scan_cutoff.is_some() {
+            self.history.outstanding_scan()
+        } else {
+            self.history.outstanding_scan_below(self.largest_ack)
+        }
     }
 
     /// Queue a fixed-cutoff sweep; newer sends cannot extend an in-progress pass.
@@ -228,8 +241,8 @@ impl Lane {
             if self.forced_before.is_none() && self.loss_due.is_none_or(|due| due > now) {
                 return Ok(false);
             }
-            self.scan = Some(self.history.outstanding_scan());
             self.scan_cutoff = self.forced_before.take();
+            self.scan = Some(self.loss_scan());
             self.scan_due = None;
             self.loss_due = None;
         }

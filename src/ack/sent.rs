@@ -666,22 +666,33 @@ impl History {
         }
     }
 
+    /// Starts a bounded pass over the outstanding charges numbered below
+    /// `number`. With the lane's largest acknowledged number these are the
+    /// only packets a loss threshold applies to, so a pass that follows an
+    /// ACK need not visit everything still in flight above it.
+    pub const fn outstanding_scan_below(&self, number: u64) -> OutstandingScan {
+        let end = number.saturating_sub(1);
+        OutstandingScan {
+            next: if number == 0 || self.inflight_bytes == 0 || end < self.floor {
+                None
+            } else {
+                Some(self.floor)
+            },
+            end: if end < self.allocated {
+                end
+            } else {
+                self.allocated
+            },
+            skip_empty: false,
+        }
+    }
+
     /// Whether a charged packet numbered below `number` is still outstanding.
     ///
     /// Spends at most `budget` bitmap reads and answers true when they run
     /// out first, so a caller that skips work on false never skips wrongly.
     pub fn outstanding_below(&self, number: u64, mut budget: usize) -> bool {
-        let Some(end) = number.checked_sub(1) else {
-            return false;
-        };
-        if self.inflight_bytes == 0 || end < self.floor {
-            return false;
-        }
-        let mut scan = OutstandingScan {
-            next: Some(self.floor),
-            end: end.min(self.allocated),
-            skip_empty: false,
-        };
+        let mut scan = self.outstanding_scan_below(number);
         scan.advance(self, &mut budget).is_some() || !scan.is_complete()
     }
 

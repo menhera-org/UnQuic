@@ -865,7 +865,11 @@ window, none of the worker's own frames awaiting repair and no refused
 admission since the worker last held data starts draft 07's
 application-limited bubble at delivered plus inflight; sends join it until
 delivery passes that point. Without this, ACKs of sparse traffic before a load
-could end Startup before the load arrived. The daemon-wide
+could end Startup before the load arrived. A probe claimed while no bit is set
+marks the bubble too, or an idle session's one liveness probe a second ends
+Startup within three seconds of the handshake. A pacing claim made after its
+time keeps the lateness, up to half its own interval, so a worker that sleeps
+until its turn still sends at the published rate. The daemon-wide
 `tolerate_random_loss` switch, on by default, deviates from draft 07: outside
 bandwidth probing, a loss round cuts the short-term bounds only when it lost
 more than 2% or even its smallest RTT sample, less the receiver's reported
@@ -918,10 +922,13 @@ Release forwarding, reconnect, allocation and routed-MTU regression tests pass.
 Sixteen workers per daemon first delivered 20 Gbit/s each way on
 November 19, and they pass 5 Gbit/s each way over a local routed path
 with loss. Since November 20 four workers pass it too when the path's
-emulation runs on other cores. The first runs across a real path of the
-target network were made on November 25, between two shared container
-hosts that limit them. The lossy-path gate is set for two to four cores on
-a real line and remains open. BENCH.md records the measurements.
+emulation runs on other cores. Runs across a real path of the target
+network began on November 25, between two shared container hosts. Since
+November 26 four workers carry 5.5 Gbit/s across it in one direction. The
+other is held near 2 Gbit/s by the receiving machine's network card, which
+limits plain UDP the same way. The lossy-path gate is set for two to four
+cores on a real line and remains open in that direction. BENCH.md records
+the measurements.
 
 ## TAP read batching
 
@@ -1177,7 +1184,8 @@ shared rate, so summing session rates can count a group more than once.
 counts plans whose frame deadline passed before or at the syscall;
 `cancelled_grants` counts claimed or waiting plans dropped for changed paths,
 connection identities or history pressure. The names predate the shared budget.
-`app_limited_marks` counts application-limited bubbles a worker started.
+`app_limited_marks` counts application-limited bubbles a worker started for
+new data; the bubbles its probes start on an idle session are not counted.
 `repairs` counts successfully submitted repair DATA records, including separate
 pieces of the same range. Feedback delay remains zero until its integration.
 Cumulative counts wrap modulo 2^64.
@@ -1272,6 +1280,7 @@ state are available through the library's `Control` API.
 | `tap_errors` rises | `tap_error_code` holds the errno of the latest refused TAP read or write: `EIO` (5) means the device a queue belongs to is administratively down, `EBADFD` (77) that the queue is no longer attached to a device. Zero means a frame failed the daemon's own checks |
 | Throughput stays low with many lanes | Flow count, TAP queue placement, worker/receive distribution and CPU use; each frame stays on one lane |
 | Losses and repairs climb with load though CPU is free | `receive_buffer_fallbacks` and `socket_overflow`. Without `CAP_NET_ADMIN` the receive sockets get only `net.core.rmem_max` (often about 416 KiB after doubling), and with UDP GRO each overflow drops a coalesced batch of up to 64 datagrams. On such a host TCP through the tunnel retransmitted about 1% of its segments under unlimited load (BENCH.md); give the daemon `CAP_NET_ADMIN` or raise `rmem_max` |
+| One direction stops near 2 Gbit/s with idle workers, no `socket_overflow`, and several TCP streams pass more | The receiving host's network card. Many cards hash UDP by the two addresses alone, and then every lane lands on one receive queue and one core however many source ports the sender uses. `ethtool -n DEV rx-flow-hash udp6` shows the hashed fields and `ethtool -N DEV rx-flow-hash udp6 sdfn` adds the ports. On one real path a single queue passed 2 Gbit/s cleanly and plain UDP lost a fifth or more above that (BENCH.md) |
 | Delay grows when the tunnel is overloaded | The TAP's transmit queue length. Under overload frames wait in the kernel's TAP ring before the daemon reads them, and with GSO input each entry can hold a 64 KB super-frame. On the loopback overload check 64 entries instead of 500 cut the median one-way delay from 34–50 ms to 4–8 ms with no loss of delivery (BENCH.md); set it with `ip link set DEV txqueuelen 64` |
 
 Both directions send from dynamic source ports to configured fixed receive

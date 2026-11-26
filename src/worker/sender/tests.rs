@@ -1133,6 +1133,33 @@ fn overtaken_probe_refreshes_its_history_and_reply_identity() {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
+fn a_probe_sent_with_nothing_unsent_is_application_limited() {
+    let (mut workers, _rx) = workers();
+    workers[0]
+        .request_probe(0, 0, BASE_UDP_PAYLOAD, false, None, Duration::ZERO)
+        .unwrap();
+    for _ in 0..8 {
+        service(&mut workers);
+    }
+    let index = workers[0].sender_index(0, 0).unwrap();
+    let lane = &workers[0].sender.lanes[index];
+    let packet = lane
+        .history
+        .packet(lane.history.highest_allocated())
+        .unwrap();
+    let record = workers[0]
+        .sender
+        .records
+        .get(packet.sample_slot.unwrap())
+        .unwrap();
+    assert!(
+        record.app_limited,
+        "an idle session's probe cannot show that its path is full"
+    );
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
 fn refresh_history_pressure_reports_unused_and_preserves_frame() {
     let (mut workers, rx) = workers();
     let index = workers[0].sender_index(0, 0).unwrap();
@@ -2394,6 +2421,47 @@ fn admitted_acks_finish_then_loss_progresses_under_continuous_ack_input() {
             lane.install(2).unwrap();
         }
     }
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
+fn a_loss_pass_after_an_ack_leaves_the_flight_above_it_unvisited() {
+    let (mut workers, _rx) = workers();
+    let [peer, worker] = &mut workers;
+    let index = worker.sender_index(0, 1).unwrap();
+    // One packet below the acknowledged one and a flight of 400 above it.
+    for number in 1..=402 {
+        worker.sender.lanes[index]
+            .history
+            .reserve(number, 1280, true, true)
+            .unwrap();
+        assert!(worker.sender.lanes[index].submitted(number, Duration::ZERO, None));
+    }
+    let now = Duration::from_millis(1);
+    let acked = [AckRange { start: 2, end: 2 }];
+    worker
+        .incoming_ack(0, 1, 2, 0, AckRanges::new(&acked).unwrap(), now)
+        .unwrap();
+    worker.service_sender(now).unwrap();
+    let Some(Event::Sender(Message::Report(report))) = peer.incoming[1].as_mut().unwrap().try_pop()
+    else {
+        panic!("missing ACK report")
+    };
+    worker
+        .sender_message(Message::ReportReturn(report), now)
+        .unwrap();
+    assert_eq!(worker.sender.lanes[index].loss_passes, 1);
+    // No threshold applies above the largest ACK, so the owed pass has packet
+    // 1 to visit and ends within two turns of 64 visits each. A pass over
+    // everything outstanding would take seven.
+    for _ in 0..2 {
+        worker.service_sender(now).unwrap();
+    }
+    let lane = &worker.sender.lanes[index];
+    assert!(lane.scan.is_none());
+    assert_eq!(lane.loss_passes, 0);
+    assert_eq!(lane.history.outstanding().count(), 401);
+    assert!(lane.deadline().is_some_and(|due| due > now));
 }
 
 #[test]

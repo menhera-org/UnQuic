@@ -267,6 +267,8 @@ on one socket. The four-worker defaults use daemon CPUs 0-7 and load CPUs 8-19.
 The two-worker defaults use daemon CPUs 0–3 and load CPUs 4–7.
 The eight-worker defaults use daemon CPUs 0-15 and one load process on each of
 CPUs 16-19. Verify the host's topology before using any layout.
+`TX_LANES` sets both peers' `tx_lanes` to something other than the worker
+count.
 
 `TAP_TXQUEUELEN` sets the test TAP queue length (1–10,000; default 10,000).
 With USO input, each entry can hold a whole super-frame, so record this value
@@ -305,9 +307,12 @@ hosts need no connection to each other besides the path under test, only
 clocks that agree to a fraction of a second. The settings are environment
 variables: `WORKERS`, `FLOWS`, `DURATION`, `BITRATE` (bits/s per flow, one
 value per point), `SEGMENTS`, `VLAN_DEPTH`, `GENERATOR_PROCESSES`,
-`DAEMON_TOML`, `OUTER_PAYLOAD_LIMIT`, `PORT` (40100), `TAP_TXQUEUELEN` (500)
-and the comma-separated CPU lists `DAEMON_CPUS`, `GENERATOR_CPUS` and
-`RECEIVER_CPUS`. Left-to-right flows use the same ports as in
+`DAEMON_TOML`, `OUTER_PAYLOAD_LIMIT`, `PORT` (40100), `TAP_TXQUEUELEN` (500),
+`TX_LANES` (the worker count) and the comma-separated CPU lists
+`DAEMON_CPUS`, `GENERATOR_CPUS` and `RECEIVER_CPUS`. `BITRATE_LEFT` or
+`BITRATE_RIGHT` gives that side's senders a rate list of their own, which
+loads one direction while the other carries a trickle; both lists need as
+many points as `BITRATE`. Left-to-right flows use the same ports as in
 `tap_transport.sh`, and right-to-left flows the ports 2000 above them.
 
 The daemon's sockets use the host's network as it is. The script changes two

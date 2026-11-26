@@ -271,7 +271,7 @@ name = "peer"
 endpoint = "rx"
 host = "$host"
 peer_port = $remote
-tx_lanes = $workers
+tx_lanes = ${TX_LANES:-$workers}
 outer_payload_limit = ${OUTER_PAYLOAD_LIMIT:-1232}
 [[sessions]]
 name = "uq-$side"

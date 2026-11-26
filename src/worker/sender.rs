@@ -1999,6 +1999,12 @@ impl Worker {
             Ok(bytes) => match budget.charge(bytes, window) {
                 Some(prior) => match budget.pace(bytes, state.rate, now) {
                     Ok(()) => {
+                        // Control sent while no worker holds unsent data says nothing of
+                        // the path's rate. Unmarked, an idle session's liveness probes
+                        // would end Startup at their own few packets a second.
+                        if !matches!(job.kind, JobKind::Data) && budget.unsupplied() {
+                            budget.application_limited(&state);
+                        }
                         let claim = Claim {
                             group: job.group,
                             prior,

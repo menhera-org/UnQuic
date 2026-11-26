@@ -1,0 +1,41 @@
+Plain UDP and TCP between the two hosts of the real path, November 26. No daemon:
+examples/udp_load sends from one host's outer address to the other's, sixteen flows on
+distinct port pairs, 1452-byte payloads, 10 s per line, two sending and two receiving
+processes unless a line says otherwise. Rates are payload Gbit/s. No receive socket
+overflowed except where noted. TCP is iperf3 3.20 with default settings.
+
+Left to right, 44-segment trains
+  offered 4.00  sent 3.99  delivered 3.99  lost 0.077%
+  offered 6.00  sent 5.88  delivered 5.88  lost 0.105%
+  offered 8.00  sent 6.07  delivered 6.06  lost 0.078%   (the load processes' limit)
+
+Right to left, 44-segment trains
+  offered 2.00  sent 2.00  delivered 1.97  lost 1.368%
+  offered 3.00  sent 3.00  delivered 2.33  lost 22.433%
+  offered 4.00  sent 4.00  delivered 2.67  lost 33.267%
+  offered 5.00  sent 5.00  delivered 2.75  lost 45.003%
+
+Right to left at 3.00 offered, by train length, two passes
+  44 segments  delivered 2.59, 2.00  lost 13.6%, 33.3%
+  12 segments  delivered 2.62, 2.66  lost 12.5%, 11.4%
+   4 segments  delivered 2.65, 2.53  lost 11.8%, 15.5%
+
+Right to left at 4.00 offered, by number of sending processes, two passes
+  1 process    delivered 2.49, 2.43  lost 37.7%, 39.3%
+  2 processes  delivered 2.69, 2.60  lost 32.7%, 35.0%
+  4 processes  delivered 1.94, 2.10  lost 51.5%, 47.5%   (receive sockets overflowed:
+               four receiving processes shared CPUs)
+
+Right to left, 4.00 offered in two halves to two destination addresses that the
+receiving machine's network card serves, eight flows to each
+  first address   sent 2.00  delivered 1.99
+  second address  sent 2.00  delivered 1.97
+  together        delivered 3.96 of 4.00
+During this run two cores of the receiving machine handled the datagrams, one for
+each address. During every run above to one address, one core handled all of them.
+During the TCP runs below several did.
+
+TCP
+  right to left, 8 streams  3.73 Gbit/s received, 1476 retransmits
+  right to left, 1 stream   0.66 Gbit/s received, 181 retransmits
+  left to right, 8 streams  2.97 Gbit/s received, 1141 retransmits
