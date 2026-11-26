@@ -188,12 +188,15 @@ fn unit_path(path: &Path) -> io::Result<&str> {
 }
 
 /// The unit template of design section 12.1 for this binary and paths.
+// DECISION(2026-11-27): the unit is ordered before network.target and wanted by it alone.
+//   Why: the user's instruction of that date. Rejected: RequiredBy and Before for both
+//   network.target and network-online.target (a daemon failure then failed both targets).
 pub fn unit(binary: &Path, config: &Path, pid_file: &Path) -> io::Result<String> {
     let (binary, config, pid) = (unit_path(binary)?, unit_path(config)?, unit_path(pid_file)?);
     Ok(format!(
         "[Unit]
 Description=UnQuic Ethernet transport
-Before=network.target network-online.target
+Before=network.target
 
 [Service]
 Type=forking
@@ -203,7 +206,7 @@ TimeoutStartSec=infinity
 Restart=on-failure
 
 [Install]
-RequiredBy=network.target network-online.target
+WantedBy=network.target
 "
     ))
 }
@@ -221,18 +224,26 @@ mod tests {
         )
         .unwrap();
         for line in [
-            "Before=network.target network-online.target",
+            "Before=network.target",
             "Type=forking",
             "PIDFile=/run/unquic.pid",
             "ExecStart=/usr/bin/unquic start /etc/unquic.toml /run/unquic.pid",
             "TimeoutStartSec=infinity",
             "Restart=on-failure",
-            "RequiredBy=network.target network-online.target",
+            "WantedBy=network.target",
         ] {
             assert!(text.lines().any(|l| l == line), "{line}");
         }
-        // The service must not depend on, or wait for, the targets it precedes.
-        for word in ["After=", "Requires=", "Wants=", "wait-online"] {
+        // The service must not depend on, or wait for, the target it precedes, and
+        // names no other target: network-online.target follows network.target by itself.
+        for word in [
+            "After=",
+            "Requires=",
+            "Wants=",
+            "RequiredBy=",
+            "wait-online",
+            "network-online",
+        ] {
             assert!(!text.contains(word), "{word}");
         }
         for bad in [
