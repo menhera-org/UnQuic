@@ -1,0 +1,43 @@
+A static kernel L2TPv3 Ethernet pseudowire against the daemon on the real path, November 26.
+benches/pair_side.sh, sixteen QinQ flows of 1522-byte frames, both directions loaded alike,
+10 s points, one round. Rates are the load tool's own counts in Gbit/s of 1472-byte
+payloads; cpu-s is CPU seconds of the load processes over the 10 s (snd, rcv).
+
+  l2ip, l2udp  KERNEL_TUNNEL=l2tp with L2TP_ENCAP=ip and udp: no daemon. The tunnel device
+               takes no segmentation offload, so the load tool sends frames singly; four
+               sending and four receiving processes a host. Each 1570-byte tunnel packet
+               leaves as two IPv6 fragments. The sending processes' CPU includes the
+               tunnel's transmit work; its receive work is kernel softirq on the hosts'
+               machines and is not in any number here.
+  uq1          the daemon (836057a, four workers), the same single frames; two sending
+               and two receiving processes a host.
+  uq44         the daemon, 44-segment GSO trains, as in the entries above.
+
+l2ip     r1/0  | L>R off  0.50 got  0.50 miss   0.0% reord       0 cpu-s snd  6.00 rcv  3.34 | R>L off  0.50 got  0.50 miss   0.0% reord       0 cpu-s snd  3.99 rcv  4.83
+l2ip     r1/1  | L>R off  0.98 got  0.98 miss   0.0% reord       0 cpu-s snd 12.11 rcv  4.67 | R>L off  1.00 got  0.37 miss  63.5% reord       0 cpu-s snd  7.16 rcv  4.60
+l2ip     r1/2  | L>R off  1.51 got  1.51 miss   0.0% reord       0 cpu-s snd 15.57 rcv  6.53 | R>L off  1.95 got  0.00 miss 100.0% reord       0 cpu-s snd 14.11 rcv  0.80
+l2ip     r1/3  | L>R off  1.61 got  1.60 miss   0.5% reord       0 cpu-s snd 14.88 rcv  7.29 | R>L off  2.07 got  0.00 miss 100.0% reord       0 cpu-s snd 15.62 rcv  0.82
+l2udp    r1/0  | L>R off  0.50 got  0.50 miss   0.0% reord       0 cpu-s snd  6.41 rcv  2.41 | R>L off  0.50 got  0.50 miss   0.0% reord       0 cpu-s snd  3.67 rcv  4.46
+l2udp    r1/1  | L>R off  0.98 got  0.98 miss   0.0% reord       0 cpu-s snd 11.99 rcv  4.12 | R>L off  1.00 got  0.78 miss  22.0% reord       0 cpu-s snd  7.02 rcv  7.99
+l2udp    r1/2  | L>R off  1.51 got  1.51 miss   0.0% reord       0 cpu-s snd 15.49 rcv  6.05 | R>L off  1.96 got  0.00 miss 100.0% reord       0 cpu-s snd 14.34 rcv  0.94
+l2udp    r1/3  | L>R off  1.61 got  1.60 miss   0.5% reord       0 cpu-s snd 15.26 rcv  6.24 | R>L off  2.05 got  0.00 miss 100.0% reord       0 cpu-s snd 16.13 rcv  0.90
+uq1      r1/0  | L>R off  0.50 got  0.50 miss   0.1% reord       0 cpu-s snd  2.72 rcv  2.05 | R>L off  0.50 got  0.50 miss   0.0% reord       0 cpu-s snd  1.16 rcv  2.95
+uq1      r1/1  | L>R off  1.00 got  1.00 miss   0.0% reord       0 cpu-s snd  5.05 rcv  3.64 | R>L off  1.00 got  1.00 miss   0.0% reord       0 cpu-s snd  2.29 rcv  4.98
+uq1      r1/2  | L>R off  1.97 got  1.86 miss   5.8% reord       2 cpu-s snd  9.26 rcv  4.05 | R>L off  2.00 got  1.99 miss   0.3% reord      17 cpu-s snd  4.44 rcv  7.29
+uq1      r1/3  | L>R off  2.94 got  1.79 miss  39.3% reord       0 cpu-s snd 13.51 rcv  3.97 | R>L off  3.00 got  2.37 miss  21.0% reord    5287 cpu-s snd  6.60 rcv  5.89
+uq44     r1/0  | L>R off  0.50 got  0.50 miss   0.0% reord       0 cpu-s snd  0.39 rcv  0.78 | R>L off  0.50 got  0.50 miss   0.0% reord      48 cpu-s snd  0.41 rcv  0.88
+uq44     r1/1  | L>R off  1.00 got  1.00 miss   0.0% reord       0 cpu-s snd  0.56 rcv  1.09 | R>L off  1.00 got  1.00 miss   0.0% reord       0 cpu-s snd  0.61 rcv  1.27
+uq44     r1/2  | L>R off  2.00 got  2.00 miss   0.0% reord      32 cpu-s snd  0.87 rcv  1.81 | R>L off  2.00 got  1.96 miss   1.8% reord     164 cpu-s snd  1.05 rcv  1.94
+uq44     r1/3  | L>R off  3.00 got  3.00 miss   0.0% reord     268 cpu-s snd  1.19 rcv  2.28 | R>L off  3.00 got  2.91 miss   2.9% reord    4593 cpu-s snd  1.40 rcv  2.72
+
+Daemon CPU, left and right, by point: uq1 134% 94%, 221% 168%, 247% 233%, 220% 199%;
+uq44 39% 32%, 71% 58%, 126% 106%, 180% 157%.
+
+Right to left through the pseudowire over IPv6 (l2ip): fragments the right host created,
+fragments that reached the left host's IPv6 layer, packets it delivered after reassembly.
+  0.5 offered     849,096      848,826     424,408
+  1 offered     1,698,160    1,649,358     369,487
+  2 offered     3,305,904    2,542,778           1
+  3 offered     3,506,668    2,354,673         216
+Left to right the right host reassembled every packet (no reassembly failures); the left
+host's senders could not offer more than 1.5-1.6 Gbit/s.

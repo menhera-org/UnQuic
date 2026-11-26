@@ -3820,6 +3820,71 @@ these runs and another 6–8% at 2, where four others lost 0–2%. First
 points lost up to 6% before the settings too, so this is the open ramp
 item of the entry above, but its worst case is now worse.
 
+## A kernel L2TPv3 pseudowire with IPv6 fragmentation on the same path (November 26)
+
+The plain alternative to the daemon is a static L2TPv3 Ethernet
+pseudowire in the kernel: each frame gets a tunnel header, and a
+1570-byte result leaves as two IPv6 fragments for the far kernel to
+reassemble. `benches/pair_side.sh` gained `KERNEL_TUNNEL=l2tp` for it
+(`L2TP_ENCAP=ip` or `udp`). Same hosts and settings as the entry above,
+sixteen QinQ flows, both directions loaded alike, 10 s points, one round
+([all rows](benches/real-path-l2tp-comparison-nov26.txt),
+[daemon, single frames](benches/real-path-l2tp-comparison-unquic-frames-nov26.json),
+[daemon, trains](benches/real-path-l2tp-comparison-unquic-gso-nov26.json)).
+
+The tunnel device takes no segmentation offload, so the load tool has to
+send it frames one by one, where the daemon's TAP takes 44-segment
+trains. The daemon is measured both ways. Delivered Gbit/s, left to
+right and right to left:
+
+| Offered each way | Pseudowire over IPv6 | Pseudowire over UDP | Daemon, single frames | Daemon, trains |
+| --- | --- | --- | --- | --- |
+| 0.5 | 0.50, 0.50 | 0.50, 0.50 | 0.50, 0.50 | 0.50, 0.50 |
+| 1 | 0.98, 0.37 | 0.98, 0.78 | 1.00, 1.00 | 1.00, 1.00 |
+| 2 | 1.51, 0.00 | 1.51, 0.00 | 1.86, 1.99 | 2.00, 1.96 |
+| 3 | 1.60, 0.00 | 1.60, 0.00 | 1.79, 2.37 | 3.00, 2.91 |
+
+CPU that these hosts let a container see, left host and right host, as
+a share of one core: the load processes, and the daemon's workers where
+there is a daemon.
+
+| Offered each way | Pseudowire over IPv6 | Daemon, single frames | Daemon, trains |
+| --- | --- | --- | --- |
+| 0.5 | 108%, 73% | 191%, 126% | 52%, 44% |
+| 1 | 167%, 118% | 321%, 227% | 89%, 75% |
+| 2 | | 413%, 318% | 154%, 135% |
+| 3 | | | 219%, 194% |
+
+**The pseudowire stops at a fraction of the daemon's rate, and one
+direction collapses.** Left to right its four sending processes cannot
+offer more than 1.5–1.6 Gbit/s: the tunnel's transmit work runs in their
+system calls and costs 14 µs of CPU a frame on the left host and 8–9 µs
+on the right, for two packets a frame through the same per-packet path
+the entries above measure. Right to left it delivers everything at 0.5
+offered, 37% over IPv6 and 78% over UDP at 1, and nothing at 2 or 3.
+
+**The collapse is reassembly.** Both fragments of a frame have no ports,
+so the receiving card puts all of them on one queue and one core. At 1
+offered, 170,000 packets a second, 2.9% of the fragments are lost before
+the left host's IPv6 layer, and nearly two thirds of the frames: a
+fragment whose partner is lost waits 60 s in a 4 MiB reassembly store,
+and a thousand or two of those fill it. At 2 offered the
+left host receives 2.5 million fragments in the point and reassembles
+one packet. Those are the kernel's default limits. The other direction
+loses nothing below its senders' limit, so it never shows this, and the
+daemon on the same path at 3 offered delivers 2.91 in the direction that
+collapses.
+
+**CPU.** For single frames the daemon costs more CPU that a container
+can see than the pseudowire does, 1.7–1.9 times at 0.5 and 1 offered,
+and is CPU-bound near 1.8–2.4 Gbit/s each way: it reads and writes each
+frame through the TAP and fragments it itself. That comparison leaves
+out the pseudowire's receive half, which is softirq on the hosts'
+machines and in no number here. With the trains a TAP accepts and the
+pseudowire's device does not, the daemon carries the same traffic for
+half to two thirds of the pseudowire's visible CPU and goes on to
+3 Gbit/s each way.
+
 ## The per-frame cost on November 19
 
 A profile build of `34aced8` on the full-size efficiency point (eight

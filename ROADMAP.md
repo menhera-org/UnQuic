@@ -47,6 +47,16 @@ direction rose from 1.9 to 2.5–2.9 Gbit/s; the path itself gives about
 4.3 of plain UDP that way, with 4% lost at 4
 ([BENCH.md](BENCH.md#the-real-path-with-udp-hashed-by-ports-and-where-its-cpu-goes-november-26)).
 
+A static kernel L2TPv3 pseudowire with IPv6 fragmentation was measured
+on the same path as the plain alternative
+([BENCH.md](BENCH.md#a-kernel-l2tpv3-pseudowire-with-ipv6-fragmentation-on-the-same-path-november-26)).
+It delivers everything at 0.5 Gbit/s each way, is sender-bound at
+1.5–1.6 one way, and collapses the other way: 37–78% at 1 offered and
+nothing at 2, once lost fragments fill the reassembly store. The daemon
+delivers 3.0 and 2.9 at 3 offered there. Fed single frames, the daemon
+uses 1.7–1.9 times the pseudowire's visible CPU; fed the trains its TAP
+accepts, half to two thirds of it.
+
 Open, ahead of the list below:
 
 1. CPU per delivered bit. Target boxes include four slow cores of the

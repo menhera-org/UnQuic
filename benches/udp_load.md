@@ -326,6 +326,18 @@ loads one direction while the other carries a trickle; both lists need as
 many points as `BITRATE`. Left-to-right flows use the same ports as in
 `tap_transport.sh`, and right-to-left flows the ports 2000 above them.
 
+`KERNEL_TUNNEL=l2tp` is a baseline without the daemon: the script sets up a
+static kernel L2TPv3 Ethernet pseudowire between the two addresses, over
+IPv6 itself or with `L2TP_ENCAP=udp` over UDP on `PORT`, and runs the same
+load through it. Its packets exceed a 1500-byte path and the kernel
+fragments them. The tunnel device takes no segmentation offload, so set
+`SEGMENTS=1`; a train fails with an I/O error. The device and its test
+addresses stay in the host's own namespace for the run, because an L2TP
+device moved into a namespace is not deleted with it. `sweep_report` cannot
+read such a run; the load tool's reports and the snapshots are there. The
+hosts need the `l2tp_eth` module and, for IPv6 encapsulation, `l2tp_ip6`;
+the kernel loads them on first use where it is allowed to.
+
 The daemon's sockets use the host's network as it is. The script changes two
 things, both for its own lifetime. The daemon's TAP appears in the host's
 namespace for the moment before the script moves it into a private one,

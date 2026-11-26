@@ -14,6 +14,14 @@
 # SEGMENTS VLAN_DEPTH GENERATOR_PROCESSES DAEMON_CPUS GENERATOR_CPUS
 # RECEIVER_CPUS (comma-separated lists) DAEMON_TOML OUTER_PAYLOAD_LIMIT PORT
 # TAP_TXQUEUELEN SESSION_COOKIE OUTER_UDP_GRO BITRATE_LEFT BITRATE_RIGHT TX_LANES.
+# KERNEL_TUNNEL=l2tp is a baseline: a static kernel L2TPv3 Ethernet pseudowire
+# between the two addresses takes the daemon's place, over IPv6 itself or,
+# with L2TP_ENCAP=udp, over UDP on PORT. Its packets exceed the path's MTU and
+# the kernel fragments them. DAEMON is then unused and sweep_report cannot read
+# the result; the load tool's reports and the CPU snapshots can.
+# DECISION(2026-11-26): the pseudowire's device and its test addresses stay in the host's
+#   namespace. Why: an L2TP device is not deleted with a namespace it was moved into, it
+#   falls back to the machine's first namespace. Rejected: the private namespace the TAP gets.
 set -eu
 [ "$#" -eq 7 ] || { echo "usage: $0 SIDE DAEMON UDP_LOAD OUT LOCAL6 PEER6 START" >&2; exit 2; }
 side=$1 daemon=$2 load=$3 out=$4 local6=$5 peer6=$6 start=$7
@@ -37,12 +45,20 @@ pid=
 servers=
 clients=
 gro_was=
+tunnel=
+case "${KERNEL_TUNNEL:-}" in ''|l2tp) ;; *) echo "KERNEL_TUNNEL must be l2tp" >&2; exit 2;; esac
+case "${L2TP_ENCAP:-ip}" in ip|udp) ;; *) echo "L2TP_ENCAP must be ip or udp" >&2; exit 2;; esac
 device=$(ip -6 route get "$peer6" | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)
 cleanup() {
     for process in $clients $servers $pid; do
         kill "$process" 2>/dev/null || :
     done
     wait || :
+    if [ -n "$tunnel" ]; then
+        # Deleting the session removes its device and the VLAN devices on it.
+        ip l2tp del session tunnel_id "$tunnel" session_id "$tunnel" 2>/dev/null || :
+        ip l2tp del tunnel tunnel_id "$tunnel" 2>/dev/null || :
+    fi
     # The TAP is persistent: it goes with its namespace, or by name if it never moved.
     ip netns del uq-inner 2>/dev/null || :
     [ -z "$gro_was" ] || ethtool -K "$device" $gro_was || :
@@ -95,7 +111,23 @@ sed -n '/model name/p' /proc/cpuinfo | head -n 1 > "$out/$side.cpu-model"
 getconf CLK_TCK > "$out/$side.clock-ticks"
 printf '%s\n' "${DAEMON_CPUS:-}" "${GENERATOR_CPUS:-}" "${RECEIVER_CPUS:-}" > "$out/$side.cpus"
 ip -s link show dev "$device" > "$out/$side.outer-device"
-taskset -c "$DAEMON_CPUS" "$daemon" run "$out/$side.toml" > "$out/$side.log" 2>&1 &
+if [ "${KERNEL_TUNNEL:-}" = l2tp ]; then
+    tunnel=$((4000 + n))
+    set -- tunnel_id "$tunnel" peer_tunnel_id "$((4000 + peer))" encap "${L2TP_ENCAP:-ip}" \
+        local "$local6" remote "$peer6"
+    [ "${L2TP_ENCAP:-ip}" = ip ] || set -- "$@" udp_sport "$port" udp_dport "$port"
+    ip l2tp add tunnel "$@"
+    ip l2tp add session name "$name" tunnel_id "$tunnel" session_id "$tunnel" \
+        peer_session_id "$((4000 + peer))"
+    # Room for a 1500-byte packet under two VLAN tags, as the TAP gives.
+    ip link set "$name" address "02:00:00:00:00:0$n" mtu 1508
+    echo 'TAPs ready' > "$out/$side.log"
+    inner=/proc/self/ns/net
+    # A stand-in for the daemon's process ID; it ignores the snapshot signal.
+    sh -c 'trap "" USR1; exec sleep 1000000' &
+else
+    taskset -c "$DAEMON_CPUS" "$daemon" run "$out/$side.toml" > "$out/$side.log" 2>&1 &
+fi
 pid=$!
 attempts=0
 until grep -q 'TAPs ready' "$out/$side.log" 2>/dev/null && ip link show "$name" >/dev/null 2>&1; do
@@ -104,8 +136,10 @@ until grep -q 'TAPs ready' "$out/$side.log" 2>/dev/null && ip link show "$name" 
     [ "$attempts" -lt 500 ] || { echo "TAP readiness timeout" >&2; exit 1; }
     sleep 0.01
 done
-ip netns add uq-inner
-ip link set "$name" netns uq-inner
+if [ -z "$tunnel" ]; then
+    ip netns add uq-inner
+    ip link set "$name" netns uq-inner
+fi
 in_ns() {
     nsenter --net="$inner" "$@"
 }
@@ -132,6 +166,8 @@ snapshot() {
         kill -USR1 $servers 2>/dev/null || :
     fi
     attempts=0
+    # A kernel tunnel prints no counters to wait for.
+    [ -z "$tunnel" ] || count=$((count - workers))
     while [ "$(grep -c '^unquic: worker [0-9][0-9]* Snapshot {.* }$' "$out/$side.log" || :)" -lt "$((count + workers))" ]; do
         kill -0 "$pid" || exit 1
         attempts=$((attempts + 1))
