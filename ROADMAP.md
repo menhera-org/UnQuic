@@ -41,17 +41,20 @@ The daemon's remaining features, all with tests:
 
 Open, ahead of the lists below:
 
-1. A stall of about a second on the real path, in both directions at once,
-   with or without the hold, at 0.5 Gbit/s of single frames as at 2, and
-   with trains: 6 of 20 points without the hold and 4 of 20 with it lost
-   more than 2.1% of their frames on November 27, most of them in such a
-   stall. Both senders' windows fill within 40 ms and almost no
-   acknowledgement is applied for hundreds of milliseconds; frames expire
-   with no loss declared, and the senders' TAP queues drop what they
-   cannot read. Every byte sent in such a point reached the other side's
-   sockets, bar 0.1–0.4% right to left. The relay bed never shows it. Why
-   acknowledgements stop is unknown; the `trace` feature now records ACKs
-   sent and seen and long sleeps to find out.
+1. The real path's right-to-left direction drops everything for about a
+   second now and then: plain UDP without the daemon lost 1.1 s of every
+   one of sixteen flows in a 300 s run, and nothing in a 60 s run before
+   it. Whether the path does it or the receiving host below the socket is
+   for whoever can look at that host. Through the daemon it shows as a
+   stall in both directions at once, with or without the hold, at any
+   rate: 6 of 20 points without the hold and 4 of 20 with it lost more
+   than 2.1% of their frames on November 27, most of them this way. Both
+   senders' windows fill within 40 ms, because one direction's data and
+   the other's acknowledgements are gone, and the daemon resumes when the
+   path does. Read real-path results with that in mind: compare arms only
+   inside one batch, and count such points before anything else. Earlier
+   real-path entries that report a few percent lost in one 10 s point may
+   have met the same thing.
 2. Four slow cores are still unmeasured (item 1 of the checkpoint below).
 3. Not built: systemd notification and descriptor storage, DEB and RPM
    packages, host details beyond the report's first line (card, driver,

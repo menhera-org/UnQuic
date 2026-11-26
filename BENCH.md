@@ -4005,7 +4005,8 @@ without; the totals average 6.0 and 5.8.
 **The missing frames in the last column are not the hold's.** They come in
 both arms, at 0.5 Gbit/s as at 2, and with trains at 1 Gbit/s where the
 busiest worker is 20% busy: 6 of 20 points without the hold, 4 of 20 with
-it. Most are one stall of about a second in both directions at once. A
+it. Most are one stall of about a second in both directions at once, and
+that stall is an outage of the path, as the end of this entry shows. A
 trace of one shows both senders' bytes in flight rising from about 2 MB to
 their windows (5.5 and 4.8 MB) within 40 ms, because acknowledgements thin
 out on both sides at the same instant; then each side applies almost no
@@ -4018,15 +4019,26 @@ either side sent in that point reached the other side's sockets, bar
 than in a clean point. The frames were dropped at the TAP's queue while the
 senders could not send.
 
-Why acknowledgements stop is open. The relay bed shows no such stall in any
-run, so the trigger belongs to the real path or its hosts. One reading fits
-every number above: the right-to-left direction stops carrying anything for
-about a second, which costs few bytes because both senders are blocked by
-then. Plain UDP at 1 Gbit/s, 60 s right to left and 30 s left to right half
-an hour later, lost nothing, which neither shows such an outage nor
-excludes one. The `trace` feature now records each ACK datagram sent, each
-ACK record read and each sleep of a millisecond or more, so the next traced
-stall shows which side stopped.
+**The stall is the path's.** The `trace` feature now records each ACK
+datagram sent, each ACK record read and each sleep of a millisecond or
+more, and a traced stall shows the right side sending ACK datagrams that
+the left side never reads (82 in one 100 ms stretch, none read), while
+ACKs the other way arrive. In clean points neither direction loses a byte;
+in the stalled point the right-to-left direction lost 2.0 MB. Then plain
+UDP, no daemon, 1 Gbit/s right to left in sixteen flows for 300 s
+([rows](benches/real-path-plain-udp-outage-nov27.txt)): 0.367% lost, and
+every flow lost the same 5,841–6,000 of its 1.61 million datagrams, 1.1 s
+of traffic, with nothing reordered and no socket overflow. A 60 s run
+twelve minutes earlier lost nothing. So that direction of the path, or the
+receiving host below the socket, drops everything for about a second now
+and then. Both senders' windows fill because one direction's data and the
+other direction's acknowledgements are gone, and the daemon resumes within
+tens of milliseconds of the path's return. The relay bed has no such
+outage, which is why it never showed one.
+
+What the daemon loses in such a second is the traffic of that second: its
+senders cannot send, and frames the TAP offers meanwhile are dropped at the
+TAP's queue. No setting of the daemon changes that.
 
 ## The per-frame cost on November 19
 

@@ -1,0 +1,28 @@
+# Plain UDP across the real path, no daemon: 16 flows of 1452-byte datagrams, 1 Gbit/s in all,
+# sent one datagram at a time, receive buffers 16 MiB. November 27.
+#
+# Right to left, 60 s (two 30 s runs) and left to right, 30 s, taken first:
+right offered 1.00 G sent 1.00 G delivered 1.00 G lost 0.000% reordered 0 socket overflow 0
+right offered 1.00 G sent 1.00 G delivered 1.00 G lost 0.000% reordered 0 socket overflow 0
+left offered 1.00 G sent 1.00 G delivered 1.00 G lost 0.000% reordered 0 socket overflow 0
+#
+# Right to left, 300 s, twelve minutes later:
+right offered 1.00 G sent 1.00 G delivered 1.00 G lost 0.367% reordered 0 socket overflow 0
+#
+# The 300 s run, per flow: datagrams received, next sequence expected, datagrams missing below it.
+flow  1 received 1607982 next 1613823 missing 5841 reordered 0 socket_overflow 0
+flow  2 received 1607960 next 1613823 missing 5863 reordered 0 socket_overflow 0
+flow  3 received 1607933 next 1613823 missing 5890 reordered 0 socket_overflow 0
+flow  4 received 1607809 next 1613725 missing 5916 reordered 0 socket_overflow 0
+flow  5 received 1607877 next 1613823 missing 5946 reordered 0 socket_overflow 0
+flow  6 received 1607863 next 1613823 missing 5960 reordered 0 socket_overflow 0
+flow  7 received 1607851 next 1613823 missing 5972 reordered 0 socket_overflow 0
+flow  8 received 1607823 next 1613823 missing 6000 reordered 0 socket_overflow 0
+flow  9 received 1608024 next 1613879 missing 5855 reordered 0 socket_overflow 0
+flow 10 received 1607546 next 1613413 missing 5867 reordered 0 socket_overflow 0
+flow 11 received 1607995 next 1613879 missing 5884 reordered 0 socket_overflow 0
+flow 12 received 1607977 next 1613879 missing 5902 reordered 0 socket_overflow 0
+flow 13 received 1607953 next 1613879 missing 5926 reordered 0 socket_overflow 0
+flow 14 received 1607835 next 1613782 missing 5947 reordered 0 socket_overflow 0
+flow 15 received 1607910 next 1613879 missing 5969 reordered 0 socket_overflow 0
+flow 16 received 1607880 next 1613879 missing 5999 reordered 0 socket_overflow 0
