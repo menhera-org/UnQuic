@@ -77,7 +77,12 @@ Open, ahead of the list below:
    four fifths of it is the kernel segmenting and transmitting each
    datagram at a card that cannot segment UDP. That part is outside the
    daemon as it is built: it needs such a card, or a send path that
-   bypasses the kernel's, which is a design decision.
+   bypasses the kernel's, which is a design decision. One of the two
+   hosts has a card of the target's `mlx4` family: sending from it costs
+   39% of a fast core per Gbit/s, 2.2 µs a datagram in `sendmmsg`
+   whatever the train length, and receiving on it 15–18%, so such a box
+   needs 2.8 fast cores for 5 Gbit/s each way. Four slow cores are
+   unmeasured.
 2. A new session's first load on a path with random loss. Startup can end
    on that loss below the offered rate, and the climb from there costs
    several percent of the first point in some runs (5% in one of two at

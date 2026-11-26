@@ -72,3 +72,21 @@ set as well, so that a poll waits for more of a train. Same build and points.
     its busy cycles a datagram                3,655          3,363
     socket read 959 -> 779
   idle round trip before a point             7.6-9.2 ms     8.5-9.5 ms
+
+One direction at 2 Gbit/s offered, 1.91 delivered, after all the host settings above.
+The right host's card uses the mlx4 driver.
+
+                                  right host sends   left host sends
+  sender CPU                            75%               93%
+  sender busy cycles a datagram        9,201             9,967
+    sendmmsg                           5,562 (2.2 us)    7,232 (3.6 us)
+    TAP read                           1,045               611
+    everything else                    2,594             2,124
+  receiver CPU (the other host)         38%               35%
+  receiver busy cycles a datagram      3,568             4,188
+    socket read                          815               892
+    TAP write                          1,658             1,991
+    admission and copy                   562               721
+
+Plain UDP sent from the mlx4 host at 3 Gbit/s, load tool CPU a datagram by train length:
+  44 segments 2.19 us, 12 segments 2.12 us, 4 segments 2.55 us.

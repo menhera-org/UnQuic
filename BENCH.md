@@ -3791,6 +3791,30 @@ Gbit/s is three quarters of what a Gbit/s costs end to end on these
 hosts, and all but a fifth of that is the kernel segmenting and
 transmitting each datagram at a card that cannot segment UDP itself.
 
+**The target's card family.** The right host's card uses the `mlx4`
+driver, as one target box does, so its rows are that card's on fast
+cores. One direction at 2 Gbit/s offered, 1.91 delivered, the rest of the
+path idle (profile build; [cycles](benches/cycle-breakdown-nov26.txt)):
+
+| | Sending from the `mlx4` host | Sending from the other host |
+| --- | --- | --- |
+| Sending daemon's CPU for each Gbit/s | 39% | 49% |
+| its busy cycles a datagram | 9,200 | 9,970 |
+| of them in `sendmmsg` | 5,560, or 2.2 µs | 7,230, or 3.6 µs |
+| Receiving daemon's CPU for each Gbit/s (the opposite host) | 20% | 18% |
+
+Plain UDP from the `mlx4` host costs the load tool 2.19, 2.12 and 2.55 µs
+a datagram in trains of 44, 12 and 4. So the stack above the card costs
+about 2.6 µs a train, which trains of twelve or more already spread
+thin, and the kernel's work at the card costs about 2 µs a datagram
+whatever the train. The daemon's `sendmmsg` is at that floor.
+
+A box with this card therefore spends about 55% of a fast core on each
+Gbit/s it carries each way, 39% to send it and 15–18% to receive it with
+coalescing set up as above: 5 Gbit/s each way is 2.8 fast cores, 1.1 of
+them inside `sendmmsg`. How that scales to four slow cores is not
+measured.
+
 One new session's first point lost 31% of its frames at 3 offered in
 these runs and another 6–8% at 2, where four others lost 0–2%. First
 points lost up to 6% before the settings too, so this is the open ramp
