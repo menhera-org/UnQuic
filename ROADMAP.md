@@ -65,6 +65,14 @@ Open, ahead of the list below:
    `rx-udp-gro-forwarding` is on for the card
    ([BENCH.md](BENCH.md#daemons-behind-sub-interfaces-and-a-routing-container-november-26)).
    What that card costs per datagram sent has to be measured on the box.
+   With the switch on for both real-path hosts' cards, receiving costs
+   22.5% and 28–29% of a core per Gbit/s where it cost 30% and 31%, and
+   four workers carry 5.99 Gbit/s one way at 7 offered
+   ([BENCH.md](BENCH.md#the-real-path-with-coalesced-udp-forwarded-by-the-cards-november-26)).
+   The received trains are 13.8 and 3.8 datagrams long where 44 are
+   sent; the cards' `gro_flush_timeout` and `napi_defer_hard_irqs` are
+   the settings for that and are untried. Sending, at 46% of a core per
+   Gbit/s on one host, is now the larger part.
 2. A new session's first load on a path with random loss. Startup can end
    on that loss below the offered rate, and the climb from there costs
    several percent of the first point in some runs (5% in one of two at

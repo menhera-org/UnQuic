@@ -35,3 +35,22 @@ receiver are different hosts, so each column is one datagram on one side.
 Plain UDP from the load tool between the same hosts, CPU time per datagram:
   send 3.6 us from one host and 2.4 us from the other; receive 2.1-2.6 us.
 The daemon's sendmmsg on those hosts: 3.5 us and 2.1 us a datagram.
+
+Real path again after both hosts' cards were set to forward coalesced UDP
+(rx-udp-gro-forwarding), same profile build, four workers, 10 s points.
+
+  Plain UDP at 2 Gbit/s, 44-segment trains sent: the load tool's receiver gets 13.8
+  datagrams a message on the left host and 3.8 on the right (none before), and spends
+  2.0 us and 2.3 us of CPU a datagram (2.6 and 2.1 before).
+
+                                              before   after
+  left to right at 4 offered, 3.83 delivered
+    receiver (right) CPU                        120%    110%
+    its socket read, cycles a datagram         2,450   2,408
+  2 each way, 1.90-1.92 delivered
+    daemon CPU left, right                 155%, 139%  135%, 124%
+    socket read left, right, a datagram   2,548, 3,077  1,466, 2,396
+  right to left at 4 offered, 2.62 delivered (after only)
+    receiver (left) CPU                                  59%
+    its busy cycles a datagram                         3,655
+    socket read 959, TAP write 1,638, admission and copy 579

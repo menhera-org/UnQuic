@@ -3726,7 +3726,43 @@ with it, so the switch matters more there than these rows show. What a
 card without UDP segmentation costs to send is not measured here either:
 it needs the box.
 
-## The per-frame cost on November 19
+## The real path with coalesced UDP forwarded by the cards (November 26)
+
+Both real-path hosts are containers on macvlan, the second shape above,
+and their machines' cards were then set to `rx-udp-gro-forwarding`.
+Same builds as the entries above, four workers, 10 s points
+([both ways](benches/real-path-gro-forwarding-both-ways-nov26.json),
+[one way](benches/real-path-gro-forwarding-left-to-right-nov26.json),
+[cycles](benches/cycle-breakdown-nov26.txt)).
+
+| | Before | After |
+| --- | --- | --- |
+| Plain UDP, datagrams in a received message, left host and right host | 1, 1 | 13.8, 3.8 |
+| Daemon socket read, cycles a datagram, left and right, 2 each way | 2,548, 3,077 | 1,466, 2,396 |
+| Daemon CPU left and right, 2 each way | 155%, 139% | 135%, 124% |
+| Receiving daemon's CPU for each Gbit/s, left host | 30% | 22.5% |
+| Receiving daemon's CPU for each Gbit/s, right host | 31% | 28–29% |
+| Both ways at 4 offered: delivered left to right, right to left | 3.49–3.78, 1.92–2.37 | 3.67–3.72, 2.26–2.59 |
+| Both ways at 5 offered | 4.11–4.58, 1.29–1.35 | 3.97–4.09, 1.84–1.98 |
+| Left daemon's receive-socket overflows at 5 offered | 88–886 | 0 |
+| Left to right alone at 6 and 7 offered | 5.36–5.49, not run | 5.26, 5.99 |
+
+Coalescing now reaches both daemons, and the left host gains most:
+its socket read costs 1,466 cycles a datagram where it cost 2,548 (959
+when it only receives), and its sockets no longer overflow while it
+sends 4 Gbit/s and receives 2. Four workers carry 5.99 Gbit/s one way at
+7 offered.
+
+The trains are short, though. Senders emit 44 datagrams at a time and a
+received message holds 13.8 on one host and 3.8 on the other, where the
+relay bed's rows above assume whole trains. The kernel coalesces what one
+poll of the card's queue finds, and a fast core empties the queue after a
+few packets. The cards' `gro_flush_timeout` and `napi_defer_hard_irqs`
+settings let a poll wait for more; they are not measured here.
+
+Sending is now the larger part by far: 46% of a core for each Gbit/s on
+the left host, 3.5 µs a datagram in `sendmmsg`, against 22.5% to receive
+one.
 
 ## The per-frame cost on November 19
 
