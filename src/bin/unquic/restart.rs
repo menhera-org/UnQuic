@@ -30,14 +30,35 @@ pub struct Session<'a> {
     pub mtu: u16,
 }
 
-/// What a re-executed daemon inherits from its predecessor.
+/// What a daemon inherits at startup, from the predecessor that re-executed
+/// it or from a service manager's descriptor store.
 pub struct Inherited {
     pub taps: Vec<Option<unquic::tap::Tap>>,
     pub pid_file: Option<PathBuf>,
+    /// A predecessor re-executed this image, which is therefore already detached.
+    pub reexec: bool,
+    /// Announced names this process did not adopt. It closed its descriptors
+    /// for them; a descriptor store still holds its own until told to forget.
+    pub dropped: Vec<String>,
 }
 
-/// Reads and removes the handover announcement. None means a fresh start.
+/// The name a session's queue goes by in an announcement and in a store.
+pub fn queue_name(sessions: &[Session<'_>], session: usize, queue: usize) -> Option<String> {
+    let configured = sessions.get(session)?;
+    Some(format!(
+        "tap.{queue}.{}.{}",
+        configured.queues,
+        hex(configured.name)
+    ))
+}
+
+/// Reads and removes the descriptor announcement. None means a fresh start.
 /// Call before any thread exists.
+// DECISION(2026-11-27): descriptors a service manager stored are adopted like a predecessor's,
+//   and anything wrong with them means "adopt nothing" where a handover fails. Why: after a
+//   crash the manager passes the same descriptors to every restart, so refusing them would
+//   fail every restart. Rejected: ignoring them (their queues stay attached, and attaching
+//   by name is then refused as a device in use).
 pub fn entry(sessions: &[Session<'_>]) -> io::Result<Option<Inherited>> {
     let read = |name| std::env::var_os(name);
     let (marker, pid_file, listen_pid, listen_fds, names) = (
@@ -59,15 +80,15 @@ pub fn entry(sessions: &[Session<'_>]) -> io::Result<Option<Inherited>> {
             std::env::remove_var(name);
         }
     }
-    let Some(marker) = marker else {
-        return Ok(None);
-    };
     let pid = std::process::id().to_string();
-    if marker.to_str() != Some(&format!("1:{pid}"))
-        || listen_pid.as_deref().and_then(|p| p.to_str()) != Some(&pid)
-    {
-        return Err(invalid("handover announcement names another process"));
-    }
+    let ours = listen_pid.as_deref().and_then(|p| p.to_str()) == Some(&pid);
+    let reexec = match marker {
+        Some(marker) if ours && marker.to_str() == Some(&format!("1:{pid}")) => true,
+        Some(_) => return Err(invalid("handover announcement names another process")),
+        // A service manager passes what it stored to the process it starts.
+        None if ours => false,
+        None => return Ok(None),
+    };
     let count: usize = listen_fds
         .as_deref()
         .and_then(|n| n.to_str())
@@ -80,9 +101,6 @@ pub fn entry(sessions: &[Session<'_>]) -> io::Result<Option<Inherited>> {
         Some(text) => text.split(':').collect(),
         None => return Err(invalid("invalid handover descriptor names")),
     };
-    if names.len() != count {
-        return Err(invalid("handover names and descriptors disagree"));
-    }
     // Take only descriptors that exist; a bogus count must not close unrelated ones.
     let mut fds = Vec::with_capacity(count);
     for index in 0..count {
@@ -91,27 +109,57 @@ pub fn entry(sessions: &[Session<'_>]) -> io::Result<Option<Inherited>> {
         if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
             return Err(invalid("announced handover descriptor is not open"));
         }
-        // SAFETY: the predecessor passed this open descriptor to us alone.
-        fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+        // SAFETY: whoever announced this open descriptor passed it to us alone.
+        fds.push(Some(unsafe { OwnedFd::from_raw_fd(fd) }));
     }
-    let mut fds: Vec<Option<OwnedFd>> = fds.into_iter().map(Some).collect();
+    let plan = if names.len() == count {
+        assign(&names, sessions)
+    } else {
+        Err(invalid("handover names and descriptors disagree"))
+    };
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) if reexec => return Err(error),
+        Err(_) => sessions.iter().map(|_| None).collect(),
+    };
+    let mut adopted = vec![false; count];
     let mut taps = Vec::with_capacity(sessions.len());
-    for (session, places) in sessions.iter().zip(assign(&names, sessions)?) {
-        let queues: Option<Vec<OwnedFd>> = places.and_then(|places| {
+    for (session, places) in sessions.iter().zip(plan) {
+        let queues: Option<Vec<OwnedFd>> = places.as_ref().and_then(|places| {
             places
-                .into_iter()
-                .map(|place| fds.get_mut(place).and_then(Option::take))
+                .iter()
+                .map(|&place| fds.get_mut(place).and_then(Option::take))
                 .collect()
         });
-        taps.push(match queues {
-            Some(queues) => Some(unquic::tap::Tap::adopt(queues, session.mtu)?),
-            None => None,
-        });
+        let tap = match queues.map(|queues| unquic::tap::Tap::adopt(queues, session.mtu)) {
+            Some(Ok(tap)) => Some(tap),
+            Some(Err(error)) if reexec => return Err(error),
+            _ => None,
+        };
+        if tap.is_some() {
+            for place in places.into_iter().flatten() {
+                if let Some(slot) = adopted.get_mut(place) {
+                    *slot = true;
+                }
+            }
+        }
+        taps.push(tap);
     }
     // Queues nobody adopted close here, before the runtime attaches by name.
     drop(fds);
+    let dropped = names
+        .iter()
+        .zip(&adopted)
+        .filter(|&(_, &adopted)| !adopted)
+        .map(|(name, _)| (*name).to_owned())
+        .collect();
     let pid_file = pid_file.filter(|path| !path.is_empty()).map(PathBuf::from);
-    Ok(Some(Inherited { taps, pid_file }))
+    Ok(Some(Inherited {
+        taps,
+        pid_file,
+        reexec,
+        dropped,
+    }))
 }
 
 /// Sorts the announced queue names into the configured sessions: for each
@@ -214,14 +262,10 @@ pub fn exec(
 ) -> io::Error {
     let mut names = Vec::with_capacity(queues.len());
     for &(session, queue, _) in queues {
-        let Some(configured) = sessions.get(session) else {
+        let Some(name) = queue_name(sessions, session, queue) else {
             return invalid("handed-over queue of an unconfigured session");
         };
-        names.push(format!(
-            "tap.{queue}.{}.{}",
-            configured.queues,
-            hex(configured.name)
-        ));
+        names.push(name);
     }
     let raw: Vec<RawFd> = queues.iter().map(|(_, _, fd)| fd.as_raw_fd()).collect();
     let pid = std::process::id().to_string();

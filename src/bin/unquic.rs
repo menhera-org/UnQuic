@@ -4,6 +4,10 @@
 mod config;
 #[path = "unquic/daemon.rs"]
 mod daemon;
+#[path = "unquic/host.rs"]
+mod host;
+#[path = "unquic/notify.rs"]
+mod notify;
 #[path = "unquic/restart.rs"]
 mod restart;
 
@@ -69,7 +73,10 @@ fn signals() -> io::Result<()> {
     Ok(())
 }
 
-fn resolve(job: config::Lookup, control: Control) {
+/// Each peer's current underlay address and scope, for the report's device lines.
+type Routes = std::sync::Arc<std::sync::Mutex<Vec<Option<(std::net::Ipv6Addr, u32)>>>>;
+
+fn resolve(job: config::Lookup, control: Control, routes: Routes) {
     let mut resolver = None;
     let mut submitted = None;
     let mut pending = None;
@@ -101,6 +108,11 @@ fn resolve(job: config::Lookup, control: Control) {
                 Ok(()) => {
                     submitted = Some(address);
                     pending = None;
+                    if let Ok(mut routes) = routes.lock()
+                        && let Some(route) = routes.get_mut(job.peer)
+                    {
+                        *route = Some((address, job.scope_id));
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break,
@@ -267,13 +279,63 @@ fn host_line() -> String {
     )
 }
 
-/// The SIGUSR1 report: the host line, each worker's totals, each session's
-/// state and totals with those of its lanes, then each peer's totals.
-/// Sessions and peers go by their configured names, the public labels; no
-/// cookie or address appears.
-fn report_text(config: &unquic::config::Config, control: &Control) -> String {
+/// One line for each underlay device the configuration names or a peer's
+/// address routes through, with what uses it.
+fn device_lines(
+    config: &unquic::config::Config,
+    routes: &[Option<(std::net::Ipv6Addr, u32)>],
+) -> String {
+    use std::fmt::Write;
+    let mut devices: Vec<(String, Vec<String>)> = Vec::new();
+    let mut note = |device: String, label: String| match devices
+        .iter_mut()
+        .find(|(name, _)| *name == device)
+    {
+        Some((_, labels)) => labels.push(label),
+        None => devices.push((device, vec![label])),
+    };
+    for endpoint in &config.endpoints {
+        if let Some(device) = endpoint.bind_device.as_ref().and_then(|d| d.to_str().ok()) {
+            note(device.to_owned(), format!("endpoint {}", endpoint.name));
+        }
+    }
+    for (peer, route) in config.peers.iter().zip(routes) {
+        // A bound endpoint's device is already listed, and a lookup made
+        // without that binding could name another.
+        let bound = config
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.name == peer.endpoint && endpoint.bind_device.is_some());
+        if !bound
+            && let Some((address, scope)) = route
+            && let Some(device) = host::route_device(*address, *scope)
+        {
+            note(device, format!("peer {}", peer.name));
+        }
+    }
+    let mut text = String::new();
+    for (device, labels) in devices {
+        let _ = writeln!(
+            text,
+            "unquic: device {device} ({}) {}",
+            labels.join(", "),
+            host::device(&device)
+        );
+    }
+    text
+}
+
+/// The SIGUSR1 report: the host's lines and devices, each worker's totals,
+/// each session's state and totals with those of its lanes, then each
+/// peer's totals. Sessions and peers go by their configured names, the
+/// public labels; no cookie or address appears.
+fn report_text(config: &unquic::config::Config, control: &Control, routes: &Routes) -> String {
     use std::fmt::Write;
     let mut text = host_line();
+    text.push_str(&host::lines());
+    if let Ok(routes) = routes.lock() {
+        text.push_str(&device_lines(config, &routes));
+    }
     let mut worker = 0;
     while let Some(totals) = control.worker_counters(worker) {
         let _ = writeln!(text, "unquic: worker {worker} {totals:?}");
@@ -303,9 +365,24 @@ fn report_text(config: &unquic::config::Config, control: &Control) -> String {
     text
 }
 
+/// Has a service manager's descriptor store forget the queues this process
+/// did not adopt, and waits until it has: a device with a stored queue still
+/// attached refuses a new attachment by name.
+fn forget(dropped: &[String]) {
+    if dropped.is_empty() {
+        return;
+    }
+    let notifier = notify::Notifier::from_env();
+    for name in dropped {
+        notifier.forget(name);
+    }
+    notifier.barrier();
+}
+
 fn serve(loaded: config::Loaded, mut launch: Launch) -> io::Result<()> {
     signals()?;
     let binary = std::env::current_exe()?;
+    let notifier = notify::Notifier::from_env();
     let mut _pid_file = None;
     #[cfg(feature = "trace")]
     let mut trace = loaded
@@ -314,8 +391,19 @@ fn serve(loaded: config::Loaded, mut launch: Launch) -> io::Result<()> {
         .first()
         .and_then(|session| Trace::open(&session.name));
     let mut adopted = std::mem::take(&mut launch.adopted);
+    let routes: Routes = std::sync::Arc::new(std::sync::Mutex::new(
+        loaded
+            .config
+            .peers
+            .iter()
+            .map(|peer| peer.address.map(|address| (address, peer.scope_id)))
+            .collect(),
+    ));
     loop {
         let control = Control::new();
+        if notifier.active() {
+            control.keep_queue_copies();
+        }
         let transport = {
             let control = control.clone();
             let config = loaded.config.clone();
@@ -329,7 +417,7 @@ fn serve(loaded: config::Loaded, mut launch: Launch) -> io::Result<()> {
         let mut restarting = false;
         while !transport.is_finished() {
             if REPORT.swap(false, Ordering::Relaxed) {
-                let text = report_text(&loaded.config, &control);
+                let text = report_text(&loaded.config, &control, &routes);
                 eprint!("{text}");
                 // `unquic status` reads the same report from beside the PID file.
                 if let Some(path) = &launch.pid_path
@@ -347,6 +435,7 @@ fn serve(loaded: config::Loaded, mut launch: Launch) -> io::Result<()> {
                 trace.drain();
             }
             if STOP.load(Ordering::Relaxed) {
+                notifier.send("STOPPING=1");
                 control.shutdown();
                 break;
             }
@@ -370,6 +459,21 @@ fn serve(loaded: config::Loaded, mut launch: Launch) -> io::Result<()> {
                 && let Some(jobs) = lookups.take()
             {
                 eprintln!("unquic: TAPs ready");
+                // DECISION(2026-11-27): under a service manager every TAP queue goes into its
+                //   descriptor store. Why: the queues then stay attached across a crash and a
+                //   manager's restart, and the next start adopts them, so the links above the
+                //   TAPs see no queue close. Rejected: storing nothing (each such restart
+                //   detaches every queue until the daemon is back).
+                if notifier.active() {
+                    use std::os::fd::AsFd;
+                    let sessions = sessions(&loaded.config);
+                    for (session, queue, fd) in control.take_queue_copies() {
+                        if let Some(name) = restart::queue_name(&sessions, session, queue) {
+                            notifier.store(&name, fd.as_fd());
+                        }
+                    }
+                    notifier.send("READY=1\nSTATUS=TAPs ready");
+                }
                 if _pid_file.is_none() {
                     let published = match launch.readiness.take() {
                         Some(readiness) => readiness.ready().map(Some),
@@ -388,11 +492,18 @@ fn serve(loaded: config::Loaded, mut launch: Launch) -> io::Result<()> {
                         }
                     }
                 }
+                // The host's facts go to the log once per start, after readiness
+                // and never before it; the report repeats them on request.
+                eprint!("{}{}", host_line(), host::lines());
+                if let Ok(routes) = routes.lock() {
+                    eprint!("{}", device_lines(&loaded.config, &routes));
+                }
                 for job in jobs {
                     let control = control.clone();
+                    let routes = routes.clone();
                     if let Err(error) = thread::Builder::new()
                         .name("unquic-dns".into())
-                        .spawn(move || resolve(job, control))
+                        .spawn(move || resolve(job, control, routes))
                     {
                         helper_error = Some(error);
                         break;
@@ -439,7 +550,8 @@ const USAGE: &str = "unquic gen-uuid | unquic check-config <config.toml> | \
 unquic run <config.toml> | \
 unquic start <config.toml> <pid-file> | unquic restart <pid-file> | \
 unquic status <pid-file> | \
-unquic systemd-unit <config.toml> <pid-file> | unquic remove-tap <name> | unquic adopt-version";
+unquic systemd-unit <config.toml> <pid-file> [<installed binary>] | \
+unquic remove-tap <name> | unquic adopt-version";
 
 fn absolute(path: std::ffi::OsString) -> io::Result<std::path::PathBuf> {
     let path = std::path::PathBuf::from(path);
@@ -477,8 +589,10 @@ fn execute() -> io::Result<u8> {
         (Some(command), Some(path), None, None) if command == "run" => {
             let loaded = config::Loaded::parse(&std::fs::read_to_string(path)?)?;
             let inherited = restart::entry(&sessions(&loaded.config))?;
-            let (adopted, pid_path) =
-                inherited.map_or((Vec::new(), None), |i| (i.taps, i.pid_file));
+            let (adopted, pid_path) = inherited.map_or((Vec::new(), None), |i| {
+                forget(&i.dropped);
+                (i.taps, i.pid_file)
+            });
             let launch = Launch {
                 readiness: None,
                 pid_path,
@@ -493,23 +607,32 @@ fn execute() -> io::Result<u8> {
             let loaded = config::Loaded::parse(&std::fs::read_to_string(&path)?)?;
             // Report configuration errors from the launching process, before forking.
             loaded.config.clone().validate().map_err(io::Error::other)?;
-            // A re-executed daemon is already detached and adopts its queues.
-            let launch = match restart::entry(&sessions(&loaded.config))? {
-                Some(inherited) => Launch {
+            let inherited = restart::entry(&sessions(&loaded.config))?;
+            if let Some(inherited) = &inherited {
+                forget(&inherited.dropped);
+            }
+            let launch = match inherited {
+                // A re-executed daemon is already detached and adopts its queues.
+                Some(inherited) if inherited.reexec => Launch {
                     readiness: None,
                     pid_path: inherited.pid_file.or(Some(pid_file)),
                     adopted: inherited.taps,
                     args: original,
                 },
-                None => match daemon::start(pid_file.clone())? {
-                    daemon::Started::Parent(status) => return Ok(status),
-                    daemon::Started::Daemon(readiness) => Launch {
-                        readiness: Some(readiness),
-                        pid_path: Some(pid_file),
-                        adopted: Vec::new(),
-                        args: original,
-                    },
-                },
+                stored => {
+                    // Queues a service manager stored cross the forks with the daemon;
+                    // the parent's own descriptors for them close when it returns.
+                    let adopted = stored.map_or_else(Vec::new, |inherited| inherited.taps);
+                    match daemon::start(pid_file.clone())? {
+                        daemon::Started::Parent(status) => return Ok(status),
+                        daemon::Started::Daemon(readiness) => Launch {
+                            readiness: Some(readiness),
+                            pid_path: Some(pid_file),
+                            adopted,
+                            args: original,
+                        },
+                    }
+                }
             };
             serve(loaded, launch)?;
         }
@@ -519,8 +642,14 @@ fn execute() -> io::Result<u8> {
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in TAP name"))?;
             unquic::tap::remove(&name)?;
         }
-        (Some(command), Some(path), Some(pid_file), None) if command == "systemd-unit" => {
-            let binary = std::env::current_exe()?;
+        (Some(command), Some(path), Some(pid_file), installed)
+            if command == "systemd-unit" && args.next().is_none() =>
+        {
+            // A package names where the binary will be installed; otherwise it is this one.
+            let binary = match installed {
+                Some(path) => absolute(path)?,
+                None => std::env::current_exe()?,
+            };
             let text = daemon::unit(&binary, &absolute(path)?, &absolute(pid_file)?)?;
             io::stdout().lock().write_all(text.as_bytes())?;
         }

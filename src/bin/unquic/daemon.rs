@@ -203,6 +203,12 @@ fn unit_path(path: &Path) -> io::Result<&str> {
 // DECISION(2026-11-27): the unit is ordered before network.target and required by it alone.
 //   Why: the user's instructions of that date. Rejected: naming network-online.target too
 //   (it follows network.target by itself); WantedBy (a failed daemon would not fail the target).
+// DECISION(2026-11-27): the unit runs as root with three capabilities and no new privileges.
+//   Why: creating and configuring TAPs and forcing socket buffers need CAP_NET_ADMIN, binding
+//   to a device and the RA resolver CAP_NET_RAW, ports below 1024 CAP_NET_BIND_SERVICE, and
+//   nothing else the daemon does needs root's other powers. Rejected: a dedicated user (it
+//   could not create a TAP without the same capabilities made ambient, and the PID file's
+//   directory would need provisioning); file-system sandboxing (the paths are the operator's).
 pub fn unit(binary: &Path, config: &Path, pid_file: &Path) -> io::Result<String> {
     let (binary, config, pid) = (unit_path(binary)?, unit_path(config)?, unit_path(pid_file)?);
     Ok(format!(
@@ -217,6 +223,10 @@ ExecStart={binary} start {config} {pid}
 ExecReload={binary} restart {pid}
 TimeoutStartSec=infinity
 Restart=on-failure
+NotifyAccess=all
+FileDescriptorStoreMax=4096
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
 
 [Install]
 RequiredBy=network.target
@@ -244,6 +254,11 @@ mod tests {
             "ExecReload=/usr/bin/unquic restart /run/unquic.pid",
             "TimeoutStartSec=infinity",
             "Restart=on-failure",
+            // The daemon, a grandchild of the started process, stores its TAP queues.
+            "NotifyAccess=all",
+            "FileDescriptorStoreMax=4096",
+            "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE",
+            "NoNewPrivileges=yes",
             "RequiredBy=network.target",
         ] {
             assert!(text.lines().any(|l| l == line), "{line}");

@@ -205,9 +205,18 @@ fn uso_delivery_allocates_nothing(
     }
     COUNTING.store(false, Ordering::SeqCst);
     assert!(seen.iter().all(|&v| v));
-    assert!(coalesced, "the allocation check must exercise USO delivery");
+    // A TAP takes UDP segmentation offload from Linux 6.2; before that the
+    // daemon writes each frame alone and nothing arrives coalesced.
+    let uso = kernel_at_least(6, 2);
+    assert!(
+        coalesced || !uso,
+        "the allocation check must exercise USO delivery"
+    );
     assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
     assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
+    if !uso {
+        return;
+    }
     // AF_PACKET's virtio metadata makes the host TAP receive actual USO inputs.
     let batches: Vec<_> = frames
         .chunks(segments)
@@ -859,7 +868,14 @@ fn offload_frames_carry_tap_super_frames_whole() {
     // per TSO super-frame. Only each 13-segment read's last segment travels
     // as an ordinary frame.
     let runs = 16 * 3 + (11 * 4 + 3) + (39 + 1) + 16 * 3;
-    assert_eq!((offload, gso), (runs, 39));
+    // Before Linux 6.2 a TAP hands over no UDP super-frame, so only the
+    // sixteen TSO super-frames travel as offload frames.
+    let expected = if kernel_at_least(6, 2) {
+        (runs, 39)
+    } else {
+        (16 * 3, 0)
+    };
+    assert_eq!((offload, gso), expected);
     left.stop();
     right.stop();
 }

@@ -43,6 +43,84 @@ enum Phase {
     Failed,
 }
 
+/// Outer bytes of a baseline datagram: larger ones test the path above it.
+const BASE_OUTER: u16 = (BASE_UDP_PAYLOAD + 48) as u16;
+/// Alternations that mark a black hole.
+const ALTERNATIONS: u8 = 8;
+
+/// Finds, from one lane's own ACKs and losses, a path that stopped carrying
+/// datagrams above the baseline while smaller ones still arrive (RFC 8899,
+/// section 4.3), sooner than timed confirmation can.
+///
+/// It counts alternations: a small packet acknowledged after a lost large
+/// one, followed by another lost large one, with no large packet acknowledged
+/// since counting began. A size-selective path yields one for every frame or
+/// probe; an outage loses small packets too and yields at most one, when it
+/// ends.
+// DECISION(2026-11-27): black holes are also found from ACK and loss feedback, at eight
+//   alternations. Why: timed confirmation needs three timeouts of a second or more, in which
+//   every full datagram is lost. Rejected: counting lost large packets alone (an outage loses
+//   hundreds and the probe that ends it is small, so every outage would reset the size).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlackHole {
+    // Highest lost large packet since a large one was last acknowledged.
+    lost: Option<u64>,
+    // Small packets acknowledged since then and above every lost large one
+    // seen so far. An ACK arrives before the losses it reveals, so these wait
+    // for the loss on either side of them.
+    smalls: [u64; 8],
+    count: u8,
+    alternations: u8,
+}
+
+impl BlackHole {
+    /// A packet of `outer_bytes` was newly acknowledged.
+    pub fn acked(&mut self, number: u64, outer_bytes: u16) {
+        if outer_bytes > BASE_OUTER {
+            *self = Self::default();
+        } else if let Some(slot) = self.smalls.get_mut(usize::from(self.count)) {
+            *slot = number;
+            self.count += 1;
+        } else if let Some(lowest) = self.smalls.iter_mut().min()
+            && *lowest < number
+        {
+            // Later losses have higher numbers, so the highest are worth keeping.
+            *lowest = number;
+        }
+    }
+
+    /// A packet of `outer_bytes` was declared lost. True, once, when the
+    /// path looks like a black hole for datagrams above the baseline.
+    pub fn lost(&mut self, number: u64, outer_bytes: u16) -> bool {
+        if outer_bytes <= BASE_OUTER {
+            return false;
+        }
+        let waiting = &self.smalls[..usize::from(self.count)];
+        if let Some(previous) = self.lost
+            && waiting
+                .iter()
+                .any(|&small| previous < small && small < number)
+        {
+            self.alternations += 1;
+        }
+        // What lies below this loss can no longer sit between it and a later one.
+        let mut kept = 0;
+        for index in 0..usize::from(self.count) {
+            if self.smalls[index] > number {
+                self.smalls[kept] = self.smalls[index];
+                kept += 1;
+            }
+        }
+        self.count = kept as u8;
+        self.lost = Some(self.lost.map_or(number, |lost| lost.max(number)));
+        if self.alternations < ALTERNATIONS {
+            return false;
+        }
+        *self = Self::default();
+        true
+    }
+}
+
 /// One transmit socket's confirmed size and at most three live probe identities.
 pub struct Path {
     ceiling: usize,
@@ -329,6 +407,69 @@ mod tests {
     use super::*;
 
     const RTT: Duration = Duration::from_millis(5);
+
+    #[test]
+    fn feedback_finds_a_size_selective_path_and_not_an_outage() {
+        const LARGE: u16 = 1500;
+        const SMALL: u16 = 200;
+        // Frames of a large datagram and a small tail: every large one is lost
+        // and every tail arrives. ACKs come before the losses they reveal.
+        let mut hole = BlackHole::default();
+        let mut found = None;
+        for frame in 0..40_u64 {
+            let (large, tail) = (2 * frame + 1, 2 * frame + 2);
+            hole.acked(tail, SMALL);
+            // Declared lost once three later packets were acknowledged.
+            if frame >= 2 && hole.lost(large - 4, LARGE) {
+                found = Some(frame);
+                break;
+            }
+        }
+        // One alternation a frame, once the first loss is declared.
+        assert_eq!(found, Some(2 + u64::from(ALTERNATIONS)));
+
+        // An outage loses large and small alike; the probe that ends it is
+        // small, and the data after it arrives.
+        let mut hole = BlackHole::default();
+        for number in 1..=400_u64 {
+            assert!(!hole.lost(number, if number % 2 == 0 { SMALL } else { LARGE }));
+        }
+        hole.acked(401, SMALL);
+        for number in 1..=400_u64 {
+            assert!(!hole.lost(number, LARGE), "{number}");
+        }
+        assert_eq!(hole.alternations, 0);
+        hole.acked(402, LARGE);
+        // Outages back to back: one alternation each, and data that arrives
+        // in between starts the count again.
+        for outage in 0..20_u64 {
+            let base = 1000 * (outage + 1);
+            hole.acked(base, SMALL);
+            for number in base + 1..base + 50 {
+                assert!(!hole.lost(number, LARGE));
+            }
+            if outage % 4 == 3 {
+                hole.acked(base + 60, LARGE);
+            }
+        }
+        // Small losses, and large ones with nothing small acknowledged, never count.
+        let mut hole = BlackHole::default();
+        for number in 1..=1000 {
+            assert!(!hole.lost(number, SMALL));
+            assert!(!hole.lost(number, LARGE));
+        }
+        // Exactly the threshold: the eighth alternation reports, once.
+        let mut hole = BlackHole::default();
+        assert!(!hole.lost(1, LARGE));
+        for step in 0..u64::from(ALTERNATIONS) {
+            hole.acked(10 * step + 5, SMALL);
+            assert_eq!(
+                hole.lost(10 * step + 6, LARGE),
+                step + 1 == u64::from(ALTERNATIONS)
+            );
+        }
+        assert!(!hole.lost(1000, LARGE));
+    }
 
     fn id(packet: u64) -> ProbeId {
         ProbeId {

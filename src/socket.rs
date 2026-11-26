@@ -506,8 +506,18 @@ impl TransmitSocket {
         };
         match send_batch(self.socket.as_fd(), datagrams, limit, gso, &mut check) {
             Err(error) if attempted.get() && gso && offload_unavailable(&error) => {
-                self.gso.store(false, Ordering::Relaxed);
-                send_batch(self.socket.as_fd(), datagrams, limit, false, &mut check)
+                let plain = send_batch(self.socket.as_fd(), datagrams, limit, false, &mut check);
+                // FAILED(2026-11-27): turning GSO off on any EINVAL -> Linux 5.0 reports a GSO
+                //   segment above the device MTU as EINVAL, so one local MTU reduction ended
+                //   GSO on that socket for good. Now: GSO stays on when the same datagrams
+                //   sent plainly are too big as well.
+                if !plain
+                    .as_ref()
+                    .is_err_and(|error| error.raw_os_error() == Some(libc::EMSGSIZE))
+                {
+                    self.gso.store(false, Ordering::Relaxed);
+                }
+                plain
             }
             result => result,
         }

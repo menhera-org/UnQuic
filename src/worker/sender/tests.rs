@@ -3752,6 +3752,45 @@ fn successful_pmtu_probe_overtakes_retained_suffix_without_reordering_data() {
 
 #[test]
 #[ignore = "kernel descriptor test; run in a disposable container"]
+fn a_lane_that_reports_a_black_hole_restarts_its_paths_discovery() {
+    let (mut workers, _rx) = workers();
+    let worker = &mut workers[1];
+    let index = worker.sender_index(0, 1).unwrap();
+    let tx = &mut worker.transmit[0].paths[0].lanes[1];
+    tx.mtu = pmtu::Path::new(1452, Duration::ZERO).unwrap();
+    let mut now = Duration::ZERO;
+    let mut number = 1;
+    while tx.mtu.payload_limit() < 1452 {
+        let length = tx.mtu.poll(now).unwrap();
+        let id = pmtu::ProbeId {
+            session: 0,
+            tag: 1,
+            lane: 2,
+            packet: number,
+        };
+        assert!(tx.mtu.submitted(id, length, now));
+        now += Duration::from_micros(1);
+        assert!(tx.mtu.reply(id, length, now));
+        number += 1;
+    }
+    for expected in [1, 1] {
+        worker.sender.lanes[index].black_holed = true;
+        worker.sender.black_holes = true;
+        worker.mtu_black_holes(now);
+        assert!(!worker.sender.black_holes && !worker.sender.lanes[index].black_holed);
+        // The first report drops the path to the baseline and restarts its
+        // search; at the baseline nothing larger was sent, so a second changes nothing.
+        assert_eq!(
+            worker.transmit[0].paths[0].lanes[1].mtu.payload_limit(),
+            BASE_UDP_PAYLOAD
+        );
+        assert_eq!(worker.counters.path_mtu_black_holes, expected);
+        assert_eq!(worker.sessions[0].totals.path_mtu_black_holes, expected);
+    }
+}
+
+#[test]
+#[ignore = "kernel descriptor test; run in a disposable container"]
 fn ack_transfer_returns_before_final_report_and_reuses_while_it_is_held() {
     let (mut workers, _rx) = workers();
     frame(&mut workers[1]);

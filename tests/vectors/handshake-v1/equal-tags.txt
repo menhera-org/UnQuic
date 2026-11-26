@@ -1,0 +1,11 @@
+# Both endpoints drew the same initiator tag. Each restarts with a fresh one,
+# and the lower of the new tags keeps the initiator role.
+0     a timer fresh=c1          => send hello c1; establishing
+0     b timer fresh=c1          => send hello c1; establishing
+5     a recv hello c1 fresh=a2  => send hello a2; establishing
+5     b recv hello c1 fresh=b2  => send hello b2; establishing
+10    b recv hello a2 fresh=b3  => send challenge a2 b3; establishing
+10    a recv hello b2 fresh=a3  => establishing
+15    a recv challenge a2 b3    => send confirm a2 b3; establishing
+20    b recv confirm a2 b3      => commit responder; carrier up; send ready a2 b3; active
+25    a recv ready a2 b3        => commit initiator; carrier up; active

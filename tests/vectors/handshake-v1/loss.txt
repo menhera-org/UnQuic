@@ -1,0 +1,25 @@
+# Lost and repeated records. An endpoint repeats a record after one second
+# and answers a repeated one at most once a second.
+0     a timer fresh=a1          => send hello a1; establishing
+500   a timer                   => establishing
+1000  a timer                   => send hello a1; establishing
+1005  b recv hello a1 fresh=b1  => send challenge a1 b1; establishing
+1010  b recv hello a1 fresh=b9  => establishing
+2010  b recv hello a1 fresh=b9  => send challenge a1 b1; establishing
+2015  a recv challenge a1 b1    => send confirm a1 b1; establishing
+2020  a recv challenge a1 b1    => establishing
+3015  a timer                   => send confirm a1 b1; establishing
+3020  b recv confirm a1 b1      => commit responder; carrier up; send ready a1 b1; active
+3025  b recv confirm a1 b1      => active
+4025  b recv confirm a1 b1      => send ready a1 b1; active
+4030  a recv ready a1 b1        => commit initiator; carrier up; active
+4035  a recv ready a1 b1        => active
+# The confirmed responder still answers its pair's HELLO, for an initiator
+# whose CHALLENGE was lost.
+5000  b recv hello a1           => send challenge a1 b1; active
+# A HELLO that changes its parameters under the same tag is an error, and so
+# is one that advertises a port other than the configured peer's.
+6000  b recv hello a1 port=40009          => error (HELLO parameters changed under the same tag); active
+6000  b recv hello a7 port=40009 fresh=b7 => error (peer receive port mismatch); active
+# A CHALLENGE for an exchange the endpoint did not start is ignored.
+6000  a recv challenge a8 b8    => active

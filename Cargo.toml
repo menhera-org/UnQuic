@@ -55,3 +55,35 @@ opt-level = 3
 lto = true
 strip = true
 codegen-units = 1
+
+# Packages are built by packaging/build.sh, which first writes the unit the
+# daemon prints for these installed paths to target/package/unquic.service.
+# Neither package enables or starts the service: it needs a configuration
+# file with provisioned cookies first.
+[package.metadata.deb]
+section = "net"
+priority = "optional"
+extended-description = """\
+UnQuic carries Ethernet frames between TAP devices over IPv6 UDP, with \
+selective repair and BBRv3 congestion control. The daemon is one static \
+binary; write /etc/unquic/unquic.toml, then enable unquic.service."""
+assets = [
+    ["target/release/unquic", "usr/bin/", "755"],
+    ["target/package/unquic.service", "usr/lib/systemd/system/", "644"],
+    ["README.md", "usr/share/doc/unquic/", "644"],
+    ["config-model.md", "usr/share/doc/unquic/", "644"],
+    ["LICENSE-APACHE", "usr/share/doc/unquic/", "644"],
+    ["LICENSE-MPL", "usr/share/doc/unquic/", "644"],
+    ["LICENSE-BBR", "usr/share/doc/unquic/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/unquic", dest = "/usr/bin/unquic", mode = "755" },
+    { source = "target/package/unquic.service", dest = "/usr/lib/systemd/system/unquic.service", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/unquic/README.md", mode = "644", doc = true },
+    { source = "config-model.md", dest = "/usr/share/doc/unquic/config-model.md", mode = "644", doc = true },
+    { source = "LICENSE-APACHE", dest = "/usr/share/licenses/unquic/LICENSE-APACHE", mode = "644" },
+    { source = "LICENSE-MPL", dest = "/usr/share/licenses/unquic/LICENSE-MPL", mode = "644" },
+    { source = "LICENSE-BBR", dest = "/usr/share/licenses/unquic/LICENSE-BBR", mode = "644" },
+]

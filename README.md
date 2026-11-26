@@ -17,7 +17,7 @@ NTT NGN is one deployment and performance validation environment.
 - No async runtime: plain pinned threads with batched syscalls. `tokio` gives one syscall per packet, no GSO/GRO, cross-core task migration, and 1 ms timers, all wrong for a few always-busy sockets. See section 10 of the design.
 - Platform contract: assume the Linux kernel and only the interfaces, files, and permissions needed by the selected features, such as `/dev/net/tun` for TAP creation and `/etc/resolv.conf` when using `iphost`'s system resolver. Its configurable `ipv6`, `ra`, and `dhcpv6` modes bypass system resolvers. Document each additional host assumption with the feature that needs it. Make no assumptions about the surrounding userspace: no required XDG or other freedesktop.org conventions, GNU userspace, Android or ChromeOS facilities, systemd, or D-Bus dependencies. Binaries are built for `*-unknown-linux-musl` targets.
 - Library I/O: the transport core reads no ordinary files or environment variables and writes no diagnostics. Kernel interfaces such as `/dev/net/tun`, sockets, and ioctls are allowed. The optional iphost layer uses the selected resolver's operating-system facilities; see [resolver requirements](config-model.md#daemon-resolver-selection). Application configuration-file handling and command-line I/O belong to the caller or daemon.
-- Optional integration: restarts and reloads preserve TAPs by retaining and handing over their file descriptors, following rs-l2tpd's descriptor-preservation approach, and the daemon prints a systemd unit without linking to systemd or D-Bus libraries. systemd notification and descriptor storage, and DEB/RPM packaging, are not built. Such additions must leave standalone operation and the library I/O boundary intact.
+- Optional integration: restarts and reloads preserve TAPs by retaining and handing over their file descriptors, following rs-l2tpd's descriptor-preservation approach, and the daemon prints a systemd unit without linking to systemd or D-Bus libraries. Under that unit it speaks systemd's notification protocol and keeps its TAP queues in the manager's descriptor store, and `packaging/build.sh` builds a DEB and an RPM. None of this is needed to run it: standalone operation and the library I/O boundary stay as they are.
 - Daemon readiness: every configured TAP interface exists, whether newly created or adopted. The daemon forks and its original parent exits successfully only at readiness, so any init system or launcher can wait for that exit status. This works without systemd and does not wait for network connectivity or peer handshakes. When used, the optional embedded systemd unit makes `network.target` require the daemon and wait for its readiness; the daemon must not depend on that target, on `network-online.target` or on any wait-online service.
 - TAP configuration: creation accepts `Option<MacAddress>`. The in-tree `MacAddress` type accepts nonzero unicast addresses, whether globally or locally administered. `None` derives a stable address in Menhera's `60:a4:34:4x:xx:xx` MAC-M range from the current UTS hostname and interface name using SHA-256. UnQuic sets the configured MTU and optional MAC but leaves administrative state, addressing and bridge membership to the caller or network manager (for example, systemd-networkd or ifupdown). Transport state controls carrier, independently of administrative state.
 - Design: see [initial-design.md](initial-design.md). Implementation order and per-step acceptance: see [ROADMAP.md](ROADMAP.md).
@@ -30,6 +30,22 @@ platform. Detect optional kernel facilities at runtime and retain documented
 fallbacks. Source references to Linux 6.8 describe that implementation; they
 do not define behavior for every kernel. Benchmark and compatibility results
 must identify the kernel actually tested.
+
+Linux 5.0 is the oldest kernel the daemon targets: it sets TAP carrier with
+`TUNSETCARRIER`, which arrived there. The kernel suites run on Linux 6.8 and
+7.0 in containers, and on Linux 5.0.0 in an emulated machine
+(`tests/qemu-kernel.sh`, QEMU without KVM and without a network device).
+On a kernel that lacks one of these the daemon does the following instead:
+
+| Kernel interface | Since | Without it |
+| --- | --- | --- |
+| io_uring, for TAP reads in batches | 5.1 | One read call per frame |
+| `TUNGETDEVNETNS` | 5.2 | Adoption compares device names only, so two TAPs of one name in two namespaces look like one device |
+| `EMSGSIZE` for a GSO send above the device MTU | after 5.0, which says `EINVAL` | The daemon sends the same datagrams plainly; if they are too big as well it keeps GSO |
+| `epoll_pwait2` | 5.11 | A timerfd carries the worker's deadline |
+| UDP segmentation offload on a TAP | 6.2 | Frames are written to the TAP one at a time and read from it segmented; TCP segmentation offload still applies |
+
+Tests that measure one of these check the kernel first and pass without it.
 
 The crate requires Linux and declares Rust 1.89 or later. Use a
 `*-unknown-linux-musl` target for builds. The default build depends only on
@@ -55,7 +71,10 @@ the TOML fields and resolver modes. Unknown fields fail, and parse errors report
 a byte position without echoing configuration text or cookies.
 
 `unquic run` stays in the foreground. It reports `TAPs ready` on stderr once all
-configured TAPs exist; SIGINT or SIGTERM requests shutdown and joins transport
+configured TAPs exist, and then logs the host's lines of the status report
+(build, kernel, CPU, socket-buffer ceilings and each underlay device it knows
+by then), so every start's log says what it ran on. SIGINT or SIGTERM requests
+shutdown and joins transport
 workers. Administrative interface setup remains external.
 
 `unquic start /etc/unquic.toml /run/unquic.pid` daemonizes instead, as design
@@ -74,6 +93,44 @@ for the running binary: `Type=forking` with that `PIDFile=`,
 `network-online.target`. Its `ExecReload=` runs `unquic restart` on the PID
 file, so `systemctl reload` applies an edited configuration file as described
 under "Reloading the configuration" below. Nothing links against systemd.
+
+The unit runs the daemon as root with
+`CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE` and
+`NoNewPrivileges=yes`. `CAP_NET_ADMIN` creates and configures TAPs and forces
+socket buffers past the kernel's ceilings, `CAP_NET_RAW` binds sockets to a
+device and serves the RA resolver, and `CAP_NET_BIND_SERVICE` allows ports
+below 1024. The daemon uses no other privilege. A launcher that is not
+systemd can grant the same three.
+
+With `NotifyAccess=all` and `FileDescriptorStoreMax=4096` the unit also lets
+the daemon use systemd's notification socket, which it speaks directly. When
+`NOTIFY_SOCKET` is set, the daemon hands a duplicate of every TAP queue to
+the manager's descriptor store once its TAPs are ready, then sends `READY=1`.
+The queues then stay attached while the daemon is down: after a crash, and
+across `systemctl restart`, the next start receives them and adopts every
+session whose name and queue count still match, exactly as a reload does.
+Queues it cannot adopt it has the manager forget, and it waits for that
+before attaching by name. A clean `systemctl stop` empties the store.
+Without `NOTIFY_SOCKET` none of this happens, and TAPs still persist as
+described below.
+
+`sh packaging/build.sh` builds a DEB and an RPM into `target/package/` with
+`cargo-deb` and `cargo-generate-rpm`. Each holds the static binary at
+`/usr/bin/unquic`, the documentation, and at
+`/usr/lib/systemd/system/unquic.service` the unit that binary prints for
+`/etc/unquic/unquic.toml` and `/run/unquic.pid`: a third argument to
+`unquic systemd-unit` names the installed binary. Neither package depends on
+anything, and neither enables or starts the service, since the daemon needs
+a configuration file with provisioned cookies first. Write the file, then
+`systemctl enable --now unquic`.
+
+`IMAGE=<incus image> sh tests/systemd.sh <binary or .deb>` runs the daemon
+under systemd in a disposable Incus container. It checks the unit's links
+and ordering, the capability set and `NoNewPrivileges`, the report, the
+descriptor store across a crash, a reload onto another session and a restart
+onto a resized one, and a clean stop. It passes on systemd 255 with the
+binary and with the DEB; the RPM installs, verifies and runs its commands in
+a Rocky Linux 9 container.
 
 `unquic check-config config.toml` reads a file as a start would and exits 0
 when the daemon could start on it: the file parses, every field is valid, and
@@ -226,6 +283,9 @@ unpublished acknowledgments cannot advance it. The runtime applies this barrier
 before changing connection state, carrier or sending the responder's READY.
 Tests cover simultaneous startup, equal tags, each lost flight, stale replay,
 role reversal, either/both endpoint restarts, reply limits and liveness deadlines.
+[Six transcripts](tests/vectors/handshake-v1/README.md) fix what each input
+must produce, effect by effect, for another implementation to check itself
+against.
 
 `config::Config::validate` checks names, references, ports, addresses/scopes,
 MTUs, queue/lane counts, TAP names and cookie uniqueness. It returns an immutable
@@ -1213,9 +1273,22 @@ kernel memory, also outside `daemon.memory_limit`. Both forcing options need
 `CAP_NET_ADMIN` in the initial user namespace: as root inside an
 unprivileged container they still fall back.
 
-Send SIGUSR1 to the daemon to print a report to stderr: one line with the
-build's version, the kernel release and the number of CPUs the daemon may
-use, then each worker's independently sampled counters, each session's
+Send SIGUSR1 to the daemon to print a report to stderr. It starts with the
+host: the build's version, the kernel release and the number of CPUs the
+daemon may use; the CPU's model, its clock and the allowed CPU list; the
+kernel's `rmem_max` and `wmem_max`; and one line for each underlay device,
+which is every endpoint's `bind_device` and the device each peer's current
+address routes through. A device line gives the driver and its version, the
+bus address, the MTU, the transmit queue length, the channel counts, the
+header fields the card hashes UDP over IPv6 by (`udp6_hash`, from `src`,
+`dst`, `sport`, `dport` and `flowlabel`),
+`gro_flush_timeout` and `napi_defer_hard_irqs`, and whether checksum
+offload, generic and UDP segmentation, GRO and UDP GRO forwarding are on:
+the settings "Operational checks" below asks about. A value the kernel does
+not give reads `unknown`, as the hash does on a virtual device. The report
+cannot say which receive queue a flow lands on, because the kernel records
+that only for connected UDP sockets. Then come each worker's independently sampled
+counters, each session's
 state, carrier, generation and totals followed by its transmit and receive
 lanes, and each peer's totals. Sessions and peers appear under their
 configured names; cookies and addresses do not appear. A daemon that has a
@@ -1302,8 +1375,17 @@ that probe's RTT, with a one-second floor. This deliberately uses a shorter
 timeout than RFC 8899's greater-than-15-second recommendation on measured low-RTT
 paths, to limit black-hole loss. Loss can make the selected size conservative;
 the state machine retries upward after 600 seconds. Current-size confirmations
-run no faster than the probe timeout. They still drive DATA-limit fallback; integrating
-transport ACK/loss feedback into that decision remains unfinished. [RFC 8899](https://www.rfc-editor.org/rfc/rfc8899.html)
+run no faster than the probe timeout, so by themselves they need three
+timeouts, three seconds or more, to notice that a path stopped carrying
+datagrams above the baseline. A lane's own ACKs and losses notice sooner
+(`pmtu::BlackHole`). They count alternations: a datagram of at most 1280
+outer bytes acknowledged after a lost larger one and before another lost
+larger one, with no larger one acknowledged since the count began. Eight
+alternations restart that path's discovery from the baseline and add one to
+`path_mtu_black_holes`. A frame's small tail, a probe or an abandonment
+supplies the small datagrams, so a flow of single frames takes about ten
+frames to notice. An outage loses small datagrams too and adds at most one
+alternation when it ends. [RFC 8899](https://www.rfc-editor.org/rfc/rfc8899.html)
 
 Both returned and silently filtered ICMPv6 are supported. Without a valid size
 hint, timed probes narrow the search; loss can therefore delay discovery and
@@ -1338,8 +1420,10 @@ state are available through the library's `Control` API.
 | Startup fails with "TAP queues belong to different devices" | Something renamed the new TAP or moved it to another namespace while its queues were still attaching, so later queues landed on a second device of the old name. Let the daemon report readiness before a script or network manager touches the TAP |
 | `tap_errors` rises | `tap_error_code` holds the errno of the latest refused TAP read or write: `EIO` (5) means the device a queue belongs to is administratively down, `EBADFD` (77) that the queue is no longer attached to a device. Zero means a frame failed the daemon's own checks |
 | Throughput stays low with many lanes | Flow count, TAP queue placement, worker/receive distribution and CPU use; each frame stays on one lane |
+| Both directions lose several percent in the same seconds, at any rate, and `tx_expired_sent_frames` jumps on both sides with few `repairs` | The path, before the daemon. Compare each side's `tx_outer_bytes` with the other side's `rx_outer_bytes`, then send plain UDP across the same path and echo every router that answers, from both ends, ten times a second. On one real path a gateway that stopped forwarding for 0.17 s at a time, on a half-hour schedule, produced exactly this: both senders' windows filled, and delivery resumed when the gateway did (BENCH.md) |
+| Some flows of a session stop while others pass | A transmit lane that reports `path_mtu_state` 4 (failed) and `path_mtu_bytes` 0. Each lane has its own source port and may take its own path. A lane whose path stops carrying baseline datagrams suspends its DATA until a baseline probe is answered, and its flows stay on it. The session stays active meanwhile, because liveness is the connection's and its probes use the first lane |
 | Losses and repairs climb with load though CPU is free | `receive_buffer_fallbacks` and `socket_overflow`. Without `CAP_NET_ADMIN` the receive sockets get only `net.core.rmem_max` (often about 416 KiB after doubling), and with UDP GRO each overflow drops a coalesced batch of up to 64 datagrams. On such a host TCP through the tunnel retransmitted about 1% of its segments under unlimited load (BENCH.md); give the daemon `CAP_NET_ADMIN` or raise `rmem_max` |
-| One direction stops near 2 Gbit/s with idle workers, no `socket_overflow`, and several TCP streams pass more | The receiving host's network card. Many cards hash UDP by the two addresses alone, and then every lane lands on one receive queue and one core however many source ports the sender uses. `ethtool -n DEV rx-flow-hash udp6` shows the hashed fields and `ethtool -N DEV rx-flow-hash udp6 sdfn` adds the ports. On one real path a single queue passed 2 Gbit/s cleanly and plain UDP lost a fifth or more above that (BENCH.md) |
+| One direction stops near 2 Gbit/s with idle workers, no `socket_overflow`, and several TCP streams pass more | The receiving host's network card. Many cards hash UDP by the two addresses alone, and then every lane lands on one receive queue and one core however many source ports the sender uses. `ethtool -n DEV rx-flow-hash udp6` shows the hashed fields, as does `udp6_hash` on the report's device line where the daemon can see the card (`src,dst` is this case), and `ethtool -N DEV rx-flow-hash udp6 sdfn` adds the ports. On one real path a single queue passed 2 Gbit/s cleanly and plain UDP lost a fifth or more above that (BENCH.md) |
 | Receiving costs two to three times the CPU it costs on the card's own host, with the daemon in a container, behind a macvlan child or behind a container that routes to it | `ethtool -k CARD` for `rx-udp-gro-forwarding`. The kernel coalesces received UDP for a socket only where it can see the socket; datagrams it forwards to another namespace stay single unless that switch is on for the card (with `gro` on). A VLAN device in the card's own namespace needs nothing. On the test bed a daemon behind a routing namespace and a macvlan pair spent 3,030 cycles a datagram in its socket read without the switch and 1,100 with it, the same as on the link itself (BENCH.md). If coalesced trains stay short because a fast core empties the card's queue after a few packets, the card's `gro_flush_timeout` and `napi_defer_hard_irqs` let a poll wait for more: on two real hosts they raised 4–14 datagrams a received message to 32–34 and halved the receive cost again, for under a millisecond more round trip on a quiet path |
 | Delay grows when the tunnel is overloaded | The TAP's transmit queue length. Under overload frames wait in the kernel's TAP ring before the daemon reads them, and with GSO input each entry can hold a 64 KB super-frame. On the loopback overload check 64 entries instead of 500 cut the median one-way delay from 34–50 ms to 4–8 ms with no loss of delivery (BENCH.md); set it with `ip link set DEV txqueuelen 64` |
 
@@ -1464,8 +1548,9 @@ quiet session delivers every frame again. Sixteen sessions on one peer start
 under a sufficient `memory_limit` with every TAP present; under 64 MiB startup
 fails with OutOfMemory before creating any.
 
-Real RA/DHCPv6 resolver networks, physical-NIC offload qualification,
-Linux 5.0 qualification and performance acceptance remain open.
+Real RA/DHCPv6 resolver networks, physical-NIC offload qualification and
+performance acceptance remain open. Linux 5.0 is qualified in an emulated
+machine without a network card: all 131 kernel tests pass there.
 
 ## License
 

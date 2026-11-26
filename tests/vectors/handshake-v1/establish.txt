@@ -1,0 +1,22 @@
+# The four-message exchange, then liveness on the confirmed connection.
+0     a timer fresh=a1          => send hello a1; establishing
+5     b recv hello a1 fresh=b1  => send challenge a1 b1; establishing
+10    a recv challenge a1 b1    => send confirm a1 b1; establishing
+15    b recv confirm a1 b1      => commit responder; carrier up; send ready a1 b1; active
+20    a recv ready a1 b1        => commit initiator; carrier up; active
+# Feedback keeps a connection active; a timer then has nothing to do.
+1020  a feedback                => active
+2900  a timer                   => active
+# Three seconds after the last feedback the connection is degraded and the
+# endpoint that notices starts a replacement, as an initiator again.
+4019  a timer fresh=a2          => active
+4020  a timer fresh=a2          => send hello a2; degraded
+# Fresh feedback restores the state. The replacement already begun goes on.
+4100  a feedback                => active
+4105  b recv hello a2 fresh=b2  => send challenge a2 b2; active
+4110  a recv challenge a2 b2    => send confirm a2 b2; active
+4115  b recv confirm a2 b2      => commit responder; send ready a2 b2; active
+4120  a recv ready a2 b2        => commit initiator; active
+# The replaced pair's records no longer match anything.
+4125  b recv confirm a1 b1      => active
+4125  a recv ready a1 b1        => active

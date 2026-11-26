@@ -1,0 +1,27 @@
+# A replacement started by the old connection's responder, then thirty
+# seconds of silence and a new connection from the inactive state.
+0     a timer fresh=a1          => send hello a1; establishing
+5     b recv hello a1 fresh=b1  => send challenge a1 b1; establishing
+10    a recv challenge a1 b1    => send confirm a1 b1; establishing
+15    b recv confirm a1 b1      => commit responder; carrier up; send ready a1 b1; active
+20    a recv ready a1 b1        => commit initiator; carrier up; active
+# b hears nothing for three seconds and starts the replacement. Roles are
+# elected anew: b initiates this one. Carrier stays up through the commit.
+3015  b timer fresh=b2          => send hello b2; degraded
+3020  a recv hello b2 fresh=a2  => send challenge b2 a2; active
+3025  b recv challenge b2 a2    => send confirm b2 a2; degraded
+3030  a recv confirm b2 a2      => commit responder; send ready b2 a2; active
+3035  b recv ready b2 a2        => commit initiator; active
+# Silence. Each endpoint keeps trying, one attempt of ten seconds after
+# another, and after thirty seconds retires the connection and lowers carrier.
+6030  a timer fresh=a3          => send hello a3; degraded
+16030 a timer fresh=a4          => send hello a4; degraded
+33029 a timer fresh=a5          => send hello a5; degraded
+33030 a timer                   => retire; carrier down; inactive
+33035 b timer fresh=b5          => retire; carrier down; send hello b5; inactive
+# The path returns. a5 is the lower tag, so b answers it.
+33040 b recv hello a5 fresh=b6  => send challenge a5 b6; inactive
+33040 a recv hello b5 fresh=a6  => inactive
+33045 a recv challenge a5 b6    => send confirm a5 b6; inactive
+33050 b recv confirm a5 b6      => commit responder; carrier up; send ready a5 b6; active
+33055 a recv ready a5 b6        => commit initiator; carrier up; active

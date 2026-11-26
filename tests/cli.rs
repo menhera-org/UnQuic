@@ -90,6 +90,10 @@ impl Running {
             .read_to_string(&mut diagnostic)
             .unwrap();
         assert!(diagnostic.contains("TAPs ready"), "{diagnostic}");
+        // The host's lines are logged at readiness and again in the report.
+        for line in ["unquic: version ", "unquic: cpu ", "unquic: limits "] {
+            assert_eq!(diagnostic.matches(line).count(), 2, "{line}: {diagnostic}");
+        }
         assert!(!diagnostic.contains("00112233-4455-4677-8899-aabbccddeeff"));
     }
 }
@@ -135,6 +139,33 @@ fn provisioning_and_configuration_errors_have_clean_cli_output() {
     let diagnostic = String::from_utf8_lossy(&output.stderr);
     assert!(diagnostic.contains("invalid TOML"));
     assert!(!diagnostic.contains("secret-invalid-cookie"));
+    // A package prints the unit for the path its binary will be installed at.
+    let unit = |args: &[&str]| {
+        Command::new(binary())
+            .arg("systemd-unit")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let packaged = unit(&["/etc/u.toml", "/run/u.pid", "/usr/bin/unquic"]);
+    assert!(packaged.status.success());
+    let text = String::from_utf8(packaged.stdout).unwrap();
+    for line in [
+        "ExecStart=/usr/bin/unquic start /etc/u.toml /run/u.pid",
+        "ExecReload=/usr/bin/unquic restart /run/u.pid",
+    ] {
+        assert!(text.lines().any(|l| l == line), "{line}");
+    }
+    assert!(
+        !unit(&["/etc/u.toml", "/run/u.pid", "bin/unquic"])
+            .status
+            .success()
+    );
+    assert!(
+        !unit(&["/etc/u.toml", "/run/u.pid", "/usr/bin/unquic", "extra"])
+            .status
+            .success()
+    );
     // check-config judges a file as a start would, without opening a device.
     let check = |text: &str| {
         let file = ConfigFile::new(text);
@@ -564,6 +595,8 @@ fn reload_applies_a_changed_session_set_and_keeps_the_taps_that_stay() {
     // This thread and the daemon it starts use a disposable namespace.
     check_namespace();
     let net = UdpSocket::bind("[::]:0").unwrap();
+    // The report names the device the peer's address, ::1, routes through.
+    common::up(&net, c"lo");
     let pid_path = std::env::temp_dir().join(format!("unquic-reload-{}.pid", std::process::id()));
     let base = config("uq-keep", 40700, 40701, "::1", "");
     let file = ConfigFile::new(&format!("{base}{}", session("uq-gone", 1)));
@@ -601,6 +634,10 @@ fn reload_applies_a_changed_session_set_and_keeps_the_taps_that_stay() {
     let report = status();
     for line in [
         "unquic: version ",
+        "unquic: cpu ",
+        "unquic: limits rmem_max=",
+        // The peer's address is ::1, which routes through loopback.
+        "unquic: device lo (peer peer) driver=",
         "unquic: worker 0 Snapshot {",
         "unquic: session uq-keep SessionStatus { state: ",
         "unquic: session uq-gone SessionStatus { state: ",

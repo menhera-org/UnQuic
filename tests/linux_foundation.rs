@@ -278,7 +278,12 @@ fn queues_of_same_named_taps_in_two_namespaces_are_one_device_to_nobody() {
         .chain(stray.next())
         .collect();
     assert_eq!(mixed.len(), 2);
-    assert!(Tap::adopt(mixed, 1500).is_err());
+    // A queue names its device's namespace from Linux 5.2 (TUNGETDEVNETNS).
+    // Before that two same-named devices in two namespaces look like one.
+    assert_eq!(
+        Tap::adopt(mixed, 1500).is_err(),
+        common::kernel_at_least(5, 2)
+    );
     let alone = Tap::adopt(stray.collect(), 1500).unwrap();
     assert_eq!(alone.queue_count(), 1);
     drop(alone);

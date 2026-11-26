@@ -771,7 +771,7 @@ Expose per-session, per-peer, and per-lane counters for delivered frame bytes, o
 
 Record kernel version, CPU model, active cores and frequency, NIC/driver, queue mapping, offload state, binding scope, and effective socket-buffer limits in diagnostic output. Include socket overflow and softnet/NIC drops in performance investigations.
 
-**Report as implemented (November 27).** On SIGUSR1 the daemon prints one line with its version, the kernel release and the number of CPUs it may use, then the counters of every worker, session (with its state, carrier and generation), lane and peer, under their configured names. With a PID file it also writes the report to `<pid-file>.status`, which `unquic status <pid-file>` requests and prints. Socket-buffer limits and fallbacks are among the worker counters. The CPU model, its frequency, and each card's driver, queue mapping and offload state are not in the report; the benchmark scripts record them, and README.md's operational checks say how to read them.
+**Report as implemented (November 27).** On SIGUSR1 the daemon prints its version, the kernel release and the number of CPUs it may use; the CPU model, its clock and the allowed CPU list; the kernel's socket-buffer ceilings; and for each underlay device (an endpoint's bound device, or the device a peer's current address routes through) its driver, MTU, channel counts, poll settings and the offloads that matter here. It logs these host lines once at every start as well, after it has reported readiness. In the report then come the counters of every worker, session (with its state, carrier and generation), lane and peer, under their configured names. With a PID file it also writes the report to `<pid-file>.status`, which `unquic status <pid-file>` requests and prints. Effective socket-buffer sizes and fallbacks are among the worker counters. A device behind a sub-interface or inside a container reports that interface's driver, since the card below it is not visible there. For queue mapping the device line gives the channel counts and the header fields the card hashes UDP over IPv6 by (`udp6_hash`). Which receive queue one flow lands on is not in the report: the kernel records a socket's receiving CPU and NAPI instance only for connected UDP sockets, and receive sockets accept any source (section 5).
 
 Bound every queue, ACK history, incomplete-frame table, completion cache, and retained transmit-buffer set. Define behavior on allocation pressure, device removal, interface renaming, DNS failure, path change, and daemon restart. Configuration reload must preserve unrelated sessions.
 
@@ -779,13 +779,17 @@ Bound every queue, ACK history, incomplete-frame table, completion cache, and re
 
 Keep privileges limited to what is needed to create/configure TAPs and bind sockets; allow attaching to appropriately provisioned devices. The daemon must run directly without a service manager. Future optional systemd integration may implement notification and descriptor-store protocols directly over Unix sockets with descriptor passing, without linking against systemd or D-Bus libraries. Keep this integration in the daemon and preserve the library I/O boundary. DEB/RPM packaging may supply service units and distribution-specific installation hooks; these must not become prerequisites for standalone operation. The exact privilege model is an implementation decision.
 
+**Privilege model as implemented (November 27, reversible).** The daemon needs three capabilities and nothing else of root: `CAP_NET_ADMIN` to create and configure TAPs, set carrier and queue length, and force socket buffers past the kernel's ceilings; `CAP_NET_RAW` to bind sockets to a device and for the RA resolver; `CAP_NET_BIND_SERVICE` for ports below 1024. The printed unit runs it as root with exactly those in `CapabilityBoundingSet=` and with `NoNewPrivileges=yes`. A dedicated user was rejected for the unit: it would need the same capabilities made ambient and a provisioned directory for the PID file, for no smaller set of powers. The unit adds no file-system sandboxing, because the configuration and PID paths are the operator's.
+
+**Service-manager integration as implemented (November 27).** When `NOTIFY_SOCKET` is set the daemon speaks the notification protocol itself over that Unix socket. Once its TAPs are ready it sends a duplicate of every TAP queue descriptor with `FDSTORE=1` under the queue's handover name, then `READY=1`; it sends `STOPPING=1` when asked to stop. A start that receives descriptors from the manager (`LISTEN_PID` naming it, without the re-exec marker of section 11) adopts them by the handover's rules. It is more forgiving than a handover in one way: a stored set it cannot use at all is closed and ignored, because the manager would pass the same set to every restart. For each queue it does not adopt it sends `FDSTOREREMOVE=1`, then a `BARRIER=1` pipe, and waits for the manager to close the pipe before it attaches any TAP by name: a device with a stored queue still attached refuses that attachment. The effect is that queues stay attached across a crash and across the manager's restart of the service, and a clean stop, after which the manager empties its store, closes them.
+
 ## 12.1 Startup readiness and optional systemd unit
 
 Readiness means that all configured TAP interfaces exist, whether newly created or adopted through descriptor handover. Report readiness exactly once after this condition holds. Do not report success while any configured TAP is missing. TAP carrier may remain down; readiness does not require DNS resolution, an underlay address or route, a binding interface or VRF to appear, a peer handshake, or working forwarding. TAP creation and adoption must therefore proceed independently of underlay socket setup and peer establishment. Later session degradation changes carrier and diagnostics, not the completed startup readiness signal.
 
 Follow rs-l2tpd's daemon startup model: double-fork, let the original parent wait for the daemon's readiness report, and exit that parent successfully only after all configured TAPs exist. If startup fails or the daemon dies before readiness, the parent reports failure. Any init system, supervisor, or launcher can wait for this parent exit status; daemon operation and this readiness signal do not require systemd or a notification service. Publish the daemon PID file before the parent reports success. Keep process management, PID-file handling, and readiness reporting in the daemon; the library exposes the TAP state needed to determine readiness without using files, environment variables, or stdio for that report. Foreground operation remains available for launchers that supervise the process directly.
 
-The future optional systemd integration consumes this same parent-exit readiness signal. When used, the embedded unit and packaged copies must share one template: `Before=network.target` in `[Unit]`, `RequiredBy=network.target` in `[Install]`, and `Type=forking`, `PIDFile=`, `ExecReload=` (the binary's `restart` on the PID file, added November 27), `TimeoutStartSec=infinity`, and `Restart=on-failure` in `[Service]`. Enabling the unit makes `network.target` require the service, so startup through `network.target` pulls in the daemon, the ordering makes the target wait for the configured TAPs to exist, and a daemon that fails to start fails the target. `network-online.target` is not named: systemd orders it after `network.target`. The service must not require, want, or be ordered after `network.target`, `network-online.target` or any wait-online service; the daemon must not wait for connectivity that may itself depend on those TAPs. The user set these lines on November 26; before that the unit named both targets.
+The future optional systemd integration consumes this same parent-exit readiness signal. When used, the embedded unit and packaged copies must share one template: `Before=network.target` in `[Unit]`, `RequiredBy=network.target` in `[Install]`, and `Type=forking`, `PIDFile=`, `ExecReload=` (the binary's `restart` on the PID file), `TimeoutStartSec=infinity`, `Restart=on-failure`, `NotifyAccess=all` and `FileDescriptorStoreMax=4096` (for the descriptor store of section 12; the daemon is a grandchild of the started process, hence `all`), `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE` and `NoNewPrivileges=yes` in `[Service]`. The lines from `ExecReload=` on were added on November 27. Enabling the unit makes `network.target` require the service, so startup through `network.target` pulls in the daemon, the ordering makes the target wait for the configured TAPs to exist, and a daemon that fails to start fails the target. `network-online.target` is not named: systemd orders it after `network.target`. The service must not require, want, or be ordered after `network.target`, `network-online.target` or any wait-online service; the daemon must not wait for connectivity that may itself depend on those TAPs. The user set these lines on November 26; before that the unit named both targets.
 
 # 13 Performance budget
 
@@ -1371,9 +1375,10 @@ If a comparison already reaches the available underlay ceiling, report that fact
 
 **Current status (November 27):** stages 1 and 4 are complete. Stages 2 and 3
 are implemented. The daemon reloads its configuration by the handover of
-section 11, reports worker, session, lane and peer counters with session
-state on request, and checks a configuration file without starting
-(section 12). The local rate of 20 Gbit/s each way was first reached on
+section 11, reports host facts and worker, session, lane and peer counters
+with session state on request, checks a configuration file without
+starting, and under systemd keeps its TAP queues in the manager's
+descriptor store (section 12). The local rate of 20 Gbit/s each way was first reached on
 November 19 with sixteen workers per daemon, by a margin of one or two
 percent and before its acceptance profile is frozen. Sixteen workers also
 pass 5 Gbit/s each way over a local routed path with loss, and since
@@ -1393,7 +1398,8 @@ persistent multiqueue TAP creation, reattachment, explicit removal and frame
 I/O. The version-1 wire codec
 validates complete datagrams before dispatch and has fixed byte vectors for all
 eleven record types, the three DATA flags and the optional feature bits in
-tests/vectors/wire-v1. TAP creation accepts an
+tests/vectors/wire-v1. The handshake's state transitions are fixed as
+transcripts in tests/vectors/handshake-v1. TAP creation accepts an
 optional MAC and leaves administrative state unchanged. Tests cover the public
 types, loopback socket invariants and live TAP behavior in an isolated network
 namespace; see README.md for commands and coverage limits. The pure handshake
@@ -1549,7 +1555,7 @@ Maintain a clear distinction between a throughput experiment and an interoperabl
 | Reordering policy | Decided: unfragmented UDP with at most one VLAN tag hashes within each reader's owned lanes when all workers have TAP queues; strict flow hashing otherwise. Queue migration may reorder new frames. Immediate completed-frame delivery; extra reorder buffering deferred |
 | Restart protocol | Decided: automatic tag election, random directional receive tags, HELLO/CHALLENGE/CONFIRM/READY (section 5) |
 | Abandonment protocol | Decided: transport-acceptance ACKs, bounded advisory abandonment, permanent window floors and lane tombstones (sections 6 and 8) |
-| Wire layout | v1: 48-byte common header and exact record bodies (section 6); interoperability vectors required before release |
+| Wire layout | v1: 48-byte common header and exact record bodies (section 6). Interoperability vectors are published: `tests/vectors/wire-v1` for the encodings and `tests/vectors/handshake-v1` for the handshake's state transitions |
 | Worker and lane counts | Start small; determine from queue and CPU measurements |
 | Feedback routing | Decided: per-worker-pair bounded SPSC queues, eventfd wakeups, explicit lane owners (section 10) |
 | Library API | Decided: library owns worker threads, blocking run plus control handle (section 3) |
@@ -1559,7 +1565,7 @@ Maintain a clear distinction between a throughput experiment and an interoperabl
 | Inner offload representation | Experimental, negotiated extension |
 | ECN and DSCP policy | Decided: outer Not-ECT and DSCP zero; preserve inner fields; ECN feedback deferred |
 | FEC | Optional experiment after selective repair is measured |
-| Minimum kernel and service packaging | Kernel target 5.0; qualify APIs/fallbacks before release. Optional service integration and packages do not raise core runtime requirements |
+| Minimum kernel and service packaging | Kernel target 5.0. The kernel suite ran on Linux 5.0.0 on November 27 (emulated, `tests/qemu-kernel.sh`); README.md lists each newer interface and what the daemon does without it. Optional service integration and packages do not raise core runtime requirements |
 
 These decisions do not weaken the confirmed constraints: encryption remains absent, the fixed port remains receive-only, all outgoing protocol traffic uses dynamic per-destination ports, native outer fragmentation remains prohibited, and the library core depends on nothing beyond `libc`.
 

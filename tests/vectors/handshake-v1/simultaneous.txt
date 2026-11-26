@@ -1,0 +1,16 @@
+# Both endpoints start at once. The lower initiator tag keeps the initiator
+# role: the endpoint that sees a lower tag than its own answers it.
+0     a timer fresh=a1          => send hello a1; establishing
+0     b timer fresh=b1          => send hello b1; establishing
+5     b recv hello a1 fresh=b2  => send challenge a1 b2; establishing
+5     a recv hello b1 fresh=a2  => establishing
+10    a recv challenge a1 b2    => send confirm a1 b2; establishing
+15    b recv confirm a1 b2      => commit responder; carrier up; send ready a1 b2; active
+20    a recv ready a1 b2        => commit initiator; carrier up; active
+# b's own HELLO arrives late and names no exchange a knows, so a answers it
+# as a new one. Nobody confirms it. When it expires a starts a replacement
+# itself: a peer that sent a HELLO wanted one.
+25    a recv hello b1 fresh=a3  => send challenge b1 a3; active
+9000  a feedback                => active
+10024 a timer fresh=a4          => active
+10025 a timer fresh=a4          => send hello a4; active

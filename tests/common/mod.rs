@@ -14,6 +14,25 @@ use std::{
 };
 use unquic::MacAddress;
 
+/// Whether the running kernel is at least `major.minor`. Tests ask this
+/// before they rely on anything newer than Linux 5.0, the oldest kernel the
+/// daemon targets and falls back on.
+pub fn kernel_at_least(major: u32, minor: u32) -> bool {
+    // SAFETY: a zeroed utsname is valid output storage, and uname
+    // NUL-terminates the release it writes.
+    let release = unsafe {
+        let mut name: libc::utsname = zeroed();
+        assert_eq!(libc::uname(&mut name), 0);
+        CStr::from_ptr(name.release.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    };
+    let mut numbers = release
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|part| part.parse::<u32>().ok());
+    (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0)) >= (major, minor)
+}
+
 pub fn ip(args: &[&str]) {
     let output = std::process::Command::new("ip")
         .args(args)

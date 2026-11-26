@@ -410,6 +410,16 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixDatagram;
 
+    /// The ring, or None on a kernel without io_uring (before Linux 5.1),
+    /// where the daemon reads its TAPs one frame a call instead.
+    fn ring() -> Option<Reader> {
+        match Reader::new() {
+            Ok(reader) => Some(reader),
+            Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => None,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
     fn queue(vnet: bool) -> (TapQueue, UnixDatagram) {
         let (a, b) = UnixDatagram::pair().unwrap();
         a.set_nonblocking(true).unwrap();
@@ -486,7 +496,9 @@ mod tests {
     #[test]
     #[ignore = "kernel ring test; run in a disposable container"]
     fn read_batches_keep_order_boundaries_and_metadata_without_async_workers() {
-        let mut ring = Reader::new().unwrap();
+        let Some(mut ring) = ring() else {
+            return;
+        };
         assert!(std::panic::catch_unwind(|| ring.sq.at::<u32>(usize::MAX)).is_err());
         assert!(std::panic::catch_unwind(|| ring.sq.at::<[u8; 4097]>(0)).is_err());
         let before = std::fs::read_dir("/proc/self/task").unwrap().count();
@@ -567,7 +579,9 @@ mod tests {
     #[ignore = "kernel ring test; run in a disposable container"]
     fn interruptions_partial_submission_and_rejection_preserve_every_frame() {
         for reject in [false, true] {
-            let mut ring = Reader::new().unwrap();
+            let Some(mut ring) = ring() else {
+                return;
+            };
             let (mut tap, sender) = queue(false);
             for i in 0..CAPACITY {
                 sender.send(&[i as u8; 60]).unwrap();
@@ -609,7 +623,9 @@ mod tests {
             );
         }
 
-        let mut ring = Reader::new().unwrap();
+        let Some(mut ring) = ring() else {
+            return;
+        };
         // An io_uring READV on an epoll descriptor is rejected without consuming input.
         let n = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         assert!(n >= 0);
@@ -648,7 +664,9 @@ mod tests {
                 .success()
         );
         let sender = raw_socket(c"uq-read", 0x88b5);
-        let mut reader = Reader::new().unwrap();
+        let Some(mut reader) = ring() else {
+            return;
+        };
         let tasks = std::fs::read_dir("/proc/self/task").unwrap().count();
         let mut storage = vec![vec![0u8; crate::MAX_FRAME_LEN + 1]; CAPACITY];
         let mut buffers: Vec<_> = storage.iter_mut().map(Vec::as_mut_slice).collect();

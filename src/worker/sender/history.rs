@@ -44,6 +44,9 @@ impl Lane {
         self.scan_cutoff = None;
         self.probes = [None; 2];
         self.retire_due = false;
+        // Packet numbers start again, so earlier evidence means nothing.
+        self.black_hole = crate::pmtu::BlackHole::default();
+        self.black_holed = false;
         Ok(())
     }
 
@@ -195,7 +198,9 @@ impl Lane {
                 },
             );
             *budget -= allowance;
+            let black_hole = &mut self.black_hole;
             let end = self.history.advance_ack(allowance, |ack| {
+                black_hole.acked(ack.packet.number, ack.packet.outer_bytes);
                 report.entries[report.count] = Entry {
                     number: ack.packet.number,
                     sample: ack.packet.sample_slot,
@@ -280,6 +285,7 @@ impl Lane {
                         .is_some_and(|range| packet.number <= range.end)
                 });
                 if !covered && let Some(packet) = self.history.lose(packet.number) {
+                    self.black_holed |= self.black_hole.lost(packet.number, packet.outer_bytes);
                     report.entries[report.count] = Entry {
                         number: packet.number,
                         sample: packet.sample_slot,
@@ -742,6 +748,47 @@ mod tests {
             assert!(report.entries[0].settled);
             lane.report_completed(&report).unwrap();
             assert_eq!(lane.history.inflight_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn tails_acknowledged_while_full_datagrams_are_lost_report_a_black_hole() {
+        let submit = |lane: &mut Lane, number: u64, bytes: u16| {
+            lane.history.reserve(number, bytes, true, true).unwrap();
+            assert!(lane.submitted(
+                number,
+                Duration::from_millis(1),
+                NonZeroU16::new(number as u16)
+            ));
+        };
+        // Applies the lane's ACK, then the loss pass it owes, long after the sends.
+        let settle = |lane: &mut Lane| {
+            let mut report = Report::new(0);
+            for _ in 0..8 {
+                if lane
+                    .advance_report(&mut report, Duration::from_secs(1), &mut 64)
+                    .unwrap()
+                {
+                    lane.report_completed(&report).unwrap();
+                }
+            }
+        };
+        for tails_only in [true, false] {
+            let mut lane = lane();
+            let mut found = None;
+            for frame in 0..24_u64 {
+                let (full, tail) = (2 * frame + 1, 2 * frame + 2);
+                submit(&mut lane, full, 1500);
+                submit(&mut lane, tail, 200);
+                assert!(lane.begin_ack(&ack(if tails_only { tail } else { full }, tail)));
+                settle(&mut lane);
+                if lane.black_holed {
+                    found = Some(frame);
+                    break;
+                }
+            }
+            // The first lost datagram starts the count; eight more frames end it.
+            assert_eq!(found, tails_only.then_some(8), "{tails_only}");
         }
     }
 

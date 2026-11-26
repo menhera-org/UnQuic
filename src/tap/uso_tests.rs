@@ -47,6 +47,11 @@ fn receive(capture: &OwnedFd) -> Vec<u8> {
 #[test]
 #[ignore = "requires disposable container, tun, iproute2 and CAP_NET_ADMIN/CAP_NET_RAW"]
 fn uso_writes_reproduce_single_frame_bytes_across_a_veth() {
+    // A TAP takes UDP segmentation offload from Linux 6.2. Before that the
+    // first such write is refused and the queue writes frames singly.
+    if !crate::tap::test_common::kernel_at_least(6, 2) {
+        return;
+    }
     // SAFETY: only this test thread and its children enter the private namespace.
     check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
     let control = UdpSocket::bind("[::]:0").unwrap();

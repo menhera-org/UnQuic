@@ -723,6 +723,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
+    /// Whether the kernel is Linux 6.2 or later, where a TAP takes UDP
+    /// segmentation offload: the offload tests below measure that.
+    fn offload_kernel() -> bool {
+        // SAFETY: a zeroed utsname is valid output storage, and uname
+        // NUL-terminates the release it writes.
+        let release = unsafe {
+            let mut name: libc::utsname = std::mem::zeroed();
+            assert_eq!(libc::uname(&mut name), 0);
+            std::ffi::CStr::from_ptr(name.release.as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        };
+        let mut numbers = release
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|part| part.parse::<u32>().ok());
+        (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0)) >= (6, 2)
+    }
+
     #[test]
     fn bins_count_by_send_time_and_keep_each_bins_largest_delay() {
         let width = Bins::WIDTH_NS;
@@ -916,6 +934,9 @@ mod tests {
     #[test]
     #[ignore = "UDP offload test; run in a disposable container"]
     fn ipv4_ipv6_gso_gro_preserve_payload_counts_and_reject_bad_input() {
+        if !offload_kernel() {
+            return;
+        }
         // SAFETY: only this test thread and its child enter the private namespace.
         assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
         assert!(
@@ -1068,6 +1089,9 @@ mod tests {
     #[ignore = "TAP offload delivery probe; run in a disposable container"]
     fn segmented_sends_follow_available_tap_offloads() {
         use std::os::fd::AsFd;
+        if !offload_kernel() {
+            return;
+        }
         // SAFETY: the test thread alone enters a disposable network namespace.
         assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
         let tap = unquic::tap::Tap::create(c"uq-prereq", 1500, 1, None).unwrap();

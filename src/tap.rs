@@ -388,6 +388,15 @@ impl Tap {
         self.queues
     }
 
+    /// Duplicates of every queue's descriptor, in queue order, for a service
+    /// manager to keep. Each refers to the same queue as the original.
+    pub fn duplicate_queues(&self) -> io::Result<Vec<OwnedFd>> {
+        self.queues
+            .iter()
+            .map(|queue| queue.fd.try_clone())
+            .collect()
+    }
+
     /// Changes carrier without removing the TAP or its upper devices.
     pub fn set_carrier(&self, up: bool) -> io::Result<()> {
         self.queues[0].set_carrier(up)

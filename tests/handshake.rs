@@ -1524,3 +1524,160 @@ fn delivery_and_controller_allocate_nothing_including_chunked_acks_and_late_loss
         (25_600_000, 12_800_000)
     );
 }
+
+fn hex(text: &str) -> u128 {
+    u128::from_str_radix(text, 16).unwrap()
+}
+
+/// Reads a record as the vectors write it: its name and its tags in hex,
+/// with `port=N` to change the port its sender advertises.
+fn written(words: &[&str], mut params: Params) -> Record<'static> {
+    let mut tags = Vec::new();
+    for word in words.iter().skip(1) {
+        match word.strip_prefix("port=") {
+            Some(port) => params.port = port.parse().unwrap(),
+            None => tags.push(hex(word)),
+        }
+    }
+    match (words.first().copied(), tags.as_slice()) {
+        (Some("hello"), &[initiator]) => Record::Hello { initiator, params },
+        (Some("challenge"), &[initiator, responder]) => Record::Challenge {
+            initiator,
+            responder,
+            params,
+        },
+        (Some("confirm"), &[initiator, responder]) => Record::Confirm {
+            initiator,
+            responder,
+        },
+        (Some("ready"), &[initiator, responder]) => Record::Ready {
+            initiator,
+            responder,
+        },
+        _ => panic!("bad record {words:?}"),
+    }
+}
+
+/// Writes what one input produced the way the vectors do: the effects in the
+/// order an owner applies them, then the state.
+fn outcome(session: &Session, own: Params, result: Result<Effects, HandshakeError>) -> String {
+    let mut items = Vec::new();
+    match result {
+        Ok(effects) => {
+            if effects.retire {
+                items.push("retire".into());
+            }
+            if let Some(connection) = effects.commit {
+                assert_eq!(session.connection(), Some(connection));
+                items.push(format!("commit {:?}", connection.role).to_lowercase());
+            }
+            match effects.carrier {
+                Some(true) => items.push("carrier up".into()),
+                Some(false) => items.push("carrier down".into()),
+                None => {}
+            }
+            match effects.send {
+                Some(Record::Hello { initiator, params }) => {
+                    assert_eq!(params, own);
+                    items.push(format!("send hello {initiator:x}"));
+                }
+                Some(Record::Challenge {
+                    initiator,
+                    responder,
+                    params,
+                }) => {
+                    assert_eq!(params, own);
+                    items.push(format!("send challenge {initiator:x} {responder:x}"));
+                }
+                Some(Record::Confirm {
+                    initiator,
+                    responder,
+                }) => items.push(format!("send confirm {initiator:x} {responder:x}")),
+                Some(Record::Ready {
+                    initiator,
+                    responder,
+                }) => items.push(format!("send ready {initiator:x} {responder:x}")),
+                Some(other) => panic!("not a handshake record: {other:?}"),
+                None => {}
+            }
+            if effects.needs_tag {
+                items.push("needs-tag".into());
+            }
+        }
+        Err(error) => items.push(format!("error ({error})")),
+    }
+    items.push(format!("{:?}", session.state()).to_lowercase());
+    items.join("; ")
+}
+
+/// Replays one file of `tests/vectors/handshake-v1` against two sessions and
+/// returns the file as this implementation would write it.
+fn replay(text: &str) -> String {
+    let (mut a, mut b) = sessions();
+    let mut actual = String::new();
+    for line in text.lines() {
+        let Some((input, _)) = line.split_once("=>").filter(|_| !line.starts_with('#')) else {
+            actual.push_str(line);
+            actual.push('\n');
+            continue;
+        };
+        let mut words: Vec<&str> = input.split_whitespace().collect();
+        let fresh = words
+            .last()
+            .and_then(|word| word.strip_prefix("fresh="))
+            .map(|tag| Tag::new(hex(tag)).unwrap());
+        if fresh.is_some() {
+            words.pop();
+        }
+        let now = Duration::from_millis(words[0].parse().unwrap());
+        let (session, own, peer) = match words[1] {
+            "a" => (&mut a, A, B),
+            "b" => (&mut b, B, A),
+            other => panic!("unknown endpoint {other}"),
+        };
+        let result = match words[2] {
+            "timer" => session.on_timer(now, fresh),
+            "reconnect" => session.reconnect(now, fresh),
+            "cancel" => session.cancel_pending(now).map(|()| Effects::default()),
+            "feedback" => {
+                let tag = session.connection().unwrap().local_tag();
+                session.on_feedback(tag, now).map(|()| Effects::default())
+            }
+            "recv" => session.on_record(written(&words[3..], peer), now, fresh),
+            other => panic!("unknown input {other}"),
+        };
+        actual.push_str(&format!("{input}=> {}\n", outcome(session, own, result)));
+    }
+    actual
+}
+
+#[test]
+fn state_machine_vectors_replay_exactly() {
+    let mut wrong = String::new();
+    for (name, text) in [
+        (
+            "establish",
+            include_str!("vectors/handshake-v1/establish.txt"),
+        ),
+        (
+            "simultaneous",
+            include_str!("vectors/handshake-v1/simultaneous.txt"),
+        ),
+        (
+            "equal-tags",
+            include_str!("vectors/handshake-v1/equal-tags.txt"),
+        ),
+        ("loss", include_str!("vectors/handshake-v1/loss.txt")),
+        ("expiry", include_str!("vectors/handshake-v1/expiry.txt")),
+        (
+            "replacement",
+            include_str!("vectors/handshake-v1/replacement.txt"),
+        ),
+    ] {
+        let actual = replay(text);
+        if actual != text {
+            wrong.push_str(&format!("{name}.txt must read:\n{actual}\n"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong}");
+}

@@ -256,6 +256,10 @@ pub(super) struct Lane {
     pub(super) probes: [Option<(u64, u16)>; 2],
     // Retained loss handles pin more than half the history; retire them before DATA is refused.
     pub(super) retire_due: bool,
+    // This lane's ACKs and losses as path-MTU evidence, and whether they
+    // found a black hole the worker has yet to apply to the lane's path.
+    pub(super) black_hole: crate::pmtu::BlackHole,
+    pub(super) black_holed: bool,
 }
 
 impl Lane {
@@ -283,6 +287,8 @@ impl Lane {
             loss_passes: 0,
             probes: [None; 2],
             retire_due: false,
+            black_hole: crate::pmtu::BlackHole::default(),
+            black_holed: false,
         })
     }
 }
@@ -368,6 +374,8 @@ pub(super) struct State {
     checks_pending: usize,
     acks_pending: usize,
     loss_fences: usize,
+    // Some lane has a black hole for the worker to apply.
+    pub(super) black_holes: bool,
     pub(super) offsets: Vec<usize>,
     pub(super) lanes: Vec<Lane>,
     pub(super) cursor: usize,
@@ -486,6 +494,7 @@ impl State {
             checks_pending: 0,
             acks_pending: 0,
             loss_fences: 0,
+            black_holes: false,
             offsets,
             lanes,
             cursor: 0,
@@ -1305,6 +1314,7 @@ impl Worker {
                     &self.sender.incoming,
                     tag,
                 )?;
+                self.sender.black_holes |= lane.black_holed;
                 self.sender.loss_fences = self
                     .sender
                     .loss_fences
@@ -1399,6 +1409,7 @@ impl Worker {
                 &self.sender.incoming,
                 tag,
             )? || (retire && lane.retire_report(&mut report, &mut budget)?);
+            self.sender.black_holes |= lane.black_holed;
             self.sender.loss_fences = self
                 .sender
                 .loss_fences

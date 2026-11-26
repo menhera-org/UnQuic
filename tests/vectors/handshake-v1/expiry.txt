@@ -1,0 +1,14 @@
+# An attempt nobody answers. Without a fresh tag nothing starts; an attempt
+# lasts ten seconds, and the next one needs a tag the endpoint has not used.
+0     a timer                   => needs-tag; configured
+0     a timer fresh=a1          => send hello a1; establishing
+1000  a timer                   => send hello a1; establishing
+9000  a timer                   => send hello a1; establishing
+9999  a timer fresh=a2          => establishing
+10000 a timer fresh=a1          => needs-tag; establishing
+10000 a timer fresh=a2          => send hello a2; establishing
+# A changed path cancels the attempt; the next one starts from configured.
+10010 a cancel                  => configured
+10010 a timer fresh=a3          => send hello a3; establishing
+# Time never runs backwards.
+10000 a timer                   => error (handshake time moved backwards); establishing

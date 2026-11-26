@@ -178,6 +178,9 @@ metrics! {
     app_limited_marks: sum,
     /// Currently charged outer IP bytes in flight.
     bytes_in_flight: sum,
+    /// Times a lane's ACKs and losses showed that datagrams above the baseline
+    /// no longer arrive, which restarts that path's size discovery.
+    path_mtu_black_holes: sum,
     /// Current outer IP size ceiling; consult path_mtu_state for its basis.
     path_mtu_bytes: min_nonzero,
     /// Numeric PathMtuState value.

@@ -1739,6 +1739,9 @@ impl Worker {
             more |= phase!(self, 2, self.distribute_receivers());
             more |= phase!(self, 3, self.addresses(now))?;
             more |= phase!(self, 4, self.service_sender(now))?;
+            if self.sender.black_holes {
+                self.mtu_black_holes(now);
+            }
             phase!(self, 5, self.progress_barriers(now))?;
             phase!(self, 6, self.timers(now))?;
             more |= phase!(self, 7, self.mtu_timers(now))?;
@@ -5272,7 +5275,11 @@ impl Worker {
     }
 
     // Nominally one 9000-byte probe per 3 ms globally, without a shared counter or lock.
-    // shortcut: static worker slots waste idle shares; replace with control grants in pacing.rs.
+    // DECISION(2026-11-27): static worker slots stay as the ceiling on padded probes. Why: the
+    //   sender's grants already charge each probe to the shared window and pacing, so a slot only
+    //   bounds how often a worker asks, and an unused slot costs a worker at most `workers` slots
+    //   of waiting per probe while DATA flows at the baseline. Rejected: one shared next-probe
+    //   time (every worker with a probe due wakes for each slot and one of them wins).
     fn probe_time(&self, now: Duration) -> Duration {
         let slot = now.as_millis() / 3;
         let workers = self.shared.workers() as u128;
@@ -5529,6 +5536,36 @@ impl Worker {
         }
         self.mtu_changed(peer, path, lane, before, now);
         Ok(!error.local)
+    }
+
+    /// Restarts discovery on the path of every lane whose ACKs and losses
+    /// showed a black hole above the baseline (pmtu::BlackHole).
+    fn mtu_black_holes(&mut self, now: Duration) {
+        self.sender.black_holes = false;
+        for index in 0..self.sender.lanes.len() {
+            let state = &mut self.sender.lanes[index];
+            if !std::mem::take(&mut state.black_holed) {
+                continue;
+            }
+            let (session, lane) = (state.session, usize::from(state.lane).wrapping_sub(1));
+            let Some(peer) = self.shared.config.peer_for_session(session) else {
+                continue;
+            };
+            let path = self.sessions[session].path;
+            let Some(tx) = self.transmit[peer].paths[path].lanes.get_mut(lane) else {
+                continue;
+            };
+            let before = (tx.mtu.payload_limit(), tx.mtu.state());
+            // At the baseline no larger datagram was sent, so none was lost.
+            if before.0 <= BASE_UDP_PAYLOAD {
+                continue;
+            }
+            tx.mtu.black_hole(now);
+            self.counters.path_mtu_black_holes = self.counters.path_mtu_black_holes.wrapping_add(1);
+            let totals = &mut self.sessions[session].totals;
+            totals.path_mtu_black_holes = totals.path_mtu_black_holes.wrapping_add(1);
+            self.mtu_changed(peer, path, lane, before, now);
+        }
     }
 
     fn mtu_changed(
@@ -6617,6 +6654,10 @@ mod tests {
         use crate::tap::test_common::udp;
         use std::os::unix::net::UnixDatagram;
         let (mut worker, _) = receive_worker();
+        // The read limits asserted here are the ring's (io_uring, Linux 5.1).
+        if worker.tap_reader.is_none() {
+            return;
+        }
         worker.sessions[0].tx.truncate(1);
         let (fd, sender) = UnixDatagram::pair().unwrap();
         fd.set_nonblocking(true).unwrap();
@@ -8766,6 +8807,10 @@ mod tests {
         use crate::tap::test_common::udp;
         use std::os::unix::net::UnixDatagram;
         let (mut worker, _) = receive_worker();
+        // A ring test: without io_uring (before Linux 5.1) there is no batch.
+        if worker.tap_reader.is_none() {
+            return;
+        }
         worker.sessions[0].tap_read_limit = 1;
         let (tx, mut incoming) = crate::spsc::channel();
         worker.outgoing[1] = Some(tx);
@@ -8826,6 +8871,10 @@ mod tests {
     #[ignore = "kernel ring test; run in a disposable container"]
     fn pool_pressure_does_not_shrink_the_tap_read_budget() {
         let (mut worker, tap) = receive_worker();
+        // A ring test: without io_uring (before Linux 5.1) there is no batch.
+        if worker.tap_reader.is_none() {
+            return;
+        }
         assert!(worker.tap_reader.as_ref().unwrap().enabled);
         worker.sessions[0].tx.truncate(1);
         worker.sessions[0].tap_read_limit = BATCH_SIZE;

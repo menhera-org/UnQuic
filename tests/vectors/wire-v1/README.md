@@ -32,5 +32,5 @@ HELLO and CHALLENGE advertise receive port 40000, frame ceiling 9022, and zero
 mandatory/optional feature bits unless the table says otherwise. The last four
 rows fix the optional extensions' encodings (design section 6): a peer that
 advertises none of them never receives a flagged DATA record. These fixtures
-describe v1's current encoding; state-machine vectors remain later roadmap
-work.
+describe v1's current encoding. [../handshake-v1](../handshake-v1/README.md)
+fixes the handshake's state transitions.

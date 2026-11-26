@@ -38,32 +38,93 @@ The daemon's remaining features, all with tests:
   round-trip sample. Resolver diagnostics name the peer, not its index.
 - Wire vectors for the three optional extensions: DATA flags 1, 2 and 4
   and a HELLO advertising all three (`tests/vectors/wire-v1`).
+- Host lines in the report: CPU model, clock and allowed CPUs, the
+  kernel's socket-buffer ceilings, and for each underlay device its
+  driver, MTU, channels, poll settings and offloads.
+- Privileges. The printed unit runs the daemon as root with
+  `CAP_NET_ADMIN`, `CAP_NET_RAW` and `CAP_NET_BIND_SERVICE` only and with
+  `NoNewPrivileges=yes` (design section 12; reversible).
+- systemd's notification socket and descriptor store, spoken without a
+  library. The daemon stores every TAP queue with the manager, so the
+  queues stay attached across a crash and across `systemctl restart`, and
+  the next start adopts them. `tests/systemd.sh` runs the whole unit under
+  systemd 255 in a container: links, ordering, privileges, a crash, a
+  reload, a resizing restart and a clean stop.
+- Packages. `packaging/build.sh` builds a DEB and an RPM with the static
+  binary and the unit it prints for the installed paths. The DEB passes
+  `tests/systemd.sh`; the RPM installs, verifies and runs in Rocky Linux 9.
+- Path-MTU black holes from ACK and loss feedback (`pmtu::BlackHole`):
+  full datagrams lost while small ones arrive restart discovery after
+  about ten frames, where timed confirmation needed three seconds or more.
+- Linux 5.0, the minimum kernel. All 131 kernel tests pass on Linux 5.0.0
+  in an emulated machine (`tests/qemu-kernel.sh`). Getting there found one
+  fault in the daemon: that kernel answers a GSO send above the device MTU
+  with `EINVAL`, and the daemon took it for a kernel without GSO and sent
+  one datagram a call from then on. It now tries the same datagrams
+  plainly first and keeps GSO when they are too big as well. The tests
+  learned which interfaces that kernel lacks (io_uring, `TUNGETDEVNETNS`,
+  UDP segmentation on a TAP) and check the fallbacks there; README.md
+  lists them.
+- Handshake state-machine vectors (`tests/vectors/handshake-v1`): six
+  transcripts fix every effect and state of the exchange, simultaneous
+  starts, repeats and losses, expiry, replacement and inactivity.
+- The device line of the report names the header fields the card hashes
+  UDP by (`udp6_hash`), which is what decides whether lanes spread over
+  receive queues.
+
+What the hold leaves is the kernel's: a profile with it on spends over
+nine tenths of the daemon's busy cycles in TAP writes (41–43%), TAP reads
+(25–26%), UDP sends (14–18%) and UDP receives (6%), and under a tenth in
+reassembly, sender accounting and control
+([BENCH.md](BENCH.md#larger-worker-turns-for-single-frames-november-27-landed)).
 
 Open, ahead of the lists below:
 
-1. The real path's right-to-left direction drops everything for about a
-   second now and then: plain UDP without the daemon lost 1.1 s of every
-   one of sixteen flows in a 300 s run, and nothing in a 60 s run before
-   it. Whether the path does it or the receiving host below the socket is
-   for whoever can look at that host. Through the daemon it shows as a
+1. The real path has outages, and they are the right side's gateway.
+   Plain UDP without the daemon lost 1.1 s of every one of sixteen flows
+   in a 300 s run right to left, and nothing in a 60 s run before it.
+   Echoes sent ten times a second from both endpoints place it: in each
+   event the right endpoint's own gateway answers 150–190 ms late, twice
+   about 0.4 s apart, to the right endpoint beside it and to the left
+   endpoint across the carrier's network at the same instants, while the
+   left gateway and the hop behind it answer as usual and no echo is lost.
+   It stops forwarding for about 0.17 s at a time and releases what it
+   held, and each event costs every flow about 0.04 s of its datagrams at
+   0.5 Gbit/s. It does this loaded or idle, on a schedule that repeats
+   every half hour: 21 events at fixed seconds in the 1,600 s of the half
+   hour that were watched, and a pass made to test the schedule met all
+   seven events it predicted
+   ([BENCH.md](BENCH.md#larger-worker-turns-for-single-frames-november-27-landed)).
+   An earlier reading of this entry blamed the receiving machine, from a
+   test that could not tell the two ends apart. The gateway's own logs
+   are the next place to look, and that is its owner's to do. Through the
+   daemon an event shows as a
    stall in both directions at once, with or without the hold, at any
    rate: 6 of 20 points without the hold and 4 of 20 with it lost more
    than 2.1% of their frames on November 27, most of them this way. Both
-   senders' windows fill within 40 ms, because one direction's data and
-   the other's acknowledgements are gone, and the daemon resumes when the
+   senders' windows fill within 40 ms, because data and acknowledgements
+   are held in both directions, and the daemon resumes when the
    path does. Read real-path results with that in mind: compare arms only
    inside one batch, and count such points before anything else. Earlier
    real-path entries that report a few percent lost in one 10 s point may
    have met the same thing.
 2. Four slow cores are still unmeasured (item 1 of the checkpoint below).
-3. Not built: systemd notification and descriptor storage, DEB and RPM
-   packages, host details beyond the report's first line (card, driver,
-   offloads), qualification on Linux 5.0, path-MTU decisions from ACK and
-   loss feedback.
+   It needs such a box; nothing here stands in for one.
+3. Three things are decided and not built. Path-MTU probes keep their
+   static worker slots: the sender's grants already charge every probe to
+   the shared window and pacing, so the slots are only a ceiling
+   (`Worker::probe_time`). The report does not say which receive queue a
+   flow lands on, because the kernel records that only for connected UDP
+   sockets; it names the card's hash fields. Liveness stays the
+   connection's (design section 5.3): a lane whose own path fails
+   suspends its DATA and reports a failed path-MTU state, and its flows
+   stay on it (README.md, operational checks). `stripe_flows` stays
+   experimental and off.
 4. Decisions that are the user's: the numeric competitive margin and the
-   frozen hardware, core budget and flow counts of design section 16; the
-   privilege model the unit should run under; whether `tx_hold_us` should
-   default on, and whether `turn_hold_us` should stay at 200.
+   frozen hardware, core budget and flow counts of design section 16;
+   whether `tx_hold_us` should default on, whether `turn_hold_us` should
+   stay at 200, and whether the unit's privileges should be tighter or run
+   under a dedicated user.
 
 ## November 26 checkpoint
 
@@ -2387,12 +2448,17 @@ full expired batches sharing the cleanup budget.
   borrows shared zero padding for scatter/gather sends. The pure state machine
   now bounds proof history, checks full probe identity/length, narrows the search
   after loss, handles reductions and baseline failure, and retries upward.
+  Since November 27 a lane's own ACKs and losses also restart discovery when
+  full datagrams are lost while small ones arrive (`pmtu::BlackHole`), where
+  timed confirmation alone took three timeouts.
   Deterministic tests cover every supported MTU, stale/forged replies, loss and
   backpressure. Runtime scheduling now visits at most 64 owned sockets per pass,
   routes feedback to lane owners and shares socket state across sessions.
   Probe-connection replacement now rearms confirmation without reopening a
   failed baseline or resetting an unchanged shared-session probe history.
-  Static probe slots are temporary until the shared control pacer is available.
+  Static probe slots stay (decided November 27): padded probes are charged
+  to the shared window and pacing through the sender's grants, and the slots
+  only bound how often a worker asks.
   Keep the hot path allocation-free. Use padded
   PROBE and matching PROBE_REPLY, with `EMSGSIZE` and validated `IPV6_RECVERR`
   Packet Too Big as "shrink now, re-probe later". Local interface MTU alone
@@ -2440,6 +2506,9 @@ full expired batches sharing the cleanup budget.
   io_uring, offload, steering and namespace behavior on the deployed kernel.
   Record the tested kernel matrix and exercise unavailable-feature fallbacks;
   Linux 6.8 source citations and tests alone do not establish compatibility.
+  The matrix is Linux 5.0.0 (emulated, no network card), 6.8 and 7.0
+  (containers); README.md's kernel table names each fallback and the suite
+  runs them on 5.0.
 - Implement section 11's TAP lifetime contract. Keep published devices alive
   through worker/socket failures and shutdown unless removal was explicitly
   requested. Define versioned descriptor adoption and re-exec handover with no
@@ -2697,8 +2766,9 @@ acceptance profile of section 14.2.
 
 As of November 27 the wire vectors are fixed test files for every record
 type, the three DATA flags and the optional feature bits
-(`tests/vectors/wire-v1`), and the container suites pass on Linux 6.8 and
-7.0. State-machine vectors are not written. The rows of section 16 that
+(`tests/vectors/wire-v1`), the handshake's state transitions are fixed
+transcripts (`tests/vectors/handshake-v1`), and the kernel suites pass on
+Linux 5.0, 6.8 and 7.0. The rows of section 16 that
 are still open need the user's decisions: the numeric competitive margin,
 and the hardware, core budget, flow count, direction and loss profile the
 two throughput requirements are frozen at.

@@ -51,6 +51,8 @@ struct ControlState {
     handover: AtomicBool,
     // (session, queue, descriptor) released by workers stopping for a handover.
     handed: Mutex<Vec<(usize, usize, std::os::fd::OwnedFd)>>,
+    // Duplicates of every TAP queue made at startup, once asked for.
+    copies: Mutex<Option<Vec<(usize, usize, std::os::fd::OwnedFd)>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -154,6 +156,28 @@ impl Control {
             .unwrap_or_default();
         handed.sort_by_key(|&(session, queue, _)| (session, queue));
         handed
+    }
+
+    /// Asks the coming run to duplicate every TAP queue descriptor as it sets
+    /// the TAPs up, for a service manager's descriptor store. Call before run
+    /// and collect with [`take_queue_copies`](Self::take_queue_copies) once
+    /// [`ready`](Self::ready); copies nobody collected close when run returns.
+    pub fn keep_queue_copies(&self) {
+        if let Ok(mut copies) = self.0.copies.lock() {
+            copies.get_or_insert_with(Vec::new);
+        }
+    }
+
+    /// The duplicates [`keep_queue_copies`](Self::keep_queue_copies) asked
+    /// for, as (session, queue index, descriptor) in that order. Each refers
+    /// to the same queue as the worker's own descriptor.
+    pub fn take_queue_copies(&self) -> Vec<(usize, usize, std::os::fd::OwnedFd)> {
+        self.0
+            .copies
+            .lock()
+            .ok()
+            .and_then(|mut copies| copies.take())
+            .unwrap_or_default()
     }
 
     /// Queues an IPv6 candidate for a configured peer without changing its port.
@@ -377,6 +401,10 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
         fn drop(&mut self) {
             self.0.0.ready.store(false, Ordering::Release);
             self.0.0.stopped.store(true, Ordering::Release);
+            // A retained handle keeps no TAP queue open.
+            if let Ok(mut copies) = self.0.0.copies.lock() {
+                *copies = None;
+            }
         }
     }
     let _finish = Finish(control.clone());
@@ -494,6 +522,13 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
         };
         tap.enable_input_offloads()?;
         tap.raise_queue()?;
+        if let Ok(mut copies) = control.0.copies.lock()
+            && let Some(copies) = copies.as_mut()
+        {
+            for (queue, fd) in tap.duplicate_queues()?.into_iter().enumerate() {
+                copies.push((index, queue, fd));
+            }
+        }
         for (worker, queue) in workers.iter_mut().zip(tap.into_queues()) {
             worker.attach_tap(index, queue)?;
         }
