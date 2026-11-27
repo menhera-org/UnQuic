@@ -147,7 +147,15 @@ to find more ([BENCH.md](BENCH.md#what-is-left-of-a-daemons-cpu-november-27)):
   coalescing leaves a tenth of the frames written alone. Not kept; the
   patch is in `benches/`.
 - Half of all TAP read requests come back empty, 2% of a daemon on single
-  frames. Sizing the batches closer recovers 0.6% and is not built.
+  frames. Sizing the batches closer recovers 0.6% at most, a fraction of
+  what two rounds of one build differ by, so it cannot be shown to help
+  and is not built.
+- The turn hold counts a worker's own reads as input and not the frames
+  other workers hand it. Counting those too changes nothing: 42–43% of a
+  core against 42% at 0.25 Gbit/s each way of single frames, 89–91%
+  against 85–90% at 1, and 73–74% against 72–77% on trains at 2 Gbit/s,
+  with the same delay and loss
+  ([rows](benches/turn-hold-light-load-four-workers-nov27.txt)). Not kept.
 - Workers and lanes beyond what the load needs cost the most: four queues
   and four lanes use two thirds more CPU than two and two on 0.5 Gbit/s
   each way of single frames. The defaults are one and one, and

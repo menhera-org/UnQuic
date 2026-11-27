@@ -4566,6 +4566,15 @@ slower host up to a third of a second of single frames in three cases of
 five. Trains showed no such cost: stepping from 1 to 2 Gbit/s, the folded
 daemons lost no more than the unfolded ones.
 
+**The final build.** The figures above are from the build before two
+later fixes of the day (a failed lane's flight is written off at once; a
+log line for failed lookups). The final build was run against that one
+afterwards, three rounds: single frames cost 71–72% and 54–55% of a core
+at 0.5 Gbit/s each way against 70–79% and 55–57%, and 116–118% and 93–95%
+at 1 against 118–130% and 93–96%, with no frame missing in either; trains
+cost 52–54% and 42–44% at 1 Gbit/s against 53–55% and 44–49%, and 109–115%
+and 91–100% at 2 against 108–113% and 94–102%.
+
 ## A longer hold while a worker is busy (November 27, landed)
 
 The turn hold stayed at 300 µs because every quiet tunnel would pay a

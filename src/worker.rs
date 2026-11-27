@@ -2635,6 +2635,9 @@ impl Worker {
                         self.setup_due = now;
                     }
                     Event::Packet(buffer) => self.received.push_back(buffer),
+                    // FAILED(2026-11-27): counting these handed-over frames as the turn's input for
+                    //   the turn hold -> the same CPU, delay and loss on single frames and on
+                    //   trains (ROADMAP.md). Now: only a worker's own reads count, as before.
                     Event::Frame(buffer) => self.input_frame(buffer, now)?,
                     Event::Free(buffer) => self.release(buffer),
                     Event::Stripe(buffer) => self.accept_stripes(buffer, now),

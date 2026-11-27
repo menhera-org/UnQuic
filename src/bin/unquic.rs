@@ -80,6 +80,7 @@ fn resolve(job: config::Lookup, control: Control, routes: Routes) {
     let mut resolver = None;
     let mut submitted = None;
     let mut pending = None;
+    let mut silent = false;
     let mut due = Instant::now();
     while !STOP.load(Ordering::Relaxed) && !control.stopped() {
         if Instant::now() >= due {
@@ -96,10 +97,20 @@ fn resolve(job: config::Lookup, control: Control, routes: Routes) {
                     ),
                 }
             }
-            if let Some(resolver) = &resolver
-                && let Some(address) = resolve_ipv6(resolver)
-            {
-                pending = (submitted != Some(address)).then_some(address);
+            if let Some(resolver) = &resolver {
+                match resolve_ipv6(resolver) {
+                    Some(address) => {
+                        pending = (submitted != Some(address)).then_some(address);
+                        silent = false;
+                    }
+                    // Said once per run of failures: a mode that finds no
+                    // server on its link otherwise fails without a word.
+                    None if !silent => {
+                        eprintln!("unquic: peer {} lookup found no address", job.name);
+                        silent = true;
+                    }
+                    None => {}
+                }
             }
             due = Instant::now() + job.refresh;
         }

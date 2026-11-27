@@ -1628,10 +1628,16 @@ fails with OutOfMemory before creating any.
 
 Three things are open because they need hardware or networks that were not
 at hand. The `system` resolver mode was checked on the two real hosts on
-November 27 and resolved its peer within a second; the `ra`, `dhcpv6` and
-`ipv6` modes resolved nothing on that link in twenty seconds, and whether
-that network advertises a resolver there was not established, so those
-modes still need a network known to advertise one. Offload frames and
+November 27 and resolved its peer within a second. The `ra`, `dhcpv6` and
+`ipv6` modes resolved nothing on that link, and a capture shows why. The
+daemon sent its router solicitations and DHCPv6 information requests and
+both were answered, but the advertisements there carry no resolver option,
+and the DHCPv6 replies, which do name a DNS server, went to the host's own
+DHCPv6 client: systemd-networkd holds UDP port 546 on that interface. On a
+host whose network manager already runs DHCPv6 on the link, use `system`.
+The two discovery modes still need a link that advertises a resolver in
+its router advertisements, or one with no other DHCPv6 client, to be seen
+working outside tests. Offload frames and
 partial checksums ran across those hosts' real cards through macvlan in
 every real-path entry of BENCH.md, and in the trains sessions of November
 27 no receiver counted an invalid frame; that is the qualification there

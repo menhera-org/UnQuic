@@ -176,6 +176,16 @@ Each hostname has its own helper, so a slow lookup does not block another peer.
 | `dhcpv6` | `interface`; optional `client_mac` | Stateless DHCPv6 DNS discovery |
 | `ipv6` | `interface`; optional `client_mac` | iphost's combined discovery, preferring available DHCPv6 servers over RA |
 
+`dhcpv6` and `ipv6` receive replies on UDP port 546 of the interface. Where
+the host's network manager already runs a DHCPv6 client there, as
+systemd-networkd does on a link it configures by DHCPv6, the replies reach
+that client and not the daemon, and the lookup never completes; use
+`system` on such a host, which reads what that client learned. `ra` needs
+router advertisements that carry a recursive DNS server option. When a
+peer's lookups begin to fail the daemon logs `peer <name> lookup found no
+address` once, and says nothing more until one has succeeded and they fail
+again.
+
 For example, place this table after a peer's fields and before the next
 `[[peers]]` or `[[sessions]]` table:
 
