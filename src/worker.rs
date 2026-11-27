@@ -5950,6 +5950,21 @@ impl Worker {
                 continue;
             }
             mark_lane(&self.shared, session, lane, limit == 0);
+            // FAILED(2026-11-27): leaving a failed lane's flight to the timers -> its packets kept
+            //   the path's probe timeout expiring, three unanswered expiries stop every grant,
+            //   and the flows that had just moved to the next lane lost frames for a second.
+            //   Now: the lane's flight is written off at once, and the silence, which was this
+            //   lane's, ends as an answered probe ends it.
+            if limit == 0
+                && before.0 != 0
+                && let Some(index) = history
+                && let Some(failed) = self.sender.lanes.get_mut(index)
+            {
+                failed.force_loss(now);
+                if let Some(fresh) = self.sender.fresh.get_mut(failed.group) {
+                    *fresh = true;
+                }
+            }
             if local.connection.is_none() {
                 continue;
             }
@@ -8665,6 +8680,19 @@ mod tests {
         worker.mtu_changed(0, 0, 1, before, Duration::ZERO);
         assert_eq!(state(&worker).0, 0);
         assert_eq!(shared.failed_lanes[0].load(Ordering::Relaxed), 0b10);
+        // A lane this worker sends on has its flight written off when it
+        // fails, and the path's silence ends with it.
+        let index = worker.sender_index(0, 2).unwrap();
+        let group = worker.sender.lanes[index].group;
+        assert!(!worker.sender.fresh[group]);
+        let mtu = &mut worker.transmit[0].paths[0].lanes[2].mtu;
+        let own = (mtu.payload_limit(), mtu.state());
+        assert!(mtu.local_too_big(BASE_UDP_PAYLOAD, 1279, Duration::ZERO));
+        worker.mtu_changed(0, 0, 2, own, ms(5));
+        assert_eq!(worker.sender.lanes[index].forced_before, Some(ms(5)));
+        assert!(worker.sender.fresh[group]);
+        assert_eq!(shared.failed_lanes[0].load(Ordering::Relaxed), 0b110);
+        shared.failed_lanes[0].store(0b10, Ordering::Relaxed);
         let before = state(&worker);
         let now = Duration::from_secs(20);
         let probe = pmtu::ProbeId {

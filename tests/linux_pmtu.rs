@@ -567,9 +567,10 @@ fn new_frames_leave_a_black_holed_lane_and_return_when_it_answers() {
     };
     // The frames below are one flow, so one data lane carries them all;
     // probes on the other add far less.
-    // Fifty frames, each awaited at the far TAP like routed_frame's. More than
-    // `allowed` of them missing fails and names the lanes.
-    let burst_but = |lanes: [u16; 2], allowed: usize| {
+    // Fifty frames, each awaited at the far TAP like routed_frame. A frame lives
+    // 20 ms on a path this short, so a machine that stalls longer loses one by
+    // design: two of the fifty may be missing, a third fails and names the lanes.
+    let burst = |lanes: [u16; 2]| {
         let before = lanes.map(|l| lane(l).tx_outer_bytes);
         let frame = routed_bytes();
         let mut capture = [0; 10_000];
@@ -577,17 +578,15 @@ fn new_frames_leave_a_black_holed_lane_and_return_when_it_answers() {
         for sent in 0..50 {
             while capture_frame(&taps[1], &mut capture).is_some() {}
             routed_send(&sources, 0, 1518);
-            let wait = Duration::from_millis(if allowed == 0 { 2000 } else { 300 });
-            let deadline = Instant::now() + wait;
+            let deadline = Instant::now() + Duration::from_millis(300);
             while !capture_frame(&taps[1], &mut capture)
                 .is_some_and(|n| n == 1518 && capture[..n] == frame[..1518])
             {
                 if Instant::now() >= deadline {
                     missing += 1;
                     assert!(
-                        missing <= allowed,
-                        "frame {sent} of a burst on lanes {lanes:?} did not arrive, the \
-                         {missing}. missing: {:?}",
+                        missing <= 2,
+                        "frame {sent} of a burst on lanes {lanes:?} is the third missing: {:?}",
                         lanes.map(&lane)
                     );
                     break;
@@ -595,12 +594,9 @@ fn new_frames_leave_a_black_holed_lane_and_return_when_it_answers() {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        if allowed != 0 {
-            println!("{missing} of 50 frames missing after the lane failed");
-        }
+        println!("{missing} of 50 frames missing on lanes {lanes:?}");
         [0, 1].map(|at| lane(lanes[at]).tx_outer_bytes - before[at])
     };
-    let burst = |lanes: [u16; 2]| burst_but(lanes, 0);
     let sent = burst([2, 3]);
     let (used, spare) = if sent[0] > sent[1] { (2, 3) } else { (3, 2) };
     assert!(sent[0].max(sent[1]) >= 40 * 1518, "{sent:?}");
@@ -653,25 +649,9 @@ fn new_frames_leave_a_black_holed_lane_and_return_when_it_answers() {
         lane(used).path_mtu_state == 4 && lane(used).path_mtu_bytes == 0
     });
     assert_ne!(lane(spare).path_mtu_bytes, 0);
-    // New frames of the flow now cross on the other data lane. For a second
-    // or so the path's window and rate are still what the black hole left
-    // of them, and a frame that waits for a grant past its lifetime expires
-    // unsent (ROADMAP.md, known and left). So the flow must cross within two
-    // seconds, and of the fifty frames after that at most five may be lost.
-    let crossed = || {
-        let (frame, mut capture, mut seen) = (routed_bytes(), [0; 10_000], false);
-        while let Some(n) = capture_frame(&taps[1], &mut capture) {
-            seen |= n == 1518 && capture[..n] == frame[..1518];
-        }
-        seen
-    };
-    crossed();
-    let failed = Instant::now();
-    wait("the flow did not cross on the other lane", &crossed);
-    let took = failed.elapsed();
-    println!("the flow crossed on the other lane {took:?} after its lane failed");
-    assert!(took < Duration::from_secs(2), "{took:?}");
-    let sent = burst_but([used, spare], 5);
+    // New frames of the flow now cross on the other data lane, the first of
+    // them too: the failed lane no longer holds the path's window.
+    let sent = burst([used, spare]);
     assert!(sent[1] >= 40 * 1518, "{sent:?}");
 
     tc(&["qdisc", "del", "dev", "r1", "clsact"]);

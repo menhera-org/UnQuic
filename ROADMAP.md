@@ -153,31 +153,37 @@ to find more ([BENCH.md](BENCH.md#what-is-left-of-a-daemons-cpu-november-27)):
   each way of single frames. The defaults are one and one, and
   config-model.md now says how to size them.
 
-Known inside this repository, and left:
+Found by the kernel suites this day:
 
-- For about a second after a lane fails, frames of its flows can expire
-  unsent on the next lane. The kernel test took every frame after a
-  failover for granted and failed about one run in eight on Linux 6.8. In
-  the runs that showed why, a frame waited for a send grant past its
-  100 ms lifetime on the new lane, once the first frame after the failover
-  and once the twenty-first, while the failed lane still showed 3,840
-  bytes in flight two seconds later. The black hole leaves the path's
-  window and rate bounds cut, and which of them starves the grant is not
-  yet known. The test now requires what holds: the flow crosses within two
-  seconds, and at most five of the fifty frames after that are lost. In 21
-  runs it crossed with its first or second frame, and one run lost one of
-  the fifty. Writing a failed lane's flight off and resetting the path's
-  short-term bounds the moment a lane fails is the likely fix.
+- A failed lane starved the lane its flows moved to. The lane failover
+  test failed about one run in eight on Linux 6.8: a frame waited for a
+  send grant past its 100 ms lifetime on the new lane, once the first
+  frame after the failover and once the twenty-first. The failed lane's
+  last packets were never answered, so they kept the path's probe timeout
+  expiring, and after three unanswered expiries a path stops every
+  ordinary grant until a probe is answered. A lane's owner now writes its
+  flight off the moment the lane fails and ends the path's silence as an
+  answered probe would, since the silence was that lane's. One strict run
+  in fifteen still lost a single frame in the middle of a burst, and that
+  one is the test host: on a path of a fraction of a millisecond a frame
+  lives 20 ms, and this host stalls for 10–50 ms every five seconds. The
+  test therefore allows two late frames in each burst of fifty and prints
+  the count. In 24 runs after that, 71 bursts of 72 lost nothing and one
+  lost one frame.
 - The kernel suites are sensitive to a busy machine. Run side by side on
   one host on November 27 they failed one or two tests a run, a different
-  one each time: a reload test whose daemon had exited by itself (the
-  build before this day's changes does the same, two runs in sixteen), a
-  reconnect that took more than thirty seconds, a handover wait of two
-  seconds. Run one at a time, each suite passed all 133 tests with the
-  final build, on Linux 6.8, 7.0 and 5.0.0. The reload test now keeps the
-  daemon's log and prints it when it fails, so the next early exit says
-  why; the daemon also removes its status file before its PID file, where
-  the same test had once found the status file left behind.
+  one each time: a reconnect that took more than thirty seconds, a
+  handover wait of two seconds. Run one at a time, each suite passed all
+  133 tests with the final build, on Linux 6.8, 7.0 and 5.0.0.
+- The reload test's missing PID file was the harness. A container that is
+  still booting empties `/tmp`, where the test keeps its PID file and the
+  daemon's log, so a test started in the first seconds found both gone
+  and looked as if the daemon had exited. Started after the container
+  reports that it runs, the test passed twelve times of twelve where it
+  had failed seven of twelve. The test now keeps the daemon's log and
+  prints it on a failure, and the daemon removes its status file before
+  its PID file, where the same test had once found the status file left
+  behind.
 
 Outside this repository:
 
