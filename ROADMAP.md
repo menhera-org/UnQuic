@@ -171,10 +171,13 @@ Decided and not built:
   Flows are pinned to their lanes while active, so that means moving
   active flows under load, and a wrong move reorders them. Across the real
   path one data lane in place of three takes 18% off a daemon's CPU at
-  0.5 Gbit/s each way of single frames and 12% at 1, and cannot carry 2
-  ([BENCH.md](BENCH.md#what-is-left-of-a-daemons-cpu-november-27)). The
-  operator sizes `queue_count` and `tx_lanes`. A hold of 1000 µs saved
-  more on the relay bed, a third, than one lane saves here.
+  0.5 Gbit/s each way of single frames and 12% at 1, where it cannot carry
+  2, and a quarter off on trains at 1 and 2 Gbit/s
+  ([BENCH.md](BENCH.md#what-is-left-of-a-daemons-cpu-november-27)). That
+  is what folding by itself would gain while a load is light. Until
+  someone decides the reordering is worth it, the operator sizes
+  `queue_count` and `tx_lanes`, and README.md and config-model.md give
+  these figures.
 - `stripe_flows` stays experimental and off.
 
 Decided on November 27 under the instruction to finish without stopping
