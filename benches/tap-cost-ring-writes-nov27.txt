@@ -1,0 +1,52 @@
+# benches/tap_cost.rs in a disposable container on Linux 6.8, pinned to one CPU, November 27.
+# Thread CPU nanoseconds per frame (per request for the empty reads); every written frame is
+# received from a UDP socket and checked. 524,288 frames a case unless noted. Two runs.
+#
+# Run 1
+read plain, one call a frame                              1354.13
+read ring, 64 empty requests a submission                  332.70 per request
+read ring, 64 frames a submission                          693.34
+write plain, no virtio header, one call a frame           2666.42
+ring write, no virtio header, 2 a submission              2736.62
+ring write, no virtio header, 4 a submission              2209.06
+ring write, no virtio header, 8 a submission              2186.18
+ring write, no virtio header, 64 a submission             1985.42
+writev with a virtio header, one call a frame             2843.16
+ring writev with a virtio header, 2 a submission          2562.00
+ring writev with a virtio header, 4 a submission          2608.76
+ring writev with a virtio header, 8 a submission          2154.69
+ring writev with a virtio header, 8 linked                2735.43
+ring writev with a virtio header, 64 a submission         2067.25
+ring writev with a virtio header, 64 linked               2665.68
+USO writev, 2 segments (16,384 frames)                    1894.67
+USO writev, 16 segments (131,072 frames)                   687.49
+USO writev, 44 segments (360,448 frames)                   568.16
+#
+# Run 2
+read plain, one call a frame                              1509.83
+read ring, 64 empty requests a submission                  358.43 per request
+read ring, 64 frames a submission                          683.47
+write plain, no virtio header, one call a frame           2920.71
+ring write, no virtio header, 2 a submission              2397.54
+ring write, no virtio header, 4 a submission              2521.52
+ring write, no virtio header, 8 a submission              2043.78
+ring write, no virtio header, 64 a submission             1966.41
+writev with a virtio header, one call a frame             2642.84
+ring writev with a virtio header, 2 a submission          2521.49
+ring writev with a virtio header, 4 a submission          2296.68
+ring writev with a virtio header, 8 a submission          2107.33
+ring writev with a virtio header, 8 linked                2324.05
+ring writev with a virtio header, 64 a submission         2328.45
+ring writev with a virtio header, 64 linked               2347.58
+USO writev, 2 segments (16,384 frames)                    1915.91
+USO writev, 16 segments (131,072 frames)                   800.75
+USO writev, 44 segments (360,448 frames)                   551.61
+#
+# The daemon on single frames, relay bed, two workers, 0.5 Gbit/s each way, hold 200 µs,
+# one 20 s point, left daemon's workers together (the run of benches/turn-hold-profile-nov27.txt):
+tap_ring_frames 848411  tap_read_requests 1696516  tap_read_batches 127673
+tap_write_calls 838347  tap_uso_batches 8617  tap_uso_frames 17241
+#
+# Idle: a pair of daemons joined over loopback, one session of four queues each, no traffic,
+# 30 s after 20 s of settling, one daemon: 0.03% of a core; its main thread wakes 20 times a
+# second and its five other threads (the runtime's and four workers) 0, 10, 1, 1 and 10 times.

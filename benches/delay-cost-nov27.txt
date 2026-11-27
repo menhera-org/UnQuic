@@ -1,0 +1,51 @@
+# Relay bed, two workers per daemon, sixteen flows with two VLAN tags as 44-segment trains,
+# 2 Gbit/s each way, two 20 s points, a `profile` build with benches/profile-sender-spots-diagnostic.patch.
+# Columns as in the other relay rows: delivered each way, offered, daemon CPU left and right,
+# busiest thread, missing frames.
+#
+# No delay:
+s        r1 p0  1.98 +  1.98 =  3.96 G | off  2.00  2.00 | CPU   64%   63% busiest  38  40 | miss  0.0%  0.0%
+s        r1 p1  1.98 +  1.98 =  3.95 G | off  2.00  2.00 | CPU   65%   63% busiest  38  40 | miss  0.0%  0.0%
+# 7.5 ms round trip:
+s        r1 p0  1.97 +  1.97 =  3.94 G | off  2.00  2.00 | CPU   65%   62% busiest  38  39 | miss  0.2%  0.3%
+s        r1 p1  1.98 +  1.98 =  3.95 G | off  2.00  2.00 | CPU   67%   64% busiest  40  40 | miss  0.0%  0.0%
+#
+# Left daemon, no delay: each phase as a share of the cycles its workers were not waiting.
+ 29.18% flush_frames
+ 25.47% flush_taps
+ 11.15% read_socket
+ 10.04% read_tap
+  8.18% drain_packets
+  6.69% service_sender
+  2.79% poll
+  2.79% flush_control
+  0.93% flush_notifications
+  0.93% drain_tap_inputs
+  0.56% reactor_drain
+  0.37% drain_queues
+  0.37% collect_acks
+  0.37% arm
+  0.19% flush_sender_messages
+# service_sender by spot, cycles/visits (spot 3 applies ACKs to the sent history, spot 4 applies
+# acknowledged pieces to their frames):
+spots 15735556/803079,306875480/803079,53267410/803079,504621914/803079,1625416794/803079,236103650/803079,74640970/803079,61894384/803079,380483934/803079
+#
+# Left daemon, 7.5 ms round trip.
+ 29.51% flush_frames
+ 25.14% flush_taps
+ 11.11% read_socket
+ 10.38% read_tap
+  8.20% drain_packets
+  6.74% service_sender
+  2.73% flush_control
+  2.37% poll
+  0.91% flush_notifications
+  0.91% drain_tap_inputs
+  0.55% reactor_drain
+  0.55% drain_queues
+  0.36% collect_acks
+  0.36% arm
+  0.18% flush_sender_messages
+# service_sender by spot, cycles/visits (spot 3 applies ACKs to the sent history, spot 4 applies
+# acknowledged pieces to their frames):
+spots 16436930/785876,318668154/785876,44163612/785876,539465132/785876,1898199094/785876,251305130/785876,65104436/785876,60182782/785876,133090812/785876

@@ -107,7 +107,7 @@ Gbit/s at an offer-limited load instead.
 
 | Requirement | Current evidence | Remaining gap |
 | --- | --- | --- |
-| At least 20 Gbit/s each way at inner MTU 1500 | November 19: sixteen workers per daemon deliver 20.1–20.7 Gbit/s each way in five of five 60 s runs with `offload_frames`, and in four of five without it (the fifth reads 19.90 one way), at 800–863% and 942–996% of a core per daemon, thirty-two QinQ flows at 21 Gbit/s offered ([BENCH.md](#one-report-per-ack-november-19-landed)). Before that: loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98%. With sixteen workers per daemon and thirty-two flows: 7.11 / 7.03 Gbit/s, no thread above 75%, limited by receive-socket overflow under the container's 416 KiB buffer ([BENCH.md](#sixteen-workers-per-daemon-november-11-exploratory)). Over a 9000-byte outer path: 10.27 / 13.90 Gbit/s with QinQ and 10.78 / 17.82 with one tag at sixteen workers, 13.36 / 11.77 with QinQ at eight, at 34–45% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)) | November 19: the margin over 20 is one or two percent, as large as this host's own variation, and the acceptance profile (hardware, core budget, flow count, frame mix) is not frozen. It takes sixteen workers per daemon, eight to ten cores of them busy. Earlier: at a 1500-byte outer path the per-bit cost must roughly halve; a 9000-byte path halves it but no thread then saturates, and reordering and overflows rise. One left worker does two jobs: it reads every L→R frame from the TAP (QinQ input all lands on one queue) and receives the R→L lanes it owns. L→R senders idle for its input; its socket overflows and R→L loses packets, so BBR cuts. More receive buffers move capacity from L→R to R→L (+11% total, L→R −14%); letting tun spread reads costs 23% more CPU per bit ([BENCH.md](#receive-buffers-for-a-busy-reader-november-11)). Next: keep receive work off the TAP reader, or split TAP reading inside the daemon. |
+| At least 20 Gbit/s each way at inner MTU 1500 | November 19: sixteen workers per daemon deliver 20.1–20.7 Gbit/s each way in five of five 60 s runs with `offload_frames`, and in four of five without it (the fifth reads 19.90 one way), at 800–863% and 942–996% of a core per daemon, thirty-two QinQ flows at 21 Gbit/s offered ([BENCH.md](#one-report-per-ack-november-19-landed)). Before that: loopback overload check (QinQ, eight workers, sixteen 44-segment GSO flows, 21 Gbit/s requested): 5.49 / 5.70 Gbit/s after the window RTT floor, busiest thread 98%. With sixteen workers per daemon and thirty-two flows: 7.11 / 7.03 Gbit/s, no thread above 75%, limited by receive-socket overflow under the container's 416 KiB buffer ([BENCH.md](#sixteen-workers-per-daemon-november-11-exploratory)). Over a 9000-byte outer path: 10.27 / 13.90 Gbit/s with QinQ and 10.78 / 17.82 with one tag at sixteen workers, 13.36 / 11.77 with QinQ at eight, at 34–45% less CPU per bit ([BENCH.md](#a-9000-byte-outer-path-on-the-loopback-check-november-12)) | November 19: the margin over 20 is one or two percent, as large as this host's own variation, and the acceptance profile was frozen at this run's settings on November 27 (design section 16). It takes sixteen workers per daemon, eight to ten cores of them busy. Earlier: at a 1500-byte outer path the per-bit cost must roughly halve; a 9000-byte path halves it but no thread then saturates, and reordering and overflows rise. One left worker does two jobs: it reads every L→R frame from the TAP (QinQ input all lands on one queue) and receives the R→L lanes it owns. L→R senders idle for its input; its socket overflows and R→L loses packets, so BBR cuts. More receive buffers move capacity from L→R to R→L (+11% total, L→R −14%); letting tun spread reads costs 23% more CPU per bit ([BENCH.md](#receive-buffers-for-a-busy-reader-november-11)). Next: keep receive work off the TAP reader, or split TAP reading inside the daemon. |
 | Goodput must plateau under excess traffic | November 19, `1f28d42`: on the decision workload every 5G total is 0.8–2.0 Gbit/s above its 2G total; sixteen flows deliver 1.92–1.96 Gbit/s each way at 2G offered and 2.16–2.73 at 5G, four flows 1.70–1.95 and 2.32–2.90 ([BENCH.md](#the-decision-workload-on-the-current-build-november-19)). Earlier: decision workload (four workers, 4.5 ms), `3178088`: sixteen flows deliver 1.62 / 1.64 Gbit/s at 2G offered and 2.03 / 1.58 at 5G; four flows 1.31 / 1.73 and 0.92 / 1.38 ([BENCH.md](#decision-workload-baseline-november-12-evening)). With the read margin (`3b9e86f`) every 5G total matches or exceeds its 2G total: four flows 1.21 / 2.07 at 5G, sixteen 2.03 / 1.77 ([BENCH.md](#owners-refusing-each-other-a-read-margin-landed)). Workers run at 77–99% of a core | Lossy four-flow L→R still falls 10% from 2G to 5G, and overloaded p99 delay rose with the extra delivery. Per-frame CPU cost; the single-flow transmit worker spends about 6 µs per 1522-byte frame on the remote host, a quarter of it in `sendmmsg`. |
 | TCP through the tunnel | Loopback, eight workers, eight iperf3 streams each way: 9.2–9.9 Gbit/s in total at about 1 core per Gbit/s, about 1% of segments retransmitted ([BENCH.md](#tap-queue-length-and-overload-delay)). November 26, across the real path: one iperf3 stream each way gets 2.3–2.4 Gbit/s, four 2.8–3.0 and sixteen 2.5–3.1, both directions at once, where direct TCP toward the lossy direction gets 0.40 with one stream and 1.60 with four ([BENCH.md](#tcp-through-the-tunnel-across-the-real-path-november-26)) | Losses come from receive-socket overflows under the container's 416 KiB buffers; the daemon cannot raise them without `CAP_NET_ADMIN`. On the real path sixteen streams each way retransmit ten to twenty times as much as four for no more delivery, unexamined. |
 | Small-frame overload must remain efficient | November 20, with offload frames on by default: untagged 64-byte frames, sixteen flows, unlimited: 11.8–12.8 / 13.2 M frames/s with eight workers and 12.6–12.7 / 13.6–14.1 M with sixteen, at 0.44–0.57 cores per M frames/s, and the 40M rows arrive complete ([BENCH.md](#offload-frames-and-lane-rotation-on-by-default-november-20-landed)). November 19, `1f28d42`, without them: 3.24–3.35 / 4.15–4.32 M frames/s with eight workers and 7.50–8.52 / 5.62–6.42 M with sixteen, at 1.6–1.8 cores per M frames/s ([BENCH.md](#small-frame-rows-on-the-current-build-november-19)). November 12: untagged 64-byte frames, sixteen flows: 3.24–3.43 / 3.27–3.48 M frames/s unlimited with eight workers and 4.23–4.53 / 4.16–4.57 M with sixteen, against 5.87 / 5.74 M for the pre-recovery build; QinQ 128-byte frames 2.18–2.31 / 3.32–3.53 M; 1.85–1.95 cores per M frames/s against 1.28–1.33 ([BENCH.md](#small-frame-rows-at-the-current-build-november-12)) | About 45% more CPU per frame since recovery and BBR, spread across transmit bookkeeping with no single large target; four candidates cut 0–3% at overload, and the expiry heap landed at −4.2% CPU per frame offer-limited ([BENCH.md](#where-the-small-frame-cost-comes-from-november-12)). One to one and a half of eight workers per daemon idle because tun's queue hash leaves them no transmit work; balanced lanes do not change this. High ingress loss persists; mixed traffic and non-coalescible frames remain unverified. |
@@ -4100,6 +4100,208 @@ at those seconds only its own logs can say.
 What the daemon loses in such a second is the traffic of that second: its
 senders cannot send, and frames the TAP offers meanwhile are dropped at the
 TAP's queue. No setting of the daemon changes that.
+
+## What is left of a daemon's CPU (November 27)
+
+Measurements taken to find anything more to cut: on the relay bed, whose
+limits are as in the entries above, and across the real path where a
+paragraph says so. One change came out of them, the default hold of 300 µs
+in place of 200.
+
+**A path's delay no longer costs the sender.** On November 20 a 7.5 ms
+round trip took two workers at 2 Gbit/s each way from 65–67% of a core to
+95%. The same offer on the current build
+([rows](benches/delay-cost-nov27.txt)): 64–65% and 63% without delay,
+65–67% and 62–64% with it. In the split of `service_sender`, applying ACKs
+to the sent history costs 69 cycles per packet sent without delay and 74
+with it, where it cost 130 and 585, and applying acknowledged pieces to
+their frames 223 and 261, where it cost 220 and 520. The changes of
+November 26 removed it, first among them the loss pass that stopped
+visiting the whole flight after every ACK; the split was not retaken
+between them. What a round trip still adds is 43 cycles a packet.
+
+**Trains: four fifths of the busy cycles are kernel calls.** The same
+profile, with or without delay: packing and sending datagrams 29%, writing
+frames to the TAP 25%, reading sockets 11%, reading the TAP 10%, polling
+3%. The daemon's own work is the rest: reassembly 8%, the sender's
+accounting 7%, and control, notifications and queue handling 7%. No phase
+of its own is as large as the smallest of the four kernel phases.
+
+**Idle, a daemon costs nothing that can be measured.** A pair joined over
+loopback, four workers each, one session, no traffic: 0.03% of a core, with
+the main thread waking twenty times a second and the workers ten times or
+fewer ([rows](benches/tap-cost-ring-writes-nov27.txt)).
+
+**The one kernel entry per frame that is left is the TAP write. Batching
+it through the ring saves 4–6% on the relay bed and costs 3–5% on the real
+path, so it was not kept.** TAP reads go through a ring in batches and
+datagrams leave in `sendmmsg` batches, but a frame that cannot be coalesced
+with others of its flow is written with one `writev` call. On the profile
+run of the entry above, 838,347 write calls delivered 848,411 frames.
+`benches/tap_cost.rs` now times the same writes submitted through the
+io_uring ring that already carries the reads
+([rows](benches/tap-cost-ring-writes-nov27.txt)):
+
+| Frames per submission | Plain `writev`, one call each | Through the ring |
+| --- | --- | --- |
+| 2 | 2.64–2.84 µs a frame | 2.52–2.56 |
+| 4 | | 2.30–2.61 |
+| 8 | | 2.11–2.15 |
+| 64 | | 2.07–2.33 |
+
+At eight frames a submission the ring saves about 0.6 µs a frame, a fifth
+of the call, and at two nothing. Linking the requests, so that a failed
+write stops those behind it, gives part of that back (2.32–2.74 µs at
+eight).
+
+A build that did this
+([patch](benches/ring-writes-single-frames-rejected.patch)) wrote three or
+more leading frames that each go out alone with one submission, unlinked,
+and kept the plain call for one or two. Relay bed, two workers, 7.5 ms,
+single frames, six rounds with the arms rotating, against the build before
+it and against that build a second time as the noise reference
+([rows](benches/ring-writes-single-frames-nov27.json)); CPU of the left and
+right daemon as a share of one core:
+
+| Offered each way | Before | Before, again | Ring writes |
+| --- | --- | --- | --- |
+| 0.5 Gbit/s | 63–64%, 59–61% | 63–65%, 57–60% | 59–61%, 56–58% |
+| 1 Gbit/s | 104–107%, 98–102% | 103–107%, 95–100% | 99–102%, 94–96% |
+
+That is 6% and 5% less on the left daemon and 4% on the right, with
+delivery, loss and delay unchanged and trains costing the same
+([rows](benches/ring-writes-trains-nov27.json)). At 1 Gbit/s the left
+daemon made 390,109 write calls in a point where the build before made
+1,405,047. With four workers on the same bed
+([rows](benches/ring-writes-four-workers-nov27.json)) it saved 3% at
+0.5 Gbit/s and nothing at 1 Gbit/s, and thresholds of four, six and eight
+frames saved less
+([two workers](benches/ring-writes-two-workers-thresholds-nov27.json)).
+
+Across the real path, four workers, it cost CPU
+([rows](benches/ring-writes-hold-300-real-path-nov27.txt)). CPU of the left
+and right daemon in the points no stall touched; the first set has the
+threshold of three, the second a threshold of four and a path that skips
+itself when fewer frames are ready, with the build before measured twice:
+
+| Offered each way | Before | Before, again | Ring writes |
+| --- | --- | --- | --- |
+| 1.5 Gbit/s, first set | 185–197%, 151–156% | | 196–203%, 149–157% |
+| 2 Gbit/s, first set | 221–231%, 185–187% | | 224–242%, 186–195% |
+| 1 Gbit/s, second set | 146–156%, 123–125% | 151–154%, 125–126% | 154–157%, 119–129% |
+| 2 Gbit/s, second set | 214–235%, 184–189% | 228–239%, 187–193% | 233–251%, 183–191% |
+
+The left daemon used 3–5% more in every row, and the right one between 1%
+less and 3% more. The counters say why nothing is gained there. The cards on that
+path coalesce received UDP, frames of one flow complete together, and the
+daemon already writes them coalesced: in one 2 Gbit/s point 461,662 such
+writes carried 1,513,209 of the 1,676,660 frames delivered. A tenth of the
+frames go out alone, mostly one or two at a time between coalesced writes,
+where a submission cannot beat a call and the look ahead for a run of
+singles is paid for nothing. The real path is the deployment, so the plain
+call stays.
+
+**Half of all TAP read requests come back empty, which is 2% of a daemon on
+single frames.** The ring reader sizes each batch at twice the frames the
+last one found, so that a batch that comes back full is rare and the turn
+knows the queue is drained. On the same run 1,696,516 requests returned
+848,411 frames. The probe prices an empty request at 0.33–0.36 µs, half of
+a read that returns a frame (0.68–0.69 µs), so the empties are 1.5% of a
+core where the daemon uses 63%. Sizing closer does not recover it: the
+frames per turn vary by about their square root, a batch sized at one and
+a half times the last one comes back full in every eighth turn, and a full
+batch costs an unheld turn. The estimate for that rule is 0.6% of the
+daemon's CPU, and it was not built.
+
+**More workers and lanes than the load needs cost a daemon up to two thirds
+more CPU on single frames.** The same offers as above, the build before
+ring writes, hold 200 µs
+([two lanes](benches/lane-count-two-lanes-four-workers-nov27.json),
+[three](benches/lane-count-three-lanes-four-workers-nov27.json),
+[four](benches/ring-writes-four-workers-nov27.json), arm `base`); CPU of the
+left and right daemon:
+
+| Workers (`queue_count`) and `tx_lanes` | 0.5 Gbit/s each way | 1 Gbit/s each way |
+| --- | --- | --- |
+| 2 and 2 | 63–64%, 59–61% | 104–107%, 98–102% |
+| 4 and 2 | 83–84%, 70–73% | 122%, 120–121% |
+| 4 and 3 | 95–97%, 93–95% | 127–133%, 139–140% |
+| 4 and 4 | 101–103%, 102–107% | 137–141%, 145–155% |
+
+With `daemon.control_lane` one lane carries ACKs and control, so the rows
+have one, one, two and three data lanes. 44-segment trains are less
+sensitive and not indifferent: four and four cost 45–50% and 42–44% of a
+core at 1 Gbit/s each way and 86–89% and 82–86% at 2
+([rows](benches/lane-count-trains-four-workers-nov27.json)), where two and
+two cost 35–36% and 33–34%, and 64–73% and 62–67%. For single frames the
+frames are the same and so are
+the TAP reads, which come in larger batches with four workers than with two
+(9.9 frames a batch against 6.6). What grows is the sending: three data
+lanes on three workers claimed credit 237,519 times in a point where one
+lane claimed 127,515 times for the same 844,000 frames, so each claim
+sends half as many datagrams. The daemon's defaults are one
+queue and one lane; the counts are the operator's, and config-model.md now
+says how to choose them. A daemon that used few lanes while its load is
+light and more as it grows would get this by itself. That is not built:
+flows are pinned to lanes while they are active, so it means moving active
+flows between lanes under load, and a wrong move reorders them.
+
+**A longer hold keeps saving CPU, and past 300 µs it starts to cost
+frames.** `daemon.turn_hold_us` from 200 to 1000 on single frames, relay
+bed, two workers, 7.5 ms, no loss; 200 to 400 in four rounds and the rest
+in two ([rows](benches/turn-hold-sweep-single-frames-nov27.json),
+[more](benches/turn-hold-sweep-single-frames-more-nov27.json)). CPU of the
+left and right daemon as a share of one core:
+
+| Hold | 0.5 Gbit/s each way | 1 Gbit/s each way | Median delay | Missing at 1 Gbit/s |
+| --- | --- | --- | --- | --- |
+| 200 µs | 61–64%, 59–61% | 103–108%, 96–102% | 4.06 ms | 0.15–0.47% |
+| 300 µs | 58–61%, 55–58% | 97–100%, 90–95% | 4.16 ms | 0.05–0.54% |
+| 400 µs | 56–58%, 51–53% | 95–98%, 88–90% | 4.26 ms | 0.15–0.77% |
+| 500 µs | 53–54%, 49–51% | 91–92%, 86% | 4.33–4.39 ms | 0.21–0.64% |
+| 700 µs | 47–49%, 45–46% | 84–85%, 79–81% | 4.39–4.59 ms | 0.34–0.44% |
+| 1000 µs | 45–47%, 44% | 81–82%, 77–78% | 4.65–4.92 ms | 0.44–0.91% |
+
+Every 100 µs of hold adds about 0.1 ms to the median one-way delay. At
+0.5 Gbit/s nothing more is lost at any setting (0.07–0.15%). At 1 Gbit/s
+the frames that go missing are dropped at the sending side's TAP queue,
+before the daemon reads them: 2,556–5,968 of 1.69 million at 200 µs,
+3,496–10,884 at 500 and 7,542–15,187 at 1000.
+
+With 1% loss on the same bed
+([four rounds](benches/turn-hold-sweep-lossy-single-frames-nov27.json),
+[six more at 1 Gbit/s](benches/turn-hold-sweep-lossy-1g-nov27.json)), 300 µs
+uses 5% less CPU than 200 at 0.5 Gbit/s (62–64% and 58–61% against 64–68%
+and 60–64%) and 3.5–7% less at 1 Gbit/s. In the six-round set, twelve
+points an arm, it loses 0.34% and 0.70% of frames at the mean where 200
+loses 0.48% and 0.74%. In the four-round set, at 1 Gbit/s, one point of
+four at 300 lost 8.0% and 6.4%, where none at 200 lost more than 3.6%.
+Without that point 300 loses 1.3% and 2.0% there against 1.9% and 2.0% at
+200. 400 loses more with or without its own worst point (4.9% and 2.6%
+with it, 2.8% and 3.0% without).
+
+Across the real path, four workers, 200 against 300 µs on one build in the
+same batches ([rows](benches/ring-writes-hold-300-real-path-nov27.txt), arms
+`ring` and `ring300`); CPU of the left and right daemon and the share of
+frames missing, without the two points the rows' header sets aside (one met
+a gateway stall, and in one a new session's controller climbed slowly):
+
+| Offered each way | 200 µs | 300 µs | Missing, 200 and 300 |
+| --- | --- | --- | --- |
+| 0.5 Gbit/s | 115%, 92–93% | 103–108%, 84–87% | 0.0–0.1%, 0.1% |
+| 1 Gbit/s | 154–162%, 127–128% | 148–151%, 119% | 0.0%, 0.0% |
+| 1.5 Gbit/s | 196–203%, 149–157% | 179–187%, 143–148% | 0.2–0.7%, 0.3–0.6% |
+| 2 Gbit/s | 224–242%, 186–195% | 210–235%, 178–186% | 0.0–1.4%, 0.0–1.6% |
+
+300 µs uses 4–8% less CPU at every rate and loses no more. **The default is
+now 300.** It had been set to 200 that morning from one round, which showed
+300 saving little more. The build as landed against the build before it,
+three rounds of which stalls left one clean point of the new build at each
+rate: 146% and 124% of a core against 153–155% and 124–133% at 1 Gbit/s,
+and 222% and 184% against 224–232% and 190–196% at 2. Trains at 1
+and 2 Gbit/s each way cost and lose the same at 200, 300 and 400, with and
+without loss ([rows](benches/turn-hold-sweep-trains-nov27.json),
+[1% loss](benches/turn-hold-sweep-lossy-trains-nov27.json)).
 
 ## The per-frame cost on November 19
 

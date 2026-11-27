@@ -217,14 +217,28 @@ fn reads(clock_cost: u64, use_ring: bool) {
     let mut received = vec![[0u8; 1515]; 64];
     let mut lengths = [0isize; 64];
     let mut ring = if use_ring {
-        Some(Ring::new(tap.as_raw_fd(), &mut received).unwrap())
+        let areas = received
+            .iter_mut()
+            .map(|b| (b.as_mut_ptr() as u64, b.len() as u32));
+        Some(Ring::new(tap.as_raw_fd(), 22, libc::RWF_NOWAIT as u32, areas).unwrap())
     } else {
         None
     };
     if let Some(ring) = &mut ring {
-        ring.read(&mut lengths);
-        assert!(lengths.iter().all(|&n| n == -(libc::EAGAIN as isize)));
-        println!("empty_ring_nowait_completions=64");
+        // What a read request costs when the queue is empty: the daemon sizes
+        // each batch above what it expects, so some always come back so.
+        let mut ns = 0u64;
+        for _ in 0..ROUNDS {
+            let start = cpu();
+            ring.submit(64, &mut lengths);
+            ns += (cpu() - start).saturating_sub(clock_cost);
+            assert!(lengths.iter().all(|&n| n == -(libc::EAGAIN as isize)));
+        }
+        println!(
+            "read ring=true empty requests={} cpu_ns_per_request={:.2}",
+            ROUNDS * 64,
+            ns as f64 / (ROUNDS * 64) as f64
+        );
     }
     let mut ns = 0u64;
     let wall = Instant::now();
@@ -234,7 +248,7 @@ fn reads(clock_cost: u64, use_ring: bool) {
         }
         let start = cpu();
         if let Some(ring) = &mut ring {
-            ring.read(&mut lengths);
+            ring.submit(64, &mut lengths);
         } else {
             for (p, n) in received.iter_mut().zip(&mut lengths) {
                 // SAFETY: each buffer is writable for its full length.
@@ -264,6 +278,116 @@ fn reads(clock_cost: u64, use_ring: bool) {
         std::fs::read_dir("/proc/self/task").unwrap().count()
     );
 }
+/// Single frames written `batch` at a time through one io_uring_enter,
+/// against one write call per frame. With `vnet` each frame is a WRITEV of a
+/// virtio header and the frame, as the daemon writes it; with `link` each
+/// request but a batch's last is linked to the next, so that a failed write
+/// would cancel those behind it.
+fn ring_writes(batch: usize, vnet: bool, link: bool, clock_cost: u64) {
+    assert!(64 % batch == 0);
+    let tap = tap(vnet);
+    let receiver = UdpSocket::bind("198.18.0.1:9999").unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let packets: Vec<_> = (0..64).map(|i| packet(1, false, i)).collect();
+    let expected: Vec<_> = (0..64).map(payload).collect();
+    let header = [0u8; 10];
+    let vectors: Vec<[libc::iovec; 2]> = packets
+        .iter()
+        .map(|p| {
+            [
+                libc::iovec {
+                    iov_base: header.as_ptr().cast_mut().cast(),
+                    iov_len: header.len(),
+                },
+                libc::iovec {
+                    iov_base: p.as_ptr().cast_mut().cast(),
+                    iov_len: p.len(),
+                },
+            ]
+        })
+        .collect();
+    let extra = if vnet { header.len() } else { 0 };
+    // IORING_OP_WRITEV or IORING_OP_WRITE; the descriptor is nonblocking, so
+    // nothing is retried.
+    let mut ring = if vnet {
+        let areas = vectors.iter().map(|v| (v.as_ptr() as u64, 2));
+        Ring::new(tap.as_raw_fd(), 2, 0, areas).unwrap()
+    } else {
+        let areas = packets.iter().map(|p| (p.as_ptr() as u64, p.len() as u32));
+        Ring::new(tap.as_raw_fd(), 23, 0, areas).unwrap()
+    };
+    if link {
+        ring.link(batch);
+    }
+    let mut results = [0isize; 64];
+    let mut received = [0u8; PAYLOAD + 1];
+    let mut ns = 0u64;
+    let rounds = ROUNDS * 64 / batch;
+    let wall = Instant::now();
+    for round in 0..rounds {
+        let first = round * batch % 64;
+        let start = cpu();
+        ring.submit(batch as u32, &mut results);
+        ns += (cpu() - start).saturating_sub(clock_cost);
+        for index in first..first + batch {
+            assert_eq!(results[index], (packets[index].len() + extra) as isize);
+            let n = receiver.recv(&mut received).unwrap();
+            assert_eq!(&received[..n], &expected[index][..]);
+        }
+    }
+    let total = rounds * batch;
+    println!(
+        "ring write vnet={vnet} link={link} batch={batch} frames={total} cpu_ns_per_frame={:.2} wall_seconds={:.3} delivered={total}",
+        ns as f64 / total as f64,
+        wall.elapsed().as_secs_f64()
+    );
+}
+/// Single complete frames with a zero virtio header, one writev call each:
+/// what the daemon does today for a frame it cannot coalesce.
+fn vnet_single_writes(clock_cost: u64) {
+    let tap = tap(true);
+    let receiver = UdpSocket::bind("198.18.0.1:9999").unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let packets: Vec<_> = (0..64).map(|i| packet(1, false, i)).collect();
+    let expected: Vec<_> = (0..64).map(payload).collect();
+    let header = [0u8; 10];
+    let mut received = [0u8; PAYLOAD + 1];
+    let mut ns = 0u64;
+    let wall = Instant::now();
+    for _ in 0..ROUNDS {
+        let start = cpu();
+        for p in &packets {
+            let iov = [
+                libc::iovec {
+                    iov_base: header.as_ptr().cast_mut().cast(),
+                    iov_len: header.len(),
+                },
+                libc::iovec {
+                    iov_base: p.as_ptr().cast_mut().cast(),
+                    iov_len: p.len(),
+                },
+            ];
+            // SAFETY: the header and the packet stay readable through the call.
+            let n = unsafe { libc::writev(tap.as_raw_fd(), iov.as_ptr(), 2) };
+            assert_eq!(n, (p.len() + 10) as isize, "{}", io::Error::last_os_error());
+        }
+        ns += (cpu() - start).saturating_sub(clock_cost);
+        for p in &expected {
+            let n = receiver.recv(&mut received).unwrap();
+            assert_eq!(&received[..n], p);
+        }
+    }
+    let total = ROUNDS * 64;
+    println!(
+        "writev vnet=true single frames={total} cpu_ns_per_frame={:.2} wall_seconds={:.3} delivered={total}",
+        ns as f64 / total as f64,
+        wall.elapsed().as_secs_f64()
+    );
+}
 fn main() {
     if !std::env::args().any(|arg| arg == "--run-in-container") {
         eprintln!("TAP cost probe requires --run-in-container in a disposable container");
@@ -282,6 +406,20 @@ fn main() {
     reads(overhead, false);
     reads(overhead, true);
     writes(1, false, overhead);
+    for batch in [2, 4, 8, 64] {
+        ring_writes(batch, false, false, overhead);
+    }
+    vnet_single_writes(overhead);
+    for (batch, link) in [
+        (2, false),
+        (4, false),
+        (8, false),
+        (8, true),
+        (64, false),
+        (64, true),
+    ] {
+        ring_writes(batch, true, link, overhead);
+    }
     for count in [1, 2, 16, 43, 44] {
         writes(count, true, overhead);
     }
@@ -404,8 +542,14 @@ struct Ring {
     tail: u32,
 }
 impl Ring {
-    fn new(fd: i32, buffers: &mut [[u8; 1515]]) -> io::Result<Self> {
-        assert_eq!(buffers.len(), 64);
+    /// Sixty-four prepared requests of one operation on `fd`, one per area.
+    fn new(
+        fd: i32,
+        opcode: u8,
+        rw_flags: u32,
+        areas: impl ExactSizeIterator<Item = (u64, u32)>,
+    ) -> io::Result<Self> {
+        assert_eq!(areas.len(), 64);
         let mut p = Params::default();
         // SAFETY: p is the complete zero-initialized io_uring_params ABI structure.
         let n = unsafe { libc::syscall(libc::SYS_io_uring_setup, 64u32, &mut p) };
@@ -426,18 +570,18 @@ impl Ring {
             0x08000000,
         )?;
         let sqes = Map::new(ring.as_raw_fd(), 64 * p.sq_entries as usize, 0x10000000)?;
-        for (i, buffer) in buffers.iter_mut().enumerate() {
-            // SAFETY: SQ storage is mapped and not submitted yet; buffers never move or resize.
+        for (i, (address, length)) in areas.enumerate() {
+            // SAFETY: SQ storage is mapped and not submitted yet; the areas never move or resize.
             unsafe {
                 sqes.at::<Sqe>(64 * i).write(Sqe {
-                    opcode: 22,
+                    opcode,
                     flags: 0,
                     priority: 0,
                     fd,
                     offset: 0,
-                    address: buffer.as_mut_ptr() as u64,
-                    length: buffer.len() as u32,
-                    rw_flags: libc::RWF_NOWAIT as u32,
+                    address,
+                    length,
+                    rw_flags,
                     user: i as u64,
                     unused: [0; 3],
                 });
@@ -453,32 +597,43 @@ impl Ring {
             tail: 0,
         })
     }
-    fn read(&mut self, lengths: &mut [isize; 64]) {
+    /// Links every request to the next one inside batches of `batch`
+    /// (IOSQE_IO_LINK), before anything is submitted.
+    fn link(&mut self, batch: usize) {
+        for i in (0..64).filter(|i| i % batch != batch - 1) {
+            // SAFETY: the SQE was written by new() and is not submitted yet.
+            unsafe { (*self._sqes.at::<Sqe>(64 * i)).flags = 1 << 2 };
+        }
+    }
+    /// Submits the next `count` prepared requests with one enter and stores
+    /// each result under its request's number.
+    fn submit(&mut self, count: u32, lengths: &mut [isize; 64]) {
         use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
         assert_eq!(self.sq.atomic(self.params.sq.head).load(Acquire), self.tail);
-        self.tail = self.tail.wrapping_add(64);
+        self.tail = self.tail.wrapping_add(count);
         self.sq
             .atomic(self.params.sq.tail)
             .store(self.tail, Release);
-        // SAFETY: 64 READ SQEs reference live buffers; RWF_NOWAIT forbids blocking fallback.
+        // SAFETY: the SQEs reference live buffers, and neither operation can block:
+        // reads carry RWF_NOWAIT and the TAP descriptor is nonblocking.
         let n = unsafe {
             libc::syscall(
                 libc::SYS_io_uring_enter,
                 self.fd.as_raw_fd(),
-                64u32,
-                64u32,
+                count,
+                count,
                 1u32,
                 std::ptr::null::<libc::sigset_t>(),
                 0usize,
             )
         };
-        assert_eq!(n, 64, "{}", io::Error::last_os_error());
+        assert_eq!(n, count as i64, "{}", io::Error::last_os_error());
         let head = self.cq.atomic(self.params.cq.head).load(Relaxed);
         let tail = self.cq.atomic(self.params.cq.tail).load(Acquire);
-        assert_eq!(tail.wrapping_sub(head), 64);
+        assert_eq!(tail.wrapping_sub(head), count);
         let mask = self.cq.atomic(self.params.cq.mask).load(Relaxed);
         let mut seen = 0u64;
-        for i in 0..64 {
+        for i in 0..count {
             // SAFETY: acquired CQ tail publishes these initialized CQEs; head remains unchanged.
             let c = unsafe {
                 self.cq
@@ -492,7 +647,7 @@ impl Ring {
             seen |= 1 << c.user;
             lengths[c.user as usize] = c.result as isize;
         }
-        assert_eq!(seen, u64::MAX);
+        assert_eq!(seen.count_ones(), count);
         self.cq.atomic(self.params.cq.head).store(tail, Release);
         assert_eq!(self.cq.atomic(self.params.cq.overflow).load(Relaxed), 0);
         assert_eq!(self.sq.atomic(self.params.sq.dropped).load(Relaxed), 0);

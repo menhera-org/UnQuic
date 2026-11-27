@@ -1,0 +1,939 @@
+diff --git a/src/counters.rs b/src/counters.rs
+index cb3ebc7..ef83c35 100644
+--- a/src/counters.rs
++++ b/src/counters.rs
+@@ -224,7 +224,8 @@ metrics! {
+     stripe_drops: sum,
+     /// Workers without a read ring at startup, plus rings disabled after rejection.
+     tap_read_fallbacks: sum,
+-    /// TAP frame write syscalls, including unsuccessful attempts and fallback retries.
++    /// TAP write syscalls, including unsuccessful attempts and fallback retries:
++    /// one for a frame, a coalesced batch, or a ring submission of several frames.
+     tap_write_calls: sum,
+     /// Successful TAP USO writes representing two or more original frames.
+     tap_uso_batches: sum,
+diff --git a/src/tap.rs b/src/tap.rs
+index f39ee99..dbe7834 100644
+--- a/src/tap.rs
++++ b/src/tap.rs
+@@ -700,42 +700,113 @@ impl TapQueue {
+     /// reach the kernel with NEEDS_CSUM whether coalesced or not.
+     pub(crate) fn write_batch_partial<'a>(
+         &mut self,
+-        mut frames: impl Iterator<Item = &'a [u8]>,
++        frames: impl Iterator<Item = &'a [u8]>,
+         partial: u64,
+     ) -> (u64, bool, io::Result<usize>) {
+-        let Some(first) = frames.next() else {
++        let mut frames = frames.peekable();
++        let Some(&first) = frames.peek() else {
+             return (0, false, Ok(0));
+         };
+-        if (self.uso || self.tso)
+-            && (14..=self.frame_limit).contains(&first.len())
+-            && let Some((mask, tcp, result)) = uso::write(
+-                self.fd.as_raw_fd(),
+-                first,
+-                frames,
+-                self.frame_limit,
+-                (self.uso, self.tso),
+-                partial,
+-            )
++        match self.write_coalesced(frames, partial) {
++            Some(outcome) => outcome,
++            None => (1, false, self.write_single(first, partial & 1 != 0)),
++        }
++    }
++
++    /// The coalescing half of write_batch_partial: writes the first frame
++    /// together with those behind it that coalesce with it. None means the
++    /// first frame goes out alone and nothing was written: no frame, nothing
++    /// to coalesce with, or a kernel that just refused the offload, which is
++    /// then off.
++    pub(crate) fn write_coalesced<'a>(
++        &mut self,
++        mut frames: impl Iterator<Item = &'a [u8]>,
++        partial: u64,
++    ) -> Option<(u64, bool, io::Result<usize>)> {
++        let first = frames.next()?;
++        if !(self.uso || self.tso) || !(14..=self.frame_limit).contains(&first.len()) {
++            return None;
++        }
++        let (mask, tcp, result) = uso::write(
++            self.fd.as_raw_fd(),
++            first,
++            frames,
++            self.frame_limit,
++            (self.uso, self.tso),
++            partial,
++        )?;
++        if result
++            .as_ref()
++            .is_err_and(|e| matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)))
+         {
+-            if result
+-                .as_ref()
+-                .is_err_and(|e| matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)))
+-            {
+-                if tcp {
+-                    self.tso = false;
+-                } else {
+-                    self.uso = false;
+-                }
++            if tcp {
++                self.tso = false;
+             } else {
+-                return (mask, tcp, result);
++                self.uso = false;
+             }
++            return None;
+         }
+-        let written = if partial & 1 != 0 {
+-            self.write_partial_frame(first)
++        Some((mask, tcp, result))
++    }
++
++    /// Writes one frame alone, with its checksum partial or complete, and
++    /// returns its length.
++    pub(crate) fn write_single(&mut self, frame: &[u8], partial: bool) -> io::Result<usize> {
++        if partial {
++            self.write_partial_frame(frame)
+         } else {
+-            self.write_frame(first)
+-        };
+-        (1, false, written.map(|()| first.len()))
++            self.write_frame(frame)
++        }
++        .map(|()| frame.len())
++    }
++
++    /// How many of the leading `frames` write_batch_partial would each write
++    /// alone with a virtio header: valid frames that coalesce with nothing
++    /// behind them. Bit i of `partial` is frame i's, as there. Zero on a queue
++    /// without virtio headers. `first_alone` says write_coalesced has just
++    /// declined the first frame, which is then not scanned again.
++    pub(crate) fn single_run(&self, frames: &[&[u8]], partial: u64, first_alone: bool) -> usize {
++        if !self.vnet {
++            return 0;
++        }
++        let mut run = 0;
++        if first_alone {
++            match frames.first() {
++                Some(first) if (14..=self.frame_limit).contains(&first.len()) => run = 1,
++                _ => return 0,
++            }
++        }
++        while let Some((first, rest)) = frames.get(run..).and_then(<[&[u8]]>::split_first) {
++            if !(14..=self.frame_limit).contains(&first.len())
++                || (self.uso || self.tso)
++                    && uso::coalesces(
++                        first,
++                        rest.iter().copied(),
++                        self.frame_limit,
++                        (self.uso, self.tso),
++                        partial >> run,
++                    )
++            {
++                break;
++            }
++            run += 1;
++        }
++        run
++    }
++
++    /// The virtio header write_batch_partial gives a frame it writes alone:
++    /// NEEDS_CSUM for a partial transport checksum, zero otherwise.
++    pub(crate) fn single_header(frame: &[u8], partial: bool) -> [u8; 10] {
++        if partial {
++            uso::partial_header(frame).unwrap_or_default()
++        } else {
++            [0; 10]
++        }
++    }
++
++    /// The length a write of `frame` behind a virtio header must return.
++    pub(crate) const fn single_len(frame: &[u8]) -> usize {
++        frame.len() + 10
+     }
+ }
+ 
+diff --git a/src/tap/read.rs b/src/tap/read.rs
+index 35f68c3..0a04df1 100644
+--- a/src/tap/read.rs
++++ b/src/tap/read.rs
+@@ -128,6 +128,8 @@ pub(crate) struct Reader {
+     params: Params,
+     tail: u32,
+     pub(crate) enabled: bool,
++    /// False once the kernel refused a write through the ring.
++    pub(crate) writes: bool,
+ }
+ // SAFETY: calls borrow Reader exclusively and return only after every submitted completion.
+ unsafe impl Send for Reader {}
+@@ -139,6 +141,23 @@ pub(crate) struct Batch {
+     pub(crate) requests: u64,
+ }
+ 
++/// What one submission of single-frame writes did.
++pub(crate) struct Written {
++    /// For each attempted frame, the bytes the kernel took or a negated errno.
++    pub(crate) results: [i32; CAPACITY],
++    /// Frames the kernel attempted, a prefix of those given; the rest were
++    /// never submitted and are still the caller's to write.
++    pub(crate) attempted: usize,
++    pub(crate) calls: u64,
++}
++
++/// Raw completions of one run of submitted requests.
++struct Run {
++    results: [i32; CAPACITY],
++    accepted: u32,
++    calls: u64,
++}
++
+ // Unwinding with published kernel pointers would free live borrowed storage.
+ struct Pending(bool);
+ impl Drop for Pending {
+@@ -235,6 +254,7 @@ impl Reader {
+             params,
+             tail: 0,
+             enabled: true,
++            writes: true,
+         })
+     }
+ 
+@@ -246,7 +266,7 @@ impl Reader {
+         &mut self,
+         tap: &mut TapQueue,
+         buffers: &mut [&mut [u8]],
+-        mut submit: impl FnMut(i32, u32, u32) -> io::Result<usize>,
++        submit: impl FnMut(i32, u32, u32) -> io::Result<usize>,
+     ) -> Batch {
+         assert!(self.enabled && buffers.len() <= CAPACITY);
+         assert!(buffers.iter().all(|b| b.len() > crate::MAX_FRAME_LEN));
+@@ -297,8 +317,114 @@ impl Reader {
+                 });
+             }
+         }
++        let run = self.run(start, buffers.len() as u32, submit);
++        batch.calls = run.calls;
++        batch.requests = u64::from(run.accepted);
++        for (i, &result) in run.results.iter().enumerate().take(run.accepted as usize) {
++            batch.results[i] = if result < 0 {
++                if matches!(-result, libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS) {
++                    self.enabled = false;
++                    Err(io::ErrorKind::WouldBlock.into())
++                } else {
++                    Err(io::Error::from_raw_os_error(-result))
++                }
++            } else {
++                tap.finish_input(&headers[i], result as usize, buffers[i])
++                    .map(|(length, segments)| {
++                        batch.segments[i] = segments;
++                        length
++                    })
++            };
++        }
++        batch
++    }
++
++    /// Writes `frames` to `tap` in order with one submission, each behind its
++    /// virtio header, where the plain path makes one `writev` call a frame.
++    ///
++    /// Every request is attempted even when an earlier one fails, so a caller
++    /// that keeps a failed frame for later writes it behind its successors.
++    /// The only failure a frame is kept for is `EAGAIN`, which a TAP whose
++    /// send buffer was never lowered does not return.
++    pub(crate) fn write(
++        &mut self,
++        tap: &TapQueue,
++        headers: &[[u8; 10]],
++        frames: &[&[u8]],
++    ) -> Written {
++        self.write_with(tap, headers, frames, enter)
++    }
++
++    fn write_with(
++        &mut self,
++        tap: &TapQueue,
++        headers: &[[u8; 10]],
++        frames: &[&[u8]],
++        submit: impl FnMut(i32, u32, u32) -> io::Result<usize>,
++    ) -> Written {
++        assert!(self.enabled && self.writes && tap.vnet);
++        assert!(frames.len() <= CAPACITY && headers.len() == frames.len());
++        assert_eq!(self.sq.atomic(self.params.sq.head).load(Acquire), self.tail);
++        assert_eq!(
++            self.cq.atomic(self.params.cq.head).load(Relaxed),
++            self.cq.atomic(self.params.cq.tail).load(Acquire)
++        );
++        let mut iov = [[libc::iovec {
++            iov_base: std::ptr::null_mut(),
++            iov_len: 0,
++        }; 2]; CAPACITY];
++        let start = self.tail;
++        for (i, (header, frame)) in headers.iter().zip(frames).enumerate() {
++            iov[i][0] = libc::iovec {
++                iov_base: header.as_ptr().cast_mut().cast(),
++                iov_len: header.len(),
++            };
++            iov[i][1] = libc::iovec {
++                iov_base: frame.as_ptr().cast_mut().cast(),
++                iov_len: frame.len(),
++            };
++            let slot = start.wrapping_add(i as u32) as usize & 63;
++            // SAFETY: each unpublished SQE references live, readable storage that
++            // outlives the run below.
++            unsafe {
++                self.sqes.at::<Sqe>(64 * slot).write(Sqe {
++                    opcode: 2, // IORING_OP_WRITEV
++                    flags: 0,
++                    priority: 0,
++                    fd: tap.fd.as_raw_fd(),
++                    offset: 0,
++                    address: iov[i].as_ptr() as u64,
++                    length: 2,
++                    rw_flags: libc::RWF_NOWAIT as u32,
++                    user: i as u64,
++                    unused: [0; 3],
++                });
++            }
++        }
++        let run = self.run(start, frames.len() as u32, submit);
++        Written {
++            results: run.results,
++            attempted: run.accepted as usize,
++            calls: run.calls,
++        }
++    }
++
++    /// Publishes the `count` requests prepared from `start` and returns once
++    /// every one the kernel accepted has completed. A failed enter withdraws
++    /// what was not accepted and disables the ring.
++    fn run(
++        &mut self,
++        start: u32,
++        count: u32,
++        mut submit: impl FnMut(i32, u32, u32) -> io::Result<usize>,
++    ) -> Run {
++        let mut run = Run {
++            results: [0; CAPACITY],
++            accepted: 0,
++            calls: 0,
++        };
+         let mut pending = Pending(true);
+-        self.tail = start.wrapping_add(buffers.len() as u32);
++        self.tail = start.wrapping_add(count);
+         self.sq
+             .atomic(self.params.sq.tail)
+             .store(self.tail, Release);
+@@ -308,8 +434,8 @@ impl Reader {
+             let head = self.sq.atomic(self.params.sq.head).load(Acquire);
+             let remaining = self.tail.wrapping_sub(head);
+             let accepted = head.wrapping_sub(start);
+-            assert!(remaining <= buffers.len() as u32 && accepted <= buffers.len() as u32);
+-            batch.calls += 1;
++            assert!(remaining <= count && accepted <= count);
++            run.calls += 1;
+             let result = submit(
+                 self.fd.as_raw_fd(),
+                 remaining,
+@@ -321,13 +447,12 @@ impl Reader {
+             );
+             let head = self.sq.atomic(self.params.sq.head).load(Acquire);
+             let accepted = head.wrapping_sub(start);
+-            assert!(accepted <= buffers.len() as u32);
++            assert!(accepted <= count);
+             let cq_head = self.cq.atomic(self.params.cq.head).load(Relaxed);
+             let cq_tail = self.cq.atomic(self.params.cq.tail).load(Acquire);
+             assert!(cq_tail.wrapping_sub(cq_head) <= self.params.cq_entries);
+             let mask = self.params.cq_entries - 1;
+-            let count = cq_tail.wrapping_sub(cq_head);
+-            for index in 0..count {
++            for index in 0..cq_tail.wrapping_sub(cq_head) {
+                 // SAFETY: acquired CQ tail publishes this CQE; CQ head is not advanced yet.
+                 let c = unsafe {
+                     self.cq
+@@ -339,21 +464,7 @@ impl Reader {
+                 };
+                 assert!(c.user < u64::from(accepted) && c.flags == 0 && seen & (1 << c.user) == 0);
+                 seen |= 1 << c.user;
+-                let i = c.user as usize;
+-                batch.results[i] = if c.result < 0 {
+-                    if matches!(-c.result, libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS) {
+-                        self.enabled = false;
+-                        Err(io::ErrorKind::WouldBlock.into())
+-                    } else {
+-                        Err(io::Error::from_raw_os_error(-c.result))
+-                    }
+-                } else {
+-                    tap.finish_input(&headers[i], c.result as usize, buffers[i])
+-                        .map(|(length, segments)| {
+-                            batch.segments[i] = segments;
+-                            length
+-                        })
+-                };
++                run.results[c.user as usize] = c.result;
+             }
+             self.cq.atomic(self.params.cq.head).store(cq_tail, Release);
+             assert_eq!(self.cq.atomic(self.params.cq.overflow).load(Relaxed), 0);
+@@ -374,8 +485,8 @@ impl Reader {
+             }
+             if seen.count_ones() == accepted && head == self.tail {
+                 pending.0 = false;
+-                batch.requests = u64::from(accepted);
+-                return batch;
++                run.accepted = accepted;
++                return run;
+             }
+             if failed && seen.count_ones() != accepted {
+                 // Outstanding kernel pointers cannot be returned after an unrecoverable enter failure.
+@@ -386,7 +497,7 @@ impl Reader {
+ }
+ 
+ fn enter(fd: i32, count: u32, wait: u32) -> io::Result<usize> {
+-    // SAFETY: this private ring has only live, bounded READV SQEs; no signal-mask pointer.
++    // SAFETY: this private ring has only live, bounded READV and WRITEV SQEs; no signal-mask pointer.
+     let n = unsafe {
+         libc::syscall(
+             libc::SYS_io_uring_enter,
+@@ -638,6 +749,81 @@ mod tests {
+             io::ErrorKind::WouldBlock
+         );
+     }
++    #[test]
++    #[ignore = "kernel ring test; run in a disposable container"]
++    fn write_batches_keep_order_and_headers_and_report_every_result() {
++        let Some(mut ring) = ring() else {
++            return;
++        };
++        let before = std::fs::read_dir("/proc/self/task").unwrap().count();
++        let (tap, peer) = queue(true);
++        peer.set_nonblocking(true).unwrap();
++        let frames: Vec<Vec<u8>> = (0..CAPACITY).map(|i| vec![i as u8; 14 + 31 * i]).collect();
++        let mut bytes = [0u8; 4096];
++        for count in [3, 1, 64, 7] {
++            let headers: Vec<[u8; 10]> = (0..count).map(|i| [!(i as u8); 10]).collect();
++            let slices: Vec<&[u8]> = frames[..count].iter().map(Vec::as_slice).collect();
++            let written = ring.write(&tap, &headers, &slices);
++            assert_eq!((written.attempted, written.calls), (count, 1));
++            for (i, frame) in frames.iter().enumerate().take(count) {
++                assert_eq!(written.results[i] as usize, frame.len() + 10);
++                let n = peer.recv(&mut bytes).unwrap();
++                assert_eq!(&bytes[..10], &[!(i as u8); 10]);
++                assert_eq!(&bytes[10..n], frame);
++            }
++            assert!(peer.recv(&mut bytes).is_err());
++        }
++        // A queue that fills part way: every request is still attempted, the
++        // ones that found no room say so, and no worker thread retries them.
++        let big = vec![7u8; 9000];
++        let slices = vec![big.as_slice(); CAPACITY];
++        let written = ring.write(&tap, &[[0; 10]; CAPACITY], &slices);
++        assert_eq!((written.attempted, written.calls), (CAPACITY, 1));
++        let taken = written.results.iter().filter(|&&r| r == 9010).count();
++        assert!((1..CAPACITY).contains(&taken), "{taken}");
++        assert!(written.results[..taken].iter().all(|&r| r == 9010));
++        assert!(
++            written.results[taken..]
++                .iter()
++                .all(|&r| r == -libc::EAGAIN)
++        );
++        let mut large = vec![0u8; 9011];
++        for _ in 0..taken {
++            assert_eq!(peer.recv(&mut large).unwrap(), 9010);
++        }
++        assert!(peer.recv(&mut large).is_err());
++        assert!(ring.enabled && ring.writes);
++        assert_eq!(
++            std::fs::read_dir("/proc/self/task").unwrap().count(),
++            before
++        );
++    }
++
++    #[test]
++    #[ignore = "kernel ring test; run in a disposable container"]
++    fn a_ring_refused_part_way_reports_the_frames_it_wrote_and_no_others() {
++        let Some(mut ring) = ring() else {
++            return;
++        };
++        let (tap, peer) = queue(true);
++        peer.set_nonblocking(true).unwrap();
++        let frames: Vec<Vec<u8>> = (0..8).map(|i| vec![i as u8; 60]).collect();
++        let slices: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
++        let written = ring.write_with(&tap, &[[0; 10]; 8], &slices, |fd, _, _| {
++            assert_eq!(enter(fd, 3, 0).unwrap(), 3);
++            Err(io::Error::from_raw_os_error(libc::EPERM))
++        });
++        assert_eq!((written.attempted, written.calls), (3, 1));
++        assert!(!ring.enabled);
++        let mut bytes = [0u8; 128];
++        for (frame, &result) in frames.iter().zip(&written.results).take(3) {
++            assert_eq!(result, 70);
++            assert_eq!(peer.recv(&mut bytes).unwrap(), 70);
++            assert_eq!(&bytes[10..70], frame);
++        }
++        assert!(peer.recv(&mut bytes).is_err());
++    }
++
+     #[test]
+     #[ignore = "requires disposable container, tun, iproute2 and network capabilities"]
+     fn real_tap_reads_preserve_every_frame_and_use_one_enter_per_batch() {
+diff --git a/src/tap/uso.rs b/src/tap/uso.rs
+index 010429f..0e23ebe 100644
+--- a/src/tap/uso.rs
++++ b/src/tap/uso.rs
+@@ -260,19 +260,52 @@ fn follows(first: &[u8], next: &[u8], layout: Layout, count: usize) -> bool {
+         }
+ }
+ 
++/// The frames one write would carry: `first` and those behind it that
++/// coalesce with it, with their payloads laid out from the third iovec on.
++struct Gathered {
++    layout: Layout,
++    size: usize,
++    iov: [libc::iovec; 66],
++    count: usize,
++    mask: u64,
++    payload: usize,
++    original_bytes: usize,
++    last_flags: u8,
++}
++
++/// Whether write() would send `first` together with a frame behind it. A
++/// frame for which this is false is written alone, by the caller.
++pub(super) fn coalesces<'a>(
++    first: &'a [u8],
++    frames: impl Iterator<Item = &'a [u8]>,
++    frame_limit: usize,
++    enabled: (bool, bool),
++    partial: u64,
++) -> bool {
++    gather(first, frames, frame_limit, enabled, partial).is_some()
++}
++
+ /// Returns the attempted mask, TCP flag and original byte count on success.
+ /// The mask survives failure so the caller retains every selected frame.
+ /// Bit i of `partial` marks the i-th frame's checksum as partial.
+ pub(super) fn write<'a>(
+     fd: RawFd,
+     first: &'a [u8],
+-    mut frames: impl Iterator<Item = &'a [u8]>,
++    frames: impl Iterator<Item = &'a [u8]>,
+     frame_limit: usize,
+     enabled: (bool, bool),
+     partial: u64,
+ ) -> Option<(u64, bool, io::Result<usize>)> {
+-    let second = frames.next()?;
+-    let layout = transport(first, partial & 1 != 0)?;
++    let Gathered {
++        layout,
++        size,
++        mut iov,
++        count,
++        mask,
++        payload,
++        original_bytes,
++        last_flags,
++    } = gather(first, frames, frame_limit, enabled, partial)?;
+     let Layout {
+         ip,
+         at,
+@@ -281,6 +314,80 @@ pub(super) fn write<'a>(
+         v6,
+         ..
+     } = layout;
++    let mut vnet = [0u8; 10];
++    let mut header = [0u8; 128];
++    header
++        .get_mut(..header_len)?
++        .copy_from_slice(first.get(..header_len)?);
++    let transport_len = payload + header_len - at;
++    let checksum_at = at + if tcp { 16 } else { 6 };
++    if tcp {
++        *header.get_mut(at + 13)? = last_flags;
++    } else {
++        header
++            .get_mut(at + 4..at + 6)?
++            .copy_from_slice(&(transport_len as u16).to_be_bytes());
++    }
++    if !v6 {
++        let total_len = (header_len + payload - ip) as u16;
++        header
++            .get_mut(ip + 2..ip + 4)?
++            .copy_from_slice(&total_len.to_be_bytes());
++        header.get_mut(ip + 10..ip + 12)?.fill(0);
++        let checksum = !fold(sum(header.get(ip..at)?));
++        header
++            .get_mut(ip + 10..ip + 12)?
++            .copy_from_slice(&checksum.to_be_bytes());
++    } else {
++        let payload_len = (header_len + payload - ip - 40) as u16;
++        header
++            .get_mut(ip + 4..ip + 6)?
++            .copy_from_slice(&payload_len.to_be_bytes());
++    }
++    let checksum = fold(layout.pseudo(&header, transport_len));
++    header
++        .get_mut(checksum_at..checksum_at + 2)?
++        .copy_from_slice(&checksum.to_be_bytes());
++    vnet[0] = 1; // VIRTIO_NET_HDR_F_NEEDS_CSUM
++    vnet[1] = if tcp { if v6 { 4 } else { 1 } } else { 5 };
++    for (offset, value) in [
++        (2, header_len as u16),
++        (4, size as u16),
++        (6, at as u16),
++        (8, (checksum_at - at) as u16),
++    ] {
++        vnet[offset..offset + 2].copy_from_slice(&value.to_ne_bytes());
++    }
++    iov[0] = libc::iovec {
++        iov_base: vnet.as_mut_ptr().cast(),
++        iov_len: vnet.len(),
++    };
++    iov[1] = libc::iovec {
++        iov_base: header.as_mut_ptr().cast(),
++        iov_len: header_len,
++    };
++    // SAFETY: header and every borrowed payload remain readable until writev returns.
++    let n = unsafe { libc::writev(fd, iov.as_ptr(), (count + 2) as _) };
++    let result =
++        super::complete_write(n, vnet.len() + header_len + payload).map(|()| original_bytes);
++    Some((mask, tcp, result))
++}
++
++fn gather<'a>(
++    first: &'a [u8],
++    mut frames: impl Iterator<Item = &'a [u8]>,
++    frame_limit: usize,
++    enabled: (bool, bool),
++    partial: u64,
++) -> Option<Gathered> {
++    let second = frames.next()?;
++    let layout = transport(first, partial & 1 != 0)?;
++    let Layout {
++        at,
++        header: header_len,
++        tcp,
++        ..
++    } = layout;
+     // transport() bounds every offset below by the header; `?` only keeps this panic-free.
+     let first_flags = if tcp { *first.get(at + 13)? } else { 0 };
+     if !(if tcp { enabled.1 } else { enabled.0 }) || first_flags & 8 != 0 {
+@@ -289,8 +396,6 @@ pub(super) fn write<'a>(
+     let data = first.get(header_len..)?;
+     let size = data.len();
+     let hash = flow_hash(first);
+-    let mut vnet = [0u8; 10];
+-    let mut header = [0u8; 128];
+     let mut iov = [libc::iovec {
+         iov_base: std::ptr::null_mut(),
+         iov_len: 0,
+@@ -349,61 +454,16 @@ pub(super) fn write<'a>(
+     if count == 1 {
+         return None;
+     }
+-    header
+-        .get_mut(..header_len)?
+-        .copy_from_slice(first.get(..header_len)?);
+-    let transport_len = payload + header_len - at;
+-    let checksum_at = at + if tcp { 16 } else { 6 };
+-    if tcp {
+-        *header.get_mut(at + 13)? = last_flags;
+-    } else {
+-        header
+-            .get_mut(at + 4..at + 6)?
+-            .copy_from_slice(&(transport_len as u16).to_be_bytes());
+-    }
+-    if !v6 {
+-        let total_len = (header_len + payload - ip) as u16;
+-        header
+-            .get_mut(ip + 2..ip + 4)?
+-            .copy_from_slice(&total_len.to_be_bytes());
+-        header.get_mut(ip + 10..ip + 12)?.fill(0);
+-        let checksum = !fold(sum(header.get(ip..at)?));
+-        header
+-            .get_mut(ip + 10..ip + 12)?
+-            .copy_from_slice(&checksum.to_be_bytes());
+-    } else {
+-        let payload_len = (header_len + payload - ip - 40) as u16;
+-        header
+-            .get_mut(ip + 4..ip + 6)?
+-            .copy_from_slice(&payload_len.to_be_bytes());
+-    }
+-    let checksum = fold(layout.pseudo(&header, transport_len));
+-    header
+-        .get_mut(checksum_at..checksum_at + 2)?
+-        .copy_from_slice(&checksum.to_be_bytes());
+-    vnet[0] = 1; // VIRTIO_NET_HDR_F_NEEDS_CSUM
+-    vnet[1] = if tcp { if v6 { 4 } else { 1 } } else { 5 };
+-    for (offset, value) in [
+-        (2, header_len as u16),
+-        (4, size as u16),
+-        (6, at as u16),
+-        (8, (checksum_at - at) as u16),
+-    ] {
+-        vnet[offset..offset + 2].copy_from_slice(&value.to_ne_bytes());
+-    }
+-    iov[0] = libc::iovec {
+-        iov_base: vnet.as_mut_ptr().cast(),
+-        iov_len: vnet.len(),
+-    };
+-    iov[1] = libc::iovec {
+-        iov_base: header.as_mut_ptr().cast(),
+-        iov_len: header_len,
+-    };
+-    // SAFETY: header and every borrowed payload remain readable until writev returns.
+-    let n = unsafe { libc::writev(fd, iov.as_ptr(), (count + 2) as _) };
+-    let result =
+-        super::complete_write(n, vnet.len() + header_len + payload).map(|()| original_bytes);
+-    Some((mask, tcp, result))
++    Some(Gathered {
++        layout,
++        size,
++        iov,
++        count,
++        mask,
++        payload,
++        original_bytes,
++        last_flags,
++    })
+ }
+ 
+ /// transport() for a frame whose checksum must verify.
+diff --git a/src/worker.rs b/src/worker.rs
+index 056e17b..8adcac2 100644
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -4942,11 +4942,126 @@ impl Worker {
+                     (1, false, tap.write_offload(frame.bytes))
+                 } else {
+                     let partial = lane.ready_partial(now);
+-                    tap.write_batch_partial(lane.ready_frames(now).take(budget), partial)
++                    match tap.write_coalesced(lane.ready_frames(now).take(budget), partial) {
++                        Some(outcome) => outcome,
++                        None => {
++                            // The front frame goes out alone.
++                            // DECISION(2026-11-27): three or more leading frames that each go out
++                            //   alone are written with one ring submission. Why: such a frame was
++                            //   the last kernel entry made once per frame, and eight in a
++                            //   submission cost a fifth less than eight calls (BENCH.md).
++                            //   Rejected: linking the requests so that a failure stops those
++                            //   behind it (it gives the saving back, and the only failure a frame
++                            //   is kept for is EAGAIN from a TAP whose send buffer was lowered).
++                            if lane.ready_count() >= RING_WRITE_MIN
++                                && let Some(reader) = self
++                                    .tap_reader
++                                    .as_mut()
++                                    .filter(|reader| reader.enabled && reader.writes)
++                            {
++                                let mut frames: [&[u8]; BATCH_SIZE] = [&[]; BATCH_SIZE];
++                                let mut count = 0;
++                                for (place, frame) in
++                                    frames.iter_mut().zip(lane.ready_frames(now).take(budget))
++                                {
++                                    *place = frame;
++                                    count += 1;
++                                }
++                                let frames = frames.get(..count).unwrap_or_default();
++                                let run = tap.single_run(frames, partial, true);
++                                if run >= RING_WRITE_MIN
++                                    && let Some(frames) = frames.get(..run)
++                                {
++                                    let mut headers = [[0u8; 10]; BATCH_SIZE];
++                                    for (index, (header, frame)) in
++                                        headers.iter_mut().zip(frames).enumerate()
++                                    {
++                                        *header = TapQueue::single_header(
++                                            frame,
++                                            partial >> index & 1 != 0,
++                                        );
++                                    }
++                                    let written = reader.write(
++                                        tap,
++                                        headers.get(..run).unwrap_or_default(),
++                                        frames,
++                                    );
++                                    let (mut done, mut delivered) = (0u64, 0u64);
++                                    let (mut errors, mut code) = (0u64, 0);
++                                    let (mut refused, mut blocked) = (0, false);
++                                    for (index, (frame, &result)) in frames
++                                        .iter()
++                                        .zip(&written.results)
++                                        .take(written.attempted)
++                                        .enumerate()
++                                    {
++                                        if usize::try_from(result)
++                                            == Ok(TapQueue::single_len(frame))
++                                        {
++                                            done |= 1 << index;
++                                            delivered += frame.len() as u64;
++                                        } else if result == -libc::EAGAIN {
++                                            blocked = true;
++                                        } else {
++                                            refused += usize::from(matches!(
++                                                -result,
++                                                libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS
++                                            ));
++                                            done |= 1 << index;
++                                            errors += 1;
++                                            // A short write has no errno, like a frame the
++                                            // daemon refused itself.
++                                            code = u64::try_from(-result).unwrap_or(0);
++                                        }
++                                    }
++                                    for totals in [
++                                        &mut self.counters,
++                                        &mut local.totals,
++                                        &mut local.rx_totals[slot],
++                                    ] {
++                                        totals.tap_write_calls =
++                                            totals.tap_write_calls.wrapping_add(written.calls);
++                                    }
++                                    if refused == written.attempted && refused != 0 {
++                                        // The kernel takes none of these through the ring:
++                                        // the plain path writes them and all that follow.
++                                        reader.writes = false;
++                                        continue;
++                                    }
++                                    for totals in [
++                                        &mut self.counters,
++                                        &mut local.totals,
++                                        &mut local.rx_totals[slot],
++                                    ] {
++                                        totals.delivered_frame_bytes =
++                                            totals.delivered_frame_bytes.wrapping_add(delivered);
++                                        totals.tap_errors = totals.tap_errors.wrapping_add(errors);
++                                        if errors != 0 {
++                                            totals.tap_error_code = code;
++                                        }
++                                    }
++                                    local.rx_dirty |= 1_u64 << slot;
++                                    if done != 0 {
++                                        lane.finish_ready(done);
++                                    }
++                                    budget -= written.attempted.min(budget);
++                                    if blocked {
++                                        local.tap_blocked = true;
++                                        writable = true;
++                                        break;
++                                    }
++                                    // A ring that failed part way is disabled now, and the
++                                    // plain path writes the frames it did not attempt.
++                                    continue;
++                                }
++                            }
++                            let Some(first) = lane.ready_frames(now).next() else {
++                                break;
++                            };
++                            (1, false, tap.write_single(first, partial & 1 != 0))
++                        }
++                    }
+                 };
+-                if mask == 0 {
+-                    break;
+-                }
+                 let attempted = mask.count_ones() as usize;
+                 debug_assert!(attempted <= budget);
+                 let offloads = tap.write_offloads();
+@@ -6297,6 +6412,9 @@ impl Worker {
+ 
+ /// Input below which a turn counts as small: sixteen full frames.
+ const HOLD_BYTES: usize = 16 * 1500;
++/// Fewest single frames worth one ring submission: at two a submission costs
++/// what two write calls do.
++const RING_WRITE_MIN: usize = 4;
+ 
+ /// When a turn that started at `now` and took in `moved` bytes should poll
+ /// again, if it should wait at all: `hold` after its start, or at the next
+@@ -7241,6 +7359,90 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    #[ignore = "kernel ring test; run in a disposable container"]
++    fn single_frames_reach_the_tap_through_one_ring_submission_in_order() {
++        use std::os::unix::net::UnixDatagram;
++        let (mut worker, _) = receive_worker();
++        // Without io_uring (before Linux 5.1) every frame takes the plain path.
++        if worker.tap_reader.is_none() {
++            return;
++        }
++        let (fd, tap) = UnixDatagram::pair().unwrap();
++        fd.set_nonblocking(true).unwrap();
++        tap.set_nonblocking(true).unwrap();
++        worker
++            .reactor
++            .remove(worker.sessions[0].tap.as_ref().unwrap().as_fd())
++            .unwrap();
++        worker
++            .attach_tap(0, TapQueue::test_fd(fd.into(), true))
++            .unwrap();
++        let admit = |worker: &mut Worker, sequence: u64| {
++            let mut bytes = [0; BASE_UDP_PAYLOAD];
++            let fill = [sequence as u8; 60];
++            let length = receive_bytes(sequence, &[receive_piece(sequence, 0, &fill)], &mut bytes);
++            let datagram = Datagram::decode(&bytes[..length]).unwrap();
++            let lane = worker.sessions[0].rx[0].as_mut().unwrap();
++            assert_eq!(lane.admit(&datagram, Duration::ZERO), Admission::Fresh);
++        };
++        let mut output = [0; 128];
++        let mut expect = |tap: &UnixDatagram, sequence: u64| {
++            assert_eq!(tap.recv(&mut output).unwrap(), 70, "frame {sequence}");
++            assert_eq!(&output[..10], &[0; 10]);
++            assert_eq!(&output[10..70], &[sequence as u8; 60]);
++        };
++        // Five frames that coalesce with nothing: one submission, in order.
++        for sequence in 1..=5 {
++            admit(&mut worker, sequence);
++        }
++        worker.flush_taps(Duration::ZERO).unwrap();
++        assert_eq!(worker.counters.tap_write_calls, 1);
++        for sequence in 1..=5 {
++            expect(&tap, sequence);
++        }
++        assert_eq!(worker.counters.delivered_frame_bytes, 300);
++        // Two are not worth a submission: a call each, as before.
++        for sequence in 6..=7 {
++            admit(&mut worker, sequence);
++        }
++        worker.flush_taps(Duration::ZERO).unwrap();
++        assert_eq!(worker.counters.tap_write_calls, 3);
++        for sequence in 6..=7 {
++            expect(&tap, sequence);
++        }
++        // A TAP that takes no more keeps the frames, and they follow in order.
++        let queue = worker.sessions[0].tap.as_mut().unwrap();
++        while queue.write_frame(&[0; 60]).is_ok() {}
++        for sequence in 8..=11 {
++            admit(&mut worker, sequence);
++        }
++        worker.flush_taps(Duration::ZERO).unwrap();
++        assert!(worker.sessions[0].tap_blocked);
++        assert_eq!(worker.counters.delivered_frame_bytes, 420);
++        let mut filler = [0; 128];
++        while tap.recv(&mut filler).is_ok() {}
++        worker.sessions[0].tap_blocked = false;
++        worker.flush_taps(Duration::ZERO).unwrap();
++        for sequence in 8..=11 {
++            expect(&tap, sequence);
++        }
++        assert_eq!(worker.counters.delivered_frame_bytes, 660);
++        assert_eq!(worker.counters.tap_errors, 0);
++        assert!(worker.tap_reader.as_ref().is_some_and(|r| r.writes));
++        // With ring writes off the same frames cost a call each.
++        worker.tap_reader.as_mut().unwrap().writes = false;
++        let calls = worker.counters.tap_write_calls;
++        for sequence in 12..=16 {
++            admit(&mut worker, sequence);
++        }
++        worker.flush_taps(Duration::ZERO).unwrap();
++        assert_eq!(worker.counters.tap_write_calls, calls + 5);
++        for sequence in 12..=16 {
++            expect(&tap, sequence);
++        }
++    }
++
+     #[test]
+     fn striped_frames_reach_the_tap_in_stripe_order_through_their_writer() {
+         let (mut worker, tap) = receive_worker();

@@ -12,14 +12,16 @@ section 15 of the design and the "Implementation status" section of
 CPU for single frames. Frames that reach the TAP one at a time cost
 32,800 cycles per frame carried each way where trains cost 8,900, nearly
 all of it kernel calls made for about four frames each.
-`daemon.turn_hold_us`, 200 by default, lets a worker that drained its
-inputs and took in little wait up to that long before it polls again. It
-cuts a daemon's CPU 15–30% on single frames at 0.5 to 2 Gbit/s each way
-across the real path, for 0.2 ms more delay, and costs trains nothing at
-1 Gbit/s each way. Its first form held a worker whose socket read had come
-back full and lost 6–22% of the frames in 5 of 16 points at 1.5–2 Gbit/s;
-the landed form does not hold then
-([BENCH.md](BENCH.md#larger-worker-turns-for-single-frames-november-27-landed)).
+`daemon.turn_hold_us`, 300 by default, lets a worker that drained its
+inputs and took in little wait up to that long before it polls again. At
+200 it cuts a daemon's CPU 15–30% on single frames at 0.5 to 2 Gbit/s each
+way across the real path, and 300 takes 4–8% more off, for 0.1 ms of delay
+per 100 µs of hold; trains cost the same. Holds of 400 µs and more save
+more CPU and lose frames at 1 Gbit/s. Its first form held a worker whose
+socket read had come back full and lost 6–22% of the frames in 5 of 16
+points at 1.5–2 Gbit/s; the landed form does not hold then
+([BENCH.md](BENCH.md#larger-worker-turns-for-single-frames-november-27-landed),
+[the sweep](BENCH.md#what-is-left-of-a-daemons-cpu-november-27)).
 
 The daemon's remaining features, all with tests:
 
@@ -72,13 +74,28 @@ The daemon's remaining features, all with tests:
   UDP by (`udp6_hash`), which is what decides whether lanes spread over
   receive queues.
 
-What the hold leaves is the kernel's: a profile with it on spends over
-nine tenths of the daemon's busy cycles in TAP writes (41–43%), TAP reads
-(25–26%), UDP sends (14–18%) and UDP receives (6%), and under a tenth in
-reassembly, sender accounting and control
-([BENCH.md](BENCH.md#larger-worker-turns-for-single-frames-november-27-landed)).
+What is left is the kernel's
+([BENCH.md](BENCH.md#what-is-left-of-a-daemons-cpu-november-27)). With
+trains four fifths of a daemon's busy cycles are in four kernel phases: UDP
+sends 29%, TAP writes 25%, socket reads 11% and TAP reads 10%. With single
+frames it is over nine tenths. Five things were measured to find more:
 
-Open, ahead of the lists below:
+- A path's delay no longer costs the sender: 65–67% of a core with a
+  7.5 ms round trip against 64–65% without, where November 20 measured
+  95% against 65–67%.
+- An idle daemon uses 0.03% of a core.
+- Single-frame TAP writes batched through the io_uring ring save 4–6% on
+  the relay bed and cost 3–5% on the real path, where the cards'
+  coalescing leaves a tenth of the frames written alone. Not kept; the
+  patch is in `benches/`.
+- Half of all TAP read requests come back empty, 2% of a daemon on single
+  frames. Sizing the batches closer recovers 0.6% and is not built.
+- Workers and lanes beyond what the load needs cost the most: four queues
+  and four lanes use two thirds more CPU than two and two on 0.5 Gbit/s
+  each way of single frames. The defaults are one and one, and
+  config-model.md now says how to size them.
+
+Outside this repository:
 
 1. The real path has outages, and they are the right side's gateway.
    Plain UDP without the daemon lost 1.1 s of every one of sixteen flows
@@ -108,23 +125,41 @@ Open, ahead of the lists below:
    inside one batch, and count such points before anything else. Earlier
    real-path entries that report a few percent lost in one 10 s point may
    have met the same thing.
-2. Four slow cores are still unmeasured (item 1 of the checkpoint below).
-   It needs such a box; nothing here stands in for one.
-3. Three things are decided and not built. Path-MTU probes keep their
-   static worker slots: the sender's grants already charge every probe to
-   the shared window and pacing, so the slots are only a ceiling
-   (`Worker::probe_time`). The report does not say which receive queue a
-   flow lands on, because the kernel records that only for connected UDP
-   sockets; it names the card's hash fields. Liveness stays the
-   connection's (design section 5.3): a lane whose own path fails
-   suspends its DATA and reports a failed path-MTU state, and its flows
-   stay on it (README.md, operational checks). `stripe_flows` stays
-   experimental and off.
-4. Decisions that are the user's: the numeric competitive margin and the
-   frozen hardware, core budget and flow counts of design section 16;
-   whether `tx_hold_us` should default on, whether `turn_hold_us` should
-   stay at 200, and whether the unit's privileges should be tighter or run
-   under a dedicated user.
+2. Four slow cores are unmeasured, and that needs such a box. What the
+   fast hosts' figures imply for one: across the real path a daemon costs
+   39–46% of a fast core per Gbit/s to send trains and 15–19% to receive
+   them, about 0.6 of a core for 1 Gbit/s each way, most of it the
+   kernel's. A box whose cores each do a fraction f of that work has 4f
+   such cores in all, and the kernel's receive work outside the daemon's
+   threads takes some of them: at most 6.7f Gbit/s each way, 2.7 at
+   f = 0.4. That is arithmetic from other machines and no measurement.
+
+Decided and not built:
+
+- Path-MTU probes keep their static worker slots: the sender's grants
+  already charge every probe to the shared window and pacing, so the slots
+  are only a ceiling (`Worker::probe_time`).
+- The report does not say which receive queue a flow lands on, because the
+  kernel records that only for connected UDP sockets; it names the card's
+  hash fields.
+- Liveness stays the connection's (design section 5.3): a lane whose own
+  path fails suspends its DATA and reports a failed path-MTU state, and
+  its flows stay on it (README.md, operational checks).
+- A daemon does not move flows onto fewer lanes while its load is light.
+  Flows are pinned to their lanes while active, so that means moving
+  active flows under load, and a wrong move reorders them. The operator
+  sizes `queue_count` and `tx_lanes`.
+- `stripe_flows` stays experimental and off.
+
+Decided on November 27 under the instruction to finish without stopping
+for decisions. Each is one line to change:
+
+- The acceptance profiles and the competitive margin of 1.5-fold are
+  frozen from the profiles that were measured (design sections 14.2 and
+  16).
+- `turn_hold_us` defaults to 300 and `tx_hold_us` stays off.
+- The unit runs the daemon as root with three capabilities and
+  `NoNewPrivileges=yes`.
 
 ## November 26 checkpoint
 
@@ -2016,7 +2051,7 @@ RA/DHCPv6 operation on real resolver networks remains unverified.
 - Test: a unit test that parses the example configuration from section 12
   and a rejection test for each `validate()` rule.
 
-## Stage 2: batched transport — implemented; acceptance profile not frozen
+## Stage 2: batched transport — implemented; acceptance profile frozen on November 27 (stage 6)
 
 Goal: the packet rate and CPU baseline of section 13 can be measured. Final
 local acceptance requires at least 20 Gbit/s in each direction simultaneously
@@ -2644,7 +2679,14 @@ full expired batches sharing the cleanup budget.
   `[Unit]`, `[Install]` and `[Service]` lines of section 12.1. No systemd
   linkage. Done: `unquic systemd-unit`, checked line by line in a unit test.
 
-## Stage 5: measured optimisation — in progress
+## Stage 5: measured optimisation — closed on November 27
+
+Closed with the measurements of the November 27 checkpoint: what a daemon
+still spends is kernel work per datagram and per frame, the candidates left
+in its own code were measured at under 1% or at a loss on the real path,
+and the next gains are a card that segments UDP, fewer workers and lanes
+for a light load, or a longer hold where the delay is acceptable. The text
+below is the stage as it was planned and worked.
 
 If evidence shows no further improvement is feasible at an earlier step,
 record the blocker and proceed with the remaining stages. Return here to the
@@ -2758,7 +2800,7 @@ November 10 evidence for that list, all in BENCH.md:
   ([BENCH.md](BENCH.md#where-the-lossy-point-loses-its-frames-november-16)).
   The 5% loss rows still need FEC or a loss-agnostic response.
 
-## Stage 6: protocol freeze — open
+## Stage 6: protocol freeze — done on November 27
 
 Publish the wire vectors from 1a and 3 as fixed test files, resolve every
 "open" row of section 16, repeat the full container suite, and record the
@@ -2768,10 +2810,22 @@ As of November 27 the wire vectors are fixed test files for every record
 type, the three DATA flags and the optional feature bits
 (`tests/vectors/wire-v1`), the handshake's state transitions are fixed
 transcripts (`tests/vectors/handshake-v1`), and the kernel suites pass on
-Linux 5.0, 6.8 and 7.0. The rows of section 16 that
-are still open need the user's decisions: the numeric competitive margin,
-and the hardware, core budget, flow count, direction and loss profile the
-two throughput requirements are frozen at.
+Linux 5.0, 6.8 and 7.0. The acceptance rows of section 16 were frozen that
+day from the profiles that had been measured. Against them:
+
+- Local throughput: met. Sixteen workers per daemon deliver 20.1–20.7
+  Gbit/s each way in five of five 60 s runs (November 19).
+- Real-access throughput on the controlled link: met. Four workers deliver
+  5.11–5.56 Gbit/s each way at 7.5 ms and 5.51–5.91 at 4.5 ms with 1% loss
+  in ten runs of ten (November 20).
+- Real-access throughput on a real path: met in one direction, 5.49–5.99
+  Gbit/s at 6 and 7 offered (November 26). The other direction carries
+  2.5–2.9, and plain UDP without the daemon gets 4.3 there with 4% lost,
+  so the path is under the target in that direction whatever crosses it.
+  That path also has the gateway stalls of the November 27 checkpoint.
+- Competitive margin: met. The kernel L2TPv3 pseudowire delivers 1.5–1.6
+  Gbit/s one way and next to nothing the other on the same path, where
+  the daemon delivers 3.0 and 2.9 at 3 offered (November 26).
 
 ## What not to do
 

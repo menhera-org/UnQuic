@@ -57,10 +57,13 @@ pub struct Daemon {
     /// 1000) after its start before it polls again, so a moderate rate of
     /// single frames is handled in fewer, larger turns. An idle worker, one
     /// with a backlog and one whose read came back full never wait.
-    // DECISION(2026-11-27): turn_hold_us defaults to 200. Why: on the real path it cuts a
-    //   daemon's CPU 20-30% on single frames at 0.5-2 Gbit/s each way for about 0.2 ms of
-    //   delay, and in 24 points beside 24 without it it stalled no more often (BENCH.md).
-    //   Rejected: 300 (little more saved, more delay); off (the CPU is the user's priority).
+    // DECISION(2026-11-27): turn_hold_us defaults to 300. Why: the hold cuts a daemon's CPU
+    //   15-30% on single frames at 0.5-2 Gbit/s each way, and 300 takes 4-8% more off than 200
+    //   on the real path and on the relay bed for 0.1 ms more delay and no more loss
+    //   (BENCH.md). Rejected: 400 and above (more saved, but frames lost at 1 Gbit/s: 2.8% at
+    //   400 against 1.9% at 1% path loss); off (the CPU is the user's priority).
+    // FAILED(2026-11-27): 200 as the default, chosen from one round -> four to twelve rounds a
+    //   setting showed 300 saving 4-8% more with the same loss. Now: 300.
     pub turn_hold_us: u32,
     /// On by default since November 12, a deviation from BBR draft 07: the
     /// ProbeRTT window covers half the bandwidth over min_rtt plus the
@@ -106,7 +109,7 @@ impl Default for Daemon {
             loss_threshold_permille: 20,
             balance_flows: true,
             tx_hold_us: 0,
-            turn_hold_us: 200,
+            turn_hold_us: 300,
             probe_rtt_ack_delay: true,
             control_lane: true,
             offload_frames: true,

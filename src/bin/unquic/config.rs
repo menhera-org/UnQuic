@@ -271,7 +271,7 @@ mod tests {
             assert_eq!(loaded.config.sessions[0].queue_count, 1);
             assert_eq!(loaded.config.daemon.memory_limit, 256 * 1024 * 1024);
             assert!(loaded.config.daemon.tolerate_random_loss);
-            assert_eq!(loaded.config.daemon.turn_hold_us, 200);
+            assert_eq!(loaded.config.daemon.turn_hold_us, 300);
             assert_eq!(loaded.config.daemon.loss_threshold_permille, 20);
             assert!(loaded.config.daemon.balance_flows);
             assert_eq!(loaded.config.daemon.tx_hold_us, 0);

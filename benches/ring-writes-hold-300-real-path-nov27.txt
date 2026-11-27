@@ -1,0 +1,106 @@
+# Real path, four workers per daemon, sixteen QinQ flows, 10 s points, both directions loaded alike, November 27.
+# Columns as printed by the summary script:
+# arm round point  delivered L>R + R>L = total | offered | daemon CPU left right, busiest worker | frames missing | socket overflow | queue drops | reordered
+# Arms: base = the build before ring writes, turn_hold_us 200; ring = single frames written through the ring in
+# submissions of three or more, turn_hold_us 200; ring300 = the same build with turn_hold_us 300.
+# The right side's gateway stalls at fixed seconds of each half hour (BENCH.md): base r2 of the first set met two of
+# them, ring300 r1 p0 of the second set one. ring r1 p1 of the second set is a new session whose controller climbed
+# slowly after early loss; the path lost nothing in it.
+
+## Single frames, 0.5 and 1 Gbit/s each way (two rounds)
+base     r1 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU  116%   86% busiest  39  33 | miss  0.1%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+base     r2 p0  0.45 +  0.43 =  0.89 G | off  0.50  0.50 | CPU  110%   86% busiest  39  33 | miss  5.1%  9.6% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+ring     r1 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU  115%   92% busiest  38  35 | miss  0.1%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+ring     r2 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU  115%   93% busiest  38  34 | miss  0.1%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 4
+ring300  r1 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU  108%   87% busiest  36  34 | miss  0.1%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+ring300  r2 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU  103%   84% busiest  36  35 | miss  0.1%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+base     r1 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  157%  122% busiest  57  47 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 11
+base     r2 p1  0.89 +  0.88 =  1.76 G | off  1.00  1.00 | CPU  154%  123% busiest  56  46 | miss  7.3%  8.7% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+ring     r1 p1  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  162%  127% busiest  57  49 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 23
+ring     r2 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  154%  128% busiest  55  47 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+ring300  r1 p1  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  148%  119% busiest  53  46 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 4
+ring300  r2 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  151%  119% busiest  55  49 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 33
+
+## Single frames, 1.5 and 2 Gbit/s each way (four rounds)
+base     r1 p0  1.43 +  1.43 =  2.86 G | off  1.50  1.50 | CPU  197%  152% busiest  71  58 | miss  0.5%  0.4% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+base     r2 p0  1.43 +  1.43 =  2.86 G | off  1.50  1.50 | CPU  194%  156% busiest  70  59 | miss  0.5%  0.6% | sockovf 0 0 | qdrop 13 919 | reord 0 0
+base     r3 p0  1.43 +  1.43 =  2.86 G | off  1.50  1.50 | CPU  185%  153% busiest  69  58 | miss  0.5%  0.4% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+base     r4 p0  1.43 +  1.43 =  2.86 G | off  1.50  1.50 | CPU  192%  151% busiest  68  57 | miss  0.5%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+ring     r1 p0  1.42 +  1.43 =  2.86 G | off  1.50  1.50 | CPU  197%  152% busiest  70  57 | miss  0.6%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+ring     r2 p0  1.42 +  1.43 =  2.86 G | off  1.50  1.50 | CPU  203%  152% busiest  69  59 | miss  0.7%  0.4% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+ring     r3 p0  1.42 +  1.37 =  2.79 G | off  1.50  1.43 | CPU  197%  149% busiest  69  56 | miss  0.6%  0.2% | sockovf 0 0 | qdrop 0 0 | reord 0 3
+ring     r4 p0  1.42 +  1.43 =  2.86 G | off  1.49  1.50 | CPU  196%  157% busiest  71  58 | miss  0.4%  0.4% | sockovf 0 0 | qdrop 2 31 | reord 0 36
+ring300  r1 p0  1.31 +  1.32 =  2.63 G | off  1.49  1.50 | CPU  168%  140% busiest  63  52 | miss  8.2%  8.1% | sockovf 0 0 | qdrop 0 0 | reord 0 19
+ring300  r2 p0  1.42 +  1.43 =  2.85 G | off  1.49  1.50 | CPU  179%  145% busiest  69  56 | miss  0.6%  0.5% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+ring300  r3 p0  1.43 +  1.42 =  2.85 G | off  1.50  1.48 | CPU  187%  143% busiest  67  52 | miss  0.5%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+ring300  r4 p0  1.43 +  1.43 =  2.86 G | off  1.50  1.50 | CPU  185%  148% busiest  69  56 | miss  0.4%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+base     r1 p1  1.89 +  1.92 =  3.80 G | off  2.00  2.00 | CPU  227%  185% busiest  80  71 | miss  1.5%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 17
+base     r2 p1  1.90 +  1.69 =  3.59 G | off  1.99  2.00 | CPU  221%  179% busiest  81  65 | miss  0.6% 11.8% | sockovf 0 0 | qdrop 0 732 | reord 0 22
+base     r3 p1  1.90 +  1.89 =  3.79 G | off  1.99  2.00 | CPU  231%  187% busiest  83  71 | miss  0.4%  1.0% | sockovf 0 0 | qdrop 0 3 | reord 0 0
+base     r4 p1  1.88 +  1.87 =  3.75 G | off  2.00  2.00 | CPU  221%  186% busiest  79  70 | miss  2.0%  2.1% | sockovf 0 0 | qdrop 3 25 | reord 0 0
+ring     r1 p1  1.88 +  1.03 =  2.91 G | off  1.99  2.00 | CPU  192%  125% busiest  80  37 | miss  1.6% 46.2% | sockovf 0 0 | qdrop 629 4893 | reord 40 0
+ring     r2 p1  1.88 +  1.90 =  3.79 G | off  1.99  2.00 | CPU  242%  186% busiest  81  73 | miss  1.4%  0.8% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+ring     r3 p1  1.90 +  1.91 =  3.81 G | off  2.00  2.00 | CPU  235%  195% busiest  85  75 | miss  0.6%  0.7% | sockovf 0 0 | qdrop 0 0 | reord 0 4
+ring     r4 p1  1.90 +  1.92 =  3.82 G | off  2.00  2.00 | CPU  224%  191% busiest  81  71 | miss  0.6%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+ring300  r1 p1  1.89 +  1.92 =  3.81 G | off  2.00  2.00 | CPU  219%  185% busiest  80  73 | miss  1.2%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 16 0
+ring300  r2 p1  1.88 +  1.89 =  3.77 G | off  1.99  2.00 | CPU  210%  178% busiest  81  66 | miss  1.6%  1.5% | sockovf 0 0 | qdrop 0 46 | reord 0 33
+ring300  r3 p1  1.90 +  1.91 =  3.81 G | off  2.00  1.99 | CPU  231%  180% busiest  88  65 | miss  0.3%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+ring300  r4 p1  1.90 +  1.92 =  3.82 G | off  2.00  2.00 | CPU  235%  186% busiest  82  72 | miss  0.5%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+
+## 44-segment trains, 1 and 3 Gbit/s each way (two rounds)
+base     r1 p0  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   66%   54% busiest  25  18 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 612 436
+base     r2 p0  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   63%   54% busiest  20  17 | miss  0.0%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 484 64
+ring     r1 p0  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   66%   53% busiest  24  17 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 112 12
+ring     r2 p0  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   65%   53% busiest  19  17 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 16 36
+ring300  r1 p0  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   66%   50% busiest  21  16 | miss  0.0%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 0 172
+ring300  r2 p0  0.94 +  0.93 =  1.87 G | off  1.00  1.00 | CPU   65%   55% busiest  23  19 | miss  1.9%  2.6% | sockovf 0 0 | qdrop 42 74 | reord 252 0
+base     r1 p1  2.87 +  2.56 =  5.42 G | off  2.99  3.00 | CPU  178%  152% busiest  70  51 | miss  0.0% 11.0% | sockovf 0 0 | qdrop 22 6076 | reord 1592 8037
+base     r2 p1  2.87 +  2.16 =  5.03 G | off  3.00  3.00 | CPU  173%  145% busiest  58  46 | miss  0.0% 24.8% | sockovf 0 0 | qdrop 5 14179 | reord 528 312
+ring     r1 p1  2.66 +  2.36 =  5.02 G | off  3.00  3.00 | CPU  171%  143% busiest  72  45 | miss  7.4% 17.9% | sockovf 0 0 | qdrop 262 9105 | reord 80 144
+ring     r2 p1  2.51 +  2.31 =  4.82 G | off  3.00  3.00 | CPU  177%  143% busiest  58  46 | miss 12.2% 19.6% | sockovf 0 0 | qdrop 2475 9573 | reord 28 24
+ring300  r1 p1  2.69 +  2.18 =  4.87 G | off  3.00  3.00 | CPU  174%  140% busiest  57  44 | miss  6.5% 24.2% | sockovf 0 0 | qdrop 344 13948 | reord 0 244
+ring300  r2 p1  2.84 +  2.63 =  5.47 G | off  3.00  3.00 | CPU  179%  144% busiest  69  50 | miss  1.0%  8.6% | sockovf 0 0 | qdrop 573 4918 | reord 388 352
+
+## Second set: single frames, 1 and 2 Gbit/s each way (four rounds). m4 = ring writes from four frames up, with a path
+## that skips itself when fewer are ready; base and copy are the build before, twice. base r1 and copy r3 met a
+## gateway stall in their first point, copy r2 and m4 r2 in their second.
+base     r1 p0  0.85 +  0.82 =  1.67 G | off  1.00  1.00 | CPU  148%  113% busiest  52  43 | miss 10.8% 14.4% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+base     r2 p0  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  146%  124% busiest  52  51 | miss  0.2%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 7
+base     r3 p0  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  150%  125% busiest  56  51 | miss  0.4%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+base     r4 p0  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  156%  123% busiest  55  50 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+copy     r1 p0  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  151%  126% busiest  52  51 | miss  0.2%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+copy     r2 p0  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  153%  125% busiest  52  50 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 4 0
+copy     r3 p0  0.88 +  0.88 =  1.75 G | off  1.00  1.00 | CPU  140%  123% busiest  48  47 | miss  8.1%  8.8% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+copy     r4 p0  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  154%  125% busiest  56  50 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+m4       r1 p0  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  157%  129% busiest  52  51 | miss  0.2%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+m4       r2 p0  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  154%  124% busiest  54  47 | miss  0.2%  0.2% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+m4       r3 p0  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  157%  119% busiest  56  45 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 6
+m4       r4 p0  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  155%  123% busiest  55  51 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+base     r1 p1  1.79 +  1.86 =  3.66 G | off  1.99  2.00 | CPU  219%  189% busiest  80  76 | miss  5.9%  2.8% | sockovf 0 0 | qdrop 98 21 | reord 16 3
+base     r2 p1  1.89 +  1.92 =  3.81 G | off  2.00  2.00 | CPU  223%  184% busiest  81  71 | miss  1.2%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 2 0
+base     r3 p1  1.86 +  1.87 =  3.73 G | off  1.98  2.00 | CPU  214%  187% busiest  82  70 | miss  2.1%  2.2% | sockovf 0 0 | qdrop 0 64 | reord 0 4
+base     r4 p1  1.88 +  1.89 =  3.76 G | off  1.99  2.00 | CPU  235%  189% busiest  85  70 | miss  1.7%  1.7% | sockovf 0 0 | qdrop 29 23 | reord 0 39
+copy     r1 p1  1.91 +  1.92 =  3.83 G | off  2.00  2.00 | CPU  239%  187% busiest  92  75 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 38 15
+copy     r2 p1  1.73 +  1.75 =  3.48 G | off  2.00  2.00 | CPU  204%  175% busiest  76  66 | miss  9.3%  8.9% | sockovf 0 0 | qdrop 0 0 | reord 0 33
+copy     r3 p1  1.86 +  1.88 =  3.74 G | off  1.99  2.00 | CPU  228%  193% busiest  80  74 | miss  2.9%  1.9% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+copy     r4 p1  1.84 +  1.90 =  3.74 G | off  1.99  2.00 | CPU  231%  187% busiest  84  70 | miss  3.1%  1.1% | sockovf 0 0 | qdrop 0 53 | reord 103 0
+m4       r1 p1  1.91 +  1.91 =  3.82 G | off  1.99  2.00 | CPU  251%  191% busiest  87  71 | miss  0.1%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+m4       r2 p1  1.74 +  1.66 =  3.40 G | off  1.99  2.00 | CPU  214%  172% busiest  77  61 | miss  8.6% 13.3% | sockovf 0 0 | qdrop 0 339 | reord 0 44
+m4       r3 p1  1.90 +  1.92 =  3.82 G | off  2.00  2.00 | CPU  234%  187% busiest  81  71 | miss  0.6%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+m4       r4 p1  1.90 +  1.89 =  3.79 G | off  1.99  2.00 | CPU  233%  183% busiest  84  70 | miss  0.6%  1.2% | sockovf 0 0 | qdrop 0 34 | reord 234 0
+
+## The build as landed: old = turn_hold_us 200 (the build before), new = turn_hold_us 300, no ring writes. Single
+## frames, 1 and 2 Gbit/s each way, three rounds. new r2 and r3 met a gateway stall in their first point and new r3
+## in its second.
+new      r1 p0  0.95 +  0.96 =  1.91 G | off  0.99  1.00 | CPU  146%  124% busiest  52  49 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 6 0
+new      r2 p0  0.88 +  0.88 =  1.76 G | off  1.00  1.00 | CPU  134%  113% busiest  50  45 | miss  7.9%  8.7% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+new      r3 p0  0.88 +  0.88 =  1.75 G | off  1.00  1.00 | CPU  139%  106% busiest  50  39 | miss  8.2%  8.7% | sockovf 0 0 | qdrop 0 0 | reord 0 28
+old      r1 p0  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  154%  133% busiest  56  51 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+old      r2 p0  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  155%  124% busiest  54  48 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+old      r3 p0  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  153%  126% busiest  54  47 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 14 0 | reord 0 0
+new      r1 p1  1.82 +  1.91 =  3.74 G | off  1.99  2.00 | CPU  218%  180% busiest  75  68 | miss  4.5%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 207
+new      r2 p1  1.90 +  1.91 =  3.81 G | off  1.99  2.00 | CPU  222%  184% busiest  82  73 | miss  0.6%  0.2% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+new      r3 p1  1.70 +  1.67 =  3.37 G | off  1.99  2.00 | CPU  217%  169% busiest  74  62 | miss 11.1% 13.1% | sockovf 0 0 | qdrop 29 34 | reord 0 0
+old      r1 p1  1.90 +  1.92 =  3.82 G | off  2.00  2.00 | CPU  224%  196% busiest  81  72 | miss  0.6%  0.0% | sockovf 0 0 | qdrop 0 11 | reord 7 15
+old      r2 p1  1.88 +  1.91 =  3.78 G | off  1.98  2.00 | CPU  228%  190% busiest  79  70 | miss  1.1%  0.5% | sockovf 0 0 | qdrop 9 26 | reord 0 0
+old      r3 p1  1.88 +  1.91 =  3.79 G | off  1.99  2.00 | CPU  232%  192% busiest  81  73 | miss  1.0%  0.3% | sockovf 0 0 | qdrop 45 0 | reord 24 0

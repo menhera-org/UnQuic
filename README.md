@@ -13,7 +13,7 @@ NTT NGN is one deployment and performance validation environment.
 - Use `libc` for syscalls and socket options where appropriate; use `const fn` wherever a function can be one.
 - Receive admission: bound receive sockets accept packets by cookie, wire validity and protocol state, regardless of source address or port. Peer addresses select transmit destinations only.
 - Performance contract: no locks or allocations in hot paths. State transitions make no syscalls; workers batch I/O, notifications and timer updates. Performance claims require measurements.
-- Performance targets: local container tests must sustain at least 20 Gbit/s in each direction simultaneously at inner MTU 1500, with CPU use reported. The deployment target is at least 5 Gbit/s over real routed IPv6 10G-EPON access lines with 4.5–7.5 ms RTT and nonzero packet loss. The local rate was first reached on November 19, with sixteen workers per daemon and a margin of one or two percent (BENCH.md); its acceptance profile is not frozen, and the deployment target has not been demonstrated. Section 14.2 of the design defines the acceptance work.
+- Performance targets: local container tests must sustain at least 20 Gbit/s in each direction simultaneously at inner MTU 1500, with CPU use reported. The deployment target is at least 5 Gbit/s over real routed IPv6 10G-EPON access lines with 4.5–7.5 ms RTT and nonzero packet loss. The local rate was first reached on November 19, with sixteen workers per daemon and a margin of one or two percent (BENCH.md); its acceptance profile was frozen on November 27. Across a real path of the target network four workers carry the deployment rate in one direction, and the other direction's path stays under it for plain UDP too (ROADMAP.md, stage 6). Section 14.2 of the design defines the acceptance work.
 - No async runtime: plain pinned threads with batched syscalls. `tokio` gives one syscall per packet, no GSO/GRO, cross-core task migration, and 1 ms timers, all wrong for a few always-busy sockets. See section 10 of the design.
 - Platform contract: assume the Linux kernel and only the interfaces, files, and permissions needed by the selected features, such as `/dev/net/tun` for TAP creation and `/etc/resolv.conf` when using `iphost`'s system resolver. Its configurable `ipv6`, `ra`, and `dhcpv6` modes bypass system resolvers. Document each additional host assumption with the feature that needs it. Make no assumptions about the surrounding userspace: no required XDG or other freedesktop.org conventions, GNU userspace, Android or ChromeOS facilities, systemd, or D-Bus dependencies. Binaries are built for `*-unknown-linux-musl` targets.
 - Library I/O: the transport core reads no ordinary files or environment variables and writes no diagnostics. Kernel interfaces such as `/dev/net/tun`, sockets, and ioctls are allowed. The optional iphost layer uses the selected resolver's operating-system facilities; see [resolver requirements](config-model.md#daemon-resolver-selection). Application configuration-file handling and command-line I/O belong to the caller or daemon.
@@ -785,20 +785,22 @@ one MSS; otherwise held frames would hide every idle moment from BBR. At
 200 µs it cut CPU per delivered Gbit/s 5.5% at 0.5 Gbit/s on the decision
 workload and left 5 Gbit/s unchanged. Its apparent extra loss turned out to
 come from test-host stalls and BBR's ProbeRTT, not from the hold (BENCH.md).
+It adds about 33 µs to the median one-way delay and 0.2 ms at p99. It
+stays off: the turn hold below covers the same light load and saves more.
 
 Frames that arrive one at a time cost several times what the same bytes
 cost in a GSO train, because a worker then turns for every four frames or
 so and each turn pays a TAP read, a `sendmmsg` and their wakes.
-`daemon.turn_hold_us`, 200 by default since November 27 and at most 1000,
+`daemon.turn_hold_us`, 300 by default since November 27 and at most 1000,
 makes those turns fewer and larger: a turn that drained its sockets and its
 TAP queue and took in less than sixteen frames' worth of input waits until
 that long after its start before it polls again. An idle worker, one with
 pending work and one whose read came back full never wait. At 200 µs it cut
 a daemon's CPU 20–30% on single frames at 0.5 to 2 Gbit/s each way across a
-real path, for about 0.2 ms more one-way delay, and cost trains nothing at
-1 Gbit/s each way (BENCH.md). Set it to 0 to turn it off.
-It adds about 33 µs to the median one-way delay and 0.2 ms at p99, so it
-stays off until that trade is decided.
+real path, and 300 µs takes 4–8% more off, for about 0.1 ms of one-way
+delay per 100 µs of hold; trains cost the same with it and without
+(BENCH.md). Longer holds save more CPU and begin to lose frames at
+1 Gbit/s. Set it to 0 to turn it off.
 
 BBR's ProbeRTT halves the window to half of max_bw × min_rtt for 200 ms. A
 steady offer's bytes stay in flight for min_rtt plus the receiver's ACK delay
@@ -1060,6 +1062,11 @@ An unrecoverable enter failure with outstanding completions, or a violated
 ring invariant while kernel pointers are live, aborts the process. Returning
 borrowed storage in that state would be unsafe. Ordinary capability failures
 and interruptions use the fallback and retry paths above.
+
+TAP writes stay plain calls: one `writev` for a frame or for a run of frames
+of one flow that coalesce. Submitting single frames through the same ring
+was measured and not kept, because it cost CPU on a real path where the
+cards already deliver most frames in coalescible runs (BENCH.md).
 
 Worker/session counters expose read syscalls (`tap_read_calls`), submitted
 read requests (`tap_read_requests`), ring batches (`tap_read_batches`),
@@ -1420,6 +1427,7 @@ state are available through the library's `Control` API.
 | Startup fails with "TAP queues belong to different devices" | Something renamed the new TAP or moved it to another namespace while its queues were still attaching, so later queues landed on a second device of the old name. Let the daemon report readiness before a script or network manager touches the TAP |
 | `tap_errors` rises | `tap_error_code` holds the errno of the latest refused TAP read or write: `EIO` (5) means the device a queue belongs to is administratively down, `EBADFD` (77) that the queue is no longer attached to a device. Zero means a frame failed the daemon's own checks |
 | Throughput stays low with many lanes | Flow count, TAP queue placement, worker/receive distribution and CPU use; each frame stays on one lane |
+| The daemon uses more CPU than a light load of single frames seems to need | `queue_count` and `tx_lanes`. Every queue is a worker and every lane past the control lane spreads the sending over another worker, so the same frames are handled in more and smaller batches. On the relay bed four queues and four lanes cost two thirds more CPU than two and two at 0.5 Gbit/s each way of single frames, and four queues with two lanes a third more (BENCH.md). Size both for the usual load ([config-model.md](config-model.md)); `turn_hold_us` trades more delay for larger batches |
 | Both directions lose several percent in the same seconds, at any rate, and `tx_expired_sent_frames` jumps on both sides with few `repairs` | The path, before the daemon. Compare each side's `tx_outer_bytes` with the other side's `rx_outer_bytes`, then send plain UDP across the same path and echo every router that answers, from both ends, ten times a second. On one real path a gateway that stopped forwarding for 0.17 s at a time, on a half-hour schedule, produced exactly this: both senders' windows filled, and delivery resumed when the gateway did (BENCH.md) |
 | Some flows of a session stop while others pass | A transmit lane that reports `path_mtu_state` 4 (failed) and `path_mtu_bytes` 0. Each lane has its own source port and may take its own path. A lane whose path stops carrying baseline datagrams suspends its DATA until a baseline probe is answered, and its flows stay on it. The session stays active meanwhile, because liveness is the connection's and its probes use the first lane |
 | Losses and repairs climb with load though CPU is free | `receive_buffer_fallbacks` and `socket_overflow`. Without `CAP_NET_ADMIN` the receive sockets get only `net.core.rmem_max` (often about 416 KiB after doubling), and with UDP GRO each overflow drops a coalesced batch of up to 64 datagrams. On such a host TCP through the tunnel retransmitted about 1% of its segments under unlimited load (BENCH.md); give the daemon `CAP_NET_ADMIN` or raise `rmem_max` |
