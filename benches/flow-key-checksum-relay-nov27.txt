@@ -1,0 +1,59 @@
+# Relay bed, 7.5 ms round trip, no loss, sixteen QinQ flows, 20 s points, arms rotating per round, November 27.
+# old = the tree before, new = TAP coalescing compares flow keys without hashing and checksums sum eight bytes a step.
+# arm round point  delivered each way | daemon CPU left right | frames missing | one-way delay median | 99th percentile
+
+## Single frames, two workers, 0.5 and 1 Gbit/s each way
+new    r1 p0  0.49+ 0.49 G | CPU   59%   58% | miss 0.07% 0.09% | p50  4162  4162 us | p99   4784   6816 us
+new    r2 p0  0.49+ 0.49 G | CPU   57%   56% | miss 0.07% 0.10% | p50  4162  4162 us | p99   5243   7668 us
+new    r3 p0  0.49+ 0.49 G | CPU   57%   55% | miss 0.07% 0.10% | p50  4162  4162 us | p99   5964   5374 us
+new    r4 p0  0.49+ 0.49 G | CPU   59%   54% | miss 0.09% 0.07% | p50  4162  4162 us | p99   6816   4981 us
+old    r1 p0  0.49+ 0.49 G | CPU   57%   55% | miss 0.07% 0.09% | p50  4162  4162 us | p99  10486   7406 us
+old    r2 p0  0.49+ 0.49 G | CPU   58%   55% | miss 0.10% 0.07% | p50  4162  4162 us | p99   5308   7143 us
+old    r3 p0  0.49+ 0.49 G | CPU   58%   54% | miss 0.20% 0.16% | p50  4162  4162 us | p99  14287   6160 us
+old    r4 p0  0.49+ 0.49 G | CPU   59%   56% | miss 0.09% 0.07% | p50  4162  4162 us | p99   4588   4653 us
+new    r1 p1  0.98+ 0.98 G | CPU   97%   95% | miss 0.12% 0.61% | p50  4162  4162 us | p99  12059  11403 us
+new    r2 p1  0.98+ 0.98 G | CPU   97%   93% | miss 0.10% 0.39% | p50  4162  4162 us | p99   8192  10486 us
+new    r3 p1  0.95+ 0.97 G | CPU   95%   91% | miss 0.52% 0.66% | p50  4162  4162 us | p99  15335  12059 us
+new    r4 p1  0.97+ 0.98 G | CPU   99%   94% | miss 0.00% 0.49% | p50  4162  4162 us | p99   5177  10355 us
+old    r1 p1  0.97+ 0.98 G | CPU   97%   95% | miss 0.34% 0.18% | p50  4162  4162 us | p99  12059  10486 us
+old    r2 p1  0.98+ 0.99 G | CPU  100%   94% | miss 0.39% 0.00% | p50  4162  4162 us | p99   5964   5243 us
+old    r3 p1  0.97+ 0.98 G | CPU   98%   93% | miss 0.48% 0.39% | p50  4162  4162 us | p99  13894  10355 us
+old    r4 p1  0.97+ 0.98 G | CPU  102%   95% | miss 0.38% 0.37% | p50  4162  4162 us | p99   5571   4784 us
+
+## Single frames, four workers, 1 and 2 Gbit/s each way
+new    r1 p0  0.98+ 0.96 G | CPU  126%  129% | miss 0.30% 0.37% | p50  4260  4194 us | p99  11010   9175 us
+new    r2 p0  0.98+ 0.97 G | CPU  126%  134% | miss 0.30% 0.35% | p50  4260  4194 us | p99  10093   5439 us
+new    r3 p0  0.98+ 0.97 G | CPU  124%  132% | miss 0.39% 0.40% | p50  4260  4194 us | p99   9568   9961 us
+new    r4 p0  0.98+ 0.98 G | CPU  126%  132% | miss 0.29% 0.27% | p50  4260  4194 us | p99  11665   9568 us
+old    r1 p0  0.97+ 0.98 G | CPU  126%  131% | miss 0.33% 0.16% | p50  4260  4194 us | p99  11928   5308 us
+old    r2 p0  0.99+ 0.97 G | CPU  126%  133% | miss 0.20% 0.18% | p50  4260  4194 us | p99   8258   6750 us
+old    r3 p0  0.98+ 0.98 G | CPU  123%  132% | miss 0.30% 0.14% | p50  4260  4194 us | p99  10224   5374 us
+old    r4 p0  0.98+ 0.98 G | CPU  126%  135% | miss 0.30% 0.27% | p50  4260  4194 us | p99  10355   8389 us
+new    r1 p1  1.96+ 1.92 G | CPU  186%  205% | miss 0.10% 0.33% | p50  4325  4260 us | p99  11141   5636 us
+new    r2 p1  1.96+ 1.94 G | CPU  195%  211% | miss 0.27% 0.22% | p50  4260  4260 us | p99   8651   7406 us
+new    r3 p1  1.97+ 1.97 G | CPU  191%  204% | miss 0.42% 0.19% | p50  4260  4260 us | p99   8258   6816 us
+new    r4 p1  1.96+ 1.96 G | CPU  195%  205% | miss 0.53% 0.13% | p50  4260  4260 us | p99   9699   6357 us
+old    r1 p1  1.96+ 1.87 G | CPU  188%  199% | miss 0.43% 1.31% | p50  4325  4260 us | p99  10748   6423 us
+old    r2 p1  1.94+ 1.92 G | CPU  191%  203% | miss 0.24% 0.37% | p50  4260  4260 us | p99   8913   7143 us
+old    r3 p1  1.96+ 1.92 G | CPU  185%  202% | miss 0.58% 0.55% | p50  4260  4260 us | p99   9568   7995 us
+old    r4 p1  1.97+ 1.92 G | CPU  191%  211% | miss 0.14% 0.45% | p50  4260  4260 us | p99   7864   7602 us
+
+## 44-segment trains, four workers, 1 and 2 Gbit/s each way
+new    r1 p0  0.99+ 0.99 G | CPU   48%   44% | miss 0.01% 0.00% | p50  4391  4588 us | p99   6357   7602 us
+new    r2 p0  0.99+ 0.99 G | CPU   44%   42% | miss 0.00% 0.00% | p50  4391  4325 us | p99   5964   5636 us
+old    r1 p0  0.99+ 0.99 G | CPU   48%   43% | miss 0.00% 0.01% | p50  4391  4522 us | p99   5505   5898 us
+old    r2 p0  0.99+ 0.99 G | CPU   48%   43% | miss 0.01% 0.00% | p50  4391  4325 us | p99   6947   6029 us
+new    r1 p1  1.98+ 1.98 G | CPU   85%   84% | miss 0.00% 0.00% | p50  4391  4522 us | p99   7930   5571 us
+new    r2 p1  1.98+ 1.98 G | CPU   86%   80% | miss 0.00% 0.00% | p50  4391  4391 us | p99   6881   7274 us
+old    r1 p1  1.98+ 1.98 G | CPU   83%   77% | miss 0.00% 0.00% | p50  4391  4522 us | p99   6881   5439 us
+old    r2 p1  1.97+ 1.98 G | CPU   84%   79% | miss 0.00% 0.01% | p50  4391  4325 us | p99   6226   8126 us
+
+## 44-segment trains, four workers, 2 Gbit/s each way, four more rounds; CPU of both daemons together
+old    r1  163% of a core
+old    r2  166% of a core
+old    r3  161% of a core
+old    r4  166% of a core
+new    r1  165% of a core
+new    r2  167% of a core
+new    r3  167% of a core
+new    r4  166% of a core

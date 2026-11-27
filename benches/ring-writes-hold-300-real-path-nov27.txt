@@ -104,3 +104,194 @@ new      r3 p1  1.70 +  1.67 =  3.37 G | off  1.99  2.00 | CPU  217%  169% busie
 old      r1 p1  1.90 +  1.92 =  3.82 G | off  2.00  2.00 | CPU  224%  196% busiest  81  72 | miss  0.6%  0.0% | sockovf 0 0 | qdrop 0 11 | reord 7 15
 old      r2 p1  1.88 +  1.91 =  3.78 G | off  1.98  2.00 | CPU  228%  190% busiest  79  70 | miss  1.1%  0.5% | sockovf 0 0 | qdrop 9 26 | reord 0 0
 old      r3 p1  1.88 +  1.91 =  3.79 G | off  1.99  2.00 | CPU  232%  192% busiest  81  73 | miss  1.0%  0.3% | sockovf 0 0 | qdrop 45 0 | reord 24 0
+
+## The build as landed (new, turn_hold_us 300) against the build before it (old, 200), single frames, 1 and 2 Gbit/s each way,
+## six rounds, each started only in seconds the gateway schedule leaves clear
+new      r1 p0  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  146%  121% busiest  54  49 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+new      r2 p0  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  145%  124% busiest  52  49 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+new      r3 p0  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  148%  122% busiest  54  50 | miss  0.3%  0.2% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+new      r4 p0  0.96 +  0.95 =  1.91 G | off  1.00  1.00 | CPU  144%  116% busiest  53  45 | miss  0.4%  0.8% | sockovf 0 0 | qdrop 0 268 | reord 0 0
+new      r5 p0  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  144%  120% busiest  54  48 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+new      r6 p0  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  146%  118% busiest  54  48 | miss  0.5%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+old      r1 p0  0.93 +  0.92 =  1.85 G | off  1.00  1.00 | CPU  155%  121% busiest  55  47 | miss  2.8%  4.2% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+old      r2 p0  0.93 +  0.88 =  1.81 G | off  1.00  1.00 | CPU  156%  120% busiest  57  46 | miss  3.2%  7.9% | sockovf 0 0 | qdrop 0 81 | reord 0 0
+old      r3 p0  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  159%  121% busiest  56  46 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 10 | reord 0 0
+old      r4 p0  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  157%  128% busiest  56  50 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+old      r5 p0  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  150%  126% busiest  54  50 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+old      r6 p0  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  152%  125% busiest  54  50 | miss  0.3%  0.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+new      r1 p1  1.85 +  1.79 =  3.65 G | off  2.00  2.00 | CPU  212%  178% busiest  82  66 | miss  3.1%  6.4% | sockovf 0 0 | qdrop 0 39 | reord 3 0
+new      r2 p1  1.89 +  1.91 =  3.81 G | off  2.00  2.00 | CPU  229%  182% busiest  80  71 | miss  1.0%  0.2% | sockovf 0 0 | qdrop 0 8 | reord 0 254
+new      r3 p1  1.89 +  1.75 =  3.63 G | off  2.00  2.00 | CPU  222%  179% busiest  85  64 | miss  1.6%  8.7% | sockovf 0 0 | qdrop 196 283 | reord 0 0
+new      r4 p1  1.78 +  1.85 =  3.63 G | off  1.99  2.00 | CPU  224%  181% busiest  80  66 | miss  7.0%  3.5% | sockovf 0 0 | qdrop 161 484 | reord 58 0
+new      r5 p1  1.90 +  1.92 =  3.82 G | off  1.99  2.00 | CPU  219%  184% busiest  81  69 | miss  0.4%  0.0% | sockovf 0 0 | qdrop 0 7 | reord 12 24
+new      r6 p1  1.90 +  1.88 =  3.78 G | off  2.00  2.00 | CPU  220%  184% busiest  79  67 | miss  0.7%  2.0% | sockovf 0 0 | qdrop 0 181 | reord 0 1223
+old      r1 p1  1.90 +  1.88 =  3.78 G | off  1.99  2.00 | CPU  238%  192% busiest  82  72 | miss  0.7%  1.7% | sockovf 0 0 | qdrop 0 11 | reord 0 0
+old      r2 p1  1.88 +  1.91 =  3.79 G | off  2.00  2.00 | CPU  225%  193% busiest  84  72 | miss  1.7%  0.2% | sockovf 0 0 | qdrop 0 119 | reord 0 0
+old      r3 p1  1.89 +  1.85 =  3.74 G | off  2.00  1.98 | CPU  230%  184% busiest  82  69 | miss  1.3%  2.3% | sockovf 0 0 | qdrop 0 5 | reord 54 0
+old      r4 p1  1.91 +  1.90 =  3.81 G | off  2.00  2.00 | CPU  235%  191% busiest  85  72 | miss  0.5%  1.0% | sockovf 0 0 | qdrop 6 6 | reord 0 0
+old      r5 p1  1.88 +  1.84 =  3.72 G | off  2.00  2.00 | CPU  223%  185% busiest  79  69 | miss  2.0%  4.3% | sockovf 0 0 | qdrop 3 19 | reord 0 223
+old      r6 p1  1.91 +  1.92 =  3.83 G | off  1.99  2.00 | CPU  239%  187% busiest  88  71 | miss  0.1%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 22 0
+
+# The same points: frames each sending TAP queue passed to its daemon and dropped before the daemon read them.
+# The dropped share equals the missing share in every point: nothing else lost frames, except in old r1 p0 and
+# old r2 p0, where both senders also expired 300 to 1,100 sent and as many unsent frames (an outage of the path).
+new r1 p0 | left passed 846299 dropped 2528 0.30% | right passed 846483 dropped 2424 0.29%
+new r2 p0 | left passed 846023 dropped 2828 0.33% | right passed 846227 dropped 2208 0.26%
+new r3 p0 | left passed 845896 dropped 2571 0.30% | right passed 847008 dropped 2115 0.25%
+new r4 p0 | left passed 845759 dropped 3164 0.37% | right passed 842123 dropped 6888 0.81%
+new r5 p0 | left passed 846085 dropped 2542 0.30% | right passed 846496 dropped 2371 0.28%
+new r6 p0 | left passed 844611 dropped 4304 0.51% | right passed 846628 dropped 2543 0.30%
+old r1 p0 | left passed 825267 dropped 22960 2.71% | right passed 813926 dropped 35133 4.14%
+old r2 p0 | left passed 821587 dropped 26320 3.10% | right passed 783103 dropped 65740 7.74%
+old r3 p0 | left passed 845731 dropped 2856 0.34% | right passed 846876 dropped 2303 0.27%
+old r4 p0 | left passed 845591 dropped 2796 0.33% | right passed 846623 dropped 2460 0.29%
+old r5 p0 | left passed 846491 dropped 2328 0.27% | right passed 846776 dropped 2403 0.28%
+old r6 p0 | left passed 845835 dropped 2360 0.28% | right passed 845831 dropped 2412 0.28%
+new r1 p1 | left passed 1642378 dropped 52912 3.12% | right passed 1589557 dropped 108565 6.39%
+new r2 p1 | left passed 1676470 dropped 17659 1.04% | right passed 1694201 dropped 3153 0.19%
+new r3 p1 | left passed 1670643 dropped 26141 1.54% | right passed 1548152 dropped 147808 8.72%
+new r4 p1 | left passed 1575220 dropped 117540 6.94% | right passed 1638322 dropped 59568 3.51%
+new r5 p1 | left passed 1686843 dropped 6943 0.41% | right passed 1697776 dropped 146 0.01%
+new r6 p1 | left passed 1684020 dropped 12157 0.72% | right passed 1664014 dropped 34218 2.01%
+old r1 p1 | left passed 1681429 dropped 11531 0.68% | right passed 1665956 dropped 28636 1.69%
+old r2 p1 | left passed 1667004 dropped 28470 1.68% | right passed 1692498 dropped 3767 0.22%
+old r3 p1 | left passed 1675391 dropped 21818 1.29% | right passed 1640063 dropped 37866 2.26%
+old r4 p1 | left passed 1688061 dropped 8508 0.50% | right passed 1680784 dropped 17513 1.03%
+old r5 p1 | left passed 1664329 dropped 33360 1.97% | right passed 1625131 dropped 72942 4.30%
+old r6 p1 | left passed 1690385 dropped 1696 0.10% | right passed 1697923 dropped 357 0.02%
+
+## The final tree of the day, single frames at 0.5, 1 and 2 Gbit/s each way, four rounds, each started in seconds the
+## gateway schedule leaves clear. old = the commit before (turn_hold_us 300), new = the final tree (300),
+## h2 = the final tree with turn_hold_us 200, l2 = the final tree with tx_lanes 2 (one data lane in place of three).
+## The first point of a round includes its session start.
+h2       r1 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU  116%   83% busiest  38  32 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+h2       r2 p0  0.46 +  0.47 =  0.93 G | off  0.50  0.50 | CPU  111%   86% busiest  39  32 | miss  3.5%  2.2% | sockovf 0 0 | qdrop 0 24 | reord 0 0
+h2       r3 p0  0.47 +  0.48 =  0.95 G | off  0.50  0.50 | CPU  118%   84% busiest  38  33 | miss  2.5%  0.1% | sockovf 0 0 | qdrop 0 6 | reord 0 0
+h2       r4 p0  0.46 +  0.46 =  0.93 G | off  0.50  0.50 | CPU  115%   86% busiest  37  33 | miss  2.9%  3.1% | sockovf 0 0 | qdrop 21 0 | reord 0 0
+l2       r1 p0  0.48 +  0.46 =  0.94 G | off  0.50  0.50 | CPU   84%   63% busiest  31  22 | miss  0.0%  3.6% | sockovf 0 0 | qdrop 42 3114 | reord 0 0
+l2       r2 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   85%   64% busiest  31  23 | miss  0.1%  0.0% | sockovf 0 0 | qdrop 3 0 | reord 0 0
+l2       r3 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   83%   64% busiest  31  22 | miss  0.1%  0.0% | sockovf 0 0 | qdrop 30 43 | reord 0 0
+l2       r4 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   83%   62% busiest  33  23 | miss  0.1%  0.1% | sockovf 0 0 | qdrop 32 95 | reord 0 0
+new      r1 p0  0.45 +  0.45 =  0.89 G | off  0.50  0.50 | CPU  100%   73% busiest  34  27 | miss  6.8%  7.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+new      r2 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU  102%   75% busiest  35  28 | miss  0.0%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+new      r3 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU  104%   78% busiest  36  32 | miss  0.1%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+new      r4 p0  0.48 +  0.47 =  0.94 G | off  0.50  0.50 | CPU  102%   83% busiest  36  30 | miss  0.1%  2.4% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+old      r1 p0  0.48 +  0.47 =  0.95 G | off  0.50  0.49 | CPU   98%   70% busiest  36  22 | miss  0.1%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+old      r2 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU  107%   80% busiest  36  32 | miss  0.1%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+old      r3 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU  101%   77% busiest  35  30 | miss  0.1%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+old      r4 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU  102%   80% busiest  36  32 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+h2       r1 p1  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  163%  120% busiest  58  44 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+h2       r2 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  166%  134% busiest  58  47 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+h2       r3 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  172%  124% busiest  61  47 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+h2       r4 p1  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  159%  122% busiest  57  47 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+l2       r1 p1  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  128%  105% busiest  47  39 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 40 5 | reord 0 16
+l2       r2 p1  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  130%  100% busiest  47  36 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 42 66 | reord 0 11
+l2       r3 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  128%  103% busiest  46  38 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 354 100 | reord 0 0
+l2       r4 p1  0.93 +  0.96 =  1.89 G | off  1.00  1.00 | CPU  125%  103% busiest  47  41 | miss  2.4%  0.2% | sockovf 0 0 | qdrop 4259 1752 | reord 61 43
+new      r1 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  146%  115% busiest  52  44 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+new      r2 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  146%  115% busiest  54  44 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+new      r3 p1  0.93 +  0.95 =  1.88 G | off  0.98  1.00 | CPU  143%  114% busiest  52  45 | miss  0.7%  1.3% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+new      r4 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  145%  128% busiest  54  46 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 7 0
+old      r1 p1  0.96 +  0.94 =  1.89 G | off  1.00  0.98 | CPU  139%  109% busiest  56  40 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 6
+old      r2 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  153%  117% busiest  55  46 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+old      r3 p1  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  147%  116% busiest  54  46 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+old      r4 p1  0.95 +  0.95 =  1.90 G | off  1.00  1.00 | CPU  147%  118% busiest  55  46 | miss  0.0%  1.0% | sockovf 0 0 | qdrop 0 100 | reord 0 2
+h2       r1 p2  1.88 +  1.92 =  3.79 G | off  1.97  2.00 | CPU  233%  190% busiest  82  73 | miss  0.7%  0.1% | sockovf 0 0 | qdrop 0 4 | reord 4 131
+h2       r2 p2  1.87 +  1.90 =  3.77 G | off  1.98  2.00 | CPU  225%  195% busiest  85  74 | miss  1.5%  0.7% | sockovf 0 0 | qdrop 0 46 | reord 0 0
+h2       r3 p2  1.85 +  1.91 =  3.75 G | off  1.98  2.00 | CPU  228%  190% busiest  83  74 | miss  2.8%  0.6% | sockovf 0 0 | qdrop 1 4 | reord 0 237
+h2       r4 p2  1.87 +  1.90 =  3.77 G | off  1.96  2.00 | CPU  225%  189% busiest  84  71 | miss  0.5%  1.2% | sockovf 0 0 | qdrop 0 57 | reord 13 1281
+l2       r1 p2  1.89 +  1.91 =  3.80 G | off  1.99  2.00 | CPU  211%  188% busiest  85  75 | miss  0.8%  0.6% | sockovf 0 0 | qdrop 11833 9143 | reord 31 17
+l2       r2 p2  1.88 +  1.88 =  3.76 G | off  1.99  2.00 | CPU  216%  175% busiest  86  68 | miss  1.5%  1.9% | sockovf 0 0 | qdrop 21406 31521 | reord 4 419
+l2       r3 p2  1.85 +  1.84 =  3.70 G | off  1.99  2.00 | CPU  207%  179% busiest  82  71 | miss  2.7%  4.0% | sockovf 0 0 | qdrop 46236 67405 | reord 0 4
+l2       r4 p2  1.38 +  1.19 =  2.56 G | off  1.99  2.00 | CPU  164%  142% busiest  70  57 | miss 27.7% 38.0% | sockovf 0 0 | qdrop 294578 338116 | reord 0 401
+new      r1 p2  1.88 +  1.90 =  3.78 G | off  1.98  2.00 | CPU  225%  181% busiest  83  69 | miss  0.9%  0.9% | sockovf 0 0 | qdrop 0 8079 | reord 0 0
+new      r2 p2  1.83 +  1.89 =  3.72 G | off  1.96  2.00 | CPU  218%  179% busiest  83  71 | miss  2.9%  1.2% | sockovf 0 0 | qdrop 0 0 | reord 0 5
+new      r3 p2  1.86 +  1.92 =  3.78 G | off  1.95  2.00 | CPU  219%  182% busiest  84  72 | miss  0.6%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 287
+new      r4 p2  1.89 +  1.67 =  3.57 G | off  1.99  1.75 | CPU  206%  178% busiest  83  65 | miss  0.5%  0.1% | sockovf 0 0 | qdrop 0 10 | reord 36 0
+old      r1 p2  1.85 +  1.82 =  3.67 G | off  1.97  2.00 | CPU  209%  189% busiest  80  70 | miss  2.1%  5.2% | sockovf 0 0 | qdrop 0 0 | reord 0 132
+old      r2 p2  1.88 +  1.90 =  3.78 G | off  1.98  2.00 | CPU  237%  191% busiest  84  73 | miss  1.3%  0.8% | sockovf 0 0 | qdrop 0 0 | reord 0 59
+old      r3 p2  1.87 +  1.91 =  3.78 G | off  1.97  2.00 | CPU  216%  183% busiest  82  72 | miss  0.6%  0.2% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+old      r4 p2  1.89 +  1.80 =  3.69 G | off  1.98  1.88 | CPU  212%  185% busiest  83  67 | miss  0.4%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 25 1
+
+# The same points: frames each sending TAP queue passed to its daemon and dropped before the daemon read them.
+h2 r1 p0 | left passed 423180 dropped 183 0.04% | right passed 424364 dropped 143 0.03%
+h2 r2 p0 | left passed 409991 dropped 13860 3.27% | right passed 415623 dropped 8868 2.09%
+h2 r3 p0 | left passed 414279 dropped 9948 2.34% | right passed 424355 dropped 240 0.06%
+h2 r4 p0 | left passed 413091 dropped 11016 2.60% | right passed 412547 dropped 12008 2.83%
+l2 r1 p0 | left passed 423927 dropped 140 0.03% | right passed 413064 dropped 11499 2.71%
+l2 r2 p0 | left passed 423959 dropped 356 0.08% | right passed 424579 dropped 0 0.00%
+l2 r3 p0 | left passed 423535 dropped 484 0.11% | right passed 424420 dropped 127 0.03%
+l2 r4 p0 | left passed 423695 dropped 284 0.07% | right passed 424396 dropped 199 0.05%
+new r1 p0 | left passed 396527 dropped 27372 6.46% | right passed 396156 dropped 28375 6.68%
+new r2 p0 | left passed 423827 dropped 144 0.03% | right passed 424307 dropped 280 0.07%
+new r3 p0 | left passed 423635 dropped 272 0.06% | right passed 424367 dropped 204 0.05%
+new r4 p0 | left passed 422131 dropped 264 0.06% | right passed 414807 dropped 9660 2.28%
+old r1 p0 | left passed 423599 dropped 236 0.06% | right passed 420183 dropped 4 0.00%
+old r2 p0 | left passed 423775 dropped 212 0.05% | right passed 424364 dropped 207 0.05%
+old r3 p0 | left passed 423535 dropped 372 0.09% | right passed 423452 dropped 407 0.10%
+old r4 p0 | left passed 424315 dropped 24 0.01% | right passed 424375 dropped 204 0.05%
+h2 r1 p1 | left passed 845139 dropped 0 0.00% | right passed 849000 dropped 0 0.00%
+h2 r2 p1 | left passed 846792 dropped 0 0.00% | right passed 848849 dropped 0 0.00%
+h2 r3 p1 | left passed 847849 dropped 56 0.01% | right passed 849081 dropped 0 0.00%
+h2 r4 p1 | left passed 845930 dropped 0 0.00% | right passed 849082 dropped 0 0.00%
+l2 r1 p1 | left passed 846256 dropped 0 0.00% | right passed 849169 dropped 0 0.00%
+l2 r2 p1 | left passed 845747 dropped 0 0.00% | right passed 849178 dropped 0 0.00%
+l2 r3 p1 | left passed 847546 dropped 0 0.00% | right passed 848858 dropped 0 0.00%
+l2 r4 p1 | left passed 831593 dropped 15840 1.87% | right passed 849073 dropped 0 0.00%
+new r1 p1 | left passed 846777 dropped 0 0.00% | right passed 849121 dropped 0 0.00%
+new r2 p1 | left passed 846984 dropped 0 0.00% | right passed 848929 dropped 0 0.00%
+new r3 p1 | left passed 828340 dropped 6100 0.73% | right passed 837474 dropped 11191 1.32%
+new r4 p1 | left passed 846833 dropped 0 0.00% | right passed 849137 dropped 0 0.00%
+old r1 p1 | left passed 846296 dropped 168 0.02% | right passed 831322 dropped 0 0.00%
+old r2 p1 | left passed 846802 dropped 0 0.00% | right passed 849168 dropped 0 0.00%
+old r3 p1 | left passed 845792 dropped 0 0.00% | right passed 849153 dropped 0 0.00%
+old r4 p1 | left passed 846344 dropped 0 0.00% | right passed 839715 dropped 8221 0.97%
+h2 r1 p2 | left passed 1664163 dropped 11925 0.71% | right passed 1695615 dropped 1587 0.09%
+h2 r2 p2 | left passed 1654743 dropped 24820 1.48% | right passed 1685684 dropped 11909 0.70%
+h2 r3 p2 | left passed 1637464 dropped 47048 2.79% | right passed 1687479 dropped 9449 0.56%
+h2 r4 p2 | left passed 1656784 dropped 9056 0.54% | right passed 1678227 dropped 19950 1.17%
+l2 r1 p2 | left passed 1686426 dropped 824 0.05% | right passed 1697427 dropped 887 0.05%
+l2 r2 p2 | left passed 1683219 dropped 4037 0.24% | right passed 1698036 dropped 117 0.01%
+l2 r3 p2 | left passed 1688881 dropped 0 0.00% | right passed 1696974 dropped 43 0.00%
+l2 r4 p2 | left passed 1514753 dropped 172000 10.20% | right passed 1389936 dropped 307162 18.10%
+new r1 p2 | left passed 1668673 dropped 14441 0.86% | right passed 1689432 dropped 7514 0.44%
+new r2 p2 | left passed 1619095 dropped 48644 2.92% | right passed 1677133 dropped 20805 1.23%
+new r3 p2 | left passed 1649611 dropped 10487 0.63% | right passed 1697594 dropped 0 0.00%
+new r4 p2 | left passed 1678451 dropped 8015 0.48% | right passed 1481595 dropped 1262 0.09%
+old r1 p2 | left passed 1641668 dropped 34742 2.07% | right passed 1608973 dropped 88075 5.19%
+old r2 p2 | left passed 1662828 dropped 21292 1.26% | right passed 1681920 dropped 14122 0.83%
+old r3 p2 | left passed 1658926 dropped 10252 0.61% | right passed 1694046 dropped 3275 0.19%
+old r4 p2 | left passed 1673901 dropped 7060 0.42% | right passed 1597833 dropped 0 0.00%
+
+# Points in which a sender expired frames (sent, then unsent, left and right): an outage of the path or a session start.
+h2 r2 p0 miss 3.5331 2.2399 | sent-exp 409 419 unsent 1065 575
+h2 r3 p0 miss 2.4728 0.0579 | sent-exp 364 0 unsent 509 0
+h2 r4 p0 miss 2.945 3.1443 | sent-exp 230 133 unsent 1451 1337
+new r1 p0 miss 6.8168 6.9896 | sent-exp 4925 5612 unsent 1508 699
+new r4 p0 miss 0.0649 2.3849 | sent-exp 98 1026 unsent 0 435
+new r3 p1 miss 0.7349 1.3492 | sent-exp 255 3004 unsent 10 255
+h2 r4 p2 miss 0.5436 1.1781 | sent-exp 29 105 unsent 0 0
+l2 r1 p2 miss 0.7502 0.5906 | sent-exp 2268 0 unsent 0 0
+l2 r4 p2 miss 27.6613 38.0225 | sent-exp 489 2747 unsent 0 0
+new r2 p2 miss 2.9168 1.2253 | sent-exp 10 0 unsent 0 0
+old r1 p2 miss 2.0861 5.1976 | sent-exp 5324 3364 unsent 229 129
+
+## The same three builds on 44-segment trains at 1 and 2 Gbit/s each way, three rounds (old, new and l2 as above)
+l2       r1 p0  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU   51%   43% busiest  32  34 | miss  0.0%  0.2% | sockovf 0 0 | qdrop 0 39 | reord 88 1216
+l2       r2 p0  0.88 +  0.86 =  1.74 G | off  1.00  1.00 | CPU   49%   43% busiest  31  35 | miss  8.2% 10.4% | sockovf 0 0 | qdrop 0 1495 | reord 88 72
+l2       r3 p0  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   52%   45% busiest  32  37 | miss  0.0%  0.2% | sockovf 0 0 | qdrop 0 44 | reord 0 1652
+new      r1 p0  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   68%   50% busiest  25  15 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 3892 144
+new      r2 p0  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   64%   52% busiest  24  16 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 168 36
+new      r3 p0  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   70%   56% busiest  21  18 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 904 0
+old      r1 p0  0.95 +  0.93 =  1.89 G | off  1.00  1.00 | CPU   68%   58% busiest  22  18 | miss  0.5%  2.8% | sockovf 0 0 | qdrop 33 98 | reord 348 20
+old      r2 p0  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   71%   57% busiest  22  18 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 32 0
+old      r3 p0  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   70%   52% busiest  23  16 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 496 0
+l2       r1 p1  1.92 +  1.91 =  3.83 G | off  2.00  2.00 | CPU   96%   76% busiest  63  65 | miss  0.0%  0.4% | sockovf 0 0 | qdrop 0 162 | reord 448 600
+l2       r2 p1  1.92 +  1.91 =  3.82 G | off  2.00  2.00 | CPU   97%   87% busiest  64  74 | miss  0.0%  0.6% | sockovf 0 0 | qdrop 0 213 | reord 24 1588
+l2       r3 p1  1.92 +  1.87 =  3.78 G | off  2.00  2.00 | CPU   96%   81% busiest  63  70 | miss  0.0%  2.6% | sockovf 0 0 | qdrop 0 990 | reord 56 2384
+new      r1 p1  1.92 +  1.92 =  3.83 G | off  2.00  2.00 | CPU  127%   98% busiest  48  32 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 340 244
+new      r2 p1  1.92 +  1.92 =  3.83 G | off  2.00  2.00 | CPU  132%   99% busiest  59  34 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 436 96
+new      r3 p1  1.91 +  1.90 =  3.81 G | off  2.00  2.00 | CPU  131%  104% busiest  43  38 | miss  0.0%  1.2% | sockovf 0 0 | qdrop 14 449 | reord 20 228
+old      r1 p1  1.91 +  1.92 =  3.83 G | off  2.00  2.00 | CPU  125%  106% busiest  46  35 | miss  0.0%  0.1% | sockovf 0 0 | qdrop 0 34 | reord 1596 632
+old      r2 p1  1.92 +  1.92 =  3.83 G | off  2.00  2.00 | CPU  134%  102% busiest  41  34 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 796 2052
+old      r3 p1  1.91 +  1.88 =  3.80 G | off  2.00  2.00 | CPU  137%  102% busiest  45  31 | miss  0.0%  1.8% | sockovf 0 0 | qdrop 0 676 | reord 1380 244

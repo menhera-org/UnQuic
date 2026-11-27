@@ -1,8 +1,11 @@
 //! Lossless coalescing of validated UDP/TCP frames with up to two VLAN tags.
-use crate::pack::flow_hash;
+use crate::pack::FlowKey;
 use std::{io, os::fd::RawFd};
 
 pub(super) fn sum(bytes: &[u8]) -> u32 {
+    // FAILED(2026-11-27): a checksum loop of eight bytes a step -> no faster than these pairs.
+    //   Both take 76 ns a 1,480-byte frame; the compiler already vectorizes the pairs.
+    //   Now: the pairs stay.
     let (pairs, tail) = bytes.as_chunks::<2>();
     let native = pairs
         .iter()
@@ -288,7 +291,7 @@ pub(super) fn write<'a>(
     }
     let data = first.get(header_len..)?;
     let size = data.len();
-    let hash = flow_hash(first);
+    let flow = FlowKey::of(first);
     let mut vnet = [0u8; 10];
     let mut header = [0u8; 128];
     let mut iov = [libc::iovec {
@@ -313,7 +316,7 @@ pub(super) fn write<'a>(
             && first.len() <= frame_limit
             && follows(first, next, layout, count);
         if !run {
-            if flow_hash(next) != hash {
+            if FlowKey::of(next) != flow {
                 continue;
             }
             // A same-flow barrier must prevent moving a later frame ahead of it.
@@ -624,7 +627,7 @@ fn tcp_coalescing_stops_at_flow_barriers_and_counts_only_selected_frames() {
     let mut other = a.clone();
     other[34] ^= 1;
     tcp::repair(&mut other, false);
-    assert_ne!(flow_hash(&a), flow_hash(&other));
+    assert!(FlowKey::of(&a) != FlowKey::of(&other));
     let (mask, tcp, result) = write(
         -1,
         &a,
@@ -677,7 +680,7 @@ fn follows_accepts_only_what_the_parsing_path_accepts() {
         udp::partial(&mut b, v6);
         let layout = transport(&a, true).unwrap();
         let parsed = |next: &[u8], count: usize| {
-            flow_hash(next) == flow_hash(&a)
+            FlowKey::of(next) == FlowKey::of(&a)
                 && transport(next, true) == Some(layout)
                 && matches(&a, next, layout, count, payload.len())
         };
@@ -704,13 +707,13 @@ fn follows_accepts_only_what_the_parsing_path_accepts() {
         assert!(!follows(&a, &short, layout, 1));
         assert_eq!(follows(&a, &b, layout, 2), v6);
         // Through write(): the run coalesces across another flow's frame,
-        // which the hash still skips.
+        // which the flow key still skips.
         let mut other = udp::frame(v6, 100, &payload);
         let port = layout.at + 1;
         other[port] ^= 1;
         udp::repair(&mut other, v6);
         udp::partial(&mut other, v6);
-        assert_ne!(flow_hash(&a), flow_hash(&other));
+        assert!(FlowKey::of(&a) != FlowKey::of(&other));
         let (mask, tcp, _) = write(
             -1,
             &a,

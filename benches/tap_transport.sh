@@ -479,6 +479,31 @@ for side in left right; do
         sleep 0.01
     done
 done
+# DAEMON_THREAD_CPU=QUOTA/PERIOD, in microseconds as cgroup v2 cpu.max takes
+# them, lets each daemon thread run QUOTA of every PERIOD: a stand-in for
+# slower cores, 1000/2500 for cores of 0.4 times the speed. The container
+# must have the cpu controller. A real slow core takes longer over each
+# packet; this one works at full speed and stops, so delay is worse here.
+if [ -n "${DAEMON_THREAD_CPU:-}" ]; then
+    # Groups an earlier run in this container left behind are empty by now.
+    rmdir /sys/fs/cgroup/uq-slow-*/* /sys/fs/cgroup/uq-slow-* 2>/dev/null || :
+    echo +cpu > /sys/fs/cgroup/cgroup.subtree_control
+    for pid in "$left" "$right"; do
+        group="/sys/fs/cgroup/uq-slow-$pid"
+        mkdir "$group"
+        echo "$pid" > "$group/cgroup.procs"
+        for task in "/proc/$pid/task"/*; do
+            mkdir "$group/${task##*/}"
+            echo threaded > "$group/${task##*/}/cgroup.type"
+        done
+        echo +cpu > "$group/cgroup.subtree_control"
+        for task in "/proc/$pid/task"/*; do
+            echo "${DAEMON_THREAD_CPU%/*} ${DAEMON_THREAD_CPU#*/}" > "$group/${task##*/}/cpu.max"
+            echo "${task##*/}" > "$group/${task##*/}/cgroup.threads"
+        done
+    done
+    cat /sys/fs/cgroup/uq-slow-*/*/cpu.max > "$out/daemon-thread-cpu"
+fi
 snapshot() {
     left_count=$(grep -c '^unquic: worker [0-9][0-9]* Snapshot {.* }$' "$base/left.log" || :)
     right_count=$(grep -c '^unquic: worker [0-9][0-9]* Snapshot {.* }$' "$base/right.log" || :)

@@ -797,21 +797,60 @@ impl Batch {
 /// encapsulation adds its inner flow while retaining the outer key.
 /// The hash is local, never a wire value.
 pub fn flow_hash(frame: &[u8]) -> u64 {
-    let (link, ip) = flow_key(frame);
+    let key = FlowKey::of(frame);
     let mut hash = DefaultHasher::new();
-    hash.write(link);
-    if let Some(key) = ip {
-        hash_ip(&mut hash, key);
-        let inner = match key.1 {
-            4 => ipv4(key.2),
-            41 => ipv6(key.2),
-            143 if key.2.len() >= 14 => {
-                let (link, inner) = flow_key(key.2);
+    hash.write(key.link);
+    if let Some(ip) = key.ip {
+        hash_ip(&mut hash, ip);
+        hash.write(key.inner_link);
+        if let Some(inner) = key.inner {
+            hash_ip(&mut hash, inner);
+        }
+    }
+    hash.finish()
+}
+
+/// What flow_hash hashes, in its order: the link key, the IP key, and for one
+/// encapsulation the inner link key (empty except for Ethernet in IP) and IP
+/// key. Two frames belong to one flow when their keys are equal; a writer
+/// that scans a batch for one flow's frames compares keys, which costs a
+/// parse where comparing hashes costs a parse and a SipHash.
+#[derive(PartialEq)]
+pub(crate) struct FlowKey<'a> {
+    link: &'a [u8],
+    ip: Option<IpKey<'a>>,
+    inner_link: &'a [u8],
+    inner: Option<IpKey<'a>>,
+}
+
+impl<'a> FlowKey<'a> {
+    pub(crate) fn of(frame: &'a [u8]) -> Self {
+        // hash_ip leaves an encapsulation's payload out, so the key does too.
+        let bare = |(addresses, protocol, tail): IpKey<'a>| -> IpKey<'a> {
+            let tail = if matches!(protocol, 4 | 41 | 143) {
+                &[]
+            } else {
+                tail
+            };
+            (addresses, protocol, tail)
+        };
+        let (link, ip) = flow_key(frame);
+        let mut key = Self {
+            link,
+            ip: ip.map(bare),
+            inner_link: &[],
+            inner: None,
+        };
+        let inner = match ip {
+            Some((_, 4, tail)) => ipv4(tail),
+            Some((_, 41, tail)) => ipv6(tail),
+            Some((_, 143, tail)) if tail.len() >= 14 => {
+                let (link, inner) = flow_key(tail);
                 let protocol = link.last_chunk().map(|&bytes| u16::from_be_bytes(bytes));
                 if inner.is_some()
                     || !matches!(protocol, Some(0x0800 | 0x86dd | 0x8100 | 0x88a8 | 0x9100))
                 {
-                    hash.write(link);
+                    key.inner_link = link;
                     inner
                 } else {
                     None
@@ -819,11 +858,9 @@ pub fn flow_hash(frame: &[u8]) -> u64 {
             }
             _ => None,
         };
-        if let Some(key) = inner {
-            hash_ip(&mut hash, key);
-        }
+        key.inner = inner.map(bare);
+        key
     }
-    hash.finish()
 }
 
 pub(crate) fn prefer_local_lane(frame: &[u8]) -> bool {
@@ -1032,8 +1069,16 @@ mod tests {
             if rng.below(2) == 0 {
                 fix_lengths(&mut frame);
             }
-            flow_hash(&frame);
+            let hash = flow_hash(&frame);
             prefer_local_lane(&frame);
+            // The key a TAP writer compares names the same flows as the hash.
+            for seed in &seeds {
+                assert_eq!(
+                    FlowKey::of(&frame) == FlowKey::of(seed),
+                    hash == flow_hash(seed),
+                    "{frame:02x?} against {seed:02x?}"
+                );
+            }
         }
     }
 

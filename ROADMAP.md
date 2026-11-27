@@ -58,7 +58,8 @@ The daemon's remaining features, all with tests:
 - Path-MTU black holes from ACK and loss feedback (`pmtu::BlackHole`):
   full datagrams lost while small ones arrive restart discovery after
   about ten frames, where timed confirmation needed three seconds or more.
-- Linux 5.0, the minimum kernel. All 131 kernel tests pass on Linux 5.0.0
+- Linux 5.0, the minimum kernel. All kernel tests (131 that morning, 132
+  with the lane test added in the evening) pass on Linux 5.0.0
   in an emulated machine (`tests/qemu-kernel.sh`). Getting there found one
   fault in the daemon: that kernel answers a GSO send above the device MTU
   with `EINVAL`, and the daemon took it for a kernel without GSO and sent
@@ -72,14 +73,38 @@ The daemon's remaining features, all with tests:
   starts, repeats and losses, expiry, replacement and inactivity.
 - The device line of the report names the header fields the card hashes
   UDP by (`udp6_hash`), which is what decides whether lanes spread over
-  receive queues.
+  receive queues, and the packets each receive queue has counted
+  (`rx_queue_packets`), which shows whether they did. Which queue one flow
+  lands on stays out: the kernel records that only for connected UDP
+  sockets.
+- New frames leave a transmit lane whose path has failed its baseline for
+  the next data lane whose path has not, and return when a baseline probe
+  is answered. Path-MTU discovery already probes every lane, so it serves
+  as the per-lane liveness check; session liveness stays the connection's
+  (design section 5.3). Before this such a lane's flows stood still while
+  the session stayed active. A kernel test drops everything one lane
+  sends and watches its flow cross on the other data lane within seconds
+  and return when the filter is gone.
+- One pace for padded path-MTU probes across all workers, an atomic time
+  before which none is sent, in place of the static slot each worker had.
+  A worker probing alone no longer waits out the other workers' slots.
 
-What is left is the kernel's
-([BENCH.md](BENCH.md#what-is-left-of-a-daemons-cpu-november-27)). With
-trains four fifths of a daemon's busy cycles are in four kernel phases: UDP
-sends 29%, TAP writes 25%, socket reads 11% and TAP reads 10%. With single
-frames it is over nine tenths. Five things were measured to find more:
+What is left is mostly the kernel's
+([BENCH.md](BENCH.md#where-a-daemons-cpu-time-goes-sampled-november-27)).
+Sampled without `perf` (`examples/stack_sample.rs`), a daemon spends 70–77%
+of its CPU time inside system calls, under trains as under single frames:
+TAP writes 28–41%, UDP sends 14–22%, TAP reads 9–17%, socket reads 2–7%,
+sleeps and polls 4–7%. Its own code is the other 23–30%, spread thin: the
+worker loop 4%, copies 2%, and nothing else above 2%. The phase counts of
+that morning had put the kernel at four fifths and more, by counting the
+daemon's work around each call as the call's. These things were measured
+to find more ([BENCH.md](BENCH.md#what-is-left-of-a-daemons-cpu-november-27)):
 
+- The TAP writer hashed every frame it looked at for more of one flow,
+  2.6% of the CPU time on single frames. It now compares the flow keys.
+  The gain is inside the rounds' spread.
+- A checksum loop over eight bytes a step is as fast as the loop over
+  pairs, which the compiler vectorizes. Not kept.
 - A path's delay no longer costs the sender: 65–67% of a core with a
   7.5 ms round trip against 64–65% without, where November 20 measured
   95% against 65–67%.
@@ -125,30 +150,31 @@ Outside this repository:
    inside one batch, and count such points before anything else. Earlier
    real-path entries that report a few percent lost in one 10 s point may
    have met the same thing.
-2. Four slow cores are unmeasured, and that needs such a box. What the
-   fast hosts' figures imply for one: across the real path a daemon costs
-   39–46% of a fast core per Gbit/s to send trains and 15–19% to receive
-   them, about 0.6 of a core for 1 Gbit/s each way, most of it the
-   kernel's. A box whose cores each do a fraction f of that work has 4f
-   such cores in all, and the kernel's receive work outside the daemon's
-   threads takes some of them: at most 6.7f Gbit/s each way, 2.7 at
-   f = 0.4. That is arithmetic from other machines and no measurement.
+2. Four slow cores are measured only by a stand-in, and the real thing
+   needs such a box. With every daemon thread held to 0.4 of a fast core
+   ([BENCH.md](BENCH.md#four-slow-cores-a-stand-in-november-27)), four
+   workers carry 2.9 Gbit/s each way of trains without loss and 1 Gbit/s
+   each way of single frames, and reach their limit at 1.5 Gbit/s of
+   single frames with under 1% lost. That is on the relay bed's virtual
+   links. Across the real path a daemon costs 39–46% of a fast core per
+   Gbit/s to send trains and 15–19% to receive them, against 40% for both
+   on the bed, so the same limit sits near 2.7 Gbit/s each way there, less
+   whatever the card's receive work takes outside the daemon's threads.
+   Light loads of single frames are the costly end on such a box:
+   0.25 Gbit/s each way takes two fifths of its four cores with four
+   queues and lanes. A hold of 1000 µs takes a third off that, for 0.8 ms
+   more one-way delay.
 
 Decided and not built:
 
-- Path-MTU probes keep their static worker slots: the sender's grants
-  already charge every probe to the shared window and pacing, so the slots
-  are only a ceiling (`Worker::probe_time`).
-- The report does not say which receive queue a flow lands on, because the
-  kernel records that only for connected UDP sockets; it names the card's
-  hash fields.
-- Liveness stays the connection's (design section 5.3): a lane whose own
-  path fails suspends its DATA and reports a failed path-MTU state, and
-  its flows stay on it (README.md, operational checks).
 - A daemon does not move flows onto fewer lanes while its load is light.
   Flows are pinned to their lanes while active, so that means moving
-  active flows under load, and a wrong move reorders them. The operator
-  sizes `queue_count` and `tx_lanes`.
+  active flows under load, and a wrong move reorders them. Across the real
+  path one data lane in place of three takes 18% off a daemon's CPU at
+  0.5 Gbit/s each way of single frames and 12% at 1, and cannot carry 2
+  ([BENCH.md](BENCH.md#what-is-left-of-a-daemons-cpu-november-27)). The
+  operator sizes `queue_count` and `tx_lanes`. A hold of 1000 µs saved
+  more on the relay bed, a third, than one lane saves here.
 - `stripe_flows` stays experimental and off.
 
 Decided on November 27 under the instruction to finish without stopping
@@ -157,7 +183,10 @@ for decisions. Each is one line to change:
 - The acceptance profiles and the competitive margin of 1.5-fold are
   frozen from the profiles that were measured (design sections 14.2 and
   16).
-- `turn_hold_us` defaults to 300 and `tx_hold_us` stays off.
+- `turn_hold_us` defaults to 300 and `tx_hold_us` stays off. 1000 uses a
+  third less CPU on light loads over four queues and adds 0.8 ms of
+  one-way delay; whether CPU or delay should win by default is the
+  operator's call, and 300 favours delay.
 - The unit runs the daemon as root with three capabilities and
   `NoNewPrivileges=yes`.
 
@@ -2491,9 +2520,9 @@ full expired batches sharing the cleanup budget.
   routes feedback to lane owners and shares socket state across sessions.
   Probe-connection replacement now rearms confirmation without reopening a
   failed baseline or resetting an unchanged shared-session probe history.
-  Static probe slots stay (decided November 27): padded probes are charged
-  to the shared window and pacing through the sender's grants, and the slots
-  only bound how often a worker asks.
+  Since November 27 the workers share one pace for padded probes
+  (`Worker::claim_probe`) in place of static slots, and new frames leave a
+  lane whose baseline failed until it is confirmed again.
   Keep the hot path allocation-free. Use padded
   PROBE and matching PROBE_REPLY, with `EMSGSIZE` and validated `IPV6_RECVERR`
   Packet Too Big as "shrink now, re-probe later". Local interface MTU alone

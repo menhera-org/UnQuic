@@ -92,6 +92,12 @@ pub(crate) struct Shared {
     // Per session, how far its receive lanes' owners are rotated; nonzero
     // only under daemon.rotate_lanes. Worker 0 writes.
     pub rotation: Vec<AtomicU8>,
+    // Per session, one bit for each transmit lane whose path failed its
+    // baseline. The lane's owner writes it and TAP readers route around it.
+    pub failed_lanes: Vec<AtomicU64>,
+    // Milliseconds of worker time before which no worker sends another
+    // padded path-MTU probe.
+    pub probe_next: AtomicU64,
 }
 
 impl Control {
@@ -489,6 +495,8 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
         stripes,
         backlog,
         rotation: (0..sessions).map(|_| AtomicU8::new(0)).collect(),
+        failed_lanes: (0..sessions).map(|_| AtomicU64::new(0)).collect(),
+        probe_next: AtomicU64::new(0),
     });
     let mut workers = (0..count)
         .map(|id| Worker::new(id, Arc::clone(&shared), control.clone()))

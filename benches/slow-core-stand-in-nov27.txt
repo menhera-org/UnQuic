@@ -1,0 +1,56 @@
+# Relay bed, 7.5 ms round trip, no loss, sixteen untagged flows, four workers and four lanes a daemon, 15 s points,
+# two rounds, November 27. slow = every daemon thread in its own cgroup with cpu.max "1000 2500" (1 ms of every
+# 2.5 ms, 0.4 of a core; benches/tap_transport.sh DAEMON_THREAD_CPU=1000/2500), full = no limit.
+# arm round point  delivered each way | daemon CPU left right | frames missing | one-way delay median | 99th percentile
+
+## 44-segment trains, full
+d      r1 p0  0.49+ 0.49 G | CPU   27%   24% | miss 0.03% 0.03% | p50  4325  4260 us | p99   5833   5112 us
+d      r2 p0  0.49+ 0.49 G | CPU   27%   23% | miss 0.02% 0.02% | p50  4653  4325 us | p99   5702   5046 us
+d      r1 p1  0.98+ 0.98 G | CPU   48%   46% | miss 0.00% 0.00% | p50  4162  5046 us | p99  12583   7930 us
+d      r2 p1  0.98+ 0.98 G | CPU   47%   43% | miss 0.00% 0.00% | p50  4325  4391 us | p99   5243   5439 us
+d      r1 p2  1.96+ 1.96 G | CPU   82%   82% | miss 0.00% 0.07% | p50  4260  4653 us | p99   4915  82838 us
+d      r2 p2  1.96+ 1.96 G | CPU   79%   74% | miss 0.00% 0.00% | p50  4260  4325 us | p99  13369   5177 us
+d      r1 p3  2.89+ 2.89 G | CPU  109%  114% | miss 0.00% 0.06% | p50  4325  4162 us | p99  11928  28574 us
+d      r2 p3  2.93+ 2.93 G | CPU  113%  108% | miss 0.00% 0.00% | p50  4162  4129 us | p99   4915   4850 us
+
+## 44-segment trains, slow
+d      r1 p0  0.49+ 0.49 G | CPU   27%   24% | miss 0.02% 0.04% | p50  4325  4325 us | p99   5308   5046 us
+d      r2 p0  0.49+ 0.49 G | CPU   27%   24% | miss 0.02% 0.03% | p50  4325  4391 us | p99   5505   7668 us
+d      r1 p1  0.98+ 0.98 G | CPU   45%   45% | miss 0.03% 0.02% | p50  4260  4391 us | p99   9830   9437 us
+d      r2 p1  0.98+ 0.98 G | CPU   51%   48% | miss 0.00% 0.04% | p50  4260  5833 us | p99   7012  16122 us
+d      r1 p2  1.94+ 1.94 G | CPU   83%   82% | miss 0.00% 0.00% | p50  4162  4162 us | p99   5112   7406 us
+d      r2 p2  1.94+ 1.94 G | CPU   87%   88% | miss 0.00% 0.02% | p50  4260  4588 us | p99  16122   7733 us
+d      r1 p3  2.94+ 2.94 G | CPU  116%  123% | miss 0.00% 0.00% | p50  4162  4260 us | p99  21758   5702 us
+d      r2 p3  2.91+ 2.91 G | CPU  116%  122% | miss 0.00% 0.01% | p50  4260  4325 us | p99   6160   9306 us
+
+## Single frames, full
+d      r1 p0  0.25+ 0.25 G | CPU   67%   66% | miss 0.00% 0.00% | p50  4162  4194 us | p99   5046   5243 us
+d      r2 p0  0.25+ 0.25 G | CPU   66%   64% | miss 0.00% 0.00% | p50  4129  4162 us | p99   5177   4915 us
+d      r1 p1  0.49+ 0.49 G | CPU   92%   92% | miss 0.00% 0.01% | p50  4194  4260 us | p99   4784   8389 us
+d      r2 p1  0.49+ 0.49 G | CPU   92%   91% | miss 0.25% 0.00% | p50  4260  4260 us | p99  18088   6226 us
+d      r1 p2  0.97+ 0.97 G | CPU  123%  133% | miss 0.00% 0.00% | p50  4260  4260 us | p99   4915   4915 us
+d      r2 p2  0.97+ 0.96 G | CPU  120%  129% | miss 0.00% 0.30% | p50  4260  4260 us | p99   8061   8913 us
+d      r1 p3  1.46+ 1.47 G | CPU  150%  170% | miss 0.03% 0.01% | p50  4325  4325 us | p99   5767   5636 us
+d      r2 p3  1.46+ 1.45 G | CPU  151%  168% | miss 0.07% 0.20% | p50  4325  4325 us | p99   6619   7274 us
+
+## Single frames, slow
+d      r1 p0  0.25+ 0.25 G | CPU   70%   66% | miss 0.00% 0.01% | p50  4162  4194 us | p99   6881   5702 us
+d      r2 p0  0.25+ 0.25 G | CPU   68%   66% | miss 0.00% 0.01% | p50  4129  4162 us | p99   4981   5243 us
+d      r1 p1  0.49+ 0.49 G | CPU   92%   94% | miss 0.15% 0.34% | p50  4194  4260 us | p99  13631   8323 us
+d      r2 p1  0.49+ 0.49 G | CPU   92%   95% | miss 0.19% 0.26% | p50  4194  4260 us | p99  11665  10617 us
+d      r1 p2  0.98+ 0.97 G | CPU  119%  131% | miss 0.27% 0.30% | p50  4260  4260 us | p99   8192   8126 us
+d      r2 p2  0.97+ 0.97 G | CPU  119%  133% | miss 0.13% 0.27% | p50  4260  4260 us | p99   8782   8389 us
+d      r1 p3  1.45+ 1.44 G | CPU  138%  145% | miss 0.63% 0.77% | p50  5308  5177 us | p99  22282  17302 us
+d      r2 p3  1.46+ 1.45 G | CPU  139%  150% | miss 0.40% 0.39% | p50  5308  5177 us | p99  31982  15991 us
+
+## CPU of each daemon thread at the highest rate, slow (share of a core; the limit is 40%)
+# trains, 2.9 Gbit/s each way
+user   7% sys  18% total  26%   |   user  10% sys  19% total  29%
+user  12% sys  26% total  39%   |   user   9% sys  13% total  22%
+user  12% sys  20% total  33%   |   user  16% sys  20% total  36%
+user  11% sys  20% total  32%   |   user  11% sys  12% total  23%
+# single frames, 1.45 Gbit/s each way
+user  10% sys  19% total  29%   |   user  15% sys  23% total  38%
+user  15% sys  23% total  38%   |   user  16% sys  17% total  33%
+user  16% sys  23% total  38%   |   user  22% sys  16% total  38%
+user  17% sys  21% total  38%   |   user  15% sys  16% total  31%

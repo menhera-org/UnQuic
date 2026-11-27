@@ -1,0 +1,369 @@
+# examples/stack_sample.rs on the left daemon, relay bed, 7.5 ms round trip, no loss, sixteen QinQ flows,
+# ten seconds at a thousand looks a second in the middle of a 20 s point, November 27. Shares are of the
+# daemon's CPU time, each thread's samples weighed by the time the kernel reports for it. The build has the
+# flow-key comparison and the eight-byte checksum loop, which was not kept (BENCH.md).
+
+## Single frames, two workers, 0.5 Gbit/s each way
+# thread 263 ran 2005001 ns
+# thread 268 ran 0 ns
+# thread 291 ran 3183634093 ns
+# thread 292 ran 2849283038 ns
+# samples 2994 asleep 37006
+user 22.9% kernel 77.1% of 6.03 s of CPU
+== per thread: share of the CPU time, samples, user share
+291  52.8%   1666 samples, 11.0% user
+292  47.2%   1328 samples, 36.2% user
+== kernel by system call (share of CPU time)
+ 41.18% writev
+ 16.29% sendmsg
+ 10.17% io_uring_enter
+  2.35% epoll_pwait2
+  2.31% clock_nanosleep
+  1.87% sendto
+  1.67% recvmmsg
+  1.05% epoll_pwait
+  0.18% write
+== user outside the executable (vDSO): 0.04%
+== user by innermost function (share of CPU time)
+  3.78% <unquic::worker::Worker>::run
+  1.44% __memcpy_fwd
+  0.78% memset
+  0.67% memcmp
+  0.65% unquic::pack::flow_key
+  0.64% <unquic::worker::Worker>::reserve_pieces
+  0.64% <unquic::worker::Worker>::flush_batch
+  0.57% <unquic::worker::Worker>::submitted_batch
+  0.51% unquic::tap::uso::sum
+  0.48% <unquic::worker::Worker>::flush_rx
+  0.43% <unquic::worker::Worker>::read_tap_result
+  0.43% <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+  0.39% <unquic::worker::frames::Store>::sift_expiry
+  0.39% <unquic::worker::Worker>::finish_sender_send
+  0.32% <unquic::worker::Worker>::release_frame_storage
+  0.32% <unquic::worker::TxBatch>::prepare
+  0.28% stage_recovery
+  0.28% <unquic::worker::Worker>::materialize
+  0.28% <unquic::ack::sent::History>::reserve
+  0.25% unquic::wire::decode_record
+  0.25% unquic::socket::send_batch::<&mut <unquic::socket::TransmitSocket>::send_batch_checked<<unquic::worker::Worker>::flush_batch::{closure#12}>::{closure#0}>
+  0.25% sum
+  0.25% <unquic::worker::Worker>::queue_recovery_in
+  0.25% <unquic::loss::repair::FrameRecovery>::acknowledge
+  0.24% <unquic::counters::Counters>::publish
+  0.22% last_bit
+  0.22% <unquic::pack::FlowKey>::of
+  0.21% reserve_packet
+  0.21% <unquic::worker::Worker>::input_frame
+  0.21% <unquic::pack::Batch>::slices
+== user by outermost function
+  3.48% run
+  1.57% <unquic::worker::Worker>::run
+  1.44% __memcpy_fwd
+  0.88% unquic::pack::flow_key
+  0.82% reserve_pieces
+  0.78% memset
+  0.67% memcmp
+  0.64% <unquic::worker::Worker>::flush_batch
+  0.51% unquic::tap::uso::sum
+  0.46% prepare
+  0.46% <unquic::worker::frames::Store>::sift_expiry
+  0.44% flush_rx
+  0.43% submitted_batch
+  0.39% <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+  0.32% try_from_fn<core::ops::try_trait::NeverShortCircuit<unquic::pack::FrameInput>, 64, core::ops::try_trait::{impl#0}::wrap_mut_1::{closure_env#0}<unquic::pack::FrameInput, usize, unquic::worker::
+== user by inline chain
+  1.44% __memcpy_fwd
+  0.78% memset
+  0.67% memcmp
+  0.64% <unquic::worker::Worker>::run < stage_recovery < service_sender < run
+  0.50% <unquic::worker::Worker>::flush_batch
+  0.44% unquic::tap::uso::sum
+  0.36% unquic::pack::flow_key
+  0.28% stage_recovery < service_sender < <unquic::worker::Worker>::run
+  0.28% <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+  0.25% unquic::socket::send_batch::<&mut <unquic::socket::TransmitSocket>::send_batch_checked<<unquic::worker::Worker>::flush_batch::{closure#12}>::{closure#0}>
+  0.25% sum < complete_checksum < finish_read < finish_input < read_with<fn(i32, u32, u32) -> core::result::Result<usize, core::io::error::Error>>
+  0.25% <unquic::worker::Worker>::run < run
+  0.25% <unquic::loss::repair::FrameRecovery>::acknowledge
+  0.25% <unquic::ack::sent::History>::reserve
+  0.22% last_bit < ranges < take_ack
+  0.21% reserve_packet < reserve_packet_pieces < reserve_pieces
+  0.21% <unquic::worker::Worker>::run < settle_report < stage_recovery < service_sender < run
+  0.21% <unquic::worker::Worker>::run < packet < stage_recovery < service_sender < run
+  0.21% <unquic::worker::Worker>::run < map<&unquic::ack::journal::Node, unquic::ack::journal::FramePiece, unquic::ack::journal::{impl#1}::packet::{closure#1}::{closure_env#0}> < {closure#1} < call_mu
+  0.21% <unquic::counters::Counters>::publish
+  0.20% sccp
+  0.19% unquic::wire::decode_record
+  0.19% <unquic::pack::FlowKey>::of
+  0.18% <unquic::worker::frames::Store>::sift_expiry
+  0.18% <unquic::worker::Worker>::reserve_pieces < reserve_packet_pieces < reserve_pieces
+  0.18% <unquic::worker::Worker>::read_tap_result
+  0.18% <unquic::worker::Worker>::materialize
+  0.18% <unquic::loss::repair::FrameRecovery>::reset < reset
+  0.16% unquic::tap::uso::transport
+  0.14% core::array::try_from_fn::<core::ops::try_trait::NeverShortCircuit<unquic::socket::SendDatagram>, 64, <core::ops::try_trait::NeverShortCircuit<unquic::socket::SendDatagram>>::wrap_mut_1<usize,
+== callers of memcpy
+  0.46% <unquic::worker::frames::Store>::append @ unquic.642ad11f5070db82-cgu.0:?
+  0.43% <unquic::worker::frames::Store>::insert_frame @ src/worker/frames.rs:403
+  0.13% <unquic::reassembly::Lane>::admit @ src/reassembly.rs:225 < admit
+  0.07% <unquic::worker::Worker>::run @ src/tap/read.rs:401 < call_mut<fn(i32, u32, u32) -> core::result::Result<usize, core::io::error::Error>, (i32, u32, u32)> < read_with<fn(i32, u32, u32) -> core:
+  0.07% <unquic::worker::Worker>::run @ src/ops/try_trait.rs:444 < try_from_fn<core::ops::try_trait::NeverShortCircuit<core::option::Option<alloc::boxed::Box<unquic::worker::Buffer, alloc::alloc::Glob
+  0.07% <unquic::worker::Worker>::run @ src/ops/try_trait.rs:444 < try_from_fn<core::ops::try_trait::NeverShortCircuit<&mut [u8]>, 64, core::ops::try_trait::{impl#0}::wrap_mut_1::{closure_env#0}<&mut 
+  0.04% sendmsg @ src/network/sendmsg.c:26
+  0.04% core::array::try_from_fn::<core::ops::try_trait::NeverShortCircuit<unquic::socket::SendDatagram>, 64, <core::ops::try_trait::NeverShortCircuit<unquic::socket::SendDatagram>>::wrap_mut_1<usize,
+== callers of memset
+  0.21% <unquic::worker::Worker>::run @ unquic.642ad11f5070db82-cgu.0:?
+  0.19% <unquic::worker::Worker>::flush_rx @ src/tap/uso.rs:306 < write_batch_partial<core::iter::adapters::take::Take<core::iter::adapters::map_while::MapWhile<alloc::collections::vec_deque::iter::It
+  0.14% unquic::socket::send_batch::<&mut <unquic::socket::TransmitSocket>::send_batch_checked<<unquic::worker::Worker>::flush_batch::{closure#12}>::{closure#0}> @ src/ptr/mod.rs:736 < write_bytes<[un
+  0.07% unquic::socket::recv_batch @ src/ptr/mod.rs:736 < write_bytes<[libc::new::musl::sys::socket::mmsghdr; 64]> < zeroed<[libc::new::musl::sys::socket::mmsghdr; 64]> < zeroed<[libc::new::musl::sys:
+  0.06% <unquic::reassembly::Lane>::admit @ src/slice/specialize.rs:60 < fill<u64> < start < admit
+  0.04% unquic::socket::send_batch::<&mut <unquic::socket::TransmitSocket>::send_batch_checked<<unquic::worker::Worker>::flush_batch::{closure#12}>::{closure#0}> @ src/ptr/mod.rs:736 < write_bytes<[li
+  0.04% unquic::socket::recv_batch @ src/socket.rs:676
+  0.03% <unquic::reassembly::Lane>::admit @ src/slice/specialize.rs:60 < fill<u64> < piece < admit
+
+## Single frames, four workers, 1 Gbit/s each way
+# thread 186 ran 1994241 ns
+# thread 191 ran 0 ns
+# thread 281 ran 1797472233 ns
+# thread 282 ran 2817697290 ns
+# thread 283 ran 2676685749 ns
+# thread 284 ran 5143669263 ns
+# samples 4820 asleep 55180
+user 29.5% kernel 70.5% of 12.44 s of CPU
+== per thread: share of the CPU time, samples, user share
+281  14.5%    139 samples, 20.9% user
+282  22.7%    574 samples, 28.2% user
+283  21.5%    575 samples, 27.1% user
+284  41.4%   3532 samples, 34.5% user
+== kernel by system call (share of CPU time)
+ 29.47% writev
+ 17.44% io_uring_enter
+ 11.66% sendmsg
+  2.48% clock_nanosleep
+  2.28% epoll_pwait2
+  2.08% sendto
+  2.06% epoll_pwait
+  1.85% recvmmsg
+  1.13% write
+  0.04% read
+== user outside the executable (vDSO): 0.20%
+== user by innermost function (share of CPU time)
+  4.44% <unquic::worker::Worker>::run
+  1.63% __memcpy_fwd
+  1.26% <unquic::worker::Worker>::flush_rx
+  1.21% sccp
+  0.90% unquic::tap::uso::sum
+  0.85% <unquic::worker::Worker>::read_tap_result
+  0.83% sum
+  0.78% memcmp
+  0.77% memset
+  0.59% <unquic::worker::Worker>::flush_batch
+  0.51% <unquic::worker::Worker>::release
+  0.49% <unquic::worker::Worker>::push
+  0.49% <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+  0.48% unquic::pack::flow_key
+  0.48% <unquic::worker::Worker>::reserve_pieces
+  0.46% <unquic::reassembly::Lane>::admit
+  0.43% <unquic::worker::Worker>::submitted_batch
+  0.39% <unquic::worker::Worker>::input_frame
+  0.36% unquic::wire::decode_record
+  0.35% write<core::iter::adapters::take::Take<core::iter::adapters::map_while::MapWhile<alloc::collections::vec_deque::iter::Iter<u8>, unquic::reassembly::{impl#4}::ready_frames::{closure_env#0}>>>
+  0.31% unquic::tap::uso::transport
+  0.30% <unquic::worker::Worker>::finish_sender_send
+  0.29% <unquic::worker::Worker>::request_batch
+  0.28% stage_recovery
+  0.26% <unquic::worker::Worker>::claim_sender
+  0.25% <unquic::worker::frames::Store>::insert_frame
+  0.24% <unquic::wire::Record>::validate
+  0.23% <unquic::worker::Worker>::release_unsent
+  0.23% <unquic::pack::FlowKey as core::cmp::PartialEq>::eq
+  0.22% <unquic::worker::sender::Lane>::advance_report_with_acks
+== user by outermost function
+  5.67% <unquic::worker::Worker>::run
+  1.63% __memcpy_fwd
+  1.21% sccp
+  1.04% run
+  0.98% unquic::tap::uso::sum
+  0.89% flush_rx
+  0.83% <unquic::worker::Worker>::flush_rx
+  0.78% memcmp
+  0.77% memset
+  0.69% <unquic::worker::Worker>::read_tap_result
+  0.59% <unquic::worker::Worker>::flush_batch
+  0.56% <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+  0.55% unquic::pack::flow_key
+  0.52% <unquic::worker::Worker>::release
+  0.41% read_tap_result
+== user by inline chain
+  1.63% __memcpy_fwd
+  1.21% sccp
+  0.83% sum < complete_checksum < finish_read < finish_input < read_with<fn(i32, u32, u32) -> core::result::Result<usize, core::io::error::Error>>
+  0.78% memcmp
+  0.77% memset
+  0.60% unquic::tap::uso::sum
+  0.46% <unquic::worker::Worker>::release
+  0.46% <unquic::worker::Worker>::flush_batch
+  0.33% <unquic::worker::Worker>::run < <unquic::worker::Worker>::run
+  0.32% unquic::wire::decode_record
+  0.32% <unquic::worker::Worker>::read_tap_result
+  0.32% <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+  0.29% <unquic::worker::Worker>::run
+  0.28% stage_recovery < service_sender < <unquic::worker::Worker>::run
+  0.27% unquic::tap::uso::transport
+  0.27% unquic::pack::flow_key
+  0.24% write<core::iter::adapters::take::Take<core::iter::adapters::map_while::MapWhile<alloc::collections::vec_deque::iter::Iter<u8>, unquic::reassembly::{impl#4}::ready_frames::{closure_env#0}>>> <
+  0.23% <unquic::worker::Worker>::run < complete_checksum < finish_read < finish_input < read_with<fn(i32, u32, u32) -> core::result::Result<usize, core::io::error::Error>>
+  0.22% <unquic::worker::Worker>::run < packet_one < drain_packets < <unquic::worker::Worker>::run
+  0.21% <unquic::worker::Worker>::request_batch
+  0.20% <unquic::worker::Worker>::push < get<core::sync::atomic::Atomic<u64>, usize> < armed < owner_times < {closure#0}
+  0.19% <unquic::worker::Worker>::flush_rx
+  0.18% <unquic::worker::Worker>::run < stage_recovery < service_sender < <unquic::worker::Worker>::run
+  0.18% <unquic::reassembly::Lane>::release_storage
+  0.16% read_with<fn(i32, u32, u32) -> core::result::Result<usize, core::io::error::Error>> < read < read_tap < <unquic::worker::Worker>::run
+  0.16% <unquic::counters::Counters>::publish
+  0.15% <unquic::worker::Worker>::run < stage_recovery < service_sender < run
+  0.15% <unquic::worker::Worker>::run < settle_report < stage_recovery < service_sender < <unquic::worker::Worker>::run
+  0.14% <unquic::worker::sender::Lane>::advance_report_with_acks < advance_report_with_acks
+  0.14% <unquic::worker::Worker>::submitted_batch
+== callers of memcpy
+  0.83% <unquic::worker::frames::Store>::append @ unquic.642ad11f5070db82-cgu.0:?
+  0.31% <unquic::worker::frames::Store>::insert_frame @ src/worker/frames.rs:403
+  0.19% <unquic::reassembly::Lane>::admit @ src/reassembly.rs:225 < admit
+  0.08% core::array::try_from_fn::<core::ops::try_trait::NeverShortCircuit<unquic::pack::FrameInput>, 64, <core::ops::try_trait::NeverShortCircuit<unquic::pack::FrameInput>>::wrap_mut_1<usize, <unquic
+  0.08% <unquic::worker::Worker>::run @ src/tap/read.rs:401 < call_mut<fn(i32, u32, u32) -> core::result::Result<usize, core::io::error::Error>, (i32, u32, u32)> < read_with<fn(i32, u32, u32) -> core:
+  0.05% <unquic::worker::Worker>::run @ src/iter/adapters/zip.rs:152 < new<core::iter::adapters::zip::Zip<core::array::iter::IntoIter<core::option::Option<alloc::boxed::Box<unquic::worker::Buffer, all
+  0.04% <unquic::worker::sender::Lane>::advance_report_with_acks @ src/option.rs:2877 < advance_ack<unquic::worker::sender::history::{impl#0}::advance_report_with_acks::{closure_env#0}> < advance_repo
+  0.04% <unquic::worker::Worker>::flush_rx @ src/ptr/mod.rs:574 < copy_from_slice_impl<u8> < copy_from_slice<u8> < write<core::iter::adapters::take::Take<core::iter::adapters::map_while::MapWhile<allo
+== callers of memset
+  0.16% <unquic::worker::Worker>::run @ unquic.642ad11f5070db82-cgu.0:?
+  0.15% <unquic::worker::Worker>::flush_rx @ src/tap/uso.rs:306 < write_batch_partial<core::iter::adapters::take::Take<core::iter::adapters::map_while::MapWhile<alloc::collections::vec_deque::iter::It
+  0.15% <unquic::worker::Worker>::flush_batch @ src/worker.rs:4696
+  0.09% unquic::socket::send_batch::<&mut <unquic::socket::TransmitSocket>::send_batch_checked<<unquic::worker::Worker>::flush_batch::{closure#12}>::{closure#0}> @ src/ptr/mod.rs:736 < write_bytes<[un
+  0.08% <unquic::reassembly::Lane>::admit @ src/slice/specialize.rs:60 < fill<u64> < piece < admit
+  0.04% unquic::socket::send_batch::<&mut <unquic::socket::TransmitSocket>::send_batch_checked<<unquic::worker::Worker>::flush_batch::{closure#12}>::{closure#0}> @ src/socket.rs:598
+  0.04% unquic::socket::send_batch::<&mut <unquic::socket::TransmitSocket>::send_batch_checked<<unquic::worker::Worker>::flush_batch::{closure#12}>::{closure#0}> @ src/ptr/mod.rs:736 < write_bytes<[li
+  0.04% <unquic::reassembly::Lane>::admit @ src/slice/specialize.rs:60 < fill<u64> < start < admit
+
+## 44-segment trains, four workers, 2 Gbit/s each way
+# thread 263 ran 2499464 ns
+# thread 268 ran 0 ns
+# thread 301 ran 1707759661 ns
+# thread 302 ran 1930766506 ns
+# thread 303 ran 2234646682 ns
+# thread 304 ran 2566080074 ns
+# samples 4546 asleep 55454
+user 28.9% kernel 71.1% of 8.44 s of CPU
+== per thread: share of the CPU time, samples, user share
+301  20.2%    812 samples, 26.7% user
+302  22.9%   1460 samples, 24.1% user
+303  26.5%    828 samples, 29.7% user
+304  30.4%   1446 samples, 33.3% user
+== kernel by system call (share of CPU time)
+ 28.25% writev
+ 19.61% sendmsg
+  8.60% io_uring_enter
+  6.87% recvmmsg
+  2.21% epoll_pwait
+  1.97% sendto
+  1.77% epoll_pwait2
+  1.49% write
+  0.22% clock_nanosleep
+  0.08% syscall 233
+  0.02% read
+== user outside the executable (vDSO): 0.12%
+== user by innermost function (share of CPU time)
+  4.26% <unquic::worker::Worker>::run
+  2.18% __memcpy_fwd
+  1.91% unquic::wire::decode_record
+  1.87% <unquic::reassembly::Lane>::admit
+  1.15% memset
+  0.87% sccp
+  0.66% <unquic::worker::Worker>::reserve_pieces
+  0.59% <unquic::worker::Worker>::finish_sender_send
+  0.57% <unquic::worker::TxBatch>::prepare
+  0.50% <unquic::pack::Batch>::slices
+  0.48% <unquic::wire::Record>::validate
+  0.47% <unquic::worker::Worker>::request_batch
+  0.46% <unquic::worker::Worker>::flush_batch
+  0.43% packet_one
+  0.40% last_bit
+  0.38% <unquic::worker::Worker>::flush_rx
+  0.37% <unquic::worker::Worker>::queue_recovery
+  0.33% validate_data
+  0.33% <unquic::pacing::sender::Flight>::prepare
+  0.33% <unquic::ack::sent::History>::checked_ack
+  0.32% <unquic::reassembly::Lane>::take_ack
+  0.31% fill
+  0.31% <unquic::worker::Worker>::submitted_batch
+  0.30% unquic::socket::send_batch::<&mut <unquic::socket::TransmitSocket>::send_batch_checked<<unquic::worker::Worker>::flush_batch::{closure#12}>::{closure#0}>
+  0.29% <unquic::worker::sender::Lane>::advance_report_with_acks
+  0.29% <unquic::worker::Worker>::push
+  0.29% <unquic::ack::sent::History>::reserve
+  0.24% stage_recovery
+  0.22% decode
+  0.21% <unquic::worker::sender::Lane>::submitted
+== user by outermost function
+  3.17% <unquic::worker::Worker>::run
+  3.10% run
+  2.18% __memcpy_fwd
+  1.96% unquic::wire::decode_record
+  1.80% <unquic::reassembly::Lane>::admit
+  1.15% memset
+  1.02% <unquic::worker::TxBatch>::prepare
+  0.89% sccp
+  0.72% take_ack
+  0.59% <unquic::pack::Batch>::slices
+  0.57% <unquic::worker::Worker>::reserve_pieces
+  0.51% admit
+  0.48% finish_sender_send
+  0.47% <unquic::worker::Worker>::request_batch
+  0.46% validate
+== user by inline chain
+  2.18% __memcpy_fwd
+  1.65% unquic::wire::decode_record
+  1.15% memset
+  0.87% sccp
+  0.65% <unquic::reassembly::Lane>::admit
+  0.44% <unquic::reassembly::Lane>::admit < admit
+  0.42% <unquic::worker::Worker>::request_batch
+  0.40% last_bit < ranges < take_ack
+  0.34% <unquic::worker::Worker>::flush_batch
+  0.32% <unquic::worker::Worker>::run < settle_report < stage_recovery < service_sender < run
+  0.31% fill < <unquic::worker::TxBatch>::prepare
+  0.31% <unquic::worker::Worker>::run < run
+  0.30% <unquic::reassembly::Lane>::take_ack < ranges < take_ack
+  0.26% <unquic::worker::TxBatch>::prepare
+  0.25% <unquic::reassembly::Lane>::admit < <unquic::reassembly::Lane>::admit
+  0.25% <unquic::pack::Batch>::slices
+  0.24% <unquic::wire::Record>::validate < validate
+  0.22% packet_one < drain_packets < <unquic::worker::Worker>::run
+  0.22% <unquic::ack::sent::History>::reserve
+  0.21% packet_one < drain_packets < run
+  0.21% <unquic::worker::Worker>::run < <unquic::worker::Worker>::run
+  0.20% stage_recovery < service_sender < <unquic::worker::Worker>::run
+  0.20% <unquic::worker::Worker>::run < packet < stage_recovery < service_sender < run
+  0.20% <unquic::worker::Worker>::reserve_pieces < reserve_packet_pieces < reserve_pieces
+  0.20% <unquic::worker::Worker>::flush_rx
+  0.20% <unquic::ack::sent::History>::checked_ack
+  0.19% decode < packet_one < drain_packets < <unquic::worker::Worker>::run
+  0.19% <unquic::worker::Worker>::submitted_batch
+  0.18% <unquic::worker::Worker>::release
+  0.18% <unquic::worker::Worker>::push < get<core::sync::atomic::Atomic<u64>, usize> < armed < owner_times < {closure#0}
+== callers of memcpy
+  1.91% <unquic::reassembly::Lane>::admit @ unquic.642ad11f5070db82-cgu.0:?
+  0.10% core::array::try_from_fn::<core::ops::try_trait::NeverShortCircuit<unquic::pack::FrameInput>, 64, <core::ops::try_trait::NeverShortCircuit<unquic::pack::FrameInput>>::wrap_mut_1<usize, <unquic
+  0.03% <unquic::worker::sender::Lane>::advance_report_with_acks @ src/option.rs:2877 < advance_ack<unquic::worker::sender::history::{impl#0}::advance_report_with_acks::{closure_env#0}> < advance_repo
+  0.03% <unquic::tap::segment::Segments>::write_run @ src/ptr/mod.rs:574 < copy_from_slice_impl<u8> < copy_from_slice<u8> < write_run
+  0.02% read_tap @ src/worker.rs:3188 < run
+  0.02% core::array::try_from_fn::<core::ops::try_trait::NeverShortCircuit<unquic::socket::SendDatagram>, 64, <core::ops::try_trait::NeverShortCircuit<unquic::socket::SendDatagram>>::wrap_mut_1<usize,
+  0.02% <unquic::worker::frames::Store>::insert_frame @ src/worker/frames.rs:403
+  0.02% <unquic::worker::Worker>::run @ src/worker.rs:3188 < run
+== callers of memset
+  0.48% <unquic::worker::Worker>::run @ unquic.642ad11f5070db82-cgu.0:?
+  0.35% <unquic::reassembly::Lane>::admit @ src/slice/specialize.rs:60 < fill<u64> < piece < admit
+  0.09% <unquic::reassembly::Lane>::admit @ src/slice/specialize.rs:60 < fill<u64> < start < admit
+  0.07% unquic::socket::send_batch::<&mut <unquic::socket::TransmitSocket>::send_batch_checked<<unquic::worker::Worker>::flush_batch::{closure#12}>::{closure#0}> @ src/ptr/mod.rs:736 < write_bytes<[un
+  0.06% unquic::socket::send_batch::<&mut <unquic::socket::TransmitSocket>::send_batch_checked<<unquic::worker::Worker>::flush_batch::{closure#12}>::{closure#0}> @ src/ptr/mod.rs:736 < write_bytes<[li
+  0.03% unquic::socket::recv_batch @ src/socket.rs:690
+  0.03% <unquic::worker::Worker>::run @ src/tap/read.rs:258 < read < read_tap < run
+  0.02% unquic::socket::send_batch::<&mut <unquic::socket::TransmitSocket>::send_batch_checked<<unquic::worker::Worker>::flush_batch::{closure#12}>::{closure#0}> @ src/socket.rs:598

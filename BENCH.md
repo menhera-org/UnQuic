@@ -4008,7 +4008,10 @@ its busy cycles writing frames to the TAP, 25–26% reading them from it,
 14–18% packing and sending datagrams, 6% reading its sockets and 1–2%
 polling. That is over nine tenths in phases that are one kernel call after
 another. Reassembly, the sender's accounting and control take under a tenth
-together. A `sendmmsg` call now carries 7.9 datagrams where it carried 4.9,
+together. (Sampled later the same day, the kernel has 77% of that daemon's
+CPU time and the daemon's own code 23%: the phases above include the
+daemon's work around each call.
+[Entry](#where-a-daemons-cpu-time-goes-sampled-november-27).) A `sendmmsg` call now carries 7.9 datagrams where it carried 4.9,
 at 2,800 cycles a datagram where each cost 3,700. Going further means fewer
 kernel entries per frame at the TAP, and for frames that arrive and leave
 one at a time on sixteen flows the daemon has no more of them to merge.
@@ -4125,7 +4128,10 @@ profile, with or without delay: packing and sending datagrams 29%, writing
 frames to the TAP 25%, reading sockets 11%, reading the TAP 10%, polling
 3%. The daemon's own work is the rest: reassembly 8%, the sender's
 accounting 7%, and control, notifications and queue handling 7%. No phase
-of its own is as large as the smallest of the four kernel phases.
+of its own is as large as the smallest of the four kernel phases. Those
+four phases also hold the daemon's work around each call, so the heading
+overstates the kernel: sampled, it has 71% of a daemon's CPU time on
+trains ([below](#where-a-daemons-cpu-time-goes-sampled-november-27)).
 
 **Idle, a daemon costs nothing that can be measured.** A pair joined over
 loopback, four workers each, one session, no traffic: 0.03% of a core, with
@@ -4246,6 +4252,35 @@ light and more as it grows would get this by itself. That is not built:
 flows are pinned to lanes while they are active, so it means moving active
 flows between lanes under load, and a wrong move reorders them.
 
+Across the real path that evening, four workers a daemon, one data lane
+(`tx_lanes = 2`) against three (`tx_lanes = 4`) in the same batch, four
+rounds ([rows](benches/ring-writes-hold-300-real-path-nov27.txt), arms `l2`
+and `new`); CPU of the left and right daemon:
+
+| Offered each way | One data lane | Three data lanes |
+| --- | --- | --- |
+| 0.5 Gbit/s | 83–85%, 62–64% | 100–104%, 73–83% |
+| 1 Gbit/s | 125–130%, 100–105% | 143–146%, 114–128% |
+| 2 Gbit/s | 207–216%, 175–188% in three rounds | 206–225%, 178–182% |
+| Trains, 1 Gbit/s | 49–52%, 43–45% | 64–70%, 50–56% |
+| Trains, 2 Gbit/s | 96–97%, 76–87% | 127–132%, 98–104% |
+
+For single frames one lane takes 18% off at 0.5 Gbit/s and 12% at 1, and
+it does not carry 2: there the daemons refused 9,000–67,000 frames a point
+at admission in three rounds, and in the fourth they delivered 1.4 and
+1.2 Gbit/s of the 2 offered. For trains (three rounds) it takes a quarter
+off the left daemon and a sixth to a fifth off the right at both rates.
+At 2 Gbit/s its one sending worker runs at 63–74% of a core and 0.4–2.6%
+of the frames go missing right to left, where three lanes lose 0.0–1.2%.
+
+So on this path a session should have no more lanes than its peak needs:
+`tx_lanes = 2` carries 2 Gbit/s each way of trains for a quarter less CPU
+than 4. A daemon that folded a light load onto one lane by itself would
+gain the same, and would have to unfold, moving every active flow, before
+the one lane fills. The final tree and the commit before it cost the same
+on trains in this batch: 64–70% and 50–56% against 68–71% and 52–58% at
+1 Gbit/s, 127–132% and 98–104% against 125–137% and 102–106% at 2.
+
 **A longer hold keeps saving CPU, and past 300 µs it starts to cost
 frames.** `daemon.turn_hold_us` from 200 to 1000 on single frames, relay
 bed, two workers, 7.5 ms, no loss; 200 to 400 in four rounds and the rest
@@ -4295,13 +4330,175 @@ a gateway stall, and in one a new session's controller climbed slowly):
 
 300 µs uses 4–8% less CPU at every rate and loses no more. **The default is
 now 300.** It had been set to 200 that morning from one round, which showed
-300 saving little more. The build as landed against the build before it,
-three rounds of which stalls left one clean point of the new build at each
-rate: 146% and 124% of a core against 153–155% and 124–133% at 1 Gbit/s,
-and 222% and 184% against 224–232% and 190–196% at 2. Trains at 1
+300 saving little more.
+
+The build as landed against the build before it, six rounds, each started
+only in seconds the gateway's schedule leaves clear (the last set of the
+same rows): 144–148% and 116–124% of a core against 150–159% and 120–128%
+at 1 Gbit/s each way, and 212–229% and 178–184% against 223–239% and
+184–193% at 2. Every frame that went missing in those rounds was dropped at
+a sending side's TAP queue before its daemon read it: the dropped share of
+each queue equals the missing share of its direction in all 24 points. The
+path lost nothing and the daemons expired nothing, except in two points of
+the old build where both senders also expired 300 to 1,100 sent frames and
+as many unsent ones, which is an outage of the path. At 1 Gbit/s both
+builds drop 0.3% that way. At 2 Gbit/s, where the busiest worker of the
+left daemon runs at 79–88% of its core, both drop more and unevenly:
+0.4–6.9% and 0.0–8.7% with 300 µs against 0.1–2.0% and 0.0–4.3% with 200,
+means of 2.3% and 3.5% against 1.0% and 1.6%. A daemon leaves frames in
+its TAP queue while its sender's backlog is full or its reader is behind,
+so these drops measure that time.
+
+A second batch that evening, four rounds at three rates on the day's final
+tree, with the hold at 300 and at 200 (the set after it in the rows; arms
+`new` and `h2`):
+
+| Offered each way | 300 µs | 200 µs | Missing, 300 and 200 |
+| --- | --- | --- | --- |
+| 0.5 Gbit/s | 100–104%, 73–83% | 111–118%, 83–86% | 0.0–0.1%, 0.0% |
+| 1 Gbit/s | 143–146%, 114–128% | 159–172%, 120–134% | 0.0%, 0.0% |
+| 2 Gbit/s | 206–225%, 178–182% | 225–233%, 189–195% | 0.5–2.9% and 0.0–1.2%, 0.5–2.8% and 0.1–1.2% |
+
+CPU is from all four rounds. The missing column leaves out the points in
+which a sender expired frames it had not sent, the mark of a path outage
+or a slow session start: three of twelve at each setting, five of the six
+a session's first point (the rows list them). 300 uses 5–12% less CPU at
+every rate, and
+at 2 Gbit/s the two lose alike here, so the first batch's difference was
+the rounds'. The final tree against the commit before it, in the same
+batch: 100–104% and 73–83% against 98–107% and 70–80% at 0.5 Gbit/s,
+143–146% and 114–128% against 139–153% and 109–118% at 1, and 206–225% and
+178–182% against 209–237% and 183–191% at 2.
+
+**On four queues a longer hold saves a third at light load.** Relay bed,
+four workers and four lanes a daemon, sixteen untagged flows of single
+frames, three rounds with the arms rotating
+([rows](benches/turn-hold-light-load-four-workers-nov27.txt)); CPU of the
+left and right daemon:
+
+| Offered each way | 300 µs | 1000 µs | Median one-way delay | Missing |
+| --- | --- | --- | --- | --- |
+| 0.25 Gbit/s | 67–68%, 64–65% | 44–45%, 39–40% | 4.2 ms, 4.9–5.0 ms | 0.00%, 0.00–0.05% |
+| 0.5 Gbit/s | 90–92%, 90–92% | 62%, 58–59% | 4.2–4.3 ms, 5.0 ms | 0.00–0.24%, 0.01–0.29% |
+
+A light load spread over four workers gives each of them one or two frames
+a turn, so most of what a turn costs is the turn. The default stays at 300
+because every lightly loaded tunnel would pay the 0.8 ms; a box whose CPU
+is the scarcer thing sets `daemon.turn_hold_us = 1000`.
+
+Trains at 1
 and 2 Gbit/s each way cost and lose the same at 200, 300 and 400, with and
 without loss ([rows](benches/turn-hold-sweep-trains-nov27.json),
 [1% loss](benches/turn-hold-sweep-lossy-trains-nov27.json)).
+
+## Where a daemon's CPU time goes, sampled (November 27)
+
+The phase counts of the entry above time whole phases, and a phase that
+makes a system call also holds the daemon's own work around it. To split
+the two, `examples/stack_sample.rs` samples a running daemon without
+`perf`, which the test host does not allow: a thousand times a second it
+looks at each thread, leaves a sleeping one alone, stops a running one with
+ptrace for an instant and records its program counter, or the system call
+it is in. Each thread's samples are weighed by the CPU time the kernel
+reports for it. `addr2line -i` names the user-code samples from a build
+with line tables.
+
+The left daemon on the relay bed, 7.5 ms round trip, no loss, sixteen QinQ
+flows, ten seconds in the middle of a 20 s point
+([samples](benches/stack-samples-nov27.txt)); shares of the daemon's CPU
+time:
+
+| | Single frames, two workers, 0.5 Gbit/s each way | Single frames, four workers, 1 Gbit/s | 44-segment trains, four workers, 2 Gbit/s |
+| --- | --- | --- | --- |
+| CPU time, share of one core | 60% | 124% | 84% |
+| The daemon's own code | 22.9% | 29.5% | 28.9% |
+| TAP writes (`writev`) | 41.2% | 29.5% | 28.3% |
+| UDP sends (`sendmsg`, `sendto`) | 18.2% | 13.7% | 21.6% |
+| TAP reads (`io_uring_enter`) | 10.2% | 17.4% | 8.6% |
+| Socket reads (`recvmmsg`) | 1.7% | 1.9% | 6.9% |
+| Sleeps and polls (`clock_nanosleep`, `epoll_pwait2`, `epoll_pwait`) | 5.7% | 6.8% | 4.2% |
+| Waking other workers (`write` to an eventfd) | 0.2% | 1.1% | 1.5% |
+
+Seven tenths to three quarters of a daemon's CPU time is inside the
+kernel, under trains as under single frames. The earlier entry's "four
+fifths" and "over nine tenths" counted the daemon's work inside the four
+phases as the kernel's and were too high. The TAP write is the largest
+item everywhere. On this bed it carries each frame through the inner
+network stack to the receiving program's socket, and that is charged to
+the daemon's thread: with two workers 805,393 calls wrote 845,000 frames
+at about 6 µs a call.
+
+The daemon's own quarter is spread thin. Its largest items in the three
+runs: the worker loop itself 3.8–4.4%, copies 1.4–2.2% (frames into the
+frame store, pieces into reassembly), record decoding and receive
+admission 1.9% each under trains, checksums 0.5–1.7% and clearing arrays
+before a call 0.8–1.2%. Nothing else passes 1.3%, and about forty
+functions of the sender's accounting take 0.2–0.9% each. Two things the
+first samples pointed at were changed:
+
+- The TAP writer looks through the ready frames for more of the first
+  frame's flow and hashed every frame it looked at with SipHash, which was
+  2.6% of the CPU time with two workers. It now compares the flow keys
+  themselves (`pack::FlowKey`), which takes 1.3%. The one hash a frame
+  that chooses a lane on the sending side stays (0.4%).
+- The checksum loop sums 16-bit pairs. Summing eight bytes a step took
+  76 ns for a 1,480-byte frame, the same as the pairs, which the compiler
+  already vectorizes. It was not kept.
+
+A build with both against the build before, arms rotating
+([rows](benches/flow-key-checksum-relay-nov27.txt)): 57–59% and 54–58% of a
+core against 57–59% and 54–56% at 0.5 Gbit/s each way of single frames with
+two workers, 95–99% and 91–95% against 97–102% and 93–95% at 1 Gbit/s,
+124–126% and 129–134% against 123–126% and 131–135% with four workers at
+1 Gbit/s, and 186–195% and 204–211% against 185–191% and 199–211% at 2.
+Trains at 2 Gbit/s each way with four workers cost both daemons together
+165–167% of a core against 161–166%; their path does not hash or compare
+at all. The change is smaller than the rounds' spread. The comparison
+stays because it is less work for the same result.
+
+## Four slow cores, a stand-in (November 27)
+
+The targets include boxes with four slow cores, and none was at hand. As a
+stand-in every thread of both daemons ran in a cgroup of its own that
+allows 1 ms of CPU time in every 2.5 ms (`DAEMON_THREAD_CPU=1000/2500` of
+`benches/tap_transport.sh`), so each of a daemon's four workers has 0.4 of
+a fast core and the daemon 160% of one. A real slow core takes longer over
+every packet. This one works at full speed and then stops for up to
+1.5 ms, so its capacity is about right and its delay is worse. The load
+tools and the relay were not limited.
+
+Relay bed, 7.5 ms round trip, no loss, four workers and four lanes a
+daemon, sixteen untagged flows, two rounds
+([rows](benches/slow-core-stand-in-nov27.txt)); CPU of the left and right
+daemon as a share of one fast core:
+
+| Offered each way | CPU, limited | CPU, unlimited | Missing, limited | Missing, unlimited | Median one-way delay, limited |
+| --- | --- | --- | --- | --- | --- |
+| Trains, 0.5 Gbit/s | 27%, 24% | 27%, 23–24% | 0.02–0.04% | 0.02–0.03% | 4.3 ms |
+| Trains, 1 Gbit/s | 45–51%, 45–48% | 47–48%, 43–46% | 0.00–0.04% | 0.00% | 4.3–5.8 ms |
+| Trains, 2 Gbit/s | 83–87%, 82–88% | 79–82%, 74–82% | 0.00–0.02% | 0.00–0.07% | 4.2–4.6 ms |
+| Trains, 3 Gbit/s (2.9 delivered) | 116%, 122–123% | 109–113%, 108–114% | 0.00–0.01% | 0.00–0.06% | 4.2–4.3 ms |
+| Single frames, 0.25 Gbit/s | 68–70%, 66% | 66–67%, 64–66% | 0.00–0.01% | 0.00% | 4.1–4.2 ms |
+| Single frames, 0.5 Gbit/s | 92%, 94–95% | 92%, 91–92% | 0.15–0.34% | 0.00–0.25% | 4.2–4.3 ms |
+| Single frames, 1 Gbit/s | 119%, 131–133% | 120–123%, 129–133% | 0.13–0.30% | 0.00–0.30% | 4.3 ms |
+| Single frames, 1.5 Gbit/s | 138–139%, 145–150% | 150–151%, 168–170% | 0.39–0.77% | 0.01–0.20% | 5.2–5.3 ms |
+
+Trains pass 2.9 Gbit/s each way inside the limit and lose nothing; the
+busiest worker is then at 39% of its 40%. Single frames pass 1 Gbit/s each
+way as they do without the limit. At 1.5 Gbit/s five of the eight workers
+run at 38% of a core against their 40%: 0.4–0.8% of the frames are dropped
+at the TAP queues,
+the median delay rises by 1 ms and the 99th percentile to 16–32 ms. The
+limited daemons use less CPU there than the unlimited ones, because a
+worker that was stopped finds a larger batch when it runs again.
+
+What this leaves out. A card's receive work outside the daemon's threads
+was not limited. A real card costs more per datagram than the bed's
+virtual links: across the real path a daemon takes 54–65% of a fast core
+per Gbit/s each way of trains, and 40% here, which puts the same limit at
+about 2.7 Gbit/s each way there. And the light end is the expensive one
+for single frames: 0.25 Gbit/s each way already takes 66–70% of a fast
+core with four queues and lanes, two fifths of what such a box has.
 
 ## The per-frame cost on November 19
 

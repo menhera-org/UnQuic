@@ -133,10 +133,9 @@ fn hash_fields(bits: u64) -> String {
     }
 }
 
-// DECISION(2026-11-27): the report shows how the card hashes UDP, not the receive queue each
-//   flow lands on. Why: the kernel records a socket's receiving CPU and NAPI instance only for
-//   connected UDP sockets, and receive sockets here take any source. Rejected: per-queue driver
-//   statistics (their names differ by driver and a container does not see them).
+// DECISION(2026-11-27): the report gives the card's UDP hash and queue counts, not a flow's queue.
+//   Why: the kernel records a socket's receiving CPU and NAPI instance only for connected UDP
+//   sockets, and receive sockets here take any source.
 fn udp_hash(socket: &UdpSocket, name: &str) -> String {
     // struct ethtool_rxnfc: cmd, flow_type, data (u64), then a flow
     // specification and a rule count that this command leaves unused.
@@ -149,6 +148,72 @@ fn udp_hash(socket: &UdpSocket, name: &str) -> String {
     let mut bits = [0; 8];
     bits.copy_from_slice(&request[8..16]);
     hash_fields(u64::from_ne_bytes(bits))
+}
+
+/// The receive queue a driver's statistic counts packets for, by the names
+/// drivers give such counters: `rx0_packets`, `rx_queue_0_packets`,
+/// `rx-0.packets`. None for any other statistic.
+fn queue_of(name: &str) -> Option<usize> {
+    // One separator, where the driver writes one.
+    fn skip(part: &str) -> &str {
+        part.strip_prefix(['_', '-', '.']).unwrap_or(part)
+    }
+    let rest = skip(name.strip_prefix("rx")?);
+    let rest = skip(rest.strip_prefix("queue").unwrap_or(rest));
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let (queue, rest) = rest.split_at_checked(digits)?;
+    let queue = queue.parse().ok()?;
+    (skip(rest) == "packets").then_some(queue)
+}
+
+/// Packets each receive queue has taken since the device came up, in queue
+/// order: whether lanes spread over the queues shows in two reports taken
+/// under load. `unknown` where the driver does not count per queue under one
+/// of the names above, and on a virtual device such as a macvlan, which has
+/// no such counters; read it there on the machine that owns the card.
+fn queue_packets(socket: &UdpSocket, name: &str) -> String {
+    const ETHTOOL_GSTATS: u32 = 0x1d;
+    const ETH_SS_STATS: u32 = 1;
+    let mut info = [0_u8; 20];
+    put(&mut info, 0, ETHTOOL_GSSET_INFO);
+    info[8..16].copy_from_slice(&(1_u64 << ETH_SS_STATS).to_ne_bytes());
+    if !ethtool(socket, name, &mut info) || info[8..16] == [0; 8] {
+        return "unknown".into();
+    }
+    let count = (word(&info, 16) as usize).min(4096);
+    let mut names = vec![0_u8; 12 + count * STRING_LEN];
+    put(&mut names, 0, ETHTOOL_GSTRINGS);
+    put(&mut names, 4, ETH_SS_STATS);
+    put(&mut names, 8, count as u32);
+    // struct ethtool_stats: cmd, n_stats, then n_stats 64-bit values.
+    let mut values = vec![0_u8; 8 + count * 8];
+    put(&mut values, 0, ETHTOOL_GSTATS);
+    put(&mut values, 4, count as u32);
+    if !ethtool(socket, name, &mut names) || !ethtool(socket, name, &mut values) {
+        return "unknown".into();
+    }
+    let mut queues = [None; 64];
+    for index in 0..count {
+        let queue = names
+            .get(12 + index * STRING_LEN..12 + (index + 1) * STRING_LEN)
+            .and_then(|bytes| queue_of(text(bytes)));
+        let value = values
+            .get(8 + index * 8..16 + index * 8)
+            .and_then(|eight| eight.try_into().ok())
+            .map(u64::from_ne_bytes);
+        if let (Some(slot), Some(value)) = (queue.and_then(|q| queues.get_mut(q)), value) {
+            *slot = Some(value);
+        }
+    }
+    let known: Vec<String> = queues
+        .iter()
+        .map_while(|queue| queue.map(|packets| packets.to_string()))
+        .collect();
+    if known.is_empty() {
+        "unknown".into()
+    } else {
+        known.join("/")
+    }
 }
 
 fn sysfs(device: &str, file: &str) -> String {
@@ -200,13 +265,14 @@ pub fn device(name: &str) -> String {
     };
     format!(
         "driver={} version={} bus={} mtu={} tx_queue_len={} channels {queues} \
-udp6_hash={} gro_flush_timeout={} napi_defer_hard_irqs={}{}",
+udp6_hash={} rx_queue_packets={} gro_flush_timeout={} napi_defer_hard_irqs={}{}",
         field(4),
         field(36),
         field(100),
         sysfs(name, "mtu"),
         sysfs(name, "tx_queue_len"),
         udp_hash(&socket, name),
+        queue_packets(&socket, name),
         sysfs(name, "gro_flush_timeout"),
         sysfs(name, "napi_defer_hard_irqs"),
         features(&socket, name),
@@ -300,6 +366,23 @@ mod tests {
         assert_eq!(hash_fields(0x30), "src,dst");
         assert_eq!(hash_fields(0xf0), "src,dst,sport,dport");
         assert_eq!(hash_fields(1 << 31), "none");
+        // Loopback counts no packets per queue. Drivers that do name the
+        // counters in a few ways, and nothing else is taken for one.
+        assert!(line.contains(" rx_queue_packets=unknown "), "{line}");
+        for (name, queue) in [
+            ("rx0_packets", Some(0)),
+            ("rx17_packets", Some(17)),
+            ("rx_queue_3_packets", Some(3)),
+            ("rx-2.packets", Some(2)),
+            ("rx_packets", None),
+            ("rx0_bytes", None),
+            ("rx_queue_0_xdp_packets", None),
+            ("rx0_csum_none", None),
+            ("tx0_packets", None),
+            ("rx_queue_packets", None),
+        ] {
+            assert_eq!(queue_of(name), queue, "{name}");
+        }
         // Names that cannot be devices cost no ioctl and no path lookup.
         for bad in ["", "..", "a/b", "sixteen-bytes-long"] {
             assert!(device(bad).starts_with("driver=unknown"), "{bad}");

@@ -1,0 +1,15 @@
+# Relay bed, 7.5 ms round trip, no loss, sixteen untagged flows of single frames, four workers and four lanes a daemon,
+# 20 s points, three rounds with the arms rotating, November 27. h3 = turn_hold_us 300 (the default), h10 = 1000.
+# arm round point  delivered each way | daemon CPU left right | frames missing | one-way delay median | 99th percentile
+h10    r1 p0  0.25+ 0.25 G | CPU   45%   39% | miss 0.05% 0.00% | p50  4915  5046 us | p99   9437   6685 us
+h10    r2 p0  0.25+ 0.25 G | CPU   45%   40% | miss 0.02% 0.00% | p50  4915  5046 us | p99  11272   7864 us
+h10    r3 p0  0.25+ 0.25 G | CPU   44%   39% | miss 0.04% 0.00% | p50  4915  5046 us | p99   8061   6750 us
+h3     r1 p0  0.25+ 0.25 G | CPU   68%   64% | miss 0.00% 0.00% | p50  4162  4194 us | p99   5177   5308 us
+h3     r2 p0  0.25+ 0.25 G | CPU   67%   64% | miss 0.00% 0.00% | p50  4162  4194 us | p99   5243   5308 us
+h3     r3 p0  0.25+ 0.25 G | CPU   68%   65% | miss 0.00% 0.00% | p50  4162  4194 us | p99   5833   4915 us
+h10    r1 p1  0.49+ 0.49 G | CPU   62%   58% | miss 0.12% 0.26% | p50  4981  5046 us | p99   7274   6947 us
+h10    r2 p1  0.49+ 0.49 G | CPU   62%   59% | miss 0.01% 0.25% | p50  4981  5046 us | p99   7143   6947 us
+h10    r3 p1  0.49+ 0.49 G | CPU   62%   58% | miss 0.16% 0.29% | p50  4981  5046 us | p99   7406   7209 us
+h3     r1 p1  0.49+ 0.49 G | CPU   90%   91% | miss 0.00% 0.08% | p50  4260  4260 us | p99   8061   6881 us
+h3     r2 p1  0.49+ 0.49 G | CPU   92%   90% | miss 0.17% 0.19% | p50  4194  4260 us | p99   7930   8389 us
+h3     r3 p1  0.48+ 0.49 G | CPU   91%   92% | miss 0.24% 0.21% | p50  4194  4260 us | p99   6554   6095 us

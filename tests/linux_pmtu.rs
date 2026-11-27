@@ -177,7 +177,7 @@ fn tc(args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-fn routed_config(local: &str, remote: &str) -> unquic::config::Config {
+fn routed_config(local: &str, remote: &str, tx_lanes: usize) -> unquic::config::Config {
     use unquic::config::{Config, Daemon, Endpoint, Peer, Session};
     Config {
         daemon: Daemon::default(),
@@ -194,7 +194,7 @@ fn routed_config(local: &str, remote: &str) -> unquic::config::Config {
             address: Some(remote.parse().unwrap()),
             peer_port: 40100,
             scope_id: 0,
-            tx_lanes: 2,
+            tx_lanes,
             outer_payload_limit: MAX_UDP_PAYLOAD,
             path_group: None,
         }],
@@ -243,6 +243,7 @@ fn routed_mtu(
     runtimes: &[common::runtime::Running],
     captures: &[std::os::fd::OwnedFd],
     observations: &mut [Observed],
+    lanes: u16,
     mtu: u64,
     seconds: u64,
 ) {
@@ -254,7 +255,7 @@ fn routed_mtu(
             observation.drain(capture);
         }
         let matches = runtimes.iter().all(|runtime| {
-            (1..=2).all(|lane| {
+            (1..=lanes).all(|lane| {
                 runtime
                     .control
                     .transmit_lane_counters(0, lane)
@@ -279,7 +280,7 @@ fn routed_mtu(
             "MTU {mtu} did not converge: {:?}",
             runtimes
                 .iter()
-                .map(|runtime| (1..=2)
+                .map(|runtime| (1..=lanes)
                     .map(|lane| runtime.control.transmit_lane_counters(0, lane))
                     .collect::<Vec<_>>())
                 .collect::<Vec<_>>()
@@ -288,32 +289,63 @@ fn routed_mtu(
     }
 }
 
-fn routed_frames(taps: &[std::os::fd::OwnedFd], sources: &[std::os::fd::OwnedFd]) {
+/// The routed tests' one flow, as the receiving TAP shows a frame of it.
+fn routed_bytes() -> [u8; unquic::MAX_FRAME_LEN] {
     let mut frame = [0x5a; unquic::MAX_FRAME_LEN];
     frame[..12].copy_from_slice(&[2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2]);
     frame[12..22].copy_from_slice(&[0x81, 0, 0, 7, 0x81, 0, 0, 8, 0x88, 0xb5]);
-    let mut capture = [0; 10_000];
+    frame
+}
+
+/// Sends one frame of `length` bytes of that flow from client `from`.
+fn routed_send(sources: &[std::os::fd::OwnedFd], from: usize, length: usize) {
+    let frame = routed_bytes();
+    // The source is the VLAN upper, which adds the outer tag itself.
     let mut outgoing = frame;
+    outgoing[12..length - 4].copy_from_slice(&frame[16..length]);
+    raw_send(&sources[from], &outgoing[..length - 4]);
+}
+
+/// Sends one such frame and waits for it at the other client's TAP.
+fn routed_frame(
+    taps: &[std::os::fd::OwnedFd],
+    sources: &[std::os::fd::OwnedFd],
+    from: usize,
+    length: usize,
+) {
+    let frame = routed_bytes();
+    let mut capture = [0; 10_000];
+    let to = 1 - from;
+    while capture_frame(&taps[to], &mut capture).is_some() {}
+    routed_send(sources, from, length);
+    wait_for(|| {
+        capture_frame(&taps[to], &mut capture)
+            .is_some_and(|n| n == length && capture[..n] == frame[..length])
+    });
+}
+
+fn routed_frames(taps: &[std::os::fd::OwnedFd], sources: &[std::os::fd::OwnedFd]) {
     for length in [60, 1518, unquic::MAX_FRAME_LEN] {
-        outgoing[12..length - 4].copy_from_slice(&frame[16..length]);
-        for (from, to) in [(0, 1), (1, 0)] {
-            while capture_frame(&taps[to], &mut capture).is_some() {}
-            raw_send(&sources[from], &outgoing[..length - 4]);
-            wait_for(|| {
-                capture_frame(&taps[to], &mut capture)
-                    .is_some_and(|n| n == length && capture[..n] == frame[..length])
-            });
+        for from in [0, 1] {
+            routed_frame(taps, sources, from, length);
         }
     }
 }
 
-#[test]
-#[ignore = "requires isolated container, tun, iproute2/tc and network capabilities; about 11 minutes"]
-fn routed_discovery_handles_returned_filtered_ptb_and_upward_retry() {
-    use std::{
-        ffi::CString,
-        time::{Duration, Instant},
-    };
+/// Two clients, each a runtime in its own namespace, joined through this
+/// thread's namespace as their router by the veths `r0` and `r1`.
+struct Routed {
+    /// Outer packets on each client's link.
+    captures: Vec<std::os::fd::OwnedFd>,
+    /// Each client's TAP, and a VLAN upper of it to send frames from.
+    taps: Vec<std::os::fd::OwnedFd>,
+    sources: Vec<std::os::fd::OwnedFd>,
+    runtimes: Vec<common::runtime::Running>,
+    _namespaces: Vec<std::fs::File>,
+}
+
+fn routed(tx_lanes: usize) -> Routed {
+    use std::ffi::CString;
     // SAFETY: the test and its children use only fresh namespaces.
     check(unsafe { libc::unshare(libc::CLONE_NEWNET) });
     let router = std::fs::File::open("/proc/thread-self/ns/net").unwrap();
@@ -371,6 +403,7 @@ fn routed_discovery_handles_returned_filtered_ptb_and_upward_retry() {
         runtimes.push(common::runtime::Running::start(routed_config(
             addresses[index],
             addresses[1 - index],
+            tx_lanes,
         )));
         wait_for(|| runtimes[index].control.ready());
         let control = UdpSocket::bind("[::]:0").unwrap();
@@ -392,6 +425,26 @@ fn routed_discovery_handles_returned_filtered_ptb_and_upward_retry() {
         sources.push(raw_socket(c"uq-route.7", libc::ETH_P_ALL as u16));
         enter(&router);
     }
+    Routed {
+        captures,
+        taps,
+        sources,
+        runtimes,
+        _namespaces: clients.into(),
+    }
+}
+
+#[test]
+#[ignore = "requires isolated container, tun, iproute2/tc and network capabilities; about 11 minutes"]
+fn routed_discovery_handles_returned_filtered_ptb_and_upward_retry() {
+    use std::time::{Duration, Instant};
+    let Routed {
+        captures,
+        taps,
+        sources,
+        mut runtimes,
+        _namespaces,
+    } = routed(2);
     let mut observations = [Observed::default(), Observed::default()];
     let change_mtu = |mtu: &str| {
         for index in 0..2 {
@@ -409,10 +462,10 @@ fn routed_discovery_handles_returned_filtered_ptb_and_upward_retry() {
             ]);
         }
     };
-    routed_mtu(&runtimes, &captures, &mut observations, 9000, 40);
+    routed_mtu(&runtimes, &captures, &mut observations, 2, 9000, 40);
     routed_frames(&taps, &sources);
     change_mtu("1500");
-    routed_mtu(&runtimes, &captures, &mut observations, 1500, 15);
+    routed_mtu(&runtimes, &captures, &mut observations, 2, 1500, 15);
     assert!(observations.iter().all(|observation| observation.ptb > 0));
     routed_frames(&taps, &sources);
 
@@ -429,7 +482,7 @@ fn routed_discovery_handles_returned_filtered_ptb_and_upward_retry() {
         observations[index].ptb = 0;
     }
     change_mtu("1280");
-    routed_mtu(&runtimes, &captures, &mut observations, 1280, 70);
+    routed_mtu(&runtimes, &captures, &mut observations, 2, 1280, 70);
     assert!(observations.iter().all(|observation| observation.ptb == 0));
     for index in 0..2 {
         let statistics = tc(&[
@@ -456,7 +509,7 @@ fn routed_discovery_handles_returned_filtered_ptb_and_upward_retry() {
         tc(&["qdisc", "del", "dev", &format!("r{index}"), "clsact"]);
     }
     let raised = Instant::now();
-    routed_mtu(&runtimes, &captures, &mut observations, 9000, 650);
+    routed_mtu(&runtimes, &captures, &mut observations, 2, 9000, 650);
     assert!(
         raised.elapsed() >= Duration::from_secs(500),
         "upward retry was bypassed"
@@ -485,6 +538,106 @@ fn routed_discovery_handles_returned_filtered_ptb_and_upward_retry() {
         });
         assert_eq!(statistics.tp_drops, 0, "outer capture lost packets");
     }
+    for runtime in &mut runtimes {
+        runtime.stop();
+    }
+}
+
+#[test]
+#[ignore = "requires isolated container, tun, iproute2/tc and network capabilities; about a minute"]
+fn new_frames_leave_a_black_holed_lane_and_return_when_it_answers() {
+    use std::time::{Duration, Instant};
+    // A control lane and two data lanes: wire lanes 1, 2 and 3.
+    let Routed {
+        captures,
+        taps,
+        sources,
+        mut runtimes,
+        _namespaces,
+    } = routed(3);
+    let mut observations = [Observed::default(), Observed::default()];
+    // Every lane has measured its path, so a silent one fails in seconds.
+    routed_mtu(&runtimes, &captures, &mut observations, 3, 9000, 40);
+    let lane = |lane: u16| {
+        runtimes[0]
+            .control
+            .transmit_lane_counters(0, lane)
+            .unwrap()
+            .counters
+    };
+    // The frames below are one flow, so one data lane carries them all;
+    // probes on the other add far less.
+    let burst = |lanes: [u16; 2]| {
+        let before = lanes.map(|l| lane(l).tx_outer_bytes);
+        for _ in 0..50 {
+            routed_frame(&taps, &sources, 0, 1518);
+        }
+        [0, 1].map(|at| lane(lanes[at]).tx_outer_bytes - before[at])
+    };
+    let sent = burst([2, 3]);
+    let (used, spare) = if sent[0] > sent[1] { (2, 3) } else { (3, 2) };
+    assert!(sent[0].max(sent[1]) >= 40 * 1518, "{sent:?}");
+    assert!(sent[0].min(sent[1]) < 25 * 1518, "{sent:?}");
+
+    // Drop everything client 0 sends on that lane: UDP whose UnQuic header
+    // names it, 36 bytes into the payload.
+    tc(&["qdisc", "add", "dev", "r1", "clsact"]);
+    tc(&[
+        "filter",
+        "add",
+        "dev",
+        "r1",
+        "egress",
+        "protocol",
+        "ipv6",
+        "pref",
+        "1",
+        "u32",
+        "match",
+        "u8",
+        "17",
+        "0xff",
+        "at",
+        "6",
+        "match",
+        "u16",
+        &used.to_string(),
+        "0xffff",
+        "at",
+        "84",
+        "action",
+        "drop",
+    ]);
+    // The flow keeps sending while the test waits, so it keeps its lane: a
+    // flow silent for a second is given a lane afresh.
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "{what}: {:?}",
+                [lane(2), lane(3)].map(|c| (c.path_mtu_bytes, c.path_mtu_state))
+            );
+            routed_send(&sources, 0, 1518);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait("the lane did not fail", &|| {
+        lane(used).path_mtu_state == 4 && lane(used).path_mtu_bytes == 0
+    });
+    assert_ne!(lane(spare).path_mtu_bytes, 0);
+    // New frames of the flow now cross on the other data lane.
+    let sent = burst([used, spare]);
+    assert!(sent[1] >= 40 * 1518, "{sent:?}");
+
+    tc(&["qdisc", "del", "dev", "r1", "clsact"]);
+    wait("the lane did not recover", &|| {
+        lane(used).path_mtu_bytes != 0
+    });
+    // And return to their own lane once its baseline probe is answered.
+    let sent = burst([used, spare]);
+    assert!(sent[0] >= 40 * 1518, "{sent:?}");
+    assert!(sent[1] < 25 * 1518, "{sent:?}");
     for runtime in &mut runtimes {
         runtime.stop();
     }

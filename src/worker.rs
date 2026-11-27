@@ -813,6 +813,35 @@ fn data_lane(lane: usize, first: usize, lanes: usize, hash: impl FnOnce() -> u64
     }
 }
 
+/// Records for a session's TAP readers whether `lane`'s path has failed.
+fn mark_lane(shared: &Shared, session: usize, lane: usize, failed: bool) {
+    let Some(mask) = shared.failed_lanes.get(session) else {
+        return;
+    };
+    if failed {
+        mask.fetch_or(1 << (lane & 63), Ordering::Relaxed);
+    } else {
+        mask.fetch_and(!(1 << (lane & 63)), Ordering::Relaxed);
+    }
+}
+
+/// The lane a new frame takes when `lane` was chosen for it: `lane` itself,
+/// or the next data lane whose path has not failed when `lane`'s has. With
+/// every data lane failed the choice stands.
+// DECISION(2026-11-27): new frames leave a lane whose path failed for the next open data lane.
+//   Why: such a lane sends no DATA until a baseline probe is answered, and its flows stood
+//   still while the session stayed active. Rejected: a liveness timer per lane (path-MTU
+//   discovery already probes each lane and knows when it fails).
+fn open_lane(failed: u64, lane: usize, data: std::ops::Range<usize>) -> usize {
+    if failed >> (lane & 63) & 1 == 0 || !data.contains(&lane) {
+        return lane;
+    }
+    (1..data.len())
+        .map(|step| data.start + (lane - data.start + step) % data.len())
+        .find(|other| failed >> (other & 63) & 1 == 0)
+        .unwrap_or(lane)
+}
+
 /// Whether tap_lane spreads this frame across all lanes by its flow hash.
 fn strict_lane(frame: &[u8], worker: usize, workers: usize, queues: usize, lanes: usize) -> bool {
     queues < workers || worker >= lanes || !pack::prefer_local_lane(frame)
@@ -1252,7 +1281,6 @@ pub(crate) struct Worker {
     mtu_start: usize,
     mtu_due: Duration,
     mtu_next: Duration,
-    probe_slot: Option<u128>,
     pub requests: Option<Consumer<AddressRequest>>,
     peer_controls: Vec<PeerControl>,
     #[allow(clippy::vec_box)] // Move pool handles without enlarging every handoff-ring slot.
@@ -1629,7 +1657,6 @@ impl Worker {
             mtu_start: 0,
             mtu_due: Duration::ZERO,
             mtu_next: Duration::MAX,
-            probe_slot: None,
             requests: None,
             peer_controls: (0..if id == 0 { config.peers.len() } else { 0 })
                 .map(|_| PeerControl::default())
@@ -3346,11 +3373,15 @@ impl Worker {
         } else {
             tap_lane(frame, self.id, workers, queues, lanes)
         };
+        // Zero unless a path of this session failed its baseline.
+        let failed = self
+            .shared
+            .failed_lanes
+            .get(session)
+            .map_or(0, |mask| mask.load(Ordering::Relaxed));
         if lane & STRIPED == 0 {
-            return (
-                data_lane(lane, first, lanes, || pack::flow_hash(frame)),
-                None,
-            );
+            let lane = data_lane(lane, first, lanes, || pack::flow_hash(frame));
+            return (open_lane(failed, lane, first..lanes), None);
         }
         let number = lane & !STRIPED;
         match stripes.and_then(|s| s.get(number)) {
@@ -3363,10 +3394,8 @@ impl Worker {
             // The connection that striped this flow was replaced.
             None => {
                 let hash = pack::flow_hash(frame);
-                (
-                    data_lane(hash as usize % lanes, first, lanes, || hash),
-                    None,
-                )
+                let lane = data_lane(hash as usize % lanes, first, lanes, || hash);
+                (open_lane(failed, lane, first..lanes), None)
             }
         }
     }
@@ -5274,24 +5303,35 @@ impl Worker {
         waiting
     }
 
-    // Nominally one 9000-byte probe per 3 ms globally, without a shared counter or lock.
-    // DECISION(2026-11-27): static worker slots stay as the ceiling on padded probes. Why: the
-    //   sender's grants already charge each probe to the shared window and pacing, so a slot only
-    //   bounds how often a worker asks, and an unused slot costs a worker at most `workers` slots
-    //   of waiting per probe while DATA flows at the baseline. Rejected: one shared next-probe
-    //   time (every worker with a probe due wakes for each slot and one of them wins).
+    // DECISION(2026-11-27): padded probes share one pace across workers, held in one atomic time.
+    //   Why: the static slots it replaces gave each worker one slot in `workers`, so a worker
+    //   probing alone waited that many slots for every probe. Rejected: no pace beyond the
+    //   sender's grant (a path whose controller allows gigabits would let every lane of every
+    //   session probe at once).
+    /// Claims the shared pace: true when this worker may send a padded probe
+    /// now, at most 9000 bytes every PROBE_SPACING_MS across all workers.
+    fn claim_probe(&self, now: Duration) -> bool {
+        let ms = now.as_millis().min(u128::from(u64::MAX)) as u64;
+        let next = self.shared.probe_next.load(Ordering::Relaxed);
+        // A worker that loses the exchange lost this turn to the winner.
+        next <= ms
+            && self
+                .shared
+                .probe_next
+                .compare_exchange(
+                    next,
+                    ms.saturating_add(PROBE_SPACING_MS),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+    }
+
+    /// The earliest time a padded probe may be tried again.
     fn probe_time(&self, now: Duration) -> Duration {
-        let slot = now.as_millis() / 3;
-        let workers = self.shared.workers() as u128;
-        let owner = slot % workers;
-        let mut distance = (self.id as u128 + workers - owner) % workers;
-        if distance == 0 && self.probe_slot != Some(slot) {
-            return now;
-        }
-        if distance == 0 {
-            distance = workers;
-        }
-        Duration::from_millis(((slot + distance) * 3).min(u64::MAX as u128) as u64)
+        now.max(Duration::from_millis(
+            self.shared.probe_next.load(Ordering::Relaxed),
+        ))
     }
 
     fn mtu_timers(&mut self, now: Duration) -> io::Result<bool> {
@@ -5316,9 +5356,8 @@ impl Worker {
             let before = (tx.mtu.payload_limit(), tx.mtu.state());
             let length = tx.mtu.poll(now);
             if let Some(length) = length
-                && now >= self.probe_time(now)
+                && self.claim_probe(now)
             {
-                self.probe_slot = Some(now.as_millis() / 3);
                 self.send_mtu_probe(session, peer, path, lane, length, now)?;
             }
             self.mtu_changed(peer, path, lane, before, now);
@@ -5588,10 +5627,11 @@ impl Worker {
         for session in 0..self.sessions.len() {
             let history = self.sender_index(session, lane).ok();
             let local = &mut self.sessions[session];
-            if self.shared.config.peer_for_session(session) != Some(peer)
-                || local.path != path
-                || local.connection.is_none()
-            {
+            if self.shared.config.peer_for_session(session) != Some(peer) || local.path != path {
+                continue;
+            }
+            mark_lane(&self.shared, session, lane, limit == 0);
+            if local.connection.is_none() {
                 continue;
             }
             if limit < before.0
@@ -5956,6 +5996,8 @@ impl Worker {
                     if index % self.shared.workers() == self.id {
                         let mtu = &self.transmit[peer].paths[path].lanes[index].mtu;
                         let limit = mtu.payload_limit();
+                        // The session may have come from another path.
+                        mark_lane(&self.shared, session, index, lane.is_some() && limit == 0);
                         local.tx_totals[index] = Snapshot {
                             path_mtu_bytes: if lane.is_none() || limit == 0 {
                                 0
@@ -6297,6 +6339,8 @@ impl Worker {
 
 /// Input below which a turn counts as small: sixteen full frames.
 const HOLD_BYTES: usize = 16 * 1500;
+/// Milliseconds between two padded path-MTU probes of any worker.
+const PROBE_SPACING_MS: u64 = 3;
 
 /// When a turn that started at `now` and took in `moved` bytes should poll
 /// again, if it should wait at all: `hold` after its start, or at the next
@@ -8254,6 +8298,86 @@ mod tests {
                 assert_eq!(routes, [(1, None); 3]);
             }
         }
+    }
+
+    #[test]
+    fn new_frames_leave_a_lane_whose_path_failed_and_return_when_it_recovers() {
+        // The choice stands for an open lane, a control lane and a lone lane.
+        assert_eq!(open_lane(0, 2, 1..4), 2);
+        assert_eq!(open_lane(0b100, 0, 1..4), 0);
+        assert_eq!(open_lane(0b1, 0, 0..1), 0);
+        // A failed lane gives way to the next open data lane, wrapping round.
+        assert_eq!(open_lane(0b0100, 2, 1..4), 3);
+        assert_eq!(open_lane(0b1000, 3, 1..4), 1);
+        assert_eq!(open_lane(0b1100, 2, 1..4), 1);
+        assert_eq!(open_lane(0b1110, 2, 1..4), 2);
+
+        let (shared, [worker, _]) = test_workers_with(3, true);
+        let frame = crate::tap::test_common::tcp::frame(false, 1, 1, 0x10, &[], &[7; 100]);
+        let ms = Duration::from_millis;
+        assert_eq!(worker.route(0, false, &frame, 1, ms(0)), (1, None));
+        shared.failed_lanes[0].store(0b10, Ordering::Relaxed);
+        assert_eq!(worker.route(0, false, &frame, 1, ms(1)), (2, None));
+        // The other session's lanes are its own.
+        assert_eq!(worker.route(1, false, &frame, 1, ms(1)).0, 1);
+        shared.failed_lanes[0].store(0, Ordering::Relaxed);
+        assert_eq!(worker.route(0, false, &frame, 1, ms(2)), (1, None));
+
+        // The lane's owner sets the mark when the baseline fails and clears it
+        // when a baseline probe is answered.
+        let (shared, [mut worker, _]) = test_workers_with(3, true);
+        let state = |worker: &Worker| {
+            let mtu = &worker.transmit[0].paths[0].lanes[1].mtu;
+            (mtu.payload_limit(), mtu.state())
+        };
+        let before = state(&worker);
+        let mtu = &mut worker.transmit[0].paths[0].lanes[1].mtu;
+        assert!(mtu.local_too_big(BASE_UDP_PAYLOAD, 1279, Duration::ZERO));
+        worker.mtu_changed(0, 0, 1, before, Duration::ZERO);
+        assert_eq!(state(&worker).0, 0);
+        assert_eq!(shared.failed_lanes[0].load(Ordering::Relaxed), 0b10);
+        let before = state(&worker);
+        let now = Duration::from_secs(20);
+        let probe = pmtu::ProbeId {
+            session: 0,
+            tag: 1,
+            lane: 2,
+            packet: 1,
+        };
+        let mtu = &mut worker.transmit[0].paths[0].lanes[1].mtu;
+        assert_eq!(mtu.poll(now), Some(BASE_UDP_PAYLOAD));
+        assert!(mtu.submitted(probe, BASE_UDP_PAYLOAD, now));
+        assert!(mtu.reply(probe, BASE_UDP_PAYLOAD, now + ms(1)));
+        worker.mtu_changed(0, 0, 1, before, now + ms(1));
+        assert_eq!(state(&worker).0, BASE_UDP_PAYLOAD);
+        assert_eq!(shared.failed_lanes[0].load(Ordering::Relaxed), 0);
+
+        // An install reads the marks of the lanes this worker owns afresh:
+        // the session may have come from another path.
+        shared.failed_lanes[1].store(u64::MAX, Ordering::Relaxed);
+        let install = Command {
+            generation: 1,
+            phase: Phase::Install,
+            connection: worker.sessions[0].connection,
+        };
+        worker.command(1, install, 0).unwrap();
+        assert_eq!(shared.failed_lanes[1].load(Ordering::Relaxed), !0b101);
+    }
+
+    #[test]
+    fn padded_probes_share_one_pace_across_workers() {
+        let (_, [a, b]) = test_workers();
+        let ms = Duration::from_millis;
+        assert!(a.claim_probe(ms(10)));
+        // Neither worker may probe again before the spacing has passed.
+        assert!(!b.claim_probe(ms(10)));
+        assert!(!a.claim_probe(ms(12)));
+        assert_eq!(b.probe_time(ms(11)), ms(13));
+        // A worker probing alone takes every turn, and so does the other later.
+        assert!(a.claim_probe(ms(13)));
+        assert!(a.claim_probe(ms(16)));
+        assert!(b.claim_probe(ms(40)));
+        assert_eq!(a.probe_time(ms(50)), ms(50));
     }
 
     #[test]
@@ -10374,6 +10498,8 @@ mod tests {
                 .map(|_| (0..tx_lanes).map(|_| AtomicU64::new(0)).collect())
                 .collect(),
             rotation: (0..2).map(|_| AtomicU8::new(0)).collect(),
+            failed_lanes: (0..2).map(|_| AtomicU64::new(0)).collect(),
+            probe_next: AtomicU64::new(0),
         });
         let workers: [Worker; 2] = std::array::from_fn(|id| {
             let mut worker = Worker::new(id, Arc::clone(&shared), Control::new()).unwrap();
