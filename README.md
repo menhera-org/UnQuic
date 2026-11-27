@@ -34,7 +34,10 @@ must identify the kernel actually tested.
 Linux 5.0 is the oldest kernel the daemon targets: it sets TAP carrier with
 `TUNSETCARRIER`, which arrived there. The kernel suites run on Linux 6.8 and
 7.0 in containers, and on Linux 5.0.0 in an emulated machine
-(`tests/qemu-kernel.sh`, QEMU without KVM and without a network device).
+(`tests/qemu-kernel.sh`, QEMU without KVM; its only network devices are two
+virtio cards joined to each other, which the host report's queue-count test
+uses). Run the suites one at a time on a quiet machine: side by side on one
+host, tests with time limits fail at random.
 On a kernel that lacks one of these the daemon does the following instead:
 
 | Kernel interface | Since | Without it |
@@ -737,6 +740,24 @@ A frame's pieces and repairs stay on its original lane. New frames leave a
 lane whose path has failed its baseline for the next data lane that has not,
 and return when a baseline probe is answered.
 
+A session with two or more data lanes does not use them all while its load
+is light (`daemon.fold_lanes`, on by default since November 27). A new
+connection starts with every lane. After five quiet seconds it closes those
+the load does not need, down to the first data lane, and it opens the next
+again when the worker of an open lane is busy seven tenths of its time, a
+lane falls behind or a frame expires on one. While any lane's path has
+failed, every lane stays open. Only the flows of a lane that opens or
+closes move, and a moved flow may deliver a few frames out of order at the
+move. Each end folds its own sending; the wire and the peer are not
+involved. On the relay bed a folded session cost a daemon 25–41% less CPU
+at 0.25 Gbit/s each way of single frames and 9–17% less on trains at
+2 Gbit/s; across a real path, where the daemons often kept two lanes, 8–10%
+less at 0.5 Gbit/s of single frames and up to 18% less on trains at
+1 Gbit/s. A load that doubles while a session is on one lane can cost a
+slower host up to a third of a second of single frames before the lanes are
+open again; steps from two lanes and steps of trains showed no loss
+(BENCH.md). Set it to false to use every lane always.
+
 Stacked VLANs, TCP, fragmented IP and other traffic retain strict flow hashing.
 Stacked VLAN traffic can concentrate on one TAP queue; hashing it across all
 lanes avoids stranding the other transmit workers. For locally routed
@@ -801,16 +822,21 @@ pending work and one whose read came back full never wait. At 200 µs it cut
 a daemon's CPU 20–30% on single frames at 0.5 to 2 Gbit/s each way across a
 real path, and 300 µs takes 4–8% more off, for about 0.1 ms of one-way
 delay per 100 µs of hold; trains cost the same with it and without
-(BENCH.md). Longer holds save more CPU and begin to lose frames at
-1 Gbit/s. Set it to 0 to turn it off.
+(BENCH.md). Set it to 0 to turn it off.
 
-The light end is where a longer hold pays most. With four queues and lanes
-on the relay bed, 1000 µs took a daemon from 67–68% of a core to 44–45% at
-0.25 Gbit/s each way of single frames and from 90–92% to 62% at 0.5, for
-0.8 ms more one-way delay and no more loss (BENCH.md). The default stays at
-300 because every lightly loaded tunnel pays that delay. Where CPU is the
-scarcer thing, as on a box with four slow cores, set
-`daemon.turn_hold_us = 1000`.
+A worker that is busy holds longer. `daemon.busy_hold_us`, 1000 by default
+since November 27 and at most 1000, replaces `turn_hold_us` from when a
+worker is awake a twentieth of its time until it is awake less than a
+fiftieth. A quiet tunnel has no CPU to save and keeps the 300 µs, so a
+ping across it shows only that. With four queues and lanes on the relay
+bed the busy hold took a daemon from 57–59% of a core to 41–42% at
+0.25 Gbit/s each way of single frames, from 84% to 57–60% at 0.5 and from
+117–121% to 89–93% at 1, for 0.7–0.9 ms more one-way delay and the same
+loss. With 1% loss on the path it saves as much, and at 1 Gbit/s it may
+lose about two tenths of a percent more of the frames (BENCH.md).
+Across a real path it took 21–22% off a daemon at 0.5 Gbit/s each way,
+17–18% at 1, and about a tenth off the CPU per delivered Gbit/s of TCP.
+Set it to 0 for one hold at every load.
 
 BBR's ProbeRTT halves the window to half of max_bw × min_rtt for 200 ms. A
 steady offer's bytes stay in flight for min_rtt plus the receiver's ACK delay
@@ -861,11 +887,17 @@ no more frames on the lossy path (BENCH.md). Set it to false to keep
 complete checksums on the wire.
 
 `daemon.stripe_flows`, off by default, turns on single-flow striping
-(decision 7, design section 13.1). It is experimental: on the lossy
-single-flow target it about doubles one flow's delivery, to about 2
-Gbit/s in both directions, with the same share of frames reordered as
-without it (BENCH.md); the worker that reads the flow from the TAP and
-writes the reverse direction to it then limits the flow. It advertises the
+(decision 7, design section 13.1). It stays off because it gives up order:
+measured across a real path on November 27 with four workers a side, one
+flow of UDP trains that a lane cannot carry delivered 2.2–2.8 Gbit/s
+striped against 1.2–2.7, with a fifth to a half of its frames out of
+sequence and half again to twice the CPU; one flow of single frames and one
+TCP stream gained nothing (BENCH.md). Turn it on for a tunnel whose one UDP
+flow must exceed a lane and whose receiver takes the frames out of order.
+On the lossy single-flow target of the local bed it about doubled one
+flow's delivery, to about 2 Gbit/s in both directions; the worker that
+reads the flow from the TAP and writes the reverse direction to it then
+limits the flow. It advertises the
 optional `STRIPED_FLOWS` feature; it acts only where both peers advertise
 it, `balance_flows` is on, and the session has at least two data lanes.
 When a flow's transmit worker has kept refusing frames for its lane for
@@ -1315,7 +1347,8 @@ state, carrier, generation and totals followed by its transmit and receive
 lanes, and each peer's totals. Sessions and peers appear under their
 configured names; cookies and addresses do not appear. A daemon that has a
 PID file also writes the report to `<pid-file>.status`, replacing it whole
-each time and removing it on clean exit, and `unquic status <pid-file>`
+each time and removing it on clean exit before the PID file itself, so a
+missing PID file means the daemon has cleaned up, and `unquic status <pid-file>`
 sends the signal, waits up to three seconds for the new file and prints it.
 Formatting runs in the daemon's supervisory thread, outside the workers and
 signal handler. The benchmark script captures the worker lines before and
@@ -1445,7 +1478,7 @@ state are available through the library's `Control` API.
 | Throughput stays low with many lanes | Flow count, TAP queue placement, worker/receive distribution and CPU use; each frame stays on one lane |
 | The daemon uses more CPU than a light load of single frames seems to need | `queue_count` and `tx_lanes`. Every queue is a worker and every lane past the control lane spreads the sending over another worker, so the same frames are handled in more and smaller batches. On the relay bed four queues and four lanes cost two thirds more CPU than two and two at 0.5 Gbit/s each way of single frames, and four queues with two lanes a third more (BENCH.md). Across a real path `tx_lanes = 2` in place of 4 took 18% off at 0.5 Gbit/s each way of single frames and 12% at 1, and could not carry 2; for trains it took a quarter off at 1 and 2 Gbit/s each way. Size both for the usual load ([config-model.md](config-model.md)). `turn_hold_us` trades delay for larger batches: 1000 µs in place of the default 300 cost a third less CPU at 0.25–0.5 Gbit/s each way over four queues, for 0.8 ms more one-way delay. And check what feeds the TAP: frames that arrive as GSO trains (a local sender with segmentation offload, or traffic a card's GRO merged before forwarding it) cost about a third of what the same bytes cost as single frames, 35–36% of a core against 97–100% at 1 Gbit/s each way with two workers. The kernel merges forwarded TCP by default and forwarded UDP only with `rx-udp-gro-forwarding` on the card it arrives on; that switch was measured on the underlay side only (the row on receiving below) |
 | Both directions lose several percent in the same seconds, at any rate, and `tx_expired_sent_frames` jumps on both sides with few `repairs` | The path, before the daemon. Compare each side's `tx_outer_bytes` with the other side's `rx_outer_bytes`, then send plain UDP across the same path and echo every router that answers, from both ends, ten times a second. On one real path a gateway that stopped forwarding for 0.17 s at a time, on a half-hour schedule, produced exactly this: both senders' windows filled, and delivery resumed when the gateway did (BENCH.md) |
-| A transmit lane reports `path_mtu_state` 4 (failed) and `path_mtu_bytes` 0, and some flows lose a burst of frames | Each lane has its own source port and may take its own path. A lane whose path stops carrying baseline datagrams suspends its DATA until a baseline probe is answered. New frames of its flows then take the next data lane whose path has not failed, and return when the probe is answered; frames already on the failed lane are lost, and a few may arrive out of order at each move. Flows stop only while every data lane has failed, and striped flows (`stripe_flows`, experimental) keep their lanes. The session stays active meanwhile, because liveness is the connection's and its probes use the first lane |
+| A transmit lane reports `path_mtu_state` 4 (failed) and `path_mtu_bytes` 0, and some flows lose a burst of frames | Each lane has its own source port and may take its own path. A lane whose path stops carrying baseline datagrams suspends its DATA until a baseline probe is answered. New frames of its flows then take the next data lane whose path has not failed, and return when the probe is answered; frames already on the failed lane are lost, a few may arrive out of order at each move, and for about a second after a lane fails a frame can expire unsent on the next one while the path's window and rate recover from the black hole (in the kernel test the flow crosses with its first or second frame, and at most a few of the next fifty are lost). Flows stop only while every data lane has failed, and striped flows (`stripe_flows`) keep their lanes. The session stays active meanwhile, because liveness is the connection's and its probes use the first lane |
 | Losses and repairs climb with load though CPU is free | `receive_buffer_fallbacks` and `socket_overflow`. Without `CAP_NET_ADMIN` the receive sockets get only `net.core.rmem_max` (often about 416 KiB after doubling), and with UDP GRO each overflow drops a coalesced batch of up to 64 datagrams. On such a host TCP through the tunnel retransmitted about 1% of its segments under unlimited load (BENCH.md); give the daemon `CAP_NET_ADMIN` or raise `rmem_max` |
 | One direction stops near 2 Gbit/s with idle workers, no `socket_overflow`, and several TCP streams pass more | The receiving host's network card. Many cards hash UDP by the two addresses alone, and then every lane lands on one receive queue and one core however many source ports the sender uses. `ethtool -n DEV rx-flow-hash udp6` shows the hashed fields, as does `udp6_hash` on the report's device line where the daemon can see the card (`src,dst` is this case, and one number of `rx_queue_packets` then grows while the others stand), and `ethtool -N DEV rx-flow-hash udp6 sdfn` adds the ports. On one real path a single queue passed 2 Gbit/s cleanly and plain UDP lost a fifth or more above that (BENCH.md) |
 | Receiving costs two to three times the CPU it costs on the card's own host, with the daemon in a container, behind a macvlan child or behind a container that routes to it | `ethtool -k CARD` for `rx-udp-gro-forwarding`. The kernel coalesces received UDP for a socket only where it can see the socket; datagrams it forwards to another namespace stay single unless that switch is on for the card (with `gro` on). A VLAN device in the card's own namespace needs nothing. On the test bed a daemon behind a routing namespace and a macvlan pair spent 3,030 cycles a datagram in its socket read without the switch and 1,100 with it, the same as on the link itself (BENCH.md). If coalesced trains stay short because a fast core empties the card's queue after a few packets, the card's `gro_flush_timeout` and `napi_defer_hard_irqs` let a poll wait for more: on two real hosts they raised 4–14 datagrams a received message to 32–34 and halved the receive cost again, for under a millisecond more round trip on a quiet path |
@@ -1593,7 +1626,8 @@ fails with OutOfMemory before creating any.
 
 Real RA/DHCPv6 resolver networks, physical-NIC offload qualification and
 performance acceptance remain open. Linux 5.0 is qualified in an emulated
-machine without a network card: all 132 kernel tests pass there.
+machine whose only cards are two virtio cards joined back to back: all 133
+kernel tests pass there.
 
 ## License
 

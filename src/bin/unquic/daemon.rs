@@ -176,8 +176,11 @@ impl Drop for PidFile {
     fn drop(&mut self) {
         if fs::read_to_string(&self.0).is_ok_and(|text| text == format!("{}\n", std::process::id()))
         {
-            let _ = fs::remove_file(&self.0);
+            // FAILED(2026-11-27): removing the PID file first -> a watcher that saw it gone could
+            //   still find the status file, and a kernel test failed on that once under load.
+            //   Now: the PID file goes last, so its absence says the daemon has cleaned up.
             let _ = fs::remove_file(status_path(&self.0));
+            let _ = fs::remove_file(&self.0);
         }
     }
 }

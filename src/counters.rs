@@ -244,6 +244,12 @@ metrics! {
     /// lanes differ; zero with tap_errors nonzero means the frame failed
     /// this daemon's own checks before any syscall.
     tap_error_code: max,
+    /// Thousandths of its recent time a worker was not asleep, smoothed over
+    /// about 40 ms; the busiest worker's where sets are merged.
+    busy_permille: max,
+    /// Data lanes a session's new frames use just now (daemon.fold_lanes);
+    /// zero for a session that does not fold.
+    tx_open_lanes: max,
 }
 
 fn sum(a: u64, b: u64) -> u64 {

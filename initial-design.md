@@ -493,6 +493,46 @@ control: balanced lanes rotate over lanes 1 and up, and a frame whose hash
 or reader-local choice is lane 0 takes lane 1 + hash mod (lanes − 1)
 instead. The wire format is unchanged, and so is a peer with one lane.
 
+**Lane folding (November 27 amendment; `daemon.fold_lanes`, on by
+default).** Lanes beyond what a load needs cost CPU: every data lane is
+another worker's share of the sending, and the same frames leave in more and
+smaller batches. A session with two or more data lanes therefore uses only
+the first `k` of them. A new connection has them all, since it may begin
+under any load, and folds once it has been quiet. The lane chosen for a
+frame as above
+is its home; a frame whose home is not among the first `k` takes one of them
+by its flow's hash, mixed anew for each closed lane so the open ones share
+evenly. Lanes close from the last down, so changing `k` by one moves the
+flows of that one lane and no others. A moved flow's frames already queued
+on its old lane may arrive after newer ones on the new lane, once per move.
+
+The owner of the session's first data lane decides, each time it turns and
+at most every 10 ms; a worker with nothing to do turns about once a second,
+so an idle session folds later and loses nothing by it. Each worker
+publishes the share of its time it was not asleep, smoothed over about four
+such windows. The next lane opens when an open lane's owner was busy 0.7
+of its time, or when any worker reported an open lane behind: its owner
+still held more than 1 MiB unsent for 5 ms on end after its sends, refused
+a frame at admission, could not be handed one, or let one expire. The
+backlog covers what this end cannot see, a far end whose one receiving
+worker is full or a path that is. Expiry covers loss: one lane's repairs
+would have to do the work of all, and on a path with 1% loss one lane lost
+1.9% of the frames at 1 Gbit/s where three lost 0.5%. The same reports keep
+every lane open while all are.
+Lanes close after 500 quiet looks in a row (five seconds under load) in
+which nothing was reported behind, down to the number that would carry what
+the open lanes' owners did together at no more than 0.6 apiece, each owner
+counted once. The owners' other work is counted with it, which keeps what
+stays open from reopening the rest. If a lane does reopen within that wait
+after a close, the wait doubles, up to ten minutes, and stays doubled until
+a close holds for the whole of it, which halves it again. An end that is
+idle while its peer needs the lanes, or a load that sits at the edge, then
+does not open and close them for ever. A lane whose path has failed gives
+way to the next data lane, open or not, and a look sees open lanes only, so
+while any lane of the session has failed every lane stays open. Nothing
+changes on the wire and the peer is not involved; each end folds its own
+sending.
+
 The flow key includes one unfragmented IPv4, IPv6 or Ethernet encapsulation
 (IP protocol numbers 4, 41 and 143). Retain the outer key and add the inner
 addresses, protocol and available transport ports, plus inner MAC addresses
@@ -1203,7 +1243,9 @@ frames written from different CPUs. One worker per striped flow writes all
 of its frames.
 
 - **Negotiation.** Optional feature bit 2, `STRIPED_FLOWS`, under
-  `daemon.stripe_flows`, off by default until it meets its bar. A peer
+  `daemon.stripe_flows`, off by default: measured across the real path on
+  November 27 it missed its bar on order (a fifth to a half of a striped
+  flow's frames out of sequence; BENCH.md), so it stays an option. A peer
   without it receives no striped frames.
 - **Wire.** DATA flag bit 2 marks a piece of a striped frame. Like an
   offload frame's descriptor, its first 8 bytes are a stripe tag: a 16-bit

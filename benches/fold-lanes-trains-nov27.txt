@@ -1,0 +1,73 @@
+# Relay bed, 7.5 ms round trip, sixteen QinQ flows of 44-segment trains, four workers and four lanes a daemon (three data
+# lanes), 20 s points, arms rotating per round, November 27. off = daemon.fold_lanes false, on = the default.
+# arm round point  delivered each way | daemon CPU left right | frames missing | one-way delay median | 99th percentile
+# Under each set: the share of outer bytes each side sent on each wire lane during the point (lane 1 is the control lane).
+
+## No loss; 1, 1, 2, 2 and 5 Gbit/s each way in one session, three rounds
+off    r1 p0  0.99+ 0.99 G | CPU   46%   40% | miss 0.00% 0.02% | p50  4391  4325 us | p99   8061   6685 us
+off    r2 p0  0.99+ 0.99 G | CPU   45%   41% | miss 0.01% 0.01% | p50  4522  4522 us | p99   5702   6029 us
+off    r3 p0  0.99+ 0.99 G | CPU   47%   43% | miss 0.00% 0.00% | p50  4325  4588 us | p99   5374   5964 us
+on     r1 p0  0.99+ 0.99 G | CPU   41%   37% | miss 0.02% 0.01% | p50  4456  4456 us | p99   7471   6357 us
+on     r2 p0  0.99+ 0.99 G | CPU   41%   38% | miss 0.00% 0.01% | p50  4456  4325 us | p99   6423   5702 us
+on     r3 p0  0.99+ 0.99 G | CPU   40%   37% | miss 0.00% 0.00% | p50  4522  4653 us | p99   6291   6029 us
+off    r1 p1  0.99+ 0.99 G | CPU   48%   41% | miss 0.00% 0.00% | p50  4456  4325 us | p99   5439   5308 us
+off    r2 p1  0.98+ 0.98 G | CPU   45%   41% | miss 0.00% 0.00% | p50  4391  4850 us | p99   5243   6029 us
+off    r3 p1  0.98+ 0.98 G | CPU   46%   42% | miss 0.00% 0.00% | p50  4391  4784 us | p99   5046   5833 us
+on     r1 p1  0.98+ 0.98 G | CPU   48%   41% | miss 0.04% 0.00% | p50  5833  4522 us | p99  25690   9437 us
+on     r2 p1  0.98+ 0.98 G | CPU   35%   32% | miss 0.00% 0.00% | p50  4850  4325 us | p99   6160   4850 us
+on     r3 p1  0.98+ 0.98 G | CPU   40%   39% | miss 0.00% 0.00% | p50  4850  4391 us | p99   6029   5112 us
+off    r1 p2  1.97+ 1.97 G | CPU   89%   79% | miss 0.05% 0.00% | p50  4522  4325 us | p99   7012   5833 us
+off    r2 p2  1.96+ 1.96 G | CPU   86%   80% | miss 0.08% 0.00% | p50  4522  4719 us | p99   7864   6291 us
+off    r3 p2  1.95+ 1.95 G | CPU   86%   82% | miss 0.00% 0.00% | p50  4325  4522 us | p99   5177   5702 us
+on     r1 p2  1.96+ 1.96 G | CPU   75%   76% | miss 0.00% 0.00% | p50  4850  4653 us | p99  42467   7274 us
+on     r2 p2  1.97+ 1.97 G | CPU   70%   68% | miss 0.00% 0.00% | p50  4784  4522 us | p99   6029   5636 us
+on     r3 p2  1.97+ 1.97 G | CPU   74%   77% | miss 0.00% 0.00% | p50  4522  4522 us | p99  11010   5112 us
+off    r1 p3  1.97+ 1.97 G | CPU   87%   76% | miss 0.00% 0.00% | p50  4522  4391 us | p99   5636   5439 us
+off    r2 p3  1.97+ 1.96 G | CPU   88%   83% | miss 0.00% 0.00% | p50  4522  4522 us | p99   5964   6160 us
+off    r3 p3  1.95+ 1.95 G | CPU   93%   83% | miss 0.02% 0.00% | p50  4456  4456 us | p99   7209   5571 us
+on     r1 p3  1.96+ 1.96 G | CPU   74%   76% | miss 0.00% 0.00% | p50  4784  4588 us | p99   6291   6619 us
+on     r2 p3  1.95+ 1.95 G | CPU   69%   69% | miss 0.00% 0.00% | p50  4719  4391 us | p99   6029   5046 us
+on     r3 p3  1.97+ 1.97 G | CPU   74%   74% | miss 0.00% 0.00% | p50  4719  4391 us | p99   7406   4981 us
+off    r1 p4  4.89+ 4.90 G | CPU  211%  184% | miss 0.23% 0.05% | p50  4391  4456 us | p99  10617   6685 us
+off    r2 p4  4.87+ 4.79 G | CPU  205%  190% | miss 0.45% 2.24% | p50  4456  4456 us | p99  72352  34079 us
+off    r3 p4  4.92+ 4.91 G | CPU  207%  188% | miss 0.00% 0.15% | p50  4391  4522 us | p99  14942  34079 us
+on     r1 p4  4.91+ 4.90 G | CPU  207%  191% | miss 0.12% 0.08% | p50  4391  4456 us | p99   9306  18874 us
+on     r2 p4  4.93+ 4.93 G | CPU  209%  189% | miss 0.06% 0.17% | p50  4391  4456 us | p99   8651  11796 us
+on     r3 p4  4.88+ 4.74 G | CPU  202%  179% | miss 0.12% 2.99% | p50  4456  4391 us | p99  47710  33030 us
+
+on r1 p0 | left 1:0% 2:67% 3:18% 4:15% | right 1:0% 2:70% 3:15% 4:15%
+on r2 p0 | left 1:0% 2:46% 3:44% 4:10% | right 1:0% 2:55% 3:35% 4:10%
+on r3 p0 | left 1:0% 2:78% 3:10% 4:12% | right 1:0% 2:81% 3:9% 4:9%
+on r1 p1 | left 1:0% 2:60% 3:31% 4:9% | right 1:0% 2:76% 3:13% 4:11%
+on r2 p1 | left 1:0% 2:100% 3:0% 4:0% | right 1:0% 2:100% 3:0% 4:0%
+on r3 p1 | left 1:0% 2:100% 3:0% 4:0% | right 1:0% 2:83% 3:17% 4:0%
+on r1 p2 | left 1:0% 2:100% 3:0% 4:0% | right 1:0% 2:100% 3:0% 4:0%
+on r2 p2 | left 1:0% 2:100% 3:0% 4:0% | right 1:0% 2:100% 3:0% 4:0%
+on r3 p2 | left 1:0% 2:100% 3:0% 4:0% | right 1:0% 2:100% 3:0% 4:0%
+on r1 p3 | left 1:0% 2:100% 3:0% 4:0% | right 1:0% 2:100% 3:0% 4:0%
+on r2 p3 | left 1:0% 2:100% 3:0% 4:0% | right 1:0% 2:100% 3:0% 4:0%
+on r3 p3 | left 1:0% 2:100% 3:0% 4:0% | right 1:0% 2:100% 3:0% 4:0%
+on r1 p4 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:31% 3:37% 4:31%
+on r2 p4 | left 1:0% 2:32% 3:38% 4:30% | right 1:0% 2:31% 3:37% 4:31%
+on r3 p4 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:33% 3:35% 4:32%
+
+## 1% loss on the path; 1, 1 and 3 Gbit/s each way in one session, two rounds
+off    r1 p0  0.99+ 0.99 G | CPU   56%   52% | miss 0.00% 0.00% | p50  4719  4784 us | p99  15598  15335 us
+off    r2 p0  0.99+ 0.99 G | CPU   54%   49% | miss 0.00% 0.00% | p50  4522  5177 us | p99  14156  14811 us
+on     r1 p0  0.99+ 0.99 G | CPU   55%   51% | miss 0.01% 0.01% | p50  4850  4915 us | p99  14549  14418 us
+on     r2 p0  0.99+ 0.99 G | CPU   55%   51% | miss 0.00% 0.01% | p50  4850  4653 us | p99  26477  14287 us
+off    r1 p1  0.98+ 0.98 G | CPU   57%   51% | miss 0.00% 0.00% | p50  4850  5177 us | p99  14549  14680 us
+off    r2 p1  0.99+ 0.99 G | CPU   56%   49% | miss 0.00% 0.00% | p50  4719  5243 us | p99  14025  14549 us
+on     r1 p1  0.99+ 0.99 G | CPU   55%   50% | miss 0.00% 0.00% | p50  4915  5243 us | p99  14025  14549 us
+on     r2 p1  0.99+ 0.99 G | CPU   54%   43% | miss 0.00% 0.00% | p50  5046  4653 us | p99  14287  13369 us
+off    r1 p2  2.96+ 2.92 G | CPU  145%  126% | miss 0.05% 1.11% | p50  4719  4588 us | p99  19661 140509 us
+off    r2 p2  2.76+ 2.78 G | CPU  142%  134% | miss 6.62% 5.83% | p50  4850  5046 us | p99 163578 192938 us
+on     r1 p2  2.95+ 2.95 G | CPU  151%  140% | miss 0.04% 0.00% | p50  4719  4588 us | p99  34079  20709 us
+on     r2 p2  2.91+ 2.96 G | CPU  136%  133% | miss 1.36% 0.00% | p50  4456  4588 us | p99 126878  14156 us
+
+on r1 p0 | left 1:1% 2:37% 3:31% 4:31% | right 1:1% 2:37% 3:31% 4:31%
+on r2 p0 | left 1:1% 2:37% 3:31% 4:31% | right 1:1% 2:31% 3:31% 4:37%
+on r1 p1 | left 1:1% 2:31% 3:37% 4:31% | right 1:1% 2:31% 3:37% 4:31%
+on r2 p1 | left 1:1% 2:31% 3:37% 4:31% | right 1:1% 2:74% 3:17% 4:8%
+on r1 p2 | left 1:1% 2:31% 3:31% 4:37% | right 1:1% 2:31% 3:31% 4:37%
+on r2 p2 | left 1:1% 2:31% 3:31% 4:37% | right 1:1% 2:31% 3:32% 4:36%

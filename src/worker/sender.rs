@@ -235,6 +235,9 @@ pub(super) struct Lane {
     pub(super) history: History,
     pub(super) generation: u64,
     pub(super) unsent_bytes: usize,
+    // Since when the lane has held more unsent than a send leaves behind in
+    // passing (daemon.fold_lanes).
+    pub(super) behind: Option<Duration>,
     pub(super) rtt: Rtt,
     pub(super) largest_ack: u64,
     pub(super) scan: Option<OutstandingScan>,
@@ -271,6 +274,7 @@ impl Lane {
             history: History::new().map_err(io::Error::other)?,
             generation: 0,
             unsent_bytes: 0,
+            behind: None,
             rtt: Rtt::new(),
             largest_ack: 0,
             scan: None,

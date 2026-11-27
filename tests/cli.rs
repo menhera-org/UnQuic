@@ -45,6 +45,26 @@ impl Drop for ConfigFile {
     }
 }
 
+/// A daemon's stderr, kept in a file and printed when the test holding it
+/// fails: a daemon that exits by itself says why there.
+struct DaemonLog(PathBuf);
+impl DaemonLog {
+    fn new(name: &str) -> (Self, Stdio) {
+        let path = std::env::temp_dir().join(format!("unquic-{name}-{}.log", std::process::id()));
+        let file = fs::File::create(&path).unwrap();
+        (Self(path), file.into())
+    }
+}
+impl Drop for DaemonLog {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            let log = fs::read_to_string(&self.0).unwrap_or_default();
+            eprintln!("daemon log:\n{log}");
+        }
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 struct Running {
     child: Child,
     _file: ConfigFile,
@@ -600,12 +620,13 @@ fn reload_applies_a_changed_session_set_and_keeps_the_taps_that_stay() {
     let pid_path = std::env::temp_dir().join(format!("unquic-reload-{}.pid", std::process::id()));
     let base = config("uq-keep", 40700, 40701, "::1", "");
     let file = ConfigFile::new(&format!("{base}{}", session("uq-gone", 1)));
+    let (_log, stderr) = DaemonLog::new("reload");
     let started = Command::new(binary())
         .arg("start")
         .arg(&file.0)
         .arg(&pid_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .status()
         .unwrap();
     assert!(started.success());

@@ -61,6 +61,11 @@ pub(crate) struct AddressRequest {
     pub address: SocketAddrV6,
 }
 
+/// `Shared::open_lanes` for a session that never folds its lanes, and for one
+/// that uses them all until it has first been quiet.
+pub(crate) const LANES_ALWAYS: u8 = u8::MAX;
+pub(crate) const LANES_UNFOLDED: u8 = u8::MAX - 1;
+
 pub(crate) struct Shared {
     pub config: Validated,
     // How many stores' worth of frame slots a session's owners share.
@@ -98,6 +103,15 @@ pub(crate) struct Shared {
     // Milliseconds of worker time before which no worker sends another
     // padded path-MTU probe.
     pub probe_next: AtomicU64,
+    // Per session, how many of its data lanes new frames use: LANES_ALWAYS
+    // with daemon.fold_lanes off, LANES_UNFOLDED for all of them until the
+    // session has been quiet. The owner of the first data lane writes it and
+    // TAP readers route by it.
+    pub open_lanes: Vec<AtomicU8>,
+    // Per session, set by any worker that saw one of those lanes fall behind.
+    pub lane_pressed: Vec<AtomicBool>,
+    // Per worker, the smoothed thousandths of its time it was not asleep.
+    pub busy: Vec<AtomicU64>,
 }
 
 impl Control {
@@ -420,6 +434,7 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
     let peers = config.config().peers.len();
     let endpoints = config.config().endpoints.len();
     let balance_flows = config.config().daemon.balance_flows;
+    let fold_lanes = config.config().daemon.fold_lanes;
     let striping = balance_flows && config.config().daemon.stripe_flows;
     if peers > (u32::MAX as usize >> 7) || adopted.len() > sessions {
         return Err(io::ErrorKind::InvalidInput.into());
@@ -497,6 +512,17 @@ pub fn run_adopting(config: Config, control: Control, adopted: Vec<Option<Tap>>)
         rotation: (0..sessions).map(|_| AtomicU8::new(0)).collect(),
         failed_lanes: (0..sessions).map(|_| AtomicU64::new(0)).collect(),
         probe_next: AtomicU64::new(0),
+        open_lanes: (0..sessions)
+            .map(|_| {
+                AtomicU8::new(if fold_lanes {
+                    LANES_UNFOLDED
+                } else {
+                    LANES_ALWAYS
+                })
+            })
+            .collect(),
+        lane_pressed: (0..sessions).map(|_| AtomicBool::new(false)).collect(),
+        busy: (0..count).map(|_| AtomicU64::new(0)).collect(),
     });
     let mut workers = (0..count)
         .map(|id| Worker::new(id, Arc::clone(&shared), control.clone()))

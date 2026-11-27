@@ -393,7 +393,7 @@ use crate::{
     loss::WIDE_FRAME_LEN,
     pacing, pack, pmtu,
     reassembly::{self, Admission},
-    runtime::{AddressRequest, BUFFERS, Control, LANES, Shared},
+    runtime::{AddressRequest, BUFFERS, Control, LANES, LANES_ALWAYS, LANES_UNFOLDED, Shared},
     socket::{BATCH_SIZE, ReceiveDatagram, ReceiveSocket, SendDatagram, TransmitSocket},
     spsc::{Consumer, Producer},
     stripe,
@@ -840,6 +840,128 @@ fn open_lane(failed: u64, lane: usize, data: std::ops::Range<usize>) -> usize {
         .map(|step| data.start + (lane - data.start + step) % data.len())
         .find(|other| failed >> (other & 63) & 1 == 0)
         .unwrap_or(lane)
+}
+
+/// How often a worker publishes how busy it was, and the owner of a session's
+/// first data lane reconsiders how many of them are open (daemon.fold_lanes).
+const FOLD_WINDOW: Duration = Duration::from_millis(10);
+/// A lane opens when the owner of an open one was awake this many
+/// thousandths of its time, smoothed over a few windows.
+const UNFOLD_BUSY: u64 = 700;
+/// Lanes close down to as many as would carry what the open lanes' owners
+/// did together at no more than this many thousandths apiece: under
+/// UNFOLD_BUSY, and the owners' other work is counted with it, so that what
+/// is left open does not at once reopen the rest.
+const FOLD_BUSY: u64 = 600;
+/// Quiet windows before lanes close: five seconds. A lane that has to
+/// reopen within that wait after a close doubles the next wait, up to
+/// FOLD_QUIET_MOST windows (ten minutes), and a close that holds for a whole
+/// wait halves it again.
+const FOLD_QUIET: u32 = 500;
+const FOLD_QUIET_MOST: u32 = 64_000;
+/// A lane that holds more fresh bytes than this after its sends, half of
+/// what it may hold at all, for this long without a break counts as behind.
+// FAILED(2026-11-27): 128 KiB as that mark -> one lane carrying 2 Gbit/s of trains keeps about
+//   a millisecond of them queued for pacing, so a lane that was keeping up opened the rest.
+//   Now: half the lane's limit, which only a lane that is losing ground reaches.
+const FOLD_PRESS_BYTES: usize = FRESH_BYTES / 2;
+const FOLD_PRESS_TIME: Duration = Duration::from_millis(5);
+/// The awake share, in thousandths, at which a worker takes up the busy
+/// hold, and the lower one at which it goes back to the quiet hold.
+const BUSY_HOLD_ON: u64 = 50;
+const BUSY_HOLD_OFF: u64 = 20;
+
+/// The lane a new frame takes while only the first `open` of the data lanes
+/// are in use: `home`, the lane chosen for it, when that is one of them, and
+/// otherwise one of them by the flow's hash. Lanes close from the last down,
+/// and a closing lane's flows spread over those still open, so opening or
+/// closing one lane moves that lane's flows and no others.
+fn fold_lane(
+    home: usize,
+    data: std::ops::Range<usize>,
+    open: usize,
+    hash: impl FnOnce() -> u64,
+) -> usize {
+    if open == 0 || open >= data.len() || !data.contains(&home) || home - data.start < open {
+        return home;
+    }
+    let hash = hash();
+    let mut lane = home - data.start;
+    for closing in (open..data.len()).rev() {
+        if lane == closing {
+            // Mixed anew for each lane, or a flow's remainders by 4 and by 2
+            // would agree and one lane would take more than its share.
+            let mixed = (hash ^ (closing as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                .wrapping_mul(0xff51_afd7_ed55_8ccd);
+            lane = ((mixed >> 32) % closing as u64) as usize;
+        }
+    }
+    data.start + lane
+}
+
+/// What the owner of a session's first data lane remembers between looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fold {
+    /// Quiet windows counted toward closing a lane, and how many one needs.
+    quiet: u32,
+    need: u32,
+    /// Windows since a lane last closed.
+    closed: u32,
+}
+
+impl Fold {
+    const NEW: Self = Self {
+        quiet: 0,
+        need: FOLD_QUIET,
+        closed: u32::MAX,
+    };
+}
+
+/// One look at a session by the owner of its first data lane: how many of
+/// its `data` lanes stay open. `busy` holds the open lanes' owners' busy
+/// thousandths, and `pressed` says a lane fell behind since the last look.
+/// One lane opens at a time, at once. Lanes close together, down to the
+/// number that fits, after `need` quiet looks in a row. A lane that reopens
+/// within that wait after a close doubles the wait, so a far end that needs
+/// the lanes while this end is idle, or a load that sits at the edge, does
+/// not make them open and close for ever.
+fn fold_step(
+    open: u8,
+    data: u8,
+    busy: impl Iterator<Item = u64> + Clone,
+    pressed: bool,
+    mut state: Fold,
+) -> (u8, Fold) {
+    state.closed = state.closed.saturating_add(1);
+    if state.closed == state.need {
+        // The last close held for a whole wait.
+        state.need = (state.need / 2).max(FOLD_QUIET);
+    }
+    let busiest = busy.clone().max().unwrap_or(0);
+    if (pressed || busiest >= UNFOLD_BUSY) && open < data {
+        if state.closed < state.need {
+            state.need = state.need.saturating_mul(2).min(FOLD_QUIET_MOST);
+            // FAILED(2026-11-27): leaving the count running here -> the wait halved again when
+            //   it reached the doubled figure, so an edge load closed and reopened a lane every
+            //   ten seconds for ever, and one burst that opened seven lanes doubled the wait
+            //   seven times. Now: that close has failed, and the wait stays until one holds.
+            state.closed = u32::MAX;
+        }
+        state.quiet = 0;
+        return (open + 1, state);
+    }
+    let fit = busy.sum::<u64>().div_ceil(FOLD_BUSY).max(1);
+    if pressed || open > data || fit >= u64::from(open) {
+        state.quiet = 0;
+        return (open, state);
+    }
+    state.quiet += 1;
+    if state.quiet < state.need {
+        return (open, state);
+    }
+    state.quiet = 0;
+    state.closed = 0;
+    (fit as u8, state)
 }
 
 /// Whether tap_lane spreads this frame across all lanes by its flow hash.
@@ -1299,9 +1421,19 @@ pub(crate) struct Worker {
     held: Vec<(usize, usize)>,
     hold: Duration,
     // Input bytes of the turn in progress, and how long a turn that took in
-    // little waits before the next poll (daemon.turn_hold_us).
+    // little waits before the next poll: quiet_hold (daemon.turn_hold_us)
+    // or, while the worker is busy, busy_hold (daemon.busy_hold_us).
     moved: usize,
     turn_hold: Duration,
+    quiet_hold: Duration,
+    busy_hold: Duration,
+    // Lane folding (daemon.fold_lanes): when this worker last went to rest,
+    // how long it rested in the window that began at busy_since, and per
+    // session its quiet windows so far and how many a lane needs to close.
+    rested: Option<Duration>,
+    slept: Duration,
+    busy_since: Duration,
+    fold: Vec<Fold>,
     notifications: u64,
     // Workers pushed a returned box this turn; see Wake::notify_return.
     return_notifications: u64,
@@ -1700,6 +1832,16 @@ impl Worker {
             hold: Duration::from_micros(config.daemon.tx_hold_us.into()),
             moved: 0,
             turn_hold: Duration::from_micros(config.daemon.turn_hold_us.into()),
+            quiet_hold: Duration::from_micros(config.daemon.turn_hold_us.into()),
+            // Never shorter than the quiet hold, and off where that is off.
+            busy_hold: Duration::from_micros(match config.daemon.turn_hold_us {
+                0 => 0,
+                quiet => config.daemon.busy_hold_us.max(quiet).into(),
+            }),
+            rested: None,
+            slept: Duration::ZERO,
+            busy_since: Duration::ZERO,
+            fold: vec![Fold::NEW; config.sessions.len()],
             notifications: 0,
             return_notifications: 0,
             counters,
@@ -1759,6 +1901,9 @@ impl Worker {
         let mut publish_turns = 0_u8;
         while !self.control.quitting() {
             let now = monotonic_now()?;
+            // An interrupted wait comes straight back here.
+            self.woke(now);
+            self.fold_tick(now);
             let mut more = phase!(self, 0, self.drain_queues(now))?;
             if now >= self.setup_due {
                 phase!(self, 1, self.setup(now))?;
@@ -1775,6 +1920,7 @@ impl Worker {
             more |= phase!(self, 8, self.drain_packets(now))?;
             phase!(self, 9, self.drain_tap_inputs(now))?;
             more |= phase!(self, 10, self.flush_frames(now))?;
+            self.press_backlogs(now);
             phase!(self, 11, self.flush_returns());
             more |= phase!(
                 self,
@@ -1832,6 +1978,10 @@ impl Worker {
             //   wakes; fewer, larger turns cost up to 30% less CPU. Rejected: holding every turn
             //   (a backlogged worker then loses capacity); holding an idle worker (pure delay).
             let moved = std::mem::take(&mut self.moved);
+            if block {
+                // From here the worker rests until its wait returns.
+                self.rested = Some(monotonic_now()?);
+            }
             if block && let Some(until) = hold_until(moved, self.turn_hold, now, deadline) {
                 phase!(self, 22, sleep_until(until));
             }
@@ -1855,6 +2005,7 @@ impl Worker {
             };
             immediate = false;
             let now = monotonic_now()?;
+            self.woke(now);
             #[cfg(feature = "trace")]
             if block && now.saturating_sub(blocked) >= Duration::from_millis(1) {
                 trace_event!(
@@ -3329,6 +3480,130 @@ impl Worker {
         Ok(false)
     }
 
+    /// Counts the rest that ended at `now` toward the window's sleep.
+    fn woke(&mut self, now: Duration) {
+        if let Some(rested) = self.rested.take() {
+            self.slept = self.slept.saturating_add(now.saturating_sub(rested));
+        }
+    }
+
+    /// Once a FOLD_WINDOW: publishes how busy this worker was, and for each
+    /// session whose first data lane it owns opens or closes a lane.
+    fn fold_tick(&mut self, now: Duration) {
+        let elapsed = now.saturating_sub(self.busy_since);
+        if elapsed < FOLD_WINDOW {
+            return;
+        }
+        let Some(mine) = self.shared.busy.get(self.id) else {
+            return;
+        };
+        let asleep = std::mem::take(&mut self.slept).min(elapsed);
+        let awake = 1000 - (asleep.as_nanos() * 1000 / elapsed.as_nanos().max(1)) as u64;
+        self.busy_since = now;
+        // Smoothed over about four windows: one busy window opens no lane.
+        // After a long rest the old value says nothing, so the new one stands.
+        let busy = if elapsed >= 4 * FOLD_WINDOW {
+            awake
+        } else {
+            (3 * mine.load(Ordering::Relaxed) + awake) / 4
+        };
+        mine.store(busy, Ordering::Relaxed);
+        self.counters.busy_permille = busy;
+        // DECISION(2026-11-27): a worker awake BUSY_HOLD_ON of the time holds its small turns for
+        //   busy_hold, and goes back to the quiet hold below BUSY_HOLD_OFF. Why: 1000 us in
+        //   place of 300 costs a third less CPU at 0.25-0.5 Gbit/s each way and loses no more
+        //   frames on a lossy path, for 0.7 ms more delay; a quiet tunnel has no CPU to save and
+        //   a ping across it shows the hold. Rejected: 1000 at every load (that delay on every
+        //   quiet tunnel); 300 at every load (the CPU is the user's priority).
+        let mark = if self.turn_hold > self.quiet_hold {
+            BUSY_HOLD_OFF
+        } else {
+            BUSY_HOLD_ON
+        };
+        self.turn_hold = if busy >= mark {
+            self.busy_hold
+        } else {
+            self.quiet_hold
+        };
+        let workers = self.shared.workers();
+        let control = self.shared.config.config().daemon.control_lane;
+        for session in 0..self.sessions.len() {
+            let lanes = self.sessions[session].tx.len();
+            let first = first_data_lane(control, lanes);
+            let data = lanes - first;
+            let (Some(open), Some(pressed), Some(state)) = (
+                self.shared.open_lanes.get(session),
+                self.shared.lane_pressed.get(session),
+                self.fold.get_mut(session),
+            ) else {
+                continue;
+            };
+            let stored = open.load(Ordering::Relaxed);
+            if data < 2 || first % workers != self.id || stored == LANES_ALWAYS {
+                continue;
+            }
+            // A session that has not folded yet has every data lane open.
+            let data = data.min(usize::from(LANES_UNFOLDED) - 1) as u8;
+            // A failed lane's flows use the next lane whose path answers, open
+            // or not, and a look sees open lanes only: every lane stays open
+            // until all of them answer again.
+            let failed = self
+                .shared
+                .failed_lanes
+                .get(session)
+                .map_or(0, |mask| mask.load(Ordering::Relaxed));
+            if failed != 0 {
+                if stored != LANES_UNFOLDED {
+                    open.store(LANES_UNFOLDED, Ordering::Relaxed);
+                }
+                *state = Fold::NEW;
+                self.sessions[session].totals.tx_open_lanes = u64::from(data);
+                continue;
+            }
+            let now_open = stored.min(data);
+            let pressed = pressed.swap(false, Ordering::Relaxed);
+            // Each owner once: with more lanes than workers they repeat.
+            let busy = (0..usize::from(now_open).min(workers)).map(|lane| {
+                self.shared
+                    .busy
+                    .get((first + lane) % workers)
+                    .map_or(0, |busy| busy.load(Ordering::Relaxed))
+            });
+            let (next, next_state) = fold_step(now_open, data, busy, pressed, *state);
+            *state = next_state;
+            if next != stored {
+                open.store(next, Ordering::Relaxed);
+            }
+            self.sessions[session].totals.tx_open_lanes = u64::from(next);
+        }
+    }
+
+    /// Says that one of a session's open lanes is behind: its owner still
+    /// holds frames after sending, refused one, could not be handed one, or
+    /// let one expire.
+    // FAILED(2026-11-27): folding by CPU and backlog alone -> with 1% loss at 1 Gbit/s one lane
+    //   lost 1.9% of the frames where three lost 0.5%, because its repairs were three lanes'
+    //   worth. Now: a frame that expires on an open lane opens the next, and with every lane
+    //   open it keeps them open.
+    fn press_lane(&self, session: usize, lane: usize) {
+        let lanes = self.sessions.get(session).map_or(0, |local| local.tx.len());
+        let first = first_data_lane(self.shared.config.config().daemon.control_lane, lanes);
+        let open = self
+            .shared
+            .open_lanes
+            .get(session)
+            .map_or(LANES_ALWAYS, |open| open.load(Ordering::Relaxed));
+        // A closed lane still sending what it held says nothing of the open
+        // ones. With every lane open the word still counts: none closes then.
+        if open != LANES_ALWAYS
+            && lane >= first
+            && lane - first < usize::from(open)
+            && let Some(pressed) = self.shared.lane_pressed.get(session)
+        {
+            pressed.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Chooses a TAP read's transmit lane and, for a striped flow, its stripe
     /// number and first sequence; `frames` is how many frames the read holds.
     fn route(
@@ -3350,11 +3625,14 @@ impl Worker {
             .get(session)
             .filter(|_| striped && lanes - first > 1);
         let backlog = self.shared.backlog.get(session);
+        // The flow's hash, where choosing the lane already took it.
+        let mut known = None;
         let lane = if let Some(cursor) = self.shared.flow_cursors.get(session)
             && !self.shared.flows.is_empty()
             && strict_lane(frame, self.id, workers, queues, lanes)
         {
             let hash = pack::flow_hash(frame);
+            known = Some(hash);
             balanced_lane(
                 &self.shared.flows,
                 || next_lane(cursor, first..lanes, |lane| lane % workers == self.id),
@@ -3379,8 +3657,16 @@ impl Worker {
             .failed_lanes
             .get(session)
             .map_or(0, |mask| mask.load(Ordering::Relaxed));
+        // How many data lanes the session uses just now (daemon.fold_lanes).
+        let open = self
+            .shared
+            .open_lanes
+            .get(session)
+            .map_or(usize::MAX, |open| usize::from(open.load(Ordering::Relaxed)));
+        let hash = || known.unwrap_or_else(|| pack::flow_hash(frame));
         if lane & STRIPED == 0 {
-            let lane = data_lane(lane, first, lanes, || pack::flow_hash(frame));
+            let lane = data_lane(lane, first, lanes, hash);
+            let lane = fold_lane(lane, first..lanes, open, hash);
             return (open_lane(failed, lane, first..lanes), None);
         }
         let number = lane & !STRIPED;
@@ -3395,6 +3681,7 @@ impl Worker {
             None => {
                 let hash = pack::flow_hash(frame);
                 let lane = data_lane(hash as usize % lanes, first, lanes, || hash);
+                let lane = fold_lane(lane, first..lanes, open, || hash);
                 (open_lane(failed, lane, first..lanes), None)
             }
         }
@@ -3402,11 +3689,13 @@ impl Worker {
 
     fn dispatch_frame(&mut self, buffer: Box<Buffer>, now: Duration) -> io::Result<()> {
         let session = buffer.session;
-        let owner = buffer.lane % self.shared.workers();
+        let lane = buffer.lane;
+        let owner = lane % self.shared.workers();
         if owner == self.id {
             self.input_frame(buffer, now)?;
         } else if let Err(Event::Frame(buffer)) = self.push(owner, Event::Frame(buffer)) {
             self.queue_drop(session, true, false);
+            self.press_lane(session, lane);
             self.release(buffer);
         }
         Ok(())
@@ -3414,8 +3703,34 @@ impl Worker {
 
     /// Records for TAP readers that this lane's owner refused a frame.
     fn mark_refusal(&self, session: usize, lane: usize, now: Duration) {
+        self.press_lane(session, lane);
         if let Some(mark) = self.shared.backlog.get(session).and_then(|m| m.get(lane)) {
             mark_refusal(mark, now.as_millis() as u64);
+        }
+    }
+
+    /// After the turn's sends: a lane that has held more than
+    /// FOLD_PRESS_BYTES unsent for FOLD_PRESS_TIME on end is behind, whatever
+    /// holds it back. A burst that pacing lets out over the next turns is not.
+    // FAILED(2026-11-27): pressing on any turn that left 128 KiB unsent -> two trains read in
+    //   one turn and paced out over the next looked like a lane behind, and a session carrying
+    //   1 Gbit/s of trains at a tenth of a core opened every lane. Now: only a backlog that
+    //   lasts FOLD_PRESS_TIME counts.
+    fn press_backlogs(&mut self, now: Duration) {
+        if !self.sender_enabled() {
+            return;
+        }
+        for index in 0..self.sender.lanes.len() {
+            let lane = &mut self.sender.lanes[index];
+            if lane.unsent_bytes <= FOLD_PRESS_BYTES {
+                lane.behind = None;
+                continue;
+            }
+            let since = *lane.behind.get_or_insert(now);
+            let (session, wire) = (lane.session, usize::from(lane.lane));
+            if now.saturating_sub(since) >= FOLD_PRESS_TIME && wire != 0 {
+                self.press_lane(session, wire - 1);
+            }
         }
     }
 
@@ -4284,6 +4599,10 @@ impl Worker {
             if !self.frame_expired(index, now) {
                 return Err(io::Error::other("early transmit expiry"));
             }
+            // A frame that ran out of time on an open lane says the lanes in
+            // use do not carry the session, as on a lossy path, where one
+            // lane's repairs would have to do for all of them.
+            self.press_lane(session, lane);
             let mut batch = self
                 .sessions
                 .get_mut(session)
@@ -5986,6 +6305,16 @@ impl Worker {
                 local.path = path;
                 let config = self.shared.config.config();
                 let cookie = config.sessions[session].cookie;
+                // A new connection may begin under any load, so it has every
+                // lane until it has been quiet (daemon.fold_lanes).
+                let first = first_data_lane(config.daemon.control_lane, local.tx.len());
+                if first % self.shared.workers() == self.id
+                    && let Some(open) = self.shared.open_lanes.get(session)
+                    && open.load(Ordering::Relaxed) != LANES_ALWAYS
+                {
+                    open.store(LANES_UNFOLDED, Ordering::Relaxed);
+                    self.fold[session] = Fold::NEW;
+                }
                 for (index, lane) in local.tx.iter_mut().enumerate() {
                     *lane = command
                         .connection
@@ -8365,6 +8694,293 @@ mod tests {
     }
 
     #[test]
+    fn a_light_session_folds_onto_its_first_data_lane_and_opens_more_under_load() {
+        // Every lane open, a control lane or a lone data lane: nothing moves.
+        for home in 1..6 {
+            assert_eq!(fold_lane(home, 1..6, 5, || unreachable!()), home);
+            assert_eq!(fold_lane(home, 1..6, 255, || unreachable!()), home);
+        }
+        assert_eq!(fold_lane(0, 1..6, 1, || unreachable!()), 0);
+        assert_eq!(fold_lane(0, 0..1, 1, || unreachable!()), 0);
+        // A flow on an open lane stays; the others land on open lanes, evenly.
+        for open in 1..5 {
+            let mut landed = [0_u32; 6];
+            for hash in 0..6000_u64 {
+                for home in 1..6 {
+                    let lane = fold_lane(home, 1..6, open, || hash);
+                    assert!((1..1 + open).contains(&lane), "{home} {open} {hash}");
+                    if home - 1 < open {
+                        assert_eq!(lane, home);
+                    }
+                    landed[lane] += 1;
+                    // Opening one more lane moves only the flows that lane takes.
+                    let wider = fold_lane(home, 1..6, open + 1, || hash);
+                    assert!(wider == lane || wider == open + 1, "{home} {open} {hash}");
+                }
+            }
+            let (least, most) = (1..1 + open).fold((u32::MAX, 0), |(least, most), lane| {
+                (least.min(landed[lane]), most.max(landed[lane]))
+            });
+            assert!(most - least <= most / 20, "{open}: {landed:?}");
+        }
+
+        let quiet = Fold::NEW;
+        let busy = |values: &'static [u64]| values.iter().copied();
+        // A busy owner or a lane that fell behind opens the next lane at once.
+        assert_eq!(fold_step(1, 3, busy(&[UNFOLD_BUSY]), false, quiet).0, 2);
+        assert_eq!(fold_step(1, 3, busy(&[0]), true, quiet).0, 2);
+        assert_eq!(fold_step(3, 3, busy(&[999, 999, 999]), true, quiet).0, 3);
+        assert_eq!(fold_step(1, 3, busy(&[UNFOLD_BUSY - 1]), false, quiet).0, 1);
+        // Lanes close only after FOLD_QUIET quiet looks in a row, and down to
+        // as many as would carry what the open ones carry now.
+        let mut state = quiet;
+        let mut open = 3;
+        for look in 1..=2 * FOLD_QUIET {
+            (open, state) = fold_step(open, 3, busy(&[400, 300, 300]), false, state);
+            assert_eq!(open, if look < FOLD_QUIET { 3 } else { 2 }, "{look}");
+        }
+        // What the three carried does not fit one, so the second stays open.
+        assert_eq!((open, state.quiet), (2, 0));
+        // A light session closes all but one together.
+        let mut state = quiet;
+        let mut open = 3;
+        for _ in 0..FOLD_QUIET {
+            (open, state) = fold_step(open, 3, busy(&[100, 100, 100]), false, state);
+        }
+        assert_eq!(open, 1);
+        // A busy look or a pressed one starts the count again.
+        let counted = fold_step(2, 3, busy(&[100, 100]), false, quiet).1;
+        assert_eq!(counted.quiet, 1);
+        assert_eq!(
+            fold_step(2, 3, busy(&[400, 300]), false, counted).1.quiet,
+            0
+        );
+        assert_eq!(fold_step(3, 3, busy(&[0, 0, 0]), true, counted).1.quiet, 0);
+        // A lane that opens again soon after a close, pressed or by this
+        // end's own load, doubles the wait, up to its ceiling.
+        let mut state = quiet;
+        let mut open = 2;
+        for _ in 0..FOLD_QUIET {
+            (open, state) = fold_step(open, 2, busy(&[0, 0]), false, state);
+        }
+        assert_eq!((open, state.need), (1, FOLD_QUIET));
+        let (open, state) = fold_step(open, 2, busy(&[0]), true, state);
+        assert_eq!((open, state.need), (2, 2 * FOLD_QUIET));
+        let closed = Fold { closed: 0, ..quiet };
+        let (_, loaded) = fold_step(1, 2, busy(&[UNFOLD_BUSY]), false, closed);
+        assert_eq!(loaded.need, 2 * FOLD_QUIET);
+        let fresh = fold_step(1, 2, busy(&[UNFOLD_BUSY]), false, quiet).1;
+        assert_eq!(fresh.need, FOLD_QUIET, "nothing had closed");
+        let most = Fold {
+            need: FOLD_QUIET_MOST,
+            ..closed
+        };
+        assert_eq!(
+            fold_step(1, 2, busy(&[0]), true, most).1.need,
+            FOLD_QUIET_MOST
+        );
+        // A close that holds for its whole wait halves the wait again.
+        let mut state = Fold {
+            need: 4 * FOLD_QUIET,
+            ..closed
+        };
+        for _ in 0..4 * FOLD_QUIET {
+            (_, state) = fold_step(1, 2, busy(&[0]), false, state);
+        }
+        assert_eq!(state.need, 2 * FOLD_QUIET);
+        // One that did not hold keeps the doubled wait: two lanes opened by
+        // one burst double it once, and it does not halve at the doubled
+        // count.
+        let (open, state) = fold_step(1, 3, busy(&[0]), true, closed);
+        let (mut open, mut state) = fold_step(open, 3, busy(&[0, 0]), true, state);
+        assert_eq!((open, state.need), (3, 2 * FOLD_QUIET));
+        for look in 1..=2 * FOLD_QUIET {
+            (open, state) = fold_step(open, 3, busy(&[0, 0, 0]), false, state);
+            assert_eq!(open, if look < 2 * FOLD_QUIET { 3 } else { 1 }, "{look}");
+        }
+        assert_eq!(state.need, 2 * FOLD_QUIET);
+
+        // TAP readers route by the count, and failed lanes still give way.
+        let (shared, [worker, _]) = test_workers_with(3, true);
+        let frame = crate::tap::test_common::tcp::frame(false, 1, 1, 0x10, &[], &[7; 100]);
+        // Another source port: another flow, which takes the next lane.
+        let mut other = frame.clone();
+        other[35] ^= 1;
+        let ms = Duration::from_millis;
+        assert_eq!(worker.route(0, false, &frame, 1, ms(0)).0, 1);
+        assert_eq!(worker.route(0, false, &other, 1, ms(0)).0, 2);
+        shared.open_lanes[0].store(1, Ordering::Relaxed);
+        assert_eq!(worker.route(0, false, &frame, 1, ms(1)).0, 1);
+        assert_eq!(worker.route(0, false, &other, 1, ms(1)).0, 1);
+        shared.failed_lanes[0].store(0b10, Ordering::Relaxed);
+        assert_eq!(worker.route(0, false, &other, 1, ms(2)).0, 2);
+        shared.failed_lanes[0].store(0, Ordering::Relaxed);
+        shared.open_lanes[0].store(2, Ordering::Relaxed);
+        assert_eq!(worker.route(0, false, &other, 1, ms(3)).0, 2);
+
+        // A worker says an open lane is behind, also with every lane open,
+        // where it keeps them open. A closed lane's leftovers, the control
+        // lane and a session that never folds say nothing.
+        let pressed = |session: usize| shared.lane_pressed[session].swap(false, Ordering::Relaxed);
+        worker.press_lane(0, 2);
+        assert!(pressed(0));
+        shared.open_lanes[0].store(LANES_UNFOLDED, Ordering::Relaxed);
+        worker.press_lane(0, 2);
+        assert!(pressed(0));
+        shared.open_lanes[0].store(1, Ordering::Relaxed);
+        worker.press_lane(0, 2);
+        worker.press_lane(0, 0);
+        worker.press_lane(1, 1);
+        assert!(!pressed(0) && !pressed(1));
+        worker.press_lane(0, 1);
+        assert!(pressed(0));
+    }
+
+    #[test]
+    fn a_busy_worker_holds_small_turns_longer_until_it_is_quiet_again() {
+        let (_shared, [mut zero, _one]) = test_workers_with(3, true);
+        let (ms, us) = (Duration::from_millis, Duration::from_micros);
+        assert_eq!(
+            (zero.turn_hold, zero.quiet_hold, zero.busy_hold),
+            (us(300), us(300), us(1000))
+        );
+        // A window that rests `rest` of its ten milliseconds, ending at `at`.
+        let window = |worker: &mut Worker, at: u64, rest: u64| {
+            worker.rested = Some(ms(at - rest));
+            worker.woke(ms(at));
+            worker.fold_tick(ms(at));
+            worker.turn_hold
+        };
+        // A long rest leaves the worker quiet.
+        zero.fold_tick(ms(100));
+        assert_eq!(window(&mut zero, 150, 50), us(300));
+        // Awake a tenth of each window, its smoothed share passes BUSY_HOLD_ON
+        // at the third: 25, 43, 57.
+        assert_eq!(window(&mut zero, 160, 9), us(300));
+        assert_eq!(window(&mut zero, 170, 9), us(300));
+        assert_eq!(window(&mut zero, 180, 9), us(1000));
+        // It keeps the busy hold down to BUSY_HOLD_OFF: 42, 31, 23, then 17.
+        for at in [190, 200, 210] {
+            assert_eq!(window(&mut zero, at, 10), us(1000));
+        }
+        assert_eq!(window(&mut zero, 220, 10), us(300));
+        // With the busy hold no longer than the quiet one nothing changes.
+        zero.busy_hold = zero.quiet_hold;
+        zero.rested = None;
+        zero.fold_tick(ms(230));
+        zero.fold_tick(ms(240));
+        assert_eq!(zero.turn_hold, us(300));
+    }
+
+    #[test]
+    fn the_first_data_lanes_owner_counts_rest_and_opens_and_closes_lanes() {
+        let (shared, [mut zero, mut one]) = test_workers_with(3, true);
+        let ms = Duration::from_millis;
+        let open = || shared.open_lanes[0].load(Ordering::Relaxed);
+        let busy = |worker: usize| shared.busy[worker].load(Ordering::Relaxed);
+        // A first look starts each worker's window. A session that has not
+        // folded yet has both its data lanes open, and its owner says so.
+        shared.open_lanes[0].store(LANES_UNFOLDED, Ordering::Relaxed);
+        for worker in [&mut zero, &mut one] {
+            worker.fold_tick(ms(100));
+        }
+        assert_eq!(open(), 2);
+        // Then fold session 0.
+        shared.open_lanes[0].store(1, Ordering::Relaxed);
+        shared.busy[0].store(0, Ordering::Relaxed);
+        shared.busy[1].store(0, Ordering::Relaxed);
+        // A worker that rested 5 ms of a 20 ms window was 750 busy, which
+        // counts a quarter against what it reported before.
+        for worker in [&mut zero, &mut one] {
+            worker.rested = Some(ms(100));
+            worker.woke(ms(105));
+            assert_eq!(worker.slept, ms(5));
+            worker.fold_tick(ms(109));
+            assert_eq!(worker.slept, ms(5), "the window is not over");
+            worker.fold_tick(ms(120));
+            assert_eq!(worker.slept, Duration::ZERO);
+        }
+        assert_eq!((busy(0), busy(1), open()), (187, 187, 1));
+        // Worker 1 owns lane 1, the first data lane. Four windows without rest
+        // take it past UNFOLD_BUSY, and it opens the second data lane.
+        for (at, figure) in [(130, 390), (140, 542), (150, 656)] {
+            one.fold_tick(ms(at));
+            assert_eq!((busy(1), open()), (figure, 1));
+        }
+        one.fold_tick(ms(160));
+        assert_eq!((busy(1), open()), (742, 2));
+        // Session 1 has folding off and keeps every lane.
+        assert_eq!(shared.open_lanes[1].load(Ordering::Relaxed), u8::MAX);
+        // With every data lane open a pressed lane changes nothing.
+        shared.lane_pressed[0].store(true, Ordering::Relaxed);
+        one.fold_tick(ms(170));
+        assert_eq!(open(), 2);
+        assert!(!shared.lane_pressed[0].load(Ordering::Relaxed));
+        // Resting windows bring the figure down, and FOLD_QUIET of them in a
+        // row with both owners light close the second lane again.
+        let mut at = 170;
+        let mut windows = 0;
+        while open() == 2 {
+            one.rested = Some(ms(at));
+            at += 10;
+            one.woke(ms(at));
+            one.fold_tick(ms(at));
+            windows += 1;
+            assert!(windows < 2 * FOLD_QUIET, "{}", busy(1));
+        }
+        assert!(
+            (FOLD_QUIET..FOLD_QUIET + 20).contains(&windows),
+            "{windows}"
+        );
+        // A lane is behind once it has held a backlog for FOLD_PRESS_TIME on
+        // end; a burst that the next turns send out is not one.
+        let pressed = || shared.lane_pressed[0].swap(false, Ordering::Relaxed);
+        let index = one.sender_index(0, 1).unwrap();
+        one.unpaced_fixture = false;
+        one.sender.lanes[index].unsent_bytes = FOLD_PRESS_BYTES + 1;
+        one.press_backlogs(ms(1000));
+        one.press_backlogs(ms(1004));
+        assert!(!pressed());
+        one.press_backlogs(ms(1005));
+        assert!(pressed());
+        one.sender.lanes[index].unsent_bytes = FOLD_PRESS_BYTES;
+        one.press_backlogs(ms(1006));
+        one.sender.lanes[index].unsent_bytes = FOLD_PRESS_BYTES + 1;
+        one.press_backlogs(ms(1007));
+        one.press_backlogs(ms(1011));
+        assert!(!pressed());
+        one.sender.lanes[index].unsent_bytes = 0;
+        // While a lane's path has failed nothing folds: its flows may be on a
+        // closed lane, which a look does not see.
+        assert_eq!(open(), 1);
+        shared.failed_lanes[0].store(0b100, Ordering::Relaxed);
+        one.fold_tick(ms(at + 10));
+        assert_eq!(open(), LANES_UNFOLDED);
+        assert_eq!(one.sessions[0].totals.tx_open_lanes, 2);
+        shared.failed_lanes[0].store(0, Ordering::Relaxed);
+        one.fold_tick(ms(at + 20));
+        assert_eq!(open(), 2);
+        // A new connection has every lane again until it has been quiet; a
+        // session that never folds is left alone.
+        for session in 0..2 {
+            let install = Command {
+                generation: 2,
+                phase: Phase::Install,
+                connection: one.sessions[session].connection,
+            };
+            one.command(session, install, 0).unwrap();
+        }
+        assert_eq!(open(), LANES_UNFOLDED);
+        assert_eq!(shared.open_lanes[1].load(Ordering::Relaxed), LANES_ALWAYS);
+        // A worker back from a long rest reports that window alone.
+        shared.busy[0].store(900, Ordering::Relaxed);
+        zero.rested = Some(ms(120));
+        zero.woke(ms(at));
+        zero.fold_tick(ms(at));
+        assert_eq!(busy(0), 0);
+    }
+
+    #[test]
     fn padded_probes_share_one_pace_across_workers() {
         let (_, [a, b]) = test_workers();
         let ms = Duration::from_millis;
@@ -10500,6 +11116,12 @@ mod tests {
             rotation: (0..2).map(|_| AtomicU8::new(0)).collect(),
             failed_lanes: (0..2).map(|_| AtomicU64::new(0)).collect(),
             probe_next: AtomicU64::new(0),
+            // Every lane is in use unless a test folds them itself.
+            open_lanes: (0..2).map(|_| AtomicU8::new(LANES_ALWAYS)).collect(),
+            lane_pressed: (0..2)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
+            busy: (0..2).map(|_| AtomicU64::new(0)).collect(),
         });
         let workers: [Worker; 2] = std::array::from_fn(|id| {
             let mut worker = Worker::new(id, Arc::clone(&shared), Control::new()).unwrap();

@@ -272,6 +272,7 @@ mod tests {
             assert_eq!(loaded.config.daemon.memory_limit, 256 * 1024 * 1024);
             assert!(loaded.config.daemon.tolerate_random_loss);
             assert_eq!(loaded.config.daemon.turn_hold_us, 300);
+            assert_eq!(loaded.config.daemon.busy_hold_us, 1000);
             assert_eq!(loaded.config.daemon.loss_threshold_permille, 20);
             assert!(loaded.config.daemon.balance_flows);
             assert_eq!(loaded.config.daemon.tx_hold_us, 0);
@@ -281,10 +282,11 @@ mod tests {
             assert!(loaded.config.daemon.partial_checksums);
             assert!(!loaded.config.daemon.stripe_flows);
             assert!(loaded.config.daemon.rotate_lanes);
+            assert!(loaded.config.daemon.fold_lanes);
             loaded.config.validate().unwrap();
         }
         let text = format!(
-            "[daemon]\ncontrol_lane = false\nbalance_flows = false\noffload_frames = false\npartial_checksums = false\nstripe_flows = true\nrotate_lanes = false\n{}",
+            "[daemon]\ncontrol_lane = false\nbalance_flows = false\noffload_frames = false\npartial_checksums = false\nstripe_flows = true\nrotate_lanes = false\nfold_lanes = false\n{}",
             sample()
         );
         let loaded = Loaded::parse(&text).unwrap();
@@ -294,6 +296,7 @@ mod tests {
         assert!(!loaded.config.daemon.partial_checksums);
         assert!(loaded.config.daemon.stripe_flows);
         assert!(!loaded.config.daemon.rotate_lanes);
+        assert!(!loaded.config.daemon.fold_lanes);
         loaded.config.validate().unwrap();
         let text = format!("[daemon]\ntx_hold_us = 1000\n{}", sample());
         let loaded = Loaded::parse(&text).unwrap();
@@ -434,6 +437,7 @@ mod tests {
             ),
             ("tx_hold_us = 1001", "daemon.tx_hold_us"),
             ("turn_hold_us = 1001", "daemon.turn_hold_us"),
+            ("busy_hold_us = 1001", "daemon.busy_hold_us"),
         ] {
             let bad = format!("[daemon]\n{setting}\n{text}");
             assert_eq!(

@@ -4382,9 +4382,10 @@ left and right daemon:
 | 0.5 Gbit/s | 90–92%, 90–92% | 62%, 58–59% | 4.2–4.3 ms, 5.0 ms | 0.00–0.24%, 0.01–0.29% |
 
 A light load spread over four workers gives each of them one or two frames
-a turn, so most of what a turn costs is the turn. The default stays at 300
-because every lightly loaded tunnel would pay the 0.8 ms; a box whose CPU
-is the scarcer thing sets `daemon.turn_hold_us = 1000`.
+a turn, so most of what a turn costs is the turn. `turn_hold_us` stays at
+300 because every quiet tunnel would pay the 0.8 ms. A busy worker now
+takes the longer hold by itself
+([below](#a-longer-hold-while-a-worker-is-busy-november-27-landed)).
 
 Trains at 1
 and 2 Gbit/s each way cost and lose the same at 200, 300 and 400, with and
@@ -4456,6 +4457,222 @@ Trains at 2 Gbit/s each way with four workers cost both daemons together
 at all. The change is smaller than the rounds' spread. The comparison
 stays because it is less work for the same result.
 
+## Folding a light session onto one data lane (November 27, landed)
+
+The entry on what is left found that lanes beyond what a load needs cost
+CPU, and across the real path one data lane in place of three took 18% off
+a daemon at 0.5 Gbit/s each way of single frames and a quarter off on
+trains. `daemon.fold_lanes`, on by default, makes a session do that by
+itself (design section 8): it starts with every data lane, closes those its
+load does not need after five quiet seconds, and opens the next when the
+worker of an open lane is busy seven tenths of its time, when a lane holds
+a backlog, or when a frame expires on one. A lane that opens or closes
+moves its own flows and no others.
+
+Three things the first builds got wrong, each found on the relay bed:
+
+- A lane counted as behind whenever a turn left 128 KiB unsent. Two trains
+  read in one turn and paced out over the next looked like that, and a
+  session carrying 1 Gbit/s of trains at a tenth of a core opened every
+  lane. A lane now counts as behind when it has held 1 MiB, half its limit,
+  for 5 ms on end.
+- A session began on one lane. A cold start at 2 Gbit/s of single frames
+  then lost 1.7% of its frames in one round of two where the unfolded
+  daemon lost 0.4–0.9%. A new connection now has every lane until it has
+  been quiet.
+- CPU and backlog alone say nothing of loss. With 1% loss at 1 Gbit/s of
+  single frames one lane lost 1.9% of the frames where three lost 0.5%,
+  because one lane's repairs did the work of three. A frame that expires
+  on an open lane now opens the next, and keeps every lane open while all
+  are.
+
+Relay bed, four workers and four lanes a daemon (three data lanes), sixteen
+QinQ flows, 7.5 ms round trip, 20 s points, folding on against off on one
+build with the arms rotating; CPU of the left and right daemon as a share
+of one core. Each rate runs twice in a session and the table has the second
+point, by which the fold has settled
+([single frames](benches/fold-lanes-single-frames-nov27.txt),
+[trains](benches/fold-lanes-trains-nov27.txt)):
+
+| Offered each way | Off | On | Missing, off and on |
+| --- | --- | --- | --- |
+| Single frames, 0.25 Gbit/s | 63–64%, 57–61% | 48%, 34–35% | 0.00%, 0.00% |
+| Single frames, 0.5 Gbit/s | 88–91%, 84–86% | 72–78%, 63–69% | 0.00%, 0.00–0.32% |
+| Single frames, 1 Gbit/s (once) | 123–129%, 125–126% | 113–128%, 119–128% | 0.14–0.30%, 0.12–0.48% |
+| Trains, 1 Gbit/s | 45–48%, 41–42% | 35–48%, 32–41% | 0.00%, 0.00–0.04% |
+| Trains, 2 Gbit/s | 87–93%, 76–83% | 69–74%, 69–76% | 0.00–0.02%, 0.00% |
+| Trains, 5 Gbit/s (once) | 205–211%, 184–190% | 202–209%, 179–191% | 0.00–2.24%, 0.06–2.99% |
+
+Once settled, a folded session takes 25–41% off a daemon's CPU at
+0.25 Gbit/s each way of single frames and 17–23% at 0.5. By 1 Gbit/s it has
+opened its lanes again and costs the same. Trains fold further up: one lane
+carries 2 Gbit/s each way for 9–17% less CPU, and at 1 Gbit/s the two
+rounds of three that had folded used 13–25% less. At 5 Gbit/s every lane is
+open, and CPU, delivery and loss are the unfolded daemon's. Folded trains
+wait a little longer for their one lane: a median one-way delay of
+4.7–4.9 ms left to right against 4.4–4.5 ms. Single frames show no such
+difference.
+
+A cold start at 2 Gbit/s each way of single frames loses as much with
+folding on (0.4–0.9% in four rounds) as off (0.5–6.0%). With 1% loss on
+the path, expiring frames keep the lanes open: every lane carries a third
+of a single-frame session at 0.5 and at 1 Gbit/s, and the session costs and
+loses what the unfolded daemon does (0.2–0.8% missing in the second point
+at 1 Gbit/s against 0.2–1.9%). Trains on that path keep their lanes too and
+lose no more (0.0–1.4% at 3 Gbit/s against 0.1–6.6%).
+
+**The real path.** Four workers and four lanes a daemon, sixteen untagged
+flows, 10 s points started in windows that the gateway's stall schedule
+leaves clear, four rounds with the arms rotating; CPU of the left and right
+daemon ([rows](benches/fold-lanes-busy-hold-real-path-nov27.txt)). Each
+session runs its first rate twice and the table has the second point:
+
+| Offered each way | Folding off | Folding on | Missing, off and on |
+| --- | --- | --- | --- |
+| Single frames, 0.5 Gbit/s | 76–85%, 60–67% | 71–75%, 54–62% | 0.0–0.6%, 0.0–0.6% |
+| Single frames, 1 Gbit/s | 113–130%, 91–105% | 114–125%, 94–103% | 0.0–0.4%, 0.0–3.3% |
+| Single frames, 2 Gbit/s | 177–199%, 159–177% | 194–202%, 162–179% | 0.3–17.0%, 0.5–16.5% |
+| Trains, 1 Gbit/s | 66–70%, 52–55% | 53–68%, 48–51% | 0.0–0.7%, 0.0–0.6% |
+| Trains, 2 Gbit/s | 117–123%, 103–106% | 106–120%, 95–100% | 0.0–8.8%, 0.0–11.4% |
+| Trains, 5 Gbit/s | 192–215%, 138–145% | 183–206%, 121–140% | 11–72%, 17–86% |
+
+Folding saves less here than on the bed, because a session folds only as
+far as its workers' shares allow and these daemons often kept two or three
+lanes. At 0.5 Gbit/s each way of single frames, three of the eight daemons
+were on one lane by the second point, three on two and two still on all
+three; on average folding took 8% off the left daemon and 10% off the
+right. Trains at 1 Gbit/s were on one lane on the left in three rounds of
+four, at 53–59% of a core against 66–70%, 18% less; the right daemon kept
+two or three lanes and saved 7%. At 2 Gbit/s the saving is 5–6%. At
+2 Gbit/s of single frames and 5 of trains the path is past what these
+hosts carry, with folding and without.
+
+**Steps up.** A folded session has to open its lanes when the load rises,
+and what that costs was measured twice. In the sessions above the load
+doubles from 0.5 to 1 Gbit/s of single frames between the second and third
+point. Of the five right-hand daemons that were folded then (four on one
+lane, one nearly), three dropped 1.0–3.3% of the third point's frames at
+their TAP queues, 0.1–0.3 s of traffic, where the unfolded ones dropped at
+most 0.5%. The left-hand daemons dropped at most 0.2% folded or not. A
+second run alternated 0.5 and 1 Gbit/s, three steps up a session, three
+sessions a setting. Five of its eighteen 1 Gbit/s points fell on one of the
+gateway's stall seconds, because a session ran 150 s and the start gate
+looked 90 s ahead, and lost 7–10% both ways: two with folding off, three
+with it on. At the other steps the senders' TAP queues dropped 0.00–0.04%
+with folding on and 0.00–0.03% with it off. Those folded daemons were on
+two lanes before nearly every step, and once on one. So a step from two
+lanes costs nothing that shows, and a doubling from one lane cost the
+slower host up to a third of a second of single frames in three cases of
+five. Trains showed no such cost: stepping from 1 to 2 Gbit/s, the folded
+daemons lost no more than the unfolded ones.
+
+## A longer hold while a worker is busy (November 27, landed)
+
+The turn hold stayed at 300 µs because every quiet tunnel would pay a
+longer one in delay, though 1000 µs cost a third less CPU on light loads.
+A quiet tunnel has no CPU to save, and a busy one does. A worker that is
+awake a twentieth of its time or more now holds its small turns for
+`daemon.busy_hold_us`, 1000 by default, and goes back to `turn_hold_us`
+when it is awake less than a fiftieth. The share is the one lane folding
+already measures every 10 ms.
+
+Relay bed, four workers and four lanes a daemon, sixteen untagged flows of
+single frames, 7.5 ms round trip, 20 s points, two rounds with the arms
+rotating on one build with folding on; CPU of the left and right daemon as
+a share of one core
+([rows](benches/turn-hold-light-load-four-workers-nov27.txt)):
+
+| Offered each way | 300 at every load | Busy hold | 1000 at every load | Median one-way delay, 300 and busy hold | Missing, 300 and busy hold |
+| --- | --- | --- | --- | --- | --- |
+| 0.03 Gbit/s | 12–13%, 9–10% | 13–17%, 10–15% | 12–14%, 9–11% | 3.9–4.2 ms, 4.0–4.9 ms | 0.00%, 0.00% |
+| 0.25 Gbit/s | 57–59%, 45–47% | 41–42%, 36% | 38–39%, 30–31% | 4.2–4.3 ms, 4.9–5.1 ms | 0.00%, 0.00–0.03% |
+| 0.5 Gbit/s | 84%, 78–81% | 57–60%, 55–62% | 58%, 54–55% | 4.3 ms, 5.1–5.2 ms | 0.22–0.29%, 0.17–0.63% |
+| 1 Gbit/s | 117–121%, 117–127% | 89–93%, 92–97% | 89–90%, 93–94% | 4.3 ms, 5.0–5.1 ms | 0.01–0.17%, 0.10–0.33% |
+
+The busy hold takes 22–28% off a daemon at 0.25 Gbit/s each way, 26–30% at
+0.5 and 23–24% at 1, for 0.7–0.9 ms more one-way delay. It saves nearly
+what 1000 µs at every load saves. At 0.03 Gbit/s frames arrive further
+apart than either hold, there is nothing to batch, and the three arms cost
+the same; the busiest worker still takes the busy hold there in some
+rounds, which shows as up to 0.7 ms on one direction's delay. Below that a
+worker stays under a twentieth and keeps the 300 µs.
+
+With 1% loss on the path, five rounds, the busy hold saves as much: 60–66%
+of a core against 87–95% at 0.5 Gbit/s each way, where both lose the same
+(0.00–0.58% of the frames against 0.00–0.84%), and 107–119% against
+135–154% at 1 Gbit/s. There it may lose a little more: 0.36–1.89% of the
+frames in ten directions of five rounds, 0.94% on average, against
+0.31–1.87% and 0.74%. Three earlier rounds with 1000 µs at every load gave
+0.89% against 0.65%. The ranges overlap and the difference is about one
+standard error, but it has the sign the sweep of longer holds found before
+folding (2.8% at 400 µs against 1.9% at 300). A path that loses 1% of its
+packets and carries 1 Gbit/s of single frames trades about two tenths of a
+percent of its frames for a quarter of the CPU; `busy_hold_us = 0` takes
+the trade back.
+
+**Both changes against the commit before.** Sessions on the same bed that
+step between 0.5 and 1 Gbit/s each way three times, 10 s points, two
+rounds: the build before folding and the busy hold cost 84–91% and 81–89%
+of a core at 0.5 Gbit/s and 107–126% and 105–134% at 1; the final build
+costs 57–61% and 53–55%, and 87–91% and 89–94%, a third less and a quarter
+less. The steps up lost the same: 0.00–0.73% of the frames in the final
+build's six and 0.00–2.47% in the old build's.
+
+**The real path.** The sessions of the folding entry above had a third
+arm, the busy hold off (`busy_hold_us = 0`) with folding on, four rounds;
+CPU of the left and right daemon
+([rows](benches/fold-lanes-busy-hold-real-path-nov27.txt)):
+
+| Single frames each way | 300 at every load | Busy hold | Missing, 300 and busy hold |
+| --- | --- | --- | --- |
+| 0.5 Gbit/s | 87–100%, 64–79% | 71–75%, 54–62% | 0.0–0.4%, 0.0–0.6% |
+| 1 Gbit/s | 136–160%, 116–119% | 114–125%, 94–103% | 0.0–1.0%, 0.0–3.3% |
+| 2 Gbit/s | 199–222%, 164–189% | 194–202%, 162–179% | 0.1–21.9%, 0.5–16.5% |
+
+The busy hold takes 22% off the left daemon and 21% off the right at
+0.5 Gbit/s each way, 17% and 18% at 1, and 7% and 5% at 2, where most
+turns are too large to hold.
+
+Four TCP streams each way with no rate limit, three rounds, second points:
+with the busy hold the two daemons together cost 62–67% of a core per
+delivered Gbit/s, and 69–75% with 300 µs at every load, about a tenth
+less. The streams delivered 3.8–4.1 Gbit/s in sum with it and 3.9–4.6
+without, inside what one arm's rounds differ by; the arm with folding off
+and the busy hold on delivered 3.9–5.4.
+
+## One flow striped across the real path (November 27)
+
+`daemon.stripe_flows` had waited for hosts with both the buffers and the
+CPUs for four workers a side. Both real hosts have them now. One flow each
+way, four workers and four lanes a daemon, 10 s points, three rounds and
+four for TCP, striping off and on; delivered Gbit/s left to right and right
+to left ([rows](benches/stripe-flows-real-path-nov27.txt)):
+
+| One flow each way | Off | On |
+| --- | --- | --- |
+| UDP trains, 2 Gbit/s offered | 1.90–1.92, 1.76–1.92 | 1.91–1.92, 1.92 |
+| UDP trains, 3 Gbit/s offered | 1.20–2.66, 1.99–2.29 | 2.46–2.76, 2.22–2.62 |
+| UDP single frames, 1.5 Gbit/s offered | 1.13–1.35, 1.42 | 1.15–1.36, 1.42–1.43 |
+| One TCP stream, second point | 0.92–1.72, 1.38–1.65 | 0.84–1.68, 1.12–1.42 |
+
+Striping helps the one case it was built for. A flow of trains that one
+lane cannot carry delivers 2.2–2.8 Gbit/s in place of 1.2–2.7, and at
+2 Gbit/s it loses 0.0–0.2% of its frames where the unstriped flow lost up
+to 8.4%. It pays in order and in CPU. At 3 Gbit/s offered, 0.4 to
+1.0 million of its frames arrive out of sequence in ten seconds, a fifth to
+a half of them, against a few thousand, and the daemons use 189–191% and
+169–173% of a core against 98–132% and 85–119%. With striping on, a flow of
+trains that fits its lane costs more too: 66–68% and 57–59% of a core at
+1 Gbit/s against 55–56% and 40–51%. A flow of single frames is held by the
+worker that reads it from the TAP, at 1.1–1.4 Gbit/s, and one TCP stream by
+its own reaction to loss and reordering; striping lifts neither. A flow far
+below a lane's capacity, 0.06 to 0.37 Gbit/s, costs the same either way.
+
+The design set the bar at frames reordered near zero. Striping misses it,
+so `stripe_flows` stays off by default. It is for a tunnel whose one UDP
+flow of trains must exceed a lane and whose receiver takes the frames out
+of order.
+
 ## Four slow cores, a stand-in (November 27)
 
 The targets include boxes with four slow cores, and none was at hand. As a
@@ -4499,6 +4716,29 @@ per Gbit/s each way of trains, and 40% here, which puts the same limit at
 about 2.7 Gbit/s each way there. And the light end is the expensive one
 for single frames: 0.25 Gbit/s each way already takes 66–70% of a fast
 core with four queues and lanes, two fifths of what such a box has.
+
+**The final build on the stand-in.** The same limit, 15 s points, two
+rounds, the build before lane folding and the busy hold against the final
+one, each rate reached after a lower or equal one in the same session; CPU
+of the left and right daemon as a share of one fast core
+([rows](benches/slow-core-stand-in-nov27.txt)):
+
+| Offered each way | Before | Final | Final, folding off | Missing, before and final |
+| --- | --- | --- | --- | --- |
+| Single frames, 0.25 Gbit/s | 65–68%, 59–62% | 36–45%, 34–36% | 41–45%, 36–39% | 0.00%, 0.00–0.04% |
+| Single frames, 0.5 Gbit/s | 90–92%, 86–88% | 57–59%, 52–58% | 58–61%, 55–65% | 0.00–0.29%, 0.00–0.54% |
+| Single frames, 1 Gbit/s | 119–123%, 123–125% | 89%, 87–101% | 86–91%, 87–101% | 0.16–0.31%, 0.01–0.33% |
+| Trains, 1 Gbit/s | 47–50%, 44–45% | 37–38%, 32% | 44–45%, 41% | 0.00–0.02%, 0.00% |
+| Trains, 2 Gbit/s | 86–93%, 82–83% | 71–80%, 65–70% | 84–91%, 77–78% | 0.00–0.21%, 0.00–0.02% |
+| Trains, 3 Gbit/s (2.9 delivered) | 124%, 115–121% | 118–121%, 110% | 117–122%, 111–113% | 0.00–0.17%, 0.00–0.02% |
+
+The light end now costs about two fifths less. 0.25 Gbit/s each way of
+single frames takes 36–45% of a fast core in place of 65–68%, a quarter of
+what such a box has where it took two fifths. Single frames cost 36% less
+at 0.5 Gbit/s and a quarter less at 1, nearly all of it the busy hold, for
+0.8 ms more median delay. Trains cost 23–28% less at 1 Gbit/s and 16–18%
+less at 2, nearly all of it folding, and the same at the limit. A real
+four-core box is still unmeasured: none was at hand.
 
 ## The per-frame cost on November 19
 

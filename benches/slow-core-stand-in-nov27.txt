@@ -54,3 +54,69 @@ user  10% sys  19% total  29%   |   user  15% sys  23% total  38%
 user  15% sys  23% total  38%   |   user  16% sys  17% total  33%
 user  16% sys  23% total  38%   |   user  22% sys  16% total  38%
 user  17% sys  21% total  38%   |   user  15% sys  16% total  31%
+
+## The final build on the stand-in (limited threads as above), 15 s points, two rounds: old = the commit before
+## folding and the busy hold, nofold = the final build with fold_lanes false, new = the final build with its defaults.
+## Single frames at 0.25, 0.25, 0.5, 0.25, 0.5 and 1 Gbit/s each way in one session
+new    r1 p0  0.25+ 0.25 G | CPU   43%   37% | miss 0.00% 0.01% | p50  4981  4981 us | p99   6685  11010 us
+new    r2 p0  0.25+ 0.25 G | CPU   42%   38% | miss 0.00% 0.01% | p50  4981  5046 us | p99   8913  10355 us
+nofold r1 p0  0.25+ 0.25 G | CPU   47%   39% | miss 0.02% 0.10% | p50  4915  5046 us | p99  12190  14287 us
+nofold r2 p0  0.25+ 0.25 G | CPU   44%   38% | miss 0.00% 0.05% | p50  4915  5046 us | p99  13238  14549 us
+old    r1 p0  0.24+ 0.24 G | CPU   69%   64% | miss 0.53% 0.09% | p50  4162  4194 us | p99   9568   6685 us
+old    r2 p0  0.25+ 0.25 G | CPU   67%   61% | miss 0.00% 0.00% | p50  4129  4162 us | p99   4915   4915 us
+new    r1 p1  0.24+ 0.24 G | CPU   45%   34% | miss 0.04% 0.00% | p50  4981  4981 us | p99  11796   6423 us
+new    r2 p1  0.23+ 0.23 G | CPU   42%   36% | miss 0.00% 0.01% | p50  4981  5046 us | p99   6947   7209 us
+nofold r1 p1  0.24+ 0.24 G | CPU   45%   39% | miss 0.00% 0.06% | p50  4915  4981 us | p99   7602   6685 us
+nofold r2 p1  0.24+ 0.25 G | CPU   43%   37% | miss 0.00% 0.00% | p50  4915  5046 us | p99   6357   6488 us
+old    r1 p1  0.25+ 0.25 G | CPU   68%   62% | miss 0.00% 0.00% | p50  4162  4194 us | p99   6423   5177 us
+old    r2 p1  0.25+ 0.25 G | CPU   66%   59% | miss 0.00% 0.00% | p50  4162  4194 us | p99   4719   4981 us
+new    r1 p2  0.49+ 0.47 G | CPU   59%   53% | miss 0.02% 0.54% | p50  4981  5112 us | p99  31195  22807 us
+new    r2 p2  0.46+ 0.46 G | CPU   58%   58% | miss 0.35% 0.31% | p50  5046  5112 us | p99  17826  13631 us
+nofold r1 p2  0.49+ 0.49 G | CPU   61%   65% | miss 0.21% 0.14% | p50  4915  5046 us | p99  12583   9961 us
+nofold r2 p2  0.49+ 0.49 G | CPU   58%   55% | miss 0.30% 0.00% | p50  4981  5046 us | p99   9568   6554 us
+old    r1 p2  0.49+ 0.49 G | CPU   92%   87% | miss 0.00% 0.29% | p50  4194  4260 us | p99   5636  11272 us
+old    r2 p2  0.49+ 0.49 G | CPU   90%   88% | miss 0.28% 0.27% | p50  4194  4260 us | p99  19137  11403 us
+new    r1 p3  0.24+ 0.23 G | CPU   36%   35% | miss 0.00% 0.00% | p50  5046  5439 us | p99   9175  17826 us
+new    r2 p3  0.25+ 0.25 G | CPU   41%   35% | miss 0.00% 0.00% | p50  5046  4981 us | p99   6619   6554 us
+nofold r1 p3  0.25+ 0.25 G | CPU   45%   36% | miss 0.00% 0.00% | p50  4915  5046 us | p99   6685   6554 us
+nofold r2 p3  0.24+ 0.24 G | CPU   41%   36% | miss 0.00% 0.00% | p50  4915  5046 us | p99   6423   6554 us
+old    r1 p3  0.25+ 0.25 G | CPU   67%   60% | miss 0.00% 0.00% | p50  4129  4162 us | p99   5505   4850 us
+old    r2 p3  0.25+ 0.25 G | CPU   65%   59% | miss 0.00% 0.00% | p50  4129  4194 us | p99   4653   4850 us
+new    r1 p4  0.49+ 0.49 G | CPU   58%   57% | miss 0.00% 0.01% | p50  5243  5112 us | p99   6685   6619 us
+new    r2 p4  0.49+ 0.49 G | CPU   57%   52% | miss 0.00% 0.02% | p50  5243  5243 us | p99   6881   6750 us
+nofold r1 p4  0.49+ 0.49 G | CPU   60%   63% | miss 0.00% 0.08% | p50  4915  5046 us | p99   7471   8782 us
+nofold r2 p4  0.48+ 0.48 G | CPU   60%   56% | miss 0.00% 0.05% | p50  4981  5046 us | p99   6488   8258 us
+old    r1 p4  0.49+ 0.49 G | CPU   90%   86% | miss 0.00% 0.00% | p50  4260  4260 us | p99   5833   5505 us
+old    r2 p4  0.48+ 0.48 G | CPU   91%   88% | miss 0.00% 0.00% | p50  4194  4260 us | p99   5308   5571 us
+new    r1 p5  0.98+ 0.98 G | CPU   89%  101% | miss 0.05% 0.31% | p50  4981  5046 us | p99   8520   7864 us
+new    r2 p5  0.97+ 0.97 G | CPU   89%   87% | miss 0.33% 0.01% | p50  4981  5046 us | p99  13369   6685 us
+nofold r1 p5  0.97+ 0.97 G | CPU   91%  101% | miss 0.27% 0.58% | p50  4850  5046 us | p99  11010   9175 us
+nofold r2 p5  0.97+ 0.98 G | CPU   86%   87% | miss 0.31% 0.00% | p50  4981  5046 us | p99  10093   6619 us
+old    r1 p5  0.97+ 0.97 G | CPU  119%  123% | miss 0.21% 0.26% | p50  4260  4260 us | p99  11010   6160 us
+old    r2 p5  0.98+ 0.97 G | CPU  123%  125% | miss 0.16% 0.31% | p50  4260  4260 us | p99   9699  10224 us
+
+## 44-segment trains at 1, 1, 2 and 3 Gbit/s each way in one session
+new    r1 p0  0.98+ 0.98 G | CPU   41%   35% | miss 0.02% 0.03% | p50  4260  4260 us | p99   6226   5898 us
+new    r2 p0  0.98+ 0.98 G | CPU   40%   35% | miss 0.02% 0.03% | p50  4260  4391 us | p99   6226   6029 us
+nofold r1 p0  0.98+ 0.98 G | CPU   45%   43% | miss 0.03% 0.05% | p50  4260  4719 us | p99  15860  11010 us
+nofold r2 p0  0.98+ 0.98 G | CPU   45%   41% | miss 0.02% 0.03% | p50  4391  4588 us | p99   5898   6291 us
+old    r1 p0  0.98+ 0.98 G | CPU   45%   45% | miss 0.03% 0.11% | p50  4260  4850 us | p99  20972  24379 us
+old    r2 p0  0.98+ 0.98 G | CPU   47%   44% | miss 0.02% 0.09% | p50  4260  4981 us | p99   6488   9961 us
+new    r1 p1  0.95+ 0.95 G | CPU   38%   32% | miss 0.00% 0.00% | p50  4391  4456 us | p99   5898   5439 us
+new    r2 p1  0.98+ 0.98 G | CPU   37%   32% | miss 0.00% 0.00% | p50  4325  4456 us | p99   5702   5243 us
+nofold r1 p1  0.97+ 0.97 G | CPU   44%   41% | miss 0.00% 0.00% | p50  4260  4522 us | p99   5308   5636 us
+nofold r2 p1  0.96+ 0.96 G | CPU   45%   41% | miss 0.00% 0.00% | p50  4588  4719 us | p99   6095   5898 us
+old    r1 p1  0.98+ 0.98 G | CPU   47%   45% | miss 0.00% 0.02% | p50  4325  5374 us | p99   5112   7668 us
+old    r2 p1  0.98+ 0.98 G | CPU   50%   44% | miss 0.00% 0.00% | p50  4325  4719 us | p99   5243   5964 us
+new    r1 p2  1.96+ 1.96 G | CPU   80%   70% | miss 0.00% 0.02% | p50  4653  4391 us | p99 132121  11272 us
+new    r2 p2  1.95+ 1.95 G | CPU   71%   65% | miss 0.00% 0.00% | p50  4325  4325 us | p99   8913   5767 us
+nofold r1 p2  1.95+ 1.95 G | CPU   84%   77% | miss 0.00% 0.00% | p50  4325  4850 us | p99   5767   6357 us
+nofold r2 p2  1.96+ 1.96 G | CPU   91%   78% | miss 0.00% 0.00% | p50  4653  4981 us | p99  19137   8913 us
+old    r1 p2  1.96+ 1.95 G | CPU   86%   83% | miss 0.00% 0.21% | p50  4162  4588 us | p99   5177  34079 us
+old    r2 p2  1.96+ 1.96 G | CPU   93%   82% | miss 0.00% 0.00% | p50  4391  4456 us | p99   6423   6554 us
+new    r1 p3  2.94+ 2.94 G | CPU  121%  110% | miss 0.00% 0.00% | p50  4981  4391 us | p99  72352   9699 us
+new    r2 p3  2.90+ 2.90 G | CPU  118%  110% | miss 0.00% 0.02% | p50  4588  4588 us | p99  13500  12059 us
+nofold r1 p3  2.90+ 2.90 G | CPU  117%  111% | miss 0.00% 0.12% | p50  4719  4784 us | p99  12059  10617 us
+nofold r2 p3  2.94+ 2.93 G | CPU  122%  113% | miss 0.01% 0.18% | p50  4981  4456 us | p99  63439  35127 us
+old    r1 p3  2.89+ 2.89 G | CPU  124%  121% | miss 0.00% 0.17% | p50  4391  4522 us | p99  17302  12714 us
+old    r2 p3  2.93+ 2.93 G | CPU  124%  115% | miss 0.13% 0.12% | p50  4456  4325 us | p99  39322  32244 us

@@ -1,7 +1,9 @@
 #!/bin/sh
-# Runs the ignored kernel tests under another kernel, in a QEMU guest with no
-# network device. It needs no KVM: emulation is fast enough (the suite takes
-# about a quarter of an hour, ten minutes of it one path-MTU test's timer).
+# Runs the ignored kernel tests under another kernel, in a QEMU guest whose
+# only network devices are two virtio cards joined to each other inside QEMU
+# (the host report's test reads a real driver's queue counters from them).
+# It needs no KVM: emulation is fast enough (the suite takes about a quarter
+# of an hour, ten minutes of it one path-MTU test's timer).
 #
 #   sh tests/qemu-kernel.sh <vmlinuz> <modules directory> <log> <daemon> <test executable>...
 #
@@ -41,6 +43,9 @@ mkdir "$root/sbin"
 ln -s ../bin/busybox "$root/sbin/modprobe"
 cp -R "$modules/kernel/net" "$modules/kernel/lib" "$modules/kernel/crypto" "$root/lib/modules/$release/kernel/"
 cp -R "$modules/kernel/drivers/net" "$root/lib/modules/$release/kernel/drivers/"
+# The virtio bus drivers, where this kernel has them as modules.
+[ ! -d "$modules/kernel/drivers/virtio" ] ||
+    cp -R "$modules/kernel/drivers/virtio" "$root/lib/modules/$release/kernel/drivers/"
 cp "$modules/modules.builtin" "$modules/modules.order" "$root/lib/modules/$release/"
 depmod -b "$root" "$release" 2> /dev/null
 # Copies a dynamically linked host program's libraries to the same paths.
@@ -82,14 +87,16 @@ mount -t tmpfs tmp /tmp
 mount -t tmpfs run /run
 mkdir -p /run/netns /var/run
 for module in veth bridge 8021q vrf dummy macvlan openvswitch sch_netem ifb sch_ingress \
-    cls_flower cls_u32 cls_matchall act_gact act_mirred; do
+    cls_flower cls_u32 cls_matchall act_gact act_mirred virtio_pci virtio_net; do
     modprobe "$module" 2> /dev/null || echo "no module $module"
 done
 ip link set lo up
 echo "KERNEL $(uname -sr)"
+echo "CARDS $(ls /sys/class/net | tr '\n' ' ')"
 for test in /t/test*; do
     echo "=== ${test##*/}"
-    UNQUIC_OVS_ROOT=/t/ovs-root UNQUIC_TEST_BINARY=/t/daemon "$test" --ignored --test-threads=1 2>&1
+    UNQUIC_VIRTIO_CARDS=2 UNQUIC_OVS_ROOT=/t/ovs-root UNQUIC_TEST_BINARY=/t/daemon \
+        "$test" --ignored --test-threads=1 2>&1
 done
 echo ALL-DONE
 poweroff -f
@@ -100,7 +107,9 @@ rm -f "$log"
 qemu-system-x86_64 -accel tcg,thread=multi -cpu max -smp 4 -m 4096 \
     -kernel "$kernel" -initrd "$work/initramfs.gz" \
     -append "console=ttyS0 panic=-1 random.trust_cpu=on quiet" \
-    -display none -serial "file:$log" -nic none -no-reboot < /dev/null
+    -display none -serial "file:$log" -nic none -no-reboot \
+    -netdev hubport,id=near,hubid=0 -device virtio-net-pci,netdev=near \
+    -netdev hubport,id=far,hubid=0 -device virtio-net-pci,netdev=far < /dev/null
 tr -d '\r' < "$log" > "$work/log"
 grep -q '^ALL-DONE$' "$work/log" || {
     echo "the guest did not finish; see $log"

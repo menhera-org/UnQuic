@@ -1,0 +1,432 @@
+# The real path, four workers and four lanes a daemon, sixteen untagged flows, 10 s points, the arms rotating, every
+# session started inside a window that the gateway stall schedule leaves clear, November 27.
+# Arms: off = fold_lanes false; on = the defaults (folding on, busy hold 1000); h3 = busy_hold_us 0 (folding on,
+# 300 us at every load). Point 0 warms the session up at point 1s rate.
+# arm round point  delivered each way = sum | offered | daemon CPU left right, busiest thread | frames missing |
+# receive socket overflows | sender queue drops | frames reordered
+
+## Single frames at 0.5, 0.5, 1 and 2 Gbit/s each way, four rounds
+h3       r1 p0  0.47 +  0.47 =  0.94 G | off  0.50  0.50 | CPU  103%   75% busiest  37  25 | miss  2.3%  2.3% | sockovf 0 0 | qdrop 70 0 | reord 3 5
+h3       r1 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU  100%   64% busiest  33  30 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 1 4
+h3       r1 p2  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  139%  119% busiest  58  37 | miss  0.0%  0.1% | sockovf 0 0 | qdrop 0 81 | reord 0 843
+h3       r1 p3  1.74 +  1.50 =  3.24 G | off  1.99  2.00 | CPU  199%  164% busiest  74  56 | miss  8.4% 21.9% | sockovf 0 0 | qdrop 8 215 | reord 35 7975
+h3       r2 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   94%   77% busiest  30  27 | miss  0.1%  0.1% | sockovf 0 0 | qdrop 0 47 | reord 0 44
+h3       r2 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   87%   79% busiest  37  33 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 101
+h3       r2 p2  0.95 +  0.95 =  1.91 G | off  0.99  1.00 | CPU  139%  118% busiest  46  47 | miss  0.0%  0.5% | sockovf 0 0 | qdrop 23 0 | reord 2 951
+h3       r2 p3  1.91 +  1.85 =  3.76 G | off  2.00  2.00 | CPU  222%  187% busiest  82  67 | miss  0.3%  3.6% | sockovf 0 0 | qdrop 0 52 | reord 0 5456
+h3       r3 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   96%   74% busiest  30  24 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 207
+h3       r3 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   89%   64% busiest  27  26 | miss  0.0%  0.4% | sockovf 0 0 | qdrop 0 2 | reord 0 325
+h3       r3 p2  0.96 +  0.95 =  1.91 G | off  1.00  1.00 | CPU  136%  116% busiest  50  37 | miss  0.0%  1.0% | sockovf 0 0 | qdrop 71 2 | reord 0 609
+h3       r3 p3  1.91 +  1.87 =  3.78 G | off  2.00  2.00 | CPU  216%  189% busiest  74  71 | miss  0.1%  2.5% | sockovf 0 0 | qdrop 0 5 | reord 0 3082
+h3       r4 p0  0.46 +  0.44 =  0.91 G | off  0.50  0.50 | CPU  102%   74% busiest  36  27 | miss  2.7%  7.3% | sockovf 0 0 | qdrop 0 12 | reord 0 0
+h3       r4 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   99%   79% busiest  32  30 | miss  0.0%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 0 216
+h3       r4 p2  0.96 +  0.95 =  1.91 G | off  1.00  1.00 | CPU  160%  119% busiest  59  38 | miss  0.0%  0.5% | sockovf 0 0 | qdrop 90 0 | reord 14 181
+h3       r4 p3  1.74 +  1.74 =  3.49 G | off  1.99  2.00 | CPU  211%  180% busiest  78  62 | miss  8.4%  9.2% | sockovf 0 0 | qdrop 0 38 | reord 53 2546
+off      r1 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   77%   60% busiest  32  25 | miss  0.1%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r1 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   77%   61% busiest  32  25 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r1 p2  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  116%   98% busiest  47  37 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 69
+off      r1 p3  1.88 +  1.73 =  3.61 G | off  2.00  2.00 | CPU  196%  172% busiest  73  60 | miss  1.7%  9.6% | sockovf 0 0 | qdrop 0 79 | reord 0 2202
+off      r2 p0  0.44 +  0.48 =  0.92 G | off  0.50  0.50 | CPU   83%   59% busiest  31  24 | miss  7.8%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r2 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   85%   60% busiest  33  24 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r2 p2  0.96 +  0.95 =  1.91 G | off  1.00  0.99 | CPU  130%   91% busiest  48  34 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 15 0 | reord 0 398
+off      r2 p3  1.57 +  1.66 =  3.23 G | off  1.97  1.91 | CPU  177%  159% busiest  62  56 | miss 17.0%  9.7% | sockovf 0 0 | qdrop 61 492 | reord 8 3726
+off      r3 p0  0.47 +  0.47 =  0.93 G | off  0.50  0.50 | CPU   81%   60% busiest  31  20 | miss  2.5%  2.4% | sockovf 0 0 | qdrop 0 0 | reord 0 62
+off      r3 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   80%   65% busiest  32  26 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 44
+off      r3 p2  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  124%  102% busiest  48  39 | miss  0.1%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 30 480
+off      r3 p3  1.91 +  1.81 =  3.72 G | off  2.00  2.00 | CPU  199%  177% busiest  74  62 | miss  0.3%  5.5% | sockovf 0 0 | qdrop 0 36 | reord 0 4450
+off      r4 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   77%   64% busiest  31  26 | miss  0.1%  0.4% | sockovf 0 0 | qdrop 0 0 | reord 0 719
+off      r4 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   76%   67% busiest  31  27 | miss  0.0%  0.6% | sockovf 0 0 | qdrop 0 0 | reord 0 658
+off      r4 p2  0.96 +  0.95 =  1.91 G | off  1.00  1.00 | CPU  113%  105% busiest  46  40 | miss  0.0%  0.4% | sockovf 0 0 | qdrop 0 0 | reord 0 653
+off      r4 p3  1.86 +  1.64 =  3.50 G | off  2.00  2.00 | CPU  190%  164% busiest  74  56 | miss  2.7% 14.5% | sockovf 0 0 | qdrop 0 251 | reord 103 4190
+on       r1 p0  0.45 +  0.44 =  0.89 G | off  0.50  0.50 | CPU   79%   58% busiest  28  21 | miss  6.8%  7.5% | sockovf 0 0 | qdrop 302 60 | reord 36 0
+on       r1 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   74%   62% busiest  25  25 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 12
+on       r1 p2  0.95 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  117%   95% busiest  36  33 | miss  0.1%  0.0% | sockovf 0 0 | qdrop 49 0 | reord 0 21
+on       r1 p3  1.86 +  1.86 =  3.72 G | off  1.98  2.00 | CPU  197%  179% busiest  70  65 | miss  1.9%  2.8% | sockovf 0 0 | qdrop 61 27 | reord 19 4437
+on       r2 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   78%   59% busiest  25  23 | miss  0.1%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+on       r2 p1  0.48 +  0.48 =  0.95 G | off  0.50  0.50 | CPU   71%   55% busiest  26  23 | miss  0.6%  0.0% | sockovf 0 0 | qdrop 61 0 | reord 1 0
+on       r2 p2  0.95 +  0.96 =  1.91 G | off  0.99  1.00 | CPU  114%   94% busiest  37  31 | miss  0.2%  0.2% | sockovf 0 0 | qdrop 0 22 | reord 0 280
+on       r2 p3  1.89 +  1.71 =  3.60 G | off  1.99  2.00 | CPU  198%  169% busiest  75  59 | miss  1.1% 10.6% | sockovf 0 0 | qdrop 1 64 | reord 66 14761
+on       r3 p0  0.46 +  0.48 =  0.94 G | off  0.50  0.50 | CPU   77%   57% busiest  26  19 | miss  2.8%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+on       r3 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   72%   54% busiest  26  20 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+on       r3 p2  0.96 +  0.95 =  1.91 G | off  1.00  1.00 | CPU  125%   97% busiest  43  31 | miss  0.0%  1.0% | sockovf 0 0 | qdrop 38 30 | reord 22 998
+on       r3 p3  1.90 +  1.88 =  3.78 G | off  1.99  2.00 | CPU  202%  174% busiest  74  64 | miss  0.5%  2.0% | sockovf 0 0 | qdrop 0 5 | reord 0 1601
+on       r4 p0  0.43 +  0.44 =  0.87 G | off  0.50  0.49 | CPU   75%   56% busiest  26  19 | miss  9.7%  7.5% | sockovf 0 0 | qdrop 32 0 | reord 0 24
+on       r4 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   75%   55% busiest  24  28 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+on       r4 p2  0.96 +  0.93 =  1.89 G | off  1.00  1.00 | CPU  119%  103% busiest  41  34 | miss  0.1%  3.3% | sockovf 0 0 | qdrop 25 69 | reord 28 1047
+on       r4 p3  1.90 +  1.60 =  3.50 G | off  2.00  2.00 | CPU  194%  162% busiest  75  55 | miss  0.7% 16.5% | sockovf 0 0 | qdrop 0 133 | reord 3 10859
+
+## The same points: share of each sides outer bytes per transmit lane (lane 1 is the control lane)
+h3 r1 p0 | left 1:1% 2:38% 3:34% 4:28% | right 1:1% 2:46% 3:37% 4:16%
+h3 r2 p0 | left 1:0% 2:42% 3:44% 4:13% | right 1:0% 2:40% 3:32% 4:28%
+h3 r3 p0 | left 1:0% 2:39% 3:47% 4:13% | right 1:0% 2:51% 3:36% 4:13%
+h3 r4 p0 | left 1:1% 2:39% 3:34% 4:26% | right 1:1% 2:45% 3:27% 4:27%
+off r1 p0 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r2 p0 | left 1:0% 2:31% 3:37% 4:31% | right 1:1% 2:37% 3:31% 4:31%
+off r3 p0 | left 1:1% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r4 p0 | left 1:1% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+on r1 p0 | left 1:0% 2:42% 3:38% 4:20% | right 1:0% 2:60% 3:20% 4:20%
+on r2 p0 | left 1:0% 2:44% 3:43% 4:13% | right 1:0% 2:72% 3:14% 4:14%
+on r3 p0 | left 1:0% 2:66% 3:17% 4:17% | right 1:0% 2:71% 3:14% 4:14%
+on r4 p0 | left 1:1% 2:56% 3:24% 4:18% | right 1:1% 2:63% 3:18% 4:18%
+h3 r1 p1 | left 1:0% 2:41% 3:44% 4:16% | right 1:0% 2:100% 3:0% 4:0%
+h3 r2 p1 | left 1:1% 2:99% 3:0% 4:0% | right 1:0% 2:31% 3:31% 4:37%
+h3 r3 p1 | left 1:0% 2:63% 3:36% 4:0% | right 1:0% 2:89% 3:11% 4:0%
+h3 r4 p1 | left 1:1% 2:41% 3:43% 4:15% | right 1:0% 2:31% 3:37% 4:31%
+off r1 p1 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:31% 3:37% 4:31%
+off r2 p1 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:31% 3:37% 4:31%
+off r3 p1 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:37% 3:31% 4:31%
+off r4 p1 | left 1:1% 2:31% 3:37% 4:31% | right 1:0% 2:31% 3:31% 4:37%
+on r1 p1 | left 1:1% 2:43% 3:44% 4:12% | right 1:0% 2:37% 3:31% 4:31%
+on r2 p1 | left 1:0% 2:74% 3:13% 4:13% | right 1:0% 2:100% 3:0% 4:0%
+on r3 p1 | left 1:0% 2:100% 3:0% 4:0% | right 1:0% 2:100% 3:0% 4:0%
+on r4 p1 | left 1:0% 2:70% 3:30% 4:0% | right 1:0% 2:100% 3:0% 4:0%
+h3 r1 p2 | left 1:0% 2:76% 3:23% 4:0% | right 1:0% 2:40% 3:41% 4:19%
+h3 r2 p2 | left 1:1% 2:47% 3:34% 4:18% | right 1:0% 2:31% 3:31% 4:37%
+h3 r3 p2 | left 1:0% 2:62% 3:37% 4:0% | right 1:0% 2:37% 3:44% 4:19%
+h3 r4 p2 | left 1:0% 2:34% 3:30% 4:36% | right 1:0% 2:37% 3:43% 4:19%
+off r1 p2 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:31% 3:31% 4:37%
+off r2 p2 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:31% 3:31% 4:37%
+off r3 p2 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:31% 3:31% 4:37%
+off r4 p2 | left 1:1% 2:31% 3:31% 4:37% | right 1:0% 2:31% 3:31% 4:37%
+on r1 p2 | left 1:0% 2:44% 3:56% 4:0% | right 1:0% 2:39% 3:47% 4:14%
+on r2 p2 | left 1:0% 2:37% 3:42% 4:21% | right 1:0% 2:38% 3:42% 4:19%
+on r3 p2 | left 1:0% 2:38% 3:38% 4:24% | right 1:0% 2:40% 3:41% 4:19%
+on r4 p2 | left 1:1% 2:37% 3:42% 4:21% | right 1:0% 2:34% 3:37% 4:29%
+h3 r1 p3 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+h3 r2 p3 | left 1:1% 2:31% 3:37% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+h3 r3 p3 | left 1:0% 2:35% 3:40% 4:25% | right 1:0% 2:31% 3:31% 4:37%
+h3 r4 p3 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:40% 3:33% 4:27%
+off r1 p3 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r2 p3 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r3 p3 | left 1:1% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r4 p3 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+on r1 p3 | left 1:1% 2:37% 3:31% 4:31% | right 1:0% 2:38% 3:31% 4:31%
+on r2 p3 | left 1:1% 2:31% 3:31% 4:37% | right 1:0% 2:38% 3:31% 4:31%
+on r3 p3 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+on r4 p3 | left 1:1% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+
+## The same points: frames each sides TAP queue passed to the daemon and dropped before it read them
+h3 r1 p0 | left passed 415091 dropped 9160 2.16% | right passed 415152 dropped 9387 2.21%
+h3 r1 p1 | left passed 424347 dropped 0 0.00% | right passed 424544 dropped 0 0.00%
+h3 r1 p2 | left passed 848328 dropped 0 0.00% | right passed 847887 dropped 1138 0.13%
+h3 r1 p3 | left passed 1545746 dropped 141280 8.37% | right passed 1330567 dropped 367145 21.63%
+h3 r2 p0 | left passed 423675 dropped 224 0.05% | right passed 424171 dropped 384 0.09%
+h3 r2 p1 | left passed 424410 dropped 0 0.00% | right passed 424538 dropped 0 0.00%
+h3 r2 p2 | left passed 844765 dropped 44 0.01% | right passed 845187 dropped 3966 0.47%
+h3 r2 p3 | left passed 1691875 dropped 4565 0.27% | right passed 1637352 dropped 60312 3.55%
+h3 r3 p0 | left passed 424159 dropped 172 0.04% | right passed 424376 dropped 211 0.05%
+h3 r3 p1 | left passed 423554 dropped 0 0.00% | right passed 422685 dropped 1885 0.44%
+h3 r3 p2 | left passed 848489 dropped 0 0.00% | right passed 840760 dropped 8385 0.99%
+h3 r3 p3 | left passed 1694340 dropped 2428 0.14% | right passed 1655560 dropped 41721 2.46%
+h3 r4 p0 | left passed 412543 dropped 10580 2.50% | right passed 394668 dropped 29911 7.04%
+h3 r4 p1 | left passed 424104 dropped 0 0.00% | right passed 424062 dropped 522 0.12%
+h3 r4 p2 | left passed 848346 dropped 0 0.00% | right passed 844653 dropped 4324 0.51%
+h3 r4 p3 | left passed 1546503 dropped 141329 8.37% | right passed 1544931 dropped 153053 9.01%
+off r1 p0 | left passed 423819 dropped 264 0.06% | right passed 424176 dropped 115 0.03%
+off r1 p1 | left passed 423769 dropped 0 0.00% | right passed 424584 dropped 0 0.00%
+off r1 p2 | left passed 848585 dropped 0 0.00% | right passed 849001 dropped 0 0.00%
+off r1 p3 | left passed 1666388 dropped 28572 1.69% | right passed 1534780 dropped 163484 9.63%
+off r2 p0 | left passed 393607 dropped 30484 7.19% | right passed 424324 dropped 263 0.06%
+off r2 p1 | left passed 424208 dropped 0 0.00% | right passed 424544 dropped 0 0.00%
+off r2 p2 | left passed 847303 dropped 316 0.04% | right passed 840281 dropped 0 0.00%
+off r2 p3 | left passed 1392716 dropped 283892 16.93% | right passed 1466992 dropped 157040 9.67%
+off r3 p0 | left passed 414171 dropped 10280 2.42% | right passed 414928 dropped 9547 2.25%
+off r3 p1 | left passed 424442 dropped 0 0.00% | right passed 424521 dropped 0 0.00%
+off r3 p2 | left passed 847708 dropped 556 0.07% | right passed 848666 dropped 118 0.01%
+off r3 p3 | left passed 1689718 dropped 5154 0.30% | right passed 1604891 dropped 92565 5.45%
+off r4 p0 | left passed 423935 dropped 228 0.05% | right passed 422947 dropped 1632 0.38%
+off r4 p1 | left passed 424592 dropped 0 0.00% | right passed 422081 dropped 2473 0.58%
+off r4 p2 | left passed 847479 dropped 260 0.03% | right passed 845373 dropped 3676 0.43%
+off r4 p3 | left passed 1650412 dropped 45900 2.71% | right passed 1452907 dropped 245381 14.45%
+on r1 p0 | left passed 397859 dropped 26384 6.22% | right passed 395279 dropped 29300 6.90%
+on r1 p1 | left passed 424424 dropped 0 0.00% | right passed 424497 dropped 0 0.00%
+on r1 p2 | left passed 845855 dropped 1114 0.13% | right passed 849082 dropped 0 0.00%
+on r1 p3 | left passed 1650694 dropped 32018 1.90% | right passed 1649675 dropped 48357 2.85%
+on r2 p0 | left passed 424155 dropped 328 0.08% | right passed 424288 dropped 291 0.07%
+on r2 p1 | left passed 421653 dropped 2420 0.57% | right passed 424594 dropped 0 0.00%
+on r2 p2 | left passed 842892 dropped 1550 0.18% | right passed 847359 dropped 1818 0.21%
+on r2 p3 | left passed 1675131 dropped 18374 1.08% | right passed 1518490 dropped 179630 10.58%
+on r3 p0 | left passed 412723 dropped 11376 2.68% | right passed 424356 dropped 135 0.03%
+on r3 p1 | left passed 424474 dropped 0 0.00% | right passed 424560 dropped 0 0.00%
+on r3 p2 | left passed 848633 dropped 0 0.00% | right passed 840149 dropped 8774 1.03%
+on r3 p3 | left passed 1685036 dropped 8140 0.48% | right passed 1663375 dropped 34041 2.01%
+on r4 p0 | left passed 387031 dropped 37476 8.83% | right passed 389040 dropped 30955 7.37%
+on r4 p1 | left passed 424521 dropped 0 0.00% | right passed 424537 dropped 0 0.00%
+on r4 p2 | left passed 848082 dropped 448 0.05% | right passed 821504 dropped 27649 3.26%
+on r4 p3 | left passed 1683180 dropped 12236 0.72% | right passed 1417710 dropped 280122 16.50%
+
+## 44-segment trains at 1, 1, 2 and 5 Gbit/s each way, four rounds, the final build
+off      r1 p0  0.96 +  0.95 =  1.91 G | off  1.00  1.00 | CPU   69%   51% busiest  24  16 | miss  0.0%  1.1% | sockovf 0 0 | qdrop 0 13 | reord 692 2828
+off      r1 p1  0.96 +  0.95 =  1.91 G | off  1.00  1.00 | CPU   67%   55% busiest  24  18 | miss  0.0%  0.7% | sockovf 0 0 | qdrop 0 38 | reord 416 2760
+off      r1 p2  1.91 +  1.79 =  3.70 G | off  2.00  2.00 | CPU  117%  106% busiest  45  37 | miss  0.0%  6.1% | sockovf 0 0 | qdrop 0 2301 | reord 64 15369
+off      r1 p3  4.23 +  1.43 =  5.66 G | off  4.99  5.00 | CPU  215%  145% busiest  77  45 | miss 11.2% 69.6% | sockovf 0 0 | qdrop 491 33986 | reord 13669 4508
+off      r2 p0  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   68%   52% busiest  22  16 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 296 1032
+off      r2 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   70%   52% busiest  23  17 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 3568 1926
+off      r2 p2  1.91 +  1.73 =  3.64 G | off  2.00  2.00 | CPU  123%  103% busiest  44  37 | miss  0.0%  8.8% | sockovf 0 0 | qdrop 15 3263 | reord 48 6016
+off      r2 p3  3.82 +  1.33 =  5.15 G | off  5.00  5.00 | CPU  195%  143% busiest  68  44 | miss 19.7% 72.0% | sockovf 0 0 | qdrop 0 29948 | reord 6994 2968
+off      r3 p0  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU   67%   57% busiest  22  18 | miss  0.0%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 828 3372
+off      r3 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   66%   54% busiest  21  18 | miss  0.0%  0.1% | sockovf 0 0 | qdrop 0 2 | reord 220 1468
+off      r3 p2  1.90 +  1.80 =  3.69 G | off  1.99  2.00 | CPU  122%  106% busiest  44  38 | miss  0.2%  6.3% | sockovf 0 0 | qdrop 88 2024 | reord 744 10140
+off      r3 p3  3.55 +  1.58 =  5.13 G | off  4.95  5.00 | CPU  196%  143% busiest  67  44 | miss 24.6% 66.7% | sockovf 0 0 | qdrop 108 30679 | reord 13160 11345
+off      r4 p0  0.96 +  0.90 =  1.86 G | off  1.00  1.00 | CPU   67%   51% busiest  23  16 | miss  0.0%  5.8% | sockovf 0 0 | qdrop 0 100 | reord 0 40
+off      r4 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   66%   55% busiest  25  21 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 352 804
+off      r4 p2  1.92 +  1.81 =  3.72 G | off  2.00  2.00 | CPU  119%  103% busiest  44  38 | miss  0.0%  5.9% | sockovf 0 0 | qdrop 4 2095 | reord 56 5814
+off      r4 p3  3.37 +  1.56 =  4.93 G | off  5.00  5.00 | CPU  192%  138% busiest  62  42 | miss 29.2% 67.3% | sockovf 0 0 | qdrop 1407 30900 | reord 888 2692
+on       r1 p0  0.90 +  0.86 =  1.77 G | off  1.00  1.00 | CPU   65%   54% busiest  20  17 | miss  4.4%  9.7% | sockovf 0 0 | qdrop 0 975 | reord 208 3780
+on       r1 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   68%   51% busiest  23  16 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 124 1720
+on       r1 p2  1.91 +  1.91 =  3.82 G | off  2.00  2.00 | CPU  106%   95% busiest  41  34 | miss  0.0%  0.1% | sockovf 0 0 | qdrop 0 38 | reord 8 4709
+on       r1 p3  3.84 +  1.49 =  5.33 G | off  4.99  5.00 | CPU  206%  140% busiest  70  44 | miss 19.1% 68.9% | sockovf 0 0 | qdrop 2863 27437 | reord 6623 5226
+on       r2 p0  0.96 +  0.93 =  1.89 G | off  1.00  1.00 | CPU   61%   50% busiest  24  23 | miss  0.0%  2.7% | sockovf 0 0 | qdrop 0 79 | reord 72 440
+on       r2 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   54%   50% busiest  32  32 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 32 1136
+on       r2 p2  1.92 +  1.70 =  3.61 G | off  2.00  2.00 | CPU  113%   99% busiest  34  32 | miss  0.1% 11.4% | sockovf 0 0 | qdrop 20 2893 | reord 2496 8737
+on       r2 p3  3.95 +  0.68 =  4.63 G | off  5.00  5.00 | CPU  195%  121% busiest  72  39 | miss 17.0% 85.6% | sockovf 0 0 | qdrop 0 30773 | reord 6276 2093
+on       r3 p0  0.90 +  0.93 =  1.83 G | off  1.00  1.00 | CPU   66%   49% busiest  23  16 | miss  6.1%  2.9% | sockovf 0 0 | qdrop 0 102 | reord 0 2128
+on       r3 p1  0.96 +  0.95 =  1.91 G | off  1.00  1.00 | CPU   59%   48% busiest  33  21 | miss  0.0%  0.6% | sockovf 0 0 | qdrop 0 4 | reord 0 1592
+on       r3 p2  1.90 +  1.85 =  3.76 G | off  1.99  2.00 | CPU  118%   98% busiest  36  32 | miss  0.0%  3.4% | sockovf 0 0 | qdrop 0 1154 | reord 836 9421
+on       r3 p3  3.77 +  1.12 =  4.89 G | off  4.98  5.00 | CPU  189%  131% busiest  66  40 | miss 20.4% 76.2% | sockovf 0 0 | qdrop 394 31198 | reord 3537 3674
+on       r4 p0  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   59%   48% busiest  23  22 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 280 368
+on       r4 p1  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU   53%   48% busiest  32  30 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 56 1464
+on       r4 p2  1.91 +  1.90 =  3.80 G | off  2.00  2.00 | CPU  120%  100% busiest  35  32 | miss  0.5%  1.1% | sockovf 0 0 | qdrop 195 379 | reord 808 7768
+on       r4 p3  3.24 +  1.30 =  4.54 G | off  5.00  5.00 | CPU  183%  126% busiest  61  39 | miss 31.7% 72.6% | sockovf 0 0 | qdrop 172 22487 | reord 1808 2828
+
+## The same points: share of each sides outer bytes per transmit lane
+off r1 p0 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:30% 3:38% 4:31%
+off r2 p0 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r3 p0 | left 1:1% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r4 p0 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+on r1 p0 | left 1:1% 2:38% 3:38% 4:24% | right 1:0% 2:38% 3:32% 4:31%
+on r2 p0 | left 1:0% 2:41% 3:44% 4:15% | right 1:0% 2:66% 3:17% 4:17%
+on r3 p0 | left 1:1% 2:59% 3:20% 4:20% | right 1:0% 2:31% 3:37% 4:31%
+on r4 p0 | left 1:0% 2:40% 3:42% 4:17% | right 1:0% 2:64% 3:18% 4:18%
+off r1 p1 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:38% 3:31% 4:31%
+off r2 p1 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r3 p1 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:31% 3:31% 4:38%
+off r4 p1 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:31% 3:31% 4:37%
+on r1 p1 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:40% 3:33% 4:27%
+on r2 p1 | left 1:0% 2:100% 3:0% 4:0% | right 1:0% 2:66% 3:17% 4:17%
+on r3 p1 | left 1:1% 2:99% 3:0% 4:0% | right 1:0% 2:31% 3:37% 4:31%
+on r4 p1 | left 1:0% 2:98% 3:2% 4:0% | right 1:0% 2:64% 3:16% 4:19%
+off r1 p2 | left 1:1% 2:31% 3:31% 4:37% | right 1:0% 2:38% 3:33% 4:29%
+off r2 p2 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:32% 3:33% 4:34%
+off r3 p2 | left 1:1% 2:31% 3:31% 4:37% | right 1:0% 2:27% 3:33% 4:39%
+off r4 p2 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:33% 3:33% 4:34%
+on r1 p2 | left 1:0% 2:57% 3:42% 4:0% | right 1:0% 2:32% 3:31% 4:37%
+on r2 p2 | left 1:1% 2:41% 3:38% 4:20% | right 1:0% 2:32% 3:33% 4:34%
+on r3 p2 | left 1:0% 2:39% 3:41% 4:20% | right 1:0% 2:33% 3:32% 4:36%
+on r4 p2 | left 1:0% 2:43% 3:35% 4:21% | right 1:0% 2:32% 3:31% 4:37%
+off r1 p3 | left 1:0% 2:38% 3:31% 4:31% | right 1:1% 2:31% 3:43% 4:25%
+off r2 p3 | left 1:0% 2:38% 3:31% 4:31% | right 1:1% 2:29% 3:43% 4:27%
+off r3 p3 | left 1:0% 2:37% 3:31% 4:31% | right 1:1% 2:27% 3:41% 4:32%
+off r4 p3 | left 1:0% 2:32% 3:36% 4:32% | right 1:0% 2:41% 3:39% 4:20%
+on r1 p3 | left 1:0% 2:32% 3:32% 4:35% | right 1:0% 2:42% 3:40% 4:18%
+on r2 p3 | left 1:0% 2:38% 3:31% 4:31% | right 1:2% 2:36% 3:40% 4:23%
+on r3 p3 | left 1:0% 2:38% 3:31% 4:31% | right 1:1% 2:35% 3:31% 4:33%
+on r4 p3 | left 1:0% 2:38% 3:31% 4:31% | right 1:1% 2:36% 3:39% 4:24%
+
+## The same points: frames each sides TAP queue passed to the daemon and dropped before it read them
+off r1 p0 | left passed 19299 dropped 0 0.00% | right passed 19299 dropped 0 0.00%
+off r1 p1 | left passed 19296 dropped 0 0.00% | right passed 19299 dropped 0 0.00%
+off r1 p2 | left passed 38587 dropped 0 0.00% | right passed 38592 dropped 0 0.00%
+off r1 p3 | left passed 86157 dropped 10243 10.63% | right passed 63318 dropped 32856 34.16%
+off r2 p0 | left passed 19299 dropped 0 0.00% | right passed 19299 dropped 0 0.00%
+off r2 p1 | left passed 19299 dropped 0 0.00% | right passed 19298 dropped 0 0.00%
+off r2 p2 | left passed 38584 dropped 0 0.00% | right passed 38392 dropped 77 0.20%
+off r2 p3 | left passed 77477 dropped 19003 19.70% | right passed 56857 dropped 39464 40.97%
+off r3 p0 | left passed 19299 dropped 0 0.00% | right passed 19299 dropped 0 0.00%
+off r3 p1 | left passed 19296 dropped 0 0.00% | right passed 19298 dropped 0 0.00%
+off r3 p2 | left passed 38312 dropped 0 0.00% | right passed 38593 dropped 0 0.00%
+off r3 p3 | left passed 72108 dropped 23396 24.50% | right passed 62802 dropped 33573 34.84%
+off r4 p0 | left passed 19299 dropped 0 0.00% | right passed 19299 dropped 0 0.00%
+off r4 p1 | left passed 19299 dropped 0 0.00% | right passed 19298 dropped 0 0.00%
+off r4 p2 | left passed 38592 dropped 0 0.00% | right passed 38593 dropped 0 0.00%
+off r4 p3 | left passed 69610 dropped 26803 27.80% | right passed 62428 dropped 33949 35.22%
+on r1 p0 | left passed 18498 dropped 801 4.15% | right passed 19299 dropped 0 0.00%
+on r1 p1 | left passed 19298 dropped 0 0.00% | right passed 19297 dropped 0 0.00%
+on r1 p2 | left passed 38552 dropped 0 0.00% | right passed 38592 dropped 0 0.00%
+on r1 p3 | left passed 80855 dropped 15546 16.13% | right passed 57972 dropped 38524 39.92%
+on r2 p0 | left passed 19299 dropped 0 0.00% | right passed 19299 dropped 0 0.00%
+on r2 p1 | left passed 19297 dropped 0 0.00% | right passed 19297 dropped 0 0.00%
+on r2 p2 | left passed 38594 dropped 0 0.00% | right passed 37651 dropped 942 2.44%
+on r2 p3 | left passed 80204 dropped 16284 16.88% | right passed 46604 dropped 49892 51.70%
+on r3 p0 | left passed 18221 dropped 1078 5.59% | right passed 19299 dropped 0 0.00%
+on r3 p1 | left passed 19297 dropped 0 0.00% | right passed 19296 dropped 0 0.00%
+on r3 p2 | left passed 38377 dropped 0 0.00% | right passed 38595 dropped 0 0.00%
+on r3 p3 | left passed 76723 dropped 19285 20.09% | right passed 54159 dropped 42088 43.73%
+on r4 p0 | left passed 19299 dropped 0 0.00% | right passed 19299 dropped 0 0.00%
+on r4 p1 | left passed 19297 dropped 0 0.00% | right passed 19298 dropped 0 0.00%
+on r4 p2 | left passed 38594 dropped 0 0.00% | right passed 38593 dropped 0 0.00%
+on r4 p3 | left passed 66016 dropped 30432 31.55% | right passed 49163 dropped 47333 49.05%
+
+## TCP through the tunnel, four streams each way with no rate limit, two 10 s points a session, three rounds, the
+## final build: received Gbit/s and sender retransmits each way, CPU of the left and right daemon
+h3       r1/0  | L>R  2.26 G retr    247 | R>L  2.08 G retr   7411 | daemon CPU  169%  140%
+h3       r1/1  | L>R  1.91 G retr    732 | R>L  2.29 G retr  12604 | daemon CPU  157%  140%
+h3       r2/0  | L>R  1.21 G retr    132 | R>L  1.30 G retr    128 | daemon CPU  116%   87%
+h3       r2/1  | L>R  1.89 G retr    425 | R>L  1.98 G retr   5587 | daemon CPU  159%  130%
+h3       r3/0  | L>R  2.15 G retr   5904 | R>L  2.29 G retr   3188 | daemon CPU  161%  137%
+h3       r3/1  | L>R  2.10 G retr   1347 | R>L  2.49 G retr   8431 | daemon CPU  171%  147%
+off      r1/0  | L>R  0.85 G retr    206 | R>L  1.89 G retr   1284 | daemon CPU  102%   93%
+off      r1/1  | L>R  2.06 G retr    241 | R>L  1.83 G retr   8568 | daemon CPU  146%  110%
+off      r2/0  | L>R  0.93 G retr    134 | R>L  1.76 G retr   2562 | daemon CPU  100%   88%
+off      r2/1  | L>R  2.10 G retr    343 | R>L  1.75 G retr   8671 | daemon CPU  146%  110%
+off      r3/0  | L>R  0.94 G retr    394 | R>L  1.11 G retr    148 | daemon CPU   92%   75%
+off      r3/1  | L>R  3.02 G retr   3664 | R>L  2.34 G retr   2746 | daemon CPU  190%  148%
+on       r1/0  | L>R  2.17 G retr   1279 | R>L  2.06 G retr   9250 | daemon CPU  152%  123%
+on       r1/1  | L>R  2.10 G retr   2335 | R>L  1.74 G retr   5475 | daemon CPU  143%  113%
+on       r2/0  | L>R  1.86 G retr    170 | R>L  2.21 G retr   7130 | daemon CPU  138%  126%
+on       r2/1  | L>R  2.37 G retr    410 | R>L  1.76 G retr   7580 | daemon CPU  150%  114%
+on       r3/0  | L>R  2.70 G retr   5369 | R>L  1.87 G retr   7476 | daemon CPU  166%  119%
+on       r3/1  | L>R  1.70 G retr     69 | R>L  2.39 G retr   7598 | daemon CPU  136%  119%
+
+## The same points: share of each sides outer bytes per transmit lane
+h3 r1 p0 | left 1:1% 2:29% 3:32% 4:39% | right 1:0% 2:45% 3:21% 4:34%
+h3 r2 p0 | left 1:0% 2:52% 3:29% 4:19% | right 1:0% 2:39% 3:54% 4:6%
+h3 r3 p0 | left 1:0% 2:61% 3:0% 4:38% | right 1:0% 2:29% 3:30% 4:42%
+off r1 p0 | left 1:0% 2:26% 3:47% 4:27% | right 1:0% 2:14% 3:15% 4:70%
+off r2 p0 | left 1:0% 2:29% 3:46% 4:24% | right 1:0% 2:74% 3:13% 4:13%
+off r3 p0 | left 1:0% 2:47% 3:27% 4:26% | right 1:0% 2:35% 3:24% 4:40%
+on r1 p0 | left 1:0% 2:60% 3:9% 4:30% | right 1:0% 2:18% 3:39% 4:42%
+on r2 p0 | left 1:0% 2:62% 3:15% 4:23% | right 1:0% 2:34% 3:39% 4:27%
+on r3 p0 | left 1:0% 2:50% 3:21% 4:28% | right 1:0% 2:23% 3:12% 4:65%
+h3 r1 p1 | left 1:1% 2:23% 3:22% 4:55% | right 1:0% 2:18% 3:36% 4:46%
+h3 r2 p1 | left 1:0% 2:31% 3:28% 4:40% | right 1:0% 2:32% 3:12% 4:56%
+h3 r3 p1 | left 1:1% 2:45% 3:0% 4:54% | right 1:0% 2:12% 3:32% 4:56%
+off r1 p1 | left 1:0% 2:28% 3:16% 4:56% | right 1:0% 2:57% 3:17% 4:26%
+off r2 p1 | left 1:0% 2:23% 3:30% 4:47% | right 1:0% 2:54% 3:31% 4:15%
+off r3 p1 | left 1:0% 2:52% 3:18% 4:30% | right 1:0% 2:46% 3:1% 4:53%
+on r1 p1 | left 1:0% 2:76% 3:0% 4:23% | right 1:0% 2:37% 3:14% 4:49%
+on r2 p1 | left 1:0% 2:25% 3:40% 4:35% | right 1:0% 2:14% 3:33% 4:52%
+on r3 p1 | left 1:0% 2:51% 3:23% 4:26% | right 1:0% 2:37% 3:35% 4:28%
+
+## Load steps, the final build: single frames at 0.5, 0.5, 1, 0.5, 1, 0.5 and 1 Gbit/s each way in one session, three
+## rounds, folding off and on
+off      r1 p0  0.48 +  0.48 =  0.95 G | off  0.50  0.50 | CPU   78%   53% busiest  30  18 | miss  0.1%  0.4% | sockovf 0 0 | qdrop 0 8 | reord 0 0
+off      r1 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   78%   57% busiest  30  20 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r1 p2  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  118%   93% busiest  46  38 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r1 p3  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   79%   61% busiest  30  25 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r1 p4  0.96 +  0.94 =  1.90 G | off  1.00  0.98 | CPU  120%   94% busiest  45  34 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r1 p5  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   79%   58% busiest  31  22 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r1 p6  0.88 +  0.85 =  1.74 G | off  1.00  1.00 | CPU  112%   96% busiest  42  36 | miss  7.9% 10.9% | sockovf 0 0 | qdrop 0 8 | reord 1 0
+off      r2 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   79%   61% busiest  30  23 | miss  0.0%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r2 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   78%   62% busiest  30  25 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r2 p2  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  116%   96% busiest  47  38 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r2 p3  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   78%   55% busiest  30  18 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r2 p4  0.96 +  0.95 =  1.91 G | off  1.00  0.99 | CPU  115%   91% busiest  44  32 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 12 0
+off      r2 p5  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   79%   55% busiest  31  19 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 4 17
+off      r2 p6  0.88 +  0.87 =  1.75 G | off  1.00  1.00 | CPU  112%   98% busiest  42  35 | miss  8.0%  9.0% | sockovf 0 0 | qdrop 0 0 | reord 85 0
+off      r3 p0  0.46 +  0.46 =  0.93 G | off  0.50  0.50 | CPU   81%   59% busiest  31  21 | miss  3.2%  3.6% | sockovf 0 0 | qdrop 0 14 | reord 0 0
+off      r3 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   84%   64% busiest  32  25 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r3 p2  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  131%  106% busiest  51  41 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r3 p3  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   84%   61% busiest  31  23 | miss  0.0%  0.1% | sockovf 0 0 | qdrop 0 94 | reord 0 0
+off      r3 p4  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  129%  105% busiest  48  39 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 33 0
+off      r3 p5  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   83%   62% busiest  32  26 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+off      r3 p6  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  125%  104% busiest  47  40 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 14
+on       r1 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   76%   58% busiest  25  22 | miss  0.1%  0.1% | sockovf 0 0 | qdrop 0 0 | reord 2 0
+on       r1 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   67%   56% busiest  27  19 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 36 | reord 0 39
+on       r1 p2  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  116%   93% busiest  35  39 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 14 0 | reord 10 0
+on       r1 p3  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   70%   55% busiest  24  19 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+on       r1 p4  0.88 +  0.87 =  1.76 G | off  1.00  1.00 | CPU  109%   94% busiest  37  31 | miss  7.5%  8.9% | sockovf 0 0 | qdrop 443 49 | reord 28 0
+on       r1 p5  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   75%   57% busiest  23  23 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+on       r1 p6  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  111%  101% busiest  35  34 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 3 47 | reord 62 116
+on       r2 p0  0.45 +  0.44 =  0.89 G | off  0.50  0.50 | CPU   78%   59% busiest  26  22 | miss  6.8%  7.5% | sockovf 0 0 | qdrop 173 88 | reord 10 0
+on       r2 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   80%   63% busiest  29  23 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+on       r2 p2  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  119%  104% busiest  46  39 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 10 50 | reord 32 122
+on       r2 p3  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   80%   61% busiest  31  25 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+on       r2 p4  0.89 +  0.86 =  1.74 G | off  1.00  1.00 | CPU  114%   98% busiest  43  35 | miss  7.5% 10.7% | sockovf 0 0 | qdrop 3 3 | reord 0 0
+on       r2 p5  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   78%   61% busiest  31  25 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+on       r2 p6  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  116%  106% busiest  44  38 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 8
+on       r3 p0  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   79%   53% busiest  26  21 | miss  0.1%  0.0% | sockovf 0 0 | qdrop 0 70 | reord 661 0
+on       r3 p1  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   80%   56% busiest  29  20 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 10 0
+on       r3 p2  0.96 +  0.96 =  1.91 G | off  1.00  1.00 | CPU  116%  104% busiest  35  35 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 23 20 | reord 2 54
+on       r3 p3  0.48 +  0.47 =  0.95 G | off  0.50  0.49 | CPU   79%   58% busiest  30  22 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+on       r3 p4  0.96 +  0.96 =  1.92 G | off  1.00  1.00 | CPU  121%   99% busiest  45  29 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 16
+on       r3 p5  0.48 +  0.48 =  0.96 G | off  0.50  0.50 | CPU   78%   58% busiest  25  19 | miss  0.0%  0.0% | sockovf 0 0 | qdrop 0 0 | reord 0 0
+on       r3 p6  0.89 +  0.86 =  1.75 G | off  1.00  1.00 | CPU  113%   94% busiest  34  35 | miss  7.4% 10.3% | sockovf 0 0 | qdrop 86 74 | reord 0 0
+
+## The same points: share of each sides outer bytes per transmit lane
+off r1 p0 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r2 p0 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r3 p0 | left 1:1% 2:37% 3:31% 4:31% | right 1:1% 2:37% 3:31% 4:31%
+on r1 p0 | left 1:0% 2:45% 3:40% 4:14% | right 1:0% 2:67% 3:18% 4:15%
+on r2 p0 | left 1:0% 2:42% 3:38% 4:19% | right 1:0% 2:62% 3:19% 4:19%
+on r3 p0 | left 1:0% 2:40% 3:43% 4:17% | right 1:0% 2:60% 3:26% 4:14%
+off r1 p1 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:31% 3:31% 4:37%
+off r2 p1 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r3 p1 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:31% 3:37% 4:31%
+on r1 p1 | left 1:0% 2:100% 3:0% 4:0% | right 1:0% 2:82% 3:18% 4:0%
+on r2 p1 | left 1:1% 2:38% 3:35% 4:26% | right 1:0% 2:46% 3:27% 4:27%
+on r3 p1 | left 1:0% 2:46% 3:27% 4:27% | right 1:0% 2:69% 3:31% 4:0%
+off r1 p2 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:31% 3:31% 4:37%
+off r2 p2 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:31% 3:31% 4:37%
+off r3 p2 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:31% 3:31% 4:37%
+on r1 p2 | left 1:0% 2:44% 3:56% 4:0% | right 1:0% 2:56% 3:44% 4:0%
+on r2 p2 | left 1:0% 2:31% 3:32% 4:37% | right 1:0% 2:31% 3:31% 4:37%
+on r3 p2 | left 1:0% 2:51% 3:45% 4:4% | right 1:0% 2:46% 3:31% 4:23%
+off r1 p3 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r2 p3 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r3 p3 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+on r1 p3 | left 1:0% 2:74% 3:26% 4:0% | right 1:0% 2:75% 3:25% 4:0%
+on r2 p3 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:37% 3:31% 4:31%
+on r3 p3 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r1 p4 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:31% 3:37% 4:31%
+off r2 p4 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:31% 3:37% 4:31%
+off r3 p4 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:31% 3:37% 4:31%
+on r1 p4 | left 1:0% 2:43% 3:39% 4:18% | right 1:0% 2:41% 3:38% 4:21%
+on r2 p4 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:31% 3:37% 4:31%
+on r3 p4 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:40% 3:50% 4:10%
+off r1 p5 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:31% 3:31% 4:37%
+off r2 p5 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:31% 3:31% 4:37%
+off r3 p5 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:31% 3:31% 4:37%
+on r1 p5 | left 1:0% 2:52% 3:38% 4:10% | right 1:0% 2:79% 3:21% 4:0%
+on r2 p5 | left 1:0% 2:31% 3:31% 4:37% | right 1:0% 2:37% 3:31% 4:31%
+on r3 p5 | left 1:0% 2:40% 3:49% 4:10% | right 1:0% 2:44% 3:56% 4:0%
+off r1 p6 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:37% 3:31% 4:31%
+off r2 p6 | left 1:0% 2:31% 3:37% 4:31% | right 1:0% 2:31% 3:37% 4:31%
+off r3 p6 | left 1:0% 2:37% 3:31% 4:31% | right 1:0% 2:31% 3:31% 4:37%
+on r1 p6 | left 1:0% 2:46% 3:54% 4:0% | right 1:0% 2:41% 3:42% 4:18%
+on r2 p6 | left 1:0% 2:32% 3:35% 4:33% | right 1:0% 2:31% 3:37% 4:31%
+on r3 p6 | left 1:0% 2:40% 3:48% 4:11% | right 1:0% 2:45% 3:46% 4:9%
+
+## The same points: frames each sides TAP queue passed to the daemon and dropped before it read them
+off r1 p0 | left passed 423767 dropped 260 0.06% | right passed 422179 dropped 1480 0.35%
+off r1 p1 | left passed 424224 dropped 0 0.00% | right passed 422626 dropped 0 0.00%
+off r1 p2 | left passed 848411 dropped 0 0.00% | right passed 847784 dropped 0 0.00%
+off r1 p3 | left passed 424576 dropped 0 0.00% | right passed 424504 dropped 0 0.00%
+off r1 p4 | left passed 847984 dropped 0 0.00% | right passed 834200 dropped 0 0.00%
+off r1 p5 | left passed 424433 dropped 0 0.00% | right passed 424544 dropped 0 0.00%
+off r1 p6 | left passed 782392 dropped 66240 7.81% | right passed 760040 dropped 88995 10.48%
+off r2 p0 | left passed 424055 dropped 148 0.03% | right passed 424099 dropped 384 0.09%
+off r2 p1 | left passed 424434 dropped 0 0.00% | right passed 424489 dropped 0 0.00%
+off r2 p2 | left passed 848977 dropped 0 0.00% | right passed 848760 dropped 233 0.03%
+off r2 p3 | left passed 424472 dropped 0 0.00% | right passed 423280 dropped 0 0.00%
+off r2 p4 | left passed 848792 dropped 0 0.00% | right passed 843760 dropped 0 0.00%
+off r2 p5 | left passed 424376 dropped 0 0.00% | right passed 423416 dropped 0 0.00%
+off r2 p6 | left passed 781242 dropped 67536 7.96% | right passed 774357 dropped 72237 8.53%
+off r3 p0 | left passed 411892 dropped 12575 2.96% | right passed 409868 dropped 14623 3.44%
+off r3 p1 | left passed 424416 dropped 0 0.00% | right passed 424536 dropped 0 0.00%
+off r3 p2 | left passed 848434 dropped 0 0.00% | right passed 849162 dropped 0 0.00%
+off r3 p3 | left passed 424296 dropped 0 0.00% | right passed 424157 dropped 435 0.10%
+off r3 p4 | left passed 848672 dropped 0 0.00% | right passed 849016 dropped 0 0.00%
+off r3 p5 | left passed 424393 dropped 0 0.00% | right passed 424593 dropped 0 0.00%
+off r3 p6 | left passed 848616 dropped 0 0.00% | right passed 848945 dropped 0 0.00%
+on r1 p0 | left passed 424107 dropped 272 0.06% | right passed 424223 dropped 324 0.08%
+on r1 p1 | left passed 424409 dropped 0 0.00% | right passed 424537 dropped 25 0.01%
+on r1 p2 | left passed 849034 dropped 0 0.00% | right passed 849168 dropped 0 0.00%
+on r1 p3 | left passed 424449 dropped 0 0.00% | right passed 424296 dropped 0 0.00%
+on r1 p4 | left passed 786764 dropped 61276 7.23% | right passed 776835 dropped 72333 8.52%
+on r1 p5 | left passed 424514 dropped 0 0.00% | right passed 424568 dropped 0 0.00%
+on r1 p6 | left passed 848104 dropped 96 0.01% | right passed 848545 dropped 0 0.00%
+on r2 p0 | left passed 397979 dropped 26496 6.24% | right passed 395695 dropped 28844 6.79%
+on r2 p1 | left passed 424329 dropped 0 0.00% | right passed 424489 dropped 0 0.00%
+on r2 p2 | left passed 847217 dropped 0 0.00% | right passed 849089 dropped 0 0.00%
+on r2 p3 | left passed 424505 dropped 0 0.00% | right passed 424592 dropped 0 0.00%
+on r2 p4 | left passed 786100 dropped 62796 7.40% | right passed 759818 dropped 88942 10.48%
+on r2 p5 | left passed 423545 dropped 0 0.00% | right passed 424553 dropped 0 0.00%
+on r2 p6 | left passed 848352 dropped 0 0.00% | right passed 848749 dropped 277 0.03%
+on r3 p0 | left passed 424191 dropped 212 0.05% | right passed 422219 dropped 0 0.00%
+on r3 p1 | left passed 423777 dropped 0 0.00% | right passed 424522 dropped 0 0.00%
+on r3 p2 | left passed 847633 dropped 376 0.04% | right passed 848227 dropped 357 0.04%
+on r3 p3 | left passed 424392 dropped 0 0.00% | right passed 414464 dropped 0 0.00%
+on r3 p4 | left passed 848720 dropped 0 0.00% | right passed 849123 dropped 21 0.00%
+on r3 p5 | left passed 424368 dropped 0 0.00% | right passed 424576 dropped 0 0.00%
+on r3 p6 | left passed 787905 dropped 60992 7.18% | right passed 764511 dropped 83876 9.89%

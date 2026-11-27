@@ -390,6 +390,67 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs two virtio cards joined back to back, as tests/qemu-kernel.sh gives its guest; passes without them"]
+    fn a_virtio_cards_receive_queues_are_counted() {
+        let driver = |name: &str| {
+            fs::read_link(format!("/sys/class/net/{name}/device/driver"))
+                .ok()
+                .and_then(|path| Some(path.file_name()?.to_str()?.to_owned()))
+        };
+        let mut cards: Vec<String> = fs::read_dir("/sys/class/net")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| driver(name).as_deref() == Some("virtio_net"))
+            .collect();
+        cards.sort();
+        let [near, far] = cards.as_slice() else {
+            // tests/qemu-kernel.sh says that its guest has the cards, so a
+            // guest without them fails instead of passing unseen.
+            assert!(
+                std::env::var_os("UNQUIC_VIRTIO_CARDS").is_none(),
+                "{} virtio cards here",
+                cards.len()
+            );
+            eprintln!("skipped: {} virtio cards here", cards.len());
+            return;
+        };
+        // Each queue's count, or None where the line says unknown.
+        let counted = |name: &str| -> Option<Vec<u64>> {
+            let line = device(name);
+            let field = line
+                .split(' ')
+                .find_map(|part| part.strip_prefix("rx_queue_packets="))?;
+            field.split('/').map(|count| count.parse().ok()).collect()
+        };
+        let before = counted(far).expect("virtio_net counts packets per receive queue");
+        assert!(!before.is_empty());
+        // The far card takes whatever the near one says as it comes up:
+        // group reports and neighbour discovery.
+        for (card, flags) in [(far, &["promisc", "on", "up"][..]), (near, &["up"][..])] {
+            let status = std::process::Command::new("ip")
+                .args(["link", "set", "dev", card])
+                .args(flags)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let now = counted(far).unwrap();
+            if now.iter().sum::<u64>() > before.iter().sum::<u64>() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no packet counted: {before:?} then {now:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
     fn host_lines_name_the_cpu_and_the_buffer_ceilings() {
         let text = lines();
         let mut lines = text.lines();

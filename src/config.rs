@@ -51,7 +51,7 @@ pub struct Daemon {
     /// frames waits up to this many microseconds (at most 1000) for more, so
     /// light traffic packs frame tails together at the cost of that latency.
     pub tx_hold_us: u32,
-    /// 200 by default since November 27; 0 turns it off. A worker turn that
+    /// 300 by default since November 27; 0 turns it off. A worker turn that
     /// drained its sockets and TAP queue and took in less than sixteen
     /// frames' worth of input waits until this many microseconds (at most
     /// 1000) after its start before it polls again, so a moderate rate of
@@ -65,6 +65,12 @@ pub struct Daemon {
     // FAILED(2026-11-27): 200 as the default, chosen from one round -> four to twelve rounds a
     //   setting showed 300 saving 4-8% more with the same loss. Now: 300.
     pub turn_hold_us: u32,
+    /// 1000 by default since November 27, and at most 1000: a worker awake a
+    /// twentieth of the time or more holds its small turns this long in place
+    /// of `turn_hold_us`, until it is awake less than a fiftieth. A value
+    /// under `turn_hold_us` counts as that one, so 0 gives one hold at every
+    /// load; with `turn_hold_us` 0 no turn holds.
+    pub busy_hold_us: u32,
     /// On by default since November 12, a deviation from BBR draft 07: the
     /// ProbeRTT window covers half the bandwidth over min_rtt plus the
     /// receiver's 1 ms ACK delay, not over min_rtt alone, so a steady offer
@@ -87,7 +93,12 @@ pub struct Daemon {
     /// and the receiving TAP's kernel completes it, so neither daemon sums
     /// the payload.
     pub partial_checksums: bool,
-    /// Off by default, experimental: advertise optional feature
+    // DECISION(2026-11-27): stripe_flows stays off by default. Why: across the real path a
+    //   striped flow of UDP trains delivered 2.2-2.8 Gbit/s against 1.2-2.7 with a fifth to a
+    //   half of its frames out of sequence and up to twice the CPU, and single frames and TCP
+    //   gained nothing; the design's bar was order. Rejected: on by default (every flow that
+    //   fills a lane for 10 ms would be reordered).
+    /// Off by default: advertise optional feature
     /// `STRIPED_FLOWS`. Where both peers advertise it, a flow that one
     /// transmit worker cannot carry is striped across the session's data
     /// lanes, and the receiver restores each stripe's order on one worker
@@ -100,6 +111,22 @@ pub struct Daemon {
     /// peer's data lane instead. Acts only on a session with as many TAP
     /// queues as workers whose endpoint serves no other session.
     pub rotate_lanes: bool,
+    /// On by default since November 27: a session with two or more data lanes
+    /// closes those its load does not need after five quiet seconds, down to
+    /// the first, and opens the next when an open lane's worker is busy
+    /// seven tenths of the time or a lane falls behind. A new connection
+    /// starts with all of them. Opening or closing a lane moves only that
+    /// lane's flows. False uses every lane always.
+    // DECISION(2026-11-27): a session folds its light load onto one data lane by itself.
+    //   Why: across the real path one data lane in place of three cost a daemon 18% less CPU at
+    //   0.5 Gbit/s each way of single frames and a quarter less on trains, and an operator who
+    //   sizes lanes for a peak pays for them all day. Folding itself measured 8-10% and up to
+    //   18% there, and its cost, up to a third of a second of single frames when a load
+    //   doubles on one lane of a slow host, is smaller than what the CPU is worth to the
+    //   user. Rejected: leaving it to `tx_lanes` (the peak then decides the idle cost); a
+    //   rate threshold (a lane's capacity depends on the machine and on the frames); off by
+    //   default (the saving would reach nobody who did not read this far).
+    pub fold_lanes: bool,
 }
 impl Default for Daemon {
     fn default() -> Self {
@@ -110,12 +137,14 @@ impl Default for Daemon {
             balance_flows: true,
             tx_hold_us: 0,
             turn_hold_us: 300,
+            busy_hold_us: 1000,
             probe_rtt_ack_delay: true,
             control_lane: true,
             offload_frames: true,
             partial_checksums: true,
             stripe_flows: false,
             rotate_lanes: true,
+            fold_lanes: true,
         }
     }
 }
@@ -316,6 +345,13 @@ impl Config {
         if self.daemon.turn_hold_us > 1000 {
             return Err(ConfigError {
                 field: "daemon.turn_hold_us",
+                index: None,
+                reason: "must be at most 1000",
+            });
+        }
+        if self.daemon.busy_hold_us > 1000 {
+            return Err(ConfigError {
+                field: "daemon.busy_hold_us",
                 index: None,
                 reason: "must be at most 1000",
             });
